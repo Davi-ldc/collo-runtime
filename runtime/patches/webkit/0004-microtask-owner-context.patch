@@ -1,0 +1,345 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Davi <davilimacarv2536@gmail.com>
+Date: Sun, 13 Sep 2026 22:38:43 -0300
+Subject: [PATCH 4/4] microtask owner context
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Carries the owning execution context from promise-reaction
+*registration* to reaction *execution*. `await p` inside request A
+registers a reaction; request B settles `p`; JSC then runs A's
+continuation inside B's turn, so any ambient "who is running" state
+names B for work that belongs to A (wrong log attribution, wrong
+per-request CPU, wrong host-API identity). The reaction gets a
+`uint64_t` owner token — opaque to JSC, not a JS value, so no write
+barrier and the cell stays trivially destructible — snapshotted in
+the `Status::Pending` arms of
+`performPromiseThen`/`performPromiseThenWithInternalMicrotask` (the
+settled arms enqueue in the same turn, where the running owner is
+already correct). When `triggerPromiseReactions` sees a reaction whose
+owner differs from the one running, it asks the embedder for a
+dispatcher that restores that owner around the run — the same
+wrapping seam `DebuggableMicrotaskDispatcher` already uses, so no
+queue-layout or scheduling change — and enqueues it straight onto the
+queue instead of through `queueMicrotask`. That bypass is the
+load-bearing part: inside a restored continuation the ordinary enqueue
+stamps the *ambient* owner, which would re-tag a reaction belonging to
+the draining turn as the continuation that happens to be running. It
+holds even when the dispatcher cannot be allocated, because falling
+back there attaches a wrong owner rather than none. A separate field
+rather than the reaction's existing `context` slot, because `await`
+already stores the resumed async frame there; boxing both into one cell
+is possible but costs an allocation per owned registration and forces
+every reader of that slot to unbox. The engine also stores a promise's
+first reaction inline, with no reaction cell to hold a token, so an
+owned turn deliberately skips that fast path and spills to a real
+reaction — otherwise the identity would be dropped on the most common
+registration there is, and the same reasoning kills the DFG
+classification that lowers `.then` into that inline write from
+generated code. Embedder opts in via `colloSetOwnerHooks`; unset hooks
+make every added operation a null check. Prerequisite for serving
+concurrent requests in one worker, and the same mechanism
+`AsyncLocalStorage` needs.
+---
+ .../dfg/DFGConstantFoldingPhase.cpp           | 23 ++++--
+ Source/JavaScriptCore/runtime/JSPromise.cpp   | 77 +++++++++++++++++--
+ Source/JavaScriptCore/runtime/JSPromise.h     | 25 ++++++
+ .../runtime/JSPromiseReaction.h               | 10 +++
+ 4 files changed, 121 insertions(+), 14 deletions(-)
+
+diff --git a/Source/JavaScriptCore/dfg/DFGConstantFoldingPhase.cpp b/Source/JavaScriptCore/dfg/DFGConstantFoldingPhase.cpp
+index 106df3f3..0cc0163d 100644
+--- a/Source/JavaScriptCore/dfg/DFGConstantFoldingPhase.cpp
++++ b/Source/JavaScriptCore/dfg/DFGConstantFoldingPhase.cpp
+@@ -65,14 +65,23 @@ static bool isNegativeBigInt(JSValue& value)
+     return value.asHeapBigInt()->sign();
+ }
+ 
+-static std::optional<JSPromise::InlineReactionKind> classifyPerformPromiseThen(const AbstractValue& fulfilledValue, const AbstractValue& rejectedValue)
++// Always declines. The inline reaction this classification enables has no slot for
++// the owner of the turn that registered it, and the fast path it lowers to writes
++// the reaction straight into the promise without ever calling performPromiseThen,
++// where the owner is captured -- so a `.then` that tiers up would lose the identity
++// of the request that registered it. Declining keeps the generic PerformPromiseThen
++// node, which calls operationPerformPromiseThen and lands in the guarded C++ path.
++//
++// An embedder that installs the owner hooks gives up nothing: an owned turn is
++// forbidden from taking the inline path in performPromiseThen, so the fast path
++// this used to enable could never have been taken in good faith. One that does
++// not install them does pay, trading the inline stores for a call into
++// operationPerformPromiseThen, whose C++ still takes the inline path. The two
++// call sites below already handle the empty answer, and
++// PerformPromiseThenOneHandler is then never created, which leaves no lowering
++// in either backend that could go stale.
++static std::optional<JSPromise::InlineReactionKind> classifyPerformPromiseThen(const AbstractValue&, const AbstractValue&)
+ {
+-    if (fulfilledValue.m_type == SpecNone || rejectedValue.m_type == SpecNone)
+-        return std::nullopt;
+-    if (fulfilledValue.isType(SpecFunction) && rejectedValue.isType(SpecOther))
+-        return JSPromise::InlineReactionKind::FulfillHandler;
+-    if (rejectedValue.isType(SpecFunction) && fulfilledValue.isType(SpecOther))
+-        return JSPromise::InlineReactionKind::RejectHandler;
+     return std::nullopt;
+ }
+ 
+diff --git a/Source/JavaScriptCore/runtime/JSPromise.cpp b/Source/JavaScriptCore/runtime/JSPromise.cpp
+index 434d4fba..a1a30a7d 100644
+--- a/Source/JavaScriptCore/runtime/JSPromise.cpp
++++ b/Source/JavaScriptCore/runtime/JSPromise.cpp
+@@ -34,11 +34,13 @@
+ #include "JSCInlines.h"
+ #include "JSFunctionWithFields.h"
+ #include "JSMicrotask.h"
++#include "JSMicrotaskDispatcher.h"
+ #include "JSPromiseCombinatorsContext.h"
+ #include "JSPromiseConstructor.h"
+ #include "JSPromisePrototype.h"
+ #include "JSPromiseReaction.h"
+ #include "Microtask.h"
++#include "MicrotaskQueue.h"
+ #include "MicrotaskQueueInlines.h"
+ #include "ObjectConstructor.h"
+ #include "TopExceptionScope.h"
+@@ -51,6 +53,24 @@ namespace JSC {
+ 
+ const ClassInfo JSPromise::s_info = { "Promise"_s, &Base::s_info, nullptr, nullptr, CREATE_METHOD_TABLE(JSPromise) };
+ 
++// Process-global: the embedder installs these once, before any JS runs, and every
++// VM resolves its own owner from the global object it is handed.
++static ColloOwnerTokenGetter g_colloCurrentOwnerToken { nullptr };
++static ColloOwnerDispatcherFactory g_colloOwnerDispatcherFactory { nullptr };
++
++void colloSetOwnerHooks(ColloOwnerTokenGetter getter, ColloOwnerDispatcherFactory factory)
++{
++    g_colloCurrentOwnerToken = getter;
++    g_colloOwnerDispatcherFactory = factory;
++}
++
++uint64_t colloCurrentOwnerToken(JSGlobalObject* globalObject)
++{
++    if (!g_colloCurrentOwnerToken)
++        return 0;
++    return g_colloCurrentOwnerToken(globalObject);
++}
++
+ JSPromise* JSPromise::create(VM& vm, Structure* structure)
+ {
+     JSPromise* promise = new (NotNull, allocateCell<JSPromise>(vm)) JSPromise(vm, structure);
+@@ -395,12 +415,18 @@ void JSPromise::performPromiseThen(VM& vm, JSGlobalObject* globalObject, JSValue
+     case JSPromise::Status::Pending: {
+         bool onlyFulfill = fulfilledCallable && !rejectedCallable;
+         bool onlyReject = !fulfilledCallable && rejectedCallable;
++        // Only Pending needs the owner: the settled cases enqueue in this same
++        // turn, where the running owner is already the right one.
++        uint64_t ownerToken = colloCurrentOwnerToken(globalObject);
++        // An owned turn cannot take the inline path. The inline reaction lives
++        // in the promise itself and has no slot for an owner, so taking it
++        // would drop the identity on the most common registration there is.
+ #if USE(BUN_JSC_ADDITIONS)
+         // Inline reactions have no slot for an async context, so fall through to
+         // the heap-allocated JSFullPromiseReaction path when one is captured.
+-        if (!hasAsyncContext && inlineReactionKind() == InlineReactionKind::None && !payloadCell()) {
++        if (!ownerToken && !hasAsyncContext && inlineReactionKind() == InlineReactionKind::None && !payloadCell()) {
+ #else
+-        if (inlineReactionKind() == InlineReactionKind::None && !payloadCell()) {
++        if (!ownerToken && inlineReactionKind() == InlineReactionKind::None && !payloadCell()) {
+ #endif
+             if ((onlyFulfill || onlyReject) && promiseOrCapability.inherits<JSPromise>()) [[likely]] {
+                 auto* resultPromise = uncheckedDowncast<JSPromise>(promiseOrCapability);
+@@ -429,6 +455,7 @@ void JSPromise::performPromiseThen(VM& vm, JSGlobalObject* globalObject, JSValue
+             reaction = JSFullPromiseReaction::create(vm, promiseOrCapability, onFulfilled, onRejected, jsUndefined(), existing);
+         } else
+             reaction = JSSlimPromiseReaction::create(vm, promiseOrCapability, InternalMicrotask::PromiseResolveWithoutHandlerJob, jsUndefined(), existing);
++        reaction->setColloOwnerToken(ownerToken);
+         setPackedCell(vm, flags() | isHandledFlag, reaction);
+         break;
+     }
+@@ -479,11 +506,13 @@ void JSPromise::performPromiseThenWithContext(VM& vm, JSGlobalObject* globalObje
+ 
+     switch (status()) {
+     case JSPromise::Status::Pending: {
++        uint64_t ownerToken = colloCurrentOwnerToken(globalObject);
+         JSPromiseReaction* existing = reactionHead(vm);
+         auto* reaction = JSFullPromiseReaction::create(vm, promiseOrCapability,
+             fulfilledCallable ? onFulfilled : jsUndefined(),
+             rejectedCallable ? onRejected : jsUndefined(),
+             context, existing);
++        reaction->setColloOwnerToken(ownerToken);
+         setPackedCell(vm, flags() | isHandledFlag, reaction);
+         break;
+     }
+@@ -524,7 +553,12 @@ void JSPromise::performPromiseThenWithInternalMicrotask(VM& vm, InternalMicrotas
+     JSValue cellValue = cell ? JSValue(cell) : jsUndefined();
+     switch (status()) {
+     case JSPromise::Status::Pending: {
+-        if (inlineReactionKind() == InlineReactionKind::None && !payloadCell()) [[likely]] {
++        // `await` lands here, so this is the arm that carries a cross-request
++        // continuation. The reaction's `context` slot is already spoken for by
++        // the resumed async frame -- hence the separate owner field -- and the
++        // inline reaction has no slot at all, so an owned turn must spill.
++        uint64_t ownerToken = colloCurrentOwnerToken(realm());
++        if (!ownerToken && inlineReactionKind() == InlineReactionKind::None && !payloadCell()) [[likely]] {
+ #if USE(BUN_JSC_ADDITIONS)
+             if (hasAsyncContext) {
+                 if (asyncContext.isCell()) [[likely]] {
+@@ -543,11 +577,13 @@ void JSPromise::performPromiseThenWithInternalMicrotask(VM& vm, InternalMicrotas
+ #if USE(BUN_JSC_ADDITIONS)
+         if (hasAsyncContext) {
+             auto* reaction = JSSlimPromiseReaction::createWithAsyncContext(vm, asyncContext, task, context, existing);
++            reaction->setColloOwnerToken(ownerToken);
+             setPackedCell(vm, flags() | isHandledFlag, reaction);
+             break;
+         }
+ #endif
+         auto* reaction = JSSlimPromiseReaction::create(vm, cellValue, task, context, existing);
++        reaction->setColloOwnerToken(ownerToken);
+         setPackedCell(vm, flags() | isHandledFlag, reaction);
+         break;
+     }
+@@ -978,8 +1014,35 @@ std::tuple<JSFunction*, JSFunction*> JSPromise::createResolvingFunctionsWithInte
+ void JSPromise::triggerPromiseReactions(VM& vm, JSGlobalObject* globalObject, Status status, JSPromiseReaction* head, JSValue argument)
+ {
+     bool isResolved = status == JSPromise::Status::Fulfilled;
++    uint64_t runningOwnerToken = colloCurrentOwnerToken(globalObject);
+ 
+     auto queue = [&](JSPromiseReaction* reaction) ALWAYS_INLINE_LAMBDA {
++        auto enqueue = [&](QueuedTask&& queuedTask) {
++            // A reaction whose owner is not the one running has to carry that owner
++            // itself, and the enqueue goes straight to the queue rather than through
++            // queueMicrotask: inside a restored continuation the latter stamps the
++            // AMBIENT owner over whatever this task decided, which would re-tag the
++            // reaction as the continuation that happens to be running. The bypass
++            // holds even when no dispatcher could be built, because falling through
++            // then would attach a wrong owner rather than none. What the bypass
++            // skips is the fully-active-document rule, which no JSC-only embedder
++            // can fail; enqueue still routes through enqueueSlow and still notifies
++            // the debugger.
++            uint64_t ownerToken = reaction->colloOwnerToken();
++            if (ownerToken && ownerToken != runningOwnerToken) [[unlikely]] {
++                RefPtr<MicrotaskDispatcher> owned;
++                if (g_colloOwnerDispatcherFactory)
++                    owned = g_colloOwnerDispatcherFactory(vm, globalObject, ownerToken);
++                if (owned)
++                    queuedTask.setDispatcher(JSMicrotaskDispatcher::create(vm, owned.releaseNonNull(), globalObject));
++                globalObject->microtaskQueue().enqueue(WTF::move(queuedTask));
++                return;
++            }
++            // Owner already running: the plain path is the correct one. Outside a
++            // restored continuation it enqueues under that owner, and inside one the
++            // ambient stamp names the same owner the reaction recorded.
++            globalObject->queueMicrotask(vm, WTF::move(queuedTask));
++        };
+         JSValue promise = reaction->promise();
+         InternalMicrotask task = InternalMicrotask::PromiseReactionJob;
+         JSValue handler;
+@@ -999,7 +1062,7 @@ void JSPromise::triggerPromiseReactions(VM& vm, JSGlobalObject* globalObject, St
+                         vm.m_synchronousModuleQueue->tasks.append({ task, static_cast<uint8_t>(status), jsUndefined(), handler, arg, promise });
+                         return;
+                     }
+-                    globalObject->queueMicrotask(vm, task, static_cast<uint8_t>(status), jsUndefined(), handler, arg, promise);
++                    enqueue(QueuedTask { nullptr, task, static_cast<uint8_t>(status), globalObject, jsUndefined(), handler, arg, promise });
+                     return;
+                 }
+                 if (vm.m_synchronousModuleQueue && isModuleLoaderInternalMicrotask(task)) [[unlikely]] {
+@@ -1030,11 +1093,11 @@ void JSPromise::triggerPromiseReactions(VM& vm, JSGlobalObject* globalObject, St
+             }
+             JSValue context = fullReaction->context();
+             if (fullReaction->contextIsAsyncContext()) {
+-                globalObject->queueMicrotask(vm, task, static_cast<uint8_t>(status) | promiseReactionJobAsyncContextFlag, promise, handler, arg, context);
++                enqueue(QueuedTask { nullptr, task, static_cast<uint8_t>(static_cast<uint8_t>(status) | promiseReactionJobAsyncContextFlag), globalObject, promise, handler, arg, context });
+                 return;
+             }
+             if (!context.isUndefinedOrNull()) {
+-                globalObject->queueMicrotask(vm, task, static_cast<uint8_t>(status), promise, handler, arg, context);
++                enqueue(QueuedTask { nullptr, task, static_cast<uint8_t>(status), globalObject, promise, handler, arg, context });
+                 return;
+             }
+ #else
+@@ -1047,7 +1110,7 @@ void JSPromise::triggerPromiseReactions(VM& vm, JSGlobalObject* globalObject, St
+         }
+ 
+ 
+-        globalObject->queueMicrotask(vm, task, static_cast<uint8_t>(status), promise, handler, arg);
++        enqueue(QueuedTask { nullptr, task, static_cast<uint8_t>(status), globalObject, promise, handler, arg });
+     };
+ 
+     ASSERT(head);
+diff --git a/Source/JavaScriptCore/runtime/JSPromise.h b/Source/JavaScriptCore/runtime/JSPromise.h
+index 6c0d25cb..0396af35 100644
+--- a/Source/JavaScriptCore/runtime/JSPromise.h
++++ b/Source/JavaScriptCore/runtime/JSPromise.h
+@@ -37,6 +37,7 @@ namespace JSC {
+ 
+ class JSPromiseConstructor;
+ class JSPromiseReaction;
++class MicrotaskDispatcher;
+ 
+ // JSPromise stores its state in two machine words:
+ //   m_packed: CompactPointerTuple<JSCell*, uint16_t>
+@@ -297,6 +298,30 @@ JSC_DECLARE_HOST_FUNCTION(promiseResolvingFunctionResolveWithInternalMicrotask);
+ JSC_DECLARE_HOST_FUNCTION(promiseResolvingFunctionRejectWithInternalMicrotask);
+ JSC_DECLARE_HOST_FUNCTION(promiseCapabilityExecutor);
+ 
++// A promise reaction belongs to the execution context that REGISTERED it, which
++// is not always the one running when it becomes runnable: `await p` in request A
++// registers a reaction that request B makes runnable by settling p, and JSC runs
++// it inside B's turn. The token is minted by the embedder and opaque here; 0
++// means the embedder could not name an owner at all, which leaves the reaction
++// running under whoever the queue supplies -- the behaviour from before this
++// existed. An embedder with no owner to name is expected to mint a token for
++// that state rather than answer 0, so that work outside any turn stays outside
++// it instead of inheriting a live one.
++//
++// One reading serves both uses: a reaction records who is running when it is
++// registered, and a settle compares against who is running then. Comparing
++// against the owner of the enclosing TURN instead would be wrong, because the
++// equal case falls through to the plain enqueue, and inside a restored
++// continuation that path stamps the ambient owner -- so a reaction belonging to
++// the outer turn would be re-tagged as the restored one.
++//
++// Hooks unset => every operation here is a no-op, so an embedder that does not
++// opt in pays one null check per promise reaction.
++using ColloOwnerTokenGetter = uint64_t (*)(JSGlobalObject*);
++using ColloOwnerDispatcherFactory = RefPtr<MicrotaskDispatcher> (*)(VM&, JSGlobalObject*, uint64_t ownerToken);
++JS_EXPORT_PRIVATE void colloSetOwnerHooks(ColloOwnerTokenGetter, ColloOwnerDispatcherFactory);
++JS_EXPORT_PRIVATE uint64_t colloCurrentOwnerToken(JSGlobalObject*);
++
+ JSObject* promiseSpeciesConstructor(JSGlobalObject*, JSObject*);
+ Structure* createPromiseCapabilityObjectStructure(VM&, JSGlobalObject&);
+ bool isDefinitelyNonThenable(JSObject*, JSGlobalObject*);
+diff --git a/Source/JavaScriptCore/runtime/JSPromiseReaction.h b/Source/JavaScriptCore/runtime/JSPromiseReaction.h
+index 582a60bf..39e69e57 100644
+--- a/Source/JavaScriptCore/runtime/JSPromiseReaction.h
++++ b/Source/JavaScriptCore/runtime/JSPromiseReaction.h
+@@ -46,6 +46,14 @@ public:
+     JSValue promise() const { return m_promise.get(); }
+     JSPromiseReaction* next() const LIFETIME_BOUND { return m_next.pointer(); }
+     InternalMicrotask internalMicrotask() const { return static_cast<InternalMicrotask>(m_next.type()); }
++    // Owner captured when this reaction was REGISTERED, which is the request
++    // that will resume once the promise settles -- not necessarily the one that
++    // settles it. Opaque to JSC, 0 when unowned. Not a JS value and not a GC
++    // pointer, so it needs no write barrier and keeps this cell trivially
++    // destructible. It lives on the base rather than on JSFullPromiseReaction
++    // because `await` registers a JSSlimPromiseReaction, and that is exactly the
++    // path that crosses requests.
++    uint64_t colloOwnerToken() const { return m_colloOwnerToken; }
+ 
+     void setPromise(VM& vm, JSValue value) { m_promise.set(vm, this, value); }
+     void setNext(VM& vm, JSPromiseReaction* value)
+@@ -53,6 +61,7 @@ public:
+         m_next.setPointer(value);
+         vm.writeBarrier(this, value);
+     }
++    void setColloOwnerToken(uint64_t token) { m_colloOwnerToken = token; }
+ 
+     static JSValue tryGetContext(JSValue reactionsValue);
+ 
+@@ -66,6 +75,7 @@ protected:
+ 
+     WriteBarrier<Unknown> m_promise;
+     CompactPointerTuple<JSPromiseReaction*, uint8_t> m_next;
++    uint64_t m_colloOwnerToken { 0 };
+ };
+ 
+ class JSSlimPromiseReaction final : public JSPromiseReaction {

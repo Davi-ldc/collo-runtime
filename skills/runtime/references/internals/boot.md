@@ -1,0 +1,285 @@
+# Boot and shutdown
+
+This reference follows a node's processes from the command line to the exit status: the roles of the one binary, the server's boot in order with the reason each step sits where it does, the zygote's preparation and fork loop, a worker's birth up to `WorkerReady`, and the shutdown with what it leaves on disk. The server's boot is in `runtime/src/server/boot/` and `server/main.zig`, the zygote and the worker child are in `runtime/src/zygote/`, and the host's side of the zygote contract is in `runtime/src/host/` and `zygote/host_client.zig`; their `//!` headers own the mechanics. [security.md](security.md) owns the worker's sandbox steps, [scheduler.md](scheduler.md) the launcher and the reaper, [egress.md](egress.md) the gateway's own boot and sandbox, and [request.md](request.md) what an ingress lane does with a connection. A reference such as `fork_loop.zig:serveForkRequests` names a file and a symbol in it. A bare file name is in `server/boot/`, `zygote/` or `host/`; `root.zig` and `cgroup.zig` always carry their directory; any other path is relative to `runtime/src/`.
+
+## One binary
+
+The binary's entry, `main.zig:boot` at the root of `runtime/src/`, chooses the role from the base name of `arg0` before it reads an argument. `collo-zygote` (`fork_loop.zig:process_name`) runs the zygote, and `collo-egress-gateway` (`egress/gateway/launch.zig:process_name`) runs the gateway, which refuses any argument (`egress/gateway/root.zig:runFromInheritedControlFd`). Any other name reads a command: `serve` boots the server (`server/boot/root.zig:serve`), and anything else, or no command, prints the usage line and exits with status 2. A worker never enters `main`: it is a `clone3` child of the zygote and runs the zygote's code from the clone on (`child_boot.zig:workerChildMain`). The server and the gateway allocate from the root allocator, a `DebugAllocator` in Debug builds and `smp_allocator` otherwise; the zygote and a worker child keep their process-lifetime state in `smp_allocator` (`state.zig`, `child_boot.zig`).
+
+| Process | Started by | How | Starts with |
+| --- | --- | --- | --- |
+| server | the operator | `collo serve` | the operator's environment, descriptors and cgroup |
+| zygote | the boot thread (`host_client.zig:spawnZygote`) | `posix_spawn` of the server's own binary under `collo-zygote` | its control socket at descriptor 3, the trace pipe's write end at 4, the server's standard descriptors and an environment of fixed values |
+| gateway | the launcher thread, at the first launch's session attach and after a loss (`server/gateway/manager.zig:Manager.attachWorker`, `Manager.prewarm`) | `posix_spawn` under `collo-egress-gateway` | its control socket at descriptor 3 and the server's standard descriptors; [egress.md](egress.md#the-gateway-process) has its environment |
+| worker | the zygote's fork loop (`fork_loop.zig:serveForkRequests`) | `clone3` with `CLONE_INTO_CGROUP` and `CLONE_PIDFD`, with no exec | the zygote's address space, its init socket and the trace pipe's write end |
+
+Both spawned processes start with an empty signal mask as the leaders of new sessions, with every descriptor above the mapped ones closed (`common/os.zig:process.spawnInternal`). The zygote writes each child's `OOM_SCORE_ADJ_WORKER` (500) after the clone, and the server writes the zygote's `OOM_SCORE_ADJ_ZYGOTE` (200) and the gateway's `OOM_SCORE_ADJ_EGRESS_GATEWAY` (-500) after each spawn (`common/limits/process.zig`); a failed write only warns, and the server writes no score of its own. The kernel therefore picks workers first, then the zygote. The gateway's score is the only one below the default, and its write fails with `EACCES`, leaving the gateway at the server's score, unless the server holds `CAP_SYS_RESOURCE` or inherited an `oom_score_adj_min` of -500 or lower from a privileged parent. The gateway is picked before the server only when whoever starts the server pins it below -500, as `common/limits/process.zig` expects a systemd unit to do with `OOMScoreAdjust=`; the repository ships no such unit.
+
+`command_line.zig:parse` reads `collo serve <collo.json | entry.js> [--listen <host:port>]`. A path ending in `.json` names a configuration file, and any other path names an entry module, for which `server/config/synthesize.zig:synthesize` builds the configuration a file would: one worker named after the file's stem, one route `/*` and every global default. `--listen` replaces `globalSettings.listen`, whose default is `127.0.0.1:8443` (`server/config/model.zig:default_listen`), and port 0 binds an ephemeral port. A malformed command line prints its reason and the usage line and exits with status 2.
+
+## The server's boot
+
+`server/boot/root.zig:serve` runs these steps in order on the main thread, which has started no other thread yet; its `//!` header states the same order:
+
+| Step | What | Where | Why there |
+| --- | --- | --- | --- |
+| 1 | refuse an effective uid of 0 | `server/boot/root.zig:rootRefusal` | the zygote, every worker and the gateway run as the server's user, so a worker that escapes its sandbox holds what that user holds |
+| 2 | block SIGHUP, SIGINT and SIGTERM, then start the signal monitor | `signals.zig:Signals.start` | every later thread inherits the mask, and a thread with one of them unblocked would take its default action and end the process without cleanup; nothing that needs cleanup exists yet |
+| 3 | raise the soft open-file limit to the hard one | `server/boot/root.zig:raiseOpenFileLimit` | the routes keep `route_descriptors_max` descriptors open from step 5 on |
+| 4 | load or synthesize the configuration, apply `--listen`, check the certificate files and the analytics directory it names | `server/boot/root.zig:loadConfiguration`, `checkConfiguredPaths` | a failure names the key that holds the path; `Server.init` opens them again |
+| 5 | build the route table and every route's artifacts | `server/routes/root.zig:Routes.init` | every module a worker can load is read from disk here, once, into a sealed module pack and a sealed bindings blob per route and one shared placeholder filesystem index, so a configuration that cannot be served fails before any child process exists ([request.md](request.md#admission) owns matching) |
+| 6 | require a cipher the kernel can take over | `server/tls/root.zig:KtlsNegotiationPolicy.fromCapabilities` | it depends on no later step, so a missing `tls` module fails the boot before any child process exists |
+| 7 | create the worker cgroup root | `cgroup_root.zig:WorkerCgroupRoot.init` | a delegated placement moves only the server out of its cgroup, and a child spawned earlier would stay there and keep the controllers off |
+| 8 | spawn the zygote and wait for its ready report | `host_client.zig:spawnZygote` | the supervisor borrows the zygote; the report follows its preparation, so no fork request reaches an unprepared zygote |
+| 9 | start the trace drain | `trace_drain.zig:TraceDrain.init` | the zygote's boot events wait in the pipe until it starts |
+| 10 | take the configured certificate, or generate a self-signed one and write a warning | `server/tls/self_signed.zig:SelfSignedCertificate.generate` | it needs the listen address from step 4 and must exist before step 11 builds the TLS context; a generated key is zeroed when `Server.init` returns, whether or not it succeeded |
+| 11 | build the server: TLS context, lane plan, listeners, gateway manager, analytics sink, supervisor | `server/main.zig:Server.init` | it needs the routes, the zygote, the cgroup root and the certificate; the listeners listen from here, so a connection waits in the backlog until the lanes start |
+| 12 | attach the signal monitor to the server | `signals.zig:Signals.attach` | a stop or a reopen that came during the boot reaches the server now |
+| 13 | run the server until it stops | `server/main.zig:Server.run`, `server/ingress/service.zig:Service.run` | last, once the signal monitor can stop it; the service writes `collo: listening on https://<address>` once every lane accepts |
+
+### Signals
+
+`signals.zig:Signals` reads the three signals from one signalfd on the monitor thread, the first thread after the main one. The first SIGINT or SIGTERM records the stop and calls the attached server's `requestStop`; during the boot nothing is attached yet, so `attach` makes the call, the boot runs to its end and the server stops before it serves. A second one, at any time from step 2 until the monitor joins at the end of the teardown, writes `collo: a second shutdown signal ends the server without draining` and calls `exit_group` with 128 plus the signal number. SIGHUP never counts toward a stop: it asks the analytics sink to reopen its record files at its next flush (`server/analytics/sink.zig:Sink.requestReopen`), and one that arrives while nothing is attached is delivered by `attach`. The zygote and the gateway lead sessions of their own, so a terminal's Ctrl-C or hang-up reaches only the server, which stops them itself. A monitor whose `poll` fails logs at `err` and stops the server, and the boot then exits with status 1, since no signal asked for the stop.
+
+### The worker cgroup root
+
+`cgroup_root.zig:WorkerCgroupRoot.init` takes one of two placements, and the header of `host/cgroup_root.zig` owns the reasoning. With `COLLO_WORKER_CGROUP_ROOT` unset or empty the placement is delegated: the server's own cgroup, read from `/proc/<pid>/cgroup`, must be delegated to it, and the server moves itself, threads included, into `<own>/main`, enables `+memory +cpu +pids` on `<own>`, creates `<own>/workers` and enables them there too (`cgroup_root.zig:prepareDelegatedSubtree`), then kills and removes every `worker-*` leaf a previous run left in `<own>/workers`. With the variable naming a delegated, process-free directory, the server enables the controllers on it and claims `host-<pid>-<start>-<n>` under it, after reclaiming the `host-*` directories of hosts that are provably gone (`cgroup_root.zig:sweepDeadHostDirs`); the server, the zygote and the gateway then stay in the server's own cgroup. A placement that cannot bound worker memory fails the boot with status 1 and a line that says how to provide one.
+
+| Directory | Created | Holds |
+| --- | --- | --- |
+| `<own>/main` | by a delegated boot | the server, and the zygote and the gateway, which inherit its cgroup |
+| `<own>/workers` | by a delegated boot | the worker leaves |
+| `<root>/host-<pid>-<start>-<n>` | by a boot under `COLLO_WORKER_CGROUP_ROOT`; `<start>` is the server's start time in ticks since boot | this server's worker leaves, out of reach of other hosts that share the root |
+| `worker-<fork job id>` | by the launcher before each fork (`cgroup_root.zig:WorkerCgroupRoot.createWorkerDir`) | one worker, under `memory.high` at its definition's memory limit, `memory.max` at 115% of it rounded down to a page, `memory.oom.group` set to 1, `cpu.max` of one core over 100 ms and `pids.max` 128 (`common/cgroup.zig:worker.configureLimitsAt`) |
+
+Fork job ids start at 1 at every boot (`host_client.zig:spawnZygote`), so a leaf a crash left behind would collide with a new id: a delegated boot clears `<own>/workers` for that reason, and `createWorkerDir` removes a leaf that already has its name, once, before it creates it again.
+
+### The zygote's spawn and the trace pipe
+
+`host_client.zig:spawnZygote` creates a SEQPACKET control socket pair and the trace pipe, spawns the server's own binary, found through `/proc/self/exe`, as `collo-zygote` with the child's ends at `fork_loop.zig:inherited_control_fd` and `inherited_trace_fd`, opens its pidfd, writes its OOM score and waits up to `ZYGOTE_READY_TIMEOUT_MS` for `ZygoteReady`. That bound covers the VM's creation, the warmup corpus with its full collection and the helper-thread drain, and exists to catch a wedged zygote; a zygote that exits or stays silent fails the spawn, which kills and reaps it, and the boot exits with status 1. The zygote's environment holds `TZ=UTC`, `LANG=C.UTF-8`, the VM flags and `COLLO_INTERNAL_ZYGOTE_WARMUP_CORPUS=1`, which `collo serve` always sets, and nothing else of the server's. The first two are the values a worker sets after `clearenv`, because the JSC and ICU caches the zygote fills before its first fork must agree with them (`child_boot.zig:worker_environment_canonical_values`). Its standard descriptors are the server's, so its errors and log lines appear on the server's stderr.
+
+The trace pipe (`trace.zig`) is nonblocking at both ends. The server keeps the read end and a write end for the launch's `host.*` events, the zygote writes `zygote.*` events at descriptor 4, and every worker child keeps that descriptor for its life and writes `child.*` events through its boot and `worker.*` and sentinel events after it ([security.md](security.md#open-points) says what that lets a worker do). Each line is formatted within `TRACE_EVENT_BUFFER_BYTES` and written in one `write` below `PIPE_BUF`, so lines from different writers never interleave, and a line that does not fit or finds the pipe full is dropped; tracing never blocks or fails its caller. `trace_drain.zig:TraceDrain` is the pipe's only reader, a thread that keeps it empty and logs each line at info as `boot-trace <line>` in a Debug build or under `COLLO_BOOT_TRACE=1` or `COLLO_DEBUG=1` (`trace_drain.zig:loggingRequested`), and discards it otherwise. A read ends wherever the bytes in the pipe run out, so the drain carries a line two reads split into the next read and logs it whole, and it drops, with one line that says so, a line longer than `TRACE_EVENT_BUFFER_BYTES` with its newline, which no writer emits (`trace_drain.zig:LineAssembler`). It ends when `deinit` wakes it or every writer is gone.
+
+### TLS
+
+The kTLS check (`server/tls/ktls.zig:KernelCapabilities.probe`) installs throwaway keys on a loopback TCP pair for each of five cipher classes. A failure that says nothing about support is tried again, up to `ktls_probe_max_attempts` attempts, and the class then counts as missing, with a warning. `KtlsNegotiationPolicy` keeps the TLS 1.2 AES-GCM suites of the sizes the kernel takes and offers every TLS 1.3 suite when the kernel takes both AES-GCM sizes and ChaCha20, only AES-GCM when it takes both sizes without ChaCha20, and no TLS 1.3 otherwise; with nothing left the boot asks for `modprobe tls` and exits with status 1. `Server.init` probes again and builds the BoringSSL context from that second result (`server/tls/root.zig:BoringSslContext.initForKernelKtls`), so a handshake completes only with a cipher the kernel can take over; the context copies the certificate and key, zeroes its copy of the key and accepts only ALPN `h2`. Without `globalSettings.tls` the boot generates an EC P-256 key and a certificate signed by it (`server/tls/self_signed.zig`), valid for `validity_days` from the start and naming `localhost`, `127.0.0.1`, `::1` and the listen address unless that address is unspecified, `127.0.0.1` or `::1`. Neither touches the disk, and each start presents a new key. A configured certificate or key that BoringSSL refuses exits with status 2.
+
+### Lanes and listeners
+
+`server/net/lane_plan.zig:build` fixes the lane count once, from the listen address. The target is the receive queue count of the interface that holds the address, or the CPUs the process may run on when the address is loopback, unspecified or held by no interface; it is capped by those CPUs and by how many lanes `MemAvailable` divided by `lane_memory_share_divisor` pays for at a lane's worst-case footprint, and each lane takes one of the first allowed CPUs. `server/net/listener.zig:IngressListeners.init` binds one nonblocking listener per lane to the same address, with `SO_REUSEPORT` when there is more than one lane and the lane's CPU as an `SO_INCOMING_CPU` hint, resolves port 0 at the first bind and listens with a backlog of 128. With more than one lane, `server/net/reuseport_bpf.zig:attachCpuSelector` then attaches a reuseport eBPF program that steers each connection to the lane pinned to the CPU that received it; a program the kernel refuses is logged, and the kernel's reuseport hash spreads connections instead. The boot logs the plan at info, and a listen address in use or held by no interface exits with status 1. Each lane thread pins itself to its CPU when it starts, and a pin that fails stops the server (`server/ingress/runner/root.zig:LaneWorker.threadMain`).
+
+### The service and the gateway
+
+`Server.run` builds the ingress service, whose `init` reads the worker boot options from the server's environment once (`server/supervisor/launcher.zig:resolveWorkerRuntimeBootOptions`, `resolveWorkerTmpfsSizeBytes`): a malformed number keeps its default, and options that fail `WorkerRuntimeBootOptions.validate` fail the run with status 1. `Server.run` then routes the gateway manager's loss reports to the service for as long as the service exists (`server/gateway/manager.zig:Manager.setDeps`). `Service.run` sets up the launcher and the reaper, which keep pointers into the service, starts the console thread, the metrics thread, the reaper, the launcher and the lanes in that order, and waits until every lane reports active before it calls `on_serving`, which writes the listening line; a lane that fails to start, or a stop that comes first, skips the line. The service's thread then checks for a stop or a lane error every `metrics_drain_stop_poll_ns`.
+
+`collo serve` does not prewarm the gateway; `Server.prewarmEgressGateway` exists for the sandbox benchmark and the local-e2e harness. The manager spawns nothing at `init`, so the first gateway starts on the launcher thread inside the first launch's session attach, before that launch's fork request (`server/supervisor/launcher.zig:attachForLaunch`, `Manager.attachWorker`). The spawn waits up to `GATEWAY_READY_TIMEOUT_MS` for a gateway that reports ready only once sandboxed ([egress.md](egress.md#the-gateway-process)). A spawn that fails leaves the launch to boot its child detached and starts the launcher's reattach pass ([scheduler.md](scheduler.md#the-launcher)), which spawns again at the first launcher turn with no fork outstanding once `egress_prewarm_interval_ms` has passed since the failed attach, and from then on at most once per interval (`server/supervisor/launcher.zig:restartPass`, `prewarmForPass`).
+
+### What the boot reports
+
+The boot's own status lines go through `report.zig`: prefixed `collo: `, formatted on the stack within `line_bytes_max`, where a longer message is cut and ends in `...`, and written in one `write`, so one never interleaves with another thread's output. The lane plan and every other log line go through `std.log`'s default handler on stderr, the console thread writes the workers' console lines (`server/ingress/service_observability.zig:consoleThreadMain`), and the usage line is written as is. A boot writes the self-signed warning when it generated a certificate and the listening line with the bound port; a failure ends with one line that names its cause, after any line a library such as BoringSSL logs itself.
+
+| Exit status (`server/boot/root.zig:ExitStatus`) | When |
+| --- | --- |
+| 0, `ok` | the server stopped because a signal asked it to |
+| 1, `failure` | anything the other rows do not list, among them no kTLS cipher, no delegated cgroup subtree, a zygote that does not start, a listen address in use or held by no interface, a certificate the boot cannot generate or BoringSSL refuses once generated, boot options in the environment that fail `WorkerRuntimeBootOptions.validate`, a lane fault, the zygote's exit, memory exhausted during the boot, and a stop no signal asked for |
+| 2, `invalid` | a malformed command line, an effective uid of 0, or a configuration that cannot be served: the file, an entry module, a path it names, or a configured certificate or key BoringSSL refuses |
+| 128 plus the signal number | a second SIGINT or SIGTERM during the boot, the drain or the teardown |
+
+## The zygote
+
+### Preparation
+
+`fork_loop.zig:runFromInheritedFds` reads its options from the environment, creates its one VM (`state.zig:Zygote.init`), prepares it once (`fork_loop.zig:prepareZygoteAtBoot`) and only then reports ready:
+
+| Step | What | Why there |
+| --- | --- | --- |
+| 1 | create the VM, which as the process's first fixes the engine's options for the whole process (`bindings/jsc/runtime/vm.cpp:collo_vm_create`) | those options bound the threads the engine can ever ask for, which a worker must start before its filter |
+| 2 | load zlib and the brotli decoder (`egress/core/decompress.zig:load`) | a worker decodes fetch bodies inside a root that holds no library files, so the libraries load before the first fork and every worker inherits them |
+| 3 | set the helper-thread idle timeout to `PREFORK_HELPER_THREAD_IDLE_TIMEOUT_NS` (`bindings/root.zig:setHelperThreadsTimeoutOverrideNs`) | before the corpus, so the helper threads it starts retire within that timeout |
+| 4 | run the warmup corpus (`warmup.zig:runCorpus`), then a full collection and allocator trim (`collo_vm_collect_full_gc_and_trim`) | JSC builds much of its state lazily, so the corpus moves builtin bytecode, structure caches and the RegExp, JSON, URL and Promise machinery into pages every worker shares, and the collection drops the corpus's own garbage |
+| 5 | prepare for the fork (`bindings/jsc/zygote/prepare_for_fork.cpp:collo_vm_prepare_for_fork`): drain the compiler worklists, finalize deferred VM cleanup, release the allocator's free pages and suspend the libpas scavenger until its thread exits | a compiler thread observes its idle timeout only while parked, so a compile still running would hold its thread past the drain; draining is what lets the corpus tier up safely |
+| 6 | sleep one idle timeout, then probe `/proc/self/task` until one thread is left, at most `PREFORK_DRAIN_MAX_CHECKS` times `PREFORK_DRAIN_CHECK_INTERVAL_NS` apart (`common/os.zig:process.waitForSingleThreadedSelf`) | a fork from a multithreaded process can leave a lock held by a thread the child does not have |
+| 7 | undo `MADV_DONTFORK` on every mapping but the kernel's own (`common/os.zig:process.makeAddressSpaceForkInheritable`) | JSC reserves its heaps with `MADV_DONTFORK`, and a child born without them faults on the first cell it touches; this runs after the last reservation |
+| 8 | mark the zygote prepared, once (`state.zig:Zygote.prepared_for_fork`, `prepare_count`) | every fork request checks it |
+| 9 | install `SIGCHLD` with `SA_NOCLDWAIT` (`fork_loop.zig:installWorkerChildAutoReap`) | the kernel reaps every worker, so the zygote never waits for one |
+| 10 | send `ZygoteReady` | the server sends no fork request before it |
+
+The corpus is `warmup.js`, embedded in the binary and free of tenant code: `runCorpus` registers it as a one-module pack under `/__collo/zygote/warmup.js`, evaluates it, calls its default export inside one VM turn so its microtasks drain, requires a nonempty digest and evicts the module. Any failure of these steps, such as an exception in the corpus, a top-level await or a thread left after step 6, ends the zygote before its report; it prints its error on the server's stderr, and the server exits with status 1. The zygote applies no sandbox of its own: it keeps the server's user, namespaces and cgroup, and it holds no tenant data, since a fork request carries only a job id and a leaf and everything a worker is given reaches the child after the fork.
+
+### The fork loop
+
+`fork_loop.zig:serveForkRequests` answers one request at a time on the control socket. A request carries a fork job id and, when its `Flags.cgroup_fd` is set, the worker's cgroup leaf as a descriptor (`common/ipc/zygote_worker.zig:recvForkRequestWithFd`); the server's launcher always sends one, and a request without one clones the child into the zygote's own cgroup. The loop checks that the zygote was prepared exactly once and that the leaf is an empty cgroup2 directory (`zygote/worker_boot/cgroup.zig:validateEmptyWorkerCgroupDirFd`), creates the child's init socket pair, proves the zygote single-threaded again and clones the child into the leaf with a pidfd (`common/os.zig:process.cloneForkWithPidFd`). The child closes the leaf, the control socket and the parent's end of the pair and never returns into the loop. The parent closes the leaf and the child's end, writes the child's OOM score, which the child cannot write itself once its root has no `/proc`, and replies with the child's pid, the parent's end of the init socket and the pidfd (`common/ipc/zygote_worker.zig:sendForkReply`). The pidfd is the server's handle on the child from then on, since the kernel may give the pid to another process once the child exits.
+
+Every request the loop consumes gets exactly one reply, or the zygote ends. A failure that comes from this fork's resources, with the VM untouched, gets a reply with pid 0 and no descriptor (`common/ipc/zygote_worker.zig:sendForkFailed`, `fork_loop.zig:isTransientForkError`) and the loop serves on; anything that makes a reply impossible or a fork unsafe ends the zygote:
+
+| Failure | The zygote |
+| --- | --- |
+| the receive refused for kernel memory (`SystemResources`), with the request still queued | retries every `RECV_PRESSURE_RETRY_INTERVAL_NS`, and ends after `RECV_PRESSURE_MAX_ATTEMPTS` |
+| the server's hang-up, or a packet shorter than a request | returns from the loop and exits with status 0 |
+| a truncated packet or control message, which loses the job id, an unknown kind or flag, a descriptor count the flags do not announce | ends |
+| a zygote not prepared exactly once | ends |
+| a leaf that is not an empty cgroup2 directory, whatever the reason | refuses the fork and serves on |
+| descriptor or memory pressure on the init socket pair, or a `/proc/self/task` it cannot read | refuses the fork and serves on |
+| a second thread | ends |
+| `clone3` failing with `EAGAIN`, `ENOMEM`, `EMFILE`, `ENFILE`, `EACCES`, `EPERM`, `EBUSY`, `ENOSPC`, `EOPNOTSUPP` or `EBADF` (`common/os.zig:process.cloneForkError`) | refuses the fork and serves on; `EMFILE` and `ENFILE` are descriptor pressure on the pidfd, as on the init socket pair; `EBUSY`, `ENOSPC`, `EOPNOTSUPP` and `EBADF` concern the leaf, `EACCES` and `EPERM` usually do, and when those two concern the zygote instead, refusing every fork still leaves the running workers serving |
+| any other error, or a reply it cannot send | ends |
+
+A zygote that ends prints its error on the server's stderr and exits with status 1; the launcher sees the exit on the zygote's pidfd, and the server stops with `ZygoteDied`, since nothing restarts the zygote ([scheduler.md](scheduler.md#the-launcher)). On the server's side (`host_client.zig`) one request is in flight at a time, a reply still missing after `fork_reply_timeout_ms` kills the zygote, because a late reply would read as the answer to the next request, and a pid-0 reply fails that launch alone as `fork_refused`.
+
+### Why the loop allocates nothing and leaves the VM alone
+
+After its preparation the loop allocates nothing and touches no VM state: its buffers are on the stack, and the receive and the replies allocate nothing (`common/ipc/zygote_worker.zig`). The conventions gate `zygote fork loop stays VM-free and allocation-free after prepare` reads the body of `serveForkRequests` for VM and allocator calls and requires the baseline and single-thread checks in it; its callees keep the rule without a gate. Every worker therefore inherits the pages the preparation left, whenever it is forked: a page the zygote wrote between two forks would be copied, and the workers born before the write and those born after it would no longer share it. `clone3` also runs no `pthread_atfork` handler, which is safe only because the loop checks that the zygote is single-threaded and leaves the allocator and the VM untouched before it forks (`common/os.zig:process.cloneForkWithPidFd`).
+
+## A worker's birth
+
+### The server's side
+
+The launcher thread drives every launch, and [scheduler.md](scheduler.md#the-launcher) owns its states, bounds and failures. It creates the leaf with the definition's memory limit and one core (`server/supervisor/launcher.zig:launch_cpu_max_cores`) before the fork request, so the child is born under its limits, and attaches the egress session before the fork too, never while a fork request is outstanding (`server/supervisor/launcher.zig:startFork`). After the reply, `launch.zig:Machine.start` runs the local steps and sends `WorkerInit`:
+
+| Step | Where | Why |
+| --- | --- | --- |
+| duplicate the route's sealed bindings blob | `launch.zig:Machine.prepare` | the launch owns its copy and closes it once `WorkerInit` went out |
+| create `/tmp/collo-<pid>-<random hex>` with mode 0700, exclusively, then check its mode and owner | `launch.zig:createTmpRoot`, `openValidatedTmpRoot` | a planted path or symlink never becomes a tmp root; the child mounts its tmpfs over it in its own mount namespace |
+| adopt the leaf: read `memory.high` and `cpu.max`, and rewrite the limits only when they differ | `host/cgroup.zig:adoptPreparedWorkerDir` | the child checks the same files against `WorkerInit` and refuses a mismatch |
+| create the shared page, written with state `forked` and reason `crash`, the completion eventfd, the payload ring memfd and its credit eventfd, and the fault socket pair | `launch.zig:Machine.prepare`, `common/worker_state/page/mapping.zig:WorkerWriterView.initializeCrashDefault` | a child that dies before it stores a state of its own reads as crashed |
+| fix the child window, mint the boot token, send `WorkerInit` with its descriptor table | `launch.zig:Machine.sendWorkerInit` | the steps before the send spend the launcher's time, never the child's |
+
+`WorkerInit` carries the memory and CPU limits the child checks, the tmpfs size (256 MiB or the memory limit, whichever is smaller, or `COLLO_WORKER_FS_TMPFS_MIB` clamped to the limit), the boot options, the isolated-network and no-direct-egress flags, the route's entry specifier with `flag_serves_routes`, the init deadline and the boot token. Its descriptors are the page, the eventfds and the payload memfd, the tmp root, the leaf, the bindings blob, the session's regions when there is a session, the worker's egress wake descriptors always, the fs index, the fault socket and the route's module pack; `common/ipc/zygote_worker.zig` owns the table.
+
+### The child
+
+The child runs on the one thread `clone3` gives it, which becomes the worker's VM thread, and ends in `_exit` on every path (`child_boot.zig:workerChildMain`). [security.md](security.md#birth-and-confinement) lists its sandbox steps in order with why each sits where it does. The child waits for `WorkerInit` up to `WORKER_INIT_TIMEOUT_MS` once it has entered its namespaces (`child_boot.zig:recvWorkerInitBeforeTimeout`), a bound beside the launcher's window, and exits with status 1 and no message when it passes. When it closes every descriptor it was not given, it also points its standard input, output and error at `/dev/null` (`common/os.zig:fd.redirectUnallowedStandardFdsToDevNull`). It stamps each phase of its boot on `CLOCK_MONOTONIC` (`common/worker_state/page/boot_stamps.zig:BootPhase`), into a local buffer until the page is mapped and into the page from then on, so a child stuck mid-boot leaves its progress readable; the launcher copies the stamps into the launch's trace at `WorkerReady` (`server/supervisor/launcher.zig:onReady`).
+
+Once `applyPreThread` has dropped every capability, threads may exist, and the child finishes the engine's side of the fork:
+
+| Step | Where | What and why |
+| --- | --- | --- |
+| resume the VM | `bindings/jsc/zygote/prepare_for_fork.cpp:collo_vm_post_fork_child` | resets the registry of WTF automatic threads, whose entries the child inherited without their threads; restarts the libpas scavenger with no thread suspender, since suspending a thread takes signals the filter denies, with a ten-year deep-sleep timeout so its thread never retires, and with that thread created now; clears the zygote's helper-thread timeout and the turn state and refreshes `navigator` |
+| reseed | `child_boot.zig`, `collo_vm_reseed_after_fork` | three seeds from `getrandom` replace the global object's, the VM's and the heap's random states, which the child inherited from the zygote like every other worker |
+| install `process` | `collo_vm_install_process` | `process` with `platform`, `version`, the worker's `pid` and an empty `env`; the route's bindings reach only the handler's `env` |
+| set the engine's collection trigger | `bindings/root.zig:setGcMaxHeapSizeOverrideBytes` | 90% of the memory limit (`common/cgroup.zig:memory.gcHeapLimitBytes`): the engine requests a collection once the bytes allocated since the last one exceed it, and no allocation fails ([memory-pressure.md](memory-pressure.md#the-engines-collection-trigger)) |
+| map the fs index | `worker/fs/index.zig:initWorker` | after the chroot, so its paths are the sandbox's, and before the filter, which forbids the calls it needs |
+| build the runtime | `worker/api.zig:initRuntime` | starts the crypto pool's threads (`worker/runtime/root.zig`) |
+| build the ring, attach the host runtime, start the sentinel | `worker/scheduler/resources.zig:initRestrictedWorkerRing`, `worker/runtime/vm_hooks.zig:attachHostRuntime`, `worker/runtime/root.zig:Runtime.startSentinel` | [security.md](security.md#the-workers-ring) owns the ring |
+| pin the helper threads | `bindings/root.zig:setHelperThreadsTimeoutOverrideNs` with `child_boot.zig:WORKER_HELPER_THREAD_PIN_TIMEOUT_NS` | no automatic thread retires, since one that retired after the filter could never be created again and the next compile would abort the worker |
+| prespawn the engine's threads | `collo_vm_prespawn_compiler_threads` | starts the JS worklist's threads and the wasm worklist's thread with empty queues, and the GC collector thread through an eden collection it waits for, so every one is parked before the filter freezes the set |
+| make the control socket nonblocking, install the filter | `child_boot.zig`, `zygote/worker_boot/sandbox.zig:applySeccomp` | [security.md](security.md#birth-and-confinement) |
+| expose `node:fs` | `collo_vm_enable_node_fs_for_worker` | installed only once the worker is inside its root and its filter |
+
+The set the prespawn starts is complete because the zygote's VM creation fixed the engine's options for the process: one wasm compiler thread, a JIT worklist of exactly two threads, one GC marker and so no marking helpers, no marked-block warm-up thread, and polling traps, since signal-based traps start a work-queue thread on their first use (`bindings/jsc/runtime/vm.cpp:collo_vm_create`).
+
+### The boot token, the route's entry and WorkerReady
+
+A child that serves routes installs its boot context after the filter (`worker/runtime/boot_context.zig:installBootContext`): the identity under which module top-level code sets timers and fetches with the boot token, which is `egress_token.none` for a detached launch ([egress.md](egress.md#the-token)). A failed install leaves top-level timers and fetches denied and does not fail the boot. The child then registers the route's pack and evaluates its entry (`worker/runtime/boot_context.zig:evaluateBootRouteEntry`), so a ready worker's first request needs no module work. The evaluation's deadline is the init deadline less `WORKER_INIT_CLEANUP_RESERVE_NS`, armed on the boot context so the sentinel can stop the VM in time for the child to report `init_deadline_exceeded` and exit on its own before the launcher's window ends; only JavaScript can be interrupted, so the native steps before it are bounded by the window alone. The boot fails when the pack does not map, parse, pass its checks or register, when the deadline stops the evaluation, and when memory runs out. A synchronous throw pins the route failed, and the worker still reports ready but never runs that route's handler (`worker/modules/routes.zig:BootEvaluateOutcome`). A top-level await still pending gets `module_eval_budget_ns` on the boot context and settles after `WorkerReady`. Its timers still run, but its fetches fail once the gateway has the token's end, which the launcher sends at `WorkerReady`. A failed install also leaves the evaluation without that deadline and a pending await without that budget, so only the launcher's window bounds a hung entry. The boot context closes when the evaluation settles, clearing the token first, and stays closed for the worker's life.
+
+The child then marks its page ready, sends `WorkerReady` on the init socket, which becomes its control socket, and enters its event loop. The child window runs from the `WorkerInit` send to an end `launch.zig:Machine.sendWorkerInit` fixes once, `WORKER_INIT_TIMEOUT_MS` after the send; an owner deadline could bring it earlier, but the server's launches set none. That end travels as the init deadline and as the boot token's deadline. At `WorkerReady` the launcher makes its end of the control socket nonblocking, sends the gateway the end of the boot token when the session's gateway is still current, without waiting for it, and publishes the worker; a launch whose session was lost first attaches to the current gateway ([scheduler.md](scheduler.md#the-launcher)).
+
+### A failed boot
+
+| `common/ipc/messages.zig:WorkerInitFailedReason` | The child sends it for |
+| --- | --- |
+| `missing_metrics_fd`, `missing_ingress_payload_fd`, `missing_ingress_payload_credit_fd`, `missing_egress_shared_fd` | a `WorkerInit` table short of that descriptor |
+| `invalid_worker_init` | another missing descriptor or a table of the wrong size, a message or a descriptor that fails its checks, a bindings blob that does not map, a cgroup leaf that fails its checks, a tmp root of the wrong mode or owner |
+| `invalid_fs_index` | an fs index that does not map or parse |
+| `init_deadline_exceeded` | the evaluation's deadline stopped the VM |
+| `internal_error` | a packet that does not decode, any other step that fails, and any error the boot did not classify |
+
+The child marks its page `dead` with reason `init_failed` when it can map the page, sends its reason and exits with status 1. It sends one outcome at most, and none after a send that failed or after `WorkerReady`, when the init socket becomes its control channel (`child_boot.zig:InitReport`). A child whose wait for `WorkerInit` timed out, or one that dies outright, sends nothing. A few failures also write a trace event (`child.worker_init.recv_failed=`, `child.worker_init.invalid`, `child.worker_init.invalid_fds`, `child.fs_index.invalid`); the others show in the trace only as the last step that succeeded. The launcher ends the launch on whichever it sees first, reading a queued outcome before the child's exit (`server/supervisor/launcher.zig:readyEvent`): a `WorkerInitFailed` as `worker_init_failed`; a child that dies without sending a reason as `worker_init_failed` too, since its exit hangs up the init socket no later than its pidfd turns readable, and a socket that ends without an outcome reads as the child's exit (`launch.zig:Machine.finishInitOutcome`); the end of the window as `child_window_expired`; and an outcome that does not decode, or any other failed read, as `zygote_protocol`. For `worker_init_failed` the launcher's warning names the child's reason or, for a child that sent none, whether its page or its leaf's `memory.events.local` shows that it ended for memory, by the rule the server applies to a live worker's death ([memory-pressure.md](memory-pressure.md#a-memory-death), `launch.zig:InitFailure`, `Machine.endedCause`); the trace says the same in `host.worker_init.failed=<reason>` or `host.worker_init.worker_exited=<memory|crash>`. The launcher then answers 503 to the waiters nothing else can serve and hands the child's pidfd and leaf to the reaper, which kills the child, waits for its exit and removes the leaf; `launch.zig:Machine.abandon` has already deleted the tmp root.
+
+## Shutdown
+
+### The drain
+
+The first SIGINT or SIGTERM calls `server/main.zig:Server.requestStop`, which raises the stop flag and wakes every lane with a `shutdown` command. The service's thread sees the flag within `metrics_drain_stop_poll_ns` and stops what it started, in the order of `server/ingress/service.zig:Service.stopAndDrainForExit`:
+
+| Step | What | Why in this order |
+| --- | --- | --- |
+| 1 | the lanes stop taking work, finish what they hold and join ([request.md](request.md#the-lane-thread)) | the launcher still runs, so a request waiting for a worker can still get one, or 503 at its deadline |
+| 2 | the metrics and console threads join | their loops ended at the stop flag, and no console drain queues a retirement after the reaper's last drain |
+| 3 | the launcher stops, ends its launches in flight as `stopping` and joins | their children and leaves go to the reaper's queue |
+| 4 | the reaper stops and joins, and the exiting thread carries out its queue (`server/supervisor/reaper/root.zig:Reaper.drainRetirements`) | every producer of retirements has joined; shutdown owns the latency |
+| 5 | the final fold drains every worker's usage ring and the analytics streams (`server/ingress/service_observability.zig:finalObservabilityFold`) | every producer has joined, so the rings are complete |
+
+The drain lasts as long as the longest admitted request, which its deadline and the grace backstop bound ([request.md](request.md#deadlines)); a second signal ends it at once.
+
+### The teardown
+
+`Server.run` takes the gateway manager's loss reports off the service before the service goes, and `serve`'s deferred steps then undo the boot in reverse:
+
+| Step | What |
+| --- | --- |
+| 1 | the signal monitor detaches from the server (`signals.zig:Signals.detach`) |
+| 2 | `server/main.zig:Server.deinit` drains every worker's usage once more, closes the listeners, tears down every worker a record still holds (`server/supervisor/supervisor.zig:Supervisor.deinit`), closes the analytics sink, which writes and syncs the tail, stops the gateway, frees the TLS context and frees the routes last, once nothing reads them |
+| 3 | the trace drain stops (`trace_drain.zig:TraceDrain.deinit`) |
+| 4 | the zygote stops (`host_client.zig:SpawnedZygote.deinit`): the server closes its control socket and its trace write end, the zygote's loop returns on the hang-up, and the zygote destroys its VM and exits with status 0; the server waits up to `PROCESS_EXIT_WAIT_MS`, sends SIGKILL and waits as long again if it must, and reaps it |
+| 5 | the worker cgroup root goes (`cgroup_root.zig:WorkerCgroupRoot.deinit`) |
+| 6 | the monitor joins and the main thread's signal mask is restored (`signals.zig:Signals.deinit`) |
+
+A live worker gets no handshake. The lanes ended every admitted request before they joined, so the workers left are idle, and `Supervisor.deinit` tears them down on the exiting thread one after another with the reaper's teardown (`server/supervisor/worker_registry.zig:teardown`, [scheduler.md](scheduler.md#the-reaper)). Each exit hangs up the liveness pipe of the worker's egress session, and the gateway drops the session on its own. The gateway stops after the workers (`server/gateway/manager.zig:Manager.deinit`): a retired gateway is killed and reaped within `REAP_NO_WAIT_MS`, and the current one has its control reader joined, gets the `shutdown` message and the close of its control socket, has up to `PROCESS_EXIT_WAIT_MS` to exit, then SIGKILL and as long again, and is reaped (`server/gateway/process.zig:GatewayProcess.deinit`).
+
+### A second signal
+
+A second SIGINT or SIGTERM skips whatever is left. The process ends with 128 plus the signal number, and the kernel closes its descriptors: the zygote's loop returns on its control socket's hang-up and the zygote exits, the gateway ends its loop on its own control socket's hang-up ([egress.md](egress.md#the-control-wire)), and each worker's event loop returns once its control socket hangs up (`worker/scheduler/loop.zig:run`), after which the child exits with status 0. Nothing removes their cgroup leaves or tmp roots then.
+
+### What stays on disk
+
+| Left behind | After a stop | After a crash or a second signal | At the next boot |
+| --- | --- | --- | --- |
+| `<own>/main` and `<own>/workers` | stay; `deinit` only closes the descriptor | stay | reused: the new server moves into `<own>/main` |
+| a leaf under `<own>/workers` | removed by each worker's teardown, except one still busy after `rmdir_max_attempts` tries, which is logged | stays | killed through `cgroup.kill` and removed before the zygote starts (`cgroup_root.zig:removeWorkerDirsUnder`) |
+| `host-<pid>-<start>-<n>` and its leaves | removed by `deinit` | stay | removed by the next host under that root that proves the owner gone, because no process has the pid or the pid's start time differs; a `worker-*` directly under the root has no owner and stays |
+| `/tmp/collo-<pid>-<hex>` | deleted by each worker's teardown | stays | nothing removes it |
+| the analytics files | written and synced at close | what the last flush wrote | appended to, never truncated |
+
+## Named bounds
+
+| Bound | Value | Bounds |
+| --- | --- | --- |
+| `host_client.zig:ZYGOTE_READY_TIMEOUT_MS` | 5 s | the zygote's boot, from the spawn to `ZygoteReady` |
+| `fork_loop.zig:PREFORK_HELPER_THREAD_IDLE_TIMEOUT_NS`, `PREFORK_DRAIN_CHECK_INTERVAL_NS`, `PREFORK_DRAIN_MAX_CHECKS` | 1 ms, 1 ms, 50 | the helper threads' idle timeout before the first fork, and the probes for a single thread, about 50 ms |
+| `fork_loop.zig:RECV_PRESSURE_RETRY_INTERVAL_NS`, `RECV_PRESSURE_MAX_ATTEMPTS` | 10 ms, 100 | retries of a fork request's receive under kernel memory pressure, about 1 s |
+| `common/limits/process.zig:WORKER_INIT_TIMEOUT_MS` | 3 s | a child's wait for `WorkerInit`, from the end of its namespace step; the launcher's window is the same constant (`server/supervisor/launcher.zig:child_window_ms`) |
+| `common/limits/process.zig:WORKER_INIT_CLEANUP_RESERVE_NS` | 100 ms | the time before the init deadline a child keeps to stop the VM, report and exit |
+| `worker/modules/routes.zig:module_eval_budget_ns` | 10 s | a top-level await still pending at `WorkerReady` |
+| `child_boot.zig:WORKER_HELPER_THREAD_PIN_TIMEOUT_NS` | the largest u64, in nanoseconds | a worker's helper-thread idle timeout, so none retires |
+| `common/limits/process.zig:TRACE_EVENT_BUFFER_BYTES`, `trace_drain.zig:read_chunk_bytes` | 192 B, 4 KiB | one trace line with its newline, the longest the drain logs; one read of the drain |
+| `server/boot/root.zig:route_descriptors_max` | 2 × `routes_max` + 1, 513 | descriptors the routes keep open |
+| `report.zig:line_bytes_max` | 2 KiB | one operator line |
+| `common/limits/process.zig:PROCESS_EXIT_WAIT_MS` | 1 s | each wait at shutdown for the zygote's or the gateway's exit, before SIGKILL and again after it, and for a worker's exit after its SIGKILL |
+| `host_client.zig:PROCESS_REAP_CHECK_INTERVAL_NS`, `PROCESS_REAP_MAX_CHECKS` | 10 ms, 100 | the reap of the zygote once it exited |
+| `cgroup_root.zig:rmdir_max_attempts`, `rmdir_retry_interval_ns`, `host_dir_claim_max_attempts` | 50, 10 ms, 4096 | the removal of a busy cgroup directory, and the host directories one process may claim under one root |
+| `server/tls/ktls.zig:ktls_probe_max_attempts`, `server/tls/self_signed.zig:validity_days` | 3, 30 | probes of one cipher class, a generated certificate's days of validity |
+| `server/net/lane_plan.zig:lane_memory_share_divisor`, `server/main.zig:Options.listen_backlog` | 50, 128 | the share of available memory the lanes may claim, each listener's backlog |
+| `common/limits/process.zig:OOM_SCORE_ADJ_WORKER`, `OOM_SCORE_ADJ_ZYGOTE`, `OOM_SCORE_ADJ_EGRESS_GATEWAY` | 500, 200, -500 | the kernel's OOM order |
+| `server/ingress/service_observability.zig:metrics_drain_stop_poll_ns` | 5 ms | how long the service's thread goes without checking for a stop |
+
+## Invariants
+
+| Invariant | Kept by |
+| --- | --- |
+| no process of the node runs with an effective uid of 0 outside a user namespace of its own | `server/boot/root.zig:rootRefusal`, the boot's first step, which checks the effective uid alone |
+| no server thread can take the default action of SIGHUP, SIGINT or SIGTERM, and every spawned child starts with an empty mask in a session of its own | `signals.zig:Signals.start` before any other thread; `common/os.zig:process.spawnInternal` |
+| no child process exists before the worker cgroup root | the boot order in `server/boot/root.zig:serve` |
+| no fork request reaches an unprepared zygote | `host_client.zig:spawnZygote` returns only after `ZygoteReady`, which follows `fork_loop.zig:prepareZygoteAtBoot`; `fork_loop.zig:assertPreparedForkBaseline` on every request |
+| the zygote is single-threaded at every fork, and its fork loop neither allocates nor touches the VM | `common/os.zig:process.assertSingleThreadedSelf` before each clone, which ends the zygote on a second thread; the conventions gate on `fork_loop.zig:serveForkRequests` |
+| every request the zygote consumes gets one reply, or the zygote ends | `fork_loop.zig:serveForkRequests`; on the server, `host_client.zig:killUnresponsiveZygote` after a missed reply |
+| a worker is born only into an empty cgroup leaf the server configured for it | `server/supervisor/launcher.zig:startFork`, which sends every fork request with a leaf it created and configured; `zygote/worker_boot/cgroup.zig:validateEmptyWorkerCgroupDirFd` before the clone; after the birth, `launch.zig:Machine.prepare` refuses a child that came without a leaf, and the child refuses a leaf it is not the only member of or whose limits differ from `WorkerInit` ([security.md](security.md#birth-and-confinement)) |
+| the zygote holds no tenant data | its environment has fixed names and values (`host_client.zig:OwnedZygoteEnv`), a fork request carries a job id and a leaf, and `WorkerInit` goes to the child after the fork |
+| every thread a worker will have exists before its seccomp filter | the engine options `collo_vm_create` fixes, then `collo_vm_post_fork_child`, `initRuntime`, `startSentinel`, the helper-thread pin and `collo_vm_prespawn_compiler_threads`, all before `applySeccomp` in `child_boot.zig:workerChildMainImpl` |
+| the child window is fixed once, at the `WorkerInit` send, and is the boot token's deadline | `launch.zig:Machine.sendWorkerInit`, `Machine.mintBootToken` |
+| a boot token stops admitting fetches when the gateway reads its end, which the launcher sends at `WorkerReady`, or at its deadline, whichever comes first | `server/supervisor/launcher.zig:onReady` sends the end before the publish, best effort (`server/gateway/manager.zig:Manager.requestEnded`): the gateway may read it after the worker's first request, and an end the full socket refuses leaves the token live until its deadline, the end of the child window; a token of a lost gateway fails as forged at its successor ([egress.md](egress.md#the-token)) |
+| a second stop signal ends the process at any point after the boot's second step | the monitor starts before anything that needs cleanup and joins last |
+
+## Open points
+
+A failed worker boot is hard to diagnose from the server. The child's own log lines go nowhere once it closes its descriptors: it points its standard descriptors at `/dev/null` (`child_boot.zig:closeUnexpectedWorkerFds`), and the binary has no log handler but stderr, so every `std.log` line a worker writes after that step, `worker sandbox setup failed` among them, is lost; only a failure before it, such as `worker namespace setup failed`, reaches the server's stderr. Past that step the launcher's warning names only the reason the child sent, and `internal_error` stands for most steps, so only the boot trace, when the server logs it, says which step failed.
+
+The zygote loads zlib and the brotli decoder from the machine with `dlopen` at boot (`egress/core/decompress.zig:load`, called from `fork_loop.zig:prepareZygoteAtBoot`), and every worker inherits them, while main.md's invariant says Collo loads no native code at run time and runs only what is linked into its binary. The decoder a worker runs is whatever version the machine has. The gateway does the same before its sandbox (`egress/gateway/runtime/root.zig:run`).
+
+During the drain nothing reads the lanes' access rings, and only the reaper's teardown of a worker it retires reads that worker's console ring: the metrics and console threads leave their loops when the stop flag rises (`server/ingress/service_observability.zig:metricsThreadMain`, `consoleThreadMain`), and the final fold runs only after the lanes joined. A lane that finishes more requests during the drain than its access ring holds (`server/analytics/access.zig:AccessRing.capacity`, 2048 records, while `server/ingress/lane.zig:Config.max_requests` lets a lane hold 4096 requests) drops the records past it, and a live worker that writes more than its console ring holds (`common/worker_state/page/console_ring.zig:LOG_RING_BYTES`) in that time loses the newest lines; both losses are counted.
+
+Nothing removes the tmp roots of the workers alive when the server crashed or ended on a second signal (`/tmp/collo-<pid>-<hex>`, `launch.zig:makeTmpRoot`). The cgroup leaves have a sweep at the next boot; the tmp roots have none.
+
+A worker's libpas scavenger never reaches its deep sleep while a thread parks without allocating, so it keeps polling every period in an idle worker (a FIXME in `bindings/jsc/zygote/prepare_for_fork.cpp:resumeFastMallocScavengerForSandbox`).
+
+Without a prewarm, the first cold start of a node pays the gateway's spawn, up to `GATEWAY_READY_TIMEOUT_MS`, and a gateway that can never start never fails the boot: workers boot detached and every fetch is refused, while the launcher retries the spawn every `egress_prewarm_interval_ms` from the failed attach, warning at the failed attach and at the first failed retry (`server/supervisor/launcher.zig:attachForLaunch`, `prewarmForPass`).

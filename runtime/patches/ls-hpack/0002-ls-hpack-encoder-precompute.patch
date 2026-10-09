@@ -1,0 +1,410 @@
+diff --git a/lshpack.c b/lshpack.c
+--- a/lshpack.c
++++ b/lshpack.c
+@@ -494,6 +494,19 @@
+     input->flags |= (LSXPACK_NAME_HASH | LSXPACK_NAMEVAL_HASH);
+ }
+ 
++static void
++update_name_hash (struct lsxpack_header *input)
++{
++    if (!(input->flags & LSXPACK_NAME_HASH))
++        input->name_hash = XXH32(lsxpack_header_get_name(input),
++                                 input->name_len, LSHPACK_XXH_SEED);
++    else
++        assert(input->name_hash == XXH32(lsxpack_header_get_name(input),
++                                         input->name_len, LSHPACK_XXH_SEED));
++
++    input->flags |= LSXPACK_NAME_HASH;
++}
++
+ 
+ unsigned
+ lshpack_enc_get_stx_tab_id (struct lsxpack_header *input)
+@@ -533,6 +546,83 @@
+ }
+ 
+ 
++unsigned
++lshpack_enc_precompute_static (struct lsxpack_header *input, unsigned flags)
++{
++    const char *value;
++    unsigned candidate, id;
++
++    if (input->hpack_index > HPACK_STATIC_TABLE_SIZE)
++    {
++        input->hpack_index = LSHPACK_HDR_UNKNOWN;
++        input->flags &= ~LSXPACK_HPACK_VAL_MATCHED;
++    }
++
++    if (flags & LSHPACK_ENC_PRECOMPUTE_NAME_ONLY)
++    {
++        input->flags &= ~(LSXPACK_HPACK_VAL_MATCHED | LSXPACK_NAMEVAL_HASH);
++        if (input->hpack_index && input->name_len == 0)
++        {
++            id = input->hpack_index - 1;
++            input->name_hash = static_table_name_hash[id];
++            input->flags |= LSXPACK_NAME_HASH;
++            return input->hpack_index;
++        }
++        if (input->name_len == 0)
++            return LSHPACK_HDR_UNKNOWN;
++        update_name_hash(input);
++        input->hpack_index = lshpack_enc_get_static_name(input);
++        return input->hpack_index;
++    }
++
++    if (input->hpack_index && input->name_len == 0)
++    {
++        id = input->hpack_index - 1;
++        value = lsxpack_header_get_value(input);
++        input->name_hash = static_table_name_hash[id];
++        input->flags |= LSXPACK_NAME_HASH;
++        input->nameval_hash = XXH32(value, input->val_len, input->name_hash);
++        input->flags |= LSXPACK_NAMEVAL_HASH;
++        input->flags &= ~LSXPACK_HPACK_VAL_MATCHED;
++        candidate = (input->nameval_hash >> XXH_NAMEVAL_SHIFT)
++                  & ((1 << XXH_NAMEVAL_WIDTH) - 1);
++        if (nameval2id[candidate])
++        {
++            candidate = nameval2id[candidate] - 1;
++            if (static_table[candidate].name_len == static_table[id].name_len
++                && static_table[candidate].val_len == input->val_len
++                && 0 == memcmp(static_table[candidate].name,
++                               static_table[id].name,
++                               static_table[id].name_len)
++                && 0 == memcmp(value, static_table[candidate].val,
++                               input->val_len))
++            {
++                input->hpack_index = candidate + 1;
++                input->flags |= LSXPACK_HPACK_VAL_MATCHED;
++            }
++        }
++        return input->hpack_index;
++    }
++
++    if (input->name_len == 0)
++    {
++        input->flags &= ~(LSXPACK_HPACK_VAL_MATCHED | LSXPACK_NAMEVAL_HASH);
++        return LSHPACK_HDR_UNKNOWN;
++    }
++    update_hash(input);
++    input->hpack_index = lshpack_enc_get_static_nameval(input);
++    if (input->hpack_index != LSHPACK_HDR_UNKNOWN)
++    {
++        input->flags |= LSXPACK_HPACK_VAL_MATCHED;
++        return input->hpack_index;
++    }
++
++    input->flags &= ~LSXPACK_HPACK_VAL_MATCHED;
++    input->hpack_index = lshpack_enc_get_static_name(input);
++    return input->hpack_index;
++}
++
++
+ /* Given a dynamic entry, return its table ID */
+ static unsigned
+ henc_calc_table_id (const struct lshpack_enc *enc,
+@@ -557,6 +647,16 @@
+     name_len = input->name_len;
+     name = lsxpack_header_get_name(input);
+ 
++    if (input->hpack_index > HPACK_STATIC_TABLE_SIZE)
++    {
++        input->hpack_index = LSHPACK_HDR_UNKNOWN;
++        if (name_len == 0)
++        {
++            *val_matched = 0;
++            return 0;
++        }
++    }
++
+     /* First, look for a match in the static table: */
+     if (input->hpack_index)
+     {
+@@ -646,6 +746,69 @@
+     return 0;
+ }
+ 
++static unsigned
++henc_find_name_id_only (struct lshpack_enc *enc, lsxpack_header_t *input)
++{
++    struct lshpack_enc_table_entry *entry;
++    const char *name;
++    unsigned buckno, id;
++    unsigned int name_len;
++
++    input->flags &= ~LSXPACK_HPACK_VAL_MATCHED;
++    name_len = input->name_len;
++    name = lsxpack_header_get_name(input);
++
++    if (input->hpack_index)
++    {
++        if (input->hpack_index > HPACK_STATIC_TABLE_SIZE)
++        {
++            input->hpack_index = LSHPACK_HDR_UNKNOWN;
++            if (name_len == 0)
++                return 0;
++        }
++        else
++        {
++            id = input->hpack_index - 1;
++#ifndef NDEBUG
++            if (name_len)
++            {
++                assert(static_table[id].name_len == name_len);
++                assert(memcmp(name, static_table[id].name, name_len) == 0);
++            }
++#endif
++            if (!name_len)
++            {
++                name = static_table[id].name;
++                name_len = static_table[id].name_len;
++            }
++            if (!(input->flags & LSXPACK_NAME_HASH))
++                input->name_hash = static_table_name_hash[id];
++            else
++                assert(input->name_hash == static_table_name_hash[id]);
++            input->flags |= LSXPACK_NAME_HASH;
++            return input->hpack_index;
++        }
++    }
++
++    if (name_len == 0)
++        return 0;
++    update_name_hash(input);
++    input->hpack_index = lshpack_enc_get_static_name(input);
++    if (input->hpack_index != LSHPACK_HDR_UNKNOWN)
++        return input->hpack_index;
++
++    buckno = BUCKNO(enc->hpe_nbits, input->name_hash);
++    STAILQ_FOREACH(entry, &enc->hpe_buckets[buckno].by_name, ete_next_name)
++        if (input->name_hash == entry->ete_name_hash &&
++            input->name_len == entry->ete_name_len &&
++            0 == memcmp(name, ETE_NAME(entry), name_len))
++        {
++            return henc_calc_table_id(enc, entry);
++        }
++
++    return 0;
++}
++
+ 
+ #if !LS_HPACK_EMIT_TEST_CODE
+ static
+@@ -1116,8 +1279,16 @@
+     if (dst_end <= dst)
+         return dst_org;
+ 
+-    if (input->flags & LSXPACK_HPACK_VAL_MATCHED)
++    if (input->flags & LSXPACK_NEVER_INDEX)
++    {
++        input->indexed_type = 2;
++        table_id = henc_find_name_id_only(enc, input);
++    }
++    else if (input->flags & LSXPACK_HPACK_VAL_MATCHED)
+     {
++        if (input->hpack_index == 0
++            || input->hpack_index > HPACK_STATIC_TABLE_SIZE)
++            return dst_org;
+         assert(input->hpack_index != LSHPACK_HDR_UNKNOWN);
+         assert(input->val_len == static_table[input->hpack_index - 1].val_len);
+         assert(memcmp(lsxpack_header_get_value(input),
+@@ -1128,8 +1299,6 @@
+     }
+     else
+     {
+-        if (input->flags & LSXPACK_NEVER_INDEX)
+-            input->indexed_type = 2;
+         table_id = henc_find_table_id(enc, input, &val_matched);
+         if (enc->hpe_hist_buf)
+         {
+@@ -1139,6 +1308,9 @@
+         }
+     }
+ 
++    if (table_id == 0 && input->name_len == 0)
++        return dst_org;
++
+     if (table_id > 0)
+     {
+         if (val_matched)
+diff --git a/lshpack.h b/lshpack.h
+--- a/lshpack.h
++++ b/lshpack.h
+@@ -154,6 +154,22 @@
+ lshpack_enc_encode (struct lshpack_enc *henc, unsigned char *dst,
+         unsigned char *dst_end, struct lsxpack_header *input);
+ 
++#define LSHPACK_ENC_PRECOMPUTE_FULL       0x0
++#define LSHPACK_ENC_PRECOMPUTE_NAME_ONLY  0x1
++
++/**
++ * Precompute reusable HPACK encoder metadata on a header.
++ *
++ * FULL computes name and name/value hashes, finds static table matches, and
++ * marks exact static name/value matches with LSXPACK_HPACK_VAL_MATCHED.
++ * NAME_ONLY computes only name metadata and clears value-match metadata; use it
++ * with LSXPACK_NEVER_INDEX to avoid hashing large or sensitive values.
++ *
++ * Returns the matching HPACK static table index, or LSHPACK_HDR_UNKNOWN.
++ */
++unsigned
++lshpack_enc_precompute_static (struct lsxpack_header *, unsigned flags);
++
+ void
+ lshpack_enc_set_max_capacity (struct lshpack_enc *, unsigned);
+ 
+diff --git a/test/test_hpack.c b/test/test_hpack.c
+--- a/test/test_hpack.c
++++ b/test/test_hpack.c
+@@ -1138,6 +1138,137 @@
+ }
+ 
+ 
++static void
++test_henc_never_index_ignores_value_match (void)
++{
++    struct lshpack_enc henc;
++    struct lsxpack_header xhdr;
++    unsigned char out[0x100], *end;
++
++    lshpack_enc_init(&henc);
++    lsxpack_header_set_idx(&xhdr, LSHPACK_HDR_STATUS_200,
++                           STR_AND_LEN("200"));
++    xhdr.flags |= LSXPACK_NEVER_INDEX | LSXPACK_HPACK_VAL_MATCHED;
++    end = lshpack_enc_encode(&henc, out, out + sizeof(out), &xhdr);
++    assert(end > out);
++    assert((out[0] & 0x80) == 0);
++    assert((out[0] & 0xF0) == 0x10);
++    lshpack_enc_cleanup(&henc);
++}
++
++
++static void
++test_henc_never_index_rejects_bad_static_index (void)
++{
++    struct lshpack_enc henc;
++    struct lsxpack_header xhdr;
++    unsigned char out[0x100], *end;
++
++    lshpack_enc_init(&henc);
++    lsxpack_header_set_idx(&xhdr, 62, STR_AND_LEN("secret"));
++    xhdr.flags |= LSXPACK_NEVER_INDEX;
++    end = lshpack_enc_encode(&henc, out, out + sizeof(out), &xhdr);
++    assert(end == out);
++    lshpack_enc_cleanup(&henc);
++}
++
++
++static void
++test_henc_rejects_bad_static_index_without_never_index (void)
++{
++    struct lshpack_enc henc;
++    struct lsxpack_header xhdr;
++    unsigned char out[0x100], *end;
++
++    lshpack_enc_init(&henc);
++    lsxpack_header_set_idx(&xhdr, 62, STR_AND_LEN("value"));
++    end = lshpack_enc_encode(&henc, out, out + sizeof(out), &xhdr);
++    assert(end == out);
++
++    lsxpack_header_set_idx(&xhdr, 62, STR_AND_LEN("value"));
++    xhdr.flags |= LSXPACK_HPACK_VAL_MATCHED;
++    end = lshpack_enc_encode(&henc, out, out + sizeof(out), &xhdr);
++    assert(end == out);
++    lshpack_enc_cleanup(&henc);
++}
++
++
++static void
++test_henc_precompute_static_metadata (void)
++{
++    struct lsxpack_header xhdr;
++    char method[] = ":methodGET";
++    char auth[] = "authorizationBearer abc";
++    unsigned index;
++
++    lsxpack_header_set_offset2(&xhdr, method, 0, 7, 7, 3);
++    index = lshpack_enc_precompute_static(&xhdr,
++                                          LSHPACK_ENC_PRECOMPUTE_FULL);
++    assert(index == LSHPACK_HDR_METHOD_GET);
++    assert(xhdr.hpack_index == LSHPACK_HDR_METHOD_GET);
++    assert(xhdr.flags & LSXPACK_NAME_HASH);
++    assert(xhdr.flags & LSXPACK_NAMEVAL_HASH);
++    assert(xhdr.flags & LSXPACK_HPACK_VAL_MATCHED);
++
++    lsxpack_header_set_offset2(&xhdr, auth, 0, 13, 13, 10);
++    index = lshpack_enc_precompute_static(&xhdr,
++                                          LSHPACK_ENC_PRECOMPUTE_NAME_ONLY);
++    assert(index == LSHPACK_HDR_AUTHORIZATION);
++    assert(xhdr.hpack_index == LSHPACK_HDR_AUTHORIZATION);
++    assert(xhdr.flags & LSXPACK_NAME_HASH);
++    assert(!(xhdr.flags & LSXPACK_NAMEVAL_HASH));
++    assert(!(xhdr.flags & LSXPACK_HPACK_VAL_MATCHED));
++}
++
++
++static void
++test_henc_precompute_indexed_name_promotes_exact_static_value (void)
++{
++    static const struct {
++        unsigned name_index;
++        unsigned exact_index;
++        const char *value;
++        size_t value_len;
++        unsigned char encoded;
++    } cases[] = {
++        { LSHPACK_HDR_METHOD_GET, LSHPACK_HDR_METHOD_POST,
++          STR_AND_LEN("POST"), 0x83, },
++        { LSHPACK_HDR_PATH, LSHPACK_HDR_PATH_INDEX_HTML,
++          STR_AND_LEN("/index.html"), 0x85, },
++        { LSHPACK_HDR_SCHEME_HTTP, LSHPACK_HDR_SCHEME_HTTPS,
++          STR_AND_LEN("https"), 0x87, },
++        { LSHPACK_HDR_STATUS_200, LSHPACK_HDR_STATUS_404,
++          STR_AND_LEN("404"), 0x8D, },
++    };
++    struct lshpack_enc henc;
++    struct lsxpack_header xhdr;
++    unsigned char out[0x100], *end;
++    unsigned i, index;
++    int rc;
++
++    for (i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i)
++    {
++        rc = lshpack_enc_init(&henc);
++        assert(rc == 0);
++        lsxpack_header_set_idx(&xhdr, cases[i].name_index,
++                               cases[i].value, cases[i].value_len);
++        index = lshpack_enc_precompute_static(&xhdr,
++                                              LSHPACK_ENC_PRECOMPUTE_FULL);
++        assert(index == cases[i].exact_index);
++        assert(xhdr.hpack_index == cases[i].exact_index);
++        assert(xhdr.flags & LSXPACK_NAME_HASH);
++        assert(xhdr.flags & LSXPACK_NAMEVAL_HASH);
++        assert(xhdr.flags & LSXPACK_HPACK_VAL_MATCHED);
++
++        end = lshpack_enc_encode(&henc, out, out + sizeof(out), &xhdr);
++        assert(end == out + 1);
++        assert(out[0] == cases[i].encoded);
++        assert(henc.hpe_nelem == 0);
++        lshpack_enc_cleanup(&henc);
++    }
++}
++
++
+ 
+ /* Test that if empty buffer is given writing is not done */
+ static void
+@@ -1761,6 +1892,11 @@
+     test_decode_limits();
+     test_hdec_missing_literal_value();
+     test_hdec_integer_overflow();
++    test_henc_never_index_ignores_value_match();
++    test_henc_never_index_rejects_bad_static_index();
++    test_henc_rejects_bad_static_index_without_never_index();
++    test_henc_precompute_static_metadata();
++    test_henc_precompute_indexed_name_promotes_exact_static_value();
+     test_static_table_search_simple();
+     test_static_table_search_exhaustive();
+     test_hpack_test_RFC_Example();

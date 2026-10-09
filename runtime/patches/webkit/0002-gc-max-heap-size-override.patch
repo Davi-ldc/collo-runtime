@@ -1,0 +1,109 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Davi <davilimacarv2536@gmail.com>
+Date: Sun, 13 Sep 2026 22:38:42 -0300
+Subject: [PATCH 2/4] gc max heap size override
+
+Declares a process-local effective `gcMaxHeapSize` hook and switches
+the heap trigger onto it. The worker can set this soft GC-pressure hint
+after `post_fork_child()` to track the customer memory budget without
+mutating the vendored checkout or relying on environment-variable
+parsing.
+---
+ Source/JavaScriptCore/heap/Heap.cpp       | 14 +++++++-----
+ Source/JavaScriptCore/runtime/Options.cpp | 28 +++++++++++++++++++++++
+ Source/JavaScriptCore/runtime/Options.h   |  4 ++++
+ 3 files changed, 40 insertions(+), 6 deletions(-)
+
+diff --git a/Source/JavaScriptCore/heap/Heap.cpp b/Source/JavaScriptCore/heap/Heap.cpp
+index ebe7cbd1..e39d264c 100644
+--- a/Source/JavaScriptCore/heap/Heap.cpp
++++ b/Source/JavaScriptCore/heap/Heap.cpp
+@@ -3033,11 +3033,12 @@ void Heap::collectIfNecessaryOrDefer(GCDeferralContext* deferralContext)
+         if (Options::logGC()) [[unlikely]]
+             logRequestGC = m_requests.isEmpty() && !deferralContext && !isDeferred();
+ #if !USE(BUN_JSC_ADDITIONS)
+-        if (Options::gcMaxHeapSize()) [[unlikely]] {
++        size_t gcMaxHeapSizeThreshold = effectiveGCMaxHeapSize();
++        if (gcMaxHeapSizeThreshold) [[unlikely]] {
+             size_t bytesAllocatedThisCycle = totalBytesAllocatedThisCycle();
+-            if (bytesAllocatedThisCycle <= Options::gcMaxHeapSize())
++            if (bytesAllocatedThisCycle <= gcMaxHeapSizeThreshold)
+                 return false;
+-            dataLogLnIf(logRequestGC, "Requesting GC because bytes allocated this cycle: ", bytesAllocatedThisCycle, " exceed Options::gcMaxHeapSize(): ", Options::gcMaxHeapSize());
++            dataLogLnIf(logRequestGC, "Requesting GC because bytes allocated this cycle: ", bytesAllocatedThisCycle, " exceed GC max heap threshold: ", gcMaxHeapSizeThreshold);
+             return true;
+         }
+ #endif
+@@ -3052,9 +3053,10 @@ void Heap::collectIfNecessaryOrDefer(GCDeferralContext* deferralContext)
+         size_t bytesAllocatedThisCycle = totalBytesAllocatedThisCycle();
+ 
+ #if USE(BUN_JSC_ADDITIONS)
+-        if (Options::gcMaxHeapSize()) {
+-            if (bytesAllocatedThisCycle > Options::gcMaxHeapSize()) {
+-                dataLogLnIf(logRequestGC, "Requesting GC because bytes allocated this cycle: ", bytesAllocatedThisCycle, " exceed Options::gcMaxHeapSize(): ", Options::gcMaxHeapSize());
++        size_t gcMaxHeapSizeThreshold = effectiveGCMaxHeapSize();
++        if (gcMaxHeapSizeThreshold) {
++            if (bytesAllocatedThisCycle > gcMaxHeapSizeThreshold) {
++                dataLogLnIf(logRequestGC, "Requesting GC because bytes allocated this cycle: ", bytesAllocatedThisCycle, " exceed GC max heap threshold: ", gcMaxHeapSizeThreshold);
+                 return true;
+             }
+         }
+diff --git a/Source/JavaScriptCore/runtime/Options.cpp b/Source/JavaScriptCore/runtime/Options.cpp
+index 587ff75b..a69c400a 100644
+--- a/Source/JavaScriptCore/runtime/Options.cpp
++++ b/Source/JavaScriptCore/runtime/Options.cpp
+@@ -32,6 +32,7 @@
+ #include "MacroAssembler.h"
+ #include "MinimumReservedZoneSize.h"
+ #include <algorithm>
++#include <atomic>
+ #include <limits>
+ #include <mutex>
+ #include <stdlib.h>
+@@ -71,6 +72,33 @@ WTF_ALLOW_UNSAFE_BUFFER_USAGE_BEGIN
+ 
+ namespace JSC {
+ 
++namespace {
++
++// Process-local by design. The zygote may set a default before fork, and each
++// worker can replace it after WorkerInit; 0 means use Options::gcMaxHeapSize().
++// Keep this outside OptionsList.h, but avoid optional+lock because this value
++// is read from the allocation-pressure GC trigger path.
++static std::atomic<size_t> s_colloGCMaxHeapSizeOverride { 0 };
++
++} // namespace
++
++void setColloGCMaxHeapSizeOverride(size_t bytes)
++{
++    s_colloGCMaxHeapSizeOverride.store(bytes, std::memory_order_release);
++}
++
++void clearColloGCMaxHeapSizeOverride()
++{
++    s_colloGCMaxHeapSizeOverride.store(0, std::memory_order_release);
++}
++
++size_t effectiveGCMaxHeapSize()
++{
++    if (size_t overrideBytes = s_colloGCMaxHeapSizeOverride.load(std::memory_order_relaxed))
++        return overrideBytes;
++    return Options::gcMaxHeapSize();
++}
++
+ bool useOSLogOptionHasChanged = false;
+ Options::SandboxPolicy Options::machExceptionHandlerSandboxPolicy = Options::SandboxPolicy::Unknown;
+ 
+diff --git a/Source/JavaScriptCore/runtime/Options.h b/Source/JavaScriptCore/runtime/Options.h
+index 80a5b11f..62de9b53 100644
+--- a/Source/JavaScriptCore/runtime/Options.h
++++ b/Source/JavaScriptCore/runtime/Options.h
+@@ -202,4 +202,8 @@ private:
+     }
+ };
+ 
++JS_EXPORT_PRIVATE void setColloGCMaxHeapSizeOverride(size_t);
++JS_EXPORT_PRIVATE void clearColloGCMaxHeapSizeOverride();
++JS_EXPORT_PRIVATE size_t effectiveGCMaxHeapSize();
++
+ } // namespace JSC

@@ -1,0 +1,8 @@
+Source: https://boringssl.googlesource.com/boringssl
+Tag: 0.20260413.0
+Commit: 78f7fbeec98a2fb15acea6f7a9f1def7f2e6d9a0
+Patches: patches/boringssl
+
+BoringSSL does not provide stability-branch semantics. Upstream periodic
+0.YYYYMMDD.N tags are snapshots for consumers that need tags; Collo pins this
+snapshot and should update intentionally.

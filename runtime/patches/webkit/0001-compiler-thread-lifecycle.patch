@@ -1,0 +1,437 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Davi <davilimacarv2536@gmail.com>
+Date: Sun, 13 Sep 2026 22:38:41 -0300
+Subject: [PATCH 1/4] compiler thread lifecycle
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Gives the embedder control over when a `WTF::AutomaticThread` is born
+and whether it may die, because a worker cannot have either by default.
+A worker is forked from a zygote and then installs a seccomp filter
+denying `clone`, so the set of threads alive when the filter goes on is
+the set that exists forever: a thread that retires can never come back,
+and a thread not yet created can never be created. Upstream gives
+neither guarantee — an `AutomaticThread` self-terminates after an
+idle timeout, and creates its OS thread lazily on the first notify that
+carries work, which for a compiler thread means the first tier-up, long
+after the filter. The patch adds a process-local idle-timeout override
+so a thread can be pinned alive, and
+`AutomaticThreadCondition::startAllThreads` so one can be started with
+nothing to do — it polls once, gets `PollResult::Wait`, and parks. On
+top of that sit `startThreads()` on the JS and wasm worklists and
+`JSC::startCompilerThreads()` over both, so the worker brings up its
+whole compiler topology in the window between the sandbox privilege
+boundary and seccomp. Neither half is separable: the pin is pointless
+if the thread was never started, and starting is pointless if it may
+retire before the filter. Only a patch can do the starting —
+`AutomaticThread::start` is private to the class and its condition. The
+alternative this replaces was to hand a worklist trivial work purely so
+its thread appeared as a side effect (validating an empty wasm module);
+that depends on the work still reaching the queue, silently stops
+creating the thread the day it is short-circuited, surfaces much later
+as an abort under load with nothing pointing at the cause, and needs a
+different trick per worklist. Starting a thread outside the normal wake
+path has one obligation, and `JITWorklist::startThreads` discharges it:
+the worklist counts threads that are awake, every wake pairs its notify
+with an increment, and `JITWorklistThread::poll` asserts that count is
+non-zero before decrementing it on the way to parking — so
+`startAllThreads` returns how many it started and the caller credits
+them. The same patch also adds `JSC::drainCompilerWorklists`, which an
+embedder about to fork needs for the mirror-image reason: a compiler
+thread observes its idle timeout only while parked, so a plan still
+compiling holds its thread against a caller waiting for the process to
+become single-threaded. Draining makes tier-up before a fork safe
+rather than forbidden.
+---
+ Source/JavaScriptCore/jit/JITWorklist.cpp     |  10 ++
+ Source/JavaScriptCore/jit/JITWorklist.h       |   6 +
+ .../runtime/InitializeThreading.cpp           |  30 +++++
+ .../runtime/InitializeThreading.h             |  19 ++++
+ Source/JavaScriptCore/wasm/WasmWorklist.cpp   |   8 ++
+ Source/JavaScriptCore/wasm/WasmWorklist.h     |   6 +
+ Source/WTF/wtf/AutomaticThread.cpp            | 103 +++++++++++++++++-
+ Source/WTF/wtf/AutomaticThread.h              |  32 +++++-
+ 8 files changed, 210 insertions(+), 4 deletions(-)
+
+diff --git a/Source/JavaScriptCore/jit/JITWorklist.cpp b/Source/JavaScriptCore/jit/JITWorklist.cpp
+index 0c3b7436..d0697f21 100644
+--- a/Source/JavaScriptCore/jit/JITWorklist.cpp
++++ b/Source/JavaScriptCore/jit/JITWorklist.cpp
+@@ -180,6 +180,16 @@ CompilationResult JITWorklist::enqueue(Ref<JITPlan> plan)
+     return CompilationResult::CompilationDeferred;
+ }
+ 
++void JITWorklist::startThreads()
++{
++    Locker locker { *m_lock };
++    // m_numberOfActiveThreads counts threads that have been woken and have not yet parked, and
++    // every wake through wakeThreads pairs its notify with an increment. Starting a thread outside
++    // that path still ends in a park, and JITWorklistThread::poll asserts the count is non-zero
++    // before decrementing it — so the increment has to happen here or the first poll crashes.
++    m_numberOfActiveThreads += m_planEnqueued->startAllThreads(locker);
++}
++
+ size_t JITWorklist::queueLength() const
+ {
+     Locker locker { *m_lock };
+diff --git a/Source/JavaScriptCore/jit/JITWorklist.h b/Source/JavaScriptCore/jit/JITWorklist.h
+index bc02159b..093a37b3 100644
+--- a/Source/JavaScriptCore/jit/JITWorklist.h
++++ b/Source/JavaScriptCore/jit/JITWorklist.h
+@@ -59,6 +59,12 @@ public:
+     void suspendAllThreads();
+     void resumeAllThreads();
+ 
++    // Brings up every compiler thread this worklist will ever use, without compiling anything.
++    // Under a syscall filter that denies thread creation, the set of threads that exists when the
++    // filter is installed is the set that exists forever; a thread born lazily by the first
++    // enqueue would be born too late and abort the process.
++    void startThreads();
++
+     enum State { NotKnown, Compiling, Compiled };
+     State compilationState(VM&, JITCompilationKey);
+ 
+diff --git a/Source/JavaScriptCore/runtime/InitializeThreading.cpp b/Source/JavaScriptCore/runtime/InitializeThreading.cpp
+index 4db13e38..683b418a 100644
+--- a/Source/JavaScriptCore/runtime/InitializeThreading.cpp
++++ b/Source/JavaScriptCore/runtime/InitializeThreading.cpp
+@@ -34,6 +34,7 @@
+ #include "ExecutableAllocator.h"
+ #include "IntlCache.h"
+ #include "JITOperationList.h"
++#include "JITWorklist.h"
+ #include "JSCConfig.h"
+ #include "JSCPtrTag.h"
+ #include "LLIntData.h"
+@@ -47,6 +48,7 @@
+ #include "WasmExecutionHandler.h"
+ #include "WasmFaultSignalHandler.h"
+ #include "WasmThunks.h"
++#include "WasmWorklist.h"
+ #include <bmalloc/BPlatform.h>
+ #include <mutex>
+ #include <wtf/Condition.h>
+@@ -160,4 +162,32 @@ void initializeWithOptionsCustomization(const ScopedLambda<void()>& optionsCusto
+     });
+ }
+ 
++void startCompilerThreads()
++{
++    // ensureGlobalWorklist() constructs the worklist and its AutomaticThread objects; the OS
++    // threads behind them are what startThreads() creates. Without the JIT there is nothing to
++    // compile, so building a worklist here would spawn threads that can never receive work.
++    if (Options::useJIT())
++        JITWorklist::ensureGlobalWorklist().startThreads();
++
++#if ENABLE(WEBASSEMBLY)
++    if (Wasm::isSupported())
++        Wasm::ensureWorklist().startThreads();
++#endif
++}
++
++void drainCompilerWorklists(VM& vm)
++{
++    // existingGlobalWorklistOrNull rather than ensureGlobalWorklist: a process
++    // that never compiled has nothing to drain and should not be made to build
++    // a worklist just to find that out.
++    if (auto* worklist = JITWorklist::existingGlobalWorklistOrNull())
++        worklist->completeAllPlansForVM(vm);
++
++#if ENABLE(WEBASSEMBLY)
++    if (auto* worklist = Wasm::existingWorklistOrNull())
++        worklist->stopAllPlansForContext(vm);
++#endif
++}
++
+ } // namespace JSC
+diff --git a/Source/JavaScriptCore/runtime/InitializeThreading.h b/Source/JavaScriptCore/runtime/InitializeThreading.h
+index 5cad1101..681a8669 100644
+--- a/Source/JavaScriptCore/runtime/InitializeThreading.h
++++ b/Source/JavaScriptCore/runtime/InitializeThreading.h
+@@ -37,6 +37,25 @@ namespace JSC {
+ JS_EXPORT_PRIVATE void initialize();
+ JS_EXPORT_PRIVATE void initializeWithOptionsCustomization(const ScopedLambda<void()>& optionsCustomizationCallback);
+ 
++// Brings up every compiler thread the process will ever use — the JS tiers and, where built,
++// WebAssembly — without compiling anything. Each thread polls once, finds nothing, and parks.
++//
++// An embedder that installs a syscall filter denying thread creation must call this while creation
++// is still permitted, because after the filter the set of live threads is final: a compiler thread
++// born lazily by a later first-enqueue would abort the process instead. Pin the AutomaticThread
++// idle timeout first, or a thread may retire between this call and the filter.
++//
++// Idempotent, and safe to call when a worklist has no threads left to create.
++JS_EXPORT_PRIVATE void startCompilerThreads();
++
++class VM;
++
++// Blocks until no compilation is in flight for this VM. An embedder about to
++// fork needs this: a compiler thread only observes its idle timeout while it is
++// parked, so a plan still being compiled holds its thread indefinitely against
++// a caller waiting for the process to become single-threaded.
++JS_EXPORT_PRIVATE void drainCompilerWorklists(VM&);
++
+ ALWAYS_INLINE void initialize(const Invocable<void()> auto& optionsCustomizationCallback)
+ {
+     SUPPRESS_FORWARD_DECL_ARG initializeWithOptionsCustomization(optionsCustomizationCallback);
+diff --git a/Source/JavaScriptCore/wasm/WasmWorklist.cpp b/Source/JavaScriptCore/wasm/WasmWorklist.cpp
+index 3ba51b57..2df26821 100644
+--- a/Source/JavaScriptCore/wasm/WasmWorklist.cpp
++++ b/Source/JavaScriptCore/wasm/WasmWorklist.cpp
+@@ -171,6 +171,14 @@ void Worklist::enqueue(Ref<Plan> plan)
+         m_planEnqueued->notifyOne(locker);
+ }
+ 
++void Worklist::startThreads()
++{
++    Locker locker { *m_lock };
++    // The count is discarded: Worklist::Thread::poll keeps no awake-thread tally, so a thread that
++    // starts with an empty queue simply returns Wait.
++    m_planEnqueued->startAllThreads(locker);
++}
++
+ void Worklist::completePlanSynchronously(Plan& plan)
+ {
+     {
+diff --git a/Source/JavaScriptCore/wasm/WasmWorklist.h b/Source/JavaScriptCore/wasm/WasmWorklist.h
+index a9e4c5f1..49ab1f9e 100644
+--- a/Source/JavaScriptCore/wasm/WasmWorklist.h
++++ b/Source/JavaScriptCore/wasm/WasmWorklist.h
+@@ -54,6 +54,12 @@ public:
+ 
+     JS_EXPORT_PRIVATE void completePlanSynchronously(Plan&);
+ 
++    // Brings up every compiler thread this worklist will ever use, without compiling anything.
++    // Under a syscall filter that denies thread creation, the set of threads that exists when the
++    // filter is installed is the set that exists forever; a thread born lazily by the first
++    // enqueue would be born too late and abort the process.
++    JS_EXPORT_PRIVATE void startThreads();
++
+     // The queue serves its greatest element, so a greater Priority is more urgent.
+     enum class Priority {
+         Preparation,
+diff --git a/Source/WTF/wtf/AutomaticThread.cpp b/Source/WTF/wtf/AutomaticThread.cpp
+index 048180f2..05350962 100644
+--- a/Source/WTF/wtf/AutomaticThread.cpp
++++ b/Source/WTF/wtf/AutomaticThread.cpp
+@@ -30,12 +30,77 @@
+ #include <wtf/PageBlock.h>
+ #include <wtf/TZoneMallocInlines.h>
+ #include <wtf/Threading.h>
++#include <optional>
+ 
+ namespace WTF {
+ 
+ WTF_MAKE_TZONE_ALLOCATED_IMPL(AutomaticThread);
+ 
+ static constexpr bool verbose = false;
++static Lock s_automaticThreadTimeoutOverrideLock;
++static std::optional<Seconds> s_automaticThreadTimeoutOverride;
++static Lock s_liveAutomaticThreadsLock;
++// JSC creates a small fixed set of AutomaticThreads in practice. A linear
++// remove is acceptable here; do not use this registry for short-lived pools.
++// Keep registry sections tiny, and never call into AutomaticThread while
++// holding s_liveAutomaticThreadsLock; registry lock must stay outside m_lock.
++struct ColloAutomaticThreadRegistryEntry {
++    AutomaticThread* thread;
++    ThreadSafeWeakPtr<AutomaticThread> weakThread;
++};
++static Vector<ColloAutomaticThreadRegistryEntry> s_liveAutomaticThreads;
++
++static Seconds effectiveAutomaticThreadTimeout(Seconds defaultTimeout)
++{
++    Locker locker { s_automaticThreadTimeoutOverrideLock };
++    if (s_automaticThreadTimeoutOverride)
++        return *s_automaticThreadTimeoutOverride;
++    // No override preserves each AutomaticThread's upstream default timeout.
++    return defaultTimeout;
++}
++
++static void wakeAutomaticThreadsForColloTimeoutOverride()
++{
++    // Override changes must interrupt threads already blocked on the old deadline.
++    Vector<ThreadSafeWeakPtr<AutomaticThread>> liveThreads;
++    {
++        Locker locker { s_liveAutomaticThreadsLock };
++        liveThreads.reserveInitialCapacity(s_liveAutomaticThreads.size());
++        for (auto& entry : s_liveAutomaticThreads)
++            liveThreads.append(entry.weakThread);
++    }
++
++    for (auto& weakThread : liveThreads) {
++        RefPtr<AutomaticThread> automaticThread = weakThread.get();
++        if (!automaticThread)
++            continue;
++        automaticThread->wakeForColloTimeoutOverride();
++    }
++}
++
++void colloResetAutomaticThreadRegistry()
++{
++    Locker locker { s_liveAutomaticThreadsLock };
++    s_liveAutomaticThreads.clear();
++}
++
++void setColloAutomaticThreadTimeout(Seconds timeout)
++{
++    {
++        Locker locker { s_automaticThreadTimeoutOverrideLock };
++        s_automaticThreadTimeoutOverride = timeout;
++    }
++    wakeAutomaticThreadsForColloTimeoutOverride();
++}
++
++void clearColloAutomaticThreadTimeoutOverride()
++{
++    {
++        Locker locker { s_automaticThreadTimeoutOverrideLock };
++        s_automaticThreadTimeoutOverride = std::nullopt;
++    }
++    wakeAutomaticThreadsForColloTimeoutOverride();
++}
+ 
+ Ref<AutomaticThreadCondition> AutomaticThreadCondition::create()
+ {
+@@ -77,6 +142,22 @@ void AutomaticThreadCondition::notifyAll(const AbstractLocker& locker)
+     }
+ }
+ 
++unsigned AutomaticThreadCondition::startAllThreads(const AbstractLocker& locker)
++{
++    // No notify: the threads have nothing to do yet. Each one polls, gets PollResult::Wait, and
++    // parks. Skipping the ones that already have a thread keeps this idempotent, and skipping the
++    // ones that stopped permanently is required — start() asserts on m_isRunning, and a thread that
++    // returned PollResult::Stop is indistinguishable from a retired one by hasUnderlyingThread.
++    unsigned started = 0;
++    for (auto& thread : m_threads) {
++        if (thread->m_isRunning && !thread->hasUnderlyingThread(locker)) {
++            thread->start(locker);
++            ++started;
++        }
++    }
++    return started;
++}
++
+ void AutomaticThreadCondition::wait(Lock& lock)
+ {
+     m_condition.wait(lock);
+@@ -123,6 +204,13 @@ AutomaticThread::AutomaticThread(const AbstractLocker& locker, Box<Lock> lock, R
+ {
+     if (verbose)
+         dataLog(RawPointer(this), ": Allocated AutomaticThread.\n");
++    {
++        Locker registryLocker { s_liveAutomaticThreadsLock };
++        s_liveAutomaticThreads.append(ColloAutomaticThreadRegistryEntry {
++            this,
++            ThreadSafeWeakPtr<AutomaticThread> { *this },
++        });
++    }
+     m_condition->add(locker, this);
+ }
+ 
+@@ -130,6 +218,10 @@ AutomaticThread::~AutomaticThread()
+ {
+     if (verbose)
+         dataLog(RawPointer(this), ": Deleting AutomaticThread.\n");
++    {
++        Locker registryLocker { s_liveAutomaticThreadsLock };
++        s_liveAutomaticThreads.removeFirstMatching([&](auto& entry) { return entry.thread == this; });
++    }
+     Locker locker { *m_lock };
+     
+     // It's possible that we're in a waiting state with the thread shut down. This is a goofy way to
+@@ -159,6 +251,13 @@ bool AutomaticThread::notify(const AbstractLocker& locker)
+     return m_waitCondition.notifyOne();
+ }
+ 
++void AutomaticThread::wakeForColloTimeoutOverride()
++{
++    Locker locker { *m_lock };
++    if (isWaiting(locker))
++        m_waitCondition.notifyOne();
++}
++
+ void AutomaticThread::join()
+ {
+     Locker locker { *m_lock };
+@@ -228,8 +327,8 @@ void AutomaticThread::start(const AbstractLocker&)
+ 
+                         // Shut the thread down after a timeout.
+                         m_isWaiting = true;
+-                        bool awokenByNotify =
+-                            m_waitCondition.waitFor(*m_lock, m_timeout);
++                        bool awokenByNotify = m_waitCondition.waitFor(
++                            *m_lock, effectiveAutomaticThreadTimeout(m_timeout));
+                         if (verbose && !awokenByNotify && !m_isWaiting)
+                             dataLog(RawPointer(this), ": waitFor timed out, but notified via m_isWaiting flag!\n");
+                         if (m_isWaiting && shouldSleep(locker)) {
+diff --git a/Source/WTF/wtf/AutomaticThread.h b/Source/WTF/wtf/AutomaticThread.h
+index f665a248..e8280d93 100644
+--- a/Source/WTF/wtf/AutomaticThread.h
++++ b/Source/WTF/wtf/AutomaticThread.h
+@@ -33,11 +33,19 @@
+ #include <wtf/StackAllocation.h>
+ #include <wtf/TZoneMalloc.h>
+ #include <wtf/ThreadSafeRefCounted.h>
++#include <wtf/ThreadSafeWeakPtr.h>
+ #include <wtf/ThreadingEnums.h>
+ #include <wtf/Vector.h>
+ 
+ namespace WTF {
+ 
++// Collo-local fork preparation hook. Upstream behavior is unchanged until
++// the embedding process installs an override explicitly. These private exports
++// are for Collo's vendored WTF build and intentionally carry the Collo prefix.
++WTF_EXPORT_PRIVATE void setColloAutomaticThreadTimeout(Seconds);
++WTF_EXPORT_PRIVATE void clearColloAutomaticThreadTimeoutOverride();
++WTF_EXPORT_PRIVATE void colloResetAutomaticThreadRegistry();
++
+ // Often, we create threads that have this as their body:
+ //
+ //     for (;;) {
+@@ -79,7 +87,25 @@ public:
+     
+     WTF_EXPORT_PRIVATE void notifyOne(const AbstractLocker&);
+     WTF_EXPORT_PRIVATE void notifyAll(const AbstractLocker&);
+-    
++
++    // Creates the underlying OS thread of every AutomaticThread registered on this condition,
++    // without giving any of them work. A thread started this way polls once, finds nothing, and
++    // parks on the condition until either work arrives or the idle timeout elapses.
++    //
++    // This exists for embedders that install a syscall filter denying thread creation: after the
++    // filter is installed an AutomaticThread can never be created, so the complete set has to be
++    // brought up while creation is still permitted. The alternative — handing a worklist token
++    // work purely so its thread is born as a side effect — depends on that work still reaching the
++    // queue, and silently stops creating the thread the day the work is short-circuited.
++    //
++    // Pin the idle timeout before calling this, or a thread may retire in the window between this
++    // call and the filter, and retirement is unrecoverable once creation is denied.
++    //
++    // Returns how many threads were started. A caller whose threads keep a running count of who is
++    // awake has to add this in: a thread started here polls once and parks, and parking decrements
++    // that count whether or not anything ever incremented it.
++    WTF_EXPORT_PRIVATE unsigned startAllThreads(const AbstractLocker&);
++
+     // You can reuse this condition for other things, just as you would any other condition.
+     // However, since conflating conditions could lead to thundering herd, it's best to avoid it.
+     // One known-good case for one-true-condition is when the communication involves just two
+@@ -101,7 +127,7 @@ private:
+     Vector<CheckedPtr<AutomaticThread>> m_threads;
+ };
+ 
+-class WTF_EXPORT_PRIVATE AutomaticThread : public ThreadSafeRefCounted<AutomaticThread>, public CanMakeThreadSafeCheckedPtr<AutomaticThread> {
++class WTF_EXPORT_PRIVATE AutomaticThread : public ThreadSafeRefCountedAndCanMakeThreadSafeWeakPtr<AutomaticThread>, public CanMakeThreadSafeCheckedPtr<AutomaticThread> {
+     WTF_MAKE_TZONE_ALLOCATED(AutomaticThread);
+     WTF_OVERRIDE_DELETE_FOR_CHECKED_PTR(AutomaticThread);
+ public:
+@@ -130,6 +156,8 @@ public:
+ 
+     bool notify(const AbstractLocker&);
+ 
++    void wakeForColloTimeoutOverride();
++
+     void join();
+ 
+     virtual ASCIILiteral name() const { return "WTF::AutomaticThread"_s; }

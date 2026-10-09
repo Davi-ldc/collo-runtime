@@ -1,0 +1,590 @@
+--- a/include/openssl/digest.h
++++ b/include/openssl/digest.h
+@@ -42,6 +42,10 @@
+ OPENSSL_EXPORT const EVP_MD *EVP_sha384(void);
+ OPENSSL_EXPORT const EVP_MD *EVP_sha512(void);
+ OPENSSL_EXPORT const EVP_MD *EVP_sha512_256(void);
++OPENSSL_EXPORT const EVP_MD *EVP_sha3_224(void);
++OPENSSL_EXPORT const EVP_MD *EVP_sha3_256(void);
++OPENSSL_EXPORT const EVP_MD *EVP_sha3_384(void);
++OPENSSL_EXPORT const EVP_MD *EVP_sha3_512(void);
+ OPENSSL_EXPORT const EVP_MD *EVP_blake2b256(void);
+ 
+ // EVP_md5_sha1 is a TLS-specific |EVP_MD| which computes the concatenation of
+@@ -122,7 +126,7 @@
+ 
+ // EVP_MAX_MD_BLOCK_SIZE is the largest digest block size supported, in
+ // bytes.
+-#define EVP_MAX_MD_BLOCK_SIZE 128  // SHA-512 is the longest so far.
++#define EVP_MAX_MD_BLOCK_SIZE 144  // SHA3-224 has the largest block.
+ 
+ // EVP_DigestFinal_ex finishes the digest in |ctx| and writes the output to
+ // |md_out|. |EVP_MD_CTX_size| bytes are written, which is at most
+@@ -315,9 +319,9 @@
+ struct evp_md_pctx_ops;
+ 
+ // EVP_MAX_MD_DATA_SIZE is a private constant which specifies the size of the
+-// largest digest state. SHA-512 and BLAKE2b are joint-largest. Consuming code
+-// only uses this via the `EVP_MD_CTX` type.
+-#define EVP_MAX_MD_DATA_SIZE 208
++// largest digest state. Keccak is the largest. Consuming code only uses this
++// via the `EVP_MD_CTX` type.
++#define EVP_MAX_MD_DATA_SIZE 240
+ 
+ // env_md_ctx_st is typoed ("evp" -> "env"), but the typo comes from OpenSSL
+ // and some consumers forward-declare these structures so we're leaving it
+--- a/include/openssl/nid.h
++++ b/include/openssl/nid.h
+@@ -5508,6 +5508,30 @@
+ #define OBJ_ML_KEM_768 2L, 16L, 840L, 1L, 101L, 3L, 4L, 4L, 2L
+ #define OBJ_ENC_ML_KEM_768 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x04, 0x02
+ 
++#define SN_sha3_224 "SHA3-224"
++#define LN_sha3_224 "sha3-224"
++#define NID_sha3_224 1096
++#define OBJ_sha3_224 2L, 16L, 840L, 1L, 101L, 3L, 4L, 2L, 7L
++#define OBJ_ENC_sha3_224 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x07
++
++#define SN_sha3_256 "SHA3-256"
++#define LN_sha3_256 "sha3-256"
++#define NID_sha3_256 1097
++#define OBJ_sha3_256 2L, 16L, 840L, 1L, 101L, 3L, 4L, 2L, 8L
++#define OBJ_ENC_sha3_256 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x08
++
++#define SN_sha3_384 "SHA3-384"
++#define LN_sha3_384 "sha3-384"
++#define NID_sha3_384 1098
++#define OBJ_sha3_384 2L, 16L, 840L, 1L, 101L, 3L, 4L, 2L, 9L
++#define OBJ_ENC_sha3_384 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x09
++
++#define SN_sha3_512 "SHA3-512"
++#define LN_sha3_512 "sha3-512"
++#define NID_sha3_512 1099
++#define OBJ_sha3_512 2L, 16L, 840L, 1L, 101L, 3L, 4L, 2L, 10L
++#define OBJ_ENC_sha3_512 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x0a
++
+ 
+ #if defined(__cplusplus)
+ } /* extern C */
+--- a/include/openssl/prefix_symbols.h
++++ b/include/openssl/prefix_symbols.h
+@@ -1335,6 +1335,10 @@
+ #pragma redefine_extname EVP_sha384 BORINGSSL_ADD_USER_LABEL_AND_PREFIX(EVP_sha384)
+ #pragma redefine_extname EVP_sha512 BORINGSSL_ADD_USER_LABEL_AND_PREFIX(EVP_sha512)
+ #pragma redefine_extname EVP_sha512_256 BORINGSSL_ADD_USER_LABEL_AND_PREFIX(EVP_sha512_256)
++#pragma redefine_extname EVP_sha3_224 BORINGSSL_ADD_USER_LABEL_AND_PREFIX(EVP_sha3_224)
++#pragma redefine_extname EVP_sha3_256 BORINGSSL_ADD_USER_LABEL_AND_PREFIX(EVP_sha3_256)
++#pragma redefine_extname EVP_sha3_384 BORINGSSL_ADD_USER_LABEL_AND_PREFIX(EVP_sha3_384)
++#pragma redefine_extname EVP_sha3_512 BORINGSSL_ADD_USER_LABEL_AND_PREFIX(EVP_sha3_512)
+ #pragma redefine_extname EXTENDED_KEY_USAGE_free BORINGSSL_ADD_USER_LABEL_AND_PREFIX(EXTENDED_KEY_USAGE_free)
+ #pragma redefine_extname EXTENDED_KEY_USAGE_it BORINGSSL_ADD_USER_LABEL_AND_PREFIX(EXTENDED_KEY_USAGE_it)
+ #pragma redefine_extname EXTENDED_KEY_USAGE_new BORINGSSL_ADD_USER_LABEL_AND_PREFIX(EXTENDED_KEY_USAGE_new)
+@@ -4428,6 +4432,10 @@
+ #define EVP_sha384 BORINGSSL_ADD_PREFIX(EVP_sha384)
+ #define EVP_sha512 BORINGSSL_ADD_PREFIX(EVP_sha512)
+ #define EVP_sha512_256 BORINGSSL_ADD_PREFIX(EVP_sha512_256)
++#define EVP_sha3_224 BORINGSSL_ADD_PREFIX(EVP_sha3_224)
++#define EVP_sha3_256 BORINGSSL_ADD_PREFIX(EVP_sha3_256)
++#define EVP_sha3_384 BORINGSSL_ADD_PREFIX(EVP_sha3_384)
++#define EVP_sha3_512 BORINGSSL_ADD_PREFIX(EVP_sha3_512)
+ #define EXTENDED_KEY_USAGE_free BORINGSSL_ADD_PREFIX(EXTENDED_KEY_USAGE_free)
+ #define EXTENDED_KEY_USAGE_it BORINGSSL_ADD_PREFIX(EXTENDED_KEY_USAGE_it)
+ #define EXTENDED_KEY_USAGE_new BORINGSSL_ADD_PREFIX(EXTENDED_KEY_USAGE_new)
+--- a/crypto/digest/digest_extra.cc
++++ b/crypto/digest/digest_extra.cc
+@@ -28,6 +28,7 @@
+ 
+ #include "../asn1/internal.h"
+ #include "../fipsmodule/digest/internal.h"
++#include "../fipsmodule/keccak/internal.h"
+ #include "../internal.h"
+ 
+ 
+@@ -47,6 +48,10 @@
+     {NID_sha384, EVP_sha384, SN_sha384, LN_sha384},
+     {NID_sha512, EVP_sha512, SN_sha512, LN_sha512},
+     {NID_sha512_256, EVP_sha512_256, SN_sha512_256, LN_sha512_256},
++    {NID_sha3_224, EVP_sha3_224, SN_sha3_224, LN_sha3_224},
++    {NID_sha3_256, EVP_sha3_256, SN_sha3_256, LN_sha3_256},
++    {NID_sha3_384, EVP_sha3_384, SN_sha3_384, LN_sha3_384},
++    {NID_sha3_512, EVP_sha3_512, SN_sha3_512, LN_sha3_512},
+     {NID_md5_sha1, EVP_md5_sha1, SN_md5_sha1, LN_md5_sha1},
+     // As a remnant of signing |EVP_MD|s, OpenSSL returned the corresponding
+     // hash function when given a signature OID. To avoid unintended lax parsing
+@@ -102,6 +107,14 @@
+     {{0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03}, 9, NID_sha512},
+     // 2.16.840.1.101.3.4.2.4
+     {{0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x04}, 9, NID_sha224},
++    // 2.16.840.1.101.3.4.2.7
++    {{0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x07}, 9, NID_sha3_224},
++    // 2.16.840.1.101.3.4.2.8
++    {{0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x08}, 9, NID_sha3_256},
++    // 2.16.840.1.101.3.4.2.9
++    {{0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x09}, 9, NID_sha3_384},
++    // 2.16.840.1.101.3.4.2.10
++    {{0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x0a}, 9, NID_sha3_512},
+ };
+ 
+ static int cbs_to_digest_nid(const CBS *cbs) {
+@@ -166,6 +179,18 @@
+   return EVP_get_digestbynid(nid);
+ }
+ 
++static bool digest_algorithm_has_null_params(int nid) {
++  switch (nid) {
++    case NID_sha3_224:
++    case NID_sha3_256:
++    case NID_sha3_384:
++    case NID_sha3_512:
++      return false;
++    default:
++      return true;
++  }
++}
++
+ static int marshal_digest_algorithm(CBB *cbb, const EVP_MD *md,
+                                     bool with_null) {
+   CBB algorithm, oid, null;
+@@ -191,7 +216,8 @@
+     return 0;
+   }
+ 
+-  if ((with_null && !CBB_add_asn1(&algorithm, &null, CBS_ASN1_NULL)) ||  //
++  const bool add_null = with_null && digest_algorithm_has_null_params(nid);
++  if ((add_null && !CBB_add_asn1(&algorithm, &null, CBS_ASN1_NULL)) ||  //
+       !CBB_flush(cbb)) {
+     return 0;
+   }
+@@ -269,6 +295,47 @@
+ 
+ static_assert(sizeof(BLAKE2B_CTX) <= EVP_MAX_MD_DATA_SIZE);
+ 
++// SHA-3.
++
++static_assert(sizeof(bssl::BORINGSSL_keccak_st) <= EVP_MAX_MD_DATA_SIZE,
++              "EVP_MAX_MD_DATA_SIZE too small for Keccak state");
++
++#define DEFINE_SHA3(bits, block_bytes)                                   \
++  static void sha3_##bits##_init(EVP_MD_CTX *ctx) {                      \
++    bssl::BORINGSSL_keccak_init(                                         \
++        reinterpret_cast<bssl::BORINGSSL_keccak_st *>(ctx->md_data),     \
++        bssl::boringssl_sha3_##bits);                                    \
++  }                                                                      \
++  static void sha3_##bits##_update(EVP_MD_CTX *ctx, const void *data,    \
++                                   size_t len) {                         \
++    bssl::BORINGSSL_keccak_absorb(                                       \
++        reinterpret_cast<bssl::BORINGSSL_keccak_st *>(ctx->md_data),     \
++        reinterpret_cast<const uint8_t *>(data), len);                   \
++  }                                                                      \
++  static void sha3_##bits##_final(EVP_MD_CTX *ctx, uint8_t *md) {        \
++    bssl::BORINGSSL_keccak_squeeze(                                      \
++        reinterpret_cast<bssl::BORINGSSL_keccak_st *>(ctx->md_data), md, \
++        (bits) / 8);                                                     \
++  }                                                                      \
++  static const EVP_MD evp_md_sha3_##bits = {                             \
++      NID_sha3_##bits,                                                   \
++      (bits) / 8,                                                        \
++      0,                                                                 \
++      sha3_##bits##_init,                                                \
++      sha3_##bits##_update,                                              \
++      sha3_##bits##_final,                                               \
++      (block_bytes),                                                     \
++      sizeof(bssl::BORINGSSL_keccak_st),                                 \
++  };                                                                     \
++  const EVP_MD *EVP_sha3_##bits() { return &evp_md_sha3_##bits; }
++
++DEFINE_SHA3(224, 144)
++DEFINE_SHA3(256, 136)
++DEFINE_SHA3(384, 104)
++DEFINE_SHA3(512, 72)
++
++#undef DEFINE_SHA3
++
+ 
+ static void md4_init(EVP_MD_CTX *ctx) {
+   BSSL_CHECK(MD4_Init(reinterpret_cast<MD4_CTX *>(ctx->md_data)));
+--- a/crypto/digest/digest_test.cc
++++ b/crypto/digest/digest_test.cc
+@@ -293,6 +293,10 @@
+   static const uint8_t kSHA256GarbageParam[] = {
+       0x30, 0x0e, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01,
+       0x65, 0x03, 0x04, 0x02, 0x01, 0x02, 0x01, 0x2a};
++  static const uint8_t kSHA3_256NoParam[] = {0x30, 0x0b, 0x06, 0x09, 0x60,
++                                             0x86, 0x48, 0x01, 0x65, 0x03,
++                                             0x04, 0x02, 0x08};
++
+   // Serialize SHA-256, with and without NULL.
+   cbb.Reset();
+   ASSERT_TRUE(CBB_init(cbb.get(), 0));
+@@ -305,6 +309,20 @@
+   EXPECT_EQ(Bytes(kSHA256NoParam),
+             Bytes(CBB_data(cbb.get()), CBB_len(cbb.get())));
+ 
++  // SHA-3 AlgorithmIdentifiers omit parameters, including in the generic
++  // marshaler.
++  cbb.Reset();
++  ASSERT_TRUE(CBB_init(cbb.get(), 0));
++  ASSERT_TRUE(EVP_marshal_digest_algorithm(cbb.get(), EVP_sha3_256()));
++  EXPECT_EQ(Bytes(kSHA3_256NoParam),
++            Bytes(CBB_data(cbb.get()), CBB_len(cbb.get())));
++  cbb.Reset();
++  ASSERT_TRUE(CBB_init(cbb.get(), 0));
++  ASSERT_TRUE(
++      EVP_marshal_digest_algorithm_no_params(cbb.get(), EVP_sha3_256()));
++  EXPECT_EQ(Bytes(kSHA3_256NoParam),
++            Bytes(CBB_data(cbb.get()), CBB_len(cbb.get())));
++
+   // Parse SHA-256. Either absent or NULL parameters are tolerated for
+   // compatibility.
+   CBS cbs;
+@@ -314,6 +332,10 @@
+   CBS_init(&cbs, kSHA256NoParam, sizeof(kSHA256NoParam));
+   EXPECT_EQ(EVP_sha256(), EVP_parse_digest_algorithm(&cbs));
+   EXPECT_EQ(0u, CBS_len(&cbs));
++  CBS_init(&cbs, kSHA3_256NoParam, sizeof(kSHA3_256NoParam));
++  EXPECT_EQ(EVP_sha3_256(), EVP_parse_digest_algorithm(&cbs));
++  EXPECT_EQ(0u, CBS_len(&cbs));
++
+   // Garbage parameters are not.
+   CBS_init(&cbs, kSHA256GarbageParam, sizeof(kSHA256GarbageParam));
+   EXPECT_FALSE(EVP_parse_digest_algorithm(&cbs));
+--- a/crypto/fipsmodule/keccak/internal.h
++++ b/crypto/fipsmodule/keccak/internal.h
+@@ -21,7 +21,9 @@
+ BSSL_NAMESPACE_BEGIN
+ 
+ enum boringssl_keccak_config_t : int32_t {
++  boringssl_sha3_224,
+   boringssl_sha3_256,
++  boringssl_sha3_384,
+   boringssl_sha3_512,
+   boringssl_shake128,
+   boringssl_shake256,
+--- a/crypto/fipsmodule/keccak/keccak.cc.inc
++++ b/crypto/fipsmodule/keccak/keccak.cc.inc
+@@ -132,10 +132,18 @@
+   size_t required_out_len;
+   size_t capacity_bytes;
+   switch (config) {
++    case boringssl_sha3_224:
++      capacity_bytes = 448 / 8;
++      required_out_len = 28;
++      break;
+     case boringssl_sha3_256:
+       capacity_bytes = 512 / 8;
+       required_out_len = 32;
+       break;
++    case boringssl_sha3_384:
++      capacity_bytes = 768 / 8;
++      required_out_len = 48;
++      break;
+     case boringssl_sha3_512:
+       capacity_bytes = 1024 / 8;
+       required_out_len = 64;
+@@ -229,7 +237,9 @@
+ static void keccak_finalize(struct BORINGSSL_keccak_st *ctx) {
+   uint8_t terminator;
+   switch (ctx->config) {
++    case boringssl_sha3_224:
+     case boringssl_sha3_256:
++    case boringssl_sha3_384:
+     case boringssl_sha3_512:
+       terminator = 0x06;
+       break;
+--- a/crypto/fipsmodule/rsa/rsa.cc.inc
++++ b/crypto/fipsmodule/rsa/rsa.cc.inc
+@@ -459,6 +459,34 @@
+          0x04, 0x02, 0x03, 0x05, 0x00, 0x04, 0x40},
+     },
+     {
++        NID_sha3_224,
++        28,
++        17,
++        {0x30, 0x2b, 0x30, 0x0b, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03,
++         0x04, 0x02, 0x07, 0x04, 0x1c},
++    },
++    {
++        NID_sha3_256,
++        32,
++        17,
++        {0x30, 0x2f, 0x30, 0x0b, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03,
++         0x04, 0x02, 0x08, 0x04, 0x20},
++    },
++    {
++        NID_sha3_384,
++        48,
++        17,
++        {0x30, 0x3f, 0x30, 0x0b, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03,
++         0x04, 0x02, 0x09, 0x04, 0x30},
++    },
++    {
++        NID_sha3_512,
++        64,
++        17,
++        {0x30, 0x4f, 0x30, 0x0b, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03,
++         0x04, 0x02, 0x0a, 0x04, 0x40},
++    },
++    {
+         NID_undef,
+         0,
+         0,
+--- a/crypto/obj/objects.txt
++++ b/crypto/obj/objects.txt
+@@ -906,6 +906,10 @@
+ nist_hashalgs 3		: SHA512		: sha512
+ nist_hashalgs 4		: SHA224		: sha224
+ nist_hashalgs 6		: SHA512-256		: sha512-256
++nist_hashalgs 7		: SHA3-224		: sha3-224
++nist_hashalgs 8		: SHA3-256		: sha3-256
++nist_hashalgs 9		: SHA3-384		: sha3-384
++nist_hashalgs 10		: SHA3-512		: sha3-512
+ 
+ !Alias sigAlgs nistAlgorithms 3
+ sigAlgs 1		: dsa_with_SHA224
+--- a/crypto/obj/obj_mac.num
++++ b/crypto/obj/obj_mac.num
+@@ -958,3 +958,7 @@
+ ML_DSA_65		968
+ ML_DSA_87		969
+ ML_KEM_768		970
++sha3_224		1096
++sha3_256		1097
++sha3_384		1098
++sha3_512		1099
+--- a/crypto/obj/obj_dat.h
++++ b/crypto/obj/obj_dat.h
+@@ -16,7 +16,7 @@
+ 
+ 
+ BSSL_NAMESPACE_BEGIN
+-#define NUM_NID 971
++#define NUM_NID 1100
+ 
+ static const uint8_t kObjectData[] = {
+     /* NID_rsadsi */
+@@ -7146,6 +7146,46 @@
+     0x04,
+     0x04,
+     0x02,
++    /* NID_sha3_224 */
++    0x60,
++    0x86,
++    0x48,
++    0x01,
++    0x65,
++    0x03,
++    0x04,
++    0x02,
++    0x07,
++    /* NID_sha3_256 */
++    0x60,
++    0x86,
++    0x48,
++    0x01,
++    0x65,
++    0x03,
++    0x04,
++    0x02,
++    0x08,
++    /* NID_sha3_384 */
++    0x60,
++    0x86,
++    0x48,
++    0x01,
++    0x65,
++    0x03,
++    0x04,
++    0x02,
++    0x09,
++    /* NID_sha3_512 */
++    0x60,
++    0x86,
++    0x48,
++    0x01,
++    0x65,
++    0x03,
++    0x04,
++    0x02,
++    0x0a,
+ };
+ 
+ static const ASN1_OBJECT kObjects[NUM_NID] = {
+@@ -8800,6 +8840,135 @@
+     {"id-ml-dsa-87", "ML-DSA-87", NID_ML_DSA_87, 9, &kObjectData[6223], 0},
+     {"id-alg-ml-kem-768", "ML-KEM-768", NID_ML_KEM_768, 9, &kObjectData[6232],
+      0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {NULL, NULL, NID_undef, 0, NULL, 0},
++    {"SHA3-224", "sha3-224", NID_sha3_224, 9, &kObjectData[6241], 0},
++    {"SHA3-256", "sha3-256", NID_sha3_256, 9, &kObjectData[6250], 0},
++    {"SHA3-384", "sha3-384", NID_sha3_384, 9, &kObjectData[6259], 0},
++    {"SHA3-512", "sha3-512", NID_sha3_512, 9, &kObjectData[6268], 0},
+ };
+ 
+ static const uint16_t kNIDsInShortNameOrder[] = {
+@@ -8987,6 +9156,10 @@
+     64 /* SHA1 */,
+     675 /* SHA224 */,
+     672 /* SHA256 */,
++    1096 /* SHA3-224 */,
++    1097 /* SHA3-256 */,
++    1098 /* SHA3-384 */,
++    1099 /* SHA3-512 */,
+     673 /* SHA384 */,
+     674 /* SHA512 */,
+     962 /* SHA512-256 */,
+@@ -10673,6 +10846,10 @@
+     671 /* sha224WithRSAEncryption */,
+     672 /* sha256 */,
+     668 /* sha256WithRSAEncryption */,
++    1096 /* sha3-224 */,
++    1097 /* sha3-256 */,
++    1098 /* sha3-384 */,
++    1099 /* sha3-512 */,
+     673 /* sha384 */,
+     669 /* sha384WithRSAEncryption */,
+     674 /* sha512 */,
+@@ -10729,8 +10906,8 @@
+ static const uint16_t kNIDsInOIDOrder[] = {
+     434 /* 0.9 (OBJ_data) */,
+     182 /* 1.2 (OBJ_member_body) */,
+-    379 /* 1.3 (OBJ_org) */,
+     676 /* 1.3 (OBJ_identified_organization) */,
++    379 /* 1.3 (OBJ_org) */,
+     11 /* 2.5 (OBJ_X500) */,
+     647 /* 2.23 (OBJ_international_organizations) */,
+     380 /* 1.3.6 (OBJ_dod) */,
+@@ -11436,6 +11613,10 @@
+     674 /* 2.16.840.1.101.3.4.2.3 (OBJ_sha512) */,
+     675 /* 2.16.840.1.101.3.4.2.4 (OBJ_sha224) */,
+     962 /* 2.16.840.1.101.3.4.2.6 (OBJ_sha512_256) */,
++    1096 /* 2.16.840.1.101.3.4.2.7 (OBJ_sha3_224) */,
++    1097 /* 2.16.840.1.101.3.4.2.8 (OBJ_sha3_256) */,
++    1098 /* 2.16.840.1.101.3.4.2.9 (OBJ_sha3_384) */,
++    1099 /* 2.16.840.1.101.3.4.2.10 (OBJ_sha3_512) */,
+     802 /* 2.16.840.1.101.3.4.3.1 (OBJ_dsa_with_SHA224) */,
+     803 /* 2.16.840.1.101.3.4.3.2 (OBJ_dsa_with_SHA256) */,
+     967 /* 2.16.840.1.101.3.4.3.17 (OBJ_ML_DSA_44) */,

@@ -1,0 +1,69 @@
+// The configuration local-e2e serves (runtime/tests/integration/local_server/).
+// Every worker has one route, the most a worker serves until multi-route
+// workers exist. The harness chooses the listener, the certificate and the
+// analytics directory itself, so none is set here.
+//
+// api/todos.js is an Elysia API and api/hono.js a Hono app, each bundled by
+// Bun into one module; the opt-in benchmarks measure them as real module
+// graphs. api/lazy.js reaches api/lib/lazy_value.js only through import().
+// api/token.js and api/upload.js answer with a token drawn once per worker
+// process, which tells the worker tests whether two responses came from one
+// worker.
+{
+  "globalSettings": {
+    "limits": { "memoryMiB": 1024, "timeoutMs": 15000 }
+  },
+  "workers": {
+    "hello": {
+      "routes": {
+        "/hello/:name": { "entry": "./api/hello.js", "bindings": { "GREETING": { "text": "hello" } } }
+      }
+    },
+    "echo": {
+      "routes": { "/echo": { "entry": "./api/echo.js" } }
+    },
+    "env": {
+      "routes": {
+        "/env": { "entry": "./api/env.js", "bindings": { "TOKEN": { "text": "e2e-token" } } }
+      }
+    },
+    // The two hanging routes need a deadline short enough for a test.
+    "hang-before": {
+      "routes": { "/hang-before": { "entry": "./api/hang_before.js" } },
+      "settings": { "limits": { "timeoutMs": 1000 } }
+    },
+    "hang-sync": {
+      "routes": { "/hang-sync": { "entry": "./api/hang_sync.js" } },
+      "settings": { "limits": { "timeoutMs": 1000 } }
+    },
+    "large-response": {
+      "routes": { "/large-response": { "entry": "./api/large_response.js" } }
+    },
+    "fetch-gzip": {
+      "routes": { "/fetch-gzip": { "entry": "./api/fetch_gzip.js" } }
+    },
+    "todos": {
+      "routes": { "/api/todos": { "entry": "./api/todos.js" } }
+    },
+    "hono": {
+      "routes": { "/api/hono": { "entry": "./api/hono.js" } }
+    },
+    "lazy": {
+      "routes": { "/lazy": { "entry": "./api/lazy.js" } }
+    },
+    // Two requests share one worker of each of these, which the worker tests
+    // rely on, and the deadline route's requests time out within a test.
+    "token": {
+      "routes": { "/token": { "entry": "./api/token.js" } },
+      "settings": { "limits": { "concurrency": 2 } }
+    },
+    "deadline": {
+      "routes": { "/deadline": { "entry": "./api/token.js" } },
+      "settings": { "limits": { "concurrency": 2, "timeoutMs": 1000 } }
+    },
+    "upload": {
+      "routes": { "/upload": { "entry": "./api/upload.js" } },
+      "settings": { "limits": { "concurrency": 2 } }
+    }
+  }
+}

@@ -1,0 +1,14 @@
+// The Collo side of the I/O comparison. run.sh copies this file and
+// hello-collo.js next to the generated certificate and key, so the relative
+// paths resolve there. Every limit keeps its default.
+{
+  "globalSettings": {
+    "listen": "127.0.0.1:8443",
+    "tls": { "certificate": "cert.pem", "privateKey": "key.pem" }
+  },
+  "workers": {
+    "hello": {
+      "routes": { "/*": { "entry": "./hello-collo.js" } }
+    }
+  }
+}

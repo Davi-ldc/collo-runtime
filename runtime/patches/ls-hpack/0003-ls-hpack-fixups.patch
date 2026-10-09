@@ -1,0 +1,782 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -6,7 +6,7 @@
+ #   XXH_INCLUDE_DIR
+ #   LSHPACK_XXH
+ 
+-CMAKE_MINIMUM_REQUIRED(VERSION 2.8)
++CMAKE_MINIMUM_REQUIRED(VERSION 3.10)
+ PROJECT(ls-hpack C)
+ 
+ include(CheckIncludeFiles)
+@@ -16,6 +16,12 @@
+ ELSE()
+     ADD_LIBRARY(ls-hpack STATIC lshpack.c)
+ ENDIF()
++OPTION(LSHPACK_FAST_DECODE
++    "Disable HTTP/1.x decode output and decode hashes" OFF)
++IF (LSHPACK_FAST_DECODE)
++    TARGET_COMPILE_DEFINITIONS(ls-hpack PUBLIC
++        LSHPACK_DEC_HTTP1X_OUTPUT=0 LSHPACK_DEC_CALC_HASH=0)
++ENDIF()
+ INCLUDE_DIRECTORIES(${CMAKE_SOURCE_DIR})
+ 
+ IF (NOT DEFINED XXH_HEADER_NAME)
+diff --git a/bin/CMakeLists.txt b/bin/CMakeLists.txt
+--- a/bin/CMakeLists.txt
++++ b/bin/CMakeLists.txt
+@@ -1,5 +1,8 @@
+ add_executable(encode-qif encode-qif.c ../deps/xxhash/xxhash.c)
+ target_link_libraries(encode-qif PRIVATE ls-hpack)
++ADD_TEST(encode-qif-sensitive-policy sh
++    ${CMAKE_CURRENT_SOURCE_DIR}/test-encode-qif-policy.sh
++    ${CMAKE_CURRENT_BINARY_DIR}/encode-qif)
+ 
+ add_executable(gen-fast-dec-table gen-fast-dec-table.c)
+ 
+diff --git a/bin/encode-qif.c b/bin/encode-qif.c
+--- a/bin/encode-qif.c
++++ b/bin/encode-qif.c
+@@ -30,6 +30,7 @@
+ #endif
+ 
+ #include <errno.h>
++#include <limits.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -59,10 +60,17 @@
+ "   -K          Discard output: encoded output is discarded.\n"
+ "   -H          Do not use the history heuristic.\n"
+ "   -n NUMBER   Number of times to iterate over the header set list.\n"
++"   -s POLICY   Sensitive header policy: none, auth, auth-and-set-cookie,\n"
++"                 cookies. set-cookie is an alias for auth-and-set-cookie.\n"
++"                 Defaults to none.\n"
+ "   -t NUMBER   Dynamic table size.  Defaults to %u.\n"
+ "   -v          Verbose: print various messages to stderr.\n"
+ "\n"
+ "   -h          Print this help screen and exit\n"
++"\n"
++"   -s none preserves header policy, but optimized static-match fast paths\n"
++"   may change byte-for-byte output when the history heuristic is enabled.\n"
++"   Use -H for stricter comparison with older encode-qif output.\n"
+     , name, TABLE_SIZE);
+ }
+ 
+@@ -73,11 +81,24 @@
+     const char    *val;
+     size_t         name_len;
+     size_t         val_len;
++    uint8_t        hpack_name_index;
++    uint8_t        hpack_nameval_index;
++    uint32_t       name_hash;
++    uint32_t       nameval_hash;
++    unsigned       flags;
+ };
+ 
+ 
+ #define MAX_HEADERS 32
+ 
++enum sensitive_policy
++{
++    SENSITIVE_NONE,
++    SENSITIVE_AUTH_ONLY,
++    SENSITIVE_AUTH_AND_SET_COOKIE,
++    SENSITIVE_ALL_COOKIES,
++};
++
+ struct header_set
+ {
+     STAILQ_ENTRY(header_set)    next;
+@@ -86,15 +107,132 @@
+ };
+ 
+ 
++static unsigned
++parse_u32_arg (const char *s, const char *name)
++{
++    char *end;
++    unsigned long v;
++    const char *p;
++
++    if (*s == '\0')
++        goto err;
++    for (p = s; *p; ++p)
++        if (*p < '0' || *p > '9')
++            goto err;
++
++    errno = 0;
++    v = strtoul(s, &end, 10);
++    if (errno != 0 || *end != '\0' || v > UINT_MAX)
++        goto err;
++
++    return (unsigned) v;
++
++  err:
++    fprintf(stderr, "invalid %s: %s\n", name, s);
++    exit(EXIT_FAILURE);
++}
++
++
++static int
++parse_sensitive_policy (const char *policy, enum sensitive_policy *out)
++{
++    if (0 == strcmp(policy, "none"))
++        *out = SENSITIVE_NONE;
++    else if (0 == strcmp(policy, "auth"))
++        *out = SENSITIVE_AUTH_ONLY;
++    else if (0 == strcmp(policy, "set-cookie")
++        || 0 == strcmp(policy, "auth-and-set-cookie"))
++        *out = SENSITIVE_AUTH_AND_SET_COOKIE;
++    else if (0 == strcmp(policy, "cookies"))
++        *out = SENSITIVE_ALL_COOKIES;
++    else
++        return -1;
++    return 0;
++}
++
++
++#define HEADER_EQ(bytes, len, lit) \
++    ((len) == sizeof(lit) - 1 && memcmp((bytes), (lit), sizeof(lit) - 1) == 0)
++
++
++static unsigned
++sensitive_flags_for_name (const char *name, size_t name_len,
++                          enum sensitive_policy policy)
++{
++    switch (policy)
++    {
++    case SENSITIVE_NONE:
++        return 0;
++    case SENSITIVE_AUTH_ONLY:
++        return HEADER_EQ(name, name_len, "authorization")
++            || HEADER_EQ(name, name_len, "proxy-authorization")
++                ? LSXPACK_NEVER_INDEX : 0;
++    case SENSITIVE_AUTH_AND_SET_COOKIE:
++        return HEADER_EQ(name, name_len, "authorization")
++            || HEADER_EQ(name, name_len, "proxy-authorization")
++            || HEADER_EQ(name, name_len, "set-cookie")
++                ? LSXPACK_NEVER_INDEX : 0;
++    case SENSITIVE_ALL_COOKIES:
++        return HEADER_EQ(name, name_len, "authorization")
++            || HEADER_EQ(name, name_len, "proxy-authorization")
++            || HEADER_EQ(name, name_len, "set-cookie")
++            || HEADER_EQ(name, name_len, "cookie")
++                ? LSXPACK_NEVER_INDEX : 0;
++    }
++    return 0;
++}
++
++
++static void
++header_precompute_metadata (struct header *header,
++                            enum sensitive_policy policy)
++{
++    lsxpack_header_t tmp;
++    const size_t val_offset = (size_t) (header->val - header->name);
++    const unsigned sensitive_flags = sensitive_flags_for_name(
++        header->name, header->name_len, policy);
++    const unsigned precompute_flags = sensitive_flags & LSXPACK_NEVER_INDEX
++        ? LSHPACK_ENC_PRECOMPUTE_NAME_ONLY : LSHPACK_ENC_PRECOMPUTE_FULL;
++
++    lsxpack_header_set_offset2(&tmp, header->name, 0, header->name_len,
++                               val_offset, header->val_len);
++    (void) lshpack_enc_precompute_static(&tmp, precompute_flags);
++    header->name_hash = tmp.flags & LSXPACK_NAME_HASH ? tmp.name_hash : 0;
++    header->nameval_hash = tmp.flags & LSXPACK_NAMEVAL_HASH
++        ? tmp.nameval_hash : 0;
++    header->hpack_nameval_index = tmp.flags & LSXPACK_HPACK_VAL_MATCHED
++        ? tmp.hpack_index : 0;
++    header->hpack_name_index = tmp.hpack_index;
++    header->flags = (tmp.flags & (LSXPACK_NAME_HASH | LSXPACK_NAMEVAL_HASH))
++        | sensitive_flags;
++}
++
++
+ static inline void
+-lsxpack_header_set_ptr(lsxpack_header_t *hdr,
+-                       const char *name, size_t name_len,
+-                       const char *val, size_t val_len)
+-{
+-    static char buf[65536];
+-    memcpy(buf, name, name_len);
+-    memcpy(&buf[name_len], val, val_len);
+-    lsxpack_header_set_offset2(hdr, buf, 0, name_len, name_len, val_len);
++lsxpack_header_set_precomputed (lsxpack_header_t *hdr,
++                                const struct header *header)
++{
++    if (header->hpack_nameval_index)
++    {
++        lsxpack_header_set_idx(hdr, header->hpack_nameval_index,
++                               header->val, header->val_len);
++        hdr->flags |= LSXPACK_HPACK_VAL_MATCHED;
++    }
++    else if (header->hpack_name_index)
++    {
++        lsxpack_header_set_idx(hdr, header->hpack_name_index,
++                               header->val, header->val_len);
++    }
++    else
++    {
++        const size_t val_offset = (size_t) (header->val - header->name);
++
++        lsxpack_header_set_offset2(hdr, header->name, 0, header->name_len,
++                                   val_offset, header->val_len);
++    }
++    hdr->name_hash = header->name_hash;
++    hdr->nameval_hash = header->nameval_hash;
++    hdr->flags |= header->flags;
+ }
+ 
+ 
+@@ -106,6 +244,7 @@
+     int discard = 0, use_history = 1;
+     unsigned n_iters = 1, n, i;
+     unsigned dyn_table_size     = TABLE_SIZE;
++    enum sensitive_policy sensitive_policy = SENSITIVE_NONE;
+     STAILQ_HEAD(, header_set) header_sets = STAILQ_HEAD_INITIALIZER(header_sets);
+     struct stat st;
+     const unsigned char *qif = NULL, *p, *tab, *nl, *nlnl;
+@@ -115,12 +254,17 @@
+     struct lshpack_enc encoder;
+     unsigned char buf[0x2000];
+ 
+-    while (-1 != (opt = getopt(argc, argv, "Hi:o:Kn:t:vh")))
++    while (-1 != (opt = getopt(argc, argv, "Hi:o:Kn:s:t:vh")))
+     {
+         switch (opt)
+         {
+         case 'n':
+-            n_iters = atoi(optarg);
++            n_iters = parse_u32_arg(optarg, "iteration count");
++            if (n_iters == 0)
++            {
++                fprintf(stderr, "iteration count must be greater than zero\n");
++                exit(EXIT_FAILURE);
++            }
+             break;
+         case 'i':
+             qif_fd = open(optarg, O_RDONLY);
+@@ -135,7 +279,7 @@
+                 exit(EXIT_FAILURE);
+             }
+             qif = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, qif_fd, 0);
+-            if (!qif)
++            if (qif == MAP_FAILED)
+             {
+                 perror("mmap");
+                 exit(EXIT_FAILURE);
+@@ -159,8 +303,16 @@
+         case 'H':
+             use_history = 0;
+             break;
++        case 's':
++            if (0 != parse_sensitive_policy(optarg, &sensitive_policy))
++            {
++                fprintf(stderr, "unknown sensitive header policy `%s'\n",
++                                                        optarg);
++                exit(EXIT_FAILURE);
++            }
++            break;
+         case 't':
+-            dyn_table_size = atoi(optarg);
++            dyn_table_size = parse_u32_arg(optarg, "dynamic table size");
+             break;
+         case 'h':
+             usage(argv[0]);
+@@ -173,7 +325,7 @@
+         }
+     }
+ 
+-    if (!qif)
++    if (qif_fd < 0)
+     {
+         fprintf(stderr, "Please specify input QIF file using -i flag\n");
+         exit(EXIT_FAILURE);
+@@ -181,7 +333,7 @@
+ 
+     const unsigned char *const begin = qif;
+     const unsigned char *const end = begin + st.st_size;
+-    while (qif + 2 < end)
++    while ((size_t) (end - qif) >= 2)
+     {
+         nlnl = memmem(qif, end - qif, "\n\n", 2);
+         if (!nlnl)
+@@ -198,14 +350,14 @@
+         {
+             if (hset->n_headers >= MAX_HEADERS)
+             {
+-                fprintf(stderr, "max headers > 32, off: %u",
++                fprintf(stderr, "max headers > 32, off: %u\n",
+                                             (unsigned) (p - begin));
+                 exit(EXIT_FAILURE);
+             }
+             tab = memmem(p, nlnl - p, "\t", 1);
+             if (!tab)
+             {
+-                fprintf(stderr, "tab not found, off: %u",
++                fprintf(stderr, "tab not found, off: %u\n",
+                                             (unsigned) (p - begin));
+                 exit(EXIT_FAILURE);
+             }
+@@ -218,9 +370,21 @@
+                 .name_len =  tab - p,
+                 .val_len = nl - tab - 1,
+             };
++            header = &hset->headers[hset->n_headers];
++            if (header->name_len > LSXPACK_MAX_STRLEN
++                || header->val_len > LSXPACK_MAX_STRLEN
++                || (size_t) (header->val - header->name) > LSXPACK_MAX_STRLEN)
++            {
++                fprintf(stderr, "header too large, off: %u\n",
++                                            (unsigned) (p - begin));
++                exit(EXIT_FAILURE);
++            }
++            header_precompute_metadata(header, sensitive_policy);
+             ++hset->n_headers;
+             p = nl + 1;
+         }
++        if (nlnl == end)
++            break;
+         qif = nlnl + 2;
+     }
+ 
+@@ -232,6 +396,7 @@
+             perror("lshpack_enc_init");
+             exit(EXIT_FAILURE);
+         }
++        lshpack_enc_set_max_capacity(&encoder, dyn_table_size);
+         (void) lshpack_enc_use_hist(&encoder, use_history);
+ 
+         STAILQ_FOREACH(hset, &header_sets, next)
+@@ -239,8 +404,7 @@
+             for (i = 0; i < hset->n_headers; ++i)
+             {
+                 header = &hset->headers[i];
+-                lsxpack_header_set_ptr(&hdr, header->name, header->name_len,
+-                                       header->val, header->val_len);
++                lsxpack_header_set_precomputed(&hdr, header);
+                 s = lshpack_enc_encode(&encoder, buf, buf + sizeof(buf), &hdr);
+                 if (s <= buf)
+                 {
+@@ -252,7 +416,6 @@
+             }
+         }
+ 
+-        lshpack_enc_set_max_capacity(&encoder, dyn_table_size);
+         lshpack_enc_cleanup(&encoder);
+     }
+ 
+diff --git a/bin/test-encode-qif-policy.sh b/bin/test-encode-qif-policy.sh
+--- a/bin/test-encode-qif-policy.sh
++++ b/bin/test-encode-qif-policy.sh
+@@ -0,0 +1,125 @@
++#!/bin/sh
++set -eu
++
++if [ "$#" -ne 1 ]; then
++    echo "usage: $0 /path/to/encode-qif" >&2
++    exit 2
++fi
++
++encode_qif="$1"
++tmp_dir="${TMPDIR:-/tmp}/lshpack-encode-qif-policy-test.$$"
++mkdir -p "$tmp_dir"
++trap 'rm -rf "$tmp_dir"' EXIT HUP INT TERM
++
++qif="$tmp_dir/input.qif"
++cat >"$qif" <<'QIF'
++:method	GET
++:scheme	https
++:authority	demo.example.test
++:path	/alpha
++authorization	Bearer abc
++set-cookie	sid=abc; HttpOnly
++cookie	a=1; b=2
++
++:method	GET
++:scheme	https
++:authority	demo.example.test
++:path	/beta
++authorization	Bearer abc
++set-cookie	sid=abc; HttpOnly
++cookie	a=1; b=2
++
++QIF
++
++run_policy() {
++    policy="$1"
++    output="$2"
++    if [ "$policy" = "default" ]; then
++        "$encode_qif" -i "$qif" -n 2 >"$output"
++    else
++        "$encode_qif" -i "$qif" -n 2 -s "$policy" >"$output"
++    fi
++}
++
++none_out="$tmp_dir/none.hpack"
++auth_out="$tmp_dir/auth.hpack"
++default_out="$tmp_dir/default.hpack"
++auth_set_cookie_out="$tmp_dir/auth-set-cookie.hpack"
++alias_out="$tmp_dir/alias.hpack"
++cookies_out="$tmp_dir/cookies.hpack"
++
++run_policy none "$none_out"
++run_policy auth "$auth_out"
++run_policy default "$default_out"
++run_policy auth-and-set-cookie "$auth_set_cookie_out"
++run_policy set-cookie "$alias_out"
++run_policy cookies "$cookies_out"
++
++if ! cmp -s "$default_out" "$none_out"; then
++    echo "default policy must match none" >&2
++    exit 1
++fi
++
++if ! cmp -s "$auth_set_cookie_out" "$alias_out"; then
++    echo "set-cookie alias must match auth-and-set-cookie policy" >&2
++    exit 1
++fi
++
++default_size="$(wc -c <"$default_out")"
++auth_size="$(wc -c <"$auth_out")"
++auth_set_cookie_size="$(wc -c <"$auth_set_cookie_out")"
++cookies_size="$(wc -c <"$cookies_out")"
++
++if [ "$default_size" -ge "$auth_size" ]; then
++    echo "auth policy should emit more bytes than default: default=$default_size auth=$auth_size" >&2
++    exit 1
++fi
++if [ "$auth_size" -ge "$auth_set_cookie_size" ]; then
++    echo "auth-and-set-cookie policy should emit more bytes than auth: auth=$auth_size auth-set-cookie=$auth_set_cookie_size" >&2
++    exit 1
++fi
++if [ "$auth_set_cookie_size" -ge "$cookies_size" ]; then
++    echo "cookies policy should emit more bytes than auth-and-set-cookie: auth-set-cookie=$auth_set_cookie_size cookies=$cookies_size" >&2
++    exit 1
++fi
++
++if "$encode_qif" -i "$qif" -n 1 -s bogus >/dev/null 2>&1; then
++    echo "unknown sensitive policy should fail" >&2
++    exit 1
++fi
++
++if "$encode_qif" -i "$qif" -n 1 -t -1 >/dev/null 2>&1; then
++    echo "negative dynamic table size should fail" >&2
++    exit 1
++fi
++
++if "$encode_qif" -i "$qif" -n 1 -t notanumber >/dev/null 2>&1; then
++    echo "non-numeric dynamic table size should fail" >&2
++    exit 1
++fi
++
++if "$encode_qif" -i "$qif" -n ' -1' >/dev/null 2>&1; then
++    echo "signed/space-prefixed iteration count should fail" >&2
++    exit 1
++fi
++
++long_qif="$tmp_dir/long.qif"
++awk 'BEGIN {
++    printf "x-long\t";
++    for (i = 0; i < 70000; ++i)
++        printf "a";
++    printf "\n\n";
++}' >"$long_qif"
++
++if "$encode_qif" -i "$long_qif" -n 1 >/dev/null 2>&1; then
++    echo "oversized header should fail" >&2
++    exit 1
++fi
++
++no_final_blank_qif="$tmp_dir/no-final-blank.qif"
++printf ':method	GET
++:path	/no-final-blank' >"$no_final_blank_qif"
++
++"$encode_qif" -i "$no_final_blank_qif" -n 1 >/dev/null
++
++exit 0
+diff --git a/lshpack.c b/lshpack.c
+--- a/lshpack.c
++++ b/lshpack.c
+@@ -345,9 +345,12 @@
+     if (enc->hpe_hist_buf)
+         return 0;
+ 
+-    hist_size = henc_hist_size(INITIAL_DYNAMIC_TABLE_SIZE);
++    hist_size = henc_hist_size(enc->hpe_max_capacity);
+     if (!hist_size)
++    {
++        enc->hpe_flags |= LSHPACK_ENC_USE_HIST;
+         return 0;
++    }
+ 
+     enc->hpe_hist_buf = malloc(sizeof(enc->hpe_hist_buf[0]) * (hist_size + 1));
+     if (!enc->hpe_hist_buf)
+@@ -1150,13 +1153,10 @@
+ {
+     unsigned buckno;
+     struct lshpack_enc_table_entry *entry;
+-    size_t size;
++    size_t size, entry_capacity;
+     const char *name;
+     unsigned int name_len;
+ 
+-    if (enc->hpe_nelem >= N_BUCKETS(enc->hpe_nbits) / 2 &&
+-                                                0 != henc_grow_tables(enc))
+-        return -1;
+     name_len = input->name_len;
+     if (name_len == 0)
+     {
+@@ -1166,6 +1166,17 @@
+     }
+     else
+         name = lsxpack_header_get_name(input);
++    entry_capacity = DYNAMIC_ENTRY_OVERHEAD + name_len + input->val_len;
++    if (entry_capacity > enc->hpe_max_capacity)
++    {
++        while (STAILQ_FIRST(&enc->hpe_all_entries))
++            henc_drop_oldest_entry(enc);
++        return 0;
++    }
++
++    if (enc->hpe_nelem >= N_BUCKETS(enc->hpe_nbits) / 2 &&
++                                                0 != henc_grow_tables(enc))
++        return -1;
+     size = sizeof(*entry) + name_len + input->val_len;
+     entry = malloc(size);
+     if (!entry)
+@@ -1201,7 +1212,7 @@
+ henc_resize_history (struct lshpack_enc *enc)
+ {
+     uint32_t *hist_buf;
+-    unsigned hist_size, first, count, i, j;
++    unsigned hist_size, first, count, i;
+ 
+     hist_size = henc_hist_size(enc->hpe_max_capacity);
+ 
+@@ -1224,7 +1235,7 @@
+ 
+     if (enc->hpe_hist_wrapped)
+     {
+-        first = (enc->hpe_hist_idx + 1) % enc->hpe_hist_size;
++        first = enc->hpe_hist_idx;
+         count = enc->hpe_hist_size;
+     }
+     else
+@@ -1232,11 +1243,16 @@
+         first = 0;
+         count = enc->hpe_hist_idx;
+     }
+-    for (i = 0, j = 0; count > 0 && j < hist_size; ++i, ++j, --count)
+-        hist_buf[j] = enc->hpe_hist_buf[ (first + i) % enc->hpe_hist_size ];
++    if (count > hist_size)
++    {
++        first = (first + count - hist_size) % enc->hpe_hist_size;
++        count = hist_size;
++    }
++    for (i = 0; i < count; ++i)
++        hist_buf[i] = enc->hpe_hist_buf[ (first + i) % enc->hpe_hist_size ];
+     enc->hpe_hist_size = hist_size;
+-    enc->hpe_hist_idx = j % hist_size;
+-    enc->hpe_hist_wrapped = enc->hpe_hist_idx == 0;
++    enc->hpe_hist_idx = count % hist_size;
++    enc->hpe_hist_wrapped = count == hist_size;
+     free(enc->hpe_hist_buf);
+     enc->hpe_hist_buf = hist_buf;
+ }
+diff --git a/test/test_hpack.c b/test/test_hpack.c
+--- a/test/test_hpack.c
++++ b/test/test_hpack.c
+@@ -1269,6 +1269,178 @@
+ }
+ 
+ 
++static void
++test_henc_resize_empty_history_not_wrapped (void)
++{
++    struct lshpack_enc henc;
++    unsigned default_hist_size, expanded_hist_size;
++    int rc;
++
++    rc = lshpack_enc_init(&henc);
++    assert(rc == 0);
++    rc = lshpack_enc_use_hist(&henc, 1);
++    assert(rc == 0);
++    default_hist_size = henc.hpe_hist_size;
++    lshpack_enc_set_max_capacity(&henc, 65536);
++    assert(henc.hpe_hist_size > default_hist_size);
++    assert(henc.hpe_hist_idx == 0);
++    assert(!henc.hpe_hist_wrapped);
++    lshpack_enc_cleanup(&henc);
++
++    rc = lshpack_enc_init(&henc);
++    assert(rc == 0);
++    lshpack_enc_set_max_capacity(&henc, 65536);
++    rc = lshpack_enc_use_hist(&henc, 1);
++    assert(rc == 0);
++    expanded_hist_size = henc.hpe_hist_size;
++    assert(expanded_hist_size > default_hist_size);
++    assert(henc.hpe_hist_idx == 0);
++    assert(!henc.hpe_hist_wrapped);
++    lshpack_enc_cleanup(&henc);
++}
++
++
++static void
++test_henc_resize_wrapped_history_keeps_newest (void)
++{
++    struct lshpack_enc henc;
++    int rc;
++
++    rc = lshpack_enc_init(&henc);
++    assert(rc == 0);
++    lshpack_enc_set_max_capacity(&henc, 288);
++    rc = lshpack_enc_use_hist(&henc, 1);
++    assert(rc == 0);
++    assert(henc.hpe_hist_size == 3);
++
++    henc.hpe_hist_buf[0] = 0xA;
++    henc.hpe_hist_buf[1] = 0xB;
++    henc.hpe_hist_buf[2] = 0xC;
++    henc.hpe_hist_idx = 0;
++    henc.hpe_hist_wrapped = 1;
++
++    lshpack_enc_set_max_capacity(&henc, 384);
++    assert(henc.hpe_hist_size == 4);
++    assert(henc.hpe_hist_buf[0] == 0xA);
++    assert(henc.hpe_hist_buf[1] == 0xB);
++    assert(henc.hpe_hist_buf[2] == 0xC);
++    assert(henc.hpe_hist_idx == 3);
++    assert(!henc.hpe_hist_wrapped);
++
++    henc.hpe_hist_buf[henc.hpe_hist_idx] = 0xD;
++    henc.hpe_hist_idx = (henc.hpe_hist_idx + 1) % henc.hpe_hist_size;
++    henc.hpe_hist_wrapped |= henc.hpe_hist_idx == 0;
++
++    lshpack_enc_set_max_capacity(&henc, 192);
++    assert(henc.hpe_hist_size == 2);
++    assert(henc.hpe_hist_buf[0] == 0xC);
++    assert(henc.hpe_hist_buf[1] == 0xD);
++    assert(henc.hpe_hist_idx == 0);
++    assert(henc.hpe_hist_wrapped);
++    lshpack_enc_cleanup(&henc);
++}
++
++
++static void
++test_henc_resize_unwrapped_history_keeps_newest (void)
++{
++    struct lshpack_enc henc;
++    int rc;
++
++    rc = lshpack_enc_init(&henc);
++    assert(rc == 0);
++    lshpack_enc_set_max_capacity(&henc, 384);
++    rc = lshpack_enc_use_hist(&henc, 1);
++    assert(rc == 0);
++    assert(henc.hpe_hist_size == 4);
++
++    henc.hpe_hist_buf[0] = 0xA;
++    henc.hpe_hist_buf[1] = 0xB;
++    henc.hpe_hist_buf[2] = 0xC;
++    henc.hpe_hist_idx = 3;
++    henc.hpe_hist_wrapped = 0;
++
++    lshpack_enc_set_max_capacity(&henc, 192);
++    assert(henc.hpe_hist_size == 2);
++    assert(henc.hpe_hist_buf[0] == 0xB);
++    assert(henc.hpe_hist_buf[1] == 0xC);
++    assert(henc.hpe_hist_idx == 0);
++    assert(henc.hpe_hist_wrapped);
++    lshpack_enc_cleanup(&henc);
++}
++
++
++static void
++test_henc_hist_enable_survives_zero_capacity (void)
++{
++    struct lshpack_enc henc;
++    int rc;
++
++    rc = lshpack_enc_init(&henc);
++    assert(rc == 0);
++    lshpack_enc_set_max_capacity(&henc, 0);
++    rc = lshpack_enc_use_hist(&henc, 1);
++    assert(rc == 0);
++    assert(lshpack_enc_hist_used(&henc));
++    assert(henc.hpe_hist_size == 0);
++    assert(henc.hpe_hist_idx == 0);
++    assert(!henc.hpe_hist_wrapped);
++
++    lshpack_enc_set_max_capacity(&henc, 65536);
++    assert(lshpack_enc_hist_used(&henc));
++    assert(henc.hpe_hist_size > 0);
++    assert(henc.hpe_hist_idx == 0);
++    assert(!henc.hpe_hist_wrapped);
++    lshpack_enc_cleanup(&henc);
++}
++
++
++static void
++test_hpack_skips_oversized_dynamic_entries (void)
++{
++    struct lshpack_enc henc;
++    struct lshpack_dec hdec;
++    struct lsxpack_header xhdr;
++    char small[] = "smallnamevalue";
++    char large[] = "large-nameaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
++                   "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
++    int rc;
++
++    rc = lshpack_enc_init(&henc);
++    assert(rc == 0);
++    lshpack_enc_set_max_capacity(&henc, 64);
++    lsxpack_header_set_offset2(&xhdr, small, 0, 5, 5, 9);
++    (void) lshpack_enc_precompute_static(&xhdr, LSHPACK_ENC_PRECOMPUTE_FULL);
++    rc = lshpack_enc_push_entry(&henc, &xhdr);
++    assert(rc == 0);
++    assert(henc.hpe_nelem == 1);
++    assert(henc.hpe_cur_capacity > 0);
++
++    lsxpack_header_set_offset2(&xhdr, large, 0, 10, 10, sizeof(large) - 11);
++    (void) lshpack_enc_precompute_static(&xhdr, LSHPACK_ENC_PRECOMPUTE_FULL);
++    rc = lshpack_enc_push_entry(&henc, &xhdr);
++    assert(rc == 0);
++    assert(henc.hpe_nelem == 0);
++    assert(henc.hpe_cur_capacity == 0);
++    lshpack_enc_cleanup(&henc);
++
++    lshpack_dec_init(&hdec);
++    lshpack_dec_set_max_capacity(&hdec, 64);
++    lsxpack_header_set_offset2(&xhdr, small, 0, 5, 5, 9);
++    rc = lshpack_dec_push_entry(&hdec, &xhdr);
++    assert(rc == 0);
++    assert(hdec.hpd_dyn_table.nelem == 1);
++    assert(hdec.hpd_cur_capacity > 0);
++
++    lsxpack_header_set_offset2(&xhdr, large, 0, 10, 10, sizeof(large) - 11);
++    rc = lshpack_dec_push_entry(&hdec, &xhdr);
++    assert(rc == 0);
++    assert(hdec.hpd_dyn_table.nelem == 0);
++    assert(hdec.hpd_cur_capacity == 0);
++    lshpack_dec_cleanup(&hdec);
++}
++
++
+ 
+ /* Test that if empty buffer is given writing is not done */
+ static void
+@@ -1897,6 +2069,11 @@
+     test_henc_rejects_bad_static_index_without_never_index();
+     test_henc_precompute_static_metadata();
+     test_henc_precompute_indexed_name_promotes_exact_static_value();
++    test_henc_resize_empty_history_not_wrapped();
++    test_henc_resize_wrapped_history_keeps_newest();
++    test_henc_resize_unwrapped_history_keeps_newest();
++    test_henc_hist_enable_survives_zero_capacity();
++    test_hpack_skips_oversized_dynamic_entries();
+     test_static_table_search_simple();
+     test_static_table_search_exhaustive();
+     test_hpack_test_RFC_Example();

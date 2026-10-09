@@ -1,0 +1,6 @@
+// Provenance markers allowed per file in comments, enforced by the
+// conventions gate in runtime/tests/conventions.zig. Generated: after
+// rewriting comments, `zig build provenance-baseline` lowers these counts
+// and drops files that reach zero. It never raises a count.
+.{
+}

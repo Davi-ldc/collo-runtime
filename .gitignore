@@ -1,0 +1,25 @@
+# Secrets never enter the repository.
+.env
+.env.*
+/.claude/settings.local.json
+
+# Working notes and measurement runs stay on the machine that wrote them.
+/todo/
+/report/
+
+# The ownership map agents work from stays on the machine.
+/runtime/MAP.md
+MAPA.md
+
+# Build outputs.
+zig-out/
+.zig-cache/
+
+# Native dependencies are provisioned per machine, not cloned: pinned
+# versions and patch series live in runtime/deps/*.version and
+# runtime/patches/, the trees and archives do not.
+runtime/deps/boringssl
+runtime/deps/ls-hpack
+runtime/deps/WebKit
+runtime/deps/webkit-authoring
+runtime/deps/jsc-build

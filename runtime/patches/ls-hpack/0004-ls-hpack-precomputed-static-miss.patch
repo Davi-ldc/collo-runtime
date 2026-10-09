@@ -1,0 +1,142 @@
+diff --git a/lsxpack_header.h b/lsxpack_header.h
+--- a/lsxpack_header.h
++++ b/lsxpack_header.h
+@@ -33,6 +33,7 @@
+     LSXPACK_NAMEVAL_HASH = 16,
+     LSXPACK_VAL_MATCHED = 32,
+     LSXPACK_NEVER_INDEX = 64,
++    LSXPACK_HPACK_STATIC_MISS = 128,
+ };
+ 
+ /**
+diff --git a/lshpack.c b/lshpack.c
+--- a/lshpack.c
++++ b/lshpack.c
+@@ -555,6 +555,7 @@
+     const char *value;
+     unsigned candidate, id;
+ 
++    input->flags &= ~LSXPACK_HPACK_STATIC_MISS;
+     if (input->hpack_index > HPACK_STATIC_TABLE_SIZE)
+     {
+         input->hpack_index = LSHPACK_HDR_UNKNOWN;
+@@ -622,6 +623,8 @@
+ 
+     input->flags &= ~LSXPACK_HPACK_VAL_MATCHED;
+     input->hpack_index = lshpack_enc_get_static_name(input);
++    if (input->hpack_index == LSHPACK_HDR_UNKNOWN)
++        input->flags |= LSXPACK_HPACK_STATIC_MISS;
+     return input->hpack_index;
+ }
+ 
+@@ -646,9 +649,18 @@
+     const char *val_ptr = input->buf + input->val_offset;
+     const char *name;
+     unsigned int name_len;
++    int static_miss;
+ 
+     name_len = input->name_len;
+     name = lsxpack_header_get_name(input);
++    static_miss = !!(input->flags & LSXPACK_HPACK_STATIC_MISS);
++
++    if (static_miss)
++    {
++        assert(input->hpack_index == LSHPACK_HDR_UNKNOWN);
++        assert(input->flags & LSXPACK_NAME_HASH);
++        assert(input->flags & LSXPACK_NAMEVAL_HASH);
++    }
+ 
+     if (input->hpack_index > HPACK_STATIC_TABLE_SIZE)
+     {
+@@ -661,7 +673,13 @@
+     }
+ 
+     /* First, look for a match in the static table: */
+-    if (input->hpack_index)
++    if (static_miss)
++    {
++        /* Static name and name/value misses were already established by
++         * lshpack_enc_precompute_static(). Keep the dynamic-table lookups
++         * below, but do not repeat either static-table probe. */
++    }
++    else if (input->hpack_index)
+     {
+         id = input->hpack_index - 1;
+ #ifndef NDEBUG
+@@ -727,7 +745,7 @@
+         }
+ 
+     /* Name/value match is not found, look for header: */
+-    if (input->hpack_index == LSHPACK_HDR_UNKNOWN)
++    if (!static_miss && input->hpack_index == LSHPACK_HDR_UNKNOWN)
+         input->hpack_index = lshpack_enc_get_static_name(input);
+     if (input->hpack_index != LSHPACK_HDR_UNKNOWN)
+     {
+diff --git a/lshpack.h b/lshpack.h
+--- a/lshpack.h
++++ b/lshpack.h
+@@ -161,7 +161,9 @@
+  * Precompute reusable HPACK encoder metadata on a header.
+  *
+  * FULL computes name and name/value hashes, finds static table matches, and
+- * marks exact static name/value matches with LSXPACK_HPACK_VAL_MATCHED.
++ * marks exact static name/value matches with LSXPACK_HPACK_VAL_MATCHED. A full
++ * miss is marked with LSXPACK_HPACK_STATIC_MISS so later encodes skip repeated
++ * static-table probes while retaining dynamic-table lookups.
+  * NAME_ONLY computes only name metadata and clears value-match metadata; use it
+  * with LSXPACK_NEVER_INDEX to avoid hashing large or sensitive values.
+  *
+diff --git a/test/test_hpack.c b/test/test_hpack.c
+--- a/test/test_hpack.c
++++ b/test/test_hpack.c
+@@ -1222,6 +1222,42 @@
+ 
+ 
+ static void
++test_henc_precompute_marks_static_miss (void)
++{
++    struct lshpack_enc henc;
++    struct lsxpack_header xhdr;
++    unsigned char out[0x100], *end;
++    char header[] = "x-prepared-missvalue";
++    unsigned index;
++    int rc;
++
++    rc = lshpack_enc_init(&henc);
++    assert(rc == 0);
++    lsxpack_header_set_offset2(&xhdr, header, 0, 15, 15, 5);
++    index = lshpack_enc_precompute_static(&xhdr,
++                                          LSHPACK_ENC_PRECOMPUTE_FULL);
++    assert(index == LSHPACK_HDR_UNKNOWN);
++    assert(xhdr.flags & LSXPACK_HPACK_STATIC_MISS);
++    assert(xhdr.flags & LSXPACK_NAME_HASH);
++    assert(xhdr.flags & LSXPACK_NAMEVAL_HASH);
++
++    end = lshpack_enc_encode(&henc, out, out + sizeof(out), &xhdr);
++    assert(end > out + 1);
++    assert(henc.hpe_nelem == 1);
++
++    lsxpack_header_set_offset2(&xhdr, header, 0, 15, 15, 5);
++    index = lshpack_enc_precompute_static(&xhdr,
++                                          LSHPACK_ENC_PRECOMPUTE_FULL);
++    assert(index == LSHPACK_HDR_UNKNOWN);
++    assert(xhdr.flags & LSXPACK_HPACK_STATIC_MISS);
++    end = lshpack_enc_encode(&henc, out, out + sizeof(out), &xhdr);
++    assert(end == out + 1);
++    assert(out[0] == 0xBE);
++    lshpack_enc_cleanup(&henc);
++}
++
++
++static void
+ test_henc_precompute_indexed_name_promotes_exact_static_value (void)
+ {
+     static const struct {
+@@ -2068,6 +2104,7 @@
+     test_henc_never_index_rejects_bad_static_index();
+     test_henc_rejects_bad_static_index_without_never_index();
+     test_henc_precompute_static_metadata();
++    test_henc_precompute_marks_static_miss();
+     test_henc_precompute_indexed_name_promotes_exact_static_value();
+     test_henc_resize_empty_history_not_wrapped();
+     test_henc_resize_wrapped_history_keeps_newest();

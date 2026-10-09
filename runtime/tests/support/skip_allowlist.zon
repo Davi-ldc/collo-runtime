@@ -1,0 +1,30 @@
+// Tests that may skip when COLLO_TEST_STRICT_SKIPS=1, as `zig build smoke`
+// runs every suite. Any other skip fails such a run, and so does an entry
+// naming a test its suite no longer compiles (rules in skip_allowlist.zig).
+//
+// `suite` is the root source file of the test compilation, relative to the
+// repository root; `name` is the test as the runner prints it; `reason` names
+// the host capability the skip stands for, the opt-in that gates the test, or
+// the recorded defect the skip reproduces.
+.{
+    .{
+        .suite = "runtime/tests/integration/all.zig",
+        .name = "local_server.e2e.test.local e2e bench: directed cold-start burst (env-gated)",
+        .reason = "opt-in benchmark: runs only with COLLO_BENCH_BURST set",
+    },
+    .{
+        .suite = "runtime/tests/integration/all.zig",
+        .name = "local_server.e2e.test.local e2e bench: cold start with TLS cold vs TLS already open (env-gated)",
+        .reason = "opt-in benchmark: runs only with COLLO_BENCH_TLS set",
+    },
+    .{
+        .suite = "runtime/tests/integration/all.zig",
+        .name = "local_server.e2e.test.local e2e bench: what one more worker costs the system (env-gated)",
+        .reason = "opt-in benchmark: runs only with COLLO_BENCH_MEM set",
+    },
+    .{
+        .suite = "runtime/tests/integration/all.zig",
+        .name = "local_server.e2e.test.local e2e bench: private bytes per byte of module pack (env-gated)",
+        .reason = "opt-in benchmark: runs only with COLLO_BENCH_PACK set",
+    },
+}

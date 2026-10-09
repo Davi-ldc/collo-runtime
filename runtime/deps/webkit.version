@@ -1,0 +1,8 @@
+Source: https://github.com/oven-sh/WebKit.git
+Commit: 2e2aa2290fac856d6f451ceacb58f7f5b44dd057
+Patches: patches/webkit
+
+Bun's fork of WebKit, pinned to one commit and consumed through a shallow,
+blob-less clone of that commit only (`zig build webkit-provision`). The
+runtime build reads this file at configure time; the buildtool receives the
+commit as an argument and refuses any checkout whose HEAD differs.

@@ -1,0 +1,189 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Davi <davilimacarv2536@gmail.com>
+Date: Sun, 13 Sep 2026 22:38:43 -0300
+Subject: [PATCH 3/4] string prefix copy and console label clamp
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds `JSString::colloCopyPrefix`, a bounded forward rope walker that
+copies a string prefix without resolving the rope (fiber accessors are
+private to `JSRopeString`, so no embedder-side helper can do this), and
+clamps the `console.count`/`time`/`profile` label coercion inside
+`ConsoleObject.cpp` — the label is stringified before any
+`ConsoleClient` hook runs, so only this patch can stop a giant rope
+label from fully materializing. Both serve the console log formatter's
+no-unbounded-materialization invariant.
+---
+ .../JavaScriptCore/runtime/ConsoleObject.cpp  | 50 +++++++++++++++-
+ Source/JavaScriptCore/runtime/JSString.cpp    | 58 +++++++++++++++++++
+ Source/JavaScriptCore/runtime/JSString.h      |  6 ++
+ 3 files changed, 112 insertions(+), 2 deletions(-)
+
+diff --git a/Source/JavaScriptCore/runtime/ConsoleObject.cpp b/Source/JavaScriptCore/runtime/ConsoleObject.cpp
+index 599be35f..f9638f1d 100644
+--- a/Source/JavaScriptCore/runtime/ConsoleObject.cpp
++++ b/Source/JavaScriptCore/runtime/ConsoleObject.cpp
+@@ -27,12 +27,58 @@
+ #include "ConsoleObject.h"
+ 
+ #include "ConsoleClient.h"
++#include "JSBigInt.h"
+ #include "JSCInlines.h"
+ #include "ScriptArguments.h"
+ #include "ScriptCallStackFactory.h"
+ 
+ namespace JSC {
+ 
++// Collo: console.count/time labels (and profile/heap-snapshot titles) are
++// coerced to WTF::String here, before any ConsoleClient hook runs, so an
++// oversized rope label would otherwise fully resolve. Copy a bounded prefix
++// instead; labels that only differ past the cap collide, which is acceptable
++// for console bookkeeping keys.
++static constexpr unsigned colloMaxLabelUnits = 1024;
++// 55 limbs materialize >= 1027 decimal digits (19+ digits per 64-bit limb),
++// so no label that could survive the unit cap is ever refused.
++static constexpr unsigned colloMaxLabelBigIntLimbs = colloMaxLabelUnits / 19 + 1;
++
++static String colloClampedToWTFString(JSGlobalObject* globalObject, JSValue value)
++{
++    VM& vm = globalObject->vm();
++    auto scope = DECLARE_THROW_SCOPE(vm);
++    // Resolve any user coercion FIRST (toPrimitive runs trappable user JS —
++    // Symbol.toPrimitive, valueOf, toString overrides), then guard the
++    // RESULT. NoPreference (valueOf-before-toString) is deliberate over a
++    // string hint: a boxed BigInt (Object(10n ** N)) coerces to its internal
++    // BigInt PRIMITIVE via valueOf — cheap — whereas a string hint would run
++    // BigInt.prototype.toString and materialize the full decimal (~10MB, the
++    // exact untrappable work we guard against) INSIDE ToPrimitive, before we
++    // could inspect it. After ToPrimitive the value is a primitive, so the
++    // guard sees the actual coerced BigInt (bare, boxed, or from a
++    // Symbol.toPrimitive that returns one) and the final toString can no
++    // longer re-enter user code. A user coercion that returns a small value
++    // (e.g. an overridden Symbol.toPrimitive) is honored — no false positive.
++    // Node's String(label) uses a string hint and would itself hang on a
++    // boxed giant BigInt; bounding it here is a deliberate, safer deviation.
++    JSValue primitive = value.toPrimitive(globalObject);
++    RETURN_IF_EXCEPTION(scope, String());
++    // An oversized BigInt collapses to one opaque label instead of
++    // materializing ~10MB of digits and seconds of untrappable CPU inside
++    // toString(); past-the-cap labels collide anyway. length() = limb count.
++    if (primitive.isHeapBigInt() && primitive.asHeapBigInt()->length() > colloMaxLabelBigIntLimbs) [[unlikely]]
++        return "[BigInt]"_s;
++    JSString* string = primitive.toString(globalObject);
++    RETURN_IF_EXCEPTION(scope, String());
++    if (string->length() > colloMaxLabelUnits) [[unlikely]] {
++        char16_t buffer[colloMaxLabelUnits];
++        unsigned copied = string->colloCopyPrefix(std::span { buffer });
++        return String(std::span { buffer }.first(copied));
++    }
++    RELEASE_AND_RETURN(scope, String(string->value(globalObject)));
++}
++
+ static String valueOrDefaultLabelString(JSGlobalObject* globalObject, CallFrame* callFrame)
+ {
+     if (callFrame->argumentCount() < 1)
+@@ -42,7 +88,7 @@ static String valueOrDefaultLabelString(JSGlobalObject* globalObject, CallFrame*
+     if (value.isUndefined())
+         return "default"_s;
+ 
+-    return value.toWTFString(globalObject);
++    return colloClampedToWTFString(globalObject, value);
+ }
+ 
+ STATIC_ASSERT_IS_TRIVIALLY_DESTRUCTIBLE(ConsoleObject);
+@@ -124,7 +170,7 @@ static String valueToStringWithUndefinedOrNullCheck(JSGlobalObject* globalObject
+ {
+     if (value.isUndefinedOrNull())
+         return String();
+-    return value.toWTFString(globalObject);
++    return colloClampedToWTFString(globalObject, value);
+ }
+ 
+ static EncodedJSValue consoleLogWithLevel(JSGlobalObject* globalObject, CallFrame* callFrame, MessageLevel level)
+diff --git a/Source/JavaScriptCore/runtime/JSString.cpp b/Source/JavaScriptCore/runtime/JSString.cpp
+index f3667ec3..fa4ec51d 100644
+--- a/Source/JavaScriptCore/runtime/JSString.cpp
++++ b/Source/JavaScriptCore/runtime/JSString.cpp
+@@ -290,6 +290,64 @@ const String& JSRopeString::resolveRopeWithoutGC() const
+     });
+ }
+ 
++// Collo: bounded forward variant of JSRopeString::resolveToBufferSlow. Walks
++// fibers left-to-right with an explicit work queue and clamps every leaf copy
++// to the remaining capacity. A fiber whose start lies past the remaining
++// capacity is never queued, so the queue never holds more than ~capacity
++// entries' worth of pending material (fibers are never empty: RopeBuilder
++// skips zero-length appends). Space never depends on the full rope length.
++//
++// TIME needs its own bound: an append-chain rope (`s += x` in a loop) puts
++// leaf k at depth N-k, so copying even a tiny prefix of a million-append
++// rope would chase a million pointers of untrappable native work before the
++// first unit lands. The node budget cuts that walk: any legitimate log
++// content stays far under it (filling C units needs ~C leaves on balanced
++// or prepend-built shapes, and append-built strings up to the budget's
++// depth still render), while a deeper-than-budget chain yields whatever was
++// copied before the cut — the caller's over-length ellipsis already marks
++// the truncation.
++static constexpr size_t colloCopyPrefixNodeBudget = 1 << 20;
++
++unsigned JSString::colloCopyPrefix(std::span<char16_t> output)
++{
++    size_t written = 0;
++    size_t nodeBudget = colloCopyPrefixNodeBudget;
++    Vector<JSString*, 32, UnsafeVectorOverflow> workQueue;
++    if (!output.empty())
++        workQueue.append(this);
++    while (!workQueue.isEmpty() && written < output.size() && nodeBudget--) {
++        JSString* current = workQueue.takeLast();
++        if (current->isRope()) {
++            JSRopeString* rope = static_cast<JSRopeString*>(current);
++            if (rope->isSubstring()) {
++                StringView view = *rope->substringBase()->valueInternal().impl();
++                unsigned take = static_cast<unsigned>(std::min<size_t>(rope->length(), output.size() - written));
++                view.substring(rope->substringOffset(), take).getCharacters(output.subspan(written, take));
++                written += take;
++                continue;
++            }
++            JSString* kept[JSRopeString::s_maxInternalRopeLength];
++            size_t keptCount = 0;
++            size_t planned = written;
++            for (unsigned i = 0; i < JSRopeString::s_maxInternalRopeLength; ++i) {
++                JSString* fiber = rope->fiber(i);
++                if (!fiber || planned >= output.size())
++                    break;
++                kept[keptCount++] = fiber;
++                planned += fiber->length();
++            }
++            while (keptCount)
++                workQueue.append(kept[--keptCount]);
++            continue;
++        }
++        StringView view = *current->valueInternal().impl();
++        unsigned take = static_cast<unsigned>(std::min<size_t>(view.length(), output.size() - written));
++        view.left(take).getCharacters(output.subspan(written, take));
++        written += take;
++    }
++    return static_cast<unsigned>(written);
++}
++
+ void JSRopeString::outOfMemory(JSGlobalObject* nullOrGlobalObjectForOOM) const
+ {
+     ASSERT(isRope());
+diff --git a/Source/JavaScriptCore/runtime/JSString.h b/Source/JavaScriptCore/runtime/JSString.h
+index 7f0f2f32..157d604e 100644
+--- a/Source/JavaScriptCore/runtime/JSString.h
++++ b/Source/JavaScriptCore/runtime/JSString.h
+@@ -144,6 +144,12 @@ public:
+     template<typename CharacterType>
+     inline void resolveToBuffer(std::span<CharacterType>);
+ 
++    // Collo: copy up to output.size() UTF-16 code units of this string's
++    // prefix without resolving ropes and without allocating, throwing, or
++    // triggering GC; returns the number of units written. 8-bit runs are
++    // upconverted on copy.
++    JS_EXPORT_PRIVATE unsigned colloCopyPrefix(std::span<char16_t> output);
++
+ private:
+     String& uninitializedValueInternal() const
+     {
