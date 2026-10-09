@@ -52,9 +52,9 @@ Collo runs on one Linux node without the Collo platform or Cloudflare. Logs and 
 
 ## Current state
 
-`collo serve` runs a `collo.json` configuration, or an entry module with a configuration synthesized from it, behind TLS and HTTP/2, and generates a self-signed certificate when none is configured. The server matches each request's path against a static route table built at boot and schedules workers per worker definition; console lines go to stderr, and access and usage records go to a local analytics directory when one is configured. Multi-route workers and `isolateRealm` are not implemented: every worker definition has exactly one route, so each VM has one global object, and `network` and `cpuMs` are rejected as not supported yet; until `network` lands, outbound `fetch` reaches any public HTTPS origin. The request path follows the four principles of [todo/request-path.md](../../../todo/request-path.md): every failure belongs to a connection, a worker, a lane or the server; one pool per worker definition hands out worker slots and gives a freed slot to the request waiting for it; the gateway admits each fetch on a capability token the server mints with no round trip; and the server reads what a worker writes once, into a private copy. Units 0 to 4 of that design have landed and unit 5, the lane's shape, is next; [todo/bugs.md](../../../todo/bugs.md) numbers the known defects. The build works, and `zig build smoke`, required before every handoff, runs the test suites and the kernel lanes with strict skips, then one HTTP/2 request through the installed `collo serve`. The cold-start budget is not met. The [ledger](../../../todo/separation.md) tracks phases and decisions.
+`collo serve` runs a `collo.json` configuration, or an entry module with a configuration synthesized from it, behind TLS and HTTP/2, and generates a self-signed certificate when none is configured. The server matches each request's path against a static route table built at boot and schedules workers per worker definition; console lines go to stderr, and access and usage records go to a local analytics directory when one is configured. A worker runs every route of its definition, each in its own realm unless `isolateRealm` is false. `network` and `cpuMs` are rejected as not supported yet; until `network` lands, outbound `fetch` reaches any public HTTPS origin. The request path follows four principles: every failure belongs to a connection, a worker, a lane or the server; one pool per worker definition hands out worker slots and gives a freed slot to the request waiting for it; the gateway admits each fetch on a capability token the server mints with no round trip; and the server reads what a worker writes once, into a private copy. The build works, and `zig build smoke`, required before every handoff, runs the test suites and the kernel lanes with strict skips, then one HTTP/2 request through the installed `collo serve`. The cold-start budget is not met.
 
-Every area reference under `internals/` and the ownership map are written from the current code and kept current with it: the change that alters a mechanism updates the reference and the map row that describe it. Where a reference disagrees with this document about goals or invariants, this document wins. Where it disagrees with the code about mechanics, the code and its `//!` headers win.
+Every area reference under `internals/` is written from the current code and kept current with it: the change that alters a mechanism updates the reference that describes it. Where a reference disagrees with this document about goals or invariants, this document wins. Where it disagrees with the code about mechanics, the code and its `//!` headers win.
 
 ## References
 
@@ -70,8 +70,6 @@ Build, tests and measurement:
 - [internals/build.md](internals/build.md): build steps, job limits, the `runtime/deps/` layout, engine profiles and provenance, WebKit patch authoring.
 - [e2e.md](e2e.md): the local full-flow test through server, zygote, sandboxed worker and gateway.
 - [runtime/bench/sandbox/README.md](../../../runtime/bench/sandbox/README.md): cold-start and memory microbenchmarks.
-- [report/bench-sandbox/README.md](../../../report/bench-sandbox/README.md): current baseline results.
-- [runtime/MAP.md](../../../runtime/MAP.md): which module, process, thread and test lane owns each directory, the shared contracts and their owners, the test lanes and the module boundaries.
 
 Areas:
 
@@ -82,13 +80,3 @@ Areas:
 - [internals/memory-pressure.md](internals/memory-pressure.md): a worker's memory limit from the configuration to its cgroup, the marks a growing worker meets, how a memory death is classified and recorded, the OOM scores, and the memory the node spends per worker outside its cgroup.
 - [internals/security.md](internals/security.md): sandbox layers, the seccomp allowlist and the server trust boundary.
 - [internals/egress.md](internals/egress.md): outbound fetch through the gateway: the token, the sessions and their wake set, admission, the pools and the limits.
-
-Ledgers and reports:
-
-- [todo/separation.md](../../../todo/separation.md): separation phases, decisions and exit criteria.
-- [todo/request-path.md](../../../todo/request-path.md): the request-path redesign: principles, units and regression tests.
-- [todo/bugs.md](../../../todo/bugs.md): known defects in fix order, cited by number.
-- [todo/napi.md](../../../todo/napi.md): native addon threat model, parked.
-- [todo/egress-0rtt.md](../../../todo/egress-0rtt.md): TLS 0-RTT in the egress client, parked.
-- [report/request-path-map.md](../../../report/request-path-map.md): the request path as it ran before the redesign, which was the redesign's read-only input.
-- [report/fase-4.md](../../../report/fase-4.md): the latest security audit, whose findings are phase 4 of the ledger.

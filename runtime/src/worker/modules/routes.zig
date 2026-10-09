@@ -25,7 +25,11 @@
 //!
 //! Exports are read only after the evaluation settles, and a failed
 //! evaluation stays failed for the worker's life (`RouteModuleState` in
-//! `state.zig` says why).
+//! `state.zig` says why). A synchronous throw, a rejected top-level await and
+//! an await still pending past `module_eval_budget_ns` each pin only their
+//! own route failed, and the route's requests get the same 500 in all three
+//! cases while the other routes keep serving. The worker gives way to a fresh
+//! one only once no route can serve (`pinFailed` owns the rule).
 
 const std = @import("std");
 const bindings = @import("collo_bindings");
@@ -65,9 +69,9 @@ pub const RouteHandlerResult = union(enum) {
 
 /// How long a route module's top-level await may stay pending, from the
 /// moment its evaluation goes pending; it matches the cap AWS Lambda puts on
-/// a function's init phase. A hung await outlives every request, and traffic
-/// keeps the worker from idling out, so past this budget the worker recycles
-/// (`evaluationZombie`).
+/// a function's init phase. A hung await outlives every request that waits
+/// on it, so past this budget its route is pinned failed (`expireEvaluation`)
+/// and the requests parked on it get their 500.
 pub const module_eval_budget_ns: u64 = 10 * std.time.ns_per_s;
 
 /// The handler and `env` of the route `request_ctx` dispatches to. A route
@@ -109,7 +113,7 @@ pub fn ensureRouteHandler(
             // later requests fail with `error.RouteModuleEvaluationFailed`
             // instead of importing the module again (`RouteModuleState` in
             // `state.zig`).
-            markRouteFailed(ctx, index);
+            markRouteThrew(ctx, index);
             return .{ .exception = exception };
         },
     }
@@ -147,7 +151,8 @@ fn evaluateRoute(
         },
         .pending => {
             var evaluating = modules_state.RouteModuleState.Evaluating{
-                .deadline_mono_ns = ctx.nowMonoNs() +| module_eval_budget_ns,
+                .deadline_mono_ns = instanceDeadline(ctx, realm, route.entry_specifier) orelse
+                    ctx.nowMonoNs() +| module_eval_budget_ns,
             };
             errdefer evaluating.waiters.deinit(ctx.allocator);
             if (waiter_request_id) |request_id|
@@ -158,6 +163,31 @@ fn evaluateRoute(
         .exception => |exception| return .{ .exception = exception },
         .unsupported => |exception| return .{ .exception = exception },
     }
+}
+
+/// The deadline of the evaluation in flight for the module instance that
+/// `specifier` names in `realm`, when another route already waits on it.
+/// Routes that share an instance get one outcome from its one evaluation, so
+/// they also share its deadline instead of each counting from its own start.
+fn instanceDeadline(ctx: *module_context.Context, realm: bindings.Realm, specifier: []const u8) ?u64 {
+    for (ctx.modules.routes.items) |*candidate| {
+        const evaluating = switch (candidate.module) {
+            .evaluating => |*evaluating| evaluating,
+            .idle, .ready, .failed => continue,
+        };
+        if (sameInstance(candidate, realm.index(), specifier))
+            return evaluating.deadline_mono_ns;
+    }
+    return null;
+}
+
+/// Whether `route` evaluates the module `specifier` names in the realm with
+/// index `realm_index`, which is how a settlement names an instance.
+fn sameInstance(route: *const modules_state.Route, realm_index: u32, specifier: []const u8) bool {
+    const realm = route.realm orelse return false;
+    if (realm.index() != realm_index)
+        return false;
+    return std.mem.eql(u8, route.entry_specifier, specifier);
 }
 
 /// The realm the route at `index` runs in, created on its first use: in a
@@ -202,12 +232,12 @@ fn finishReadyRoute(ctx: *module_context.Context, index: usize) !ReadyOutcome {
     return .ready;
 }
 
+/// The end of one route's evaluation, settled or expired: the requests parked
+/// on it, which the caller queues again so each runs against the route's new
+/// state.
 pub const Settlement = struct {
     /// Owned by the caller.
     waiters: std.ArrayListUnmanaged(u64),
-    /// `.ready` means the await resolved, even when reading the handler then
-    /// failed and left the next request to try again.
-    transition: enum { ready, failed },
 };
 
 /// Finishes the evaluation of the next route whose entry is `specifier` and
@@ -216,10 +246,10 @@ pub const Settlement = struct {
 /// `collo_runtime_module_eval_settled` reported. Routes that share a realm and
 /// an entry share one module instance, so one settlement finishes each of
 /// them, one call at a time. A resolved await makes the route ready through
-/// `finishReadyRoute`; a rejected one pins it failed (`RouteModuleState` in
-/// `state.zig`). Returns the route's parked request ids for the caller to
-/// queue again, or null once no route matches, as for a settlement that came
-/// late or twice.
+/// `finishReadyRoute`; a rejected one pins it failed (`pinFailed`). Returns
+/// the route's parked request ids for the caller to queue again, or null
+/// once no route matches, as for a settlement that came late or twice, or
+/// after its routes expired (`expireEvaluation`).
 pub fn settleEvaluation(
     ctx: *module_context.Context,
     realm_index: u32,
@@ -229,19 +259,21 @@ pub fn settleEvaluation(
     const index = for (ctx.modules.routes.items, 0..) |*candidate, candidate_index| {
         if (candidate.module != .evaluating)
             continue;
-        const realm = candidate.realm orelse continue;
-        if (realm.index() == realm_index and std.mem.eql(u8, candidate.entry_specifier, specifier))
+        if (sameInstance(candidate, realm_index, specifier))
             break candidate_index;
     } else return null;
+    if (!resolved) {
+        std.log.warn("route module evaluation rejected; route pinned failed route={d} specifier={s}", .{
+            index,
+            specifier,
+        });
+        return .{ .waiters = pinFailed(ctx, index, .rejected) };
+    }
     const route = &ctx.modules.routes.items[index];
     const waiters = route.module.evaluating.waiters;
     // The waiters move to the caller; the evaluating record owns nothing
     // else, so the tag flips in place.
-    route.module = if (resolved) .idle else .failed;
-    if (!resolved) {
-        std.log.warn("route module evaluation rejected route={d} specifier={s}", .{ index, specifier });
-        return .{ .waiters = waiters, .transition = .failed };
-    }
+    route.module = .idle;
 
     const outcome = finishReadyRoute(ctx, index) catch |err| blk: {
         std.log.warn("route module settlement finish failed route={d} specifier={s}: {s}", .{
@@ -259,38 +291,38 @@ pub fn settleEvaluation(
             std.log.warn("route module default export raised at settlement route={d} specifier={s}", .{ index, specifier });
         },
     };
-    return .{ .waiters = waiters, .transition = .ready };
+    // The waiters run even when reading the handler failed: the route is
+    // then `idle` again, and each evaluates the entry on its own.
+    return .{ .waiters = waiters };
 }
 
-/// Whether the route at `index` has stayed pending past
-/// `module_eval_budget_ns`, in which case the caller recycles the worker.
-/// `deadlineTimeout` in `worker/serve/dispatch.zig` checks it and says why
-/// a request's deadline is the wake that reaches it.
-pub fn evaluationZombie(ctx: *module_context.Context, index: usize) bool {
-    if (index >= ctx.modules.routes.items.len)
-        return false;
-    return routeZombie(ctx, &ctx.modules.routes.items[index]);
-}
-
-/// Whether any route has stayed pending past `module_eval_budget_ns`: the
-/// check of the boot context's deadline, which bounds every route the boot
-/// evaluated.
-pub fn anyEvaluationZombie(ctx: *module_context.Context) bool {
-    for (ctx.modules.routes.items) |*route| {
-        if (routeZombie(ctx, route))
-            return true;
-    }
-    return false;
-}
-
-fn routeZombie(ctx: *module_context.Context, route: *const modules_state.Route) bool {
-    if (route.module != .evaluating)
-        return false;
-    return ctx.nowMonoNs() >= route.module.evaluating.deadline_mono_ns;
+/// Pins failed the next route whose top-level await is still pending past
+/// its deadline (`RouteModuleState.Evaluating.deadline_mono_ns`), as a
+/// rejection would, and returns its parked request ids for the caller to
+/// queue again, or null once no route has expired. The module's code may
+/// still run and settle later; that settlement finds no route evaluating it
+/// and is ignored, so the route stays failed. The caller decides when to
+/// look (`deadlineTimeout` in `worker/serve/dispatch.zig`).
+pub fn expireEvaluation(ctx: *module_context.Context) ?Settlement {
+    const now = ctx.nowMonoNs();
+    const index = for (ctx.modules.routes.items, 0..) |*candidate, candidate_index| {
+        const evaluating = switch (candidate.module) {
+            .evaluating => |*evaluating| evaluating,
+            .idle, .ready, .failed => continue,
+        };
+        if (now >= evaluating.deadline_mono_ns)
+            break candidate_index;
+    } else return null;
+    std.log.warn("route module evaluation exceeded its budget; route pinned failed route={d} specifier={s}", .{
+        index,
+        ctx.modules.routes.items[index].entry_specifier,
+    });
+    return .{ .waiters = pinFailed(ctx, index, .exceeded_budget) };
 }
 
 /// Whether any route's top-level await is still in flight. The boot context
-/// closes once none is (`Runtime.handleModuleEvaluationSettled`).
+/// closes once none is, after a settlement or an expiry
+/// (`worker/runtime/modules.zig`).
 pub fn anyEvaluating(ctx: *module_context.Context) bool {
     for (ctx.modules.routes.items) |route| {
         if (route.module == .evaluating)
@@ -372,7 +404,7 @@ pub fn bootEvaluateRoute(ctx: *module_context.Context, index: usize) !BootRouteO
             // route's requests fail at once with
             // `error.RouteModuleEvaluationFailed` and the worker answers each
             // with a 500.
-            markRouteFailed(ctx, index);
+            markRouteThrew(ctx, index);
             std.log.warn("boot route evaluation raised; route pinned failed route={d} specifier={s}", .{
                 index,
                 ctx.modules.routes.items[index].entry_specifier,
@@ -435,12 +467,60 @@ fn registerPack(
 }
 
 /// Pins the `idle` route at `index` failed after a synchronous throw, when
-/// no `evaluating` record exists for `settleEvaluation` to flip. Changes the
+/// no `evaluating` record exists for `settleEvaluation` to flip.
+fn markRouteThrew(ctx: *module_context.Context, index: usize) void {
+    std.debug.assert(ctx.modules.routes.items[index].module == .idle);
+    var waiters = pinFailed(ctx, index, .threw);
+    // Only an evaluating record parks requests.
+    std.debug.assert(waiters.items.len == 0);
+    waiters.deinit(ctx.allocator);
+}
+
+/// The one place a route becomes failed, for the worker's life. Returns the
+/// requests parked on the route's evaluation, which the caller owns and
+/// queues again so each gets its 500, empty for an `idle` route. Changes the
 /// tag in place and allocates nothing.
-fn markRouteFailed(ctx: *module_context.Context, index: usize) void {
+///
+/// It also owns the rule that sets `State.recycle_after_drain`: the worker
+/// gives way to a fresh one only once none of its routes can serve, and only
+/// when one failed on an await (`RouteModuleState.Failure`), which a fresh
+/// evaluation may get past. While any route is ready, still evaluating or
+/// `idle`, the worker keeps serving, so one broken route never takes the
+/// healthy ones down with it, and a worker whose routes all threw
+/// synchronously keeps answering 500s instead of booting replacements that
+/// would throw again.
+fn pinFailed(
+    ctx: *module_context.Context,
+    index: usize,
+    failure: modules_state.RouteModuleState.Failure,
+) std.ArrayListUnmanaged(u64) {
     const route = &ctx.modules.routes.items[index];
-    std.debug.assert(route.module == .idle);
-    route.module = .failed;
+    const waiters: std.ArrayListUnmanaged(u64) = switch (route.module) {
+        .idle => .empty,
+        // The waiters move to the caller; the evaluating record owns nothing
+        // else.
+        .evaluating => |evaluating| evaluating.waiters,
+        .ready, .failed => unreachable,
+    };
+    route.module = .{ .failed = failure };
+    if (freshWorkerMayServe(ctx.modules.routes.items))
+        ctx.modules.recycle_after_drain = true;
+    return waiters;
+}
+
+/// Whether every route is failed and at least one on an await.
+fn freshWorkerMayServe(routes: []const modules_state.Route) bool {
+    var await_failed = false;
+    for (routes) |route| {
+        switch (route.module) {
+            .idle, .ready, .evaluating => return false,
+            .failed => |failure| switch (failure) {
+                .threw => {},
+                .rejected, .exceeded_budget => await_failed = true,
+            },
+        }
+    }
+    return await_failed;
 }
 
 /// Whether a pack the worker registered holds `specifier`.

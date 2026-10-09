@@ -155,3 +155,5 @@ COLLO_WEBAPI_CACHE_GETTER(cryptoKeyStructure, crypto_key_structure, JSC::Structu
 
 COLLO_WEBAPI_CACHE_FIELD(immediate_handle_prototype, JSC::JSObject)
 COLLO_WEBAPI_CACHE_FIELD(immediate_handle_structure, JSC::Structure)
+
+COLLO_WEBAPI_CACHE_FIELD(performance, JSC::JSObject)

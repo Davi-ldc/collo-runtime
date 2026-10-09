@@ -260,9 +260,9 @@ pub fn Methods(comptime Self: type) type {
             for (notice.slice()) |lane| {
                 if (lane == self.lane.lane_id)
                     continue;
-                // A `worker_died` may take the queue's reserve
+                // A `worker_died` takes any free place, a reserved one first
                 // (`commands.zig`), so a refusal means that lane is not
-                // running.
+                // running or its queue is full.
                 if (!try self.postToLane(lane, .{ .worker_died = .{
                     .worker_key = worker.key(),
                     .reason = reason,

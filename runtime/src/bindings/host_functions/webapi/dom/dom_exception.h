@@ -54,7 +54,7 @@ JSC::JSObject* createDOMException(JSC::JSGlobalObject*, WTF::String message, WTF
 // jsc/runtime/values.cpp reads exception properties without calling getters, and a DOMException exposes both only
 // through prototype accessors. Returns false, leaving the out-parameters untouched, for any other value.
 bool domExceptionNameAndMessage(JSC::JSValue, WTF::String& out_name, WTF::String& out_message);
-// Installs the DOMException constructor. The host function registry (globals.def) calls it at most once per VM.
+// Installs the DOMException constructor. The host function registry (globals.def) calls it at most once per realm.
 void installWebApiDOMException(Collo::GlobalObject*, JSC::VM&);
 
 } // namespace Collo::HostFunctions

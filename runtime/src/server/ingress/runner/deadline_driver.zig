@@ -20,25 +20,36 @@
 //!
 //! A connection has at most one deadline at a time, one entry in the heap,
 //! and which one follows from its state (`desiredDeadline`):
-//! - pre-request, from the accept until its first request starts, at the
-//!   accept plus `pre_request_timeout_ns`; nothing extends it, and it closes
-//!   the connection with GOAWAY NO_ERROR.
-//! - stall, while the lane holds something of the connection that only the
-//!   client can move (`Slot.stalled`), or while a close waits to flush its
-//!   GOAWAY, at the last byte read or written plus `stall_timeout_ns`; it
-//!   closes the connection at once, without waiting for its write queue.
-//! - idle, while the connection has no stream and nothing stalls, at the
-//!   moment it came to have none plus `idle_timeout_ns`; only a new stream
-//!   ends it, and it queues GOAWAY NO_ERROR naming the last stream and closes
-//!   once that is written, a write the stall deadline bounds.
-//! A connection with streams in flight and nothing stalled has none: its
-//! requests' deadlines govern.
+//! - pre-request, from the accept until the client opens its first stream,
+//!   at the accept plus `pre_request_timeout_ns`; nothing else ends it, and
+//!   it closes the connection with GOAWAY NO_ERROR.
+//! - none, while a stream of the connection serves a request, waiting for
+//!   a worker or dispatched (`Slot.servesRequest`), and no header block is
+//!   open: that request's own deadline bounds what the connection holds, so
+//!   a client that stops reading a long response, or in the middle of a
+//!   request's DATA frame, loses it only when the request ends.
+//! - stall, while a header block is open, or while no stream serves a
+//!   request and the lane holds something of the connection that only the
+//!   client can move (`Slot.stalled`), at the last byte read or written
+//!   plus `stall_timeout_ns`; it closes the connection at once, without
+//!   waiting for its write queue. An open header block blocks every other
+//!   frame of the connection, so it gets no request's deadline.
+//! - idle, while no stream serves a request and nothing stalls, at the
+//!   moment the connection came to serve none plus `idle_timeout_ns`. Only
+//!   a new stream restarts it, whatever the lane answers on that stream; a
+//!   frame that opens none, such as PING, leaves it. It queues GOAWAY
+//!   NO_ERROR naming the last stream and closes once that is written.
+//! A close that flushes its GOAWAY is bounded by the stall deadline, counted
+//! from the later of the last byte and the close's decision, so a client
+//! that stopped reading before an idle or pre-request expiry still gets a
+//! whole stall period to take the GOAWAY.
 //!
 //! The heap is re-keyed lazily. A deadline that moves later, as the stall
 //! deadline does with every byte, only changes the state it follows from;
 //! the expiry of the entry finds the later deadline and files it again. Only
 //! a deadline that appears or moves earlier touches the heap at once
-//! (`syncConnectionDeadline`), which every drive of a connection calls last.
+//! (`syncConnectionDeadline`), which every drive of a connection calls last
+//! (`connection_flow.zig`).
 
 const std = @import("std");
 
@@ -81,19 +92,33 @@ pub fn effectiveHardTimeoutDeadline(request_deadline_ns: u64, hard_timeout_grace
 /// null when it calls for none.
 pub fn desiredDeadline(runtime: *const Slot, timeouts: ConnectionTimeouts) ?Deadline {
     if (runtime.closing) |closing| {
-        if (closing.flush and runtime.h2WritesPending())
-            return .{ .kind = .stall, .at_ns = runtime.last_progress_ns +| timeouts.stall_ns };
+        if (closing.flush and runtime.h2WritesPending()) {
+            const since = @max(runtime.last_progress_ns, closing.decided_ns);
+            return .{ .kind = .stall, .at_ns = since +| timeouts.stall_ns };
+        }
         return null;
     }
     if (runtime.awaiting_first_request)
         return .{ .kind = .pre_request, .at_ns = runtime.accepted_ns +| timeouts.pre_request_ns };
+    return openDeadline(runtime, timeouts, runtime.servesRequest());
+}
+
+/// The deadline of an open connection past its first stream, given whether
+/// a stream of it serves a request (`Slot.servesRequest`).
+fn openDeadline(runtime: *const Slot, timeouts: ConnectionTimeouts, serves_request: bool) ?Deadline {
+    std.debug.assert(runtime.closing == null);
+    std.debug.assert(!runtime.awaiting_first_request);
+    // An open header block stops every other frame of the connection, and
+    // its CONTINUATION frames must follow without a gap (RFC 9113 §6.10),
+    // so no request's deadline excuses a client that leaves one open.
+    if (runtime.h2HasPendingHeaderBlock())
+        return .{ .kind = .stall, .at_ns = runtime.last_progress_ns +| timeouts.stall_ns };
+    if (serves_request)
+        return null;
     if (runtime.stalled())
         return .{ .kind = .stall, .at_ns = runtime.last_progress_ns +| timeouts.stall_ns };
-    if (runtime.ingress_channel_count == 0) {
-        const since = runtime.idle_since_ns orelse return null;
-        return .{ .kind = .idle, .at_ns = since +| timeouts.idle_ns };
-    }
-    return null;
+    const since = runtime.idle_since_ns orelse return null;
+    return .{ .kind = .idle, .at_ns = since +| timeouts.idle_ns };
 }
 
 /// Loop handler: drains the timerfd and handles the deadlines due now. Its
@@ -320,15 +345,11 @@ pub fn Methods(comptime Self: type) type {
         /// Brings the connection's heap entry in step with the deadline its
         /// state calls for: files a deadline it lacks or one earlier than its
         /// entry at once, and leaves a later one to the entry's expiry. It
-        /// also notes the moment the connection came to have no stream, from
-        /// which its idle deadline runs, and clears it once a stream opens.
+        /// also notes the moment the connection came to serve no request,
+        /// from which its idle deadline runs, unless that moment is noted
+        /// already and no stream opened since (`Slot.noteStreamOpened`).
         pub fn syncConnectionDeadline(self: *Self, runtime: *Slot) LaneFault!void {
-            if (runtime.ingress_channel_count != 0 or runtime.awaiting_first_request) {
-                runtime.idle_since_ns = null;
-            } else if (runtime.idle_since_ns == null) {
-                runtime.idle_since_ns = self.monotonicNowNs();
-            }
-            const desired = desiredDeadline(runtime, self.connection_timeouts) orelse return;
+            const desired = deadlineAfterDrive(self, runtime) orelse return;
             const heap = connectionDeadlines(self);
             if (runtime.deadline) |current| {
                 if (current.at_ns <= desired.at_ns)
@@ -338,6 +359,18 @@ pub fn Methods(comptime Self: type) type {
             runtime.deadline = desired;
             heap.insertAssumeCapacity(runtime);
             try armTimerNoLaterThanDeadline(Self, self, desired.at_ns);
+        }
+
+        fn deadlineAfterDrive(self: *Self, runtime: *Slot) ?Deadline {
+            if (runtime.closing != null or runtime.awaiting_first_request)
+                return desiredDeadline(runtime, self.connection_timeouts);
+            const serves_request = runtime.servesRequest();
+            if (serves_request) {
+                runtime.idle_since_ns = null;
+            } else if (runtime.idle_since_ns == null) {
+                runtime.idle_since_ns = self.monotonicNowNs();
+            }
+            return openDeadline(runtime, self.connection_timeouts, serves_request);
         }
 
         /// Removes the connection's heap entry if it has one, so callers need

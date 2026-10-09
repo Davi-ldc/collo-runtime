@@ -70,7 +70,6 @@ const completions = @import("../completions.zig");
 const fault = @import("../fault.zig");
 const lane_commands = @import("../lane_commands.zig");
 const server_responses = @import("../server_responses.zig");
-const http2_connection = @import("../http2/connection.zig");
 const http2_writing = @import("../http2/writing.zig");
 const admission = @import("admission.zig");
 const connection_flow = @import("connection_flow.zig");
@@ -120,12 +119,22 @@ fn windowRoom(worker: *WorkerRecord) bool {
 /// Takes a unit of `worker`'s window for a descriptor about to be posted.
 /// False, taking none, when the window is full, which only a drain that
 /// reads through the window meets.
+///
+/// The count never passes the window, so every decrement is a release
+/// (`releaseForwardUnit`), and the one that brings the count back within the
+/// reading bound wakes the waiting reader. An add that overshot and took
+/// itself back could make that step instead and wake nobody. Only the
+/// worker's reader takes units, so an exchange fails only after a release
+/// lowered the count, and the loop ends within the window's size; one still
+/// failing then counts as a full window.
 fn acquireForwardUnit(worker: *WorkerRecord) bool {
-    const previous = worker.forwarded_in_queues.fetchAdd(1, .seq_cst);
-    if (previous < window_units_max)
-        return true;
-    // The window was full, so this cannot be the release that reopens it.
-    _ = worker.forwarded_in_queues.fetchSub(1, .seq_cst);
+    var expected = worker.forwarded_in_queues.load(.seq_cst);
+    for (0..window_units_max + 1) |_| {
+        if (expected >= window_units_max)
+            return false;
+        expected = worker.forwarded_in_queues.cmpxchgStrong(expected, expected + 1, .seq_cst, .seq_cst) orelse
+            return true;
+    }
     return false;
 }
 
@@ -774,20 +783,14 @@ pub fn Methods(comptime Self: type) type {
         }
 
         /// Drives a connection with bytes waiting before more of a worker's
-        /// response goes onto it.
+        /// response goes onto it, its deadline brought in step as after any
+        /// drive.
         fn driveBacklog(self: *Self, runtime: *ConnectionSlot) LaneFault!void {
-            if (!runtime.isLive() or runtime.state != .http2_connection)
+            if (!runtime.isOpen() or runtime.state != .http2_connection)
                 return;
             if (!hasBacklog(runtime))
                 return;
-            const start_ns = process.monotonicNowNsOrZero();
-            if (http2_connection.drive(Self, self, runtime)) |_| {} else |err| {
-                switch (try fault.classifyConnectionError(.{ .http2 = err })) {
-                    .keep => {},
-                    .close => |close| Connection.closeRuntimeConnection(self, runtime, close),
-                }
-            }
-            self.lane.counters.h2_server_protocol_time_ns += process.monotonicNowNsOrZero() -| start_ns;
+            _ = try Connection.driveHttp2(self, runtime);
         }
 
         /// Queues the connection to be driven when it has bytes waiting, and

@@ -540,9 +540,29 @@ fn processHeaderBlock(
 ) Http2Failure!void {
     switch (kind) {
         .request_headers => try processRequestHead(Worker, worker, runtime, stream_id, block, end_stream),
-        .trailers => try processTrailers(Worker, worker, runtime, stream_id, block, end_stream),
+        .trailers => if (takesTrailers(runtime, stream_id))
+            try processTrailers(Worker, worker, runtime, stream_id, block, end_stream)
+        else
+            try discardHeaderBlock(Worker, worker, runtime, block),
         .discarded => try discardHeaderBlock(Worker, worker, runtime, block),
     }
+}
+
+/// Whether the stream of a trailer block still takes it once the block is
+/// whole. The block's kind was fixed by its HEADERS frame, and a block that
+/// spans reads can outlive its stream: the lane may reset the stream or
+/// answer it alone meanwhile, at its request's deadline or on a response the
+/// stream cannot take. Frames on a stream the server closed are ignored
+/// (RFC 9113 §5.1), so such a block is dropped with the END_STREAM it
+/// carries, while a stream the client never opened still fails at its
+/// HEADERS frame (`headerBlockKind`).
+fn takesTrailers(runtime: *const Slot, stream_id: u32) bool {
+    const state = runtime.h2StreamState(stream_id) orelse return false;
+    return switch (state) {
+        .preparing, .active => true,
+        .draining_response => false,
+        .vacant => unreachable,
+    };
 }
 
 /// Decompresses a request's header block within the bounds of a request
@@ -573,7 +593,9 @@ fn decodeHeaderBlock(comptime Worker: type, worker: *Worker, runtime: *Slot, blo
 /// stream handler. A head over the bounds or malformed fails only its
 /// stream (`refuseRequestHead`). A head that waits to send its body gets 100
 /// (Continue) before the handler runs, so the interim response precedes
-/// anything the handler answers.
+/// anything the handler answers. The stream counts as opened for the
+/// connection's deadlines whatever becomes of it, since a stream the lane
+/// answers within this drive leaves no other trace for the drive's end.
 fn processRequestHead(
     comptime Worker: type,
     worker: *Worker,
@@ -582,6 +604,7 @@ fn processRequestHead(
     block: []const u8,
     end_stream: bool,
 ) Http2Failure!void {
+    runtime.noteStreamOpened();
     const allocator = worker.service.allocator;
     var decoded = decodeHeaderBlock(Worker, worker, runtime, block) catch |err| switch (err) {
         // More fields or bytes than a head may hold, answered 431 either way.

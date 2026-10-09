@@ -68,35 +68,25 @@ pub fn deadlineTimeout(runtime: *state.Runtime, request_id: u64) !void {
     const request_ctx = runtime.requests.active.get(request_id) orelse return;
     if (!request_ctx.deadline_armed and !request_ctx.deadline_due_queued)
         return;
-    // A top-level await that never settles outlives every request, and
-    // traffic keeps the worker from going idle, so once the evaluation
-    // budget is spent the only way out is to recycle the worker: requests in
-    // flight fail through the server's death path and the next one starts a
-    // fresh worker. The deadline of a request parked on the evaluation is
-    // the one wake guaranteed to reach this point. The boot context's
-    // deadline bounds every route the boot evaluated, so it checks them all.
-    {
-        var modules_ctx = runtime.modulesContext();
-        const zombie = if (request_id == request_context.boot_request_id)
-            module_routes.anyEvaluationZombie(&modules_ctx)
-        else
-            module_routes.evaluationZombie(&modules_ctx, request_ctx.dispatch_work.route_index);
-        if (zombie) {
-            // warn, not err: the boot tests exercise this recycle on purpose,
-            // and the test runner fails a run on any err line. The recycle
-            // after a failed evaluation in `worker/runtime/modules.zig` logs at
-            // the same level.
-            std.log.warn("route module evaluation exceeded budget; recycling worker request_id={d}", .{request_id});
-            runtime.core.running = false;
-        }
-    }
-    // The boot context's deadline is the evaluation budget, and it has no
-    // client stream to answer. Either the check above already recycled the
-    // worker, or the module settled before this entry fired; either way the
-    // window is over.
+    // A top-level await still pending past its budget pins its route failed
+    // and nothing else (`expireRouteEvaluations`). A deadline is the wake
+    // that finds it: the boot context's, armed to the latest budget of the
+    // routes the boot evaluated, reaches every route even when no request
+    // waits, and a parked request's reaches its own route sooner.
+    runtime.expireRouteEvaluations();
     if (request_id == request_context.boot_request_id) {
-        runtime.disarmRequestDeadline(request_ctx);
-        request_ctx.exec.deadline_monotonic_ns = 0;
+        // The boot context's deadline is the evaluation budget, and it has no
+        // client stream to answer. Every route the boot evaluated has expired
+        // or settled by now, so the expiry above has closed the context,
+        // which frees `request_ctx`. One still open has only routes left
+        // that a request evaluated after the boot, each bounded by its own
+        // budget, and the window is over all the same. A sentinel fire under
+        // the boot id is folded into the worker's stop by either disarm
+        // (`disarmRequestDeadline`), since it poisons the VM for every route.
+        if (runtime.bootContext()) |boot_ctx| {
+            runtime.disarmRequestDeadline(boot_ctx);
+            boot_ctx.exec.deadline_monotonic_ns = 0;
+        }
         return;
     }
     // A sentinel that fired terminated the VM for good, so once this 504 is

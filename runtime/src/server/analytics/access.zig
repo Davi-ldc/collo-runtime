@@ -21,9 +21,10 @@
 //!   answers alone emits at that one answer.
 //! - Each lane's ring has one producer, the lane thread, and one consumer, the
 //!   metrics thread. A full ring drops the newest record and counts it.
-//! - A ring's slots are one MAP_NORESERVE mapping, so a page of it costs
-//!   memory only once a record lands on it: a lane that served nothing holds
-//!   none of its ring.
+//! - A ring's slots are one MAP_NORESERVE mapping that refuses transparent
+//!   huge pages (`AccessRing.init`), so a page of it costs memory only once a
+//!   record lands on it: a lane that served nothing holds none of its ring,
+//!   and one that has passed `AccessRing.capacity` records holds all of it.
 //!
 //! Records in `access.jsonl`, one JSON object per line:
 //!
@@ -41,6 +42,7 @@
 //! none did.
 
 const std = @import("std");
+const os = @import("collo_os");
 const limits = @import("collo_limits").runtime_logs;
 const worker_shared_page = @import("collo_worker_state").page;
 const record = @import("record.zig");
@@ -345,16 +347,12 @@ pub const AccessRing = struct {
     /// Records refused while full. The producer adds; the consumer takes.
     dropped: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
-    /// An empty ring whose slots are reserved and none written.
-    pub fn init() !AccessRing {
-        const mapping = try std.posix.mmap(
-            null,
-            slot_bytes,
-            std.posix.PROT.READ | std.posix.PROT.WRITE,
-            .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .NORESERVE = true },
-            -1,
-            0,
-        );
+    /// An empty ring whose slots are reserved and none written, in a mapping
+    /// that faults in a page at a time and refuses transparent huge pages
+    /// (`os.memory.reserveFaultIn`), so the first record does not fault in a
+    /// whole huge page of slots.
+    pub fn init() os.memory.ReserveError!AccessRing {
+        const mapping = try os.memory.reserveFaultIn(slot_bytes);
         const records: [*]AccessRecord = @ptrCast(@alignCast(mapping.ptr));
         return .{ .slots = records[0..capacity] };
     }

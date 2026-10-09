@@ -8,8 +8,8 @@
 namespace Collo::HostFunctions {
 
 // Installs the Response constructor with its json, redirect and error statics and the Response prototype on the global
-// object, and stores them with the Response structure in the VM's Web API cache. Host function installation calls it
-// once per VM.
+// object, and stores them with the Response structure in the realm's Web API cache. Host function installation calls
+// it once per realm.
 void installServerResponse(Collo::GlobalObject*, JSC::VM&);
 
 } // namespace Collo::HostFunctions

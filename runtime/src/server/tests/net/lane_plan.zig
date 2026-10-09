@@ -1,12 +1,21 @@
 //! The ingress lane plan (`server/net/lane_plan.zig`): the lane count against
-//! its queue, CPU and memory caps, CPU selection, and the interface a listen
+//! its queue, CPU and memory caps, the memory a lane is charged against the
+//! tables and buffers it reserves, CPU selection, and the interface a listen
 //! address maps to. The interface lookups read this machine's own interface
 //! list, so they rely only on `lo` and on documentation addresses no host
 //! assigns. Lane `server-core-test`; the lanes running on the plan are covered
 //! by `server-ingress-test`.
 
 const std = @import("std");
-const lane_plan = @import("collo_server_main").lane_plan;
+const ipc = @import("collo_ipc");
+const ingress_limits = @import("collo_limits").ingress;
+const server_main = @import("collo_server_main");
+const supervision = @import("collo_server_supervisor");
+const analytics = @import("collo_server_analytics");
+
+const lane_plan = server_main.lane_plan;
+const ingress = server_main.ingress;
+const runner = ingress.runner;
 
 test "static lane count follows RX queues within CPU and memory caps" {
     try std.testing.expectEqual(@as(usize, 2), try lane_plan.resolveStaticLaneCount(2, 4, 32, 0));
@@ -15,8 +24,56 @@ test "static lane count follows RX queues within CPU and memory caps" {
     try std.testing.expectError(error.NoRxQueues, lane_plan.resolveStaticLaneCount(0, 4, 32, 0));
 }
 
-test "a lane's memory shape charges its tables at their limits, so a node with 10 GiB available runs a lane on each of 4 CPUs" {
-    const runner = @import("collo_server_main").ingress.runner;
+test "each term of a lane's memory shape covers what its structure reserves at a serving lane's caps" {
+    for ([_]usize{ 1, 16 }) |definition_count| {
+        const terms = runner.laneMemoryTerms(definition_count);
+        try std.testing.expectEqual(terms.total(), runner.laneMemoryShape(definition_count).resident_cap_bytes);
+
+        // The connection deadline heap keeps one pointer per connection.
+        var connections = try runner.connection_slot.ConnectionSlab.init(ingress_limits.connections_per_lane_max);
+        defer connections.deinit();
+        const heap_bytes = ingress_limits.connections_per_lane_max * @sizeOf(*runner.connection_slot.Slot);
+        try std.testing.expect(terms.connections >= reservedBytes(connections.entries) + heap_bytes);
+
+        var requests = try runner.request_slot.RequestSlab.init(ingress_limits.requests_per_lane_max);
+        defer requests.deinit();
+        var wheel = try ingress.timer_wheel.DeadlineWheel.init(
+            std.testing.allocator,
+            ingress_limits.requests_per_lane_max,
+            ingress.timer_wheel.minimum_slots,
+            0,
+        );
+        defer wheel.deinit();
+        try std.testing.expect(terms.requests >= reservedBytes(requests.entries) + reservedBytes(wheel.entries.entries));
+
+        var queue = try ingress.commands.Queue.init(
+            ingress_limits.commands_per_lane_max,
+            ingress.lane.obligationReserve(definition_count),
+        );
+        defer queue.deinit();
+        try std.testing.expect(terms.commands >= reservedBytes(queue.nodes.entries));
+
+        // A lane's registration slab spans every worker the node can have,
+        // but it holds one registration per worker the configuration runs.
+        const workers = definition_count * supervision.scheduler_limits.capacity.pool_workers_max;
+        try std.testing.expect(terms.registrations >= workers * @sizeOf(ingress.completions.Registration));
+
+        var http2 = try ingress.http2.lane_resources.LaneResources.init(ingress_limits.streams_per_lane_max);
+        defer http2.deinit();
+        const http2_bytes = http2.read_buffer.len + http2.decode_scratch.len + http2.encode_scratch.len +
+            reservedBytes(http2.streams.entries);
+        try std.testing.expect(terms.http2 >= http2_bytes);
+
+        try std.testing.expect(terms.header_blocks >= ingress_limits.header_block_bytes_per_lane_max);
+        try std.testing.expect(terms.ipc_scratch >= 2 * ipc.max_message_bytes);
+
+        var access_ring = try analytics.access.AccessRing.init();
+        defer access_ring.deinit();
+        try std.testing.expect(terms.access_ring >= reservedBytes(access_ring.slots));
+    }
+}
+
+test "a node with 10 GiB available runs a lane on each of 4 CPUs, with one worker definition or sixteen" {
     const available_bytes: usize = 10 * 1024 * 1024 * 1024;
     const cpu_count = 4;
     for ([_]usize{ 1, 16 }) |definition_count| {
@@ -24,9 +81,12 @@ test "a lane's memory shape charges its tables at their limits, so a node with 1
         const capacity = (available_bytes / lane_plan.lane_memory_share_divisor) / shape.estimatedHeavyLaneBytes();
         try std.testing.expectEqual(@as(usize, cpu_count), try lane_plan.resolveStaticLaneCount(cpu_count, cpu_count, capacity, 0));
     }
-    // Each definition adds its workers' registrations and the queue places
-    // reserved for them.
-    try std.testing.expect(runner.laneMemoryShape(16).resident_cap_bytes > runner.laneMemoryShape(1).resident_cap_bytes);
+}
+
+/// The bytes of a table's entries, all of which a lane at its caps may make
+/// resident.
+fn reservedBytes(entries: anytype) usize {
+    return std.mem.sliceAsBytes(entries).len;
 }
 
 test "explicit lane count override is capped only by allowed CPUs" {

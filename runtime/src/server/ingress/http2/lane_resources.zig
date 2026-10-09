@@ -16,6 +16,7 @@
 //!   connection assembles a block.
 
 const std = @import("std");
+const os = @import("collo_os");
 
 const h2 = @import("collo_http").http2;
 const hpack = @import("collo_hpack");
@@ -65,20 +66,13 @@ pub const LaneResources = struct {
     pub const encode_scratch_bytes: usize = limits.headers.INGRESS_H2_RESPONSE_HEADER_BLOCK_BYTES;
 
     /// Reserves the buffers and a slab of `stream_capacity` streams, and
-    /// writes none of them.
+    /// writes none of them (`os.memory.reserveFaultIn`).
     pub fn init(stream_capacity: u32) !LaneResources {
         const read_offset: usize = 0;
         const decode_offset = std.mem.alignForward(usize, read_offset + read_buffer_bytes, page_size);
         const encode_offset = std.mem.alignForward(usize, decode_offset + decode_scratch_bytes, page_size);
         const total = std.mem.alignForward(usize, encode_offset + encode_scratch_bytes, page_size);
-        const mapping = try std.posix.mmap(
-            null,
-            total,
-            std.posix.PROT.READ | std.posix.PROT.WRITE,
-            .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .NORESERVE = true },
-            -1,
-            0,
-        );
+        const mapping = try os.memory.reserveFaultIn(total);
         errdefer std.posix.munmap(mapping);
         var streams = try stream_table.StreamSlab.init(stream_capacity);
         errdefer streams.deinit();

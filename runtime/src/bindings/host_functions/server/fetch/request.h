@@ -21,7 +21,7 @@ namespace Collo::HostFunctions {
 JSC::EncodedJSValue scheduleFetchFromRequest(JSC::JSGlobalObject*, JSC::ThrowScope&,
     const Runtime::ActiveRequestRuntime&, JSC::JSValue input, JSC::JSValue init);
 // Installs the Request constructor and prototype on the global object and stores them with the Request structure in
-// the VM's Web API cache. Host function installation calls it once per VM.
+// the realm's Web API cache. Host function installation calls it once per realm.
 void installServerRequest(Collo::GlobalObject*, JSC::VM&);
 
 } // namespace Collo::HostFunctions

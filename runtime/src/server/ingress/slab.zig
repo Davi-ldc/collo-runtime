@@ -5,10 +5,12 @@
 //! other threads reach, under the queue's mutex.
 //!
 //! Invariants:
-//! - A slab reserves `capacity` entries of address space when it is created,
-//!   with MAP_NORESERVE, and writes none of it. An entry is written first when
-//!   it is first handed out, so the pages a lane holds are the ones its
-//!   busiest moment needed, and an idle lane holds none.
+//! - A slab reserves `capacity` entries of address space when it is created
+//!   (`os.memory.reserveFaultIn`) and writes none of it. An entry is written
+//!   first when it is first handed out, so a lane that has served nothing
+//!   holds no page of its slabs. Nothing gives a page back while the slab
+//!   lives, so a lane keeps the pages of every entry below `high_water`, the
+//!   most entries its busiest moment held at once, after the load has gone.
 //! - Entries below `high_water` have been handed out at least once. A
 //!   released entry goes on top of a LIFO free stack, and `acquire` takes the
 //!   top before it raises `high_water`, so the lane reuses the entry it
@@ -26,6 +28,7 @@
 //!   or a vacant place.
 
 const std = @import("std");
+const os = @import("collo_os");
 
 /// The index that names no entry.
 pub const none: u32 = std.math.maxInt(u32);
@@ -88,19 +91,13 @@ pub fn FaultInSlab(comptime T: type) type {
         };
 
         /// Reserves `entry_count` entries of address space and touches none.
-        /// Fails with `error.InvalidSlabCapacity` for zero, and with the
-        /// mapping's error when the address space cannot be reserved.
-        pub fn init(entry_count: u32) (error{InvalidSlabCapacity} || std.posix.MMapError)!Self {
+        /// Fails with `error.InvalidSlabCapacity` for zero, and with
+        /// `os.memory.reserveFaultIn`'s error when the address space cannot
+        /// be reserved.
+        pub fn init(entry_count: u32) (error{InvalidSlabCapacity} || os.memory.ReserveError)!Self {
             if (entry_count == 0 or entry_count == none)
                 return error.InvalidSlabCapacity;
-            const bytes = try std.posix.mmap(
-                null,
-                mappingBytes(entry_count),
-                std.posix.PROT.READ | std.posix.PROT.WRITE,
-                .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .NORESERVE = true },
-                -1,
-                0,
-            );
+            const bytes = try os.memory.reserveFaultIn(mappingBytes(entry_count));
             const first: [*]T = @ptrCast(@alignCast(bytes.ptr));
             return .{ .entries = first[0..entry_count] };
         }

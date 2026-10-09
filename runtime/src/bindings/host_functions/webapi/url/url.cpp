@@ -3,8 +3,8 @@
 // parse; every other setter leaves the URL unchanged when the URL Standard's setter steps reject the value. The cell
 // reaches its URLSearchParams through a WriteBarrier: the params are created on the first `searchParams` access,
 // reparsed when a setter replaces the query, and write their own changes back through
-// `syncURLSearchParamsToAssociatedURL`. Object URLs live in the VM's `ColloBlobObjectURLRegistry` (state.h), which
-// bounds their count and bytes.
+// `syncURLSearchParamsToAssociatedURL`. Object URLs live in the calling realm's `ColloBlobObjectURLRegistry`
+// (state.h), which bounds their count and bytes, so revokeObjectURL reaches only URLs its own realm created.
 
 #include "host_functions/webapi/url/url.h"
 
@@ -596,7 +596,7 @@ namespace {
             return JSC::throwVMTypeError(global_object, scope, "createObjectURL expects a Blob object"_s);
 
         auto* collo_global = uncheckedDowncast<Collo::GlobalObject>(global_object);
-        auto& registry = collo_global->owner().blob_object_urls;
+        auto& registry = collo_global->realm().blob_object_urls;
         // The entry carries the creating request's id, so request cleanup (`collo_webapi_cleanup_request`) revokes
         // only that request's URLs and a co-scheduled request keeps its own. Outside a request turn the id is 0, and
         // the entry lives until revokeObjectURL or VM teardown.
@@ -643,7 +643,7 @@ namespace {
         RETURN_IF_EXCEPTION(scope, {});
 
         auto* collo_global = uncheckedDowncast<Collo::GlobalObject>(global_object);
-        collo_global->owner().blob_object_urls.remove(url);
+        collo_global->realm().blob_object_urls.remove(url);
         return JSValue::encode(JSC::jsUndefined());
     }
 

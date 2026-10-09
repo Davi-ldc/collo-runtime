@@ -121,10 +121,10 @@ pub fn run(runtime: *state.Runtime) !void {
         if (!runtime.core.running)
             break;
 
-        // A failed module evaluation, or a deadline fire that left the VM
-        // terminated, stops the loop only here and only once no queued work
-        // or live request remains, so every parked request has been answered
-        // by this worker before it stops.
+        // A worker none of whose routes can serve, or a deadline fire that
+        // left the VM terminated, stops the loop only here and only once no
+        // queued work or live request remains, so every parked request has
+        // been answered by this worker before it stops.
         runtime.maybeRecycleAfterFailedEvaluation();
         if (!runtime.core.running)
             break;

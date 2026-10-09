@@ -12,8 +12,9 @@ namespace Collo::HostFunctions {
 // false and leaves `handle` untouched otherwise.
 bool webApiPerformanceTargetHandle(JSC::JSValue, WebApiEventTargetHandle&);
 // Defines `performance` and the Performance, PerformanceEntry, PerformanceMark, PerformanceMeasure,
-// PerformanceObserver, PerformanceObserverEntryList and PerformanceTiming interfaces. The host function registry
-// (`globals.def`) calls it once per VM from `collo_vm_create` when the VM installs Web APIs.
+// PerformanceObserver, PerformanceObserverEntryList and PerformanceTiming interfaces, and stores the realm's
+// Performance cell in its Web API cache. The host function registry (`globals.def`) calls it once per realm when the
+// VM installs Web APIs.
 void installWebApiPerformance(Collo::GlobalObject*, JSC::VM&);
 
 } // namespace Collo::HostFunctions

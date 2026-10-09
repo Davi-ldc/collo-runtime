@@ -42,7 +42,7 @@
 //! Which file holds what:
 //! - This file: `LaneWorker` with its fields, its start, thread entry and
 //!   teardown, its command posts and wake bits, its memory shape for the lane
-//!   plan, and the declarations above.
+//!   plan with the terms it adds up, and the declarations above.
 //! - `ring_driver.zig`: the event loop, the completion dispatch, the worker
 //!   handlers, the writability poll of a worker's control socket, the wake
 //!   bits' handling, the shutdown drain and the lane's allocations;
@@ -144,22 +144,53 @@ pub const wake = struct {
 };
 
 /// A lane's resident memory with every table full and every buffer used,
-/// for a configuration of `definition_count` worker definitions: the cost
-/// the lane plan's memory cap charges per lane. The tables fault in, so a
-/// lane holds this only at its busiest; at start it holds almost none of it.
-pub fn laneMemoryShape(definition_count: usize) lane_plan.MemoryShape {
+/// term by term, for a configuration of `definition_count` worker
+/// definitions (`laneMemoryTerms`). The tables fault in, so a lane holds
+/// this only at its busiest; at start it holds almost none of it.
+pub const LaneMemoryTerms = struct {
+    /// The connection slab and the connection deadline heap.
+    connections: usize,
+    /// The request slab and the deadline wheel's entries.
+    requests: usize,
+    /// The command queue's places, ordinary and reserved.
+    commands: usize,
+    /// One registration per worker the configuration can run.
+    registrations: usize,
+    /// The read buffer, the HPACK scratch and the stream slab.
+    http2: usize,
+    /// The unfinished header blocks the lane's budget admits.
+    header_blocks: usize,
+    /// The IPC send and receive scratch.
+    ipc_scratch: usize,
+    access_ring: usize,
+
+    pub fn total(self: LaneMemoryTerms) usize {
+        var bytes: usize = 0;
+        inline for (std.meta.fields(LaneMemoryTerms)) |field|
+            bytes += @field(self, field.name);
+        return bytes;
+    }
+};
+
+pub fn laneMemoryTerms(definition_count: usize) LaneMemoryTerms {
     const registrations = definition_count * supervision.scheduler_limits.capacity.pool_workers_max;
     const command_places = limits.ingress.commands_per_lane_max + lane_mod.obligationReserve(definition_count);
-    var bytes: usize = 0;
-    bytes += limits.ingress.connections_per_lane_max * (@sizeOf(ConnectionSlot) + @sizeOf(*ConnectionSlot));
-    bytes += limits.ingress.requests_per_lane_max * (@sizeOf(RequestSlot) + timer_wheel.entrySizeBytes());
-    bytes += command_places * commands.node_bytes;
-    bytes += registrations * @sizeOf(completions.Registration);
-    bytes += http2_lane.LaneResources.residentCapBytes(limits.ingress.streams_per_lane_max);
-    bytes += limits.ingress.header_block_bytes_per_lane_max;
-    bytes += 2 * ipc.max_message_bytes;
-    bytes += access_log.AccessRing.slot_bytes;
-    return .{ .resident_cap_bytes = bytes };
+    return .{
+        .connections = limits.ingress.connections_per_lane_max * (@sizeOf(ConnectionSlot) + @sizeOf(*ConnectionSlot)),
+        .requests = limits.ingress.requests_per_lane_max * (@sizeOf(RequestSlot) + timer_wheel.entrySizeBytes()),
+        .commands = command_places * commands.node_bytes,
+        .registrations = registrations * @sizeOf(completions.Registration),
+        .http2 = http2_lane.LaneResources.residentCapBytes(limits.ingress.streams_per_lane_max),
+        .header_blocks = limits.ingress.header_block_bytes_per_lane_max,
+        .ipc_scratch = 2 * ipc.max_message_bytes,
+        .access_ring = access_log.AccessRing.slot_bytes,
+    };
+}
+
+/// The cost the lane plan's memory cap charges per lane: the sum of
+/// `laneMemoryTerms`.
+pub fn laneMemoryShape(definition_count: usize) lane_plan.MemoryShape {
+    return .{ .resident_cap_bytes = laneMemoryTerms(definition_count).total() };
 }
 
 const ConnectionSlot = connection_slot.Slot;

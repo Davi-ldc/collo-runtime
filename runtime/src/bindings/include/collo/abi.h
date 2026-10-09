@@ -588,7 +588,8 @@ ColloStatus collo_response_extract(ColloVm* vm, const ColloValue* value, const C
 void collo_response_extract_free(ColloExtractedResponse* response);
 void collo_owned_byte_segments_destroy(ColloOwnedByteSegments* owner);
 void collo_owned_header_block_destroy(ColloOwnedHeaderBlock* owner);
-/* Clears request-scoped Web API state held by worker-global singletons. */
+/* Releases the Web API state request_id owns in the VM and in every realm:
+   its blob: URLs, its request-scoped GC roots and its console budget. */
 ColloStatus collo_webapi_cleanup_request(ColloVm* vm, uint64_t request_id);
 
 /* Creates a fully initialized VM in *out_vm, which the caller owns until
@@ -828,8 +829,10 @@ ColloStatus collo_promise_deferred_resolve(
 ColloStatus collo_promise_deferred_reject(
     ColloVm* vm, ColloPromiseDeferred* deferred, const ColloValue* reason, ColloValue** out_exception);
 /* The realm the deferred's promise belongs to, where the caller creates the
-   value that settles it. Valid for an unsettled or settled deferred until
-   collo_promise_deferred_release. */
+   value that settles it. Callable on an unsettled or settled deferred until
+   collo_promise_deferred_release. The realm is valid as long as its VM, like
+   every realm pointer: after collo_vm_destroy the deferred may still be
+   released, but the returned pointer must not be used. */
 ColloRealm* collo_promise_deferred_realm(const ColloPromiseDeferred* deferred);
 void collo_promise_deferred_release(ColloPromiseDeferred* deferred);
 ColloStatus collo_request_task_settle_thenable(

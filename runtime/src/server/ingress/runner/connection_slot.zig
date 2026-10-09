@@ -72,12 +72,15 @@ pub fn connectionGenerationTag(key: lifecycle.ConnectionKey) u32 {
 /// Which of a connection's deadlines its one heap entry stands for
 /// (`deadline_driver.zig`).
 pub const DeadlineKind = enum {
-    /// From the accept until the first request starts.
+    /// From the accept until the client opens its first stream.
     pre_request,
-    /// While the connection has no stream.
+    /// While no stream of the connection serves a request and nothing
+    /// stalls.
     idle,
-    /// While the lane holds something of the connection that only the
-    /// client can move, and no byte moves.
+    /// While a header block is open, while no stream of the connection
+    /// serves a request and the lane holds something of it that only the
+    /// client can move, or while a close flushes its GOAWAY, and no byte
+    /// moves.
     stall,
 };
 
@@ -146,10 +149,12 @@ pub const Slot = struct {
     deadline_heap: common_io.heap.IntrusiveHeapField(Slot) = .{},
     /// When the lane accepted the connection (CLOCK_MONOTONIC).
     accepted_ns: u64 = 0,
-    /// Set from the accept until the connection starts its first request.
+    /// Set from the accept until the client opens its first stream
+    /// (`noteStreamOpened`).
     awaiting_first_request: bool = true,
-    /// When the connection last came to have no stream, while it has none
-    /// and has started a request; null otherwise.
+    /// When the connection last came to serve no request, while it serves
+    /// none and no stream opened since; null otherwise
+    /// (`deadline_driver.syncConnectionDeadline`).
     idle_since_ns: ?u64 = null,
     /// When a byte of the connection was last read or written.
     last_progress_ns: u64 = 0,
@@ -168,6 +173,30 @@ pub const Slot = struct {
     /// restarts its stall deadline.
     pub fn noteProgress(self: *Slot, now_ns: u64) void {
         self.last_progress_ns = now_ns;
+    }
+
+    /// Records that the client opened a new stream, whatever the lane then
+    /// does with it, a local answer or a refusal included. A new stream is
+    /// the one thing that ends the pre-request deadline and restarts the
+    /// idle one; the end of the drive files the next deadline.
+    pub fn noteStreamOpened(self: *Slot) void {
+        self.awaiting_first_request = false;
+        self.idle_since_ns = null;
+    }
+
+    /// Whether a stream of the connection is bound to a lane request,
+    /// waiting for a worker or dispatched. That request's own deadline then
+    /// bounds everything the connection holds for it.
+    pub fn servesRequest(self: *const Slot) bool {
+        if (self.ingress_channel_count == 0)
+            return false;
+        for (self.stream_ids, 0..) |stream_id, position| {
+            if (stream_id == 0)
+                continue;
+            if (stream_table.streamAt(self, position).request != null)
+                return true;
+        }
+        return false;
     }
 
     /// Whether the lane holds something of the connection that only the
@@ -370,6 +399,11 @@ pub const Closing = struct {
     /// The write queue, a GOAWAY at its end, goes out before the teardown.
     /// False when no GOAWAY could be queued or the socket failed.
     flush: bool,
+    /// When the lane decided the close (CLOCK_MONOTONIC). A flush gets a
+    /// whole stall period from here even when the client stopped reading
+    /// long before, as the client of an idle connection may have. Zero
+    /// counts the flush from the last byte alone.
+    decided_ns: u64 = 0,
     /// The connection's streams were reset toward their workers.
     streams_reset: bool = false,
 };

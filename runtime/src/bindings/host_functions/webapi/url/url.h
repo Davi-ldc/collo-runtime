@@ -12,8 +12,8 @@ namespace Collo::HostFunctions {
 // never throws and applies no pair cap: `value` must come from a URL the runtime already accepted, as
 // `createURLSearchParamsFromSearch` in `search_params.cpp` explains.
 JSC::JSObject* createURLSearchParamsFromString(JSC::JSGlobalObject*, WTF::String value);
-// Installs `URL` and `URLSearchParams` and caches their constructors, prototypes and structures on the VM. The host
-// function registry (`globals.def`) calls it once per VM from `collo_vm_create`.
+// Installs `URL` and `URLSearchParams` and caches their constructors, prototypes and structures on the realm. The host
+// function registry (`globals.def`) calls it once per realm.
 void installWebApiURL(Collo::GlobalObject*, JSC::VM&);
 
 } // namespace Collo::HostFunctions

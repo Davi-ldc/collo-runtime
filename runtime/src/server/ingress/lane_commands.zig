@@ -104,10 +104,12 @@ pub const ForwardedPayload = union(enum) {
 /// The command holds one unit of the worker's forwarding window
 /// (`Record.forwarded_in_queues`) from before its post: the owner releases it
 /// once it applied or dropped the descriptor, or hands it on to its
-/// `payload_consumed`. The post may take the queue's reserve
-/// (`commands.zig`), so a refusal means the owner lane is not running: the
-/// reader then releases the unit, frees a `ring` payload's bytes itself, in
-/// ring order, and drops the descriptor.
+/// `payload_consumed`. The post takes only the queue's reserve, which holds
+/// the window of every worker table entry, so it is refused when the owner
+/// lane is not running, or when deaths and reader grants past their own
+/// share fill the reserve (`commands.zig`). On a refusal the reader releases
+/// the unit, frees a `ring` payload's bytes itself, in ring order, and drops
+/// the descriptor.
 ///
 /// A descriptor that shows the worker faulty is a worker fault on the owner.
 /// An owner with no request on the worker takes it out of service through
@@ -147,8 +149,10 @@ pub const ForwardedDescriptor = struct {
 /// (`runner/h2_worker_ipc.zig`). The record is the copy the reader's drain
 /// loaded once and validated.
 ///
-/// The post may take the queue's reserve (`commands.zig`), so a refusal
-/// means the owner lane is not running, and the reader drops the record.
+/// The post takes a reserved place, or an ordinary one once the reserve is
+/// full (`commands.zig`), so it is refused only when the owner lane is not
+/// running or every place of its queue is taken; the reader then drops the
+/// record.
 pub const ForwardedCompletion = struct {
     request_key: RequestKey,
     worker_key: WorkerKey,

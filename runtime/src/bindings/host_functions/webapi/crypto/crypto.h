@@ -1,5 +1,5 @@
 // Declares the installer of the Web Cryptography API globals. The host function registry (`globals.def`) calls it at
-// most once per VM, on the VM thread; `crypto.cpp` says what it installs.
+// most once per realm, on the VM thread; `crypto.cpp` says what it installs.
 
 #pragma once
 

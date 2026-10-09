@@ -311,10 +311,8 @@ pub fn Methods(comptime Self: type) type {
                 self.service.allocator,
                 .{
                     .lane_id = self.listener_index,
+                    .definition_count = self.service.routes.definitionCount(),
                     .max_requests = self.table_capacities.requests,
-                    .command_obligation_reserve = lane_mod.obligationReserve(
-                        self.service.routes.definitionCount(),
-                    ),
                 },
                 self.monotonicNowNs(),
             );

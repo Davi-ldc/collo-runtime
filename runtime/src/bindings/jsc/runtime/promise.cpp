@@ -2,10 +2,11 @@
 // reports a handler's result to the Zig runtime once it settles. Runs on the VM thread.
 //
 // A ColloPromiseDeferred holds a value handle to each of its promise's resolve and reject functions until it settles;
-// collo_promise_deferred_release frees it, settled or not. It also names its promise's realm, where the value that
-// settles it is created, for its whole life. The settler functions capture the request's completion token by value,
-// and the Zig runtime checks its slot and generations, so a settlement that arrives after its request ended cannot
-// complete a later one.
+// collo_promise_deferred_release frees it, settled or not, also after collo_vm_destroy, since releasing a value handle
+// is safe then. It also names its promise's realm, where the value that settles it is created; the VM owns that realm,
+// so the pointer is valid only while the VM lives, however long the deferred does. The settler functions capture the
+// request's completion token by value, and the Zig runtime checks its slot and generations, so a settlement that
+// arrives after its request ended cannot complete a later one.
 
 #include "host_functions/internal.h"
 #include "jsc/runtime/state.h"

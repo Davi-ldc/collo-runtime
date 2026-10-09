@@ -1,5 +1,5 @@
-// Declares the installer of the URLPattern global. The host function registry (`globals.def`) calls it once per VM,
-// on the VM thread, from `collo_vm_create` when the VM installs Web APIs; `binding.cpp` says what it installs.
+// Declares the installer of the URLPattern global. The host function registry (`globals.def`) calls it once per
+// realm, on the VM thread, when the VM installs Web APIs; `binding.cpp` says what it installs.
 
 #pragma once
 

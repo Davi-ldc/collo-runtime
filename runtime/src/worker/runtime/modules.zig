@@ -2,9 +2,9 @@
 //! routes of the worker's definition, registered packs and route module
 //! state (`modules/state.zig`). `Methods` holds the runtime's module
 //! operations, which `Runtime` declares as its own (`root.zig`): the modules
-//! context, the settlements of route module evaluations, and the worker's
-//! stop once a failed evaluation or a deadline fire has drained. It belongs
-//! to the worker's VM thread.
+//! context, the settlements and expiries of route module evaluations, and
+//! the worker's stop, once drained, when no route can serve or after a
+//! deadline fire. It belongs to the worker's VM thread.
 //!
 //! `collo_runtime_module_eval_settled` only parks a settlement, in the
 //! middle of a JavaScript drain; the settlement runs from the scheduler loop
@@ -92,20 +92,43 @@ pub fn Methods(comptime Runtime: type) type {
                 settled_any = true;
                 var settlement = settled;
                 defer settlement.waiters.deinit(self.core.allocator);
-                // A failed evaluation recycles the worker, but only after the
-                // waiters drain with their own 500s; stopping now would turn
-                // them into errors the host synthesizes before any of them ran.
-                if (settlement.transition == .failed)
-                    self.modules.state.recycle_after_drain = true;
                 queueSettledWaiters(self, settlement.waiters.items);
             }
-            // The boot context is the owner of every route's top-level code,
-            // so it closes only once no route evaluates any more. The close
-            // disarms its budget too, so a deadline entry already queued for
-            // the boot id does nothing and no stale deadline reaches later
-            // work.
-            if (settled_any and self.bootContext() != null and !modules_routes.anyEvaluating(&ctx))
-                self.closeBootContext();
+            if (settled_any)
+                closeBootContextOnceSettled(self);
+        }
+
+        /// Pins failed every route whose top-level await outlived its budget
+        /// (`expireEvaluation` in `worker/modules/routes.zig`) and queues the
+        /// requests parked on each, which then get the 500 of a failed route.
+        /// Once no route's evaluation is left in flight, the boot context
+        /// closes and ends the timers and fetches the expired evaluations
+        /// left behind; until then they run under the boot context, whose
+        /// deadline is the latest route's budget. Runs no JavaScript.
+        pub fn expireRouteEvaluations(self: *Runtime) void {
+            var ctx = self.modulesContext();
+            var expired_any = false;
+            while (modules_routes.expireEvaluation(&ctx)) |expired| {
+                expired_any = true;
+                var settlement = expired;
+                defer settlement.waiters.deinit(self.core.allocator);
+                queueSettledWaiters(self, settlement.waiters.items);
+            }
+            if (expired_any)
+                closeBootContextOnceSettled(self);
+        }
+
+        /// The boot context is the owner of every route's top-level code, so
+        /// it closes only once no route evaluates any more. The close disarms
+        /// its budget too, so a deadline entry already queued for the boot id
+        /// does nothing and no stale deadline reaches later work.
+        fn closeBootContextOnceSettled(self: *Runtime) void {
+            if (self.bootContext() == null)
+                return;
+            var ctx = self.modulesContext();
+            if (modules_routes.anyEvaluating(&ctx))
+                return;
+            self.closeBootContext();
         }
 
         fn queueSettledWaiters(self: *Runtime, waiters: []const u64) void {
@@ -123,8 +146,8 @@ pub fn Methods(comptime Runtime: type) type {
             }
         }
 
-        /// Stops the loop after a failed evaluation, or after a sentinel deadline
-        /// fire whose request already has its response
+        /// Stops the loop once no route can serve (`recycle_after_drain`), or
+        /// after a sentinel deadline fire whose request already has its response
         /// (`stop_after_deadline_fire`), once everything drained: the ready
         /// queue, its backlog, the stalled waiters and the pending settlements
         /// are empty, and no request but the boot context is active. The drain
@@ -151,7 +174,7 @@ pub fn Methods(comptime Runtime: type) type {
             if (!only_boot)
                 return;
             if (self.modules.state.recycle_after_drain)
-                std.log.warn("route module evaluation failed; recycling worker after drain", .{})
+                std.log.warn("no route of the worker can serve; recycling worker after drain", .{})
             else
                 std.log.warn("deadline termination poisoned the VM; stopping worker after drain", .{});
             self.core.running = false;

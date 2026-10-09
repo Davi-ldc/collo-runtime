@@ -5,7 +5,8 @@
 //! changes the route records. `collo_runtime_module_eval_settled` in
 //! `worker/host/module_settlement.zig` appends to the settlement list, and
 //! `Runtime` in `worker/runtime/modules.zig` drains it and keeps the stalled
-//! waiters and `recycle_after_drain`.
+//! waiters. `routes.zig` alone sets `recycle_after_drain`, and the runtime
+//! acts on it.
 
 const std = @import("std");
 const bindings = @import("collo_bindings");
@@ -19,7 +20,9 @@ pub const RouteModule = runtime_types.RouteModule;
 /// `export default function` bindings are initialized before the body runs,
 /// so a module whose init threw still exports a callable handler; the pin
 /// keeps that handler from being served whatever JSC returns for a re-import
-/// of a module whose evaluation failed.
+/// of a module whose evaluation failed. A failure ends only its own route:
+/// the worker gives way to a fresh one only once no route can serve
+/// (`State.recycle_after_drain`).
 pub const RouteModuleState = union(enum) {
     /// The entry has not been evaluated in the route's realm, or its
     /// default export was not callable the last time it was read. A worker's
@@ -30,20 +33,34 @@ pub const RouteModuleState = union(enum) {
     idle,
     ready: RouteModule,
     /// A top-level await is in flight. Requests for the route park in
-    /// `waiters` and are queued again when it settles. `deadline_mono_ns`
-    /// bounds an await that never settles; a parked request's deadline path
-    /// checks it (`evaluationZombie` in `routes.zig`).
+    /// `waiters` and are queued again when it settles or expires.
+    /// `deadline_mono_ns` bounds an await that never settles: past it the
+    /// route is pinned failed (`expireEvaluation` in `routes.zig`).
     evaluating: Evaluating,
-    /// The evaluation threw or its top-level await rejected. A rejected
-    /// await also recycles the worker once its waiters drain
-    /// (`recycle_after_drain`), which ends every route of the worker, so a
-    /// fresh worker evaluates them all again; after a synchronous throw the
-    /// worker keeps serving and fails every request for this route.
-    failed,
+    /// The evaluation failed, for the reason the payload names.
+    failed: Failure,
 
     pub const Evaluating = struct {
         waiters: std.ArrayListUnmanaged(u64) = .{},
+        /// Routes that share a module instance share its deadline, so they
+        /// expire together, as they settle together.
         deadline_mono_ns: u64,
+    };
+
+    /// Why a route failed, which decides whether a fresh worker could do
+    /// better. A synchronous throw depends on nothing but the module, so a
+    /// new evaluation would most likely throw again; a top-level await
+    /// usually waits on I/O, which may succeed the next time.
+    pub const Failure = enum {
+        /// The synchronous part of the evaluation threw, or the default
+        /// export could not be read.
+        threw,
+        /// The top-level await rejected.
+        rejected,
+        /// The top-level await was still pending past
+        /// `module_eval_budget_ns` (`routes.zig`). Its later settlement finds
+        /// no route evaluating and is ignored.
+        exceeded_budget,
     };
 
     pub fn deinit(self: *RouteModuleState, allocator: std.mem.Allocator) void {
@@ -100,12 +117,13 @@ pub const State = struct {
     /// queue takes them; a waiter dropped here would wait until its
     /// deadline.
     stalled_waiters: std.ArrayListUnmanaged(u64) = .empty,
-    /// Set when a top-level await rejects. The scheduler loop stops the
-    /// worker only after every parked waiter and in-flight request has
-    /// drained with its own 500 from the worker
-    /// (`Runtime.maybeRecycleAfterFailedEvaluation`). Stopping at once would
-    /// leave the loop before any waiter ran, and the server would answer
-    /// them with errors of its own.
+    /// Set once no route can serve and a fresh worker might
+    /// (`pinFailed` in `routes.zig` owns the rule), and never cleared, since
+    /// a failed route stays failed. The scheduler loop stops the worker only
+    /// after every parked waiter and in-flight request has drained with its
+    /// own 500 from the worker (`Runtime.maybeRecycleAfterFailedEvaluation`).
+    /// Stopping at once would leave the loop before any waiter ran, and the
+    /// server would answer them with errors of its own.
     recycle_after_drain: bool = false,
 
     /// Appends a route with no realm and an `idle` module, and returns its

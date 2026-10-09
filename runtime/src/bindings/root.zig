@@ -1667,7 +1667,8 @@ pub const Realm = struct {
 };
 
 /// The realm the deferred's promise belongs to, where the value that settles
-/// it is created.
+/// it is created. Like every `Realm`, it is valid only while its VM lives,
+/// even when the deferred outlives the VM (`collo_promise_deferred_realm`).
 pub fn promiseDeferredRealm(raw: *const RawPromiseDeferred) Realm {
     return .{ .raw = collo_promise_deferred_realm(raw).? };
 }

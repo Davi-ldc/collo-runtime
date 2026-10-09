@@ -1,8 +1,8 @@
-//! Linux descriptor and process primitives shared by every process of the
-//! runtime, grouped as `fd`, `process`, `socket`, `cmsg` and `linux`. Nothing
-//! here keeps state. The calls the zygote's fork loop makes
-//! (`cloneForkWithPidFd`, `writeOomScoreAdj`, `assertSingleThreadedSelf`)
-//! do not allocate.
+//! Linux descriptor, process and memory primitives shared by every process of
+//! the runtime, grouped as `fd`, `process`, `socket`, `cmsg`, `linux` and
+//! `memory`. Nothing here keeps state. The calls the zygote's fork loop makes
+//! (`cloneForkWithPidFd`, `writeOomScoreAdj`, `assertSingleThreadedSelf`) do
+//! not allocate.
 
 const std = @import("std");
 const c = @cImport({
@@ -875,5 +875,41 @@ pub const linux = struct {
     pub fn dropAllCapabilities() !void {
         try clearAmbientCapabilities();
         try clearCapabilitySets();
+    }
+};
+
+pub const memory = struct {
+    pub const ReserveError = std.posix.MMapError || error{SystemResources};
+
+    /// Reserves `byte_count` bytes of anonymous, private address space that
+    /// costs memory a page at a time, on first touch, and writes none of it.
+    /// The caller unmaps it with `std.posix.munmap`.
+    ///
+    /// The mapping is MAP_NORESERVE, so its size is not charged against
+    /// overcommit, and refuses transparent huge pages: with THP `always`, the
+    /// first touch inside a 2 MiB-aligned range could fault in the whole huge
+    /// page, and khugepaged could later collapse a few touched pages into one,
+    /// so a table would hold up to 2 MiB per entry it used. Adjacent mappings
+    /// with the same flags merge, so even a mapping smaller than a huge page
+    /// can end up inside one. A kernel without THP rejects the advice with
+    /// EINVAL, and then has no huge page to refuse. Fails with the mapping's
+    /// error, or with `error.SystemResources` when the kernel cannot record
+    /// the advice.
+    pub fn reserveFaultIn(byte_count: usize) ReserveError![]align(std.heap.page_size_min) u8 {
+        const mapping = try std.posix.mmap(
+            null,
+            byte_count,
+            std.posix.PROT.READ | std.posix.PROT.WRITE,
+            .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .NORESERVE = true },
+            -1,
+            0,
+        );
+        errdefer std.posix.munmap(mapping);
+        const sys = std.os.linux;
+        switch (sys.E.init(sys.madvise(mapping.ptr, mapping.len, sys.MADV.NOHUGEPAGE))) {
+            .SUCCESS, .INVAL => return mapping,
+            .AGAIN => return error.SystemResources,
+            else => |errno| return std.posix.unexpectedErrno(errno),
+        }
     }
 };

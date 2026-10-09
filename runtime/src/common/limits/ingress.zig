@@ -50,24 +50,29 @@ pub const header_block_frames_max: u32 = 128;
 /// ENHANCE_YOUR_CALM, so a flood costs the client its connection.
 pub const budgeted_frames_per_read_max: u32 = 128;
 
-/// How long an accepted connection may take to start its first request: the
-/// TLS handshake, the client preface and the first stream's headers. It runs
-/// from the accept and nothing extends it, so a client that sends bytes
-/// without starting a request still loses its connection.
+/// How long an accepted connection may take to open its first stream: the
+/// TLS handshake, the client preface and the first stream's whole headers.
+/// It runs from the accept and nothing else ends it, so a client that sends
+/// bytes without opening a stream still loses its connection.
 pub const pre_request_timeout_ns: u64 = 3 * 1_000_000_000;
 
-/// How long a connection may stay open with no stream. Only a new stream
-/// ends it: PING, SETTINGS and WINDOW_UPDATE keep no connection alive. At
-/// expiry the lane queues GOAWAY NO_ERROR naming the last stream it
-/// processed and closes once that is written, a write the stall deadline
-/// bounds.
+/// How long a connection may stay open while none of its streams serves a
+/// request. Only a new stream restarts it, whatever the lane answers on it:
+/// PING, SETTINGS and WINDOW_UPDATE keep no connection alive. At expiry the
+/// lane queues GOAWAY NO_ERROR naming the last stream it processed and
+/// closes once that is written, a write the stall deadline bounds.
 pub const idle_timeout_ns: u64 = 300 * 1_000_000_000;
 
 /// How long a connection may go without a byte read or written while the
 /// lane holds something of it that only the client can move: a partial frame
 /// or header block, writes queued behind a full socket, or response bytes
 /// held by flow control. At expiry the lane closes it without waiting for its
-/// write queue.
+/// write queue. While a stream serves a request, that request's deadline
+/// bounds the same holdings instead, so a client that stops reading a long
+/// response loses the connection only when the request ends; an open header
+/// block, which stops every other frame of the connection, stays under this
+/// bound all the same. A close that flushes its GOAWAY gets this long from
+/// its decision too.
 pub const stall_timeout_ns: u64 = 10 * 1_000_000_000;
 
 /// Submission queue entries of a lane's io_uring. A pass prepares its polls,
@@ -81,9 +86,9 @@ pub const ring_submission_entries: u16 = 256;
 /// completions on its overflow list.
 pub const ring_completion_entries: u32 = 4096;
 
-/// Ordinary places of a lane's command queue, which every command may fill.
-/// The commands that discharge an obligation also have a reserve per worker
-/// table entry (`server/ingress/lane.zig`, `obligationReserve`).
+/// Ordinary places of a lane's command queue. Worker output never takes one;
+/// a death, a reader grant and a forwarded completion take one only once the
+/// reserve (`server/ingress/lane.zig`, `obligationReserve`) is full.
 pub const commands_per_lane_max: u32 = 1024;
 
 /// Commands of one worker's output that may wait in other lanes' queues at

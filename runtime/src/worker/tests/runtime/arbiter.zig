@@ -6,7 +6,9 @@
 //! JavaScript is running. A timer callback turn is published under the
 //! request that owns the timer, so that request's deadline can stop a
 //! callback that hangs. A fire that no response path read is still folded
-//! into the worker's stop when its request is disarmed.
+//! into the worker's stop when its request is disarmed. A boot turn that
+//! never yields is stopped by the boot context's deadline, and that fire
+//! stops the worker even though the expiry alone fails only its route.
 //!
 //! The set tests drive a `Sentinel` directly. It measures real monotonic
 //! time, and inside a full runtime a real deadline would race the module
@@ -18,6 +20,7 @@ const support = @import("bindings_support");
 const worker = @import("collo_worker");
 const rt = @import("collo_test_harness");
 const process = @import("collo_os").process;
+const boot_request_id = @import("collo_worker_request").context.boot_request_id;
 
 const sentinel = worker.testing.sentinel;
 const fakeNow = rt.fakeNow;
@@ -265,6 +268,85 @@ test "an unsampled terminal folds the sentinel fire into the self-stop at the di
     try std.testing.expect(!runtime.stop_after_deadline_fire);
     runtime.disarmRequestDeadline(request_ctx);
     try std.testing.expect(runtime.stop_after_deadline_fire);
+}
+
+test "a boot turn that never yields is terminated at the boot budget and stops the worker, though the expiry fails only its route" {
+    var vm = try support.createVm();
+    defer vm.deinit();
+
+    const control_pair = try socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
+    defer std.posix.close(control_pair[0]);
+    defer std.posix.close(control_pair[1]);
+    // The boot context's deadline is the fake clock plus the evaluation
+    // budget, while the sentinel compares it with real monotonic time; this
+    // start puts the deadline about 400 ms of real time ahead.
+    const budget_ns = worker.testing.module_routes.module_eval_budget_ns;
+    var now_mono_ns: u64 = (process.monotonicNowNsOrZero() + 400 * std.time.ns_per_ms) -| budget_ns;
+    var completion_fixture = try rt.CompletionFixture.init();
+    defer completion_fixture.deinit();
+    var runtime = try worker.Runtime.init(std.testing.allocator, &vm, control_pair[0], &completion_fixture.view, try rt.createCompletionEventfd(), worker.RuntimeOptions{
+        .clock = .{
+            .ctx = &now_mono_ns,
+            .now_fn = fakeNow,
+        },
+    });
+    defer runtime.deinit();
+    try runtime.attachHostRuntime();
+    try runtime.startSentinel();
+
+    // Route 1's top-level timer busy-waits 8 s before it settles the await,
+    // so a turn published under the wrong owner fails the elapsed-time check
+    // below instead of hanging the lane.
+    const ok_entry = "/__collo_route/demo/arbiter-boot-ok.js";
+    const hung_entry = "/__collo_route/demo/arbiter-boot-hung.js";
+    const pack_fd = try rt.createModulePackGraphFd(&.{
+        .{ .specifier = ok_entry, .source = "export default () => \"ok\";" },
+        .{
+            .specifier = hung_entry,
+            .source =
+            \\await new Promise((resolve) => setTimeout(() => {
+            \\    const end = Date.now() + 8000;
+            \\    while (Date.now() < end) {}
+            \\    resolve();
+            \\}, 0));
+            \\export default () => "never";
+            ,
+        },
+    }, 0);
+    defer std.posix.close(pack_fd);
+    _ = try rt.addRoute(&runtime, ok_entry);
+    _ = try rt.addRoute(&runtime, hung_entry);
+    try runtime.installBootContext(&rt.bootEgressToken(30 * std.time.ns_per_s));
+    try runtime.evaluateBootRoutes(pack_fd, 0, null);
+    const boot_ctx = runtime.bootContext() orelse return error.MissingBootContext;
+    try std.testing.expect(boot_ctx.deadline_armed);
+    const boot_generation = boot_ctx.deadline_generation;
+    const boot_deadline_ns = boot_ctx.exec.deadline_monotonic_ns;
+
+    // The timer turn runs under the boot context, so the boot deadline's
+    // fire stops it after about 400 ms.
+    try runtime.collectDueTimers();
+    const hang_started_ns = process.monotonicNowNsOrZero();
+    try executeNextReady(&runtime);
+    try std.testing.expect(process.monotonicNowNsOrZero() - hang_started_ns < 4 * std.time.ns_per_s);
+    try std.testing.expect(runtime.observability.sentinel.terminationWasRequested(
+        boot_request_id,
+        boot_generation,
+    ));
+
+    // The deadline turn expires route 1 alone, and route 0 could still
+    // serve, but the fire forbade execution in the VM for good: closing the
+    // boot context folds it into the stop.
+    now_mono_ns = boot_deadline_ns + std.time.ns_per_ms;
+    try runtime.collectDueRequestDeadlines();
+    try executeNextReady(&runtime);
+    try std.testing.expect(rt.routeModule(&runtime, hung_entry).?.* == .failed);
+    try std.testing.expect(rt.routeModule(&runtime, ok_entry).?.* == .ready);
+    try std.testing.expect(runtime.boot_ctx == .closed);
+    try std.testing.expect(!runtime.modules.state.recycle_after_drain);
+    try std.testing.expect(runtime.stop_after_deadline_fire);
+    runtime.maybeRecycleAfterFailedEvaluation();
+    try std.testing.expect(!runtime.core.running);
 }
 
 test "re-arming the same identity replaces its entry without disturbing neighbors" {

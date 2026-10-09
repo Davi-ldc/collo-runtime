@@ -275,6 +275,7 @@ void destroyVmContents(ColloVm* vm)
         vm->microtask_delay_scope.reset();
         for (auto& realm : vm->realms) {
             realm->webapi_cache.clear();
+            realm->blob_object_urls.clear();
             if (realm->global_object_protected) {
                 bool protect_count_is_zero = owned_vm->heap.unprotect(realm->global_object);
                 if (protect_count_is_zero)
@@ -282,7 +283,6 @@ void destroyVmContents(ColloVm* vm)
                 realm->global_object_protected = false;
             }
         }
-        vm->blob_object_urls.clear();
         // Includes the holders with owner 0, which no request end claims. Their roots must go while the VM is still
         // alive: a JSC::Strong left for a later destructor would touch a HandleSet that is already gone.
         vm->request_scoped_roots.clear();

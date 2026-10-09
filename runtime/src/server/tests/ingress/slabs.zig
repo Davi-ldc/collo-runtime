@@ -1,12 +1,15 @@
 //! The fault-in slab every per-lane table is built on (`ingress/slab.zig`): a
-//! fresh slab touches none of its pages, and a started lane holds no page of
-//! its tables until it serves; released entries come back last in first out
-//! before the high-water mark grows; a key looks up live, vacant once its
+//! fresh slab touches none of its pages, a started lane holds no page of its
+//! tables until it serves, and one accept and one admission make only their
+//! entries' pages resident; a fault-in mapping, the access ring's included,
+//! refuses transparent huge pages; released entries come back last in first
+//! out before the high-water mark grows; a key looks up live, vacant once its
 //! entry is released and stale once the entry is handed out again; and a
 //! FIFO place keeps its membership across the release and reuse of its
 //! entry. Lane `server-ingress-test`.
 
 const std = @import("std");
+const analytics = @import("collo_server_analytics");
 const server_main = @import("collo_server_main");
 const supervision = @import("collo_server_supervisor");
 const lane_harness = @import("lane_harness.zig");
@@ -64,8 +67,88 @@ test "a started lane holds no page of its tables, its read buffer or its scratch
     try std.testing.expectEqual(@as(usize, 0), try residentPages(lane.requests.entries));
     try std.testing.expectEqual(@as(usize, 0), try residentPages(lane.registrations.entries));
     try std.testing.expectEqual(@as(usize, 0), try residentPages(lane.h2_lane.mapping));
+    try std.testing.expectEqual(@as(usize, 0), try residentPages(lane.h2_lane.streams.entries));
     try std.testing.expectEqual(@as(usize, 0), try residentPages(lane.lane.deadline_wheel.entries.entries));
     try std.testing.expectEqual(@as(usize, 0), try residentPages(lane.lane.command_queue.nodes.entries));
+    try std.testing.expectEqual(@as(usize, 0), try residentPages(lane.access_ring.slots));
+}
+
+test "one accept and one admission make resident only the pages of the entries they took" {
+    var fixture: lane_harness.OneWorker = undefined;
+    try fixture.init(.{});
+    defer fixture.deinit();
+    _ = try fixture.get(1);
+    const lane = fixture.harness.lane(0);
+
+    try std.testing.expectEqual(@as(u32, 1), lane.connections.high_water);
+    try std.testing.expectEqual(@as(u32, 1), lane.requests.high_water);
+    try std.testing.expectEqual(@as(u32, 1), lane.h2_lane.streams.high_water);
+    try std.testing.expectEqual(@as(u32, 1), lane.lane.deadline_wheel.entries.high_water);
+    try expectOnlyTouchedResident(&lane.connections);
+    try expectOnlyTouchedResident(&lane.requests);
+    try expectOnlyTouchedResident(&lane.h2_lane.streams);
+    try expectOnlyTouchedResident(&lane.registrations);
+    try expectOnlyTouchedResident(&lane.lane.deadline_wheel.entries);
+    try expectOnlyTouchedResident(&lane.lane.command_queue.nodes);
+}
+
+test "a fault-in mapping refuses transparent huge pages" {
+    std.fs.accessAbsolute("/sys/kernel/mm/transparent_hugepage/enabled", .{}) catch |err| switch (err) {
+        // The kernel has no huge page to refuse.
+        error.FileNotFound => return error.SkipZigTest,
+        else => return err,
+    };
+    var table = try SmallSlab.init(1 << 20);
+    defer table.deinit();
+    try std.testing.expect(try refusesHugePages(@intFromPtr(table.entries.ptr)));
+
+    var ring = try analytics.access.AccessRing.init();
+    defer ring.deinit();
+    try std.testing.expect(try refusesHugePages(@intFromPtr(ring.slots.ptr)));
+}
+
+/// Fails unless the table's resident pages are at most the pages its
+/// entries below the high-water mark span from the start of the mapping.
+fn expectOnlyTouchedResident(table: anytype) !void {
+    const touched_bytes = std.mem.sliceAsBytes(table.touched()).len;
+    const touched_pages = std.math.divCeil(usize, touched_bytes, std.heap.pageSize()) catch unreachable;
+    try std.testing.expect(try residentPages(table.entries) <= touched_pages);
+}
+
+/// Whether the mapping that holds `address` carries the kernel's `nh` flag
+/// (MADV_NOHUGEPAGE) in `/proc/self/smaps`.
+fn refusesHugePages(address: usize) !bool {
+    const smaps = try std.fs.cwd().readFileAlloc(std.testing.allocator, "/proc/self/smaps", 256 * 1024 * 1024);
+    defer std.testing.allocator.free(smaps);
+    var lines = std.mem.splitScalar(u8, smaps, '\n');
+    var inside = false;
+    while (lines.next()) |line| {
+        if (mappingRange(line)) |range| {
+            inside = range.start <= address and address < range.end;
+            continue;
+        }
+        if (!inside or !std.mem.startsWith(u8, line, "VmFlags:"))
+            continue;
+        var flags = std.mem.tokenizeScalar(u8, line["VmFlags:".len..], ' ');
+        while (flags.next()) |flag| {
+            if (std.mem.eql(u8, flag, "nh"))
+                return true;
+        }
+        return false;
+    }
+    return error.MappingNotFound;
+}
+
+/// The address range of an smaps header line (`start-end perms ...`), or
+/// null for a field line.
+fn mappingRange(line: []const u8) ?struct { start: usize, end: usize } {
+    const dash = std.mem.indexOfScalar(u8, line, '-') orelse return null;
+    const space = std.mem.indexOfScalar(u8, line, ' ') orelse return null;
+    if (dash > space)
+        return null;
+    const start = std.fmt.parseUnsigned(usize, line[0..dash], 16) catch return null;
+    const end = std.fmt.parseUnsigned(usize, line[dash + 1 .. space], 16) catch return null;
+    return .{ .start = start, .end = end };
 }
 
 test "a key looks up live, vacant once its entry is released, and stale once the entry is handed out again" {

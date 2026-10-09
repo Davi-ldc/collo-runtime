@@ -8,15 +8,19 @@
 //! ended the request and queues its retirement, leaving the kill to the
 //! reaper. A completion parks only behind a response
 //! head the lane queued, with that entry still armed, and a worker that
-//! answers a deadline itself stays in service. Lane `server-ingress-test`,
+//! answers a deadline itself stays in service. A trailer block that a
+//! deadline's answer overtakes between two reads is dropped with its stream,
+//! and the connection goes on. Lane `server-ingress-test`,
 //! through `lane_harness.zig`; the wheel itself is pinned in
 //! `deadline_wheel.zig`, the reaper's teardown in
 //! `server/tests/supervisor/reaper/`, and a real worker's own 504 in
 //! `local-e2e`.
 
 const std = @import("std");
+const h2 = @import("collo_http").http2;
 const lane_harness = @import("lane_harness.zig");
 
+const Harness = lane_harness.Harness;
 const OneWorker = lane_harness.OneWorker;
 const TwoLanes = lane_harness.TwoLanes;
 
@@ -250,4 +254,88 @@ test "a request whose deadline passes while it waits for a slot is answered 503 
     try std.testing.expectEqual(@as(u8, 0), harness.workerView(scene.stub).?.slots_held);
     try harness.expectLanesRunning();
     try harness.expectServing(scene.stub);
+}
+
+test "trailers split across reads on a stream the lane answered at its request's deadline meanwhile are dropped, and the connection goes on" {
+    var harness: Harness = undefined;
+    // A request deadline well inside the stall deadline, which an open
+    // header block keeps even while a request runs.
+    try harness.init(std.testing.allocator, .{
+        .lane_count = 2,
+        .routes = .{ .concurrency = 1, .timeout_ms = 1000 },
+    });
+    defer harness.deinit();
+    const stub = try harness.publishWorker(.{});
+    const first = try harness.connect(0, .{});
+    const second = try harness.connect(1, .{});
+    try first.get(1);
+    try first.drive();
+    const holder = try stub.readRequestBegin();
+    // An upload on lane 1 waits for the worker's one slot.
+    try second.request(1, "POST", lane_harness.default_path, .{ .body_follows = true });
+    try second.drive();
+    try std.testing.expectEqual(@as(u32, 1), harness.poolOf(stub).snapshot().waiters);
+    const waiting = harness.requestSlotOf(second, 1) orelse return error.RequestNotAdmitted;
+    const waiting_deadline_ns = waiting.deadline_ns;
+
+    // The trailers add `user-agent: probe/1` to the HPACK dynamic table
+    // (a literal with incremental indexing of static name 58). The first
+    // byte of their block arrives in one read, so their HEADERS frame marks
+    // the block as trailers before the stream ends.
+    const trailer_block = [_]u8{ 0x40 | 58, 7 } ++ "probe/1".*;
+    var trailers_frame: [h2.frame_header_len + trailer_block.len]u8 = undefined;
+    try encodeHeadersFrame(&trailers_frame, 1, true, &trailer_block);
+    const cut = h2.frame_header_len + 1;
+    try second.writeAll(trailers_frame[0..cut]);
+    try second.drive();
+
+    // Two wheel ticks past the waiter's deadline.
+    try harness.expireDeadlines(1, waiting_deadline_ns + 10 * std.time.ns_per_ms);
+    try second.expectStatus(1, 503);
+    try std.testing.expect(harness.requestKeyOf(second, 1) == null);
+    try std.testing.expectEqual(@as(?u16, 503), harness.takeAccessStatus(1));
+
+    // The rest of the block reaches a stream the lane closed, which ignores
+    // it (RFC 9113 §5.1) instead of failing the connection.
+    try second.writeAll(trailers_frame[cut..]);
+    try second.drive();
+    try second.collect();
+    try std.testing.expect(second.open());
+    try std.testing.expectEqual(@as(?u32, null), second.goaway_code);
+
+    // The dropped block was still decoded: a later head that names its
+    // entry by dynamic index 62, the newest, decodes to that user agent.
+    // The rest of the head adds nothing to the table: indexed static
+    // fields and literals without indexing (`/__collo/none`, which the lane
+    // answers 404 with an access record).
+    const later_block = [_]u8{ 0x82, 0x87, 0x01, 17 } ++ "demo.example.test".* ++
+        [_]u8{ 0x04, 13 } ++ "/__collo/none".* ++ [_]u8{0x80 | 62};
+    var later_frame: [h2.frame_header_len + later_block.len]u8 = undefined;
+    try encodeHeadersFrame(&later_frame, 3, true, &later_block);
+    try second.writeAll(&later_frame);
+    try second.drive();
+    try std.testing.expect(second.open());
+    const record = harness.takeAccessRecord(1) orelse return error.AccessRecordMissing;
+    try std.testing.expectEqual(@as(u16, 404), record.status);
+    try std.testing.expectEqualStrings("probe/1", record.facts.userAgentSlice());
+
+    try stub.answer(holder, 200, "first");
+    try harness.serveWorker(0, stub);
+    try first.expectStatus(1, 200);
+    try harness.expectLanesRunning();
+    try harness.expectServing(stub);
+}
+
+/// A HEADERS frame with END_HEADERS and the END_STREAM flag `end_stream`,
+/// carrying `block` whole, into `out`, which holds exactly the frame.
+fn encodeHeadersFrame(out: []u8, stream_id: u32, end_stream: bool, block: []const u8) !void {
+    std.debug.assert(out.len == h2.frame_header_len + block.len);
+    try (h2.FrameHeader{
+        .length = @intCast(block.len),
+        .frame_type_raw = @intFromEnum(h2.FrameType.headers),
+        .frame_type = .headers,
+        .flags = .{ .end_stream = end_stream, .end_headers_or_ack = true },
+        .stream_id = stream_id,
+    }).encode(out[0..h2.frame_header_len]);
+    @memcpy(out[h2.frame_header_len..], block);
 }

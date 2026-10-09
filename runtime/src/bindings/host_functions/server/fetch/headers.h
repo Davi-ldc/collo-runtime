@@ -73,8 +73,8 @@ bool setHeaderDefault(
 // and always for set-cookie, whose values only getSetCookie() returns.
 bool getHeaderValue(JSC::JSGlobalObject*, JSC::ThrowScope&, JSC::JSObject* headers, WTF::String name, WTF::String& out);
 // Installs the Headers constructor and its prototype on the global object, creates the Headers Iterator prototype,
-// and stores the constructor, both prototypes and their structures in the VM's Web API cache. Host function
-// installation calls it once per VM.
+// and stores the constructor, both prototypes and their structures in the realm's Web API cache. Host function
+// installation calls it once per realm.
 void installServerHeaders(Collo::GlobalObject*, JSC::VM&);
 
 } // namespace Collo::HostFunctions

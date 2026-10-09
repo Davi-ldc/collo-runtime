@@ -16,17 +16,18 @@ const uring = @import("uring.zig");
 const supervision = @import("collo_server_supervisor");
 
 /// Sizes of a lane's state besides its tables. A serving lane uses the
-/// defaults and reserves command places for its configuration
-/// (`obligationReserve`).
+/// defaults.
 pub const Config = struct {
     lane_id: u16 = 0,
+    /// The worker definitions the lane serves, which size its command
+    /// queue's reserve (`obligationReserve`). It has no default: a reserve
+    /// smaller than the configuration needs refuses worker output the
+    /// forwarding window promised a place to.
+    definition_count: usize,
     /// Deadline wheel entries: one per request the lane can hold.
     max_requests: usize = limits.ingress.requests_per_lane_max,
     deadline_wheel_slots: usize = timer_wheel.minimum_slots,
     command_queue_capacity: usize = limits.ingress.commands_per_lane_max,
-    /// Command places only the commands that discharge an obligation may
-    /// fill (`commands.Queue`).
-    command_obligation_reserve: usize = 0,
 };
 
 /// The command places a lane reserves for `definition_count` worker
@@ -186,7 +187,7 @@ pub const IngressLane = struct {
         errdefer wheel.deinit();
         var queue = try commands.Queue.init(
             config.command_queue_capacity,
-            config.command_obligation_reserve,
+            obligationReserve(config.definition_count),
         );
         errdefer queue.deinit();
         return .{

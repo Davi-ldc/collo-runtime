@@ -1,5 +1,5 @@
 // Private state of the JavaScriptCore bridge: ColloVm and its realms, the value handles the ABI lends to Zig, the Collo
-// global object and the per-VM registries host functions share. None of it is ABI; the exported surface is
+// global object and the registries host functions keep per realm or per VM. None of it is ABI; the exported surface is
 // bindings/include/collo/abi.h and its Zig facade, bindings/root.zig.
 //
 // Everything here belongs to one VM thread, the zygote's before a fork and the worker's after it, and code that
@@ -352,30 +352,6 @@ struct ColloWebApiCache {
     void clear();
 };
 
-// One realm of a VM: a Collo global object, with its own globals, intrinsics and module registry, and the roots and
-// tables that belong to that global alone. Every VM has its main realm, created with it; collo_realm_create adds
-// others, each with every install the VM made so far. A realm lives as long as its VM, which owns it and clears its
-// roots in destroyVmContents, and the global it holds stays protected from collection until then.
-//
-// Realms separate state, not trust: they share the VM's heap, collector, turns, microtask queue and module sources.
-struct ColloRealm {
-    ColloVm* vm { nullptr };
-    Collo::GlobalObject* global_object { nullptr };
-    bool global_object_protected { false };
-    // Its position in ColloVm::realms, 0 for the main realm.
-    uint32_t index { 0 };
-    ColloWebApiCache webapi_cache;
-    // Namespaces evaluated in this realm, by canonical specifier, which live as long as the worker. The realm's own
-    // JSC module registry still owns the module records, so evicting an entry here does not unload the module.
-    WTF::HashMap<WTF::String, JSC::Strong<JSC::Unknown>> module_namespaces;
-    // Set once `process` and the node:fs host object are installed on this realm's global (ColloVm::process_installed
-    // and ColloVm::node_fs_enabled say whether every realm should have them).
-    bool process_installed { false };
-    bool node_fs_installed { false };
-    // This realm's console labels and groups; the VM's one console client keeps them here.
-    Collo::ConsoleRealmState console;
-};
-
 struct ColloValueOwnerState;
 
 struct ColloModuleSourceEntry {
@@ -414,8 +390,10 @@ struct ColloBlobObjectURLBackingRef {
     size_t ref_count { 0 };
 };
 
-// The worker's blob: URL table. createObjectURL throws QuotaExceededError past either bound. `bytes` counts each
-// backing store once however many URLs share it, and `backing_store_refs` holds the share counts.
+// One realm's blob: URL table. createObjectURL throws QuotaExceededError past either bound, which counts only that
+// realm's URLs, so one route filling its table never fails another's; the worker's memory limit bounds all realms
+// together. `bytes` counts each backing store once however many URLs of the realm share it, and `backing_store_refs`
+// holds the share counts.
 struct ColloBlobObjectURLRegistry {
     static constexpr size_t entries_max = 4096;
     static constexpr size_t bytes_max = 256ULL * 1024 * 1024;
@@ -522,6 +500,35 @@ struct ColloBlobObjectURLRegistry {
     }
 
     bool contains(const WTF::String& url) const { return entries.contains(url); }
+};
+
+// One realm of a VM: a Collo global object, with its own globals, intrinsics and module registry, and the roots and
+// tables that belong to that global alone. Every VM has its main realm, created with it; collo_realm_create adds
+// others, each with every install the VM made so far. A realm lives as long as its VM, which owns it and clears its
+// roots in destroyVmContents, and the global it holds stays protected from collection until then.
+//
+// Realms separate state, not trust: they share the VM's heap, collector, turns, microtask queue, module sources and
+// console sink. A table or quota that script can fill belongs to its realm, here, so that one realm can neither
+// exhaust nor change another's.
+struct ColloRealm {
+    ColloVm* vm { nullptr };
+    Collo::GlobalObject* global_object { nullptr };
+    bool global_object_protected { false };
+    // Its position in ColloVm::realms, 0 for the main realm.
+    uint32_t index { 0 };
+    ColloWebApiCache webapi_cache;
+    // Namespaces evaluated in this realm, by canonical specifier, which live as long as the worker. The realm's own
+    // JSC module registry still owns the module records, so evicting an entry here does not unload the module.
+    WTF::HashMap<WTF::String, JSC::Strong<JSC::Unknown>> module_namespaces;
+    // The blob: URLs this realm's createObjectURL made. Each entry keeps its Blob alive until revokeObjectURL in this
+    // realm, the cleanup of the request that created it (collo_webapi_cleanup_request), or VM teardown.
+    ColloBlobObjectURLRegistry blob_object_urls;
+    // Set once `process` and the node:fs host object are installed on this realm's global (ColloVm::process_installed
+    // and ColloVm::node_fs_enabled say whether every realm should have them).
+    bool process_installed { false };
+    bool node_fs_installed { false };
+    // This realm's console labels and groups; the VM's one console client keeps them here.
+    Collo::ConsoleRealmState console;
 };
 
 // Base for a native object that owns GC roots on behalf of one request and is itself invisible to the collector.
@@ -677,9 +684,6 @@ struct ColloVm {
     // fails closed on a second hash, because this hash is what maps public /var/task specifiers back onto internal
     // keys. Null on the zygote's VM, whose warmup corpus is not deploy-scoped.
     WTF::String deploy_hash;
-    // createObjectURL keeps the Blob alive until revokeObjectURL, the cleanup of the request that created the URL,
-    // or VM teardown.
-    ColloBlobObjectURLRegistry blob_object_urls;
     // Native holders of per-request GC roots the collector cannot reclaim; ColloRequestScopedRoots explains why.
     ColloRequestScopedRootsRegistry request_scoped_roots;
     ColloExecCtx* current_exec_ctx;

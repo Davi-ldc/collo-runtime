@@ -29,6 +29,9 @@
 //!   (`responseHeadQueued`), never a flag the worker wrote: a request that
 //!   ends without its response gets a 5xx before a head and RST_STREAM after
 //!   one.
+//! - Every finish but the teardown's queues the request's connection for a
+//!   turn, so the connection's deadline follows the requests it still
+//!   serves (`deadline_driver.zig`) whatever ended this one.
 
 const std = @import("std");
 
@@ -223,13 +226,32 @@ pub fn Methods(comptime Self: type) type {
         /// lane's slot and its wheel entry, and gives a worker slot back to
         /// the pool, which may hand it to a waiter at once. A waiting request
         /// leaves its pool's FIFO. An inactive slot is left alone.
+        ///
+        /// Every finish then queues the request's connection for a turn,
+        /// whichever path it took and whatever ended it. The request no
+        /// longer serves its stream, which can leave the connection with no
+        /// request at all and so calls for its stall or idle deadline, and
+        /// only a drive files that (`connection_flow.zig`). A finish runs
+        /// from deadline expiries, commands and worker faults as well as
+        /// from drives, and the answer it writes needs no poll, so nothing
+        /// else would bring the connection back.
         pub fn finishRequest(self: *Self, request_slot: u32, outcome: RequestOutcome) LaneFault!void {
             if (request_slot >= self.requests.capacity())
                 return error.RequestSlotOutOfRange;
             const slot = self.requests.get(request_slot) orelse return;
-            if (slot.worker) |worker|
-                return finishDispatched(self, request_slot, worker, outcome);
-            return finishWaiting(self, request_slot, outcome);
+            const connection_key = slot.connection_key;
+            if (slot.worker) |worker| {
+                try finishDispatched(self, request_slot, worker, outcome);
+            } else {
+                try finishWaiting(self, request_slot, outcome);
+            }
+            // The lane's teardown closes every connection without a turn.
+            if (outcome == .shutdown)
+                return;
+            switch (self.connections.lookup(connection_key.slot, connection_key.generation)) {
+                .live => |runtime| Connection.keepConnectionAfterActiveRequest(self, runtime),
+                .stale_generation, .vacant, .out_of_range => {},
+            }
         }
 
         /// Ends the dispatched request in `request_slot` with the completion
@@ -329,8 +351,7 @@ pub fn Methods(comptime Self: type) type {
         }
 
         /// Takes a finished request off its stream. A response whose end
-        /// never went out is reset, since nothing else ends the stream; the
-        /// connection then resumes.
+        /// never went out is reset, since nothing else ends the stream.
         fn leaveStream(
             self: *Self,
             runtime: *ConnectionSlot,
@@ -343,7 +364,6 @@ pub fn Methods(comptime Self: type) type {
                 .none, .closed, .draining => {},
                 .unfinished => try http2_writing.queueRstStream(Self, self, runtime, slot.ingress_channel_id, .internal_error),
             }
-            Connection.keepConnectionAfterActiveRequest(self, runtime);
         }
 
         /// Gives `worker_slot` of `worker` back to its pool. A slot the pool
@@ -411,8 +431,8 @@ pub fn Methods(comptime Self: type) type {
                                 .reader = handoff.reader,
                             } }))
                                 break;
-                            // The waiter's lane is not running, so its request
-                            // ends with it.
+                            // The waiter's lane is not running or its queue is
+                            // full, so its request ends with it.
                             self.lane.counters.silent_queue_overflows += 1;
                             released = try worker_pool.returnHandoff(
                                 worker,

@@ -215,6 +215,24 @@ comptime {
         ipc.module_pack.max_pack_bytes);
 }
 
+// A lane's ingress bounds (`common/limits/ingress.zig`, which imports
+// nothing) against the bounds of what they hold.
+comptime {
+    // A worker's reader receives a packet only while a whole batch of
+    // descriptors still fits the forwarding window (`windowHasRoom` in
+    // `server/ingress/runner/h2_worker_ipc.zig`). A window below one batch
+    // would never let it receive, and one below two would let it receive
+    // only once the lanes had applied everything it forwarded before, so the
+    // worker's output would stop at every packet.
+    std.debug.assert(limits.ingress.forwarded_commands_per_worker_max >=
+        2 * ipc.ingress_channel.max_batch_descriptors);
+    // A connection whose header block would pass the lane's budget closes,
+    // so a budget below one block's bound would close a client that sends a
+    // block the server admits, even with no other connection on the lane.
+    std.debug.assert(limits.ingress.header_block_bytes_per_lane_max >=
+        limits.headers.INGRESS_H2_REQUEST_HEADER_BLOCK_BYTES);
+}
+
 // The completion ring's status bound against the statuses a worker publishes.
 // The drain (`validateWorkerCompletionRecord` in
 // `common/worker_state/page/completion_ring.zig`) refuses a status above the

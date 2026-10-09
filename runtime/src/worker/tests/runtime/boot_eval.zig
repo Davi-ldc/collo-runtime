@@ -464,7 +464,7 @@ test "a boot context with the none boot token gives top-level code timers and re
     try std.testing.expectEqual(@as(usize, 0), gateway.recordedFetchStarts(&starts));
 }
 
-test "hung top-level await recycles the worker at the eval budget" {
+test "a hung top-level await in a worker's only route fails it at the eval budget and recycles the worker after the drain" {
     var vm = try support.createVm();
     defer vm.deinit();
 
@@ -503,16 +503,21 @@ test "hung top-level await recycles the worker at the eval budget" {
     now_mono_ns = module_eval_budget_ns + std.time.ns_per_ms;
     try pumpOnce(&runtime);
 
-    try std.testing.expect(!runtime.core.running);
-    // The boot context never reaches the response path: it stays in the
-    // active map with its deadline disarmed and reset to 0.
-    try std.testing.expect(runtime.requests.active.contains(boot_request_id));
-    try std.testing.expect(!boot_ctx.finish_started);
-    try std.testing.expectEqual(@as(u64, 0), boot_ctx.exec.deadline_monotonic_ns);
+    // The route is pinned failed, and with no evaluation left the boot
+    // context closed instead of reaching the response path.
     const record = try routeRecord(&runtime, specifier);
-    try std.testing.expect(record == .evaluating);
+    try std.testing.expect(record == .failed);
+    try std.testing.expect(runtime.boot_ctx == .closed);
+    try std.testing.expect(!runtime.requests.active.contains(boot_request_id));
     // No frame was sent for the boot id.
     try expectControlSilent(control_pair[1], 25);
+
+    // The worker's only route can no longer serve, and a fresh worker might
+    // get past the await, so the loop stops it once nothing is left to drain.
+    try std.testing.expect(runtime.modules.state.recycle_after_drain);
+    try std.testing.expect(runtime.core.running);
+    runtime.maybeRecycleAfterFailedEvaluation();
+    try std.testing.expect(!runtime.core.running);
 }
 
 test "eval-budget deadline after settlement is a no-op" {

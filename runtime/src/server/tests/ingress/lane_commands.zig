@@ -5,7 +5,8 @@
 //! forwards to the lane that owns the request (`forwarded_descriptor`,
 //! `forwarded_completion`), a reader asked to give its role up
 //! (`release_worker`), and a death another lane saw (`worker_died`), with the
-//! reserve a worker's forwarded output takes, the window that stops its
+//! reserve a worker's forwarded output takes and the ordinary place a death
+//! takes once that reserve is full, the window that stops its
 //! reader while too much of that output waits, the reader's check of a
 //! descriptor against the worker's request table, and the queue a stopping
 //! lane runs dry before it closes. A command that crosses lanes runs between
@@ -424,6 +425,46 @@ test "worker_died answers 502 the request a lane holds on a worker another lane 
     const record = harness.takeAccessRecord(1) orelse return error.AccessRecordMissing;
     try std.testing.expectEqual(@as(u16, 502), record.status);
     try std.testing.expectEqualStrings("exited", record.facts.worker_fault);
+    try harness.expectLanesRunning();
+    try harness.expectFaulted(scene.stub, .exited);
+}
+
+test "a death reaches a lane whose reserve is full through an ordinary place, which a worker's output never takes" {
+    var scene: TwoLanes = undefined;
+    try scene.init(.{});
+    defer scene.deinit();
+    const harness = &scene.harness;
+    _ = try scene.get(scene.first, 1);
+    const other = try scene.get(scene.second, 1);
+
+    // Deaths of workers lane 1 never registered, which it runs as stale,
+    // fill every reserved place of its queue. They go straight to the lane,
+    // so the harness's record of deaths keeps only the real one.
+    const queue = &harness.lane(1).lane.command_queue;
+    for (0..queue.reserve) |index| {
+        const stale_worker = lane_harness.lane_commands.WorkerKey{ .worker_id = 1_000_000 + index, .worker_generation = 1 };
+        try std.testing.expect(try harness.lane(1).post(.{ .worker_died = .{
+            .worker_key = stale_worker,
+            .reason = .exited,
+        } }));
+    }
+    try std.testing.expectEqual(queue.reserve, queue.reserved_used);
+    try std.testing.expectEqual(@as(usize, 0), queue.ordinary_used);
+
+    // The worker's response head for lane 1 finds the reserve full and is
+    // dropped at the reader, although ordinary places are free.
+    try scene.stub.sendHead(other, 200, false);
+    try harness.handleControl(0, scene.stub);
+    try std.testing.expectEqual(@as(u64, 1), harness.lane(0).lane.counters.forwarded_descriptor_drops);
+    try std.testing.expectEqual(@as(usize, 0), queue.ordinary_used);
+
+    // The worker's death, which lane 0 sees, still reaches lane 1.
+    try scene.stub.kill();
+    try harness.handleWorkerExit(0, scene.stub);
+    try std.testing.expectEqual(@as(usize, 1), queue.ordinary_used);
+    try harness.handleCommands(1);
+    try scene.second.expectStatus(1, 502);
+    try std.testing.expectEqual(@as(u64, queue.reserve), harness.lane(1).lane.counters.stale_commands);
     try harness.expectLanesRunning();
     try harness.expectFaulted(scene.stub, .exited);
 }

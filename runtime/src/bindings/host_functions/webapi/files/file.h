@@ -1,5 +1,5 @@
 // Declares the installer of the File global. blob.cpp implements it beside Blob, because the File cell derives from
-// the Blob cell. The host function registry (`globals.def`) calls it at most once per VM, on the VM thread.
+// the Blob cell. The host function registry (`globals.def`) calls it at most once per realm, on the VM thread.
 
 #pragma once
 

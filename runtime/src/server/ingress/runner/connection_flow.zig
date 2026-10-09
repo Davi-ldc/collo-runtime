@@ -26,9 +26,10 @@
 //! the descriptor's number stays taken until no prepared entry names it.
 //!
 //! Every drive ends by bringing the connection's deadline in step with what
-//! it now waits for (`deadline_driver.syncConnectionDeadline`). Whatever
-//! changes a connection outside its drive queues it for a turn, so its
-//! deadline follows within the pass.
+//! it now waits for (`deadline_driver.syncConnectionDeadline`): the loop's
+//! turn (`driveConnection`) and a handler's drive of a connection with bytes
+//! waiting (`driveHttp2`) alike. Whatever changes a connection outside a
+//! drive queues it for a turn, so its deadline follows within the pass.
 
 const std = @import("std");
 const process = @import("collo_os").process;
@@ -65,20 +66,34 @@ pub fn Methods(comptime Self: type) type {
             const runtime = self.connections.get(slot) orelse return false;
             if (runtime.closing == null) {
                 const did_work = switch (runtime.state) {
-                    .tls_handshake => try tls_handshake.drive(Self, self, runtime),
-                    .http2_connection => blk: {
-                        const start_ns = monotonicNowNs();
-                        const h2_did_work = try http2_connection.drive(Self, self, runtime);
-                        self.lane.counters.h2_server_protocol_time_ns += monotonicNowNs() -| start_ns;
-                        break :blk h2_did_work;
+                    .tls_handshake => handshake: {
+                        const handshake_did_work = try tls_handshake.drive(Self, self, runtime);
+                        if (runtime.closing == null)
+                            try Deadlines.syncConnectionDeadline(self, runtime);
+                        break :handshake handshake_did_work;
                     },
+                    .http2_connection => try driveHttp2(self, runtime),
                 };
-                if (runtime.closing == null) {
-                    try Deadlines.syncConnectionDeadline(self, runtime);
+                if (runtime.closing == null)
                     return did_work;
-                }
             }
             return finishClose(Self, self, runtime);
+        }
+
+        /// Drives an HTTP/2 connection that has not been asked to close,
+        /// then brings its deadline in step unless the drive decided a
+        /// close. A decided close waits for the connection's next turn
+        /// (`driveConnection`), so a handler that drives a connection
+        /// between its own steps still finds the slot afterwards. Returns
+        /// whether anything happened.
+        pub fn driveHttp2(self: *Self, runtime: *ConnectionSlot) LaneFault!bool {
+            std.debug.assert(runtime.state == .http2_connection);
+            const start_ns = monotonicNowNs();
+            const did_work = try http2_connection.drive(Self, self, runtime);
+            self.lane.counters.h2_server_protocol_time_ns += monotonicNowNs() -| start_ns;
+            if (runtime.closing == null)
+                try Deadlines.syncConnectionDeadline(self, runtime);
+            return did_work;
         }
 
         /// Arms a poll for each interest in `runtime.wait_events` that has
@@ -131,7 +146,11 @@ pub fn Methods(comptime Self: type) type {
                 http2_writing.queueCloseGoaway(self.service.allocator, runtime, error_code)
             else
                 false;
-            runtime.closing = .{ .reason = close.reason, .flush = goaway_queued };
+            runtime.closing = .{
+                .reason = close.reason,
+                .flush = goaway_queued,
+                .decided_ns = self.monotonicNowNs(),
+            };
             if (close.reason == .header_block_budget)
                 self.lane.counters.header_block_budget_closes += 1;
             Queues.enqueueConnection(self, runtime.key.slot);

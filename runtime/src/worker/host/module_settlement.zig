@@ -17,8 +17,8 @@ const host_adapter = @import("adapter.zig");
 ///
 /// A settlement dropped for lack of memory leaves the module evaluating: its
 /// waiting requests run into their deadlines, and the first deadline that
-/// fires once the evaluation has run for `module_eval_budget_ns` recycles the
-/// worker (`evaluationZombie` in `worker/modules/routes.zig`).
+/// finds the evaluation past `module_eval_budget_ns` pins its route failed
+/// (`expireEvaluation` in `worker/modules/routes.zig`).
 pub export fn collo_runtime_module_eval_settled(
     runtime_ptr: ?*anyopaque,
     realm_index: u32,

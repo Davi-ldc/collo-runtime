@@ -56,7 +56,7 @@ void removeWebApiEventTargetListener(
 void clearWebApiEventTargetListeners(WebApiEventTargetHandle);
 
 // Installs Event and its subclasses, EventTarget, and the global object's event methods and handlers. The host
-// function registry (globals.def) calls it at most once per VM.
+// function registry (globals.def) calls it at most once per realm.
 void installWebApiEvent(Collo::GlobalObject*, JSC::VM&);
 
 } // namespace Collo::HostFunctions

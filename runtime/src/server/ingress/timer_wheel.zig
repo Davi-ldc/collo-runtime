@@ -50,7 +50,6 @@ pub const Counters = struct {
 
 const Entry = struct {
     slab_link: slab.Link = .{},
-    cancelled: bool = false,
     bucket: u32 = invalid_index,
     next: u32 = invalid_index,
     prev: u32 = invalid_index,
@@ -73,7 +72,6 @@ pub const DeadlineWheel = struct {
     current_time_ns: u64,
     pending_due_head: u32 = invalid_index,
     pending_due_tail: u32 = invalid_index,
-    active_len: usize = 0,
     armed: bool = false,
     next_deadline_monotonic_ns: ?u64 = null,
     next_deadline_dirty: bool = false,
@@ -112,7 +110,8 @@ pub const DeadlineWheel = struct {
         self.* = undefined;
     }
 
-    /// Entries armed now, cancelled ones the wheel has not swept included.
+    /// Entries armed now, those due and waiting in the pending list included.
+    /// A cancel releases its entry at once.
     pub fn liveEntries(self: *const DeadlineWheel) u32 {
         return self.entries.live_count;
     }
@@ -143,24 +142,20 @@ pub const DeadlineWheel = struct {
         entry.worker_key = worker_key;
         entry.deadline_monotonic_ns = absolute_deadline_ns;
         self.push(bucket, acquired.index);
-        self.active_len += 1;
         self.counters.inserts += 1;
         self.noteInsertedDeadline(absolute_deadline_ns);
         self.setArmed(true);
         return .{ .slot = acquired.index, .generation = acquired.generation };
     }
 
-    /// Disarms the entry `handle` names; false when the handle is stale.
+    /// Disarms the entry `handle` names and releases it; false when the
+    /// handle is stale, because the entry expired, was cancelled or was
+    /// handed out again.
     pub fn cancel(self: *DeadlineWheel, handle: Handle) bool {
-        const entry = self.entryForHandle(handle) orelse {
-            self.counters.stale_cancels += 1;
-            return false;
-        };
-        if (entry.cancelled) {
+        if (self.entryForHandle(handle) == null) {
             self.counters.stale_cancels += 1;
             return false;
         }
-        entry.cancelled = true;
         self.unlink(handle.slot);
         self.releaseEntry(handle.slot);
         self.counters.cancels += 1;
@@ -175,7 +170,7 @@ pub const DeadlineWheel = struct {
     pub fn expireDue(self: *DeadlineWheel, now_monotonic_ns: u64, out: []Expired) usize {
         var emitted: usize = 0;
         emitted += self.drainPendingDue(out[emitted..]);
-        while (emitted < out.len and self.active_len != 0 and self.current_time_ns +| tick_ns <= now_monotonic_ns) {
+        while (emitted < out.len and self.liveEntries() != 0 and self.current_time_ns +| tick_ns <= now_monotonic_ns) {
             self.current_time_ns +|= tick_ns;
             self.cursor = @intCast((@as(u64, self.cursor) + 1) % self.buckets.len);
             emitted += self.expireBucket(out[emitted..]);
@@ -206,7 +201,7 @@ pub const DeadlineWheel = struct {
     }
 
     pub fn isEmpty(self: *const DeadlineWheel) bool {
-        return self.active_len == 0;
+        return self.liveEntries() == 0;
     }
 
     fn expireBucket(self: *DeadlineWheel, out: []Expired) usize {
@@ -218,9 +213,7 @@ pub const DeadlineWheel = struct {
             const next = entry.next;
             entry.next = invalid_index;
             entry.prev = invalid_index;
-            if (entry.cancelled) {
-                self.releaseEntry(index);
-            } else if (entry.rounds_remaining != 0) {
+            if (entry.rounds_remaining != 0) {
                 entry.rounds_remaining -= 1;
                 self.push(self.cursor, index);
             } else if (entry.deadline_monotonic_ns > self.current_time_ns) {
@@ -251,10 +244,6 @@ pub const DeadlineWheel = struct {
                 self.pending_due_tail = invalid_index;
             entry.next = invalid_index;
             entry.prev = invalid_index;
-            if (entry.cancelled) {
-                self.releaseEntry(index);
-                continue;
-            }
             if (entry.deadline_monotonic_ns > self.current_time_ns) {
                 self.push(self.cursor, index);
                 continue;
@@ -340,12 +329,10 @@ pub const DeadlineWheel = struct {
     fn releaseEntry(self: *DeadlineWheel, index: u32) void {
         self.noteRemovedDeadline(self.at(index).deadline_monotonic_ns);
         self.entries.release(index);
-        std.debug.assert(self.active_len > 0);
-        self.active_len -= 1;
     }
 
     fn syncIdleClock(self: *DeadlineWheel, now_monotonic_ns: u64) void {
-        if (self.active_len != 0)
+        if (self.liveEntries() != 0)
             return;
         if (now_monotonic_ns <= self.current_time_ns)
             return;
@@ -384,7 +371,7 @@ pub const DeadlineWheel = struct {
         for (self.buckets) |head|
             self.scanNextDeadlineList(head, &best, &active_count);
         self.scanNextDeadlineList(self.pending_due_head, &best, &active_count);
-        std.debug.assert(active_count == self.active_len);
+        std.debug.assert(active_count == self.liveEntries());
         return best;
     }
 
@@ -400,14 +387,12 @@ pub const DeadlineWheel = struct {
             std.debug.assert(inspected < self.entries.high_water);
             const entry = self.at(index);
             std.debug.assert(entry.slab_link.live);
-            if (!entry.cancelled) {
-                active_count.* += 1;
-                if (best.*) |current| {
-                    if (entry.deadline_monotonic_ns < current)
-                        best.* = entry.deadline_monotonic_ns;
-                } else {
+            active_count.* += 1;
+            if (best.*) |current| {
+                if (entry.deadline_monotonic_ns < current)
                     best.* = entry.deadline_monotonic_ns;
-                }
+            } else {
+                best.* = entry.deadline_monotonic_ns;
             }
             inspected += 1;
             index = entry.next;
@@ -436,7 +421,7 @@ pub const DeadlineWheel = struct {
     }
 
     fn maybeDisarm(self: *DeadlineWheel) void {
-        if (self.active_len == 0 and self.pending_due_head == invalid_index) {
+        if (self.liveEntries() == 0 and self.pending_due_head == invalid_index) {
             self.next_deadline_monotonic_ns = null;
             self.next_deadline_dirty = false;
             self.setArmed(false);

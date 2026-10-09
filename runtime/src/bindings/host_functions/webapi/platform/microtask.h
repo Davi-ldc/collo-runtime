@@ -1,5 +1,5 @@
 // Declares the `queueMicrotask` global and its installer, which the host function registry (`globals.def`) calls
-// once per VM, on the VM thread, from `collo_vm_create` when the VM installs Web APIs.
+// once per realm, on the VM thread, when the VM installs Web APIs.
 
 #pragma once
 

@@ -349,7 +349,7 @@ void notifyPerformanceObservers(
 static JSC::Structure* performanceObserverStructureForNewTarget(
     JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSC::CallFrame* call_frame)
 {
-    auto* performance = performanceSingleton(global_object);
+    auto* performance = realmPerformance(global_object);
     RELEASE_ASSERT(performance);
     auto* new_target = call_frame->newTarget().getObject();
     auto* constructor = call_frame->jsCallee();
@@ -383,7 +383,7 @@ JSC_DEFINE_HOST_FUNCTION(
         return JSC::throwVMTypeError(global_object, scope,
             "Argument 1 ('callback') to the PerformanceObserver constructor must be a function"_s);
 
-    auto* performance = performanceSingleton(global_object);
+    auto* performance = realmPerformance(global_object);
     RELEASE_ASSERT(performance);
     auto* structure = performanceObserverStructureForNewTarget(global_object, scope, call_frame);
     RETURN_IF_EXCEPTION(scope, {});

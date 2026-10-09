@@ -7,10 +7,10 @@
 // defines. TextEncoderStream and TextDecoderStream are installed by
 // text_codec.cpp. Runs on the VM thread.
 //
-// Installation runs once per VM, when collo_vm_create installs the Web APIs; a
-// worker's VM was created and installed in the zygote before the fork. The
-// structures and functions cached on the global object and in ColloWebApiCache
-// live until destroyVmContents.
+// Installation runs once per realm when the VM installs the Web APIs; a
+// worker's VM and main realm were created and installed in the zygote before
+// the fork. The structures and functions cached on the global object and in
+// the realm's ColloWebApiCache live until destroyVmContents.
 #include "host_functions/webapi/streams/compression_stream_private.h"
 #include "host_functions/webapi/streams/pipe_transform_stream_private.h"
 #include "host_functions/webapi/streams/queuing_strategy_private.h"

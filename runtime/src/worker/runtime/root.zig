@@ -33,8 +33,8 @@
 //!   deadlines, the worker ring and the loop's eventfds.
 //! - `requests.zig`: request contexts, ingress work and request completions.
 //! - `egress.zig`: fetches and their bodies through the egress gateway.
-//! - `modules.zig`: route module evaluation settlements, and the worker's
-//!   stop after a failed evaluation or a deadline fire.
+//! - `modules.zig`: route module evaluation settlements and expiries, and
+//!   the worker's stop when no route can serve or after a deadline fire.
 //! - `crypto.zig`: WebCrypto jobs.
 //! - `fs_fault.zig`: the entry points into the fault plane
 //!   (`worker/fs/fault.zig`).
@@ -332,6 +332,7 @@ pub const Runtime = struct {
 
     pub const collectModuleSettlements = ModulesMethods.collectModuleSettlements;
     pub const handleModuleEvaluationSettled = ModulesMethods.handleModuleEvaluationSettled;
+    pub const expireRouteEvaluations = ModulesMethods.expireRouteEvaluations;
     pub const maybeRecycleAfterFailedEvaluation = ModulesMethods.maybeRecycleAfterFailedEvaluation;
     pub const modulesContext = ModulesMethods.modulesContext;
 

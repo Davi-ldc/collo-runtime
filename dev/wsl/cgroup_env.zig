@@ -7,9 +7,10 @@
 //! Every command is a short-lived, single-threaded process. The runner cgroup
 //! is `COLLO_TEST_CGROUP`, or `default_runner_root` when that is unset, and its
 //! parent is the dev root. `prepare` needs root once per boot: it creates both
-//! directories, gives them to the sudo caller and enables cpu, memory and pids
-//! at the cgroup2 root and in the dev root. `run` moves itself into the runner,
-//! drops back to the sudo caller and execs the command with
+//! directories, enables cpu, memory and pids at the cgroup2 root and in the dev
+//! root, and delegates both to the sudo caller: each directory and the control
+//! files the kernel lists in `/sys/kernel/cgroup/delegate`. `run` moves itself
+//! into the runner, drops back to the sudo caller and execs the command with
 //! `COLLO_TEST_WORKER_CGROUP_ROOT` set to the dev root, under which kernel
 //! tests create worker cgroups. From a shell outside the subtree, only that
 //! first move needs root.
@@ -375,10 +376,12 @@ fn removeScopeTree(
 fn prepare(paths: Paths) !void {
     try ensureDirectory(paths.dev_root);
     try ensureDirectory(paths.runner_root);
-    try chownIfRoot(paths.dev_root);
-    try chownIfRoot(paths.runner_root);
     try enableControllers(cgroup_mount);
     try enableControllers(paths.dev_root);
+    // Enabling a controller creates its files as the writer, so delegation
+    // comes last to also hand over the controller files root just created.
+    try delegateIfRoot(paths.dev_root);
+    try delegateIfRoot(paths.runner_root);
 }
 
 /// A prepared dev root can lose its empty runner leaf between uses, so `run`
@@ -387,7 +390,7 @@ fn prepare(paths: Paths) !void {
 /// `enterRunner` to report.
 fn healRunnerLeaf(paths: Paths) void {
     std.posix.mkdir(paths.runner_root, 0o755) catch return;
-    chownIfRoot(paths.runner_root) catch {};
+    delegateIfRoot(paths.runner_root) catch {};
 }
 
 fn enterRunner(paths: Paths) !void {
@@ -490,13 +493,66 @@ fn ensureDirectory(path: []const u8) !void {
     };
 }
 
-fn chownIfRoot(path: []const u8) !void {
+/// Files the kernel requires a delegatee to own when it cannot read
+/// `delegate_list_path`, which kernels since 4.15 provide.
+const delegate_files_fallback = [_][]const u8{
+    "cgroup.procs",
+    "cgroup.threads",
+    "cgroup.subtree_control",
+};
+const delegate_list_path = "/sys/kernel/cgroup/delegate";
+
+/// Delegates a cgroup to the sudo caller the way cgroup v2 defines it: the
+/// directory and every file the kernel lists in `delegate_list_path`. Owning
+/// the directory alone lets the caller create children but not move processes
+/// into it or enable controllers below it, because a root-created cgroup's
+/// control files stay root-owned. The kernel gives a cgroup and its files to
+/// the process that creates them, so cgroups the caller creates below are
+/// already its own and only the cgroups root creates need this.
+fn delegateIfRoot(directory: []const u8) !void {
     if (std.posix.getuid() != 0) {
         return;
     }
     const uid = targetUid();
     const gid = targetGid();
-    try chownPath(path, uid, gid);
+    try chownPath(directory, uid, gid);
+
+    var list_buffer: [1024]u8 = undefined;
+    const listed = readDelegateList(&list_buffer);
+    var names = std.mem.tokenizeAny(u8, listed orelse "", " \n\t");
+    var any_listed = false;
+    while (names.next()) |name| {
+        any_listed = true;
+        try chownCgroupFile(directory, name, uid, gid);
+    }
+    if (any_listed) return;
+    for (delegate_files_fallback) |name|
+        try chownCgroupFile(directory, name, uid, gid);
+}
+
+fn readDelegateList(buffer: []u8) ?[]const u8 {
+    var file = std.fs.openFileAbsolute(delegate_list_path, .{}) catch return null;
+    defer file.close();
+    const len = file.readAll(buffer) catch return null;
+    return buffer[0..len];
+}
+
+/// A listed file absent from this cgroup belongs to a controller its parent
+/// does not enable, such as `memory.reclaim` on a kernel without the memory
+/// controller, so it is skipped.
+fn chownCgroupFile(
+    directory: []const u8,
+    file_name: []const u8,
+    uid: std.posix.uid_t,
+    gid: std.posix.gid_t,
+) !void {
+    var path_buffer: [256]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buffer, "{s}/{s}", .{ directory, file_name }) catch
+        return error.NameTooLong;
+    chownPath(path, uid, gid) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
 }
 
 extern "c" fn chown(path: [*:0]const u8, owner: std.c.uid_t, group: std.c.gid_t) c_int;

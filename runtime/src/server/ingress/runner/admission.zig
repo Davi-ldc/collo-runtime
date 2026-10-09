@@ -170,7 +170,6 @@ fn h2HeadersForIpc(
 
 pub fn Methods(comptime Self: type) type {
     return struct {
-        const Deadlines = deadline_driver.Methods(Self);
         const Dispatch = dispatch.Methods(Self);
         const RequestFinish = request_finish.Methods(Self);
         const WorkerRegistration = worker_registration.Methods(Self);
@@ -201,10 +200,6 @@ pub fn Methods(comptime Self: type) type {
             };
             runtime.h2SetRequestBodyExpectation(stream_id, head.body_framing, head.content_length, head.end_stream) catch return false;
             self.lane.counters.ingress_channels_started += 1;
-            // The connection's first stream ends its pre-request deadline; the
-            // drive that called this files the next one
-            // (`deadline_driver.syncConnectionDeadline`).
-            runtime.awaiting_first_request = false;
 
             var captures: routes_mod.Captures = undefined;
             const matched = switch (streamTarget(&self.service.routes.table, head.path, &captures)) {

@@ -15,28 +15,38 @@
 //! the order).
 //!
 //! A full queue refuses a command, and its producer acts on the refusal as
-//! `lane_commands.zig` says for that command. The queue's places are of two
-//! kinds, and a command takes only places of its own kind. Five commands
-//! take reserved places (`Command.takesReserve`), because a refusal would
-//! cost more than the command, or because they carry worker output, which
-//! must never take the places the lane's own exchanges need: a worker's
-//! death, which the lane's requests on that worker would otherwise wait out
-//! to their deadlines; a slot whose grant makes the lane the worker's reader,
-//! which a refused post would hand back with the slot, leaving its waiting
-//! request to its deadline; a completion a reader forwards, whose loss would
-//! leave a worker that answered in time to the grace backstop's fault; and a
-//! descriptor a reader forwards and the answer for its ring payload. Every
-//! other command takes ordinary places. A lane serving the configuration
-//! reserves, per worker table entry of every pool, one place for a death, one
-//! for a reader grant, one per slot for a completion, and the entry's
-//! forwarding window (`lane.obligationReserve`): a worker dies once, the pool
-//! grants its reader role to one lane at a time, a reader forwards at most
-//! one completion per request it was sent (`RequestTable.claimCompletion`),
-//! and an entry's forwarded descriptors and answers waiting in all lanes'
-//! queues together never pass `limits.ingress.forwarded_commands_per_worker_max`
-//! (`runner/h2_worker_ipc.zig`). The reserve runs out only if one entry's
-//! worker is launched, dies and is retired again while the lane leaves an
-//! earlier command of that entry unprocessed.
+//! `lane_commands.zig` says for that command. The queue has ordinary places
+//! and reserved ones, and each command's `Command.placement` says which it
+//! may take:
+//! - Worker output, a descriptor a reader forwards and the answer for its
+//!   ring payload, takes only reserved places, so no worker's bytes can take
+//!   a place the lane's own exchanges need.
+//! - Three obligations take a reserved place, or an ordinary one once the
+//!   reserve is full, because a refusal would cost more than the command: a
+//!   worker's death, which the lane's requests on that worker would otherwise
+//!   wait out to their deadlines; a slot whose grant makes the lane the
+//!   worker's reader, which a refused post would hand back with the slot,
+//!   leaving its waiting request to its deadline; and a completion a reader
+//!   forwards, whose loss would leave a worker that answered in time to the
+//!   grace backstop's fault.
+//! - Every other command takes only ordinary places.
+//!
+//! A lane serving the configuration reserves, per worker table entry of every
+//! pool, one place for a death, one for a reader grant, one per slot for a
+//! completion, and the entry's forwarding window (`lane.obligationReserve`):
+//! a worker dies once, the pool grants its reader role to one lane at a time,
+//! a reader forwards at most one completion per request it was sent
+//! (`RequestTable.claimCompletion`), and an entry's forwarded descriptors and
+//! answers waiting in all lanes' queues together never pass
+//! `limits.ingress.forwarded_commands_per_worker_max`
+//! (`runner/h2_worker_ipc.zig`). So the reserve holds every obligation and
+//! all worker output at once, and an obligation takes it first, leaving the
+//! ordinary places to the commands that can take nothing else. The
+//! obligations pass their share only when one entry's worker is launched,
+//! dies and is retired again while the lane leaves an earlier command of that
+//! entry unprocessed. The excess then fills ordinary places once the reserve
+//! is full, and a forwarded descriptor that finds the reserve full meanwhile
+//! is refused.
 //!
 //! The queue's places are a fault-in slab of nodes threaded on a FIFO
 //! (`slab.zig`), so its memory follows the most commands it ever held at
@@ -89,25 +99,38 @@ pub const Command = union(enum) {
         self.* = .empty;
     }
 
-    /// Whether the command may fill the queue's reserve: it hands the lane
-    /// an obligation no other lane or thread can discharge (the file header
-    /// says why each one is bounded).
-    pub fn takesReserve(self: *const Command) bool {
+    /// The places the command may take (the file header says why each kind
+    /// is bounded).
+    pub fn placement(self: *const Command) Placement {
         return switch (self.*) {
-            .worker_died,
-            .forwarded_completion,
             .forwarded_descriptor,
             .payload_consumed,
-            => true,
-            .dispatch_ready => |*ready| ready.reader == .you_become_reader,
+            => .reserved_only,
+            .worker_died,
+            .forwarded_completion,
+            => .reserved_first,
+            .dispatch_ready => |*ready| switch (ready.reader) {
+                .you_become_reader => .reserved_first,
+                .already, .transfer_from => .ordinary_only,
+            },
             .empty,
             .dispatch_failed,
             .release_worker,
             .shutdown,
-            => false,
+            => .ordinary_only,
         };
     }
 };
+
+pub const Placement = enum {
+    /// Worker output: a reserved place or none.
+    reserved_only,
+    /// An obligation: a reserved place, else an ordinary one.
+    reserved_first,
+    ordinary_only,
+};
+
+const PlaceKind = enum { ordinary, reserved };
 
 /// One place of a queue.
 const Node = struct {
@@ -136,8 +159,8 @@ pub const Queue = struct {
     nodes: slab.FaultInSlab(Node),
     /// The queued commands' places, oldest first.
     fifo: slab.Fifo(Node) = .{},
-    /// The places only `Command.takesReserve` commands fill; the rest of
-    /// `nodes` are ordinary places, which those commands never fill.
+    /// The reserved places, which only worker output and obligations fill
+    /// (`Command.placement`); the rest of `nodes` are ordinary places.
     reserve: usize,
     /// Queued commands in ordinary and in reserved places.
     ordinary_used: usize = 0,
@@ -145,8 +168,8 @@ pub const Queue = struct {
     counters: Counters = .{},
     event_fd: std.posix.fd_t,
 
-    /// Reserves `ordinary` places plus `reserve` places for the commands
-    /// that take the reserve, and creates the eventfd. Fails with
+    /// Reserves `ordinary` places plus `reserve` reserved places, and creates
+    /// the eventfd. Fails with
     /// `error.InvalidCommandQueueCapacity` for zero ordinary places, and with
     /// the mapping's or the eventfd's error, leaving nothing behind.
     pub fn init(ordinary: usize, reserve: usize) !Queue {
@@ -255,18 +278,24 @@ pub const Queue = struct {
         return value;
     }
 
-    /// Pushes `command` under the mutex unless every place of its kind is
+    /// Pushes `command` under the mutex unless every place it may take is
     /// taken. Leaves freeing a refused command to `post`, outside the mutex.
     fn push(self: *Queue, command: Command) error{CommandEventfdCorrupt}!bool {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const reserved = command.takesReserve();
-        const used = if (reserved) &self.reserved_used else &self.ordinary_used;
-        const limit = if (reserved) self.reserve else self.nodes.capacity() - self.reserve;
-        if (used.* >= limit) {
+        const reserved_free = self.reserved_used < self.reserve;
+        const ordinary_free = self.ordinary_used < self.nodes.capacity() - self.reserve;
+        const place: ?PlaceKind = switch (command.placement()) {
+            .reserved_only => if (reserved_free) .reserved else null,
+            .reserved_first => if (reserved_free) .reserved else if (ordinary_free) .ordinary else null,
+            .ordinary_only => if (ordinary_free) .ordinary else null,
+        };
+        if (place == null) {
             self.counters.refused_full += 1;
             return false;
         }
+        const reserved = place.? == .reserved;
+        const used = if (reserved) &self.reserved_used else &self.ordinary_used;
         try self.signalLocked();
         // Fewer places are queued than the queue has, and a place is free
         // exactly while it is not queued.

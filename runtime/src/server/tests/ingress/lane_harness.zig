@@ -500,6 +500,8 @@ pub const Harness = struct {
         // double may read.
         for (self.lanes, 0..) |*lane_runner, index|
             lane_runner.* = .{ .listener_index = @intCast(index) };
+        // Runs after `stopLanes`: a lane's access ring outlives its runtime.
+        errdefer self.unmapAccessRings();
         self.reaper.lanes = self.lanes;
         self.service = .{
             .allocator = gpa,
@@ -532,19 +534,26 @@ pub const Harness = struct {
             entry.* = null;
         }
         // A test reads a stopped lane's access records, so each ring goes
-        // only now; a lane that never started holds an empty one.
-        for (self.lanes) |*lane_runner|
-            lane_runner.access_ring.deinit();
+        // only now.
+        self.unmapAccessRings();
         self.gpa.free(self.lanes);
         self.egress_gateways.deinit();
         fixture.deinitMinimal(&self.supervisor);
         self.* = undefined;
     }
 
+    /// Unmaps every lane's access ring, a lane that never started holding an
+    /// empty one; `init` and `deinit` call it once each lane is stopped.
+    fn unmapAccessRings(self: *Harness) void {
+        for (self.lanes) |*lane_runner|
+            lane_runner.access_ring.deinit();
+    }
+
+    /// Starts lane `index`. Its access ring, once mapped, stays with the
+    /// lane even when a later step fails, for `unmapAccessRings`.
     fn startLane(self: *Harness, index: u16, options: Options) !void {
         const lane_runner = &self.lanes[index];
         lane_runner.* = try Lane.init(index, null);
-        errdefer lane_runner.access_ring.deinit();
         lane_runner.table_capacities = options.table_capacities;
         lane_runner.connection_timeouts = options.connection_timeouts;
         lane_runner.service = &self.service;
@@ -834,7 +843,7 @@ pub const Harness = struct {
     /// The entries lane `lane_index`'s deadline wheel holds, which are the
     /// only request timers a lane has.
     pub fn armedDeadlineCount(self: *Harness, lane_index: u16) usize {
-        return self.lane(lane_index).lane.deadline_wheel.active_len;
+        return self.lane(lane_index).lane.deadline_wheel.liveEntries();
     }
 
     /// Copies of the commands waiting in lane `lane_index`'s queue, oldest

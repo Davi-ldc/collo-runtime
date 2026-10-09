@@ -1,11 +1,11 @@
-// Helpers every stream class shares: receiver checks, the per-VM property
+// Helpers every stream class shares: receiver checks, the per-realm property
 // identifiers, buffer copies and transfers, promise plumbing, and the native
 // source that serves a byte buffer as a readable stream. Runs on the VM thread.
 //
 // A native callback reaches its cell through a DontEnum property of its
 // JSFunction, never through a captured pointer, so the collector traces the
-// edge. The identifiers are cached in the VM's ColloWebApiCache and live until
-// destroyVmContents clears it.
+// edge. The identifiers are cached in the realm's ColloWebApiCache and live
+// until destroyVmContents clears it.
 #include "host_functions/webapi/streams/pipe_transform_stream_private.h"
 
 #include "host_functions/webapi/dom/dom_exception.h"

@@ -15,6 +15,7 @@ const ingress_assertions = @import("assertions.zig");
 const ingress = server_main.ingress;
 const event_sources = ingress.runner.event_sources;
 const connection_slot = ingress.runner.connection_slot;
+const stream_table = ingress.runner.stream_table;
 const deadline_driver = ingress.runner.deadline_driver;
 
 test "runner event data round trips kind index and generation, and refuses a tag naming no kind" {
@@ -73,38 +74,57 @@ fn expectDeadline(actual: ?connection_slot.Deadline, kind: connection_slot.Deadl
     try std.testing.expectEqual(at_ns, deadline.at_ns);
 }
 
-test "a connection's one deadline follows its state: pre-request, stall, idle, or none while its streams run" {
+test "a connection's one deadline follows its state: pre-request, none while a stream serves a request and no header block is open, then stall or idle" {
     const timeouts: deadline_driver.ConnectionTimeouts = .{ .pre_request_ns = 3, .idle_ns = 300, .stall_ns = 10 };
-    var slot: connection_slot.Slot = .{ .accepted_ns = 1000, .last_progress_ns = 1000 };
+    var streams = try stream_table.StreamSlab.init(4);
+    defer streams.deinit();
+    var slot: connection_slot.Slot = .{ .accepted_ns = 1000, .last_progress_ns = 1000, .streams = &streams };
+    const no_deadline: ?connection_slot.Deadline = null;
 
-    // From the accept until the first request, whatever moves meanwhile.
+    // From the accept until the first stream, whatever moves meanwhile.
     try expectDeadline(deadline_driver.desiredDeadline(&slot, timeouts), .pre_request, 1003);
     slot.last_progress_ns = 2000;
     slot.h2_pending_response_bytes = 1;
     try expectDeadline(deadline_driver.desiredDeadline(&slot, timeouts), .pre_request, 1003);
 
-    // A first request started and a stream runs: the request's own
-    // deadline governs, unless the client holds something back.
-    slot.awaiting_first_request = false;
-    slot.ingress_channel_count = 1;
-    try expectDeadline(deadline_driver.desiredDeadline(&slot, timeouts), .stall, 2010);
-    slot.h2_pending_response_bytes = 0;
-    try std.testing.expectEqual(@as(?connection_slot.Deadline, null), deadline_driver.desiredDeadline(&slot, timeouts));
-
-    // No stream: idle from the moment the last one ended, unless a write
-    // the socket has not taken stalls first.
-    slot.ingress_channel_count = 0;
-    slot.idle_since_ns = 5000;
-    try expectDeadline(deadline_driver.desiredDeadline(&slot, timeouts), .idle, 5300);
+    // A stream serves a request: its deadline governs, even while the
+    // client holds response bytes back or leaves writes in the queue.
+    slot.noteStreamOpened();
+    try slot.h2ReserveStream(1);
+    try slot.h2BindRequest(1, .{ .lane_id = 0, .slot = 0, .generation = 1 }, 7);
+    try std.testing.expectEqual(no_deadline, deadline_driver.desiredDeadline(&slot, timeouts));
     slot.h2_write_len = 9;
+    try std.testing.expectEqual(no_deadline, deadline_driver.desiredDeadline(&slot, timeouts));
+    // Except a header block left open, which stops every other frame.
+    slot.h2_header_block_stream_id = 3;
+    try expectDeadline(deadline_driver.desiredDeadline(&slot, timeouts), .stall, 2010);
+    slot.h2_header_block_stream_id = 0;
+
+    // A stream no request holds, such as one draining its response's tail,
+    // leaves the connection to its own deadlines: the stall while the
+    // client holds bytes back.
+    streams.entries[slot.stream_refs[0]].request = null;
     try expectDeadline(deadline_driver.desiredDeadline(&slot, timeouts), .stall, 2010);
 
-    // A close that flushes its GOAWAY is bounded by the stall deadline, and
-    // one that does not flush needs no deadline.
-    slot.closing = .{ .reason = .idle_timeout, .flush = true };
+    // No stream: idle from the moment the connection came to serve none,
+    // unless a write the socket has not taken stalls first.
+    try std.testing.expect(slot.h2RemoveStream(std.testing.allocator, 1));
+    slot.h2_pending_response_bytes = 0;
+    slot.idle_since_ns = 5000;
     try expectDeadline(deadline_driver.desiredDeadline(&slot, timeouts), .stall, 2010);
-    slot.closing = .{ .reason = .idle_timeout, .flush = false };
-    try std.testing.expectEqual(@as(?connection_slot.Deadline, null), deadline_driver.desiredDeadline(&slot, timeouts));
+    slot.h2_write_len = 0;
+    try expectDeadline(deadline_driver.desiredDeadline(&slot, timeouts), .idle, 5300);
+
+    // A close that flushes its GOAWAY gets a stall period from the later of
+    // its decision and the last byte, and one that does not flush needs no
+    // deadline.
+    slot.h2_write_len = 9;
+    slot.closing = .{ .reason = .idle_timeout, .flush = true, .decided_ns = 5400 };
+    try expectDeadline(deadline_driver.desiredDeadline(&slot, timeouts), .stall, 5410);
+    slot.last_progress_ns = 5500;
+    try expectDeadline(deadline_driver.desiredDeadline(&slot, timeouts), .stall, 5510);
+    slot.closing = .{ .reason = .idle_timeout, .flush = false, .decided_ns = 5400 };
+    try std.testing.expectEqual(no_deadline, deadline_driver.desiredDeadline(&slot, timeouts));
 }
 
 test "connection deadlines leave their heap in deadline order, ties by key" {

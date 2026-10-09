@@ -171,14 +171,16 @@ pub const ConnectionCloseReason = enum {
     allocation_failed,
     /// The client closed or reset the connection.
     peer_closed,
-    /// The connection started no request before its pre-request deadline
-    /// (`runner/deadline_driver.zig`).
+    /// The connection opened no stream before its pre-request deadline. A
+    /// stream opened at a complete request head ends that deadline, whatever
+    /// the lane answers on it (`runner/deadline_driver.zig`).
     pre_request_timeout,
-    /// The connection had no stream for the whole idle deadline; it got
-    /// GOAWAY NO_ERROR first.
+    /// No stream of the connection served a request for the whole idle
+    /// deadline; it got GOAWAY NO_ERROR first.
     idle_timeout,
-    /// The lane held part of a frame, a header block or writes for the
-    /// connection, and no byte moved for the whole stall deadline.
+    /// No stream of the connection served a request, the lane held part of
+    /// a frame, a header block or writes for it, and no byte moved for the
+    /// whole stall deadline.
     stall_timeout,
     /// The connection's header block would have taken the lane past its
     /// header block budget (`limits.ingress.header_block_bytes_per_lane_max`).
@@ -1235,10 +1237,10 @@ pub const loop_handlers = [_]LoopHandler{
 //   with `.exited`.
 // handleDeadlineTimer(lane) LaneFault!void
 //   Drains the timerfd and expires the deadlines due. A connection that
-//   started no request by its pre-request deadline closes as
-//   `.pre_request_timeout`, one idle past its idle deadline closes as
-//   `.idle_timeout` after GOAWAY NO_ERROR is written, and one stalled past
-//   its stall deadline closes as `.stall_timeout` at once. A
+//   opened no stream by its pre-request deadline closes as
+//   `.pre_request_timeout`. One where no stream serves a request closes as
+//   `.idle_timeout` past its idle deadline, after GOAWAY NO_ERROR is
+//   written, or as `.stall_timeout` at once past its stall deadline. A
 //   request still waiting for a worker slot at its deadline leaves its
 //   pool's waiters with 503. A dispatched request past its deadline plus
 //   `hard_timeout_grace_ns` first lets its worker's output in; a completion

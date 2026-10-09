@@ -1,8 +1,10 @@
 //! The lane command queue (`ingress/commands.zig`): a command keeps its
 //! payload through the queue, a full queue refuses a command and keeps the
 //! ones it holds, and the queue's ordinary places and its reserve fill
-//! apart: a worker's death, a reader grant and a reader's forwards take only
-//! reserved places, every other command only ordinary ones. A command the
+//! apart: a reader's forwarded output takes only reserved places, a worker's
+//! death and a reader grant take a reserved place first and an ordinary one
+//! once the reserve is full, and every other command takes only ordinary
+//! ones. A command the
 //! queue refuses, abandons at teardown or cannot wake the lane for frees what
 //! it owns. The queue writes only the places it used, and one eventfd wake
 //! covers several commands. Lane `server-ingress-test`; what a lane does with
@@ -128,16 +130,19 @@ test "deaths and reader grants fill a one-definition lane's reserve, which the o
     try std.testing.expectEqual(1 + reserve, queue.pending());
 }
 
-test "worker output and deaths never take an ordinary place, and ordinary commands never a reserved one" {
-    var queue = try Queue.init(1, 1);
+test "worker output never takes an ordinary place, a death takes one once the reserve is full, and ordinary commands never take a reserved one" {
+    var queue = try Queue.init(2, 1);
     defer queue.deinit();
 
     try std.testing.expect(try queue.post(try forwardedDescriptor(std.testing.allocator, "first")));
-    // The reserve is full; the free ordinary place does not take a reader's
-    // forward or a death.
+    // The reserve is full; the free ordinary places do not take a reader's
+    // forward, but they take a death.
     try std.testing.expect(!try queue.post(try forwardedDescriptor(std.testing.allocator, "second")));
-    try std.testing.expect(!try queue.post(workerDied(.{ .worker_id = 2, .worker_generation = 1 })));
     try std.testing.expect(try queue.post(.shutdown));
+    try std.testing.expect(try queue.post(workerDied(.{ .worker_id = 2, .worker_generation = 1 })));
+    try std.testing.expectEqual(@as(usize, 1), queue.reserved_used);
+    try std.testing.expectEqual(@as(usize, 2), queue.ordinary_used);
+    try std.testing.expect(!try queue.post(workerDied(.{ .worker_id = 3, .worker_generation = 1 })));
     try std.testing.expect(!try queue.post(.shutdown));
     try std.testing.expectEqual(@as(u64, 3), queue.counters.refused_full);
 
@@ -145,7 +150,18 @@ test "worker output and deaths never take an ordinary place, and ordinary comman
     var first = queue.dequeue() orelse return error.MissingCommand;
     first.deinit();
     try std.testing.expect(!try queue.post(.shutdown));
-    try std.testing.expect(try queue.post(workerDied(.{ .worker_id = 3, .worker_generation = 1 })));
+    try std.testing.expect(try queue.post(workerDied(.{ .worker_id = 4, .worker_generation = 1 })));
+    try std.testing.expectEqual(@as(usize, 1), queue.reserved_used);
+}
+
+test "a death takes a reserved place before an ordinary one, leaving the ordinary places to the commands that can take nothing else" {
+    var queue = try Queue.init(1, 1);
+    defer queue.deinit();
+
+    try std.testing.expect(try queue.post(workerDied(.{ .worker_id = 1, .worker_generation = 1 })));
+    try std.testing.expectEqual(@as(usize, 1), queue.reserved_used);
+    try std.testing.expectEqual(@as(usize, 0), queue.ordinary_used);
+    try std.testing.expect(try queue.post(.shutdown));
 }
 
 test "a queue torn down with a forwarded descriptor in it frees the descriptor's inline bytes" {

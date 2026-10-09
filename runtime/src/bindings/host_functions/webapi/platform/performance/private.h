@@ -1,11 +1,12 @@
 // The cells behind `performance`, shared by the files under `performance/`: Performance, PerformanceEntry with its
 // Mark and Measure subclasses, PerformanceTiming, PerformanceObserver and PerformanceObserverEntryList. They run on
-// the VM thread, except visitChildren, which the concurrent marker runs. The VM's one Performance cell, found through
-// the global `performance` property (`performanceSingleton`), holds the structures of the cells it creates, the entry
-// buffer and the registered observers. Like Node's per-process `performance`, that timeline belongs to the worker
-// rather than to a request: entries, observers, listeners and the time origin persist across requests, and requests
-// co-scheduled on one worker share them, so nothing may reset them when a request ends. Resource timing is not
-// implemented: no resource entry is ever recorded, and the buffer size and buffer-full handler are only stored.
+// the VM thread, except visitChildren, which the concurrent marker runs. Each realm has one Performance cell, which
+// installation stores in the realm's Web API cache (`realmPerformance`) and on its global `performance` property; it
+// holds the structures of the cells it creates, the entry buffer and the registered observers. That timeline belongs
+// to the realm rather than to a request: entries, observers, listeners and the time origin persist across requests,
+// and requests co-scheduled on that realm share them, so nothing may reset them when a request ends. Another realm of
+// the same VM has a timeline of its own. Resource timing is not implemented: no resource entry is ever recorded, and
+// the buffer size and buffer-full handler are only stored.
 
 #pragma once
 
@@ -76,7 +77,9 @@ class JSColloPerformance;
 class JSColloPerformanceEntry;
 
 void notifyPerformanceObservers(JSC::JSGlobalObject*, JSC::VM&, JSColloPerformance&, JSColloPerformanceEntry*);
-JSColloPerformance* performanceSingleton(JSC::JSGlobalObject*);
+// The Performance cell installed on `global_object`'s realm, which every PerformanceMark and PerformanceObserver that
+// realm's constructors create records into or observes. Null only on a global whose Web APIs were not installed.
+JSColloPerformance* realmPerformance(JSC::JSGlobalObject*);
 
 inline bool requireArgumentCount(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSC::CallFrame* call_frame,
     unsigned count, WTF::ASCIILiteral message)
@@ -405,9 +408,9 @@ public:
         notifyPerformanceObservers(global_object, vm, *this, entry);
     }
 
-    // Fixes the time origin at the first access. It resets nothing: the timeline is the worker's, and a reset keyed
+    // Fixes the time origin at the first access. It resets nothing: the timeline is the realm's, and a reset keyed
     // on the current request would wipe the entries, observers and listeners of a request co-scheduled on the same
-    // worker while it is still running.
+    // realm while it is still running.
     void ensureTimeOriginForAccess() { ensureOrigin(); }
 
     void setResourceTimingBufferSize(unsigned size)

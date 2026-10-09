@@ -279,8 +279,9 @@ pub fn Methods(comptime Self: type) type {
                 // The worker is done with the request, so nothing more of a
                 // response the reader stopped forwarding can follow.
                 registration.forward_loss.remove(request_key);
-                // The completion may take the owner's command reserve, so
-                // only a lane that is not running refuses it.
+                // The completion takes any free place of the owner's queue,
+                // a reserved one first (`commands.zig`), so only a lane that
+                // is not running or whose queue is full refuses it.
                 if (!try self.postToLane(request_key.lane_id, .{ .forwarded_completion = .{
                     .request_key = request_key,
                     .worker_key = worker_key,

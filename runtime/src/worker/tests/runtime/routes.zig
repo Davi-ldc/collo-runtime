@@ -2,13 +2,15 @@
 //! (`worker/modules/routes.zig`): dispatch by route index, each route in its
 //! own realm or every route in one (`WorkerInit.flag_isolate_realm`), each
 //! route's own `env`, the boot that evaluates every route before ready and
-//! keeps one boot context open until the last top-level await settles, that
-//! context's budget over a hung await in any route, settlements keyed by
-//! realm and specifier, a synchronous throw confined to its route, a
-//! rejected await that fails its route and recycles the worker once its
-//! requests drain, and an index past the table. The runtime here runs in
-//! process with the table WorkerInit would carry; `local-e2e` serves the
-//! same through the server in both realm modes.
+//! keeps one boot context open until the last top-level await settles,
+//! settlements keyed by realm and specifier, and an index past the table. A
+//! failure ends only its own route: a synchronous throw, a rejected await
+//! and an await past its budget each pin their route failed while the
+//! others serve, and the worker recycles, once its requests drain, only
+//! when no route can serve and one failed on an await. The runtime here runs
+//! in process with the table WorkerInit would carry; `local-e2e` serves the
+//! same through the server in both realm modes, and `arbiter.zig` covers a
+//! boot turn that never yields.
 
 const std = @import("std");
 const support = @import("bindings_support");
@@ -18,6 +20,7 @@ const rt = @import("collo_test_harness");
 
 const route_table = ipc.route_table;
 const Module = ipc.module_pack.Module;
+const Failure = worker.testing.module_routes.RouteModuleState.Failure;
 
 /// One runtime started with a route table, as a worker's boot starts it.
 const Fixture = struct {
@@ -239,7 +242,7 @@ test "the boot evaluates every route, serves the settled ones, and keeps its con
     try std.testing.expect(fixture.runtime.bootContext() == null);
 }
 
-test "the boot context's budget reclaims a hung await in any route, not only the first" {
+test "an await past its budget pins only its own route failed, and the other routes keep serving" {
     const sync_entry = "/__collo_route/routes/sync.js";
     const hung_entry = "/__collo_route/routes/hung.js";
     var fixture: Fixture = undefined;
@@ -261,17 +264,114 @@ test "the boot context's budget reclaims a hung await in any route, not only the
     const boot_ctx = fixture.runtime.bootContext() orelse return error.MissingBootContext;
     try std.testing.expect(boot_ctx.deadline_armed);
 
-    // No request waits on route 1, so the boot context's budget is the one
-    // wake that finds its await hung, though route 0 settled at once.
+    // A request for the hung route parks on it; its own deadline lies past
+    // the budget, so the boot context's deadline is the wake that finds the
+    // await hung.
+    try fixture.enqueue(1, 1);
+    try rt.executeNextReady(&fixture.runtime);
+    try std.testing.expect(fixture.runtime.requests.active.contains(1));
     fixture.now_mono_ns = worker.testing.module_routes.module_eval_budget_ns + std.time.ns_per_ms;
     try fixture.runtime.collectDueRequestDeadlines();
-    while (!fixture.runtime.scheduler.ready_queue.isEmpty())
-        try rt.executeNextReady(&fixture.runtime);
-    try std.testing.expect(!fixture.runtime.core.running);
-    try std.testing.expect(fixture.module(1) == .evaluating);
+    try rt.executeNextReady(&fixture.runtime);
+
+    // The route is pinned failed and the boot context closed, but the worker
+    // stays up: route 0 can still serve.
+    try std.testing.expect(fixture.module(1) == .failed);
+    try std.testing.expectEqual(Failure.exceeded_budget, fixture.module(1).failed);
+    try std.testing.expect(fixture.runtime.boot_ctx == .closed);
+    try std.testing.expect(!fixture.runtime.modules.state.recycle_after_drain);
+
+    // The parked request gets the 500 a synchronous throw would give, and
+    // route 0 serves.
+    try rt.executeUntilRequestDone(&fixture.runtime, 1);
+    var failed = try rt.readIngressResponse(&fixture.runtime, fixture.control_pair[1], 1);
+    defer failed.deinit();
+    try std.testing.expectEqual(@as(u16, 500), failed.status);
+    try fixture.expectBody(2, 0, "sync");
+    fixture.runtime.maybeRecycleAfterFailedEvaluation();
+    try std.testing.expect(fixture.runtime.core.running);
+
+    // A settlement that arrives after the expiry finds no route evaluating
+    // and leaves the route failed.
+    fixture.runtime.handleModuleEvaluationSettled(fixture.realmIndex(1), hung_entry, true);
+    try std.testing.expect(fixture.module(1) == .failed);
+    try fixture.expectBody(3, 0, "sync");
 }
 
-test "routes sharing an entry settle together in one realm and apart in realms of their own, where a rejection recycles the worker once its requests drain" {
+test "the worker recycles once every route failed and one of them on an await, after its requests drain" {
+    const throws_entry = "/__collo_route/routes/throws.js";
+    const rejects_entry = "/__collo_route/routes/rejects.js";
+    const hung_entry = "/__collo_route/routes/hung.js";
+    var fixture: Fixture = undefined;
+    try fixture.init(&.{
+        .{ .entry_specifier = throws_entry, .bindings = &.{} },
+        .{ .entry_specifier = rejects_entry, .bindings = &.{} },
+        .{ .entry_specifier = hung_entry, .bindings = &.{} },
+    }, true);
+    defer fixture.deinit();
+    const pending_source = "await new Promise(() => {});\nexport default () => new Response(\"never\");\n";
+    try fixture.boot(&.{
+        .{
+            .specifier = throws_entry,
+            .source = "throw new Error(\"boom\");\nexport default function handle() { return \"never\"; }\n",
+            .dependencies = &.{},
+        },
+        .{ .specifier = rejects_entry, .source = pending_source, .dependencies = &.{} },
+        .{ .specifier = hung_entry, .source = pending_source, .dependencies = &.{} },
+    });
+    try std.testing.expectEqual(Failure.threw, fixture.module(0).failed);
+    try std.testing.expect(fixture.module(1) == .evaluating);
+    try std.testing.expect(fixture.module(2) == .evaluating);
+
+    // A rejection leaves one route still evaluating, so the worker serves on.
+    fixture.runtime.handleModuleEvaluationSettled(fixture.realmIndex(1), rejects_entry, false);
+    try std.testing.expectEqual(Failure.rejected, fixture.module(1).failed);
+    try std.testing.expect(!fixture.runtime.modules.state.recycle_after_drain);
+
+    // The last route expires with a request parked on it: now no route can
+    // serve, and a fresh worker might get past the awaits.
+    try fixture.enqueue(1, 2);
+    try rt.executeNextReady(&fixture.runtime);
+    fixture.now_mono_ns = worker.testing.module_routes.module_eval_budget_ns + std.time.ns_per_ms;
+    try fixture.runtime.collectDueRequestDeadlines();
+    try rt.executeNextReady(&fixture.runtime);
+    try std.testing.expectEqual(Failure.exceeded_budget, fixture.module(2).failed);
+    try std.testing.expect(fixture.runtime.modules.state.recycle_after_drain);
+
+    // The parked request is queued again and drains with the worker's own
+    // 500 before the worker stops.
+    fixture.runtime.maybeRecycleAfterFailedEvaluation();
+    try std.testing.expect(fixture.runtime.core.running);
+    try rt.executeUntilRequestDone(&fixture.runtime, 1);
+    var failed = try rt.readIngressResponse(&fixture.runtime, fixture.control_pair[1], 1);
+    defer failed.deinit();
+    try std.testing.expectEqual(@as(u16, 500), failed.status);
+    fixture.runtime.maybeRecycleAfterFailedEvaluation();
+    try std.testing.expect(!fixture.runtime.core.running);
+}
+
+test "a worker whose every route threw synchronously keeps answering 500s instead of recycling" {
+    const throws_entry = "/__collo_route/routes/throws.js";
+    var fixture: Fixture = undefined;
+    try fixture.init(&.{.{ .entry_specifier = throws_entry, .bindings = &.{} }}, true);
+    defer fixture.deinit();
+    try fixture.boot(&.{.{
+        .specifier = throws_entry,
+        .source = "throw new Error(\"boom\");\nexport default function handle() { return \"never\"; }\n",
+        .dependencies = &.{},
+    }});
+
+    // A fresh worker would evaluate the same module and throw again.
+    try std.testing.expectEqual(Failure.threw, fixture.module(0).failed);
+    try std.testing.expect(!fixture.runtime.modules.state.recycle_after_drain);
+    var failed = try fixture.send(1, 0);
+    defer failed.deinit();
+    try std.testing.expectEqual(@as(u16, 500), failed.status);
+    fixture.runtime.maybeRecycleAfterFailedEvaluation();
+    try std.testing.expect(fixture.runtime.core.running);
+}
+
+test "routes sharing an entry settle together in one realm and apart in realms of their own, where a rejection fails only its own route" {
     const tla_entry = "/__collo_route/routes/tla.js";
     const tla_source =
         \\await new Promise((resolve) => setTimeout(resolve, 0));
@@ -324,10 +424,8 @@ test "routes sharing an entry settle together in one realm and apart in realms o
         try std.testing.expect(fixture.module(1) == .failed);
         try std.testing.expect(fixture.module(0) == .evaluating);
         try std.testing.expect(fixture.runtime.bootContext() != null);
-        // A rejected await asks for a recycle, as in a worker of one route,
-        // so a fresh worker evaluates every route again; the other routes
-        // serve until then.
-        try std.testing.expect(fixture.runtime.modules.state.recycle_after_drain);
+        // Route 0 can still serve, so the rejection asks for no recycle.
+        try std.testing.expect(!fixture.runtime.modules.state.recycle_after_drain);
 
         try fixture.expectBody(1, 0, "a");
         try std.testing.expect(fixture.module(1) == .failed);
@@ -336,11 +434,11 @@ test "routes sharing an entry settle together in one realm and apart in realms o
         defer refused.deinit();
         try std.testing.expectEqual(@as(u16, 500), refused.status);
 
-        // Once nothing is left to drain, the worker stops.
+        // With nothing left to drain, the worker still serves route 0.
         fixture.runtime.collectModuleSettlements();
-        try std.testing.expect(fixture.runtime.core.running);
         fixture.runtime.maybeRecycleAfterFailedEvaluation();
-        try std.testing.expect(!fixture.runtime.core.running);
+        try std.testing.expect(fixture.runtime.core.running);
+        try fixture.expectBody(3, 0, "a");
     }
 }
 

@@ -159,8 +159,7 @@ JSC_DEFINE_HOST_FUNCTION(countQueuingStrategySize, (JSC::JSGlobalObject*, JSC::C
 }
 
 // Web IDL makes size a readonly attribute. After the brand check the getter returns the size function created once
-// at installation, which the Streams Standard keeps per global object; ColloWebApiCache holds it per VM, and each VM
-// has one global object.
+// at installation, which the Streams Standard keeps per global object; each realm's ColloWebApiCache holds its own.
 JSC_DEFINE_HOST_FUNCTION(
     byteLengthQueuingStrategySizeGetter, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
 {

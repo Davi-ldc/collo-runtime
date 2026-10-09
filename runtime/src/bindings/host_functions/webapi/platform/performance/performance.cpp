@@ -94,14 +94,12 @@ static JSColloPerformanceTiming* requirePerformanceTiming(
     return nullptr;
 }
 
-// The Performance cell the global `performance` property holds, or null.
-// FIXME: that property is configurable, so script can delete or redefine it, and the PerformanceMark and
-// PerformanceObserver constructors then reach RELEASE_ASSERT on the null this returns, ending the worker.
-JSColloPerformance* performanceSingleton(JSC::JSGlobalObject* global_object)
+JSColloPerformance* realmPerformance(JSC::JSGlobalObject* global_object)
 {
-    auto& vm = global_object->vm();
-    auto value = global_object->getDirect(vm, JSC::Identifier::fromString(vm, "performance"_s));
-    return dynamicDowncast<JSColloPerformance>(value);
+    auto* collo_global = dynamicDowncast<Collo::GlobalObject>(global_object);
+    if (!collo_global)
+        return nullptr;
+    return dynamicDowncast<JSColloPerformance>(collo_global->webApiCache().performance.get());
 }
 
 JSC_DEFINE_HOST_FUNCTION(performanceConstructorCall, (JSC::JSGlobalObject * global_object, JSC::CallFrame*))
@@ -352,17 +350,18 @@ bool webApiPerformanceTargetHandle(JSC::JSValue value, WebApiEventTargetHandle& 
     return false;
 }
 
-// Releases what worker-wide objects hold for `request_id` once that request ends: the object URLs it created, the GC
-// roots of its native holders and its console output budget. Each step touches only this request's share, because a
-// request co-scheduled on the same worker may still be running. The performance timeline is the worker's, so nothing
-// in it is released here.
+// Releases what the VM and its realms hold for `request_id` once that request ends: the object URLs it created in any
+// realm, the GC roots of its native holders and its console output budget. Each step touches only this request's
+// share, because a request co-scheduled on the same worker may still be running. A realm's performance timeline
+// belongs to the realm rather than to a request, so nothing in it is released here.
 extern "C" ColloStatus collo_webapi_cleanup_request(ColloVm* vm, uint64_t request_id)
 {
     if (!vm || !vm->isReady() || !request_id)
         return COLLO_STATUS_INVALID_ARGUMENT;
 
     JSC::JSLockHolder locker(*vm->vm);
-    vm->blob_object_urls.removeOwnedBy(request_id);
+    for (auto& realm : vm->realms)
+        realm->blob_object_urls.removeOwnedBy(request_id);
     // Native objects that root this request's JS graphs, such as a body consumer whose ReadableStream never settled,
     // cannot be reclaimed by the collector; without this they would live as long as the worker.
     // ColloRequestScopedRoots in state.h explains why.
@@ -544,6 +543,9 @@ void installWebApiPerformance(Collo::GlobalObject* global_object, JSC::VM& vm)
         static_cast<unsigned>(JSC::PropertyAttribute::DontEnum));
     global_object->putDirect(vm, JSC::Identifier::fromString(vm, "performance"_s), performance,
         static_cast<unsigned>(JSC::PropertyAttribute::ReadOnly | JSC::PropertyAttribute::DontEnum));
+    // Script can delete or redefine the configurable `performance` property, so the constructors that record into
+    // this realm's timeline find it through the cache, never through the property.
+    global_object->webApiCache().performance.set(vm, performance);
     RELEASE_ASSERT(global_object->getDirect(vm, JSC::Identifier::fromString(vm, "PerformanceEntry"_s)));
     RELEASE_ASSERT(global_object->getDirect(vm, JSC::Identifier::fromString(vm, "PerformanceMark"_s)));
     RELEASE_ASSERT(global_object->getDirect(vm, JSC::Identifier::fromString(vm, "PerformanceMeasure"_s)));

@@ -77,8 +77,9 @@ pub fn Methods(comptime Runtime: type) type {
         /// `worker/modules/routes.zig`). With a top-level await, ready means the
         /// synchronous part is done and the event loop settles the evaluation
         /// later; the boot context's deadline is then armed to the evaluation
-        /// budget, so an await that never settles is reclaimed even when no
-        /// request waits on it.
+        /// budget, so a route whose await never settles is pinned failed, and
+        /// the context closed, even when no request waits on it
+        /// (`deadlineTimeout` in `worker/serve/dispatch.zig`).
         ///
         /// A nonzero `init_deadline_mono_ns` is the host's absolute init deadline
         /// minus the child's cleanup reserve. It is armed before the pack is
@@ -152,13 +153,16 @@ pub fn Methods(comptime Runtime: type) type {
             }
             const boot_ctx = maybe_boot_ctx orelse return;
             // A top-level await is pending: the init deadline gives way to the
-            // evaluation budget, which starts after the last route's
-            // synchronous part and so covers every await in flight.
+            // evaluation budget. It starts after the last route's synchronous
+            // part, so it falls no earlier than any route's own budget
+            // (`Evaluating.deadline_mono_ns`), and its expiry finds every
+            // await still in flight expired.
             self.disarmRequestDeadline(boot_ctx);
             boot_ctx.exec.deadline_monotonic_ns = self.nowMonoNs() +| modules_routes.module_eval_budget_ns;
             // Without the armed budget, an await that never settles and has no
-            // request waiting on it would keep a ready worker alive until its
-            // idle timeout. Failing to arm it fails the init instead.
+            // request waiting on it would hold the boot context, with its
+            // timers and fetches, open for the worker's life. Failing to arm
+            // it fails the init instead.
             errdefer boot_ctx.exec.deadline_monotonic_ns = 0;
             try self.armRequestDeadline(boot_ctx);
         }

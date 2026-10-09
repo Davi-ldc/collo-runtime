@@ -1,7 +1,7 @@
 // Installs the Web Cryptography API on a global object: the `crypto` instance with its `subtle` member, and the
 // `Crypto`, `SubtleCrypto` and `CryptoKey` interfaces, whose constructors throw on every call. It runs at most once
-// per VM, on the VM thread, from `collo_vm_create` when the VM installs Web APIs; a worker's VM is created in the
-// zygote, so every worker inherits these objects from the zygote's heap. The CryptoKey structure is cached on the
+// per realm, on the VM thread, when the VM installs Web APIs; a worker's VM and main realm are created in the zygote,
+// so every worker inherits the main realm's objects from the zygote's heap. The CryptoKey structure is cached on the
 // global object (`cacheCryptoApi`), where the key factories in `keys.cpp` read it, so this installer must run before
 // any key is created.
 

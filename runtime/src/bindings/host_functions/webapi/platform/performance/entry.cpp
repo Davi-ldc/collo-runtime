@@ -269,7 +269,7 @@ static std::optional<ParsedMeasureOptions> parseMeasureOptions(JSC::JSGlobalObje
 static JSC::Structure* performanceMarkStructureForNewTarget(
     JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSC::CallFrame* call_frame)
 {
-    auto* performance = performanceSingleton(global_object);
+    auto* performance = realmPerformance(global_object);
     RELEASE_ASSERT(performance);
     auto* new_target = call_frame->newTarget().getObject();
     auto* constructor = call_frame->jsCallee();
@@ -310,7 +310,7 @@ JSC_DEFINE_HOST_FUNCTION(
     if (!requireArgumentCount(global_object, scope, call_frame, 1, "PerformanceMark constructor requires a name"_s))
         return {};
 
-    auto* performance = performanceSingleton(global_object);
+    auto* performance = realmPerformance(global_object);
     RELEASE_ASSERT(performance);
     auto name = argumentToWebApiString(global_object, scope, call_frame, 0);
     RETURN_IF_EXCEPTION(scope, {});
