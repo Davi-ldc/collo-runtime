@@ -133,7 +133,7 @@ fn settleReady(runtime: *egress_context.Context, body_id: u64) !void {
             return;
         }
 
-        var value = pullResultValue(runtime, &pull.bytes, pull.done) catch |err| {
+        var value = pullResultValue(bindings.promiseDeferredRealm(raw_deferred), &pull.bytes, pull.done) catch |err| {
             _ = rejectSettlementError(runtime, request, &deferred, "fetch body pull value", err);
             cleanup.cancel(runtime, body.identity);
             return;
@@ -260,6 +260,8 @@ fn resolveWaiter(
     waiter: FetchBodyWaiter,
     bytes: []const u8,
 ) !void {
+    // The read's value belongs to the realm of the code that started it.
+    const realm = try deferred.realm();
     switch (waiter.kind) {
         .text => {
             var text = try runtime.vm.stringValueUtf8(bytes);
@@ -271,7 +273,7 @@ fn resolveWaiter(
                 runtime.vm,
                 &request.exec,
                 deferred,
-                try turn.jsonParseUtf8(runtime.vm, &request.exec, bytes),
+                try turn.jsonParseUtf8(runtime.vm, realm, &request.exec, bytes),
             );
         },
         .array_buffer => {
@@ -279,7 +281,7 @@ fn resolveWaiter(
                 runtime.vm,
                 &request.exec,
                 deferred,
-                try runtime.vm.arrayBufferValueCopy(bytes),
+                try realm.arrayBufferValueCopy(bytes),
             );
         },
         .bytes => {
@@ -287,7 +289,7 @@ fn resolveWaiter(
                 runtime.vm,
                 &request.exec,
                 deferred,
-                try runtime.vm.uint8ArrayValueCopy(bytes),
+                try realm.uint8ArrayValueCopy(bytes),
             );
         },
         .blob => {
@@ -295,7 +297,7 @@ fn resolveWaiter(
                 runtime.vm,
                 &request.exec,
                 deferred,
-                try runtime.vm.blobValueCopy(bytes, waiter.content_type),
+                try realm.blobValueCopy(bytes, waiter.content_type),
             );
         },
         .form_data => {
@@ -303,15 +305,15 @@ fn resolveWaiter(
                 runtime.vm,
                 &request.exec,
                 deferred,
-                try turn.formDataFromBytes(runtime.vm, &request.exec, bytes, waiter.content_type),
+                try turn.formDataFromBytes(runtime.vm, realm, &request.exec, bytes, waiter.content_type),
             );
         },
     }
 }
 
-fn pullResultValue(runtime: *egress_context.Context, lease: *const ByteLease, done: bool) !bindings.Value {
+fn pullResultValue(realm: bindings.Realm, lease: *const ByteLease, done: bool) !bindings.Value {
     const bytes: ?[]const u8 = if (lease.isPresent()) lease.bytes() else null;
-    return switch (try runtime.vm.fetchReadResultValueCopy(bytes, done)) {
+    return switch (try realm.fetchReadResultValueCopy(bytes, done)) {
         .success => |value| value,
         .exception => |exception| {
             var owned = exception;

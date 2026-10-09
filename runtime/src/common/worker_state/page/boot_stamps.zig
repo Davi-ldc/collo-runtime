@@ -6,16 +6,15 @@
 /// Child boot phases stamped with one CLOCK_MONOTONIC read each, in the
 /// order `zygote/child_boot.zig` reaches them, most named after the child's
 /// trace event at the same step. A slot stays 0 when the phase never ran
-/// (for example with no route entry). The booting child writes them and the
-/// host reads them, mid-boot too: a child wedged in a later phase leaves
-/// every earlier stamp visible.
+/// (for example in a worker that serves no route). The booting child writes
+/// them and the host reads them, mid-boot too: a child wedged in a later
+/// phase leaves every earlier stamp visible.
 pub const BootPhase = enum(u32) {
     namespaces_entered,
     worker_init_received,
     unexpected_fds_closed,
     worker_init_validated,
-    /// The route's bindings are mapped and the process environment is
-    /// cleared.
+    /// The route table is mapped and the process environment is cleared.
     environment_cleared,
     metrics_mapped,
     cgroup_validated,
@@ -27,14 +26,15 @@ pub const BootPhase = enum(u32) {
     helper_threads_pinned,
     seccomp_applied,
     boot_context_ready,
-    // `route_entry_evaluated` alone would not measure module execution: the
-    // span before it covers mapping the pack, parsing and validating it in
-    // Zig, a second validation in C++ and registration, so these three
-    // stamps split that span from the evaluation itself.
-    route_pack_mapped,
-    route_pack_parsed,
-    route_pack_registered,
-    route_entry_evaluated,
+    // `routes_evaluated` alone would not measure module execution: the span
+    // before it covers mapping the definition's pack, parsing and validating
+    // it in Zig, a second validation in C++ and registration, so these three
+    // stamps split that span from the evaluation of every route, realm
+    // creation included.
+    module_pack_mapped,
+    module_pack_parsed,
+    module_pack_registered,
+    routes_evaluated,
     ready_sent,
 };
 

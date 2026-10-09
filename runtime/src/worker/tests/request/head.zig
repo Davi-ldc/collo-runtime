@@ -18,7 +18,7 @@ fn dispatchWork(headers: []const ipc.RequestHeader, body_framing: ipc.RequestBod
         .request_headers = headers,
         .body_framing = body_framing,
         .route_captures = &.{},
-        .route_entry_specifier = "route",
+        .route_index = 0,
     });
 }
 

@@ -198,7 +198,7 @@ test "a request whose begin waits for room in its worker's control socket ends a
     // A second request takes the worker's other slot, and its begin waits
     // behind the full socket.
     const parked_key = try scene.client.getAdmitted(3);
-    const parked = harness.lane(0).dynamic_requests[parked_key.slot];
+    const parked = harness.lane(0).requests.entries[parked_key.slot];
     try std.testing.expect(parked.dispatched());
     try std.testing.expect(!parked.begin_sent);
     // Its one wheel entry stays at its own deadline, not at the backstop.

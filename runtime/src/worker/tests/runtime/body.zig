@@ -80,7 +80,7 @@ test "pending ingress body read observes request deadline without body bytes" {
 
     const route_specifier = try rt.routeSpecifier(std.testing.allocator, "/body-deadline.js");
     defer std.testing.allocator.free(route_specifier);
-    try rt.registerRoute(&runtime, route_specifier,
+    const route_index = try rt.registerRoute(&runtime, route_specifier,
         \\export default async function handle(req) {
         \\    await req.text();
         \\    return "unexpected";
@@ -99,7 +99,7 @@ test "pending ingress body read observes request deadline without body bytes" {
     };
     var dispatch = try initDispatchWork(std.testing.allocator, .{
         .request_id = 28,
-        .route_entry_specifier = route_specifier,
+        .route_index = route_index,
         .deadline_monotonic_ns = 5,
         .request = request,
     });
@@ -143,7 +143,7 @@ test "request text waits for body chunk descriptors" {
 
     const route_specifier = try rt.routeSpecifier(std.testing.allocator, "/lazy-body.js");
     defer std.testing.allocator.free(route_specifier);
-    try rt.registerRoute(&runtime, route_specifier,
+    const route_index = try rt.registerRoute(&runtime, route_specifier,
         \\export default async function handle(req) {
         \\    return Response.json({ body: await req.text() });
         \\}
@@ -161,7 +161,7 @@ test "request text waits for body chunk descriptors" {
     };
     var dispatch = try initDispatchWork(std.testing.allocator, .{
         .request_id = 82,
-        .route_entry_specifier = route_specifier,
+        .route_index = route_index,
         .request = request,
     });
     defer dispatch.deinit();
@@ -531,13 +531,13 @@ test "saved Request rejects when numeric request id is reused without metrics" {
         .headers = &[_]ipc.RequestHeader{ .{ .name = "host", .value = "demo.test" }, .{ .name = "content-length", .value = "6" } },
         .body = "second",
     };
-    // The first run registered the route's pack.
+    // The first run registered the route's pack and added the route.
     const route_specifier = try rt.routeSpecifier(std.testing.allocator, specifier);
     defer std.testing.allocator.free(route_specifier);
     var use_dispatch = try initDispatchWork(std.testing.allocator, .{
         .request_id = reused_request_id,
         .request_generation = 2,
-        .route_entry_specifier = route_specifier,
+        .route_index = rt.routeIndex(&runtime, route_specifier) orelse return error.TestRouteMissing,
         .request = use_request,
     });
     defer use_dispatch.deinit();

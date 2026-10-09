@@ -21,7 +21,7 @@ test "a connection keeps its kTLS rekey state byte for byte across a request its
     // handshake and the connection's own reads leave it. The harness's
     // socket carries no kernel TLS, so the lane's reads through the state see
     // only application data.
-    const connection = &harness.lane(0).connection_slots[scene.client.slot];
+    const connection = &harness.lane(0).connections.entries[scene.client.slot];
     connection.ktls_rekey_state = try ktls.RekeyState.initTls13(
         ktls.tls13_aes_128_gcm_sha256,
         &client_to_server_secret,

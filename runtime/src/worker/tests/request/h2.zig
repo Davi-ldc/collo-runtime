@@ -30,7 +30,7 @@ fn dispatchWork() !ipc.DispatchWork {
         .request_headers = &headers,
         .body_framing = .ingress_channel,
         .route_captures = &.{},
-        .route_entry_specifier = "route",
+        .route_index = 0,
     });
 }
 
@@ -119,7 +119,7 @@ test "worker refuses a stream begin whose dispatch carries no server request ide
 }
 
 test "a request begin that carries a file descriptor fails to decode and the descriptor is closed" {
-    // A worker takes its route's pack in WorkerInit, so both decoders the
+    // A worker takes its definition's pack in WorkerInit, so both decoders the
     // worker's control loop uses refuse an ingress packet with a descriptor,
     // and consuming the packet closes it. The descriptor is a pipe's write
     // end: once the test has closed its own copy, the read end reports end of
@@ -190,7 +190,7 @@ test "a request context takes its stream and generation from the dispatch" {
         .request_headers = &headers,
         .body_framing = .ingress_channel,
         .route_captures = &.{},
-        .route_entry_specifier = "route",
+        .route_index = 0,
     });
 
     // The context owns the dispatch from here on.

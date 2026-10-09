@@ -39,7 +39,8 @@ const stream_table = server_h2.stream_table;
 const flow_control = server_h2.flow_control;
 const write_queue = server_h2.write_queue;
 const h2_request = server_h2.http2.request_head;
-const ingress_state = server_h2.ingress_state;
+const LaneResources = server_h2.http2.lane_resources.LaneResources;
+const RequestKey = server_h2.lifecycle.RequestKey;
 const h2 = @import("collo_http").http2;
 const hpack = @import("collo_hpack");
 const ipc = @import("collo_ipc");
@@ -62,8 +63,34 @@ const encodeGoawayFrame = h2.encodeGoawayFrame;
 const server_max_frame_size = limits.h2.INGRESS_MAX_FRAME_SIZE_BYTES;
 const max_response_header_block_bytes: usize = 64 * 1024;
 
+/// Streams the suite's lane holds at once, far above what its tests open.
+const shared_stream_capacity: u32 = 1 << 14;
+
+/// The lane every connection of this suite sits on: its read buffer, HPACK
+/// scratch, header block budget and stream slab, which a lane's connections
+/// share as they share its own (`http2/lane_resources.zig`). It is mapped on
+/// first use and kept for the process. The tests run one at a time, and an
+/// entry a test leaves in the slab starts from its defaults when it is
+/// handed out again.
+var shared_lane: LaneResources = undefined;
+var shared_lane_mapped = false;
+
+fn sharedLane() *LaneResources {
+    if (!shared_lane_mapped) {
+        shared_lane = LaneResources.init(shared_stream_capacity) catch |err|
+            std.debug.panic("the suite's lane could not be mapped: {s}", .{@errorName(err)});
+        shared_lane_mapped = true;
+    }
+    return &shared_lane;
+}
+
+/// A slot on the suite's lane holding no connection yet.
+fn testSlot() Slot {
+    return .{ .streams = &sharedLane().streams };
+}
+
 test "http2 request body accounting accepts exact multi-data body" {
-    var runtime = Slot{};
+    var runtime = testSlot();
     try runtime.h2ReserveStream(1);
     try runtime.h2SetRequestBodyExpectation(1, .ingress_channel, 5, false);
 
@@ -73,7 +100,7 @@ test "http2 request body accounting accepts exact multi-data body" {
 }
 
 test "http2 request body accounting rejects oversize and early end stream" {
-    var runtime = Slot{};
+    var runtime = testSlot();
     try runtime.h2ReserveStream(1);
     try runtime.h2SetRequestBodyExpectation(1, .ingress_channel, 4, false);
 
@@ -83,7 +110,7 @@ test "http2 request body accounting rejects oversize and early end stream" {
 }
 
 test "http2 request body accounting accepts unknown length until end stream" {
-    var runtime = Slot{};
+    var runtime = testSlot();
     try runtime.h2ReserveStream(1);
     try runtime.h2SetRequestBodyExpectation(1, .ingress_channel, null, false);
 
@@ -93,23 +120,23 @@ test "http2 request body accounting accepts unknown length until end stream" {
 }
 
 test "http2 inbound flow-control blocks data until consumed bytes restore window" {
-    var runtime = Slot{};
+    var runtime = testSlot();
     try runtime.h2ReserveStream(1);
     try runtime.h2SetRequestBodyExpectation(1, .ingress_channel, limits.h2.INGRESS_STREAM_RECV_WINDOW_BYTES + 1, false);
 
     try runtime.h2ConsumeInboundWindow(1, limits.h2.INGRESS_STREAM_RECV_WINDOW_BYTES);
     try std.testing.expectEqual(@as(i64, limits.h2.INGRESS_CONNECTION_RECV_WINDOW_BYTES - limits.h2.INGRESS_STREAM_RECV_WINDOW_BYTES), runtime.h2_connection_recv_window);
-    try std.testing.expectEqual(@as(i64, 0), runtime.ingress_channels[0].recv_window);
+    try std.testing.expectEqual(@as(i64, 0), runtime.streamAt(0).recv_window);
     try std.testing.expectError(error.Http2FlowControlError, runtime.h2ConsumeInboundWindow(1, 1));
 
     try runtime.h2BufferInboundWindowUpdate(1, limits.h2.INGRESS_STREAM_RECV_WINDOW_BYTES);
     try runtime.h2ConsumeInboundWindow(1, 1);
     try std.testing.expectEqual(@as(i64, limits.h2.INGRESS_CONNECTION_RECV_WINDOW_BYTES - 1), runtime.h2_connection_recv_window);
-    try std.testing.expectEqual(@as(i64, limits.h2.INGRESS_STREAM_RECV_WINDOW_BYTES - 1), runtime.ingress_channels[0].recv_window);
+    try std.testing.expectEqual(@as(i64, limits.h2.INGRESS_STREAM_RECV_WINDOW_BYTES - 1), runtime.streamAt(0).recv_window);
 }
 
 test "http2 inbound window updates coalesce per connection and stream" {
-    var runtime = Slot{};
+    var runtime = testSlot();
     try runtime.h2ReserveStream(1);
     try runtime.h2SetRequestBodyExpectation(1, .ingress_channel, 10, false);
 
@@ -118,60 +145,69 @@ test "http2 inbound window updates coalesce per connection and stream" {
     try runtime.h2BufferInboundWindowUpdate(1, 3);
 
     try std.testing.expectEqual(@as(i64, limits.h2.INGRESS_CONNECTION_RECV_WINDOW_BYTES), runtime.h2_connection_recv_window);
-    try std.testing.expectEqual(@as(i64, limits.h2.INGRESS_STREAM_RECV_WINDOW_BYTES), runtime.ingress_channels[0].recv_window);
+    try std.testing.expectEqual(@as(i64, limits.h2.INGRESS_STREAM_RECV_WINDOW_BYTES), runtime.streamAt(0).recv_window);
     try std.testing.expectEqual(@as(u32, 5), runtime.h2_pending_connection_window_update);
-    try std.testing.expectEqual(@as(u32, 5), runtime.ingress_channels[0].pending_recv_window_update);
+    try std.testing.expectEqual(@as(u32, 5), runtime.streamAt(0).pending_recv_window_update);
 }
 
 test "http2 inbound window update overflow leaves window state unchanged" {
-    var runtime = Slot{};
+    var runtime = testSlot();
     try runtime.h2ReserveStream(1);
     try runtime.h2SetRequestBodyExpectation(1, .ingress_channel, 1, false);
     try runtime.h2ConsumeInboundWindow(1, 1);
 
     const connection_window_before = runtime.h2_connection_recv_window;
-    const stream_window_before = runtime.ingress_channels[0].recv_window;
+    const stream_window_before = runtime.streamAt(0).recv_window;
     runtime.h2_pending_connection_window_update = std.math.maxInt(u32);
     try std.testing.expectError(error.Http2FlowControlError, runtime.h2BufferInboundWindowUpdate(1, 1));
     try std.testing.expectEqual(connection_window_before, runtime.h2_connection_recv_window);
-    try std.testing.expectEqual(stream_window_before, runtime.ingress_channels[0].recv_window);
+    try std.testing.expectEqual(stream_window_before, runtime.streamAt(0).recv_window);
     try std.testing.expectEqual(std.math.maxInt(u32), runtime.h2_pending_connection_window_update);
-    try std.testing.expectEqual(@as(u32, 0), runtime.ingress_channels[0].pending_recv_window_update);
+    try std.testing.expectEqual(@as(u32, 0), runtime.streamAt(0).pending_recv_window_update);
 
     runtime.h2_pending_connection_window_update = 0;
-    runtime.ingress_channels[0].pending_recv_window_update = std.math.maxInt(u32);
+    runtime.streamAt(0).pending_recv_window_update = std.math.maxInt(u32);
     try std.testing.expectError(error.Http2FlowControlError, runtime.h2BufferInboundWindowUpdate(1, 1));
     try std.testing.expectEqual(connection_window_before, runtime.h2_connection_recv_window);
-    try std.testing.expectEqual(stream_window_before, runtime.ingress_channels[0].recv_window);
+    try std.testing.expectEqual(stream_window_before, runtime.streamAt(0).recv_window);
     try std.testing.expectEqual(@as(u32, 0), runtime.h2_pending_connection_window_update);
-    try std.testing.expectEqual(std.math.maxInt(u32), runtime.ingress_channels[0].pending_recv_window_update);
+    try std.testing.expectEqual(std.math.maxInt(u32), runtime.streamAt(0).pending_recv_window_update);
 }
 
-test "http2 continuation header block grows amortized not exact per frame" {
+test "http2 continuation header block grows amortized not exact per frame, and gives its charge back when taken" {
     const allocator = std.testing.allocator;
-    var runtime = Slot{};
-    defer runtime.deinitProtocolState(allocator);
+    var runtime = testSlot();
+    defer runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
+    const budget = &shared_lane.header_blocks;
+    const charged_before = budget.used;
 
-    try runtime.h2BeginHeaderBlock(allocator, 1, "a", false, .request_headers);
-    try runtime.h2AppendHeaderBlock(allocator, 1, "b");
+    try runtime.h2BeginHeaderBlock(1, false, .request_headers);
+    try runtime.h2AppendHeaderBlock(allocator, budget, "a");
+    try runtime.h2CountHeaderBlockFrame();
+    try runtime.h2AppendHeaderBlock(allocator, budget, "b");
 
     try std.testing.expectEqual(@as(usize, 2), runtime.h2_header_block_len);
     try std.testing.expect(runtime.h2_header_block.len > runtime.h2_header_block_len);
+    try std.testing.expectEqual(charged_before + runtime.h2_header_block.len, budget.used);
 
-    var block = runtime.h2TakeHeaderBlock();
+    var block = runtime.h2TakeHeaderBlock(budget);
     defer block.deinit(allocator);
     try std.testing.expectEqualStrings("ab", block.bytes);
+    try std.testing.expectEqual(charged_before, budget.used);
 }
 
-test "http2 header block append failure preserves accumulated block" {
+test "http2 header block append failure preserves accumulated block and its charge" {
     const allocator = std.testing.allocator;
-    var runtime = Slot{};
-    defer runtime.deinitProtocolState(allocator);
+    var runtime = testSlot();
+    defer runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
+    const budget = &shared_lane.header_blocks;
 
-    try runtime.h2BeginHeaderBlock(allocator, 1, "abc", false, .request_headers);
+    try runtime.h2BeginHeaderBlock(1, false, .request_headers);
+    try runtime.h2AppendHeaderBlock(allocator, budget, "abc");
     const len_before = runtime.h2_header_block_len;
     const capacity_before = runtime.h2_header_block.len;
     const frame_count_before = runtime.h2_header_block_frame_count;
+    const charged_before = budget.used;
 
     const payload = try allocator.alloc(u8, capacity_before + 1);
     defer allocator.free(payload);
@@ -180,27 +216,50 @@ test "http2 header block append failure preserves accumulated block" {
     var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
     try std.testing.expectError(
         error.OutOfMemory,
-        runtime.h2AppendHeaderBlock(failing.allocator(), 1, payload),
+        runtime.h2AppendHeaderBlock(failing.allocator(), budget, payload),
     );
 
     try std.testing.expectEqual(len_before, runtime.h2_header_block_len);
     try std.testing.expectEqual(capacity_before, runtime.h2_header_block.len);
     try std.testing.expectEqual(frame_count_before, runtime.h2_header_block_frame_count);
+    try std.testing.expectEqual(charged_before, budget.used);
     try std.testing.expectEqualStrings("abc", runtime.h2_header_block[0..runtime.h2_header_block_len]);
+}
+
+test "http2 header block growth past the lane's budget fails and charges nothing" {
+    const allocator = std.testing.allocator;
+    var budget: server_h2.http2.lane_resources.HeaderBlockBudget = .{ .limit = 300 };
+    var runtime = testSlot();
+    defer runtime.deinitProtocolState(allocator, &budget);
+
+    // A block's first growth takes 256 bytes; the next doubles it, past the
+    // budget.
+    try runtime.h2BeginHeaderBlock(1, false, .request_headers);
+    try runtime.h2AppendHeaderBlock(allocator, &budget, "abc");
+    try std.testing.expectEqual(@as(usize, 256), budget.used);
+    var big: [300]u8 = @splat('x');
+    try std.testing.expectError(
+        error.Http2HeaderBlockBudgetExceeded,
+        runtime.h2AppendHeaderBlock(allocator, &budget, &big),
+    );
+    try std.testing.expectEqual(@as(usize, 256), budget.used);
+    try std.testing.expectEqual(@as(usize, 3), runtime.h2_header_block_len);
+    runtime.h2ClearHeaderBlock(allocator, &budget);
+    try std.testing.expectEqual(@as(usize, 0), budget.used);
 }
 
 test "http2 preparing body grows amortized and transfers exact used bytes" {
     const allocator = std.testing.allocator;
-    var runtime = Slot{};
-    defer runtime.deinitProtocolState(allocator);
+    var runtime = testSlot();
+    defer runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
 
     try runtime.h2ReserveStream(1);
     try runtime.h2SetRequestBodyExpectation(1, .ingress_channel, 6, false);
     try runtime.h2AppendPreparingBody(allocator, 1, "abc", false, 3);
     try runtime.h2AppendPreparingBody(allocator, 1, "def", true, 3);
 
-    try std.testing.expectEqual(@as(usize, 6), runtime.ingress_channels[0].pending_body_len);
-    try std.testing.expect(runtime.ingress_channels[0].pending_body.len > runtime.ingress_channels[0].pending_body_len);
+    try std.testing.expectEqual(@as(usize, 6), runtime.streamAt(0).pending_body_len);
+    try std.testing.expect(runtime.streamAt(0).pending_body.len > runtime.streamAt(0).pending_body_len);
     try std.testing.expectEqual(@as(usize, 6), runtime.h2_pending_body_bytes);
 
     var pending = runtime.h2TakePendingBody(1) orelse return error.MissingPendingBody;
@@ -209,23 +268,23 @@ test "http2 preparing body grows amortized and transfers exact used bytes" {
     try std.testing.expect(pending.allocation.len >= pending.bytes.len);
     try std.testing.expect(pending.end_stream);
     try std.testing.expectEqual(@as(usize, 6), pending.window_credit_len);
-    try std.testing.expectEqual(@as(usize, 0), runtime.ingress_channels[0].pending_body_len);
+    try std.testing.expectEqual(@as(usize, 0), runtime.streamAt(0).pending_body_len);
     try std.testing.expectEqual(@as(usize, 0), runtime.h2_pending_body_bytes);
 }
 
 test "http2 preparing body append failure preserves bytes and flow credit" {
     const allocator = std.testing.allocator;
-    var runtime = Slot{};
-    defer runtime.deinitProtocolState(allocator);
+    var runtime = testSlot();
+    defer runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
 
     try runtime.h2ReserveStream(1);
     try runtime.h2SetRequestBodyExpectation(1, .ingress_channel, 512, false);
     try runtime.h2AppendPreparingBody(allocator, 1, "abc", false, 3);
 
-    const len_before = runtime.ingress_channels[0].pending_body_len;
-    const capacity_before = runtime.ingress_channels[0].pending_body.len;
-    const complete_before = runtime.ingress_channels[0].pending_body_complete;
-    const credit_before = runtime.ingress_channels[0].pending_body_window_credit;
+    const len_before = runtime.streamAt(0).pending_body_len;
+    const capacity_before = runtime.streamAt(0).pending_body.len;
+    const complete_before = runtime.streamAt(0).pending_body_complete;
+    const credit_before = runtime.streamAt(0).pending_body_window_credit;
     const connection_pending_before = runtime.h2_pending_body_bytes;
 
     const payload = try allocator.alloc(u8, capacity_before + 1);
@@ -238,38 +297,38 @@ test "http2 preparing body append failure preserves bytes and flow credit" {
         runtime.h2AppendPreparingBody(failing.allocator(), 1, payload, true, payload.len),
     );
 
-    try std.testing.expectEqual(len_before, runtime.ingress_channels[0].pending_body_len);
-    try std.testing.expectEqual(capacity_before, runtime.ingress_channels[0].pending_body.len);
-    try std.testing.expectEqual(complete_before, runtime.ingress_channels[0].pending_body_complete);
-    try std.testing.expectEqual(credit_before, runtime.ingress_channels[0].pending_body_window_credit);
+    try std.testing.expectEqual(len_before, runtime.streamAt(0).pending_body_len);
+    try std.testing.expectEqual(capacity_before, runtime.streamAt(0).pending_body.len);
+    try std.testing.expectEqual(complete_before, runtime.streamAt(0).pending_body_complete);
+    try std.testing.expectEqual(credit_before, runtime.streamAt(0).pending_body_window_credit);
     try std.testing.expectEqual(connection_pending_before, runtime.h2_pending_body_bytes);
-    try std.testing.expectEqualStrings("abc", runtime.ingress_channels[0].pending_body[0..runtime.ingress_channels[0].pending_body_len]);
+    try std.testing.expectEqualStrings("abc", runtime.streamAt(0).pending_body[0..runtime.streamAt(0).pending_body_len]);
 }
 
 test "http2 preparing body credit overflow is transactional" {
     const allocator = std.testing.allocator;
-    var runtime = Slot{};
-    defer runtime.deinitProtocolState(allocator);
+    var runtime = testSlot();
+    defer runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
 
     try runtime.h2ReserveStream(1);
     try runtime.h2SetRequestBodyExpectation(1, .ingress_channel, 0, false);
-    runtime.ingress_channels[0].pending_body_window_credit = std.math.maxInt(usize);
+    runtime.streamAt(0).pending_body_window_credit = std.math.maxInt(usize);
 
     try std.testing.expectError(
         error.Http2FlowControlError,
         runtime.h2AppendPreparingBody(allocator, 1, "", true, 1),
     );
 
-    try std.testing.expect(!runtime.ingress_channels[0].pending_body_complete);
-    try std.testing.expectEqual(std.math.maxInt(usize), runtime.ingress_channels[0].pending_body_window_credit);
-    try std.testing.expectEqual(@as(usize, 0), runtime.ingress_channels[0].pending_body_len);
+    try std.testing.expect(!runtime.streamAt(0).pending_body_complete);
+    try std.testing.expectEqual(std.math.maxInt(usize), runtime.streamAt(0).pending_body_window_credit);
+    try std.testing.expectEqual(@as(usize, 0), runtime.streamAt(0).pending_body_len);
     try std.testing.expectEqual(@as(usize, 0), runtime.h2_pending_body_bytes);
 }
 
 test "http2 preparing body tracks flow-control credit separately from retained bytes" {
     const allocator = std.testing.allocator;
-    var runtime = Slot{};
-    defer runtime.deinitProtocolState(allocator);
+    var runtime = testSlot();
+    defer runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
 
     try runtime.h2ReserveStream(1);
     try runtime.h2SetRequestBodyExpectation(1, .ingress_channel, 3, false);
@@ -284,8 +343,8 @@ test "http2 preparing body tracks flow-control credit separately from retained b
 
 test "http2 taken pending body can restore connection credit on transfer failure" {
     const allocator = std.testing.allocator;
-    var runtime = Slot{};
-    defer runtime.deinitProtocolState(allocator);
+    var runtime = testSlot();
+    defer runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
 
     try runtime.h2ReserveStream(1);
     try runtime.h2SetRequestBodyExpectation(1, .ingress_channel, 3, false);
@@ -300,18 +359,18 @@ test "http2 taken pending body can restore connection credit on transfer failure
     try std.testing.expectEqual(limits.h2.INGRESS_CONNECTION_RECV_WINDOW_BYTES, runtime.h2_connection_recv_window);
     try std.testing.expectEqual(
         limits.h2.INGRESS_STREAM_RECV_WINDOW_BYTES - 6,
-        runtime.ingress_channels[0].recv_window,
+        runtime.streamAt(0).recv_window,
     );
     try std.testing.expectEqual(@as(u32, 6), runtime.h2_pending_connection_window_update);
-    try std.testing.expectEqual(@as(u32, 0), runtime.ingress_channels[0].pending_recv_window_update);
+    try std.testing.expectEqual(@as(u32, 0), runtime.streamAt(0).pending_recv_window_update);
 }
 
 test "http2 active pending body shares bounded storage and preserves flow-control credit" {
     const allocator = std.testing.allocator;
-    var runtime = Slot{};
-    defer runtime.deinitProtocolState(allocator);
+    var runtime = testSlot();
+    defer runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
 
-    const request_key = ingress_state.RequestKey{ .lane_id = 0, .slot = 1, .generation = 1 };
+    const request_key = RequestKey{ .lane_id = 0, .slot = 1, .generation = 1 };
     try runtime.h2ReserveStream(1);
     try runtime.h2SetRequestBodyExpectation(1, .ingress_channel, 6, false);
     try runtime.h2ActivateStream(1, request_key, 10);
@@ -333,10 +392,10 @@ test "http2 active pending body shares bounded storage and preserves flow-contro
 
 test "http2 dropping active pending body restores connection credit only" {
     const allocator = std.testing.allocator;
-    var runtime = Slot{};
-    defer runtime.deinitProtocolState(allocator);
+    var runtime = testSlot();
+    defer runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
 
-    const request_key = ingress_state.RequestKey{ .lane_id = 0, .slot = 1, .generation = 1 };
+    const request_key = RequestKey{ .lane_id = 0, .slot = 1, .generation = 1 };
     try runtime.h2ReserveStream(1);
     try runtime.h2SetRequestBodyExpectation(1, .ingress_channel, 3, false);
     try runtime.h2ActivateStream(1, request_key, 10);
@@ -352,10 +411,10 @@ test "http2 dropping active pending body restores connection credit only" {
 
 test "http2 dropping zero-byte active pending body still restores connection credit" {
     const allocator = std.testing.allocator;
-    var runtime = Slot{};
-    defer runtime.deinitProtocolState(allocator);
+    var runtime = testSlot();
+    defer runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
 
-    const request_key = ingress_state.RequestKey{ .lane_id = 0, .slot = 1, .generation = 1 };
+    const request_key = RequestKey{ .lane_id = 0, .slot = 1, .generation = 1 };
     try runtime.h2ReserveStream(1);
     try runtime.h2SetRequestBodyExpectation(1, .ingress_channel, 0, false);
     try runtime.h2ActivateStream(1, request_key, 10);
@@ -370,8 +429,8 @@ test "http2 dropping zero-byte active pending body still restores connection cre
 
 test "http2 preparing body enforces bounded per-stream and connection memory" {
     const allocator = std.testing.allocator;
-    var runtime = Slot{};
-    defer runtime.deinitProtocolState(allocator);
+    var runtime = testSlot();
+    defer runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
 
     const too_large = try allocator.alloc(u8, flow_control.max_h2_pending_body_bytes_per_stream + 1);
     defer allocator.free(too_large);
@@ -384,7 +443,7 @@ test "http2 preparing body enforces bounded per-stream and connection memory" {
         runtime.h2AppendPreparingBody(allocator, 1, too_large, false, too_large.len),
     );
     try std.testing.expectEqual(@as(usize, 0), runtime.h2_pending_body_bytes);
-    try std.testing.expectEqual(@as(usize, 0), runtime.ingress_channels[0].pending_body_len);
+    try std.testing.expectEqual(@as(usize, 0), runtime.streamAt(0).pending_body_len);
 
     const fill_len = flow_control.max_h2_pending_body_bytes_per_stream;
     const fill = try allocator.alloc(u8, fill_len);
@@ -410,15 +469,16 @@ test "http2 preparing body enforces bounded per-stream and connection memory" {
 
 test "http2 preparing body lifecycle stress preserves flow-control accounting" {
     const allocator = std.testing.allocator;
-    var runtime = Slot{};
-    defer runtime.deinitProtocolState(allocator);
+    var runtime = testSlot();
+    defer runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
 
     for (0..10_000) |index| {
         const stream_id: u32 = @intCast(1 + index * 2);
 
-        try runtime.h2BeginHeaderBlock(allocator, stream_id, "h", false, .request_headers);
-        try runtime.h2AppendHeaderBlock(allocator, stream_id, "x");
-        var block = runtime.h2TakeHeaderBlock();
+        try runtime.h2BeginHeaderBlock(stream_id, false, .request_headers);
+        try runtime.h2AppendHeaderBlock(allocator, &shared_lane.header_blocks, "h");
+        try runtime.h2AppendHeaderBlock(allocator, &shared_lane.header_blocks, "x");
+        var block = runtime.h2TakeHeaderBlock(&shared_lane.header_blocks);
         block.deinit(allocator);
 
         try runtime.h2ReserveStream(stream_id);
@@ -443,8 +503,8 @@ test "http2 preparing body lifecycle stress preserves flow-control accounting" {
                 try std.testing.expect(runtime.h2FinishLocalResponse(allocator, stream_id));
             },
             else => {
-                runtime.deinitProtocolState(allocator);
-                runtime = Slot{};
+                runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
+                runtime = testSlot();
             },
         }
 
@@ -466,7 +526,7 @@ const StreamHandlerError = fault.LaneFault || fault.Http2Error;
 /// write queue when `close` names a code and HTTP/2 can still speak, and a
 /// second decision keeps the first reason and drops the flush.
 fn closeAsLane(allocator: std.mem.Allocator, runtime: *Slot, close: fault.ConnectionClose) void {
-    if (!runtime.active)
+    if (!runtime.isLive())
         return;
     if (runtime.closing) |*closing| {
         closing.flush = false;
@@ -481,15 +541,6 @@ fn closeAsLane(allocator: std.mem.Allocator, runtime: *Slot, close: fault.Connec
 
 const TestService = struct {
     allocator: std.mem.Allocator,
-};
-
-const TestHeaderBuffers = struct {
-    storage: [h2.frame_header_len + server_max_frame_size]u8 = undefined,
-
-    pub fn buffer(self: *TestHeaderBuffers, index: u32) []u8 {
-        _ = index;
-        return &self.storage;
-    }
 };
 
 /// Requests `TestWorker` keeps a copy of; it counts every request it starts.
@@ -549,7 +600,9 @@ const AutoResponseMode = enum {
 
 const TestWorker = struct {
     service: TestService,
-    header_buffers: TestHeaderBuffers = .{},
+    /// What the driver shares across a lane's connections; every slot of
+    /// the suite sits on it (`sharedLane`).
+    h2_lane: *LaneResources = &shared_lane,
     requests: [captured_requests_max]CapturedRequest = @splat(.{}),
     request_count: usize = 0,
     /// Streams refused past the concurrency cap, as the lane refuses them.
@@ -604,7 +657,7 @@ const TestWorker = struct {
             else => |other| return other,
         };
         try runtime.h2SetRequestBodyExpectation(stream_id, head.body_framing, head.content_length, head.end_stream);
-        const request_key = ingress_state.RequestKey{
+        const request_key = RequestKey{
             .lane_id = 0,
             .slot = @intCast(self.request_count + 1),
             .generation = 1,
@@ -709,7 +762,7 @@ const TestWorker = struct {
 /// goes back.
 const BackpressuredTestWorker = struct {
     service: TestService,
-    header_buffers: TestHeaderBuffers = .{},
+    h2_lane: *LaneResources = &shared_lane,
     data_frame_count: usize = 0,
     data_batch_count: usize = 0,
     /// The first close the driver asked for, null while it asked none.
@@ -828,17 +881,15 @@ fn copyBounded(dest: []u8, value: []const u8) usize {
     return len;
 }
 
+/// A connection the suite's lane holds over a socket pair, past its
+/// handshake: `pair[1]` is the client's end.
 fn newH2SocketPairRuntime() !struct { pair: [2]std.posix.fd_t, runtime: Slot } {
     const pair = try fd_mod.socketPairType(std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC | std.posix.SOCK.NONBLOCK);
-    return .{
-        .pair = pair,
-        .runtime = .{
-            .active = true,
-            .fd = pair[0],
-            .state = .http2_connection,
-            .buffer_index = 0,
-        },
-    };
+    var runtime = testSlot();
+    runtime.slab_link.live = true;
+    runtime.fd = pair[0];
+    runtime.state = .http2_connection;
+    return .{ .pair = pair, .runtime = runtime };
 }
 
 fn writeAllFd(fd: std.posix.fd_t, bytes: []const u8) !void {
@@ -1303,7 +1354,7 @@ test "http2 driver completes GET with simulated worker response on the same conn
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{
         .service = .{ .allocator = allocator },
         .auto_response_mode = .on_headers_end_stream,
@@ -1340,7 +1391,7 @@ test "http2 driver applies peer header table size before response encoding" {
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{
         .service = .{ .allocator = allocator },
         .auto_response_mode = .on_headers_end_stream,
@@ -1399,7 +1450,7 @@ test "http2 driver streams POST body and responds after end stream" {
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{
         .service = .{ .allocator = allocator },
         .auto_response_mode = .on_body_end_stream,
@@ -1444,7 +1495,7 @@ test "http2 a request that expects 100-continue and announces a body gets an int
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{
         .service = .{ .allocator = allocator },
         .auto_response_mode = .on_body_end_stream,
@@ -1492,7 +1543,7 @@ test "http2 a request that sends no body, declares an empty one, or does not exp
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
     try writeClientPrefaceAndSettings(setup.pair[1]);
@@ -1536,7 +1587,7 @@ test "http2 driver accepts padded priority headers and padded data" {
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{
         .service = .{ .allocator = allocator },
         .auto_response_mode = .on_body_end_stream,
@@ -1572,7 +1623,7 @@ test "http2 driver accepts request trailers as body terminator" {
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{
         .service = .{ .allocator = allocator },
         .auto_response_mode = .on_body_end_stream,
@@ -1608,7 +1659,7 @@ test "http2 driver parses GET headers through socket preface" {
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
     try writeClientPrefaceAndSettings(setup.pair[1]);
@@ -1652,7 +1703,7 @@ test "http2 driver closes a connection whose SETTINGS frame passes the per-frame
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
     const count = h2.Settings.max_settings_per_frame + 8;
@@ -1690,7 +1741,7 @@ test "http2 driver requires client settings before request frames" {
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
     try writeAllFd(setup.pair[1], h2.client_connection_preface);
@@ -1716,7 +1767,7 @@ test "http2 driver closes connection on DATA inside an open header block" {
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
     try writeClientPrefaceAndSettings(setup.pair[1]);
@@ -1752,7 +1803,7 @@ test "http2 driver rejects settings ack as initial client settings" {
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
     try writeAllFd(setup.pair[1], h2.client_connection_preface);
@@ -1773,7 +1824,7 @@ test "http2 driver resets stream when host conflicts with authority" {
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
     try writeClientPrefaceAndSettings(setup.pair[1]);
@@ -1803,7 +1854,7 @@ test "http2 request head over the decoded byte bound answers 431 and keeps its c
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
     const header_value = try allocator.alloc(u8, limits.headers.INGRESS_H2_REQUEST_DECODED_HEADER_BYTES + 1);
@@ -1843,7 +1894,7 @@ test "http2 a request head at the decoder's field bound reaches the stream handl
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
     var encoder = try hpack.Encoder.init();
     defer encoder.deinit();
@@ -1868,7 +1919,7 @@ test "http2 a request head one field past the decoder's bound answers 431 and it
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
     var encoder = try hpack.Encoder.init();
     defer encoder.deinit();
@@ -1902,7 +1953,7 @@ test "http2 257 repeated request headers in about 300 bytes of HPACK answer 431,
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
     var encoder = try hpack.Encoder.init();
     defer encoder.deinit();
@@ -1944,7 +1995,7 @@ test "http2 a request head declaring a body over the limit answers 413 and asks 
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
     var content_length_buffer: [20]u8 = undefined;
@@ -1984,7 +2035,7 @@ test "http2 invalid headers still consume stream ordering, and a head on a lower
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
     var encoder = try hpack.Encoder.init();
     defer encoder.deinit();
@@ -2020,7 +2071,7 @@ test "http2 invalid hpack closes connection with compression error" {
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
     try writeClientPrefaceAndSettings(setup.pair[1]);
@@ -2042,7 +2093,7 @@ test "http2 data before headers is a connection error" {
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
     try writeClientPrefaceAndSettings(setup.pair[1]);
@@ -2063,7 +2114,7 @@ test "http2 rst stream before headers is a connection error" {
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
     var reset_payload: [4]u8 = undefined;
@@ -2086,7 +2137,7 @@ test "http2 window update before headers is a connection error" {
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
     var increment_one = [_]u8{ 0, 0, 0, 1 };
@@ -2108,7 +2159,7 @@ test "http2 driver parses fragmented request headers through continuation" {
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
     try writeClientPrefaceAndSettings(setup.pair[1]);
@@ -2134,7 +2185,7 @@ test "http2 driver caps continuation frames per header block" {
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
     try writeClientPrefaceAndSettings(setup.pair[1]);
@@ -2161,7 +2212,7 @@ test "http2 driver closes a connection whose header block passes its compressed 
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
     // Two fragments, each just over half of
@@ -2197,7 +2248,7 @@ test "http2 driver closes a connection whose header block passes its compressed 
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
     // One byte past `INGRESS_H2_REQUEST_HEADER_BLOCK_BYTES`. Each byte is the
@@ -2222,12 +2273,72 @@ test "http2 driver closes a connection whose header block passes its compressed 
     try std.testing.expectEqual(@intFromEnum(h2.ErrorCode.compression_error), readU32(goaway.payload[4..8]));
 }
 
+test "http2 a header block the lane's budget cannot hold closes only its own connection, with ENHANCE_YOUR_CALM" {
+    // Unfinished header blocks of every connection of a lane share one
+    // budget. The connection whose fragment would pass it loses its
+    // connection; another one that holds part of a block keeps it, finishes
+    // the block and starts its request.
+    const allocator = std.testing.allocator;
+    defer shared_lane.header_blocks.limit = limits.ingress.header_block_bytes_per_lane_max;
+    var holder = try newH2SocketPairRuntime();
+    defer std.posix.close(holder.pair[0]);
+    defer std.posix.close(holder.pair[1]);
+    defer holder.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
+    var holder_worker = TestWorker{ .service = .{ .allocator = allocator } };
+    var flooder = try newH2SocketPairRuntime();
+    defer std.posix.close(flooder.pair[0]);
+    defer std.posix.close(flooder.pair[1]);
+    defer flooder.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
+    var flooder_worker = TestWorker{ .service = .{ .allocator = allocator } };
+
+    var encoder = try hpack.Encoder.init();
+    defer encoder.deinit();
+    var block = try encoder.encodeHeaders(allocator, &.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "example.com" },
+        .{ .name = ":path", .value = "/held" },
+    }, max_response_header_block_bytes);
+    defer block.deinit(allocator);
+    const split = block.bytes().len / 2;
+    try writeClientPrefaceAndSettings(holder.pair[1]);
+    try writeFrameFd(holder.pair[1], .headers, 0x1, 1, block.bytes()[0..split]);
+    try driveUntilIdle(TestWorker, &holder_worker, &holder.runtime);
+    try std.testing.expect(holder.runtime.h2HasPendingHeaderBlock());
+    // The held fragment took a block's first growth; the budget keeps less
+    // than another one.
+    const held = shared_lane.header_blocks.used;
+    try std.testing.expect(held != 0);
+    shared_lane.header_blocks.limit = held + 255;
+
+    var fragment: [300]u8 = @splat(0x82);
+    try writeClientPrefaceAndSettings(flooder.pair[1]);
+    try writeFrameFd(flooder.pair[1], .headers, 0x1, 1, &fragment);
+    try driveUntilIdle(TestWorker, &flooder_worker, &flooder.runtime);
+
+    try std.testing.expect(!flooder.runtime.isOpen());
+    try std.testing.expectEqual(fault.ConnectionCloseReason.header_block_budget, flooder_worker.close.?.reason);
+    var out: [1024]u8 = undefined;
+    const received = try readAvailableFd(flooder.pair[1], &out);
+    const goaway = findFrame(received, .goaway, 0) orelse return error.MissingGoaway;
+    try std.testing.expectEqual(@intFromEnum(h2.ErrorCode.enhance_your_calm), readU32(goaway.payload[4..8]));
+    try std.testing.expectEqual(held, shared_lane.header_blocks.used);
+
+    try writeFrameFd(holder.pair[1], .continuation, 0x4, 1, block.bytes()[split..]);
+    try driveUntilIdle(TestWorker, &holder_worker, &holder.runtime);
+    try std.testing.expect(holder.runtime.isOpen());
+    try std.testing.expectEqual(@as(?fault.ConnectionClose, null), holder_worker.close);
+    try std.testing.expectEqual(@as(usize, 1), holder_worker.request_count);
+    try std.testing.expectEqualStrings("/held", holder_worker.requests[0].pathSlice());
+    try std.testing.expectEqual(@as(usize, 0), shared_lane.header_blocks.used);
+}
+
 test "http2 driver streams POST body across multiple DATA frames and emits window updates" {
     const allocator = std.testing.allocator;
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
     try writeClientPrefaceAndSettings(setup.pair[1]);
@@ -2261,7 +2372,7 @@ test "http2 driver accepts end-stream delimited POST body without content length
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
     try writeClientPrefaceAndSettings(setup.pair[1]);
@@ -2290,7 +2401,7 @@ test "http2 driver enforces inbound flow-control while worker is backpressured" 
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = BackpressuredTestWorker{ .service = .{ .allocator = allocator } };
 
     try writeClientPrefaceAndSettings(setup.pair[1]);
@@ -2324,7 +2435,7 @@ test "http2 driver enforces inbound flow-control while worker is backpressured" 
     try std.testing.expect(setup.runtime.isOpen());
     try std.testing.expectEqual(@as(usize, limits.h2.INGRESS_STREAM_RECV_WINDOW_BYTES / server_max_frame_size), worker.data_frame_count);
     try std.testing.expectEqual(@as(i64, limits.h2.INGRESS_CONNECTION_RECV_WINDOW_BYTES - limits.h2.INGRESS_STREAM_RECV_WINDOW_BYTES), setup.runtime.h2_connection_recv_window);
-    try std.testing.expectEqual(@as(i64, 0), setup.runtime.ingress_channels[0].recv_window);
+    try std.testing.expectEqual(@as(i64, 0), setup.runtime.streamAt(0).recv_window);
 
     try writeFrameFd(setup.pair[1], .data, 0x1, 1, "b");
     try driveUntilIdle(BackpressuredTestWorker, &worker, &setup.runtime);
@@ -2347,7 +2458,7 @@ test "http2 driver closes a connection whose run of DATA frames passes the strea
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = BackpressuredTestWorker{ .service = .{ .allocator = allocator } };
 
     try writeClientPrefaceAndSettings(setup.pair[1]);
@@ -2400,7 +2511,7 @@ test "http2 driver batches preparing stream data without restoring inbound credi
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = BackpressuredTestWorker{ .service = .{ .allocator = allocator } };
 
     try writeClientPrefaceAndSettings(setup.pair[1]);
@@ -2424,9 +2535,9 @@ test "http2 driver batches preparing stream data without restoring inbound credi
     try std.testing.expectEqual(@as(usize, 2), worker.data_frame_count);
     try std.testing.expectEqual(@as(?stream_table.H2StreamState, .preparing), setup.runtime.h2StreamState(1));
     try std.testing.expectEqual(@as(i64, limits.h2.INGRESS_CONNECTION_RECV_WINDOW_BYTES - 6), setup.runtime.h2_connection_recv_window);
-    try std.testing.expectEqual(@as(i64, limits.h2.INGRESS_STREAM_RECV_WINDOW_BYTES - 6), setup.runtime.ingress_channels[0].recv_window);
+    try std.testing.expectEqual(@as(i64, limits.h2.INGRESS_STREAM_RECV_WINDOW_BYTES - 6), setup.runtime.streamAt(0).recv_window);
     try std.testing.expectEqual(@as(u32, 0), setup.runtime.h2_pending_connection_window_update);
-    try std.testing.expectEqual(@as(u32, 0), setup.runtime.ingress_channels[0].pending_recv_window_update);
+    try std.testing.expectEqual(@as(u32, 0), setup.runtime.streamAt(0).pending_recv_window_update);
 }
 
 test "http2 driver accepts large data frames up to advertised server max frame size" {
@@ -2434,7 +2545,7 @@ test "http2 driver accepts large data frames up to advertised server max frame s
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
     try writeClientPrefaceAndSettings(setup.pair[1]);
@@ -2471,7 +2582,7 @@ test "http2 driver keeps concurrent streams distinct" {
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
     try writeClientPrefaceAndSettings(setup.pair[1]);
@@ -2504,7 +2615,7 @@ test "http2 reset isolates one stream while a concurrent stream completes" {
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{
         .service = .{ .allocator = allocator },
         .auto_response_mode = .on_headers_end_stream,
@@ -2558,7 +2669,7 @@ test "http2 driver forwards a client reset of an active stream to the lane, and 
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
     try writeClientPrefaceAndSettings(setup.pair[1]);
@@ -2592,7 +2703,7 @@ test "http2 DATA on a stream the client reset gives the connection's credit back
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
     var encoder = try hpack.Encoder.init();
     defer encoder.deinit();
@@ -2644,7 +2755,7 @@ test "http2 DATA on a stream that drains its response is dropped with its connec
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
     // A client window of 0 keeps every response byte buffered.
@@ -2675,12 +2786,57 @@ test "http2 DATA on a stream that drains its response is dropped with its connec
     _ = findWindowUpdateWithIncrement(received, 0, 3) orelse return error.MissingConnectionWindowUpdate;
 }
 
+test "http2 a padded DATA frame whose stream goes away between its pieces gives the connection its credit back once" {
+    // The first piece takes the frame's whole length from the windows. The
+    // lane then resets the stream, as a request deadline does, before the
+    // rest arrives, so the last piece and the padding after it return only
+    // the connection's credit, and the client's connection window ends where
+    // the server advertised it.
+    const allocator = std.testing.allocator;
+    var setup = try newH2SocketPairRuntime();
+    defer std.posix.close(setup.pair[0]);
+    defer std.posix.close(setup.pair[1]);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
+    var worker = TestWorker{ .service = .{ .allocator = allocator } };
+
+    try writeClientPrefaceAndSettings(setup.pair[1]);
+    try writeHeadersFrameFd(allocator, setup.pair[1], 1, &.{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "example.com" },
+        .{ .name = ":path", .value = "/upload" },
+    }, false);
+    try driveUntilIdle(TestWorker, &worker, &setup.runtime);
+    var out: [1024]u8 = undefined;
+    _ = try readAvailableFd(setup.pair[1], &out);
+
+    const pad_len = 6;
+    const data = "0123456789";
+    var payload: [1 + data.len + pad_len]u8 = @splat(0);
+    payload[0] = pad_len;
+    @memcpy(payload[1..][0..data.len], data);
+    var header: [h2.frame_header_len]u8 = undefined;
+    try encodeFrameHeader(&header, payload.len, .data, (h2.Flags{ .padded = true }).toByte(), 1);
+    try writeAllFd(setup.pair[1], &header);
+    try writeAllFd(setup.pair[1], payload[0..5]);
+    try driveUntilIdle(TestWorker, &worker, &setup.runtime);
+    try std.testing.expectEqual(@as(usize, 4), worker.body_len);
+
+    _ = setup.runtime.h2MarkStreamReset(allocator, 1);
+    try writeAllFd(setup.pair[1], payload[5..]);
+    try driveUntilIdle(TestWorker, &worker, &setup.runtime);
+
+    try std.testing.expect(setup.runtime.isOpen());
+    try std.testing.expectEqual(@as(usize, 4), worker.body_len);
+    try std.testing.expectEqual(@as(i64, limits.h2.INGRESS_CONNECTION_RECV_WINDOW_BYTES), setup.runtime.h2_connection_recv_window);
+}
+
 test "http2 driver responds to ping without involving worker request path" {
     const allocator = std.testing.allocator;
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
     const ping_payload = "12345678";
@@ -2702,7 +2858,7 @@ test "http2 driver sends enhance your calm on control frame flood" {
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
     const ping_payload = "12345678";
@@ -2725,7 +2881,7 @@ test "http2 driver budgets padded empty data frame flood" {
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
     try writeClientPrefaceAndSettings(setup.pair[1]);
@@ -2763,8 +2919,8 @@ test "http2 stream reservation enforces the advertised concurrency cap not just 
     // `startDynamicH2` in `server/ingress/runner/admission.zig` answers it with
     // RST_STREAM REFUSED_STREAM.
     const allocator = std.testing.allocator;
-    var runtime = Slot{ .active = true };
-    defer runtime.deinitProtocolState(allocator);
+    var runtime = Slot{ .slab_link = .{ .live = true }, .streams = &sharedLane().streams };
+    defer runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
 
     var stream_id: u32 = 1;
     var opened: usize = 0;
@@ -2791,7 +2947,7 @@ test "http2 sixty-four streams held and answered on one connection draw no REFUS
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
     const cap = stream_table.max_h2_concurrent_streams;
     var out: [16 * 1024]u8 = undefined;
@@ -2856,7 +3012,7 @@ test "http2 streams answered as their heads arrive leave the concurrency count, 
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{
         .service = .{ .allocator = allocator },
         .auto_response_mode = .on_headers_end_stream,
@@ -2882,11 +3038,11 @@ test "http2 streams answered as their heads arrive leave the concurrency count, 
 
 test "http2 a stream stays in the concurrency count until both its response and its request have ended (#30)" {
     const allocator = std.testing.allocator;
-    var runtime = Slot{ .active = true };
-    defer runtime.deinitProtocolState(allocator);
+    var runtime = Slot{ .slab_link = .{ .live = true }, .streams = &sharedLane().streams };
+    defer runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
 
     // The response ended first; the request still sends its body.
-    const sending_key = ingress_state.RequestKey{ .lane_id = 0, .slot = 1, .generation = 1 };
+    const sending_key = RequestKey{ .lane_id = 0, .slot = 1, .generation = 1 };
     try runtime.h2ReserveStream(1);
     try runtime.h2SetRequestBodyExpectation(1, .ingress_channel, null, false);
     try runtime.h2ActivateStream(1, sending_key, 1);
@@ -2900,7 +3056,7 @@ test "http2 a stream stays in the concurrency count until both its response and 
 
     // Both ends are done, but the lane still holds request bytes for the
     // worker, so the stream stays until they leave.
-    const holding_key = ingress_state.RequestKey{ .lane_id = 0, .slot = 3, .generation = 1 };
+    const holding_key = RequestKey{ .lane_id = 0, .slot = 3, .generation = 1 };
     try runtime.h2ReserveStream(3);
     try runtime.h2SetRequestBodyExpectation(3, .ingress_channel, 2, false);
     try runtime.h2ActivateStream(3, holding_key, 3);
@@ -2926,7 +3082,7 @@ test "http2 driver shuts a rapid-reset RST_STREAM flood with enhance your calm" 
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
     try writeClientPrefaceAndSettings(setup.pair[1]);
@@ -2963,7 +3119,7 @@ test "http2 driver ignores inbound ping acknowledgements" {
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
     try writeClientPrefaceAndSettings(setup.pair[1]);
@@ -2982,7 +3138,7 @@ test "http2 driver sends goaway on connection-level frame errors" {
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
     try writeClientPrefaceAndSettings(setup.pair[1]);
@@ -3012,7 +3168,7 @@ test "http2 driver closes a connection whose client-sized allocation fails, with
         .refused_min_len = 4096,
     };
     // The protocol state is freed with the allocator that grew it.
-    defer setup.runtime.deinitProtocolState(refusing.allocator());
+    defer setup.runtime.deinitProtocolState(refusing.allocator(), &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = refusing.allocator() } };
 
     // A fragment the server buffers and never decodes, since no END_HEADERS
@@ -3045,7 +3201,7 @@ test "http2 driver closes a client that stops reading while it widens its window
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
     try writeClientPrefaceAndSettings(setup.pair[1]);
@@ -3056,7 +3212,7 @@ test "http2 driver closes a client that stops reading while it widens its window
     // A response twice the write queue's bound waits on a stream the client
     // has given no send window.
     setup.runtime.h2_peer_settings.initial_window_size = 0;
-    const request_key = ingress_state.RequestKey{ .lane_id = 0, .slot = 1, .generation = 1 };
+    const request_key = RequestKey{ .lane_id = 0, .slot = 1, .generation = 1 };
     try setup.runtime.h2ReserveStream(1);
     try setup.runtime.h2ActivateStream(1, request_key, 1);
     const body = try allocator.alloc(u8, 2 * write_queue.max_queued_write_bytes);
@@ -3087,12 +3243,12 @@ test "http2 driver returns a client descriptor that is not open as the lane's ow
     // `server/ingress/fault.zig`) and is the one error `drive` returns.
     const allocator = std.testing.allocator;
     var runtime = Slot{
-        .active = true,
+        .slab_link = .{ .live = true },
+        .streams = &sharedLane().streams,
         .fd = -1,
         .state = .http2_connection,
-        .buffer_index = 0,
     };
-    defer runtime.deinitProtocolState(allocator);
+    defer runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
     try std.testing.expectError(error.NotOpenForReading, drive(TestWorker, &worker, &runtime));
@@ -3104,7 +3260,7 @@ test "http2 a client that closes its socket closes the connection without GOAWAY
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
     try writeClientPrefaceAndSettings(setup.pair[1]);
@@ -3134,7 +3290,7 @@ test "http2 a connection error met while a request is in flight asks for the clo
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
     try writeClientPrefaceAndSettings(setup.pair[1]);
@@ -3167,7 +3323,7 @@ test "http2 driver treats invalid stream window update as stream error" {
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
     try writeClientPrefaceAndSettings(setup.pair[1]);
@@ -3195,7 +3351,7 @@ test "http2 driver treats stream window overflow as stream error" {
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
     try writeClientPrefaceAndSettings(setup.pair[1]);
@@ -3224,7 +3380,7 @@ test "http2 driver validates unsupported client push promise as connection error
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
     try writeClientPrefaceAndSettings(setup.pair[1]);
@@ -3246,13 +3402,14 @@ test "http2 response data queues behind outbound flow-control window" {
     defer sink.close();
 
     var runtime = Slot{
-        .active = true,
+        .slab_link = .{ .live = true },
+        .streams = &sharedLane().streams,
         .fd = sink.handle,
     };
-    defer runtime.deinitProtocolState(allocator);
+    defer runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
-    const request_key = ingress_state.RequestKey{ .lane_id = 0, .slot = 1, .generation = 1 };
+    const request_key = RequestKey{ .lane_id = 0, .slot = 1, .generation = 1 };
     try runtime.h2ReserveStream(1);
     try runtime.h2ActivateStream(1, request_key, 1);
 
@@ -3280,16 +3437,17 @@ test "http2 pending response flush rotates streams round robin" {
     defer sink.close();
 
     var runtime = Slot{
-        .active = true,
+        .slab_link = .{ .live = true },
+        .streams = &sharedLane().streams,
         .fd = sink.handle,
         .h2_connection_send_window = 0,
     };
-    defer runtime.deinitProtocolState(allocator);
+    defer runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
-    const request_key_1 = ingress_state.RequestKey{ .lane_id = 0, .slot = 1, .generation = 1 };
-    const request_key_3 = ingress_state.RequestKey{ .lane_id = 0, .slot = 3, .generation = 1 };
-    const request_key_5 = ingress_state.RequestKey{ .lane_id = 0, .slot = 5, .generation = 1 };
+    const request_key_1 = RequestKey{ .lane_id = 0, .slot = 1, .generation = 1 };
+    const request_key_3 = RequestKey{ .lane_id = 0, .slot = 3, .generation = 1 };
+    const request_key_5 = RequestKey{ .lane_id = 0, .slot = 5, .generation = 1 };
     try runtime.h2ReserveStream(1);
     try runtime.h2ActivateStream(1, request_key_1, 1);
     try runtime.h2ReserveStream(3);
@@ -3329,36 +3487,37 @@ test "http2 pending response drops prefixes with cursor instead of memmove" {
     defer sink.close();
 
     var runtime = Slot{
-        .active = true,
+        .slab_link = .{ .live = true },
+        .streams = &sharedLane().streams,
         .fd = sink.handle,
         .h2_connection_send_window = 0,
     };
-    defer runtime.deinitProtocolState(allocator);
+    defer runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
-    const request_key = ingress_state.RequestKey{ .lane_id = 0, .slot = 12, .generation = 1 };
+    const request_key = RequestKey{ .lane_id = 0, .slot = 12, .generation = 1 };
     try runtime.h2ReserveStream(19);
     try runtime.h2ActivateStream(19, request_key, 19);
 
     _ = try queueResponseChunk(TestWorker, &worker, &runtime, 19, "abcdefghij", false);
     try std.testing.expectEqualStrings("abcdefghij", runtime.h2PendingResponseSlice(19).?);
-    try std.testing.expectEqual(@as(usize, 0), runtime.ingress_channels[0].pending_response_start);
+    try std.testing.expectEqual(@as(usize, 0), runtime.streamAt(0).pending_response_start);
 
     try runtime.h2DropPendingResponsePrefix(allocator, 19, 3);
     try std.testing.expectEqualStrings("defghij", runtime.h2PendingResponseSlice(19).?);
-    try std.testing.expectEqual(@as(usize, 3), runtime.ingress_channels[0].pending_response_start);
+    try std.testing.expectEqual(@as(usize, 3), runtime.streamAt(0).pending_response_start);
     try std.testing.expectEqual(@as(usize, 7), runtime.h2_pending_response_bytes);
 
     _ = try queueResponseChunk(TestWorker, &worker, &runtime, 19, "kl", true);
     try std.testing.expectEqualStrings("defghijkl", runtime.h2PendingResponseSlice(19).?);
     try std.testing.expect(runtime.h2PendingResponseEndsStream(19));
-    try std.testing.expectEqual(@as(usize, 3), runtime.ingress_channels[0].pending_response_start);
+    try std.testing.expectEqual(@as(usize, 3), runtime.streamAt(0).pending_response_start);
     try std.testing.expectEqual(@as(usize, 9), runtime.h2_pending_response_bytes);
 
     try runtime.h2DropPendingResponsePrefix(allocator, 19, 9);
     try std.testing.expect(!runtime.h2HasPendingResponse(19));
-    try std.testing.expectEqual(@as(usize, 0), runtime.ingress_channels[0].pending_response_start);
-    try std.testing.expectEqual(@as(usize, 0), runtime.ingress_channels[0].pending_response.len);
+    try std.testing.expectEqual(@as(usize, 0), runtime.streamAt(0).pending_response_start);
+    try std.testing.expectEqual(@as(usize, 0), runtime.streamAt(0).pending_response.len);
     try std.testing.expectEqual(@as(usize, 0), runtime.h2_pending_response_bytes);
 }
 
@@ -3368,14 +3527,15 @@ test "http2 response backpressure rejects unbounded pending stream data" {
     defer sink.close();
 
     var runtime = Slot{
-        .active = true,
+        .slab_link = .{ .live = true },
+        .streams = &sharedLane().streams,
         .fd = sink.handle,
         .h2_connection_send_window = 0,
     };
-    defer runtime.deinitProtocolState(allocator);
+    defer runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
-    const request_key = ingress_state.RequestKey{ .lane_id = 0, .slot = 9, .generation = 1 };
+    const request_key = RequestKey{ .lane_id = 0, .slot = 9, .generation = 1 };
     try runtime.h2ReserveStream(15);
     try runtime.h2ActivateStream(15, request_key, 15);
 
@@ -3397,14 +3557,15 @@ test "http2 reset releases pending response bytes immediately" {
     defer sink.close();
 
     var runtime = Slot{
-        .active = true,
+        .slab_link = .{ .live = true },
+        .streams = &sharedLane().streams,
         .fd = sink.handle,
         .h2_connection_send_window = 0,
     };
-    defer runtime.deinitProtocolState(allocator);
+    defer runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
-    const request_key = ingress_state.RequestKey{ .lane_id = 0, .slot = 10, .generation = 1 };
+    const request_key = RequestKey{ .lane_id = 0, .slot = 10, .generation = 1 };
     try runtime.h2ReserveStream(17);
     try runtime.h2ActivateStream(17, request_key, 17);
 
@@ -3428,20 +3589,17 @@ test "http2 worker-death synthetic error drains failed stream while peer stream 
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
-    const failed_key = ingress_state.RequestKey{ .lane_id = 0, .slot = 31, .generation = 1 };
-    const peer_key = ingress_state.RequestKey{ .lane_id = 0, .slot = 32, .generation = 1 };
+    const failed_key = RequestKey{ .lane_id = 0, .slot = 31, .generation = 1 };
+    const peer_key = RequestKey{ .lane_id = 0, .slot = 32, .generation = 1 };
     try setup.runtime.h2ReserveStream(1);
     try setup.runtime.h2ActivateStream(1, failed_key, 31);
     try setup.runtime.h2ReserveStream(3);
     try setup.runtime.h2ActivateStream(3, peer_key, 32);
 
-    for (&setup.runtime.ingress_channels) |*entry| {
-        if (entry.stream_id == 1)
-            entry.send_window = 0;
-    }
+    (setup.runtime.h2StreamEntry(1) orelse return error.MissingStream).send_window = 0;
 
     const error_headers = [_]ipc.ingress_channel.ResponseHeader{
         .{ .name = "content-type", .value = "text/plain" },
@@ -3482,16 +3640,17 @@ test "http2 a dead worker's buffered response delivers its tail only when END_ST
     defer sink.close();
 
     var runtime = Slot{
-        .active = true,
+        .slab_link = .{ .live = true },
+        .streams = &sharedLane().streams,
         .fd = sink.handle,
         .h2_connection_send_window = 0,
     };
-    defer runtime.deinitProtocolState(allocator);
+    defer runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
-    const cut_key = ingress_state.RequestKey{ .lane_id = 0, .slot = 1, .generation = 1 };
-    const whole_key = ingress_state.RequestKey{ .lane_id = 0, .slot = 2, .generation = 1 };
-    const quiet_key = ingress_state.RequestKey{ .lane_id = 0, .slot = 3, .generation = 1 };
+    const cut_key = RequestKey{ .lane_id = 0, .slot = 1, .generation = 1 };
+    const whole_key = RequestKey{ .lane_id = 0, .slot = 2, .generation = 1 };
+    const quiet_key = RequestKey{ .lane_id = 0, .slot = 3, .generation = 1 };
     try runtime.h2ReserveStream(1);
     try runtime.h2ActivateStream(1, cut_key, 1);
     try runtime.h2ReserveStream(3);
@@ -3527,16 +3686,17 @@ test "http2 a request that leaves its stream closes it, drains a tail that carri
     defer sink.close();
 
     var runtime = Slot{
-        .active = true,
+        .slab_link = .{ .live = true },
+        .streams = &sharedLane().streams,
         .fd = sink.handle,
         .h2_connection_send_window = 0,
     };
-    defer runtime.deinitProtocolState(allocator);
+    defer runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
-    const cut_key = ingress_state.RequestKey{ .lane_id = 0, .slot = 1, .generation = 1 };
-    const whole_key = ingress_state.RequestKey{ .lane_id = 0, .slot = 2, .generation = 1 };
-    const ended_key = ingress_state.RequestKey{ .lane_id = 0, .slot = 3, .generation = 1 };
+    const cut_key = RequestKey{ .lane_id = 0, .slot = 1, .generation = 1 };
+    const whole_key = RequestKey{ .lane_id = 0, .slot = 2, .generation = 1 };
+    const ended_key = RequestKey{ .lane_id = 0, .slot = 3, .generation = 1 };
     try runtime.h2ReserveStream(1);
     try runtime.h2ActivateStream(1, cut_key, 1);
     try runtime.h2ReserveStream(3);
@@ -3572,10 +3732,10 @@ test "http2 combined response head and chunk frames in one queued write" {
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
-    const request_key = ingress_state.RequestKey{ .lane_id = 0, .slot = 3, .generation = 1 };
+    const request_key = RequestKey{ .lane_id = 0, .slot = 3, .generation = 1 };
     try setup.runtime.h2ReserveStream(5);
     try setup.runtime.h2ActivateStream(5, request_key, 5);
 
@@ -3607,10 +3767,10 @@ test "http2 explicit response end emits empty data end stream" {
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
-    const request_key = ingress_state.RequestKey{ .lane_id = 0, .slot = 4, .generation = 1 };
+    const request_key = RequestKey{ .lane_id = 0, .slot = 4, .generation = 1 };
     try setup.runtime.h2ReserveStream(7);
     try setup.runtime.h2ActivateStream(7, request_key, 7);
 
@@ -3647,13 +3807,13 @@ test "http2 a response head the encoder fails midway poisons it, and the connect
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
     // The connection speaks HTTP/2, so its close can carry a GOAWAY.
-    setup.runtime.h2_preface_complete = true;
+    setup.runtime.frame_reader.preface_len = h2.client_connection_preface.len;
     setup.runtime.h2_last_client_stream_id = 9;
-    const request_key = ingress_state.RequestKey{ .lane_id = 0, .slot = 5, .generation = 1 };
+    const request_key = RequestKey{ .lane_id = 0, .slot = 5, .generation = 1 };
     try setup.runtime.h2ReserveStream(9);
     try setup.runtime.h2ActivateStream(9, request_key, 9);
 
@@ -3694,10 +3854,10 @@ test "http2 worker response descriptor pair queues fused headers and data frames
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
-    const request_key = ingress_state.RequestKey{ .lane_id = 3, .slot = 19, .generation = 7 };
+    const request_key = RequestKey{ .lane_id = 3, .slot = 19, .generation = 7 };
     try setup.runtime.h2ReserveStream(13);
     try setup.runtime.h2ActivateStream(13, request_key, 9001);
     const identity = ipc.ingress_channel.RequestIdentity{
@@ -3762,13 +3922,14 @@ test "http2 worker response descriptor identity must match active stream" {
     defer sink.close();
 
     var runtime = Slot{
-        .active = true,
+        .slab_link = .{ .live = true },
+        .streams = &sharedLane().streams,
         .fd = sink.handle,
     };
-    defer runtime.deinitProtocolState(allocator);
+    defer runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
-    const request_key = ingress_state.RequestKey{ .lane_id = 3, .slot = 19, .generation = 7 };
+    const request_key = RequestKey{ .lane_id = 3, .slot = 19, .generation = 7 };
     try runtime.h2ReserveStream(13);
     try runtime.h2ActivateStream(13, request_key, 9001);
 
@@ -3810,13 +3971,14 @@ test "http2 worker response descriptors enforce head body end ordering" {
     defer sink.close();
 
     var runtime = Slot{
-        .active = true,
+        .slab_link = .{ .live = true },
+        .streams = &sharedLane().streams,
         .fd = sink.handle,
     };
-    defer runtime.deinitProtocolState(allocator);
+    defer runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
-    const request_key = ingress_state.RequestKey{ .lane_id = 4, .slot = 21, .generation = 8 };
+    const request_key = RequestKey{ .lane_id = 4, .slot = 21, .generation = 8 };
     const identity = ipc.ingress_channel.RequestIdentity{
         .request_id = 9010,
         .request_generation = request_key.generation,
@@ -3859,7 +4021,7 @@ test "http2 worker response descriptors enforce head body end ordering" {
         queueWorkerResponseDescriptor(TestWorker, &worker, &runtime, &head_received),
     );
 
-    const end_before_head_key = ingress_state.RequestKey{ .lane_id = 4, .slot = 22, .generation = 8 };
+    const end_before_head_key = RequestKey{ .lane_id = 4, .slot = 22, .generation = 8 };
     const end_before_head_identity = ipc.ingress_channel.RequestIdentity{
         .request_id = 9011,
         .request_generation = end_before_head_key.generation,
@@ -3878,7 +4040,7 @@ test "http2 worker response descriptors enforce head body end ordering" {
         queueWorkerResponseDescriptor(TestWorker, &worker, &runtime, &early_end_received),
     );
 
-    const ended_key = ingress_state.RequestKey{ .lane_id = 4, .slot = 23, .generation = 8 };
+    const ended_key = RequestKey{ .lane_id = 4, .slot = 23, .generation = 8 };
     const ended_identity = ipc.ingress_channel.RequestIdentity{
         .request_id = 9012,
         .request_generation = ended_key.generation,
@@ -3910,10 +4072,10 @@ test "http2 worker response reset queues rst stream after committed head" {
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
-    const request_key = ingress_state.RequestKey{ .lane_id = 6, .slot = 24, .generation = 12 };
+    const request_key = RequestKey{ .lane_id = 6, .slot = 24, .generation = 12 };
     try setup.runtime.h2ReserveStream(21);
     try setup.runtime.h2ActivateStream(21, request_key, 9021);
     const identity = ipc.ingress_channel.RequestIdentity{
@@ -3970,10 +4132,10 @@ test "http2 worker response descriptors queue split head chunk and explicit end"
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(allocator);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
-    const request_key = ingress_state.RequestKey{ .lane_id = 5, .slot = 23, .generation = 11 };
+    const request_key = RequestKey{ .lane_id = 5, .slot = 23, .generation = 11 };
     try setup.runtime.h2ReserveStream(15);
     try setup.runtime.h2ActivateStream(15, request_key, 9002);
     const identity = ipc.ingress_channel.RequestIdentity{
@@ -4046,13 +4208,14 @@ test "http2 the lane's record of a worker's head turns true when the head is que
     defer sink.close();
 
     var runtime = Slot{
-        .active = true,
+        .slab_link = .{ .live = true },
+        .streams = &sharedLane().streams,
         .fd = sink.handle,
     };
-    defer runtime.deinitProtocolState(allocator);
+    defer runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
-    const request_key = ingress_state.RequestKey{ .lane_id = 2, .slot = 7, .generation = 3 };
+    const request_key = RequestKey{ .lane_id = 2, .slot = 7, .generation = 3 };
     const identity = ipc.ingress_channel.RequestIdentity{
         .request_id = 9031,
         .request_generation = request_key.generation,
@@ -4100,10 +4263,11 @@ test "http2 response headers reject invalid names and values before framing" {
     defer sink.close();
 
     var runtime = Slot{
-        .active = true,
+        .slab_link = .{ .live = true },
+        .streams = &sharedLane().streams,
         .fd = sink.handle,
     };
-    defer runtime.deinitProtocolState(allocator);
+    defer runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
     const invalid_headers = [_][]const ipc.ingress_channel.ResponseHeader{
@@ -4128,13 +4292,14 @@ test "http2 completed active request drains pending response before removing str
     defer sink.close();
 
     var runtime = Slot{
-        .active = true,
+        .slab_link = .{ .live = true },
+        .streams = &sharedLane().streams,
         .fd = sink.handle,
     };
-    defer runtime.deinitProtocolState(allocator);
+    defer runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
-    const request_key = ingress_state.RequestKey{ .lane_id = 0, .slot = 2, .generation = 1 };
+    const request_key = RequestKey{ .lane_id = 0, .slot = 2, .generation = 1 };
     try runtime.h2ReserveStream(3);
     try runtime.h2ActivateStream(3, request_key, 3);
 
@@ -4159,10 +4324,11 @@ test "http2 local server response drains when peer stream window is closed" {
     defer sink.close();
 
     var runtime = Slot{
-        .active = true,
+        .slab_link = .{ .live = true },
+        .streams = &sharedLane().streams,
         .fd = sink.handle,
     };
-    defer runtime.deinitProtocolState(allocator);
+    defer runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
     runtime.h2_peer_settings.initial_window_size = 0;
     try runtime.h2ReserveStream(9);
@@ -4191,13 +4357,14 @@ test "http2 active request detached for server response keeps pending data drain
     defer sink.close();
 
     var runtime = Slot{
-        .active = true,
+        .slab_link = .{ .live = true },
+        .streams = &sharedLane().streams,
         .fd = sink.handle,
     };
-    defer runtime.deinitProtocolState(allocator);
+    defer runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
     runtime.h2_peer_settings.initial_window_size = 0;
-    const request_key = ingress_state.RequestKey{ .lane_id = 0, .slot = 8, .generation = 2 };
+    const request_key = RequestKey{ .lane_id = 0, .slot = 8, .generation = 2 };
     try runtime.h2ReserveStream(11);
     try runtime.h2ActivateStream(11, request_key, 11);
 
@@ -4284,10 +4451,11 @@ test "http2 response data direct writev avoids heap allocation" {
     defer sink.close();
 
     var runtime = Slot{
-        .active = true,
+        .slab_link = .{ .live = true },
+        .streams = &sharedLane().streams,
         .fd = sink.handle,
     };
-    defer runtime.deinitProtocolState(failing.allocator());
+    defer runtime.deinitProtocolState(failing.allocator(), &shared_lane.header_blocks);
     runtime.h2_peer_settings.max_frame_size = 4;
     var worker = TestWorker{ .service = .{ .allocator = failing.allocator() } };
     try runtime.h2ReserveStream(7);
@@ -4307,10 +4475,11 @@ test "http2 empty data end stream uses fixed write buffer without heap allocatio
     defer sink.close();
 
     var runtime = Slot{
-        .active = true,
+        .slab_link = .{ .live = true },
+        .streams = &sharedLane().streams,
         .fd = sink.handle,
     };
-    defer runtime.deinitProtocolState(failing.allocator());
+    defer runtime.deinitProtocolState(failing.allocator(), &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = failing.allocator() } };
     try runtime.h2ReserveStream(7);
 
@@ -4328,10 +4497,11 @@ test "http2 small control frames use fixed write buffer without heap allocation"
     defer sink.close();
 
     var runtime = Slot{
-        .active = true,
+        .slab_link = .{ .live = true },
+        .streams = &sharedLane().streams,
         .fd = sink.handle,
     };
-    defer runtime.deinitProtocolState(failing.allocator());
+    defer runtime.deinitProtocolState(failing.allocator(), &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = failing.allocator() } };
 
     try http2_writing.queueRstStream(TestWorker, &worker, &runtime, 7, .cancel);
@@ -4346,7 +4516,7 @@ test "http2 pending writes remain segmented when socket backpressures" {
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
     defer std.posix.close(setup.pair[1]);
-    defer setup.runtime.deinitProtocolState(std.testing.allocator);
+    defer setup.runtime.deinitProtocolState(std.testing.allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = std.testing.allocator } };
 
     try saturateFd(setup.pair[0]);

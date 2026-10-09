@@ -8,7 +8,6 @@ const builtin = @import("builtin");
 const ipc = @import("collo_ipc");
 const process = @import("collo_os").process;
 const js_value = @import("collo_worker_js").value;
-const route_env = @import("../modules/route_env.zig");
 
 /// A route whose module evaluated: its default export and the `env` object
 /// every request of the route receives with it.
@@ -132,14 +131,14 @@ pub const RuntimeOptions = struct {
     /// Owned eventfd; `Runtime.init` closes it on failure or runtime teardown.
     ingress_payload_credit_eventfd: ?std.posix.fd_t = null,
     egress_shared_fds: ?*ipc.egress_shared.RawFds = null,
-    /// The route's bindings blob (`worker/modules/route_env.zig`), borrowed
-    /// for the runtime's whole life; the default holds no bindings.
-    route_bindings_blob: []const u8 = &route_env.empty_blob,
-    /// Entry specifier of the route `route_bindings_blob` belongs to,
-    /// borrowed for the runtime's whole life: WorkerInit carries a route's
-    /// entry and its bindings together. Only that route's `env` is built
-    /// from a blob that holds bindings.
-    route_bindings_route: []const u8 = "",
+    /// The route table of the worker's definition (`common/ipc/route_table.zig`),
+    /// borrowed for the runtime's whole life, since every route's bindings
+    /// point into it; the default holds no route.
+    route_table: []const u8 = &ipc.route_table.empty_blob,
+    /// Each route but the first runs in a realm of its own
+    /// (`WorkerInit.flag_isolate_realm`); false runs every route in the VM's
+    /// main realm.
+    isolate_realm: bool = false,
     trace_requests: bool = false,
     trace_all_requests: bool = false,
     /// Gives the first handler call the benchmark marker

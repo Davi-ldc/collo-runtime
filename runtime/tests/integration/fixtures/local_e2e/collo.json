@@ -1,6 +1,7 @@
 // The configuration local-e2e serves (runtime/tests/integration/local_server/).
-// Every worker has one route, the most a worker serves until multi-route
-// workers exist. The harness chooses the listener, the certificate and the
+// Most workers have one route; the two realm workers have two each, to
+// compare a realm per route with one realm shared by every route of a
+// worker. The harness chooses the listener, the certificate and the
 // analytics directory itself, so none is set here.
 //
 // api/todos.js is an Elysia API and api/hono.js a Hono app, each bundled by
@@ -64,6 +65,22 @@
     "upload": {
       "routes": { "/upload": { "entry": "./api/upload.js" } },
       "settings": { "limits": { "concurrency": 2 } }
+    },
+    // Two routes on one entry, each with its own binding, served by one
+    // worker: in a realm each (the default), or in one shared realm.
+    "realms-isolated": {
+      "routes": {
+        "/realms/isolated/a": { "entry": "./api/realm_probe.js", "bindings": { "ROUTE": { "text": "a" } } },
+        "/realms/isolated/b": { "entry": "./api/realm_probe.js", "bindings": { "ROUTE": { "text": "b" } } }
+      },
+      "settings": { "isolateRealm": true }
+    },
+    "realms-shared": {
+      "routes": {
+        "/realms/shared/a": { "entry": "./api/realm_probe.js", "bindings": { "ROUTE": { "text": "a" } } },
+        "/realms/shared/b": { "entry": "./api/realm_probe.js", "bindings": { "ROUTE": { "text": "b" } } }
+      },
+      "settings": { "isolateRealm": false }
     }
   }
 }

@@ -124,7 +124,7 @@ test "hung timer callback is terminated by its owning request's deadline" {
     // turn published under the wrong owner fails the elapsed-time check
     // below instead of hanging the lane.
     const specifier = "/__collo_route/demo/arbiter-hung-timer.js";
-    try rt.registerRoute(&runtime, specifier,
+    const route_index = try rt.registerRoute(&runtime, specifier,
         \\export default function handle() {
         \\    setTimeout(() => {
         \\        const end = Date.now() + 8000;
@@ -143,7 +143,7 @@ test "hung timer callback is terminated by its owning request's deadline" {
     const deadline_ns = process.monotonicNowNsOrZero() + 400 * std.time.ns_per_ms;
     var dispatch = try rt.initDispatchWork(std.testing.allocator, .{
         .request_id = request_id,
-        .route_entry_specifier = specifier,
+        .route_index = route_index,
         .deadline_monotonic_ns = deadline_ns,
         .request = .{ .path = "/hung-timer" },
     });
@@ -220,7 +220,7 @@ test "an unsampled terminal folds the sentinel fire into the self-stop at the di
     try runtime.startSentinel();
 
     const specifier = "/__collo_route/demo/arbiter-unsampled-terminal.js";
-    try rt.registerRoute(&runtime, specifier,
+    const route_index = try rt.registerRoute(&runtime, specifier,
         \\export default function handle() {
         \\    setTimeout(() => {
         \\        const end = Date.now() + 8000;
@@ -234,7 +234,7 @@ test "an unsampled terminal folds the sentinel fire into the self-stop at the di
     const deadline_ns = process.monotonicNowNsOrZero() + 400 * std.time.ns_per_ms;
     var dispatch = try rt.initDispatchWork(std.testing.allocator, .{
         .request_id = request_id,
-        .route_entry_specifier = specifier,
+        .route_index = route_index,
         .deadline_monotonic_ns = deadline_ns,
         .request = .{ .path = "/unsampled" },
     });

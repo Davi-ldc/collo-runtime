@@ -1,8 +1,8 @@
 //! Runs one web API compat suite inside a worker forked from a real zygote
 //! and booted through its sandbox. The suite's module, `support/collo_test.js`
 //! and an entry route that runs the suite and answers with its JSON result
-//! travel as one module pack in WorkerInit's route entry, and the response to
-//! one request must report `"ok":true`. The worker launches attached to an
+//! travel as one module pack in WorkerInit, with a one-route table naming
+//! that entry, and the response to one request must report `"ok":true`. The worker launches attached to an
 //! in-process egress gateway (`rt.LocalEgressGateway`) with a boot token, as
 //! a launch with an egress grant does, and the suite's fetches run under
 //! `rt.local_origin_network`, plain HTTP to private addresses; the test thread
@@ -76,6 +76,8 @@ pub fn runCompatSuite(source: []const u8, specifier: []const u8) !void {
 
     const route_fd = try rt.createModulePackGraphFd(&modules, 2);
     defer std.posix.close(route_fd);
+    var route = try rt.SingleRoute.init(route_fd, collo_test_entry_specifier);
+    defer route.deinit();
 
     const request_id = requestIdForSpecifier(specifier);
     var launched = zygote_support.launchWorker(
@@ -88,7 +90,7 @@ pub fn runCompatSuite(source: []const u8, specifier: []const u8) !void {
                 .shared_fds = egress_shared_fds,
                 .boot = rt.localBootEgress(),
             } },
-            .route_entry = .{ .fd = route_fd, .specifier = collo_test_entry_specifier },
+            .routes = route.launchRoutes(),
         },
     ) catch |err| switch (err) {
         error.WorkerCgroupDelegationUnavailable => return error.SkipZigTest,
@@ -102,7 +104,6 @@ pub fn runCompatSuite(source: []const u8, specifier: []const u8) !void {
     const request_budget_ms: u32 = 30_000;
     var dispatch = try rt.initDispatchWork(std.testing.allocator, .{
         .request_id = request_id,
-        .route_entry_specifier = collo_test_entry_specifier,
         // The forked worker reads the real monotonic clock, and the harness
         // default (`DispatchParts.deadline_monotonic_ns`) is an instant on
         // the in-process fake clock, long past on the real one.

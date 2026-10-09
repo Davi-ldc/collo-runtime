@@ -12,14 +12,14 @@ const bindings = @import("collo_bindings");
 const ipc = @import("collo_ipc");
 const request_head = @import("collo_worker_request").head;
 const request_context = @import("collo_worker_request").context;
-const state = @import("../../runtime/root.zig");
 
-/// Creates the handler's `Request` for `request`. A head with more headers
-/// or route captures than the dispatch format allows fails with
-/// `error.InvalidDispatchRequestHead`, and an exception while the object is
-/// built is released and returned as `error.JsException`.
+/// Creates the handler's `Request` for `request` in `realm`, the realm of the
+/// request's route. A head with more headers or route captures than the
+/// dispatch format allows fails with `error.InvalidDispatchRequestHead`, and
+/// an exception while the object is built is released and returned as
+/// `error.JsException`.
 pub fn makeRequestObject(
-    runtime: *state.Runtime,
+    realm: bindings.Realm,
     request: *request_context.RequestContext,
     parsed: *const request_head.ParsedHead,
 ) !bindings.Value {
@@ -60,7 +60,7 @@ pub fn makeRequestObject(
         },
     };
 
-    return switch (try runtime.core.vm.requestValue(&init)) {
+    return switch (try realm.requestValue(&init)) {
         .success => |value| value,
         .exception => |exception| {
             var owned = exception;

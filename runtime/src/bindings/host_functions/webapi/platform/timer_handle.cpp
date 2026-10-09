@@ -1,6 +1,6 @@
 // The Immediate prototype and methods, and `collo_webapi_immediate_mark_destroyed`, on the VM thread. The prototype
-// and structure are built on the first setImmediate call, not at install, and cached on the VM (`webapi_cache`). The
-// Immediate constructor is reachable only as the prototype's `constructor`, and calling it throws.
+// and structure are built on a realm's first setImmediate call, not at install, and cached in that realm's
+// `webapi_cache`. The Immediate constructor is reachable only as the prototype's `constructor`, and calling it throws.
 
 #include "jsc/runtime/state.h"
 
@@ -138,7 +138,7 @@ namespace {
 
     JSC::Structure* immediateStructure(Collo::GlobalObject* global_object, JSC::VM& vm)
     {
-        auto& cache = global_object->owner().webapi_cache;
+        auto& cache = global_object->webApiCache();
         if (auto* structure = cache.immediate_handle_structure.get())
             return structure;
 

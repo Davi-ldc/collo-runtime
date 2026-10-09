@@ -170,6 +170,8 @@ fn resolveWaiter(runtime: anytype, request_ctx: *request_context.RequestContext)
     var waiter = request_ctx.body.takeWaiter() orelse return;
     defer waiter.deinit(request_ctx.requestAllocator());
 
+    // The read's value belongs to the realm of the code that started it.
+    const realm = try waiter.deferred.realm();
     switch (waiter.kind) {
         .text => {
             var text = try runtime.core.vm.stringValueUtf8(request_ctx.body.textSlice());
@@ -181,7 +183,7 @@ fn resolveWaiter(runtime: anytype, request_ctx: *request_context.RequestContext)
                 runtime.core.vm,
                 &request_ctx.exec,
                 &waiter.deferred,
-                try turn.jsonParseUtf8(runtime.core.vm, &request_ctx.exec, request_ctx.body.textSlice()),
+                try turn.jsonParseUtf8(runtime.core.vm, realm, &request_ctx.exec, request_ctx.body.textSlice()),
             );
         },
         .array_buffer => {
@@ -189,7 +191,7 @@ fn resolveWaiter(runtime: anytype, request_ctx: *request_context.RequestContext)
                 runtime.core.vm,
                 &request_ctx.exec,
                 &waiter.deferred,
-                try runtime.core.vm.arrayBufferValueCopy(request_ctx.body.textSlice()),
+                try realm.arrayBufferValueCopy(request_ctx.body.textSlice()),
             );
         },
         .bytes => {
@@ -197,7 +199,7 @@ fn resolveWaiter(runtime: anytype, request_ctx: *request_context.RequestContext)
                 runtime.core.vm,
                 &request_ctx.exec,
                 &waiter.deferred,
-                try runtime.core.vm.uint8ArrayValueCopy(request_ctx.body.textSlice()),
+                try realm.uint8ArrayValueCopy(request_ctx.body.textSlice()),
             );
         },
         .blob => {
@@ -205,7 +207,7 @@ fn resolveWaiter(runtime: anytype, request_ctx: *request_context.RequestContext)
                 runtime.core.vm,
                 &request_ctx.exec,
                 &waiter.deferred,
-                try runtime.core.vm.blobValueCopy(request_ctx.body.textSlice(), waiter.content_type),
+                try realm.blobValueCopy(request_ctx.body.textSlice(), waiter.content_type),
             );
         },
         .form_data => {
@@ -215,6 +217,7 @@ fn resolveWaiter(runtime: anytype, request_ctx: *request_context.RequestContext)
                 &waiter.deferred,
                 try turn.formDataFromBytes(
                     runtime.core.vm,
+                    realm,
                     &request_ctx.exec,
                     request_ctx.body.textSlice(),
                     waiter.content_type,

@@ -172,17 +172,24 @@ pub const ConnectionCloseReason = enum {
     /// The client closed or reset the connection.
     peer_closed,
     /// The connection started no request before its pre-request deadline
-    /// (`runner/deadline_driver.zig`). A connection has no other deadline,
-    /// so one that falls idle after its first request stays open.
-    idle,
+    /// (`runner/deadline_driver.zig`).
+    pre_request_timeout,
+    /// The connection had no stream for the whole idle deadline; it got
+    /// GOAWAY NO_ERROR first.
+    idle_timeout,
+    /// The lane held part of a frame, a header block or writes for the
+    /// connection, and no byte moved for the whole stall deadline.
+    stall_timeout,
+    /// The connection's header block would have taken the lane past its
+    /// header block budget (`limits.ingress.header_block_bytes_per_lane_max`).
+    header_block_budget,
     /// The server is stopping.
     server_stop,
     /// The lane failed to encode a frame or to keep its stream records for
     /// this connection. Its own sizing and checks rule these out, and the
     /// failure stays with the connection it concerns.
     internal_error,
-    /// The lane had no connection slot or header buffer for an accepted
-    /// socket.
+    /// The lane had no connection slot for an accepted socket.
     connection_limit,
     /// An accepted socket could not be configured or given a TLS session.
     setup_failed,
@@ -203,7 +210,10 @@ pub const ConnectionCloseReason = enum {
             .write_backpressure => "write_backpressure",
             .allocation_failed => "allocation_failed",
             .peer_closed => "peer_closed",
-            .idle => "idle",
+            .pre_request_timeout => "pre_request_timeout",
+            .idle_timeout => "idle_timeout",
+            .stall_timeout => "stall_timeout",
+            .header_block_budget => "header_block_budget",
             .server_stop => "server_stop",
             .internal_error => "internal_error",
             .connection_limit => "connection_limit",
@@ -258,6 +268,7 @@ pub const Http2Error = error{
     Http2UnknownStream,
     Http2ContentLengthMismatch,
     Http2TooManyConcurrentStreams,
+    Http2StreamSlabFull,
     Http2EnhanceYourCalm,
     Http2StreamClosed,
     Http2FrameSizeError,
@@ -268,6 +279,7 @@ pub const Http2Error = error{
     HpackHeaderListTooLarge,
     HpackOutputTooSmall,
     Http2HeaderBlockTooLarge,
+    Http2HeaderBlockBudgetExceeded,
     TooManyHttp2Settings,
     ShortHttp2Setting,
     Http2WriteBackpressure,
@@ -384,14 +396,13 @@ pub const RequestHeadError = error{
     Http2HostAuthorityMismatch,
 };
 
-/// `runner/accept_flow.zig`, setting up one accepted socket: its slot and
-/// header buffer, its socket options through `collo_os.socket`, its peer
-/// address (`peer_address.PeerAddress.fromSocket`) and its TLS session
+/// `runner/accept_flow.zig`, setting up one accepted socket: its slot, its
+/// socket options through `collo_os.socket`, its peer address
+/// (`peer_address.PeerAddress.fromSocket`) and its TLS session
 /// (`BoringSslContext.start`). The accept itself sets the socket's
 /// non-blocking and close-on-exec flags. Arming the socket's deadline and
 /// polls fails only through the lane's own timerfd and ring.
 pub const AcceptError = error{
-    IngressHeaderBufferExhausted,
     ConnectionSlabFull,
     BoringSslInitFailed,
     PermissionDenied,
@@ -445,6 +456,9 @@ fn classifyHttp2(err: (LaneFault || Http2Error)) LaneFault!ConnectionOutcome {
         error.HpackHeaderListTooLarge,
         => close(.header_block_too_large, .compression_error),
         error.HpackOutputTooSmall => close(.header_too_large, .compression_error),
+        // A flood of unfinished header blocks across the lane's connections;
+        // the one whose block would pass the budget pays with its own.
+        error.Http2HeaderBlockBudgetExceeded => close(.header_block_budget, .enhance_your_calm),
         // RFC 9113 bounds no SETTINGS frame; past
         // `Settings.max_settings_per_frame` the peer only adds load.
         error.TooManyHttp2Settings => close(.settings_error, .enhance_your_calm),
@@ -453,6 +467,9 @@ fn classifyHttp2(err: (LaneFault || Http2Error)) LaneFault!ConnectionOutcome {
         // The full write queue is where a GOAWAY would wait.
         error.Http2WriteBackpressure => close(.write_backpressure, null),
         error.OutOfMemory => close(.allocation_failed, .internal_error),
+        // Every caller refuses a new stream past the lane's slab with
+        // REFUSED_STREAM, so one reaching this table is the lane's mistake.
+        error.Http2StreamSlabFull,
         error.Http2StreamAlreadyOpen,
         error.Http2StreamStateMismatch,
         error.Http2PendingBodyTooLarge,
@@ -585,9 +602,7 @@ fn classifyRequestHead(err: (LaneFault || RequestHeadError)) LaneFault!Connectio
 // byte yet.
 fn classifyAccept(err: (LaneFault || AcceptError)) LaneFault!ConnectionOutcome {
     return switch (err) {
-        error.IngressHeaderBufferExhausted,
-        error.ConnectionSlabFull,
-        => close(.connection_limit, null),
+        error.ConnectionSlabFull => close(.connection_limit, null),
         error.BoringSslInitFailed,
         error.PermissionDenied,
         error.Unexpected,
@@ -784,9 +799,10 @@ pub const FsFaultDecodeError = error{
     OutOfMemory,
 };
 
-/// A read of the eventfds a worker writes to wake the lane: its completion
-/// eventfd (`page.drainCompletionEventfd`, whose short read is `ShortRead`)
-/// and its payload credit eventfd (`event_sources.drainEventFd`).
+/// A read of the eventfd a worker writes to wake its reader lane, its
+/// completion eventfd (`page.drainCompletionEventfd`, whose short read is
+/// `ShortRead`), which also carries the credit of its server-to-worker
+/// payload ring (`common/ipc/ingress_channel/payload_ring.zig`).
 pub const WakeError = std.posix.ReadError || error{
     ShortRead,
     EventfdShortRead,
@@ -1164,7 +1180,6 @@ pub const loop_handlers = [_]LoopHandler{
     .{ .name = "handleWorkerFsFault", .Argument = u32 },
     .{ .name = "handleWorkerPidfd", .Argument = u32 },
     .{ .name = "handleDeadlineTimer", .Argument = void },
-    .{ .name = "handleWorkerPayloadCredit", .Argument = u32 },
     .{ .name = "handleStop", .Argument = void },
 };
 // A worker fault below means: mark the worker dead with the reason, answer
@@ -1187,12 +1202,14 @@ pub const loop_handlers = [_]LoopHandler{
 //   set up (`ConnectionError.accept`) closes alone and is counted; a failed
 //   re-arm or an accept errno no single connection explains is a lane fault.
 // handleCommands(lane) LaneFault!void
-//   Drains the command queue (`lane_commands.zig`). `worker_died` is a worker
-//   fault with the reason the command carries, for this lane's requests on
-//   the worker and the reader role it holds; a forwarded descriptor that
-//   shows its worker faulty is a worker fault too. A command naming a
-//   request or worker that is gone gives back what it holds and does nothing
-//   else.
+//   Takes the lane's wake bits, retrying the request bodies parked on a full
+//   payload ring and resuming the workers whose forwarding window reopened,
+//   then drains the command queue (`lane_commands.zig`). `worker_died` is a
+//   worker fault with the reason the command carries, for this lane's
+//   requests on the worker and the reader role it holds; a forwarded
+//   descriptor that shows its worker faulty is a worker fault too. A command
+//   naming a request or worker that is gone gives back what it holds and does
+//   nothing else.
 // handleWorkerControlReadable(lane, registration: u32) LaneFault!void
 //   Drains a bounded batch from the worker's control socket, queues each
 //   response of this lane's requests onto its stream and forwards the rest
@@ -1204,10 +1221,11 @@ pub const loop_handlers = [_]LoopHandler{
 //   Sends, in order, the bytes parked on the worker's full control socket.
 //   `.would_block` parks the rest again; `.fault` is a worker fault.
 // handleWorkerCompletions(lane, registration: u32) LaneFault!void
-//   Drains the worker's control socket, then its completion eventfd and
-//   ring, finishes each request of this lane a completion names, or parks
-//   the completion behind its response, and forwards the rest to their
-//   lanes. `.fault` is a worker fault.
+//   Wakes the lanes whose request bodies wait on the worker's full payload
+//   ring, then drains the worker's control socket, then its completion
+//   eventfd and ring, finishes each request of this lane a completion names,
+//   or parks the completion behind its response, and forwards the rest to
+//   their lanes. `.fault` is a worker fault.
 // handleWorkerFsFault(lane, registration: u32) LaneFault!void
 //   Answers each fault request on the worker's fault socket. `.fault` is a
 //   worker fault; an answer that would block is dropped, and the worker's
@@ -1217,7 +1235,10 @@ pub const loop_handlers = [_]LoopHandler{
 //   with `.exited`.
 // handleDeadlineTimer(lane) LaneFault!void
 //   Drains the timerfd and expires the deadlines due. A connection that
-//   started no request by its pre-request deadline closes as `.idle`. A
+//   started no request by its pre-request deadline closes as
+//   `.pre_request_timeout`, one idle past its idle deadline closes as
+//   `.idle_timeout` after GOAWAY NO_ERROR is written, and one stalled past
+//   its stall deadline closes as `.stall_timeout` at once. A
 //   request still waiting for a worker slot at its deadline leaves its
 //   pool's waiters with 503. A dispatched request past its deadline plus
 //   `hard_timeout_grace_ns` first lets its worker's output in; a completion
@@ -1225,10 +1246,6 @@ pub const loop_handlers = [_]LoopHandler{
 //   response, and otherwise its worker takes a fault with
 //   `.deadline_grace_expired`, which answers it 504, or RST_STREAM when its
 //   head went out, and its other requests 502.
-// handleWorkerPayloadCredit(lane, registration: u32) LaneFault!void
-//   Drains the worker's credit eventfd and sends the request bodies parked
-//   on its full payload ring. `.would_block` keeps them parked; `.fault` is a
-//   worker fault.
 // handleStop(lane) LaneFault!void
 //   Runs once the server is stopping: queues GOAWAY with no new streams on
 //   every HTTP/2 connection, best effort, serves until no request of the lane

@@ -124,23 +124,24 @@ namespace {
     }
 
     extern "C" ColloStatus collo_fetch_read_result_new_copy(
-        ColloVm* owner, ColloBuffer bytes, uint8_t done, ColloValue** out_value, ColloValue** out_exception)
+        ColloRealm* realm, ColloBuffer bytes, uint8_t done, ColloValue** out_value, ColloValue** out_exception)
     {
         if (out_value)
             *out_value = nullptr;
         Collo::clearOutException(out_exception);
-        if (!owner || !owner->isReady() || !out_value)
+        if (!realmIsReady(realm) || !out_value)
             return COLLO_STATUS_INVALID_ARGUMENT;
         if (!bytes.ptr && bytes.len)
             return COLLO_STATUS_INVALID_ARGUMENT;
 
+        ColloVm* owner = realm->vm;
         JSC::JSLockHolder locker(*owner->vm);
         auto& vm = *owner->vm;
         auto scope = DECLARE_THROW_SCOPE(vm);
         JSC::JSValue value = JSC::jsUndefined();
         if (!done) {
             auto* array = createBodyUint8ArrayCopy(
-                owner->global_object, scope, std::span<const uint8_t> { bytes.ptr, bytes.len });
+                realm->global_object, scope, std::span<const uint8_t> { bytes.ptr, bytes.len });
             if (!array) {
                 if (scope.exception()) {
                     JSC::JSValue exception = scope.exception()->value();
@@ -154,7 +155,7 @@ namespace {
             value = array;
         }
 
-        auto* object = createReadResultObject(owner->global_object, value, done);
+        auto* object = createReadResultObject(realm->global_object, value, done);
         return Collo::makeValueHandle(owner, object, out_value);
     }
 
@@ -1119,13 +1120,13 @@ void installServerResponse(Collo::GlobalObject* global_object, JSC::VM& vm)
 }
 
 extern "C" ColloStatus collo_response_new(
-    ColloVm* vm, const ColloResponseInit* init, ColloValue** out_value, ColloValue** out_exception)
+    ColloRealm* realm, const ColloResponseInit* init, ColloValue** out_value, ColloValue** out_exception)
 {
     if (out_value)
         *out_value = nullptr;
     Collo::clearOutException(out_exception);
 
-    if (!vm || !vm->isReady() || !init || !out_value)
+    if (!realmIsReady(realm) || !init || !out_value)
         return COLLO_STATUS_INVALID_ARGUMENT;
     if ((init->body.len != 0 && !init->body.ptr) || (init->headers_len != 0 && !init->headers) || init->status < 200
         || init->status > 599)
@@ -1134,6 +1135,7 @@ extern "C" ColloStatus collo_response_new(
     if (init->body.len != 0 && isNullBodyStatus(init->status))
         return COLLO_STATUS_INVALID_ARGUMENT;
 
+    ColloVm* vm = realm->vm;
     JSC::JSLockHolder locker(*vm->vm);
     auto scope = DECLARE_THROW_SCOPE(*vm->vm);
 
@@ -1150,8 +1152,8 @@ extern "C" ColloStatus collo_response_new(
     if (init->body.len && !body.tryAppend(std::span<const uint8_t> { init->body.ptr, init->body.len }))
         return COLLO_STATUS_OUT_OF_MEMORY;
 
-    auto* headers
-        = createHeadersFromRawPairs(vm->global_object, scope, init->headers, init->headers_len, HeaderGuard::Immutable);
+    auto* headers = createHeadersFromRawPairs(
+        realm->global_object, scope, init->headers, init->headers_len, HeaderGuard::Immutable);
     if (auto status = consumeExceptionStatus(vm, scope, out_exception); status != COLLO_STATUS_OK)
         return status;
     if (!headers)
@@ -1161,7 +1163,7 @@ extern "C" ColloStatus collo_response_new(
     if (!BodyState::fromBytes(WTF::move(body), pending_body.state))
         return COLLO_STATUS_OUT_OF_MEMORY;
 
-    auto* object = JSColloResponse::create(*vm->vm, vm->global_object, init->status, WTF::move(status_text),
+    auto* object = JSColloResponse::create(*vm->vm, realm->global_object, init->status, WTF::move(status_text),
         WTF::move(url), WTF::move(pending_body), headers, ResponseType::Basic,
         (init->flags & COLLO_RESPONSE_INIT_FLAG_REDIRECTED) != 0);
     if (auto status = consumeExceptionStatus(vm, scope, out_exception); status != COLLO_STATUS_OK)
@@ -1170,15 +1172,16 @@ extern "C" ColloStatus collo_response_new(
 }
 
 extern "C" ColloStatus collo_fetch_response_new(
-    ColloVm* vm, const ColloFetchResponseInit* init, ColloValue** out_value, ColloValue** out_exception)
+    ColloRealm* realm, const ColloFetchResponseInit* init, ColloValue** out_value, ColloValue** out_exception)
 {
     if (out_value)
         *out_value = nullptr;
     Collo::clearOutException(out_exception);
 
-    if (!vm || !vm->isReady() || !init || !out_value)
+    if (!realmIsReady(realm) || !init || !out_value)
         return COLLO_STATUS_INVALID_ARGUMENT;
 
+    ColloVm* vm = realm->vm;
     const ColloResponseInit& response = init->response;
     // From here on the call owns init->body_identity: a failure before the Response exists releases it, and after
     // that the Response's body owns it.
@@ -1209,7 +1212,7 @@ extern "C" ColloStatus collo_fetch_response_new(
     }
 
     auto* headers = createHeadersFromRawPairs(
-        vm->global_object, scope, response.headers, response.headers_len, HeaderGuard::Immutable);
+        realm->global_object, scope, response.headers, response.headers_len, HeaderGuard::Immutable);
     if (auto status = consumeExceptionStatus(vm, scope, out_exception); status != COLLO_STATUS_OK) {
         release_unattached_body();
         return status;
@@ -1220,7 +1223,7 @@ extern "C" ColloStatus collo_fetch_response_new(
     }
 
     PendingBody pending_body { BodyState::fetchStream(*vm, init->body_identity) };
-    auto* object = JSColloResponse::create(*vm->vm, vm->global_object, response.status, WTF::move(status_text),
+    auto* object = JSColloResponse::create(*vm->vm, realm->global_object, response.status, WTF::move(status_text),
         WTF::move(url), WTF::move(pending_body), headers, ResponseType::Basic,
         (response.flags & COLLO_RESPONSE_INIT_FLAG_REDIRECTED) != 0);
     if (auto status = consumeExceptionStatus(vm, scope, out_exception); status != COLLO_STATUS_OK)
@@ -1240,26 +1243,28 @@ extern "C" ColloStatus collo_response_extract(ColloVm* vm, const ColloValue* val
     JSC::JSLockHolder locker(*vm->vm);
     auto scope = DECLARE_THROW_SCOPE(*vm->vm);
     JSValue js_value = Collo::toJSValue(value);
+    // The handler's realm, which a body stream it read from or an error it raises belongs to.
+    auto* global_object = Collo::globalObjectForValue(vm, js_value);
 
     ColloStatus status = COLLO_STATUS_OK;
     if (auto* response = dynamicDowncast<JSColloResponse>(js_value)) {
-        status = fillExtractedResponse(vm, vm->global_object, scope, response, *limits, out_response, out_exception);
+        status = fillExtractedResponse(vm, global_object, scope, response, *limits, out_response, out_exception);
     } else {
         out_response->status = 200;
-        String text = js_value.toWTFString(vm->global_object);
+        String text = js_value.toWTFString(global_object);
         if (auto exception_status = consumeExceptionStatus(vm, scope, out_exception);
             exception_status != COLLO_STATUS_OK)
             return exception_status;
         if (stringUtf8LengthWithinLimit(text, limits->max_body_bytes)) {
             size_t body_byte_length = 0;
             BodyState body = BodyState::fromText(WTF::move(text));
-            if (!body.byteLength(vm->global_object, scope, body_byte_length)) {
+            if (!body.byteLength(global_object, scope, body_byte_length)) {
                 if (auto exception_status = consumeExceptionStatus(vm, scope, out_exception);
                     exception_status != COLLO_STATUS_OK)
                     return exception_status;
                 status = COLLO_STATUS_ERROR;
             } else if (!body.extractByteSegmentsForHostResponse(
-                           vm->global_object, scope, body_byte_length, 64, out_response->body)) {
+                           global_object, scope, body_byte_length, 64, out_response->body)) {
                 if (auto exception_status = consumeExceptionStatus(vm, scope, out_exception);
                     exception_status != COLLO_STATUS_OK)
                     return exception_status;

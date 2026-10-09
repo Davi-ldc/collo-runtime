@@ -180,6 +180,7 @@ pub fn scheduleTimer(
     runtime: anytype,
     request_id: u64,
     callback: js_value.JsFunctionOwned,
+    receiver: ?js_value.JsValueOwned,
     args: ?[]js_value.JsValueOwned,
     delay_ms: u32,
     repeats: bool,
@@ -188,6 +189,9 @@ pub fn scheduleTimer(
     var callback_owned = true;
     defer if (callback_owned)
         callback_fn.deinit();
+    var receiver_value = receiver;
+    defer if (receiver_value) |*owned|
+        owned.deinit();
     var args_slice = args;
     defer if (args_slice) |owned_args| {
         for (owned_args) |*arg|
@@ -211,9 +215,11 @@ pub fn scheduleTimer(
         .delay_ms = delay_ms,
         .repeats = repeats,
         .callback = callback_fn.take(),
+        .receiver = if (receiver_value) |*owned| owned.take() else null,
         .args = args_slice,
     };
     callback_owned = false;
+    receiver_value = null;
     args_slice = null;
     errdefer entry.deinit(runtime.core.allocator);
     try runtime.scheduler.timers.push(entry);
@@ -268,25 +274,6 @@ pub fn scheduleImmediate(
     errdefer entry.deinit(runtime.core.allocator);
     try runtime.scheduler.pending_immediate_callbacks.push(entry);
     return immediate_id;
-}
-
-/// `scheduleTimer` for a one-shot timer whose callback arrives as a value.
-/// Takes `callback` on every path and also fails when it is not a function.
-pub fn scheduleTimeout(
-    runtime: anytype,
-    request_id: u64,
-    callback: bindings.Value,
-    delay_ms: u32,
-) !u64 {
-    var callback_value = callback;
-    var callback_owned = true;
-    defer if (callback_owned)
-        callback_value.deinit();
-
-    callback_owned = false;
-    var callback_fn = try js_value.JsFunctionOwned.fromOwnedValueChecked(runtime.core.vm, callback_value);
-    errdefer callback_fn.deinit();
-    return scheduleTimer(runtime, request_id, callback_fn.take(), null, delay_ms, false);
 }
 
 /// The entries the shared budget counts (see the file header).

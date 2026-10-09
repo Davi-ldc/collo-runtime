@@ -301,6 +301,8 @@ test "independent runtime gate: prepared cgroup child serves sealed hello-world 
     ;
     const route_fd = try rt.createModulePackFd(route_specifier, source);
     defer std.posix.close(route_fd);
+    var route = try rt.SingleRoute.init(route_fd, route_specifier);
+    defer route.deinit();
 
     var gate_handle = try host.runToReady(
         std.testing.allocator,
@@ -312,7 +314,7 @@ test "independent runtime gate: prepared cgroup child serves sealed hello-world 
                 .shared_fds = egress_shared.rawForWorker(),
                 .boot = rt.localBootEgress(),
             } },
-            .route_entry = .{ .fd = route_fd, .specifier = route_specifier },
+            .routes = route.launchRoutes(),
         },
     );
     var handle_armed = true;
@@ -345,7 +347,6 @@ test "independent runtime gate: prepared cgroup child serves sealed hello-world 
     const request = rt.RequestParts{ .method = "GET", .path = "/hello" };
     var dispatch = try rt.initDispatchWork(std.testing.allocator, .{
         .request_id = request_id,
-        .route_entry_specifier = route_specifier,
         .deadline_monotonic_ns = try forkedDeadlineNs(),
         .request = request,
     });
@@ -367,7 +368,7 @@ test "independent runtime gate: prepared cgroup child serves sealed hello-world 
 }
 
 test "a worker refuses a request begin that carries a file descriptor and stops" {
-    // The route's pack reached the worker in WorkerInit, so no ingress packet
+    // The pack reached the worker in WorkerInit, so no ingress packet
     // may carry a descriptor. A request begin with the pack attached fails to
     // decode in the worker's control loop, which ends the worker before any
     // handler runs.
@@ -381,15 +382,16 @@ test "a worker refuses a request begin that carries a file descriptor and stops"
         \\}
     );
     defer std.posix.close(route_fd);
+    var route = try rt.SingleRoute.init(route_fd, route_specifier);
+    defer route.deinit();
     var launched = try launchOrSkip(&spawned, 90_019, .{
-        .route_entry = .{ .fd = route_fd, .specifier = route_specifier },
+        .routes = route.launchRoutes(),
     });
     defer launched.deinit();
     const handle = &launched.handle;
 
     var dispatch = try rt.initDispatchWork(std.testing.allocator, .{
         .request_id = 90_019,
-        .route_entry_specifier = route_specifier,
         .deadline_monotonic_ns = try forkedDeadlineNs(),
     });
     defer dispatch.deinit();
@@ -578,8 +580,10 @@ test "an idle worker spends almost no CPU and keeps every thread" {
         \\}
     );
     defer std.posix.close(route_fd);
+    var route = try rt.SingleRoute.init(route_fd, route_specifier);
+    defer route.deinit();
     var launched = try launchOrSkip(&spawned, 90_018, .{
-        .route_entry = .{ .fd = route_fd, .specifier = route_specifier },
+        .routes = route.launchRoutes(),
     });
     defer launched.deinit();
     const handle = &launched.handle;
@@ -589,7 +593,6 @@ test "an idle worker spends almost no CPU and keeps every thread" {
     const request_id: u64 = 90_018;
     var dispatch = try rt.initDispatchWork(std.testing.allocator, .{
         .request_id = request_id,
-        .route_entry_specifier = route_specifier,
         .deadline_monotonic_ns = try forkedDeadlineNs(),
     });
     defer dispatch.deinit();
@@ -678,16 +681,17 @@ test "worker node fs round trip stays inside chroot tmpfs" {
     ;
     const route_fd = try rt.createModulePackFd(route_specifier, source);
     defer std.posix.close(route_fd);
+    var route = try rt.SingleRoute.init(route_fd, route_specifier);
+    defer route.deinit();
 
     var launched = try launchOrSkip(&spawned, 90_004, .{
-        .route_entry = .{ .fd = route_fd, .specifier = route_specifier },
+        .routes = route.launchRoutes(),
     });
     defer launched.deinit();
     const handle = &launched.handle;
 
     var dispatch = try rt.initDispatchWork(std.testing.allocator, .{
         .request_id = 42,
-        .route_entry_specifier = route_specifier,
         .deadline_monotonic_ns = try forkedDeadlineNs(),
     });
     defer dispatch.deinit();
@@ -723,17 +727,18 @@ test "worker node fs tmpfs cap returns ENOSPC" {
     ;
     const route_fd = try rt.createModulePackFd(route_specifier, source);
     defer std.posix.close(route_fd);
+    var route = try rt.SingleRoute.init(route_fd, route_specifier);
+    defer route.deinit();
 
     var launched = try launchOrSkip(&spawned, 90_005, .{
         .tmpfs_size_bytes = 1024 * 1024,
-        .route_entry = .{ .fd = route_fd, .specifier = route_specifier },
+        .routes = route.launchRoutes(),
     });
     defer launched.deinit();
     const handle = &launched.handle;
 
     var dispatch = try rt.initDispatchWork(std.testing.allocator, .{
         .request_id = 43,
-        .route_entry_specifier = route_specifier,
         .deadline_monotonic_ns = try forkedDeadlineNs(),
     });
     defer dispatch.deinit();
@@ -843,17 +848,18 @@ test "worker fs index serves file tree metadata, EROFS matrix, and explicit ENOE
     ;
     const route_fd = try rt.createModulePackFd(route_specifier, source);
     defer std.posix.close(route_fd);
+    var route = try rt.SingleRoute.init(route_fd, route_specifier);
+    defer route.deinit();
 
     var launched = try launchOrSkip(&spawned, 90_006, .{
         .fs_index_memfd = fs_index_memfd,
-        .route_entry = .{ .fd = route_fd, .specifier = route_specifier },
+        .routes = route.launchRoutes(),
     });
     defer launched.deinit();
     const handle = &launched.handle;
 
     var dispatch = try rt.initDispatchWork(std.testing.allocator, .{
         .request_id = 44,
-        .route_entry_specifier = route_specifier,
         .deadline_monotonic_ns = try forkedDeadlineNs(),
     });
     defer dispatch.deinit();
@@ -907,17 +913,18 @@ test "worker fs fault: async readFile faults, harness serves bytes, promise reso
     const route_specifier = "/__collo_route/test/fs-fault-e1.js";
     const route_fd = try rt.createModulePackFd(route_specifier, fs_fault_e2e_route_source);
     defer std.posix.close(route_fd);
+    var route = try rt.SingleRoute.init(route_fd, route_specifier);
+    defer route.deinit();
 
     var launched = try launchOrSkip(&spawned, 90_007, .{
         .fs_index_memfd = fs_index_memfd,
-        .route_entry = .{ .fd = route_fd, .specifier = route_specifier },
+        .routes = route.launchRoutes(),
     });
     defer launched.deinit();
     const handle = &launched.handle;
 
     var dispatch = try rt.initDispatchWork(std.testing.allocator, .{
         .request_id = 46,
-        .route_entry_specifier = route_specifier,
         .deadline_monotonic_ns = try forkedDeadlineNs(),
     });
     defer dispatch.deinit();
@@ -953,10 +960,12 @@ test "worker fs fault: second read of a materialized path is local, zero second 
     const route_specifier = "/__collo_route/test/fs-fault-e2.js";
     const route_fd = try rt.createModulePackFd(route_specifier, fs_fault_e2e_route_source);
     defer std.posix.close(route_fd);
+    var route = try rt.SingleRoute.init(route_fd, route_specifier);
+    defer route.deinit();
 
     var launched = try launchOrSkip(&spawned, 90_008, .{
         .fs_index_memfd = fs_index_memfd,
-        .route_entry = .{ .fd = route_fd, .specifier = route_specifier },
+        .routes = route.launchRoutes(),
     });
     defer launched.deinit();
     const handle = &launched.handle;
@@ -964,7 +973,6 @@ test "worker fs fault: second read of a materialized path is local, zero second 
     // First request faults and materializes.
     var first_dispatch = try rt.initDispatchWork(std.testing.allocator, .{
         .request_id = 48,
-        .route_entry_specifier = route_specifier,
         .deadline_monotonic_ns = try forkedDeadlineNs(),
     });
     defer first_dispatch.deinit();
@@ -982,7 +990,6 @@ test "worker fs fault: second read of a materialized path is local, zero second 
     // ids).
     var second_dispatch = try rt.initDispatchWork(std.testing.allocator, .{
         .request_id = 49,
-        .route_entry_specifier = route_specifier,
         .deadline_monotonic_ns = try forkedDeadlineNs(),
     });
     defer second_dispatch.deinit();
@@ -1011,10 +1018,12 @@ test "worker fs fault: sha256 mismatch rejects fail-closed, nothing materializes
     const route_specifier = "/__collo_route/test/fs-fault-e3.js";
     const route_fd = try rt.createModulePackFd(route_specifier, fs_fault_e2e_route_source);
     defer std.posix.close(route_fd);
+    var route = try rt.SingleRoute.init(route_fd, route_specifier);
+    defer route.deinit();
 
     var launched = try launchOrSkip(&spawned, 90_009, .{
         .fs_index_memfd = fs_index_memfd,
-        .route_entry = .{ .fd = route_fd, .specifier = route_specifier },
+        .routes = route.launchRoutes(),
     });
     defer launched.deinit();
     const handle = &launched.handle;
@@ -1025,7 +1034,6 @@ test "worker fs fault: sha256 mismatch rejects fail-closed, nothing materializes
 
     var first_dispatch = try rt.initDispatchWork(std.testing.allocator, .{
         .request_id = 50,
-        .route_entry_specifier = route_specifier,
         .deadline_monotonic_ns = try forkedDeadlineNs(),
     });
     defer first_dispatch.deinit();
@@ -1044,7 +1052,6 @@ test "worker fs fault: sha256 mismatch rejects fail-closed, nothing materializes
     // stream's must be.
     var second_dispatch = try rt.initDispatchWork(std.testing.allocator, .{
         .request_id = 51,
-        .route_entry_specifier = route_specifier,
         .deadline_monotonic_ns = try forkedDeadlineNs(),
     });
     defer second_dispatch.deinit();
@@ -1097,17 +1104,18 @@ test "worker fs fault: sync readFileSync miss faults, harness serves, bytes retu
         \\}
     );
     defer std.posix.close(route_fd);
+    var route = try rt.SingleRoute.init(route_fd, route_specifier);
+    defer route.deinit();
 
     var launched = try launchOrSkip(&spawned, 90_010, .{
         .fs_index_memfd = fs_index_memfd,
-        .route_entry = .{ .fd = route_fd, .specifier = route_specifier },
+        .routes = route.launchRoutes(),
     });
     defer launched.deinit();
     const handle = &launched.handle;
 
     var dispatch = try rt.initDispatchWork(std.testing.allocator, .{
         .request_id = 60,
-        .route_entry_specifier = route_specifier,
         .deadline_monotonic_ns = try forkedDeadlineNs(),
     });
     defer dispatch.deinit();
@@ -1151,17 +1159,18 @@ test "worker fs fault: async response during sync wait is stashed, both settle" 
         \\}
     );
     defer std.posix.close(route_fd);
+    var route = try rt.SingleRoute.init(route_fd, route_specifier);
+    defer route.deinit();
 
     var launched = try launchOrSkip(&spawned, 90_011, .{
         .fs_index_memfd = fs_index_memfd,
-        .route_entry = .{ .fd = route_fd, .specifier = route_specifier },
+        .routes = route.launchRoutes(),
     });
     defer launched.deinit();
     const handle = &launched.handle;
 
     var dispatch = try rt.initDispatchWork(std.testing.allocator, .{
         .request_id = 62,
-        .route_entry_specifier = route_specifier,
         .deadline_monotonic_ns = try forkedDeadlineNs(),
     });
     defer dispatch.deinit();
@@ -1215,10 +1224,12 @@ test "worker fs fault: withheld sync fault answer 504s within the request deadli
         \\}
     );
     defer std.posix.close(route_fd);
+    var route = try rt.SingleRoute.init(route_fd, route_specifier);
+    defer route.deinit();
 
     var launched = try launchOrSkip(&spawned, 90_012, .{
         .fs_index_memfd = fs_index_memfd,
-        .route_entry = .{ .fd = route_fd, .specifier = route_specifier },
+        .routes = route.launchRoutes(),
     });
     defer launched.deinit();
     const handle = &launched.handle;
@@ -1228,7 +1239,6 @@ test "worker fs fault: withheld sync fault answer 504s within the request deadli
     // the reader budget below, never as an unbounded block.
     var dispatch = try rt.initDispatchWork(std.testing.allocator, .{
         .request_id = 64,
-        .route_entry_specifier = route_specifier,
         .deadline_monotonic_ns = (try process.monotonicNowNs()) + 2 * std.time.ns_per_s,
     });
     defer dispatch.deinit();
@@ -1265,16 +1275,18 @@ test "worker fs fault: boot context fault after ready is denied fail-closed" {
         \\}
     );
     defer std.posix.close(route_fd);
+    var route = try rt.SingleRoute.init(route_fd, route_specifier);
+    defer route.deinit();
 
     // A route delivered at init: the synchronous slice of its evaluation
     // runs before ready, and the timer-parked continuation, with its
     // readFile, runs after ready, outside the evaluation window, where the
     // worker must deny it locally with no traffic on the fault channel. The
-    // route entry makes the launch serve routes, which installs the boot
-    // context that top-level timers need.
+    // route makes the launch serve routes, which installs the boot context
+    // that top-level timers need.
     var launched = try launchOrSkip(&spawned, 90_013, .{
         .fs_index_memfd = fs_index_memfd,
-        .route_entry = .{ .fd = route_fd, .specifier = route_specifier },
+        .routes = route.launchRoutes(),
     });
     defer launched.deinit();
     const handle = &launched.handle;
@@ -1285,7 +1297,6 @@ test "worker fs fault: boot context fault after ready is denied fail-closed" {
 
     var dispatch = try rt.initDispatchWork(std.testing.allocator, .{
         .request_id = 66,
-        .route_entry_specifier = route_specifier,
         .deadline_monotonic_ns = try forkedDeadlineNs(),
     });
     defer dispatch.deinit();
@@ -1313,6 +1324,8 @@ test "worker fs fault: a sync read during module evaluation is served under the 
         \\export default function handle() { return new Response("boot:" + content); }
     );
     defer std.posix.close(route_fd);
+    var route = try rt.SingleRoute.init(route_fd, route_specifier);
+    defer route.deinit();
 
     // The evaluation-window fault policy, through the launch's serve
     // callback: the all-zero boot identity with the known path serves the
@@ -1345,7 +1358,7 @@ test "worker fs fault: a sync read during module evaluation is served under the 
     var fault_policy = FaultPolicy{ .path = fs_fault_e2e_path, .content_fd = content_fd };
     var launched = try launchOrSkip(&spawned, 90_014, .{
         .fs_index_memfd = fs_index_memfd,
-        .route_entry = .{ .fd = route_fd, .specifier = route_specifier },
+        .routes = route.launchRoutes(),
         .fault_serve = .{ .serve = .{
             .ctx = &fault_policy,
             .serve = FaultPolicy.serve,
@@ -1357,7 +1370,6 @@ test "worker fs fault: a sync read during module evaluation is served under the 
 
     var dispatch = try rt.initDispatchWork(std.testing.allocator, .{
         .request_id = 68,
-        .route_entry_specifier = route_specifier,
         .deadline_monotonic_ns = try forkedDeadlineNs(),
     });
     defer dispatch.deinit();
@@ -1403,13 +1415,15 @@ test "a fetch during module evaluation whose origin answers 600 rejects instead 
     defer std.testing.allocator.free(source);
     const route_fd = try rt.createModulePackFd(route_specifier, source);
     defer std.posix.close(route_fd);
+    var route = try rt.SingleRoute.init(route_fd, route_specifier);
+    defer route.deinit();
 
     var launched = try launchOrSkip(&spawned, 90_015, .{
         .egress = .{ .attached = .{
             .shared_fds = egress_shared_fds,
             .boot = rt.localBootEgress(),
         } },
-        .route_entry = .{ .fd = route_fd, .specifier = route_specifier },
+        .routes = route.launchRoutes(),
     });
     defer launched.deinit();
     const handle = &launched.handle;
@@ -1420,7 +1434,6 @@ test "a fetch during module evaluation whose origin answers 600 rejects instead 
     // forever.
     var dispatch = try rt.initDispatchWork(std.testing.allocator, .{
         .request_id = 70,
-        .route_entry_specifier = route_specifier,
         .deadline_monotonic_ns = try forkedDeadlineNs(),
     });
     defer dispatch.deinit();
@@ -1440,20 +1453,21 @@ test "a synchronous throw during module evaluation pins the route failed and its
         \\throw new Error("boot init failed");
     );
     defer std.posix.close(route_fd);
+    var route = try rt.SingleRoute.init(route_fd, route_specifier);
+    defer route.deinit();
 
     // The sync throw happens after the hoisted default export initialized:
     // without the sticky failed record the per-request re-import would serve
     // the handler of an init that failed. The failure is the tenant code's,
     // so the worker still becomes ready, but it must answer 500.
     var launched = try launchOrSkip(&spawned, 90_016, .{
-        .route_entry = .{ .fd = route_fd, .specifier = route_specifier },
+        .routes = route.launchRoutes(),
     });
     defer launched.deinit();
     const handle = &launched.handle;
 
     var dispatch = try rt.initDispatchWork(std.testing.allocator, .{
         .request_id = 72,
-        .route_entry_specifier = route_specifier,
         .deadline_monotonic_ns = try forkedDeadlineNs(),
     });
     defer dispatch.deinit();
@@ -1570,18 +1584,20 @@ test "a worker that loses its egress gateway keeps serving, refuses fetch with a
     defer std.testing.allocator.free(source);
     const route_fd = try rt.createModulePackFd(route_specifier, source);
     defer std.posix.close(route_fd);
+    var route = try rt.SingleRoute.init(route_fd, route_specifier);
+    defer route.deinit();
 
     var launched = try launchOrSkip(&spawned, 90_020, .{
         .egress = .{ .attached = .{
             .shared_fds = first_fds,
             .boot = rt.localBootEgress(),
         } },
-        .route_entry = .{ .fd = route_fd, .specifier = route_specifier },
+        .routes = route.launchRoutes(),
     });
     defer launched.deinit();
     const handle = &launched.handle;
 
-    const before_body = try forkedRequestBody(handle, route_specifier, 90_020, 1, "/before");
+    const before_body = try forkedRequestBody(handle,90_020, 1, "/before");
     defer std.testing.allocator.free(before_body);
     try std.testing.expectEqualStrings("fetched:200", before_body);
     var starts: [2]rt.FetchStartIdentity = undefined;
@@ -1593,7 +1609,7 @@ test "a worker that loses its egress gateway keeps serving, refuses fetch with a
     // and the worker keeps serving.
     first_gateway_alive = false;
     first_gateway.deinit();
-    const during_body = try forkedRequestBody(handle, route_specifier, 90_021, 3, "/during");
+    const during_body = try forkedRequestBody(handle,90_021, 3, "/during");
     defer std.testing.allocator.free(during_body);
     try std.testing.expectEqualStrings("TypeError", during_body);
     try std.testing.expect(!process.pidFdHasExited(handle.pidfd));
@@ -1604,7 +1620,7 @@ test "a worker that loses its egress gateway keeps serving, refuses fetch with a
     var second_gateway = try attachToNewGateway(handle, &wake_set);
     defer second_gateway.deinit();
 
-    const after_body = try forkedRequestBody(handle, route_specifier, 90_022, 5, "/after");
+    const after_body = try forkedRequestBody(handle,90_022, 5, "/after");
     defer std.testing.allocator.free(after_body);
     try std.testing.expectEqualStrings("fetched:200", after_body);
     try std.testing.expectEqual(@as(usize, 1), second_gateway.recordedFetchStarts(&starts));
@@ -1654,18 +1670,20 @@ test "an egress_attach to a worker still attached fails its fetch in flight with
     defer std.testing.allocator.free(source);
     const route_fd = try rt.createModulePackFd(route_specifier, source);
     defer std.posix.close(route_fd);
+    var route = try rt.SingleRoute.init(route_fd, route_specifier);
+    defer route.deinit();
 
     var launched = try launchOrSkip(&spawned, 90_021, .{
         .egress = .{ .attached = .{
             .shared_fds = first_fds,
             .boot = rt.localBootEgress(),
         } },
-        .route_entry = .{ .fd = route_fd, .specifier = route_specifier },
+        .routes = route.launchRoutes(),
     });
     defer launched.deinit();
     const handle = &launched.handle;
 
-    try sendForkedRequest(handle, route_specifier, 90_021, 1, "/hang");
+    try sendForkedRequest(handle,90_021, 1, "/hang");
     try waitForFetchStarts(first_gateway, 1, 8_000);
 
     // The worker still holds the first gateway's session when the host
@@ -1682,7 +1700,7 @@ test "an egress_attach to a worker still attached fails its fetch in flight with
     // gateway's end, so the first one's exit does not detach the worker.
     first_gateway_alive = false;
     first_gateway.deinit();
-    const after_body = try forkedRequestBody(handle, route_specifier, 90_022, 3, "/after");
+    const after_body = try forkedRequestBody(handle,90_022, 3, "/after");
     defer std.testing.allocator.free(after_body);
     try std.testing.expectEqualStrings("fetched:200", after_body);
     var starts: [2]rt.FetchStartIdentity = undefined;
@@ -1724,11 +1742,10 @@ fn waitForFetchStarts(gateway: *rt.LocalEgressGateway, count: usize, budget_ms: 
     }
 }
 
-/// Sends one request for `path` to the route a forked worker serves, on
+/// Sends one request for `path` to the one route a forked worker serves, on
 /// `stream_id`, which must be odd as a client-initiated HTTP/2 stream's is.
 fn sendForkedRequest(
     handle: *host.WorkerHandle,
-    route_specifier: []const u8,
     request_id: u64,
     stream_id: u32,
     path: []const u8,
@@ -1736,7 +1753,6 @@ fn sendForkedRequest(
     const request = rt.RequestParts{ .path = path };
     var dispatch = try rt.initDispatchWork(std.testing.allocator, .{
         .request_id = request_id,
-        .route_entry_specifier = route_specifier,
         .deadline_monotonic_ns = try forkedDeadlineNs(),
         .request = request,
     });
@@ -1756,12 +1772,11 @@ fn readForkedBody(handle: *host.WorkerHandle, request_id: u64) ![]u8 {
 /// `sendForkedRequest` and then `readForkedBody`.
 fn forkedRequestBody(
     handle: *host.WorkerHandle,
-    route_specifier: []const u8,
     request_id: u64,
     stream_id: u32,
     path: []const u8,
 ) ![]u8 {
-    try sendForkedRequest(handle, route_specifier, request_id, stream_id, path);
+    try sendForkedRequest(handle,request_id, stream_id, path);
     return readForkedBody(handle, request_id);
 }
 
@@ -1824,13 +1839,15 @@ fn probeWasmOutcome(allocator: std.mem.Allocator, request_id: u64, source: []con
     const route_specifier = "/__collo_route/test/wasm-probe.js";
     const route_fd = try rt.createModulePackFd(route_specifier, source);
     defer std.posix.close(route_fd);
+    var route = try rt.SingleRoute.init(route_fd, route_specifier);
+    defer route.deinit();
 
     var launched = support.launchWorker(
         allocator,
         &spawned,
         worker_memory_limit_bytes,
         request_id,
-        .{ .route_entry = .{ .fd = route_fd, .specifier = route_specifier } },
+        .{ .routes = route.launchRoutes() },
     ) catch |err| switch (err) {
         error.WorkerCgroupDelegationUnavailable => return error.SkipZigTest,
         else => return err,
@@ -1840,7 +1857,6 @@ fn probeWasmOutcome(allocator: std.mem.Allocator, request_id: u64, source: []con
 
     var dispatch = try rt.initDispatchWork(allocator, .{
         .request_id = request_id,
-        .route_entry_specifier = route_specifier,
         .deadline_monotonic_ns = try forkedDeadlineNs(),
     });
     defer dispatch.deinit();
@@ -2484,13 +2500,32 @@ test "post-fork invalid init flushes exit probe before _exit" {
 }
 
 test "worker boot eval hung in the sync slice dies typed at the init deadline before the wall kill" {
-    // A route entry whose synchronous top-level slice never lets a microtask
-    // drain settle, since each microtask enqueues another. The child's
-    // watchdog, armed at init_deadline_mono_ns less the cleanup reserve,
-    // stops the VM: a typed init failure (.init_deadline_exceeded) arrives on
-    // the init fd and the child exits by itself, so the passing path sends no
-    // signal. The failure lands neither before the arm point (deadline less
-    // reserve) nor at or after the deadline itself.
+    try expectBootDiesAtInitDeadline(1, 90_031);
+}
+
+test "a boot past its init deadline evaluates no further route, so a worker of the most isolated routes still dies typed in time" {
+    try expectBootDiesAtInitDeadline(zygote.ipc.route_table.routes_max, 90_032);
+}
+
+/// Route 0's entry: its synchronous top-level slice never lets a microtask
+/// drain settle, since each microtask enqueues another, and it starts no
+/// timer and no fetch, so only the watchdog can end it.
+const init_deadline_spin_source =
+    \\export default function handle() { return new Response("unreachable"); }
+    \\function spin() { Promise.resolve().then(spin); }
+    \\spin();
+;
+const init_deadline_plain_source = "export default () => new Response(\"plain\");";
+
+/// Boots a worker of `route_count` routes, every one past the first in a
+/// realm of its own, whose route 0 spins. The child's watchdog, armed at
+/// init_deadline_mono_ns less the cleanup reserve, stops the VM, and the boot
+/// evaluates no route after that: a typed init failure
+/// (.init_deadline_exceeded) arrives on the init fd and the child exits by
+/// itself, so the passing path sends no signal. The failure lands neither
+/// before the arm point (deadline less reserve) nor at or after the deadline
+/// itself, whatever the routes left behind route 0 would have cost.
+fn expectBootDiesAtInitDeadline(route_count: usize, fork_job_id: u64) !void {
     var spawned = try support.spawnZygote();
     defer spawned.deinit();
 
@@ -2502,7 +2537,6 @@ test "worker boot eval hung in the sync slice dies typed at the init deadline be
         else => return err,
     };
     defer root.deinit(std.testing.allocator);
-    const fork_job_id: u64 = 90_031;
     const cgroup_dir_fd = try root.createWorkerDir(fork_job_id, .{
         .memory_limit_bytes = worker_memory_limit_bytes,
         .cpu_max_cores = limits.worker.cpu_max_cores,
@@ -2545,31 +2579,36 @@ test "worker boot eval hung in the sync slice dies typed at the init deadline be
     defer metrics.deinit();
     metrics.initializeCrashDefault(worker.pid, worker_memory_limit_bytes, try process.monotonicNowNs());
 
-    const route_bindings_fd = try createSealedMemfdFromBytes(&zygote.ipc.route_bindings.empty_blob);
-    defer std.posix.close(route_bindings_fd);
     const fs_index_fd = try zygote.ipc.zygote_worker.createPlaceholderFsIndexMemfd();
     defer std.posix.close(fs_index_fd);
     const fs_fault_pair = try fd_mod.socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
     defer std.posix.close(fs_fault_pair[0]);
     defer std.posix.close(fs_fault_pair[1]);
 
-    // Module evaluation's synchronous microtask drain never empties, because
-    // every microtask enqueues another; no timers and no fetches, so only the
-    // watchdog can end it.
-    const route_specifier = "/__collo_route/test/init-deadline-spin.js";
-    const route_fd = try rt.createModulePackFd(route_specifier,
-        \\export default function handle() { return new Response("unreachable"); }
-        \\function spin() { Promise.resolve().then(spin); }
-        \\spin();
-    );
-    defer std.posix.close(route_fd);
+    const routes_max = zygote.ipc.route_table.routes_max;
+    var specifier_buffers: [routes_max][64]u8 = undefined;
+    var modules: [routes_max]zygote.ipc.module_pack.Module = undefined;
+    var routes: [routes_max]zygote.ipc.route_table.RouteInput = undefined;
+    for (0..route_count) |index| {
+        const specifier = try std.fmt.bufPrint(&specifier_buffers[index], "/__collo_route/test/init-deadline-{d}.js", .{index});
+        modules[index] = .{
+            .specifier = specifier,
+            .source = if (index == 0) init_deadline_spin_source else init_deadline_plain_source,
+            .dependencies = &.{},
+        };
+        routes[index] = .{ .entry_specifier = specifier, .bindings = &.{} };
+    }
+    const pack_fd = try rt.createModulePackGraphFd(modules[0..route_count], 0);
+    defer std.posix.close(pack_fd);
+    const table = try zygote.ipc.route_table.buildSealed(std.testing.allocator, routes[0..route_count]);
+    defer table.close();
 
     var message = try zygote.ipc.WorkerInit.init(
         worker_memory_limit_bytes,
         zygote.ipc.WorkerRuntimeBootOptions.default(),
     );
-    message.route_bindings_blob_len = zygote.ipc.route_bindings.empty_blob.len;
-    message.flags |= zygote.ipc.WorkerInit.flag_serves_routes;
+    message.route_table_len = table.blob_len;
+    message.flags |= zygote.ipc.WorkerInit.flag_serves_routes | zygote.ipc.WorkerInit.flag_isolate_realm;
     message.enableEgressGatewaySandbox();
     // The host's window: now plus WORKER_INIT_TIMEOUT_MS, fixed before the
     // send, the same absolute value both ends enforce. The boot token takes
@@ -2578,7 +2617,7 @@ test "worker boot eval hung in the sync slice dies typed at the init deadline be
         @as(u64, @intCast(zygote.host_client.worker_init_timeout_ms)) * std.time.ns_per_ms;
     message.init_deadline_mono_ns = init_deadline_mono_ns;
     message.boot_egress_token = rt.bootEgressToken(init_deadline_mono_ns);
-    try zygote.ipc.sendWorkerInitWithRouteBindingsAndEgressShared(
+    try zygote.ipc.sendWorkerInitWithRouteTableAndEgressShared(
         worker.worker_init_fd.?,
         &message,
         metrics_fd,
@@ -2587,11 +2626,11 @@ test "worker boot eval hung in the sync slice dies typed at the init deadline be
         ingress_payload_credit_eventfd,
         tmp_root_dir.fd,
         cgroup_dir_fd,
-        route_bindings_fd,
+        table.fd,
         egress_shared.rawForWorker(),
-        .{ .fd = route_fd, .specifier = route_specifier },
         fs_index_fd,
         fs_fault_pair[1],
+        pack_fd,
     );
 
     // Wait past the deadline: a working watchdog answers typed before it; a
@@ -2639,6 +2678,6 @@ test "worker boot eval hung in the sync slice dies typed at the init deadline be
     // The child died in the evaluation: every native phase completed, and
     // the evaluation never did.
     try std.testing.expect(trace.containsPrefix("child.boot_context.installed"));
-    try std.testing.expect(!trace.containsPrefix("child.route_entry.evaluated"));
+    try std.testing.expect(!trace.containsPrefix("child.routes.evaluated"));
     try std.testing.expect(!trace.containsPrefix("child.worker_ready"));
 }

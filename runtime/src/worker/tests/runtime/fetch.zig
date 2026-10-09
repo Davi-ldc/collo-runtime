@@ -198,7 +198,7 @@ test "a request's egress token reaches the gateway byte for byte in its fetch's 
         \\}}
     , .{ origin.host(), origin.port });
     defer std.testing.allocator.free(source);
-    try rt.registerRoute(&runtime, specifier, source);
+    const route_index = try rt.registerRoute(&runtime, specifier, source);
 
     // The server's lane mints the token under the request id and the
     // generation of the request slot the request took. A reused slot is past
@@ -208,7 +208,7 @@ test "a request's egress token reaches the gateway byte for byte in its fetch's 
     var dispatch = try initDispatchWork(std.testing.allocator, .{
         .request_id = request_id,
         .request_generation = request_generation,
-        .route_entry_specifier = specifier,
+        .route_index = route_index,
     });
     defer dispatch.deinit();
     try rt.enqueueIngressRoute(&runtime, &dispatch, 1, .{});
@@ -272,7 +272,7 @@ test "a fetch of a request dispatched without an egress token rejects with a Typ
         \\}}
     , .{ origin.host(), origin.port });
     defer std.testing.allocator.free(source);
-    try rt.registerRoute(&runtime, specifier, source);
+    const route_index = try rt.registerRoute(&runtime, specifier, source);
 
     // The worker is attached, but the server dispatched the request with no
     // token, so the worker refuses the fetch itself rather than present bytes
@@ -280,7 +280,7 @@ test "a fetch of a request dispatched without an egress token rejects with a Typ
     const request_id: u64 = 32;
     var dispatch = try initDispatchWork(std.testing.allocator, .{
         .request_id = request_id,
-        .route_entry_specifier = specifier,
+        .route_index = route_index,
         .egress_token = ipc.egress_token.none,
     });
     defer dispatch.deinit();
@@ -479,12 +479,12 @@ test "losing the gateway fails the active fetch with a TypeError and the worker 
         \\}}
     , .{ host, silent_server.listen_address.getPort() });
     defer std.testing.allocator.free(source);
-    try rt.registerRoute(&runtime, specifier, source);
+    const route_index = try rt.registerRoute(&runtime, specifier, source);
 
     const first_id: u64 = 34;
     var first = try initDispatchWork(std.testing.allocator, .{
         .request_id = first_id,
-        .route_entry_specifier = specifier,
+        .route_index = route_index,
     });
     defer first.deinit();
     try rt.enqueueIngressRoute(&runtime, &first, 1, .{});
@@ -512,7 +512,7 @@ test "losing the gateway fails the active fetch with a TypeError and the worker 
     const second_id: u64 = 35;
     var second = try initDispatchWork(std.testing.allocator, .{
         .request_id = second_id,
-        .route_entry_specifier = specifier,
+        .route_index = route_index,
     });
     defer second.deinit();
     try rt.enqueueIngressRoute(&runtime, &second, 1, .{});
@@ -589,12 +589,11 @@ test "a worker booted without a session holds its wake descriptors until egress_
     const attached_wake = egress_state.wakeFds() orelse return error.TestExpectedWakeDescriptors;
     try expectSamePipe(wake_set.liveness_read.fd(), attached_wake.liveness_fd);
 
-    const specifier = try registerFetchRoute(&runtime, "/fetch-after-attach.js", origin.host(), origin.port, "/binary");
-    defer std.testing.allocator.free(specifier);
+    const route_index = try registerFetchRoute(&runtime, "/fetch-after-attach.js", origin.host(), origin.port, "/binary");
     const request_id: u64 = 38;
     var dispatch = try initDispatchWork(std.testing.allocator, .{
         .request_id = request_id,
-        .route_entry_specifier = specifier,
+        .route_index = route_index,
     });
     defer dispatch.deinit();
     try rt.enqueueIngressRoute(&runtime, &dispatch, 1, .{});
@@ -649,15 +648,13 @@ test "an egress_attach to an attached worker fails its fetch in flight with a Ty
     defer runtime.deinit();
     try runtime.attachHostRuntime();
 
-    const hang_specifier = try registerFetchRoute(&runtime, "/fetch-hang-across-attach.js", host, silent_server.listen_address.getPort(), "/hang");
-    defer std.testing.allocator.free(hang_specifier);
-    const origin_specifier = try registerFetchRoute(&runtime, "/fetch-after-attach.js", origin.host(), origin.port, "/binary");
-    defer std.testing.allocator.free(origin_specifier);
+    const hang_route = try registerFetchRoute(&runtime, "/fetch-hang-across-attach.js", host, silent_server.listen_address.getPort(), "/hang");
+    const origin_route = try registerFetchRoute(&runtime, "/fetch-after-attach.js", origin.host(), origin.port, "/binary");
 
     const first_id: u64 = 39;
     var first = try initDispatchWork(std.testing.allocator, .{
         .request_id = first_id,
-        .route_entry_specifier = hang_specifier,
+        .route_index = hang_route,
     });
     defer first.deinit();
     try rt.enqueueIngressRoute(&runtime, &first, 1, .{});
@@ -700,7 +697,7 @@ test "an egress_attach to an attached worker fails its fetch in flight with a Ty
     const second_id: u64 = 40;
     var second = try initDispatchWork(std.testing.allocator, .{
         .request_id = second_id,
-        .route_entry_specifier = origin_specifier,
+        .route_index = origin_route,
     });
     defer second.deinit();
     try rt.enqueueIngressRoute(&runtime, &second, 1, .{});
@@ -759,17 +756,16 @@ test "an egress_attach whose session is on another wake set is refused with ever
 
 /// Registers route `path`, whose handler fetches `target_path` from
 /// `host:port` and answers the fetch's status, or the TypeError it rejected
-/// with and its message. Returns the route's specifier, which the caller
-/// frees.
+/// with and its message. Returns the route's index.
 fn registerFetchRoute(
     runtime: *worker.Runtime,
     path: []const u8,
     host: []const u8,
     port: u16,
     target_path: []const u8,
-) ![]const u8 {
+) !u16 {
     const specifier = try rt.routeSpecifier(std.testing.allocator, path);
-    errdefer std.testing.allocator.free(specifier);
+    defer std.testing.allocator.free(specifier);
     const source = try std.fmt.allocPrint(std.testing.allocator,
         \\export default async function handle() {{
         \\    try {{
@@ -781,8 +777,7 @@ fn registerFetchRoute(
         \\}}
     , .{ host, port, target_path });
     defer std.testing.allocator.free(source);
-    try rt.registerRoute(runtime, specifier, source);
-    return specifier;
+    return rt.registerRoute(runtime, specifier, source);
 }
 
 /// Open descriptors of this process, counted from `/proc/self/fd` without
@@ -962,12 +957,12 @@ test "a whole body the handler has not read yet rejects once the worker detaches
         \\}}
     , .{ origin.host(), origin.port });
     defer std.testing.allocator.free(source);
-    try rt.registerRoute(&runtime, specifier, source);
+    const route_index = try rt.registerRoute(&runtime, specifier, source);
 
     const request_id: u64 = 37;
     var dispatch = try initDispatchWork(std.testing.allocator, .{
         .request_id = request_id,
-        .route_entry_specifier = specifier,
+        .route_index = route_index,
         // Past the instant the clock moves to below, so only the timer fires.
         .deadline_monotonic_ns = 60 * std.time.ns_per_s,
     });

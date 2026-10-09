@@ -22,9 +22,9 @@
 //!    Ctrl-C stops it, and it stops them, while a hangup makes it reopen its
 //!    analytics files and keep serving.
 //! 3. Raise the soft open file limit to the hard one, then load the
-//!    configuration and build every route's artifacts. The routes alone keep
-//!    `route_descriptors_max` descriptors open for the server's life, before
-//!    any client connection or worker channel.
+//!    configuration and build every definition's artifact. The artifacts
+//!    alone keep `artifact_descriptors_max` descriptors open for the server's
+//!    life, before any client connection or worker channel.
 //! 4. Require a kernel TLS cipher, which the server cannot serve without.
 //!    Nothing here depends on the steps after it, so a missing `tls` module
 //!    fails the boot before any child process exists.
@@ -83,9 +83,9 @@ pub const ExitStatus = enum(u8) {
 /// cgroup, which must then be delegated to it.
 pub const worker_cgroup_root_env = "COLLO_WORKER_CGROUP_ROOT";
 
-/// Every route's sealed module pack and bindings blob, plus the filesystem
-/// index they share.
-pub const route_descriptors_max: usize = 2 * server_limits.routes_max + 1;
+/// Every definition's sealed module pack and route table, plus the
+/// filesystem index they share.
+pub const artifact_descriptors_max: usize = 2 * server_limits.worker_definitions_max + 1;
 
 /// Prints why `command_line.parse` refused the arguments, then the usage
 /// line.
@@ -330,8 +330,8 @@ fn checkPemFile(config_path: []const u8, file: PemFile, diagnostic: *config.Diag
     }
 }
 
-/// Raised before the routes are built, since they keep
-/// `route_descriptors_max` descriptors open from boot on.
+/// Raised before the routes are built, since their artifacts keep
+/// `artifact_descriptors_max` descriptors open from boot on.
 fn raiseOpenFileLimit() !void {
     const limit = try std.posix.getrlimit(.NOFILE);
     if (limit.cur >= limit.max)

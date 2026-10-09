@@ -10,18 +10,25 @@
 //! received. Numbers already printed by earlier rounds prove nothing on
 //! their own.
 //!
-//! Three scenarios, each printed as a human block plus one JSON line:
+//! Four scenarios, each printed as a human block plus one JSON line:
 //! `zygote_spawn` (spawn-to-serving wall and the idle zygote's memory),
 //! `worker_cold_start` per worker count and round (fork-to-ready and
 //! first-response percentiles; the set's PSS, private-dirty and shared-clean
 //! totals at ready and after the first response, plus the PSS and
 //! private-dirty each worker adds over the idle zygote, which is the
-//! copy-on-write yield), and `warm_sequential` (back-to-back requests on
+//! copy-on-write yield), `multi_route` per route count, realm mode and round
+//! (the same fork-to-ready percentiles and per-worker increments for workers
+//! whose definition has that many routes on distinct entries, each evaluated
+//! at boot, with a realm per route or one shared realm, at ready and after
+//! one request per route), and `warm_sequential` (back-to-back requests on
 //! one warm worker). Memory is reported in KiB in the JSON and MiB in the
 //! human block.
 //!
 //! Knobs: COLLO_BENCH_WORKER_COUNTS (default 1,4,16), COLLO_BENCH_ROUNDS
-//! (default 3), COLLO_BENCH_WARM_REQUESTS (default 200). COLLO_BENCH_EXECUTABLE
+//! (default 3), COLLO_BENCH_ROUTE_COUNTS (default 1,4,16,64, at most
+//! `ipc.route_table.routes_max` each), COLLO_BENCH_ROUTE_WORKERS (workers per
+//! multi-route round, default 4), COLLO_BENCH_WARM_REQUESTS (default 200).
+//! COLLO_BENCH_EXECUTABLE
 //! selects an absolute Collo executable; otherwise the build-time path is used.
 //! Workers are born in leaves under COLLO_BENCH_CGROUP_ROOT, else
 //! COLLO_TEST_WORKER_CGROUP_ROOT, else COLLO_WORKER_CGROUP_ROOT, else under a
@@ -77,6 +84,9 @@ const warm_requests_max: usize = 100_000;
 const default_worker_counts = [_]usize{ 1, 4, 16 };
 const default_rounds: usize = 3;
 const default_warm_requests: usize = 200;
+const default_route_counts = [_]usize{ 1, 4, 16, 64 };
+const default_route_workers: usize = 4;
+const route_workers_max: usize = 64;
 /// Streams multiplex requests on one ingress connection; this host keeps one
 /// request in flight per worker, and the request id is the identity the
 /// completion record is matched on.
@@ -113,6 +123,11 @@ pub fn main() !void {
 
     const pack_fd = try host.dispatch.createModulePackFd(allocator, entry_specifier, entry_source);
     defer std.posix.close(pack_fd);
+    const route_table = try ipc.route_table.buildSealed(allocator, &.{.{
+        .entry_specifier = entry_specifier,
+        .bindings = &.{},
+    }});
+    defer route_table.close();
 
     // Every worker is born inside its own leaf of this subtree; without a
     // delegated subtree there is no worker to measure.
@@ -149,12 +164,22 @@ pub fn main() !void {
         .cgroup_root = &cgroup_root,
         .ids = &ids,
         .pack_fd = pack_fd,
+        .route_table = route_table,
         .system_zygote = system_zygote,
     };
     for (settings.worker_counts) |worker_count| {
         var round: usize = 1;
         while (round <= settings.rounds) : (round += 1)
             try runColdStartRound(ctx, zygote_idle, worker_count, round);
+    }
+    for (settings.route_counts) |route_count| {
+        var route_set = try RouteSet.build(allocator, route_count);
+        defer route_set.deinit();
+        for ([_]bool{ true, false }) |isolate_realm| {
+            var round: usize = 1;
+            while (round <= settings.rounds) : (round += 1)
+                try runMultiRouteRound(ctx, zygote_idle, &route_set, isolate_realm, settings.route_workers, round);
+        }
     }
     try runWarmSequential(ctx, settings.warm_requests);
 }
@@ -170,6 +195,8 @@ fn resolveExecutable(allocator: std.mem.Allocator) ![]u8 {
 const Settings = struct {
     worker_counts: []usize,
     rounds: usize,
+    route_counts: []usize,
+    route_workers: usize,
     warm_requests: usize,
 
     fn fromEnv(allocator: std.mem.Allocator) !Settings {
@@ -183,9 +210,21 @@ const Settings = struct {
             if (count > worker_count_max)
                 return error.InvalidBenchSetting;
         }
+        const route_counts = try bench_common.parseCommaSeparatedUsizeList(
+            allocator,
+            "COLLO_BENCH_ROUTE_COUNTS",
+            &default_route_counts,
+        );
+        errdefer allocator.free(route_counts);
+        for (route_counts) |count| {
+            if (count == 0 or count > ipc.route_table.routes_max)
+                return error.InvalidBenchSetting;
+        }
         return .{
             .worker_counts = worker_counts,
             .rounds = try envUsize("COLLO_BENCH_ROUNDS", default_rounds, rounds_max),
+            .route_counts = route_counts,
+            .route_workers = try envUsize("COLLO_BENCH_ROUTE_WORKERS", default_route_workers, route_workers_max),
             .warm_requests = try envUsize(
                 "COLLO_BENCH_WARM_REQUESTS",
                 default_warm_requests,
@@ -196,6 +235,56 @@ const Settings = struct {
 
     fn deinit(self: Settings, allocator: std.mem.Allocator) void {
         allocator.free(self.worker_counts);
+        allocator.free(self.route_counts);
+    }
+};
+
+/// The routes of a multi-route definition: `count` routes, route `i` on an
+/// entry of its own, `/__collo_route/bench/route<i>.js`, whose body names
+/// it, with every entry in one pack and the routes in one table, as the
+/// server builds them for a definition.
+const RouteSet = struct {
+    count: usize,
+    pack_fd: std.posix.fd_t,
+    table: ipc.route_table.Sealed,
+
+    fn build(allocator: std.mem.Allocator, count: usize) !RouteSet {
+        std.debug.assert(count != 0 and count <= ipc.route_table.routes_max);
+        var arena_state: std.heap.ArenaAllocator = .init(allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const modules = try arena.alloc(ipc.module_pack.Module, count);
+        const inputs = try arena.alloc(ipc.route_table.RouteInput, count);
+        for (modules, inputs, 0..) |*module, *input, index| {
+            const specifier = try std.fmt.allocPrint(arena, "{s}bench/route{d}.js", .{ ipc.module_pack.route_specifier_prefix, index });
+            module.* = .{
+                .specifier = specifier,
+                .source = try std.fmt.allocPrint(arena,
+                    \\export default function handle(request) {{
+                    \\  const url = new URL(request.url);
+                    \\  return new Response(`host_lifecycle route{d} ${{request.method}} ${{url.pathname}}\n`, {{
+                    \\    headers: {{ "content-type": "text/plain" }},
+                    \\  }});
+                    \\}}
+                , .{index}),
+                .dependencies = &.{},
+            };
+            input.* = .{ .entry_specifier = specifier, .bindings = &.{} };
+        }
+        const pack_fd = try host.dispatch.createModulePackGraphFd(allocator, modules, 0);
+        errdefer std.posix.close(pack_fd);
+        const table = try ipc.route_table.buildSealed(allocator, inputs);
+        return .{ .count = count, .pack_fd = pack_fd, .table = table };
+    }
+
+    fn deinit(self: *RouteSet) void {
+        std.posix.close(self.pack_fd);
+        self.table.close();
+        self.* = undefined;
+    }
+
+    fn launchRoutes(self: *const RouteSet, isolate_realm: bool) host.launch.LaunchRoutes {
+        return .{ .table = self.table, .module_pack_fd = self.pack_fd, .isolate_realm = isolate_realm };
     }
 };
 
@@ -235,16 +324,23 @@ const Worker = struct {
 
 /// What every scenario needs from the host: the zygote that forks, the
 /// subtree the leaves go under, the identities handed out, and the entry
-/// pack every worker boots with. One per run; scenarios share it.
+/// pack and one-route table every worker boots with. One per run;
+/// scenarios share it.
 const Context = struct {
     allocator: std.mem.Allocator,
     spawned: *zygote.host_client.SpawnedZygote,
     cgroup_root: *host.WorkerCgroupRoot,
     ids: *Ids,
     pack_fd: std.posix.fd_t,
+    route_table: ipc.route_table.Sealed,
     /// The machine with the idle zygote and nothing else of ours: every
     /// system-wide increment a round reports is over this reading.
     system_zygote: proc_memory.SystemMemory,
+
+    /// The one route of the single-route scenarios.
+    fn singleRoute(self: Context) host.launch.LaunchRoutes {
+        return .{ .table = self.route_table, .module_pack_fd = self.pack_fd, .isolate_realm = true };
+    }
 };
 
 /// What a set of processes cost the whole machine between two
@@ -321,7 +417,7 @@ fn runColdStartRound(
     }
 
     for (workers) |*worker| {
-        worker.* = try launchWorker(ctx);
+        worker.* = try launchWorker(ctx, ctx.singleRoute());
         launched += 1;
     }
     std.Thread.sleep(memory_settle_ns);
@@ -363,6 +459,79 @@ fn runColdStartRound(
     });
 }
 
+/// `worker_count` workers of a definition with `route_set.count` routes,
+/// in a realm each or in one shared realm: fork-to-ready, which includes
+/// every route's boot evaluation, and what each worker adds over the idle
+/// zygote at ready and after one request per route, each body checked.
+fn runMultiRouteRound(
+    ctx: Context,
+    zygote_idle: proc_memory.Metrics,
+    route_set: *const RouteSet,
+    isolate_realm: bool,
+    worker_count: usize,
+    round: usize,
+) !void {
+    std.debug.assert(worker_count != 0);
+    const workers = try ctx.allocator.alloc(Worker, worker_count);
+    defer ctx.allocator.free(workers);
+    var launched: usize = 0;
+    defer {
+        for (workers[0..launched]) |*worker|
+            worker.deinit();
+    }
+
+    for (workers) |*worker| {
+        worker.* = try launchWorker(ctx, route_set.launchRoutes(isolate_realm));
+        launched += 1;
+    }
+    std.Thread.sleep(memory_settle_ns);
+    const ready_set = try measureSet(ctx, workers);
+
+    for (workers, 0..) |*worker, worker_index| {
+        for (0..route_set.count) |route| {
+            var path_buffer: [request_path_max]u8 = undefined;
+            const path = try std.fmt.bufPrint(&path_buffer, "/routes/{d}/{d}/{d}", .{ round, worker_index, route });
+            var prefix_buffer: [expected_body_max]u8 = undefined;
+            const prefix = try std.fmt.bufPrint(&prefix_buffer, "host_lifecycle route{d} GET ", .{route});
+            _ = try requestRouteChecked(ctx, &worker.handle, @intCast(route), prefix, path);
+        }
+    }
+    std.Thread.sleep(memory_settle_ns);
+    const served_set = try measureSet(ctx, workers);
+
+    const fork_samples = try ctx.allocator.alloc(u64, workers.len);
+    defer ctx.allocator.free(fork_samples);
+    for (workers, fork_samples) |worker, *sample|
+        sample.* = worker.fork_to_ready_ns;
+    std.mem.sort(u64, fork_samples, {}, std.sort.asc(u64));
+
+    const fork_to_ready = Percentiles.ofSorted(fork_samples);
+    const ready_added = SetIncrement.perWorker(ready_set, zygote_idle, worker_count);
+    const served_added = SetIncrement.perWorker(served_set, zygote_idle, worker_count);
+    const mode: []const u8 = if (isolate_realm) "isolated" else "shared";
+    std.debug.print(
+        \\host_lifecycle
+        \\  scenario: multi_route
+        \\  route_count: {d}
+        \\  realms: {s}
+        \\  worker_count: {d}
+        \\  round: {d}
+    , .{ route_set.count, mode, worker_count, round });
+    printPercentileLines("fork_to_ready", fork_to_ready);
+    printIncrementLines("ready_added", ready_added);
+    printIncrementLines("served_added", served_added);
+    std.debug.print("\n", .{});
+    std.debug.print(
+        "{{\"bench\":\"host_lifecycle\",\"scenario\":\"multi_route\",\"route_count\":{d}" ++
+            ",\"realms\":\"{s}\",\"worker_count\":{d},\"round\":{d}",
+        .{ route_set.count, mode, worker_count, round },
+    );
+    printJsonPercentiles("fork_to_ready_ns", fork_to_ready);
+    printJsonIncrement("ready_added", ready_added);
+    printJsonIncrement("served_added", served_added);
+    std.debug.print("}}\n", .{});
+}
+
 /// K back-to-back requests on one warm worker. Each sample runs from
 /// `sendRequest` to `readResponse` returning, and requests per second is
 /// over the whole loop, so both carry the host's own share (dispatch work,
@@ -370,7 +539,7 @@ fn runColdStartRound(
 fn runWarmSequential(ctx: Context, request_count: usize) !void {
     std.debug.assert(request_count != 0);
     std.debug.assert(request_count <= warm_requests_max);
-    var worker = try launchWorker(ctx);
+    var worker = try launchWorker(ctx, ctx.singleRoute());
     defer worker.deinit();
 
     // The first request on a worker is a cold first response (the cold-start
@@ -396,10 +565,10 @@ fn runWarmSequential(ctx: Context, request_count: usize) !void {
 }
 
 /// The production launch minus the server: leaf first so the child is born
-/// inside it, fork, then WorkerInit with the entry pack as the route. The
-/// entry is evaluated before ready, so the first request never waits on
-/// module work.
-fn launchWorker(ctx: Context) !Worker {
+/// inside it, fork, then WorkerInit with `routes`. Every route's entry is
+/// evaluated before ready, so the first request never waits on module
+/// work.
+fn launchWorker(ctx: Context, routes: host.launch.LaunchRoutes) !Worker {
     var timer = try std.time.Timer.start();
     const fork_job_id = ctx.ids.forkJobId();
     const leaf_fd = try ctx.cgroup_root.createWorkerDir(fork_job_id, .{
@@ -434,7 +603,7 @@ fn launchWorker(ctx: Context) !Worker {
                 .shared_fds = egress.rawForWorker(),
                 .boot = bench_boot_egress,
             } },
-            .route_entry = .{ .fd = ctx.pack_fd, .specifier = entry_specifier },
+            .routes = routes,
         },
     );
     // The launch took every fd the fork reply carried.
@@ -447,17 +616,26 @@ fn launchWorker(ctx: Context) !Worker {
     };
 }
 
-/// One GET to `path`, timed from the send to the response in hand. The body
-/// is checked byte for byte against what the entry must have produced for
-/// this path; the content-type header by prefix.
+/// One GET to `path` on the single-route entry, timed from the send to the
+/// response in hand (`requestRouteChecked`).
 fn requestChecked(ctx: Context, handle: *host.WorkerHandle, path: []const u8) !u64 {
+    return requestRouteChecked(ctx, handle, 0, expected_body_prefix, path);
+}
+
+/// One GET to `path` on the route at `route_index`, timed from the send to
+/// the response in hand. The body is checked byte for byte against
+/// `expected_prefix` followed by the path, what that route's entry must have
+/// produced; the content-type header by prefix.
+fn requestRouteChecked(
+    ctx: Context,
+    handle: *host.WorkerHandle,
+    route_index: u16,
+    expected_prefix: []const u8,
+    path: []const u8,
+) !u64 {
     const request_id = ctx.ids.requestId();
     var expected_buffer: [expected_body_max]u8 = undefined;
-    const expected_body = try std.fmt.bufPrint(
-        &expected_buffer,
-        expected_body_prefix ++ "{s}\n",
-        .{path},
-    );
+    const expected_body = try std.fmt.bufPrint(&expected_buffer, "{s}{s}\n", .{ expected_prefix, path });
 
     // The worker rejects a request without a host header, as any ingress
     // would; a local run is addressed to `localhost`.
@@ -468,7 +646,7 @@ fn requestChecked(ctx: Context, handle: *host.WorkerHandle, path: []const u8) !u
     };
     var dispatch = try host.dispatch.initDispatchWork(ctx.allocator, .{
         .request_id = request_id,
-        .route_entry_specifier = entry_specifier,
+        .route_index = route_index,
         .deadline_monotonic_ns = (try process.monotonicNowNs()) + request_budget_ns,
         .authority = authority,
         .request = request,

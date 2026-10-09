@@ -1,11 +1,12 @@
-//! Covers the handler's second argument: the `env` object a route's bindings
-//! blob becomes (`worker/modules/route_env.zig`), its identity across
-//! requests, the route it belongs to, the blob validation that runs when the
-//! runtime starts, and the entries `collo_env_object_new` refuses on its
-//! own. Valid blobs come from the builder the server uses
-//! (`route_bindings.buildSealed` in `common/ipc/route_bindings.zig`), so
-//! these tests also pin the layout both ends share. The forked path, where
-//! WorkerInit delivers the blob, runs in `local-e2e`.
+//! Covers the handler's second argument: the `env` object a route's
+//! bindings section becomes (`worker/modules/route_env.zig`), its identity
+//! across requests, each route receiving its own bindings and never another
+//! route's, the route table check that runs when the runtime starts, and the
+//! entries `collo_env_object_new` refuses on its own. Valid tables come from
+//! the builder the server uses (`route_table.buildSealed` in
+//! `common/ipc/route_table.zig`), so these tests also pin the layout both
+//! ends share. The forked path, where WorkerInit delivers the table, runs in
+//! `local-e2e`.
 
 const std = @import("std");
 const support = @import("bindings_support");
@@ -19,56 +20,85 @@ const socketPairType = rt.socketPairType;
 const runRouteAndReadBody = rt.runRouteAndReadBody;
 
 const route_bindings = ipc.route_bindings;
+const route_table = ipc.route_table;
 const Entry = route_bindings.Entry;
 
-/// The blob `entries` serialize to, read back from the sealed memfd a worker
-/// receives with WorkerInit.
-fn sealedBlob(entries: []const Entry) ![]u8 {
-    const sealed = try route_bindings.buildSealed(std.testing.allocator, entries);
+/// One route of a fixture's table: the path the harness turns into the
+/// route's specifier (`rt.routeSpecifier`), and its bindings.
+const RouteSpec = struct {
+    path: []const u8,
+    bindings: []const Entry = &.{},
+};
+
+/// The table `routes` serialize to, read back from the sealed memfd a
+/// worker receives with WorkerInit; the caller frees it.
+fn sealedTable(routes: []const route_table.RouteInput) ![]u8 {
+    const sealed = try route_table.buildSealed(std.testing.allocator, routes);
     defer sealed.close();
     const bytes = try std.testing.allocator.alloc(u8, @intCast(sealed.blob_len));
     errdefer std.testing.allocator.free(bytes);
     if (try std.posix.pread(sealed.fd, bytes, 0) != bytes.len)
-        return error.ShortBlobRead;
+        return error.ShortTableRead;
     return bytes;
 }
 
-/// `entries` in the blob layout without the builder's checks, for blobs the
-/// builder refuses to write.
-fn uncheckedBlob(entries: []const Entry) ![]u8 {
+/// A one-route table naming `/__collo_route/test/env.js` whose bindings
+/// section is `section`, written without the builder's checks, for sections
+/// the builder refuses to write; the caller frees it.
+fn uncheckedTable(section: []const u8) ![]u8 {
+    const specifier = "/__collo_route/test/env.js";
     var bytes: std.ArrayList(u8) = .empty;
     errdefer bytes.deinit(std.testing.allocator);
-    var count: [4]u8 = undefined;
-    std.mem.writeInt(u32, &count, @intCast(entries.len), .little);
-    try bytes.appendSlice(std.testing.allocator, &count);
+    for ([_][]const u8{ &.{ 1, 0, 0, 0 }, &lengthBytes(specifier.len), specifier, &lengthBytes(section.len), section }) |part|
+        try bytes.appendSlice(std.testing.allocator, part);
+    return bytes.toOwnedSlice(std.testing.allocator);
+}
+
+/// `entries` in the bindings layout without the encoder's checks; the
+/// caller frees it.
+fn uncheckedSection(entries: []const Entry) ![]u8 {
+    var bytes: std.ArrayList(u8) = .empty;
+    errdefer bytes.deinit(std.testing.allocator);
+    try bytes.appendSlice(std.testing.allocator, &lengthBytes(entries.len));
     for (entries) |entry| {
         for ([_][]const u8{ entry.name, entry.value }) |field| {
-            var len: [4]u8 = undefined;
-            std.mem.writeInt(u32, &len, @intCast(field.len), .little);
-            try bytes.appendSlice(std.testing.allocator, &len);
+            try bytes.appendSlice(std.testing.allocator, &lengthBytes(field.len));
             try bytes.appendSlice(std.testing.allocator, field);
         }
     }
     return bytes.toOwnedSlice(std.testing.allocator);
 }
 
-/// One runtime under test, with the bindings blob it borrows.
+fn lengthBytes(len: usize) [4]u8 {
+    var bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &bytes, @intCast(len), .little);
+    return bytes;
+}
+
+/// One runtime under test, started with the route table of `routes`, which
+/// it borrows.
 const Fixture = struct {
     vm: support.bindings.Vm,
     control_pair: [2]std.posix.fd_t,
     now_mono_ns: u64,
     completion: rt.CompletionFixture,
     runtime: worker.Runtime,
-    /// The entry specifier `blob` belongs to, as the harness dispatches the
-    /// route named at `init`.
-    bindings_route: []u8,
+    table: []u8,
 
-    /// Initializes in place: the runtime keeps pointers to the clock and the
-    /// completion view. `blob` belongs to the route the harness dispatches
-    /// as `route` and must outlive the fixture.
-    fn init(self: *Fixture, blob: []const u8, route: []const u8) !void {
-        self.bindings_route = try rt.routeSpecifier(std.testing.allocator, route);
-        errdefer std.testing.allocator.free(self.bindings_route);
+    /// Initializes in place: the runtime keeps pointers to the clock, the
+    /// completion view and the table.
+    fn init(self: *Fixture, routes: []const RouteSpec) !void {
+        var specifiers: [route_table.routes_max][]u8 = undefined;
+        var inputs: [route_table.routes_max]route_table.RouteInput = undefined;
+        var built: usize = 0;
+        defer for (specifiers[0..built]) |specifier| std.testing.allocator.free(specifier);
+        for (routes, 0..) |route, index| {
+            specifiers[index] = try rt.routeSpecifier(std.testing.allocator, route.path);
+            built += 1;
+            inputs[index] = .{ .entry_specifier = specifiers[index], .bindings = route.bindings };
+        }
+        self.table = try sealedTable(inputs[0..routes.len]);
+        errdefer std.testing.allocator.free(self.table);
         self.vm = try support.createVm();
         errdefer self.vm.deinit();
         self.control_pair = try socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
@@ -79,8 +109,7 @@ const Fixture = struct {
         self.runtime = try worker.Runtime.init(std.testing.allocator, &self.vm, self.control_pair[0], &self.completion.view, try rt.createCompletionEventfd(), .{
             .ctx = &self.now_mono_ns,
             .now_fn = fakeNow,
-            .route_bindings_blob = blob,
-            .route_bindings_route = self.bindings_route,
+            .route_table = self.table,
         });
         errdefer self.runtime.deinit();
         try self.runtime.attachHostRuntime();
@@ -91,25 +120,25 @@ const Fixture = struct {
         self.completion.deinit();
         for (self.control_pair) |fd| std.posix.close(fd);
         self.vm.deinit();
-        std.testing.allocator.free(self.bindings_route);
+        std.testing.allocator.free(self.table);
         self.* = undefined;
     }
 
-    fn run(self: *Fixture, source: []const u8, request_id: u64, specifier: []const u8) ![]u8 {
-        return runRouteAndReadBody(&self.runtime, self.control_pair[1], source, request_id, specifier);
+    /// Runs one request on the table's route at `path`, with `source` as
+    /// that route's entry, and returns the response body.
+    fn run(self: *Fixture, source: []const u8, request_id: u64, path: []const u8) ![]u8 {
+        return runRouteAndReadBody(&self.runtime, self.control_pair[1], source, request_id, path);
     }
 };
 
 test "handler receives the route's text bindings as a frozen env object" {
-    const blob = try sealedBlob(&.{
+    const route = "/__test_route/env-bindings.js";
+    var fixture: Fixture = undefined;
+    try fixture.init(&.{.{ .path = route, .bindings = &.{
         .{ .name = "SECRET", .value = "s3cr3t" },
         .{ .name = "GREETING", .value = "olá" },
         .{ .name = "EMPTY", .value = "" },
-    });
-    defer std.testing.allocator.free(blob);
-    const route = "/__test_route/env-bindings.js";
-    var fixture: Fixture = undefined;
-    try fixture.init(blob, route);
+    } }});
     defer fixture.deinit();
 
     // Module code is strict, so writing to a frozen object throws.
@@ -137,11 +166,9 @@ test "handler receives the route's text bindings as a frozen env object" {
 }
 
 test "every request of a route receives the same env object" {
-    const blob = try sealedBlob(&.{.{ .name = "TOKEN", .value = "abc" }});
-    defer std.testing.allocator.free(blob);
     const route = "/__test_route/env-identity.js";
     var fixture: Fixture = undefined;
-    try fixture.init(blob, route);
+    try fixture.init(&.{.{ .path = route, .bindings = &.{.{ .name = "TOKEN", .value = "abc" }} }});
     defer fixture.deinit();
 
     const source =
@@ -158,31 +185,39 @@ test "every request of a route receives the same env object" {
     }
 }
 
-test "a route other than the one the bindings belong to never receives them" {
-    const blob = try sealedBlob(&.{.{ .name = "SECRET", .value = "s3cr3t" }});
-    defer std.testing.allocator.free(blob);
+test "each route receives its own bindings and never another route's" {
     var fixture: Fixture = undefined;
-    try fixture.init(blob, "/__test_route/env-owner.js");
+    try fixture.init(&.{
+        .{ .path = "/__test_route/env-a.js", .bindings = &.{.{ .name = "SECRET", .value = "secret-a" }} },
+        .{ .path = "/__test_route/env-b.js", .bindings = &.{
+            .{ .name = "SECRET", .value = "secret-b" },
+            .{ .name = "ONLY_B", .value = "b" },
+        } },
+        .{ .path = "/__test_route/env-none.js" },
+    });
     defer fixture.deinit();
 
-    // The worker refuses to build `env` for the other route, so its handler
-    // never runs and the worker answers the request with its own 500.
-    var response = try rt.runRouteAndReadIngressResponse(&fixture.runtime, fixture.control_pair[1],
+    const source =
         \\export default function handle(request, env) {
-        \\    return String(env.SECRET);
+        \\    return JSON.stringify(env);
         \\}
-    , 1, "/__test_route/env-other.js");
-    defer response.deinit();
-    try std.testing.expectEqual(@as(u16, 500), response.status);
-    try std.testing.expect(!std.mem.containsAtLeast(u8, response.body, 1, "s3cr3t"));
+    ;
+    const cases = [_]struct { path: []const u8, expected: []const u8 }{
+        .{ .path = "/__test_route/env-a.js", .expected = "{\"SECRET\":\"secret-a\"}" },
+        .{ .path = "/__test_route/env-b.js", .expected = "{\"SECRET\":\"secret-b\",\"ONLY_B\":\"b\"}" },
+        .{ .path = "/__test_route/env-none.js", .expected = "{}" },
+    };
+    for (cases, 1..) |case, request_id| {
+        const body = try fixture.run(source, request_id, case.path);
+        defer std.testing.allocator.free(body);
+        try std.testing.expectEqualStrings(case.expected, body);
+    }
 }
 
 test "a route without bindings receives an empty frozen env object" {
-    const blob = try sealedBlob(&.{});
-    defer std.testing.allocator.free(blob);
     const route = "/__test_route/env-empty.js";
     var fixture: Fixture = undefined;
-    try fixture.init(blob, route);
+    try fixture.init(&.{.{ .path = route }});
     defer fixture.deinit();
 
     const body = try fixture.run(
@@ -195,14 +230,12 @@ test "a route without bindings receives an empty frozen env object" {
 }
 
 test "a binding named like a prototype property is an own value of env" {
-    const blob = try sealedBlob(&.{
-        .{ .name = "__proto__", .value = "own" },
-        .{ .name = "toString", .value = "shadowed" },
-    });
-    defer std.testing.allocator.free(blob);
     const route = "/__test_route/env-proto.js";
     var fixture: Fixture = undefined;
-    try fixture.init(blob, route);
+    try fixture.init(&.{.{ .path = route, .bindings = &.{
+        .{ .name = "__proto__", .value = "own" },
+        .{ .name = "toString", .value = "shadowed" },
+    } }});
     defer fixture.deinit();
 
     // Defining properties directly bypasses the `__proto__` setter of
@@ -235,12 +268,13 @@ test "the env bridge refuses entries it cannot define without running JavaScript
         .{ .name = raw(""), .value = raw("v") },
         .{ .name = raw("NAME"), .value = raw("\xc3") },
     };
+    const realm = vm.mainRealm();
     for (refused) |entry|
-        try std.testing.expectError(error.InvalidArgument, vm.envObjectValue(&.{entry}));
+        try std.testing.expectError(error.InvalidArgument, realm.envObjectValue(&.{entry}));
 
     // An array index is below 2^32 - 1 (ECMA-262), so this index-like name
     // is an ordinary one.
-    var accepted = try vm.envObjectValue(&.{.{ .name = raw("4294967295"), .value = raw("max") }});
+    var accepted = try realm.envObjectValue(&.{.{ .name = raw("4294967295"), .value = raw("max") }});
     accepted.deinit();
 }
 
@@ -248,7 +282,7 @@ fn raw(bytes: []const u8) support.bindings.RawString {
     return .{ .ptr = if (bytes.len == 0) null else bytes.ptr, .len = bytes.len };
 }
 
-test "runtime start refuses a malformed bindings blob" {
+test "runtime start refuses a route table with a malformed bindings section" {
     const too_many_count = server_limits.bindings_per_route_max + 1;
     var too_many: [too_many_count]Entry = undefined;
     var names: [too_many_count][8]u8 = undefined;
@@ -267,27 +301,37 @@ test "runtime start refuses a malformed bindings blob" {
     for (invalid_cases) |entries| {
         // The builder refuses each case on its own; the worker must refuse
         // the same bytes when they arrive anyway.
-        try std.testing.expectError(error.InvalidRouteBindings, route_bindings.buildSealed(std.testing.allocator, entries));
-        const blob = try uncheckedBlob(entries);
-        defer std.testing.allocator.free(blob);
-        try expectRuntimeRefuses(blob);
+        try std.testing.expectError(error.InvalidRouteTable, route_table.buildSealed(std.testing.allocator, &.{.{
+            .entry_specifier = "/__collo_route/test/env.js",
+            .bindings = entries,
+        }}));
+        const section = try uncheckedSection(entries);
+        defer std.testing.allocator.free(section);
+        const table = try uncheckedTable(section);
+        defer std.testing.allocator.free(table);
+        try expectRuntimeRefuses(table);
     }
 
-    // Layouts the builder never writes: a count with no entry behind it, a
+    // Sections the builder never writes: a count with no entry behind it, a
     // name length past the end, a byte after the last entry, a truncated
     // count and no bytes at all.
-    const raw_cases = [_][]const u8{
+    const raw_sections = [_][]const u8{
         &.{ 1, 0, 0, 0 },
         &.{ 1, 0, 0, 0, 200, 0, 0, 0, 'A' },
         &.{ 0, 0, 0, 0, 0 },
         &.{ 0, 0 },
         &.{},
     };
-    for (raw_cases) |blob|
-        try expectRuntimeRefuses(blob);
+    for (raw_sections) |section| {
+        const table = try uncheckedTable(section);
+        defer std.testing.allocator.free(table);
+        try expectRuntimeRefuses(table);
+    }
+    // And a table that is not one at all.
+    try expectRuntimeRefuses(&.{ 1, 0 });
 }
 
-fn expectRuntimeRefuses(blob: []const u8) !void {
+fn expectRuntimeRefuses(table: []const u8) !void {
     var vm = try support.createVm();
     defer vm.deinit();
     const control_pair = try socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
@@ -297,12 +341,12 @@ fn expectRuntimeRefuses(blob: []const u8) !void {
     var completion = try rt.CompletionFixture.init();
     defer completion.deinit();
     // On failure `Runtime.init` closes the completion eventfd it took over.
-    try std.testing.expectError(error.InvalidRouteBindings, worker.Runtime.init(
+    try std.testing.expectError(error.InvalidRouteTable, worker.Runtime.init(
         std.testing.allocator,
         &vm,
         control_pair[0],
         &completion.view,
         try rt.createCompletionEventfd(),
-        .{ .ctx = &now_mono_ns, .now_fn = fakeNow, .route_bindings_blob = blob },
+        .{ .ctx = &now_mono_ns, .now_fn = fakeNow, .route_table = table },
     ));
 }

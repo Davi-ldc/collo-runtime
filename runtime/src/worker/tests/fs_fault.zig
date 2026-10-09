@@ -163,10 +163,10 @@ fn registerAndEnqueueRoute(
     path: []const u8,
     deadline_monotonic_ns: u64,
 ) !void {
-    try rt.registerRoutePack(runtime, route_fd, route_entry_specifier);
+    const route_index = try rt.registerRoutePack(runtime, route_fd, route_entry_specifier);
     var dispatch = try initDispatchWork(std.testing.allocator, .{
         .request_id = request_id,
-        .route_entry_specifier = route_entry_specifier,
+        .route_index = route_index,
         .deadline_monotonic_ns = deadline_monotonic_ns,
         .request = .{ .path = path },
     });

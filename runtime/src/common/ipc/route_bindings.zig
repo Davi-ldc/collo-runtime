@@ -1,41 +1,36 @@
-//! The bindings blob of one route: its text bindings as name/value pairs in
-//! configuration order, sealed into a read-only memfd that WorkerInit
-//! carries to every worker of the route. The server builds one blob per
-//! route at boot (`server/routes/artifacts.zig`), each launch sends its own
-//! dup (`host/launch.zig`), and the worker maps it once and builds the
-//! route's `env` from it (`worker/modules/route_env.zig`). Both processes
-//! compile this file, so the layout and the rules below are the whole
-//! contract. The blob holds secrets and never reaches `process.env`, which a
-//! worker installs empty.
+//! The bindings of one route: its text bindings as name/value pairs in
+//! configuration order, the section a route holds in its definition's route
+//! table (`route_table.zig`). The worker builds the route's `env` from it
+//! (`worker/modules/route_env.zig`). Both processes compile this file, so the
+//! layout and the rules below are the whole contract. Bindings hold secrets
+//! and never reach `process.env`, which a worker installs empty.
 //!
 //! Layout, little-endian: a u32 entry count, then for every entry a u32
 //! name length, the name bytes, a u32 value length and the value bytes.
 //!
-//! A valid blob holds at most `entries_max` entries in at most `bytes_max`
+//! A valid section holds at most `entries_max` entries in at most `bytes_max`
 //! bytes, every name passes `isBindingName`, no name repeats, every value is
-//! UTF-8, and no byte follows the last entry. `buildSealed` checks these on
-//! its input and `decode` checks them again on the bytes. The configuration
-//! parser (`server/config/parse.zig`) checks `collo.json` against the same
-//! rules, so a configuration it accepts never yields a blob a worker
-//! refuses.
+//! UTF-8, and no byte follows the last entry. `encodedLen` checks these on
+//! entries about to be encoded and `decode` checks them again on the bytes.
+//! The configuration parser (`server/config/parse.zig`) checks `collo.json`
+//! against the same rules, so a configuration it accepts never yields
+//! bindings a worker refuses.
 //!
-//! Any thread may call these functions; only `buildSealed` and
-//! `createEmptySealed` touch the kernel, to create the memfd.
+//! Every function here is pure; any thread may call it.
 
 const std = @import("std");
 const server_limits = @import("collo_limits").server;
-const fd_mod = @import("collo_os").fd;
 
-/// Largest blob a worker accepts, the configuration's per-route bound.
+/// Largest section a worker accepts, the configuration's per-route bound.
 pub const bytes_max: usize = server_limits.binding_bytes_per_route_max;
 
-/// Most entries one blob holds, the configuration's per-route bound.
+/// Most entries one section holds, the configuration's per-route bound.
 pub const entries_max: usize = server_limits.bindings_per_route_max;
 
 /// Longest binding name, the configuration's bound.
 pub const name_bytes_max: usize = server_limits.binding_name_bytes_max;
 
-/// The blob of a route with no bindings: an entry count of zero.
+/// The section of a route with no bindings: an entry count of zero.
 pub const empty_blob = [_]u8{0} ** @sizeOf(u32);
 
 pub const Entry = struct {
@@ -43,30 +38,10 @@ pub const Entry = struct {
     value: []const u8,
 };
 
-/// Caller storage for the entries of one decoded blob.
+/// Caller storage for the entries of one decoded section.
 pub const Entries = [entries_max]Entry;
 
 pub const Error = error{InvalidRouteBindings};
-
-/// A built blob: the sealed memfd and the length WorkerInit carries, which
-/// is exactly what the worker maps.
-pub const Sealed = struct {
-    fd: std.posix.fd_t,
-    blob_len: u64,
-
-    /// A close-on-exec dup with its own lifetime. Seals live on the inode,
-    /// so the copy is read-only too, and the shared file offset is harmless
-    /// because every reader maps at offset 0.
-    pub fn dupCloexec(self: Sealed) !Sealed {
-        var owned = try fd_mod.OwnedFd.dupCloexec(self.fd);
-        return .{ .fd = owned.release(), .blob_len = self.blob_len };
-    }
-
-    pub fn close(self: Sealed) void {
-        if (self.fd >= 0)
-            std.posix.close(self.fd);
-    }
-};
 
 /// True for a name `[A-Za-z_][A-Za-z0-9_]*` of at most `name_bytes_max`
 /// bytes. Such a name is never an array index, which the bridge's `env`
@@ -81,22 +56,6 @@ pub fn isBindingName(name: []const u8) bool {
             return false;
     }
     return true;
-}
-
-/// Serializes `entries` (none gives `empty_blob`) into a memfd sealed
-/// read-only, after checking them against the rules in this file's header.
-/// The caller owns the result and closes it.
-pub fn buildSealed(allocator: std.mem.Allocator, entries: []const Entry) !Sealed {
-    const blob_len = try encodedLen(entries);
-    const buffer = try allocator.alloc(u8, blob_len);
-    defer allocator.free(buffer);
-    encode(buffer, entries);
-    return sealBytes(buffer);
-}
-
-/// `empty_blob` in a sealed memfd, without allocating.
-pub fn createEmptySealed() !Sealed {
-    return sealBytes(&empty_blob);
 }
 
 /// The entries of `blob`, borrowing its bytes; fails unless `blob` follows
@@ -120,7 +79,9 @@ pub fn decode(blob: []const u8, entries: *Entries) Error![]const Entry {
     return entries[0..count];
 }
 
-fn encodedLen(entries: []const Entry) Error!usize {
+/// The length of `entries` once encoded (none gives `empty_blob`), after
+/// checking them against the rules in this file's header.
+pub fn encodedLen(entries: []const Entry) Error!usize {
     if (entries.len > entries_max)
         return error.InvalidRouteBindings;
     var len: usize = @sizeOf(u32);
@@ -150,7 +111,9 @@ fn validEntry(earlier: []const Entry, name: []const u8, value: []const u8) bool 
     return std.unicode.utf8ValidateSlice(value);
 }
 
-fn encode(buffer: []u8, entries: []const Entry) void {
+/// Writes `entries`, which passed `encodedLen`, into `buffer`, exactly
+/// `encodedLen(entries)` bytes long.
+pub fn encode(buffer: []u8, entries: []const Entry) void {
     var offset: usize = 0;
     writeU32(buffer, &offset, @intCast(entries.len));
     for (entries) |entry| {
@@ -170,18 +133,6 @@ fn writeU32(buffer: []u8, offset: *usize, value: u32) void {
     std.debug.assert(buffer.len - offset.* >= @sizeOf(u32));
     std.mem.writeInt(u32, buffer[offset.*..][0..@sizeOf(u32)], value, .little);
     offset.* += @sizeOf(u32);
-}
-
-fn sealBytes(bytes: []const u8) !Sealed {
-    const fd = try std.posix.memfd_create(
-        "collo-route-bindings",
-        std.os.linux.MFD.CLOEXEC | std.os.linux.MFD.ALLOW_SEALING,
-    );
-    errdefer std.posix.close(fd);
-    try fd_mod.writeAllRaw(fd, bytes);
-    try std.posix.lseek_SET(fd, 0);
-    try fd_mod.addSeals(fd, fd_mod.memfd_readonly_seals);
-    return .{ .fd = fd, .blob_len = bytes.len };
 }
 
 /// Little-endian u32 lengths and the bytes they announce, never past the end.

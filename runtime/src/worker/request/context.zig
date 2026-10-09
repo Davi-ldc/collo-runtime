@@ -385,12 +385,12 @@ pub const RequestContext = struct {
     }
 
     /// The boot context: the identity module top-level code uses for
-    /// fetches and timers. It is installed before the route entry is
-    /// evaluated and closed when that evaluation settles
+    /// fetches and timers. It is installed before the routes' entries are
+    /// evaluated and closed once none of those evaluations is in flight
     /// (`Runtime.closeBootContext`), which also removes it from the active
     /// map, so a native completion arriving later finds no request and is
-    /// dropped. Besides its id, `boot_request_id`, four fields differ from a
-    /// dispatched request's:
+    /// dropped. Its dispatch names route 0 and no request. Besides its id,
+    /// `boot_request_id`, four fields differ from a dispatched request's:
     ///  - `dispatch_started` is true. The ingress rescan queues every active
     ///    entry that has not started; a queued boot context would wait on its
     ///    own evaluation and then write a response into a stream that does
@@ -398,9 +398,8 @@ pub const RequestContext = struct {
     ///  - `live_slot_released` is true. The boot context has no live slot on
     ///    the shared page, and the per-tick CPU flush must skip it.
     ///  - `exec.deadline_monotonic_ns` is 0. The evaluation budget is armed
-    ///    separately (`Runtime.evaluateBootRouteEntry`) and reset to 0 when
-    ///    the evaluation settles, so instance timers never inherit a stale
-    ///    deadline.
+    ///    separately (`Runtime.evaluateBootRoutes`) and reset to 0 when the
+    ///    context closes, so instance timers never inherit a stale deadline.
     ///  - `request_generation` is 0, the mark fs faults use to recognize the
     ///    boot context, and the generation a boot token names.
     pub fn initBoot(
@@ -466,7 +465,7 @@ pub const RequestTrace = struct {
     execute_request_start_ns: u64 = 0,
     evaluate_module_done_ns: u64 = 0,
     /// The request has its route's handler: the default export the route's
-    /// evaluation read, which the route table keeps
+    /// evaluation read, which the route's record keeps
     /// (`ensureRouteHandler` in `worker/modules/routes.zig`).
     get_export_done_ns: u64 = 0,
     parse_request_done_ns: u64 = 0,

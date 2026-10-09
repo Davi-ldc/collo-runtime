@@ -3,15 +3,16 @@
 //! may call it.
 //!
 //! An encoded packet is a `messages.DispatchPacketHeader` followed by, in
-//! order, the authority, method, path and raw query, the request headers and
-//! the route captures as `NameValuePacket` sections, and the route-entry
-//! specifier. The decoder treats the bytes as hostile: it checks every length
-//! against the packet before reading the section, and refuses a packet with
-//! bytes after the route-entry specifier, a header whose reserved field is
-//! not zero, and an empty authority or route-entry specifier. The header's
-//! egress token is copied unread: the worker never interprets it and only the
-//! gateway can verify it, and `egress_token.none` is valid here, for a worker
-//! without an egress session.
+//! order, the authority, method, path and raw query, and the request headers
+//! and the route captures as `NameValuePacket` sections. The header names the
+//! request's route by its index in the route table of the worker's
+//! definition, which the worker checks against its table. The decoder treats
+//! the bytes as hostile: it checks every length against the packet before
+//! reading the section, and refuses a packet with bytes after the route
+//! captures, a header whose reserved field is not zero, and an empty
+//! authority. The header's egress token is copied unread: the worker never
+//! interprets it and only the gateway can verify it, and `egress_token.none`
+//! is valid here, for a worker without an egress session.
 
 const std = @import("std");
 const packet = @import("packet.zig");
@@ -42,7 +43,6 @@ const DispatchLayout = struct {
     raw_query: Range,
     request_headers: Range,
     route_captures: Range,
-    route_entry_specifier: Range,
 };
 
 /// A dispatch that owns its bytes: every slice points into `storage` or into
@@ -67,7 +67,8 @@ pub const DispatchWork = struct {
     request_headers: []RequestHeader,
     body_framing: messages.RequestBodyFraming,
     route_captures: []RouteCapture,
-    route_entry_specifier: []const u8,
+    /// As `messages.DispatchWorkView.route_index`.
+    route_index: u16,
 
     /// Copies `input` into one allocation. The caller keeps `input` and owns
     /// the result.
@@ -81,7 +82,6 @@ pub const DispatchWork = struct {
             input.raw_query,
             input.request_headers,
             input.route_captures,
-            input.route_entry_specifier,
         );
         const storage = try allocator.alloc(u8, storage_len);
         errdefer if (storage.len != 0) allocator.free(storage);
@@ -108,7 +108,6 @@ pub const DispatchWork = struct {
                 .value = copyDispatchStorageSlice(storage, &cursor, capture.value),
             };
         }
-        const owned_route_entry_specifier = copyDispatchStorageSlice(storage, &cursor, input.route_entry_specifier);
         std.debug.assert(cursor == storage.len);
 
         return .{
@@ -130,32 +129,28 @@ pub const DispatchWork = struct {
             .request_headers = owned_headers,
             .body_framing = input.body_framing,
             .route_captures = owned_captures,
-            .route_entry_specifier = owned_route_entry_specifier,
+            .route_index = input.route_index,
         };
     }
 
     /// The identity of a worker's boot context, which module top-level code
-    /// runs under for its fetches and timers. `request_id` is the boot
-    /// context's id inside the worker (`boot_request_id` in
-    /// `worker/request/context.zig`). It owns only a copy of the route-entry
-    /// specifier and carries nothing a real dispatch reads from the wire: the
-    /// boot context never dispatches, and its fetches present `boot_egress_token`,
-    /// WorkerInit's boot token, whose request id and generation are 0.
+    /// of every route runs under for its fetches and timers. `request_id` is
+    /// the boot context's id inside the worker (`boot_request_id` in
+    /// `worker/request/context.zig`). It carries nothing a real dispatch reads
+    /// from the wire: the boot context never dispatches and names no route,
+    /// and its fetches present `boot_egress_token`, WorkerInit's boot token,
+    /// whose request id and generation are 0.
     pub fn initBoot(
         allocator: std.mem.Allocator,
         request_id: u64,
         boot_egress_token: *const egress_token.Bytes,
-        route_entry_specifier: []const u8,
     ) !DispatchWork {
-        const storage = try allocator.dupe(u8, route_entry_specifier);
-        errdefer allocator.free(storage);
         const owned_headers = try allocator.alloc(RequestHeader, 0);
         errdefer allocator.free(owned_headers);
         const owned_captures = try allocator.alloc(RouteCapture, 0);
         errdefer allocator.free(owned_captures);
         return .{
             .allocator = allocator,
-            .storage = storage,
             .request_id = request_id,
             .egress_token = boot_egress_token.*,
             .authority = "",
@@ -166,7 +161,7 @@ pub const DispatchWork = struct {
             .request_headers = owned_headers,
             .body_framing = .none,
             .route_captures = owned_captures,
-            .route_entry_specifier = storage,
+            .route_index = 0,
         };
     }
 
@@ -197,7 +192,7 @@ pub const DispatchWork = struct {
             .request_headers = self.request_headers,
             .body_framing = self.body_framing,
             .route_captures = self.route_captures,
-            .route_entry_specifier = self.route_entry_specifier,
+            .route_index = self.route_index,
         };
     }
 };
@@ -226,7 +221,6 @@ pub fn encodeDispatchWorkInto(scratch: []u8, message: *const DispatchWorkView) !
     try addMessageLen(&total_len, message.raw_query.len);
     try addMessageLen(&total_len, request_headers_bytes_len);
     try addMessageLen(&total_len, captures_bytes_len);
-    try addMessageLen(&total_len, message.route_entry_specifier.len);
 
     const encoded = scratch[0..total_len];
 
@@ -241,6 +235,7 @@ pub fn encodeDispatchWorkInto(scratch: []u8, message: *const DispatchWorkView) !
     header.worker_generation = message.worker_generation;
     header.deadline_monotonic_ns = message.deadline_monotonic_ns;
     header.accounting_flags = message.accounting_flags;
+    header.route_index = message.route_index;
     header.authority_len = @intCast(message.authority.len);
     header.method_len = @intCast(message.method.len);
     header.path_len = @intCast(message.path.len);
@@ -250,7 +245,6 @@ pub fn encodeDispatchWorkInto(scratch: []u8, message: *const DispatchWorkView) !
     header.body_framing = @intFromEnum(message.body_framing);
     header.route_capture_count = @intCast(message.route_captures.len);
     header.route_captures_bytes_len = @intCast(captures_bytes_len);
-    header.route_entry_specifier_len = @intCast(message.route_entry_specifier.len);
 
     var cursor: usize = 0;
     cursor += packet.writeStruct(encoded[cursor..], &header);
@@ -260,7 +254,6 @@ pub fn encodeDispatchWorkInto(scratch: []u8, message: *const DispatchWorkView) !
     cursor += packet.writeSlice(encoded[cursor..], message.raw_query);
     cursor += writeNameValues(encoded[cursor..], message.request_headers);
     cursor += writeNameValues(encoded[cursor..], message.route_captures);
-    cursor += packet.writeSlice(encoded[cursor..], message.route_entry_specifier);
     std.debug.assert(cursor == encoded.len);
     return encoded;
 }
@@ -299,7 +292,7 @@ fn materializeDispatchWorkFromStorage(allocator: std.mem.Allocator, storage: []u
         .request_headers = request_headers,
         .body_framing = layout.body_framing,
         .route_captures = route_captures,
-        .route_entry_specifier = layout.route_entry_specifier.slice(storage),
+        .route_index = layout.header.route_index,
     };
 }
 
@@ -336,13 +329,10 @@ fn parseDispatchLayout(encoded: []const u8) !DispatchLayout {
         error.InvalidPacket,
     );
     cursor = route_captures.end;
-    const route_entry_specifier = try readRange(encoded, &cursor, header.route_entry_specifier_len);
     if (cursor != encoded.len)
         return error.InvalidPacket;
     if (authority.start == authority.end)
         return error.MissingAuthority;
-    if (route_entry_specifier.start == route_entry_specifier.end)
-        return error.MissingRouteEntrySpecifier;
     const body_framing = try messages.decodeRequestBodyFraming(header.body_framing);
     try messages.validateRequestBodyFraming(body_framing);
 
@@ -355,7 +345,6 @@ fn parseDispatchLayout(encoded: []const u8) !DispatchLayout {
         .raw_query = raw_query,
         .request_headers = request_headers,
         .route_captures = route_captures,
-        .route_entry_specifier = route_entry_specifier,
     };
 }
 
@@ -452,7 +441,6 @@ fn dispatchWorkStorageLen(
     raw_query: []const u8,
     request_headers: []const RequestHeader,
     route_captures: []const RouteCapture,
-    route_entry_specifier: []const u8,
 ) !usize {
     var total: usize = 0;
     try addMessageLen(&total, authority.len);
@@ -467,7 +455,6 @@ fn dispatchWorkStorageLen(
         try addMessageLen(&total, capture.name.len);
         try addMessageLen(&total, capture.value.len);
     }
-    try addMessageLen(&total, route_entry_specifier.len);
     return total;
 }
 

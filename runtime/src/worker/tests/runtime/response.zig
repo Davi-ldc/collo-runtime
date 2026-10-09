@@ -761,7 +761,6 @@ test "flushBufferedBody delivers exact bytes at chunk boundaries without overrea
     for (cases, 0..) |body_len, case_index| {
         const dispatch = try rt.initDispatchWork(std.testing.allocator, .{
             .request_id = 9100 + @as(u64, case_index),
-            .route_entry_specifier = "route",
         });
         var ctx = worker_request.context.RequestContext.initOwnedDispatch(
             std.testing.allocator,
@@ -1498,11 +1497,11 @@ const SocketFullWorker = struct {
     fn dispatch(self: *SocketFullWorker, request_id: u64, source: []const u8, specifier: []const u8) !void {
         const route_specifier = try rt.routeSpecifier(std.testing.allocator, specifier);
         defer std.testing.allocator.free(route_specifier);
-        try rt.registerRoute(&self.runtime, route_specifier, source);
+        const route_index = try rt.registerRoute(&self.runtime, route_specifier, source);
         const request: rt.RequestParts = .{ .path = specifier };
         var dispatch_work = try initDispatchWork(std.testing.allocator, .{
             .request_id = request_id,
-            .route_entry_specifier = route_specifier,
+            .route_index = route_index,
             .request = request,
         });
         defer dispatch_work.deinit();

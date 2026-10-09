@@ -44,11 +44,11 @@ fn enqueueWasmRoute(
 ) !void {
     const route_specifier = try rt.routeSpecifier(std.testing.allocator, specifier);
     defer std.testing.allocator.free(route_specifier);
-    try rt.registerRoute(runtime, route_specifier, source);
+    const route_index = try rt.registerRoute(runtime, route_specifier, source);
 
     var dispatch = try rt.initDispatchWork(std.testing.allocator, .{
         .request_id = request_id,
-        .route_entry_specifier = route_specifier,
+        .route_index = route_index,
         .deadline_monotonic_ns = deadline_monotonic_ns,
         .request = .{},
     });

@@ -48,7 +48,6 @@ const lane_plan_mod = @import("net/lane_plan.zig");
 pub const boot = @import("boot/root.zig");
 pub const analytics = analytics_mod;
 pub const ingress = ingress_mod;
-pub const ingress_state = ingress.state;
 pub const connection_slot = ingress.runner.connection_slot;
 pub const http2 = ingress.http2;
 pub const listener = listener_mod;
@@ -143,7 +142,7 @@ pub const Server = struct {
         var plan = try lane_plan_mod.build(
             allocator,
             options.listen,
-            ingress_mod.runner.laneMemoryShape(),
+            ingress_mod.runner.laneMemoryShape(routes.definitionCount()),
             options.ingress_lane_override,
         );
         defer plan.deinit(allocator);

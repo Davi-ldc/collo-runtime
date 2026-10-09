@@ -25,13 +25,14 @@ const std = @import("std");
 const connection = @import("connection.zig");
 const connection_slot = @import("../runner/connection_slot.zig");
 const fault = @import("../fault.zig");
-const ingress_state = @import("../state.zig");
 const response = @import("response.zig");
 const server_responses = @import("../server_responses.zig");
 const stream_table = @import("../runner/stream_table.zig");
+const process = @import("collo_os").process;
 const h2 = @import("collo_http").http2;
 const ipc = @import("collo_ipc");
 const limits = @import("collo_limits");
+const lifecycle = @import("collo_server_lifecycle");
 
 const LaneFault = fault.LaneFault;
 const Http2Failure = connection.Http2Failure;
@@ -80,7 +81,7 @@ pub fn resetStream(
     runtime: *Slot,
     stream_id: u32,
     error_code: h2.ErrorCode,
-) LaneFault!?ingress_state.RequestKey {
+) LaneFault!?lifecycle.RequestKey {
     if (runtime.h2StreamState(stream_id) == null)
         return null;
     const request_key = runtime.h2MarkStreamReset(worker.service.allocator, stream_id);
@@ -94,7 +95,7 @@ pub fn resetStream(
 /// HTTP/2 yet or its queue cannot take the frame: the close then goes ahead
 /// without it.
 pub fn queueCloseGoaway(allocator: std.mem.Allocator, runtime: *Slot, error_code: h2.ErrorCode) bool {
-    if (runtime.state != .http2_connection or !runtime.h2_preface_complete)
+    if (runtime.state != .http2_connection or !runtime.frame_reader.prefaceComplete())
         return false;
     var scratch: [h2.frame_header_len + 8]u8 = undefined;
     h2.encodeGoawayFrame(&scratch, runtime.h2_last_client_stream_id, error_code) catch return false;
@@ -116,7 +117,7 @@ pub fn queueGoawayNoNewStreams(
     worker: *Worker,
     runtime: *Slot,
 ) LaneFault!void {
-    if (!runtime.isOpen() or runtime.state != .http2_connection or !runtime.h2_preface_complete)
+    if (!runtime.isOpen() or runtime.state != .http2_connection or !runtime.frame_reader.prefaceComplete())
         return;
     var scratch: [h2.frame_header_len + 8]u8 = undefined;
     h2.encodeGoawayFrame(&scratch, runtime.h2_last_client_stream_id, .no_error) catch |err|
@@ -209,6 +210,7 @@ pub fn queueResponseHead(
     const encoded_headers = try response.encodeResponseHeadersScratch(
         worker.service.allocator,
         &runtime.h2_hpack_encoder,
+        worker.h2_lane.encode_scratch,
         status_value,
         headers,
     );
@@ -279,6 +281,7 @@ pub fn queueResponseHeadAndChunk(
     const encoded_headers = try response.encodeResponseHeadersScratch(
         worker.service.allocator,
         &runtime.h2_hpack_encoder,
+        worker.h2_lane.encode_scratch,
         status_value,
         headers,
     );
@@ -501,7 +504,7 @@ pub fn sameWorkerResponseIdentity(a: ipc.ingress_channel.Descriptor, b: ipc.ingr
 /// connection. A closing connection writes only while its close flushes the
 /// queue.
 pub fn flushPendingWrite(comptime Worker: type, worker: *Worker, runtime: *Slot) LaneFault!bool {
-    if (!runtime.active)
+    if (!runtime.isLive())
         return false;
     if (runtime.closing) |closing| {
         if (!closing.flush)
@@ -517,6 +520,7 @@ pub fn flushPendingWrite(comptime Worker: type, worker: *Worker, runtime: *Slot)
             return true;
         }
         runtime.h2ConsumeQueuedWrite(worker.service.allocator, written);
+        runtime.noteProgress(process.monotonicNowNsOrZero());
         did_work = true;
     }
     return did_work;
@@ -620,12 +624,6 @@ fn queuePendingWindowUpdates(
 ) Http2Failure!bool {
     if (!runtime.isOpen() or runtime.h2WritesPending())
         return false;
-    if (runtime.h2_pending_connection_window_update == 0) {
-        for (&runtime.ingress_channels) |*entry| {
-            if (entry.pending_recv_window_update != 0)
-                break;
-        } else return false;
-    }
 
     const frame_len = h2.frame_header_len + 4;
     var scratch: [frame_len * (stream_table.max_h2_concurrent_streams + 1)]u8 = undefined;
@@ -634,18 +632,23 @@ fn queuePendingWindowUpdates(
         try h2.encodeWindowUpdateFrame(scratch[cursor..][0..frame_len], 0, runtime.h2_pending_connection_window_update);
         cursor += frame_len;
     }
-    for (&runtime.ingress_channels) |*entry| {
+    for (runtime.stream_ids, 0..) |stream_id, position| {
+        if (stream_id == 0)
+            continue;
+        const entry = stream_table.streamAt(runtime, position);
         if (entry.pending_recv_window_update == 0)
             continue;
-        try h2.encodeWindowUpdateFrame(scratch[cursor..][0..frame_len], entry.stream_id, entry.pending_recv_window_update);
+        try h2.encodeWindowUpdateFrame(scratch[cursor..][0..frame_len], stream_id, entry.pending_recv_window_update);
         cursor += frame_len;
     }
     if (cursor == 0)
         return false;
     const queued = try queueWriteCopy(Worker, worker, runtime, scratch[0..cursor]);
     runtime.h2_pending_connection_window_update = 0;
-    for (&runtime.ingress_channels) |*entry|
-        entry.pending_recv_window_update = 0;
+    for (runtime.stream_ids, 0..) |stream_id, position| {
+        if (stream_id != 0)
+            stream_table.streamAt(runtime, position).pending_recv_window_update = 0;
+    }
     return queued;
 }
 
@@ -667,18 +670,19 @@ pub fn flushPendingResponseData(
 
     var did_work = false;
     var visited: usize = 0;
-    var index = runtime.h2_response_rr_cursor % runtime.ingress_channels.len;
-    while (visited < runtime.ingress_channels.len) : (visited += 1) {
+    const positions = runtime.stream_ids.len;
+    var index = runtime.h2_response_rr_cursor % positions;
+    while (visited < positions) : (visited += 1) {
         if (runtime.h2PendingResponseStreamIdAt(index)) |stream_id| {
             const stream_work = try flushPendingResponseStream(Worker, worker, runtime, stream_id);
             if (stream_work) {
-                runtime.h2_response_rr_cursor = (index + 1) % runtime.ingress_channels.len;
+                runtime.h2_response_rr_cursor = (index + 1) % positions;
                 did_work = true;
             }
             if (!runtime.isOpen() or runtime.h2WritesPending())
                 return did_work;
         }
-        index = (index + 1) % runtime.ingress_channels.len;
+        index = (index + 1) % positions;
     }
     return did_work;
 }
@@ -798,6 +802,7 @@ fn writeDataFramesDirectNoWindowAccounting(
             return result;
         }
         result.did_work = true;
+        runtime.noteProgress(process.monotonicNowNsOrZero());
 
         const total_len = h2.frame_header_len + chunk.len;
         if (written < total_len) {

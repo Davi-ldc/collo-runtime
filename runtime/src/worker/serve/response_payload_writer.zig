@@ -5,7 +5,9 @@
 //! (`zygote/child_boot.zig`), so every send here can find it full and
 //! reports that instead of failing; a body chunk above
 //! `shared_payload_threshold` travels through the ring and can find the ring
-//! full as well. The step that found no room sent nothing, and the caller
+//! full as well, after which the worker has marked itself waiting, so the
+//! reader's next release writes the credit eventfd the loop polls
+//! (`ringFits`). The step that found no room sent nothing, and the caller
 //! parks it, with everything after it, in the request's outbox
 //! (`request/ingress/response_outbox.zig`). A response is committed when its
 //! head goes out and at no other point. It runs on the worker's VM thread.
@@ -27,6 +29,10 @@ comptime {
     // A first chunk the ring has room for always fits a batch, so a ring
     // batch is never empty (`writeSpan`).
     std.debug.assert(limits.http_body.INGRESS_RESPONSE_CHUNK_BYTES <= ingress_response_batch_body_bytes);
+    // An empty ring takes any batch wherever its write position stands, so a
+    // ring that refuses one holds bytes whose release brings the credit wake
+    // (`ringSentOrBlocked`).
+    std.debug.assert(2 * ingress_response_batch_body_bytes <= ipc.ingress_channel.shared_payload_ring_capacity);
 }
 
 /// What a send on the control socket did.
@@ -81,6 +87,45 @@ pub fn sentOrBlocked(runtime: *state.Runtime, result: anytype) !Sent {
         else => |other| return other,
     };
     return .sent;
+}
+
+/// What a send of payloads through the ring did.
+const RingSent = enum { sent, socket_full, ring_full };
+
+/// `sentOrBlocked` for a send that writes the payload ring. A batch can also
+/// find the ring short of room for a chunk that must skip the ring's tail:
+/// the send took back what it wrote, and the worker marks itself waiting for
+/// the reader's next release, which the ring's bytes guarantee (the comptime
+/// check above).
+fn ringSentOrBlocked(
+    runtime: *state.Runtime,
+    ingress_payload: *ipc.ingress_channel.SharedPayloadView,
+    result: anytype,
+) !RingSent {
+    result catch |err| switch (err) {
+        error.WouldBlock => {
+            runtime.requests.control_send_blocked = true;
+            return .socket_full;
+        },
+        error.IngressSharedPayloadRingFull => {
+            ingress_payload.markWriterWaiting(.worker_to_server);
+            return .ring_full;
+        },
+        else => |other| return other,
+    };
+    return .sent;
+}
+
+/// Whether a payload of `byte_len` bytes fits the worker-to-server ring now.
+/// When it does not, the worker marks itself waiting and looks once more, so
+/// the reader's next release writes the credit eventfd the loop polls,
+/// unless this look already sees the room that release made
+/// (`SharedPayloadReadRelease`).
+fn ringFits(ingress_payload: *ipc.ingress_channel.SharedPayloadView, byte_len: usize) !bool {
+    if (try ingress_payload.fits(.worker_to_server, byte_len))
+        return true;
+    ingress_payload.markWriterWaiting(.worker_to_server);
+    return ingress_payload.fits(.worker_to_server, byte_len);
 }
 
 /// Sends `body` from `sent_len.*` on and advances `sent_len.*` past every
@@ -156,9 +201,9 @@ fn writeSpan(
         const chunk_len = @min(chunk_limit, span.bytes.len - chunk_start);
         if (chunk_len > ipc.ingress_channel.shared_payload_threshold) {
             const ingress_payload = if (runtime.requests.ingress_payload) |*view| view else return error.IngressSharedPayloadUnavailable;
-            const available_capacity = try ingress_payload.availableCapacity(.worker_to_server);
-            if (available_capacity < chunk_len)
+            if (!try ringFits(ingress_payload, chunk_len))
                 return .ring_full;
+            const available_capacity = try ingress_payload.availableCapacity(.worker_to_server);
 
             var batch_entries: [ipc.ingress_channel.max_batch_descriptors]ipc.ingress_channel.BatchEntry = undefined;
             var batch_count: usize = 0;
@@ -186,14 +231,15 @@ fn writeSpan(
                 batch_count += 1;
             }
             std.debug.assert(batch_count > 0);
-            switch (try sentOrBlocked(runtime, ipc.ingress_channel.sendDescriptorBatchRingPayloads(
+            switch (try ringSentOrBlocked(runtime, ingress_payload, ipc.ingress_channel.sendDescriptorBatchRingPayloads(
                 control_fd,
                 batch_entries[0..batch_count],
                 runtime.core.dispatch_recv_scratch,
                 ingress_payload.writer(.worker_to_server),
             ))) {
                 .sent => {},
-                .blocked => return .socket_full,
+                .socket_full => return .socket_full,
+                .ring_full => return .ring_full,
             }
             request_ctx.client_served_bytes += batch_bytes;
             sent_len.* = chunk_start + batch_bytes;
@@ -397,12 +443,13 @@ pub fn writeStreamChunk(
 }
 
 /// Whether `byte_len` bytes can be sent now: inline at or below
-/// `shared_payload_threshold`, through the ring above it.
+/// `shared_payload_threshold`, through the ring above it. False marks the
+/// worker waiting for the ring's room (`ringFits`).
 pub fn canWritePayload(runtime: *state.Runtime, byte_len: usize) !bool {
     if (byte_len <= ipc.ingress_channel.shared_payload_threshold)
         return true;
     const ingress_payload = if (runtime.requests.ingress_payload) |*view| view else return error.IngressSharedPayloadUnavailable;
-    return (try ingress_payload.availableCapacity(.worker_to_server)) >= byte_len;
+    return ringFits(ingress_payload, byte_len);
 }
 
 /// Sends the end of a streamed response.
@@ -527,14 +574,16 @@ pub fn trySendInitialRingBatch(
         };
     }
 
-    switch (try sentOrBlocked(runtime, ipc.ingress_channel.sendDescriptorBatchPayloadsWithRing(
+    switch (try ringSentOrBlocked(runtime, ingress_payload, ipc.ingress_channel.sendDescriptorBatchPayloadsWithRing(
         control_fd,
         entries[0..entry_count],
         runtime.core.dispatch_recv_scratch,
         ingress_payload.writer(.worker_to_server),
     ))) {
         .sent => {},
-        .blocked => return .blocked,
+        .socket_full => return .blocked,
+        // Nothing went out; the head goes alone and the body follows it.
+        .ring_full => return .unbatched,
     }
     request_ctx.client_served_bytes += body_offset;
     request_ctx.markResponseCommitted();

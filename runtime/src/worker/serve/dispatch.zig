@@ -5,9 +5,10 @@
 //! response or a reset. It runs on the worker's VM thread.
 //!
 //! The server chose the route from the request path and names it in the
-//! dispatch (`DispatchWork.route_entry_specifier`), so the worker serves
-//! every request with that route's handler and never compares the request's
-//! authority with a name of its own.
+//! dispatch by its index in the definition's route table
+//! (`DispatchWork.route_index`), so the worker serves every request with that
+//! route's handler, in that route's realm, and never compares the request's
+//! authority or path with a name of its own.
 
 const std = @import("std");
 const bindings = @import("collo_bindings");
@@ -72,17 +73,20 @@ pub fn deadlineTimeout(runtime: *state.Runtime, request_id: u64) !void {
     // budget is spent the only way out is to recycle the worker: requests in
     // flight fail through the server's death path and the next one starts a
     // fresh worker. The deadline of a request parked on the evaluation is
-    // the one wake guaranteed to reach this point.
+    // the one wake guaranteed to reach this point. The boot context's
+    // deadline bounds every route the boot evaluated, so it checks them all.
     {
         var modules_ctx = runtime.modulesContext();
-        if (module_routes.evaluationZombie(&modules_ctx, request_ctx.dispatch_work.route_entry_specifier)) {
+        const zombie = if (request_id == request_context.boot_request_id)
+            module_routes.anyEvaluationZombie(&modules_ctx)
+        else
+            module_routes.evaluationZombie(&modules_ctx, request_ctx.dispatch_work.route_index);
+        if (zombie) {
             // warn, not err: the boot tests exercise this recycle on purpose,
             // and the test runner fails a run on any err line. The recycle
             // after a failed evaluation in `worker/runtime/modules.zig` logs at
             // the same level.
-            std.log.warn("route module evaluation exceeded budget; recycling worker specifier={s}", .{
-                request_ctx.dispatch_work.route_entry_specifier,
-            });
+            std.log.warn("route module evaluation exceeded budget; recycling worker request_id={d}", .{request_id});
             runtime.core.running = false;
         }
     }
@@ -303,7 +307,7 @@ fn writeRequestParseError(
 fn invokeHandlerAfterParse(
     runtime: *state.Runtime,
     request_ctx: *request_context.RequestContext,
-    route: *const module_routes.RouteModule,
+    route: module_routes.ReadyRoute,
 ) !void {
     var parsed = request_head.fromDispatchWork(&request_ctx.dispatch_work) catch |err| {
         try writeRequestParseError(runtime, request_ctx, err);
@@ -313,11 +317,13 @@ fn invokeHandlerAfterParse(
     if (!request_ctx.body.isInitialized())
         try request_ctx.body.initFromHead(request_ctx.requestAllocator(), &parsed);
 
-    var request_value = try request_bridge.makeRequestObject(runtime, request_ctx, &parsed);
+    // Built in the route's realm, so `request instanceof Request` holds in
+    // the handler whichever realm the route runs in.
+    var request_value = try request_bridge.makeRequestObject(route.realm, request_ctx, &parsed);
     tracing.mark(runtime, request_ctx, "make_request_done_ns");
     defer request_value.deinit();
 
-    try invokeHandlerOrFinish(runtime, request_ctx, route, &request_value);
+    try invokeHandlerOrFinish(runtime, request_ctx, route.module, &request_value);
 }
 
 /// Calls `handler(request, env)`, where `env` is the route's frozen bindings

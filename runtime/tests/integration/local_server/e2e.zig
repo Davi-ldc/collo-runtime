@@ -2,8 +2,10 @@
 //! `fixtures/local_e2e/collo.json`, a zygote that forks fully sandboxed
 //! workers, and the egress gateway behind them. The tests here drive it with
 //! h2 clients from the TLS test shim and check responses, deadlines, the
-//! handler's `env`, a module loaded through `import()` from the route's pack,
-//! the paths the server answers itself, the analytics records, and a worker
+//! handler's `env`, the routes of one definition served by one worker in a
+//! realm each and in one shared realm, a module loaded through `import()`
+//! from the definition's pack, the paths the server answers itself, the
+//! analytics records, and a worker
 //! that outlives its gateway: a gateway killed mid-fetch fails that fetch
 //! with a TypeError, the worker keeps serving, and its fetches reach the
 //! origin again once the launcher attaches it to the next gateway. Four
@@ -205,6 +207,56 @@ test "local e2e hands a route its bindings as a frozen env and leaves process.en
     defer headers.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), try responseStatus(&headers));
     try std.testing.expectEqualStrings("{\"token\":\"e2e-token\",\"frozen\":true,\"processEnv\":[]}", reply.body);
+}
+
+test "local e2e serves both routes of a definition from one worker, in a realm each or in one shared realm" {
+    var harness: Harness = undefined;
+    try harness.init(.{});
+    defer harness.deinit();
+    errdefer dumpZygoteTrace(&harness.spawned);
+
+    var client = try Client.open(&harness);
+    defer client.close();
+
+    // Both routes of each definition share the entry `api/realm_probe.js`,
+    // which counts its module instance's requests (`hits`) and its global
+    // object's (`requests`). With a realm per route each route counts alone;
+    // with one shared realm the two routes count together. Either way each
+    // route receives its own binding and a `Request` of its realm.
+    const cases = [_]struct { definition: []const u8, paths: [3][]const u8, bodies: [3][]const u8 }{
+        .{
+            .definition = "realms-isolated",
+            .paths = .{ "/realms/isolated/a", "/realms/isolated/b", "/realms/isolated/a" },
+            .bodies = .{
+                "{\"route\":\"a\",\"hits\":1,\"requests\":1,\"request\":true}",
+                "{\"route\":\"b\",\"hits\":1,\"requests\":1,\"request\":true}",
+                "{\"route\":\"a\",\"hits\":2,\"requests\":2,\"request\":true}",
+            },
+        },
+        .{
+            .definition = "realms-shared",
+            .paths = .{ "/realms/shared/a", "/realms/shared/b", "/realms/shared/a" },
+            .bodies = .{
+                "{\"route\":\"a\",\"hits\":1,\"requests\":1,\"request\":true}",
+                "{\"route\":\"b\",\"hits\":2,\"requests\":2,\"request\":true}",
+                "{\"route\":\"a\",\"hits\":3,\"requests\":3,\"request\":true}",
+            },
+        },
+    };
+    for (cases) |case| {
+        const definition = try harness.definitionIndex(case.definition);
+        for (case.paths, case.bodies) |path, expected| {
+            const response = try client.get(path);
+            try std.testing.expectEqual(@as(u16, 200), response.status);
+            try std.testing.expectEqualStrings(expected, response.body());
+        }
+        // The counts above already say one process served the three
+        // requests; the launches say it too.
+        var traces: [16]LaunchTrace = undefined;
+        const launches = harness_mod.countLaunches(harness.takeLaunches(&traces), definition);
+        try std.testing.expectEqual(@as(usize, 1), launches.published);
+        try std.testing.expectEqual(@as(usize, 0), launches.failed);
+    }
 }
 
 test "local e2e loads a module named by a string-literal import() from the route's pack and rejects one the pack lacks" {

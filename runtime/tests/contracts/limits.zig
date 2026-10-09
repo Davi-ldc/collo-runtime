@@ -192,10 +192,16 @@ comptime {
 // The server's configuration bounds (`common/limits/server.zig`) against the
 // IPC messages and the state page a configured route travels through.
 comptime {
-    // A route's text bindings reach the worker as its bindings blob; a
-    // larger per-route bound would accept bindings no worker can receive.
+    // A route's text bindings reach the worker as its section of the route
+    // table; a larger per-route bound would accept bindings no worker can
+    // receive.
     std.debug.assert(limits.server.binding_bytes_per_route_max ==
         ipc.route_bindings.bytes_max);
+    // Every route of a definition travels in one route table, and a dispatch
+    // names a route by a u16 index into it.
+    std.debug.assert(limits.server.routes_per_definition_max ==
+        ipc.route_table.routes_max);
+    std.debug.assert(ipc.route_table.routes_max <= std.math.maxInt(u16) + 1);
     // `concurrency` counts request slots on the worker's state page.
     std.debug.assert(limits.server.worker_concurrency_max ==
         worker_shared_page.LIVE_SLOT_COUNT);

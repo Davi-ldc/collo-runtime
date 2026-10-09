@@ -42,7 +42,7 @@ pub const max_module_count: usize = 4096;
 /// `COLLO_MODULE_PACK_MAX_BYTES` in `bindings/include/collo/abi.h` repeats
 /// it by hand.
 pub const max_pack_bytes: usize = 16 * 1024 * 1024;
-/// Prefix of every module key in a route's pack: the server keys each
+/// Prefix of every module key in a definition's pack: the server keys each
 /// module `<prefix><worker>/<path>` (`moduleKey` in
 /// `server/routes/artifacts.zig`), and `<worker>` is the scope segment
 /// `deployHashFromSpecifier` returns.

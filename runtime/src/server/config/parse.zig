@@ -8,7 +8,7 @@
 //! pattern grammar (`pattern.zig`), two routes that match the same paths,
 //! the path prefix the server reserves, the bounds in `common/limits/server.zig`,
 //! and the features the runtime does not implement yet (`network`, binding
-//! kinds other than `text`, more than one route per worker, `cpuMs`). A
+//! kinds other than `text`, `cpuMs`). A
 //! limit with no enforcing mechanism is rejected rather than ignored: the
 //! worker's sentinel (`worker/runtime/sentinel.zig`) arms a wall-clock
 //! deadline per request, which `timeoutMs` sets, and the worker measures a
@@ -476,8 +476,6 @@ const Parser = struct {
             return self.fail("declare at least one route", .{});
         if (count > server_limits.routes_per_definition_max)
             return self.fail("{d} routes are declared; at most {d} are allowed per worker", .{ count, server_limits.routes_per_definition_max });
-        if (count > 1)
-            return self.fail("multi-route workers are not supported yet; declare one route per worker", .{});
 
         const routes = try self.arena.alloc(model.Route, count);
         var entries = object.iterator();

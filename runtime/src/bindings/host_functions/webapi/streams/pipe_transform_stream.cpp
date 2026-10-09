@@ -132,7 +132,7 @@ JSColloPipeToState* JSColloPipeToState::create(JSC::VM& vm, JSC::JSGlobalObject*
     JSColloWritableStreamDefaultWriter* writer)
 {
     auto* collo_global = uncheckedDowncast<Collo::GlobalObject>(global_object);
-    auto* structure = collo_global->owner().webapi_cache.pipe_to_state_structure.get();
+    auto* structure = collo_global->webApiCache().pipe_to_state_structure.get();
     RELEASE_ASSERT(structure);
     auto* object = new (NotNull, JSC::allocateCell<JSColloPipeToState>(vm)) JSColloPipeToState(vm, structure);
     auto scope = DECLARE_THROW_SCOPE(vm);

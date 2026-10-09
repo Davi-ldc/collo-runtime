@@ -112,18 +112,20 @@ extern "C" ColloStatus collo_invoke(ColloVm* vm, const ColloExecCtx* expected_ct
     if (this_value && !Collo::valueBelongsToVm(vm, this_value))
         return COLLO_STATUS_INVALID_ARGUMENT;
 
+    // The callee's realm: where its errors are created and the marker is installed.
     JSC::JSValue callable_value = Collo::toJSValue(callable);
+    auto* global_object = Collo::globalObjectForValue(vm, callable_value);
     auto* callable_object = dynamicDowncast<JSC::JSObject>(callable_value);
     if (!callable_object)
         return Collo::statusOr(
             Collo::setJsException(
-                vm, JSC::createTypeError(vm->global_object, "collo_invoke expects a callable value."_s), out_exception),
+                vm, JSC::createTypeError(global_object, "collo_invoke expects a callable value."_s), out_exception),
             COLLO_STATUS_JS_EXCEPTION);
 
     JSC::CallData call_data = JSC::getCallData(callable_object);
     if (call_data.type == JSC::CallData::Type::None)
-        return Collo::statusOr(Collo::setJsException(vm,
-                                   JSC::createTypeError(vm->global_object, "Value is not callable."_s), out_exception),
+        return Collo::statusOr(
+            Collo::setJsException(vm, JSC::createTypeError(global_object, "Value is not callable."_s), out_exception),
             COLLO_STATUS_JS_EXCEPTION);
 
     JSC::MarkedArgumentBuffer arguments;
@@ -141,14 +143,14 @@ extern "C" ColloStatus collo_invoke(ColloVm* vm, const ColloExecCtx* expected_ct
     JSC::JSValue receiver = Collo::borrowedThisValue(this_value);
     std::optional<BenchInvocationScope> marker;
     if (out_call_started_ns || active_bench_target) {
-        marker.emplace(vm->global_object, out_call_started_ns);
+        marker.emplace(global_object, out_call_started_ns);
         bool installed = marker->install();
         if (scope.exception())
             return Collo::caughtExceptionStatus(vm, scope, out_exception);
         if (!installed)
             return COLLO_STATUS_INVALID_ARGUMENT;
     }
-    JSC::JSValue result = JSC::call(vm->global_object, callable_object, call_data, receiver, arguments);
+    JSC::JSValue result = JSC::call(global_object, callable_object, call_data, receiver, arguments);
     marker.reset();
     if (scope.exception())
         return Collo::caughtExceptionStatus(vm, scope, out_exception);

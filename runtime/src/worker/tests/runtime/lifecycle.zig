@@ -53,7 +53,7 @@ test "scheduler cancels request timers when dispatch work finishes" {
 
     const route_specifier = try rt.routeSpecifier(std.testing.allocator, "/__test_route/unit.js");
     defer std.testing.allocator.free(route_specifier);
-    try rt.registerRoute(&runtime, route_specifier,
+    const route_index = try rt.registerRoute(&runtime, route_specifier,
         \\let events = [];
         \\export default function handle(req) {
         \\    events.push("req:" + req.path);
@@ -67,7 +67,7 @@ test "scheduler cancels request timers when dispatch work finishes" {
 
     var dispatch = try initDispatchWork(std.testing.allocator, .{
         .request_id = 1,
-        .route_entry_specifier = route_specifier,
+        .route_index = route_index,
         .request = .{ .path = "/unit" },
     });
     defer dispatch.deinit();
@@ -114,7 +114,7 @@ test "scheduler cancels request immediates when dispatch work finishes" {
 
     const route_specifier = try rt.routeSpecifier(std.testing.allocator, "/__test_route/immediate.js");
     defer std.testing.allocator.free(route_specifier);
-    try rt.registerRoute(&runtime, route_specifier,
+    const route_index = try rt.registerRoute(&runtime, route_specifier,
         \\let events = [];
         \\export default function handle(req) {
         \\    events.push("req:" + req.path);
@@ -128,7 +128,7 @@ test "scheduler cancels request immediates when dispatch work finishes" {
 
     var dispatch = try initDispatchWork(std.testing.allocator, .{
         .request_id = 1,
-        .route_entry_specifier = route_specifier,
+        .route_index = route_index,
         .request = .{ .path = "/unit" },
     });
     defer dispatch.deinit();
@@ -246,7 +246,7 @@ test "h2 stream reset cancels worker request before handler dispatch" {
 
     const route_specifier = try rt.routeSpecifier(std.testing.allocator, "/h2-reset.js");
     defer std.testing.allocator.free(route_specifier);
-    try rt.registerRoute(
+    const route_index = try rt.registerRoute(
         &runtime,
         route_specifier,
         "export default function() { return new Response('should not run'); }",
@@ -256,7 +256,7 @@ test "h2 stream reset cancels worker request before handler dispatch" {
         .request_id = 41,
         .request_generation = 3,
         .request_slot = 7,
-        .route_entry_specifier = route_specifier,
+        .route_index = route_index,
         .request = .{
             .method = "POST",
             .path = "/cancelled",
@@ -326,7 +326,7 @@ test "late h2 body chunk after request finish is stale no-op" {
 
     const route_specifier = try rt.routeSpecifier(std.testing.allocator, "/h2-late-body.js");
     defer std.testing.allocator.free(route_specifier);
-    try rt.registerRoute(
+    const route_index = try rt.registerRoute(
         &runtime,
         route_specifier,
         "export default function() { return new Response('done'); }",
@@ -336,7 +336,7 @@ test "late h2 body chunk after request finish is stale no-op" {
         .request_id = 43,
         .request_generation = 9,
         .request_slot = 11,
-        .route_entry_specifier = route_specifier,
+        .route_index = route_index,
         .request = .{
             .method = "POST",
             .path = "/late-body",
@@ -441,7 +441,7 @@ test "a full record ring stops the worker and keeps the request live for death s
 
     const route_specifier = try rt.routeSpecifier(std.testing.allocator, "/completed-ring-full.js");
     defer std.testing.allocator.free(route_specifier);
-    try rt.registerRoute(
+    const route_index = try rt.registerRoute(
         &runtime,
         route_specifier,
         "export default function() { return new Response('tracked'); }",
@@ -451,7 +451,7 @@ test "a full record ring stops the worker and keeps the request live for death s
         .request_id = 44,
         .request_generation = 10,
         .request_slot = 1,
-        .route_entry_specifier = route_specifier,
+        .route_index = route_index,
         .request = .{ .path = "/completed-ring-full" },
     });
     defer dispatch.deinit();
@@ -518,7 +518,7 @@ test "worker completion ring overflow stops worker before retrying finalization"
 
     const route_specifier = try rt.routeSpecifier(std.testing.allocator, "/worker-completion-ring-full.js");
     defer std.testing.allocator.free(route_specifier);
-    try rt.registerRoute(
+    const route_index = try rt.registerRoute(
         &runtime,
         route_specifier,
         "export default function() { return new Response('tracked'); }",
@@ -528,7 +528,7 @@ test "worker completion ring overflow stops worker before retrying finalization"
         .request_id = 45,
         .request_generation = 11,
         .request_slot = 1,
-        .route_entry_specifier = route_specifier,
+        .route_index = route_index,
         .request = .{ .path = "/worker-completion-ring-full" },
     });
     defer dispatch.deinit();
@@ -570,7 +570,7 @@ test "a usage record carries the dispatch's identity and the bytes served" {
 
     const route_specifier = try rt.routeSpecifier(std.testing.allocator, "/__test_route/record-identity.js");
     defer std.testing.allocator.free(route_specifier);
-    try rt.registerRoute(&runtime, route_specifier,
+    const route_index = try rt.registerRoute(&runtime, route_specifier,
         \\export default function handle() {
         \\    return "ok";
         \\}
@@ -582,7 +582,7 @@ test "a usage record carries the dispatch's identity and the bytes served" {
         .request_slot = 2,
         .worker_id = 6,
         .worker_generation = 3,
-        .route_entry_specifier = route_specifier,
+        .route_index = route_index,
         .request = .{ .path = "/record-identity" },
     });
     defer dispatch.deinit();
@@ -633,7 +633,7 @@ test "a record's cpu is the process cpu since the previous record, beside the pe
 
     const route_specifier = try rt.routeSpecifier(std.testing.allocator, "/__test_route/process-cpu.js");
     defer std.testing.allocator.free(route_specifier);
-    try rt.registerRoute(&runtime, route_specifier,
+    const route_index = try rt.registerRoute(&runtime, route_specifier,
         \\export default function handle() {
         \\    let acc = 0;
         \\    for (let i = 0; i < 2000000; i++) acc += Math.sqrt(i);
@@ -650,7 +650,7 @@ test "a record's cpu is the process cpu since the previous record, beside the pe
 
     var dispatch_a = try initDispatchWork(std.testing.allocator, .{
         .request_id = 31,
-        .route_entry_specifier = route_specifier,
+        .route_index = route_index,
         .request = .{ .path = "/burn-a" },
     });
     defer dispatch_a.deinit();
@@ -672,7 +672,7 @@ test "a record's cpu is the process cpu since the previous record, beside the pe
 
     var dispatch_b = try initDispatchWork(std.testing.allocator, .{
         .request_id = 32,
-        .route_entry_specifier = route_specifier,
+        .route_index = route_index,
         .request = .{ .path = "/burn-b" },
     });
     defer dispatch_b.deinit();
@@ -722,7 +722,7 @@ test "native cancel completion without a vm turn publishes zero turn cpu" {
 
     const route_specifier = try rt.routeSpecifier(std.testing.allocator, "/native-cancel-turn-cpu.js");
     defer std.testing.allocator.free(route_specifier);
-    try rt.registerRoute(
+    const route_index = try rt.registerRoute(
         &runtime,
         route_specifier,
         "export default function() { return new Response('should not run'); }",
@@ -732,7 +732,7 @@ test "native cancel completion without a vm turn publishes zero turn cpu" {
         .request_id = 61,
         .request_generation = 3,
         .request_slot = 7,
-        .route_entry_specifier = route_specifier,
+        .route_index = route_index,
         .request = .{ .path = "/native-cancel" },
     });
     defer dispatch.deinit();
@@ -791,7 +791,7 @@ test "native deadline completion without a vm turn publishes zero turn cpu" {
 
     const route_specifier = try rt.routeSpecifier(std.testing.allocator, "/native-deadline-turn-cpu.js");
     defer std.testing.allocator.free(route_specifier);
-    try rt.registerRoute(&runtime, route_specifier,
+    const route_index = try rt.registerRoute(&runtime, route_specifier,
         \\export default function handle() {
         \\    return "should not run";
         \\}
@@ -801,7 +801,7 @@ test "native deadline completion without a vm turn publishes zero turn cpu" {
     // route module is evaluated or the VM entered.
     var dispatch = try initDispatchWork(std.testing.allocator, .{
         .request_id = 62,
-        .route_entry_specifier = route_specifier,
+        .route_index = route_index,
         .deadline_monotonic_ns = 5,
     });
     defer dispatch.deinit();
@@ -845,10 +845,11 @@ test "native internal failure without a vm turn publishes zero turn cpu" {
     // 500 internal-error path of `failInternal`.
     const route_specifier = try rt.routeSpecifier(std.testing.allocator, "/native-fail-turn-cpu.js");
     defer std.testing.allocator.free(route_specifier);
+    const route_index = try runtime.modules.state.addRoute(std.testing.allocator, route_specifier, &ipc.route_bindings.empty_blob);
 
     var dispatch = try initDispatchWork(std.testing.allocator, .{
         .request_id = 63,
-        .route_entry_specifier = route_specifier,
+        .route_index = route_index,
         .request = .{ .path = "/native-fail" },
     });
     defer dispatch.deinit();
@@ -889,7 +890,7 @@ test "vm turn completion publishes the turn cpu delta not accumulated thread cpu
 
     const heavy_specifier = try rt.routeSpecifier(std.testing.allocator, "/turn-cpu-delta-heavy.js");
     defer std.testing.allocator.free(heavy_specifier);
-    try rt.registerRoute(&runtime, heavy_specifier,
+    const heavy_route = try rt.registerRoute(&runtime, heavy_specifier,
         \\export default function handle() {
         \\    let acc = 0;
         \\    for (let i = 0; i < 2000000; i++) acc += Math.sqrt(i);
@@ -899,7 +900,7 @@ test "vm turn completion publishes the turn cpu delta not accumulated thread cpu
 
     const light_specifier = try rt.routeSpecifier(std.testing.allocator, "/turn-cpu-delta-light.js");
     defer std.testing.allocator.free(light_specifier);
-    try rt.registerRoute(&runtime, light_specifier,
+    const light_route = try rt.registerRoute(&runtime, light_specifier,
         \\export default function handle() {
         \\    return "light";
         \\}
@@ -913,7 +914,7 @@ test "vm turn completion publishes the turn cpu delta not accumulated thread cpu
 
     var dispatch_a = try initDispatchWork(std.testing.allocator, .{
         .request_id = 64,
-        .route_entry_specifier = heavy_specifier,
+        .route_index = heavy_route,
         .request = .{ .path = "/turn-heavy" },
     });
     defer dispatch_a.deinit();
@@ -934,7 +935,7 @@ test "vm turn completion publishes the turn cpu delta not accumulated thread cpu
 
     var dispatch_b = try initDispatchWork(std.testing.allocator, .{
         .request_id = 65,
-        .route_entry_specifier = light_specifier,
+        .route_index = light_route,
         .request = .{ .path = "/turn-light" },
     });
     defer dispatch_b.deinit();
@@ -975,7 +976,7 @@ test "native completion after a vm turn on the same thread does not inherit turn
 
     const route_specifier = try rt.routeSpecifier(std.testing.allocator, "/turn-cpu-inherit.js");
     defer std.testing.allocator.free(route_specifier);
-    try rt.registerRoute(&runtime, route_specifier,
+    const route_index = try rt.registerRoute(&runtime, route_specifier,
         \\export default function handle() {
         \\    let acc = 0;
         \\    for (let i = 0; i < 2000000; i++) acc += Math.sqrt(i);
@@ -991,7 +992,7 @@ test "native completion after a vm turn on the same thread does not inherit turn
     // thread clock the CPU a reading of that clock would leak into B.
     var dispatch_a = try initDispatchWork(std.testing.allocator, .{
         .request_id = 66,
-        .route_entry_specifier = route_specifier,
+        .route_index = route_index,
         .request = .{ .path = "/inherit-heavy" },
     });
     defer dispatch_a.deinit();
@@ -1011,7 +1012,7 @@ test "native completion after a vm turn on the same thread does not inherit turn
         .request_id = 67,
         .request_generation = 5,
         .request_slot = 9,
-        .route_entry_specifier = route_specifier,
+        .route_index = route_index,
         .request = .{ .path = "/inherit-cancel" },
     });
     defer dispatch_b.deinit();
@@ -1062,7 +1063,7 @@ test "expired request deadline wins before synchronous handler dispatch" {
 
     const route_specifier = try rt.routeSpecifier(std.testing.allocator, "/__test_route/expired.js");
     defer std.testing.allocator.free(route_specifier);
-    try rt.registerRoute(&runtime, route_specifier,
+    const route_index = try rt.registerRoute(&runtime, route_specifier,
         \\export default function handle() {
         \\    return "should not run";
         \\}
@@ -1070,7 +1071,7 @@ test "expired request deadline wins before synchronous handler dispatch" {
 
     var dispatch = try initDispatchWork(std.testing.allocator, .{
         .request_id = 19,
-        .route_entry_specifier = route_specifier,
+        .route_index = route_index,
         .deadline_monotonic_ns = 5,
     });
     defer dispatch.deinit();
@@ -1105,7 +1106,7 @@ test "expired deadline wins over queued async completion" {
 
     const route_specifier = try rt.routeSpecifier(std.testing.allocator, "/__test_route/async-deadline.js");
     defer std.testing.allocator.free(route_specifier);
-    try rt.registerRoute(&runtime, route_specifier,
+    const route_index = try rt.registerRoute(&runtime, route_specifier,
         \\export default async function handle() {
         \\    await Promise.resolve();
         \\    return "late ok";
@@ -1114,7 +1115,7 @@ test "expired deadline wins over queued async completion" {
 
     var dispatch = try initDispatchWork(std.testing.allocator, .{
         .request_id = 20,
-        .route_entry_specifier = route_specifier,
+        .route_index = route_index,
         .deadline_monotonic_ns = 5,
     });
     defer dispatch.deinit();
@@ -1205,7 +1206,7 @@ test "a traced request stamps each phase up to its handler's call in order, the 
 
     const route_specifier = try rt.routeSpecifier(std.testing.allocator, "/__test_route/traced.js");
     defer std.testing.allocator.free(route_specifier);
-    try rt.registerRoute(&runtime, route_specifier,
+    const route_index = try rt.registerRoute(&runtime, route_specifier,
         \\export default async function handle() {
         \\    await Promise.resolve();
         \\    return "traced";
@@ -1218,7 +1219,7 @@ test "a traced request stamps each phase up to its handler's call in order, the 
     for ([_]u64{ 71, 72 }, [_]u32{ 1, 3 }) |request_id, stream_id| {
         var dispatch = try initDispatchWork(std.testing.allocator, .{
             .request_id = request_id,
-            .route_entry_specifier = route_specifier,
+            .route_index = route_index,
             .request = .{ .path = "/traced" },
         });
         defer dispatch.deinit();

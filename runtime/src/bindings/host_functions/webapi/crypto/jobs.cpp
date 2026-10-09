@@ -61,7 +61,7 @@ extern "C" ColloStatus collo_crypto_job_settle(ColloVm* vm, ColloCryptoJob* job,
         return COLLO_STATUS_INVALID_ARGUMENT;
     if (!owned->belongsTo(vm))
         return COLLO_STATUS_INVALID_ARGUMENT;
-    return owned->settle(vm->global_object, out_exception);
+    return owned->settle(out_exception);
 }
 
 extern "C" void collo_crypto_job_destroy(ColloCryptoJob* job) { delete reinterpret_cast<CryptoJob*>(job); }
@@ -77,7 +77,7 @@ static JSC::EncodedJSValue runCryptoJobPromiseInline(
 
     job->run();
     ColloValue* exception = nullptr;
-    ColloStatus status = job->settle(global_object, &exception);
+    ColloStatus status = job->settle(&exception);
     if (exception)
         collo_value_release(exception);
     if (status != COLLO_STATUS_OK)

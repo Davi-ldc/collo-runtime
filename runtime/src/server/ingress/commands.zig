@@ -15,30 +15,41 @@
 //! the order).
 //!
 //! A full queue refuses a command, and its producer acts on the refusal as
-//! `lane_commands.zig` says for that command. Three commands may also fill a
-//! reserve the other commands cannot reach, because a refusal would cost
-//! more than the command: a worker's death, which the lane's requests on that
-//! worker would otherwise wait out to their deadlines; a slot whose grant
-//! makes the lane the worker's reader, which a refused post would hand back
-//! with the slot, leaving its waiting request to its deadline; and a
-//! completion a reader forwards, whose loss would leave a worker that
-//! answered in time to the grace backstop's fault. A lane serving the
-//! configuration reserves, per worker table entry of every pool, one place
-//! for a death, one for a reader grant and one per slot for a completion
-//! (`lane.obligationReserve`): a worker dies once, the pool grants its
-//! reader role to one lane at a time, and a reader forwards at most one
-//! completion per request it was sent (`RequestTable.claimCompletion`). The
-//! reserve runs out only if one entry's worker is launched, dies and is
-//! retired again while the lane leaves an earlier command of that entry
-//! unprocessed.
+//! `lane_commands.zig` says for that command. The queue's places are of two
+//! kinds, and a command takes only places of its own kind. Five commands
+//! take reserved places (`Command.takesReserve`), because a refusal would
+//! cost more than the command, or because they carry worker output, which
+//! must never take the places the lane's own exchanges need: a worker's
+//! death, which the lane's requests on that worker would otherwise wait out
+//! to their deadlines; a slot whose grant makes the lane the worker's reader,
+//! which a refused post would hand back with the slot, leaving its waiting
+//! request to its deadline; a completion a reader forwards, whose loss would
+//! leave a worker that answered in time to the grace backstop's fault; and a
+//! descriptor a reader forwards and the answer for its ring payload. Every
+//! other command takes ordinary places. A lane serving the configuration
+//! reserves, per worker table entry of every pool, one place for a death, one
+//! for a reader grant, one per slot for a completion, and the entry's
+//! forwarding window (`lane.obligationReserve`): a worker dies once, the pool
+//! grants its reader role to one lane at a time, a reader forwards at most
+//! one completion per request it was sent (`RequestTable.claimCompletion`),
+//! and an entry's forwarded descriptors and answers waiting in all lanes'
+//! queues together never pass `limits.ingress.forwarded_commands_per_worker_max`
+//! (`runner/h2_worker_ipc.zig`). The reserve runs out only if one entry's
+//! worker is launched, dies and is retired again while the lane leaves an
+//! earlier command of that entry unprocessed.
+//!
+//! The queue's places are a fault-in slab of nodes threaded on a FIFO
+//! (`slab.zig`), so its memory follows the most commands it ever held at
+//! once, not its capacity.
 
 const std = @import("std");
-const ingress_state = @import("state.zig");
+const lifecycle = @import("collo_server_lifecycle");
 const fault = @import("fault.zig");
 const lane_commands = @import("lane_commands.zig");
+const slab = @import("slab.zig");
 
 pub const WorkerDied = struct {
-    worker_key: ingress_state.WorkerKey,
+    worker_key: lifecycle.WorkerKey,
     /// Why the worker is dead, as the access records and usage floors of the
     /// requests its death ends carry it.
     reason: fault.WorkerFaultReason,
@@ -83,18 +94,31 @@ pub const Command = union(enum) {
     /// says why each one is bounded).
     pub fn takesReserve(self: *const Command) bool {
         return switch (self.*) {
-            .worker_died, .forwarded_completion => true,
+            .worker_died,
+            .forwarded_completion,
+            .forwarded_descriptor,
+            .payload_consumed,
+            => true,
             .dispatch_ready => |*ready| ready.reader == .you_become_reader,
             .empty,
             .dispatch_failed,
-            .forwarded_descriptor,
-            .payload_consumed,
             .release_worker,
             .shutdown,
             => false,
         };
     }
 };
+
+/// One place of a queue.
+const Node = struct {
+    slab_link: slab.Link = .{},
+    command: Command = .empty,
+    /// The command counts against the reserved places.
+    reserved: bool = false,
+};
+
+/// The memory one queued command costs, for the lane plan's charge.
+pub const node_bytes: usize = @sizeOf(Node);
 
 pub const Counters = struct {
     posted: u64 = 0,
@@ -107,49 +131,52 @@ pub const Counters = struct {
 };
 
 pub const Queue = struct {
-    allocator: std.mem.Allocator,
     mutex: std.Thread.Mutex = .{},
-    /// A ring of `len` commands from `head`, oldest first.
-    items: []Command,
-    head: usize = 0,
-    len: usize = 0,
-    /// The places at the end of `items` that only `Command.takesReserve`
-    /// commands may fill.
+    /// Every place, `capacity + reserve` of them.
+    nodes: slab.FaultInSlab(Node),
+    /// The queued commands' places, oldest first.
+    fifo: slab.Fifo(Node) = .{},
+    /// The places only `Command.takesReserve` commands fill; the rest of
+    /// `nodes` are ordinary places, which those commands never fill.
     reserve: usize,
+    /// Queued commands in ordinary and in reserved places.
+    ordinary_used: usize = 0,
+    reserved_used: usize = 0,
     counters: Counters = .{},
     event_fd: std.posix.fd_t,
 
-    /// Allocates `capacity` places for every command plus `reserve` places
-    /// for the commands that may take the reserve, and the eventfd. Fails
-    /// with `error.InvalidCommandQueueCapacity` for a zero `capacity`, and
-    /// with the allocation's or the eventfd's error, leaving nothing
-    /// allocated.
-    pub fn init(allocator: std.mem.Allocator, capacity: usize, reserve: usize) !Queue {
-        if (capacity == 0)
+    /// Reserves `ordinary` places plus `reserve` places for the commands
+    /// that take the reserve, and creates the eventfd. Fails with
+    /// `error.InvalidCommandQueueCapacity` for zero ordinary places, and with
+    /// the mapping's or the eventfd's error, leaving nothing behind.
+    pub fn init(ordinary: usize, reserve: usize) !Queue {
+        if (ordinary == 0)
             return error.InvalidCommandQueueCapacity;
-        const items = try allocator.alloc(Command, capacity + reserve);
-        errdefer allocator.free(items);
-        @memset(items, .empty);
+        const total = std.math.cast(u32, ordinary + reserve) orelse return error.InvalidCommandQueueCapacity;
+        var nodes = try slab.FaultInSlab(Node).init(total);
+        errdefer nodes.deinit();
         const event_fd = try std.posix.eventfd(0, std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK);
         return .{
-            .allocator = allocator,
-            .items = items,
+            .nodes = nodes,
             .reserve = reserve,
             .event_fd = event_fd,
         };
     }
 
     pub fn deinit(self: *Queue) void {
-        var remaining = self.len;
-        var index = self.head;
-        while (remaining != 0) : (remaining -= 1) {
-            self.items[index].deinit();
-            index = (index + 1) % self.items.len;
+        while (self.fifo.pop(&self.nodes)) |index| {
+            self.nodes.entries[index].command.deinit();
+            self.nodes.release(index);
         }
         if (self.event_fd >= 0)
             std.posix.close(self.event_fd);
-        self.allocator.free(self.items);
+        self.nodes.deinit();
         self.* = undefined;
+    }
+
+    /// The places of the queue, ordinary and reserved.
+    pub fn capacity(self: *const Queue) usize {
+        return self.nodes.capacity();
     }
 
     pub fn commandEventFd(self: *const Queue) std.posix.fd_t {
@@ -175,12 +202,16 @@ pub const Queue = struct {
     pub fn dequeue(self: *Queue) ?Command {
         self.mutex.lock();
         defer self.mutex.unlock();
-        if (self.len == 0)
-            return null;
-        const command = self.items[self.head];
-        self.items[self.head] = .empty;
-        self.head = (self.head + 1) % self.items.len;
-        self.len -= 1;
+        const index = self.fifo.pop(&self.nodes) orelse return null;
+        const node = &self.nodes.entries[index];
+        const command = node.command;
+        node.command = .empty;
+        if (node.reserved) {
+            self.reserved_used -= 1;
+        } else {
+            self.ordinary_used -= 1;
+        }
+        self.nodes.release(index);
         self.counters.dequeued += 1;
         return command;
     }
@@ -190,7 +221,15 @@ pub const Queue = struct {
     pub fn pending(self: *Queue) usize {
         self.mutex.lock();
         defer self.mutex.unlock();
-        return self.len;
+        return self.fifo.len;
+    }
+
+    /// Writes a wake without queueing a command, for a lane whose wake bits
+    /// changed (`LaneWorker.raiseWake` in `runner/root.zig`).
+    pub fn wake(self: *Queue) error{CommandEventfdCorrupt}!void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.signalLocked();
     }
 
     /// Reads and clears the eventfd's count. A read that fails for any reason
@@ -216,29 +255,28 @@ pub const Queue = struct {
         return value;
     }
 
-    /// Pushes `command` under the mutex unless the queue is full for it.
-    /// Leaves freeing a refused command to `post`, outside the mutex.
+    /// Pushes `command` under the mutex unless every place of its kind is
+    /// taken. Leaves freeing a refused command to `post`, outside the mutex.
     fn push(self: *Queue, command: Command) error{CommandEventfdCorrupt}!bool {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const limit = if (command.takesReserve()) self.items.len else self.items.len - self.reserve;
-        if (self.len < limit) {
-            try self.signalLocked();
-            self.pushLocked(command);
-            return true;
-        } else {
+        const reserved = command.takesReserve();
+        const used = if (reserved) &self.reserved_used else &self.ordinary_used;
+        const limit = if (reserved) self.reserve else self.nodes.capacity() - self.reserve;
+        if (used.* >= limit) {
             self.counters.refused_full += 1;
             return false;
         }
-    }
-
-    fn pushLocked(self: *Queue, command: Command) void {
-        std.debug.assert(self.len < self.items.len);
-        const index = (self.head + self.len) % self.items.len;
-        std.debug.assert(std.meta.activeTag(self.items[index]) == .empty);
-        self.items[index] = command;
-        self.len += 1;
+        try self.signalLocked();
+        // Fewer places are queued than the queue has, and a place is free
+        // exactly while it is not queued.
+        const acquired = self.nodes.acquire().?;
+        acquired.entry.command = command;
+        acquired.entry.reserved = reserved;
+        _ = self.fifo.push(&self.nodes, acquired.index);
+        used.* += 1;
         self.counters.posted += 1;
+        return true;
     }
 
     fn signalLocked(self: *Queue) error{CommandEventfdCorrupt}!void {

@@ -15,9 +15,10 @@
 //! after that, on first use or otherwise.
 //!
 //! The boot context is the identity of module top-level code. It is open
-//! from before the route entry is evaluated until that evaluation settles,
-//! and once closed it is gone for the life of the process: no work may be
-//! scheduled under its id again (`bootIdentityClosed`).
+//! from before the routes' entries are evaluated until every one of those
+//! evaluations settles, and once closed it is gone for the life of the
+//! process: no work may be scheduled under its id again
+//! (`bootIdentityClosed`).
 //!
 //! Which file holds what. Every file below but `core.zig`, `types.zig` and
 //! `sentinel.zig` has a `Methods(Runtime)` mixin whose functions `Runtime`
@@ -25,7 +26,7 @@
 //! - This file: `Runtime` with its fields, its construction and teardown,
 //!   its clock and the sentinel's start.
 //! - `boot_context.zig`: the boot context, from its install through the
-//!   route entry's evaluation to its close.
+//!   evaluation of every route's entry to its close.
 //! - `vm_hooks.zig`: what `attachHostRuntime` registers on the VM, with the
 //!   owner-transition hook and the console and exception-log sinks.
 //! - `scheduler.zig`: the ready queue, timers and immediates, request
@@ -50,7 +51,6 @@ const egress_body = @import("../egress/body/root.zig");
 const exception_log = @import("collo_worker_js").exception_log;
 const response_flow = @import("../serve/response.zig");
 const fs_fault = @import("../fs/fault.zig");
-const route_env = @import("../modules/route_env.zig");
 const runtime_boot_context = @import("boot_context.zig");
 const runtime_core = @import("core.zig");
 const runtime_crypto = @import("crypto.zig");
@@ -75,7 +75,7 @@ pub const Runtime = struct {
     /// it (`worker/fs/fault.zig` owns the behavior).
     fs_fault: fs_fault.State,
     /// The boot context's state, independent of the worker's lifecycle:
-    /// `.open` from init until the route entry's evaluation settles, then
+    /// `.open` from init until every route's evaluation settles, then
     /// `.closing` and `.closed` through `closeBootContext`. A top-level await
     /// may settle after the worker reported ready, so requests can run while
     /// the boot context is still open. `.closed` is final.
@@ -144,8 +144,14 @@ pub const Runtime = struct {
         });
 
         // A route's `env` is built only once its module is ready, so a
-        // malformed blob is refused here, before the worker reports ready.
-        try route_env.validate(runtime_options.route_bindings_blob);
+        // malformed route table is refused here, before the worker reports
+        // ready.
+        var modules = try runtime_modules.Modules.init(
+            allocator,
+            runtime_options.route_table,
+            runtime_options.isolate_realm,
+        );
+        errdefer modules.deinit(allocator);
 
         var core = try runtime_core.Core.init(allocator, vm, control_fd, runtime_options);
         errdefer core.deinit();
@@ -175,11 +181,6 @@ pub const Runtime = struct {
             requests.deinitTables(allocator);
             requests.deinitActiveMap(allocator);
         }
-
-        const modules = runtime_modules.Modules.init(
-            runtime_options.route_bindings_blob,
-            runtime_options.route_bindings_route,
-        );
 
         return .{
             .core = core,
@@ -255,7 +256,7 @@ pub const Runtime = struct {
 
     pub const installBootContext = BootContextMethods.installBootContext;
     pub const bootContext = BootContextMethods.bootContext;
-    pub const evaluateBootRouteEntry = BootContextMethods.evaluateBootRouteEntry;
+    pub const evaluateBootRoutes = BootContextMethods.evaluateBootRoutes;
     pub const closeBootContext = BootContextMethods.closeBootContext;
     pub const bootIdentityClosed = BootContextMethods.bootIdentityClosed;
 
@@ -272,7 +273,6 @@ pub const Runtime = struct {
     pub const requestDeadlineSentinelFired = SchedulerMethods.requestDeadlineSentinelFired;
     pub const scheduleTimer = SchedulerMethods.scheduleTimer;
     pub const scheduleImmediate = SchedulerMethods.scheduleImmediate;
-    pub const scheduleTimeout = SchedulerMethods.scheduleTimeout;
     pub const readyItemOwnerRequestId = SchedulerMethods.readyItemOwnerRequestId;
     pub const tryQueueReadyWork = SchedulerMethods.tryQueueReadyWork;
     pub const tryQueueReadyWorkReadySince = SchedulerMethods.tryQueueReadyWorkReadySince;

@@ -16,6 +16,7 @@ comptime {
     _ = @import("modules.zig");
     _ = @import("multiplexing.zig");
     _ = @import("response.zig");
+    _ = @import("routes.zig");
     _ = @import("server_api.zig");
     _ = @import("vm_hooks.zig");
     _ = @import("wasm.zig");

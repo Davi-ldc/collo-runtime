@@ -122,6 +122,12 @@ const boot_egress: launch.BootEgress = .{
 /// Whether a launch sends a session or the worker's wake descriptors alone.
 const Egress = enum { detached, attached };
 
+/// The routes of an `InitSend` launch: a one-route table, and whether each
+/// route runs in a realm of its own.
+const Routes = struct {
+    isolate_realm: bool = false,
+};
+
 /// A machine posed after its local steps, with every descriptor `sendInit`
 /// reads, so `sendInit` sends a real WorkerInit down `pair[0]`. One eventfd
 /// stands in for every borrowed descriptor, since the receiver only counts
@@ -132,13 +138,16 @@ const InitSend = struct {
     stand_in_fd: std.posix.fd_t,
     wake_set: ipc.egress_shared.WakeSet,
     session: ipc.egress_shared.SessionFds,
+    /// The launch's route table when it has routes.
+    table: ?ipc.route_table.Sealed,
     machine: Machine,
 
-    /// With `route_entry_specifier`, the launch carries a route entry whose
-    /// pack is the stand-in. The wake set and a session on it exist either
-    /// way; `egress` decides whether the launch sends the session's half and
-    /// its boot token or the wake descriptors alone.
-    fn init(self: *InitSend, route_entry_specifier: ?[]const u8, egress: Egress) !void {
+    /// With `routes`, the launch carries a one-route table, whose length
+    /// WorkerInit announces, and the stand-in as its pack. The wake set and
+    /// a session on it exist either way; `egress` decides whether the launch
+    /// sends the session's half and its boot token or the wake descriptors
+    /// alone.
+    fn init(self: *InitSend, routes: ?Routes, egress: Egress) !void {
         self.pair = try fd_mod.socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
         errdefer closePair(self.pair);
         self.stand_in_fd = try eventFd();
@@ -147,18 +156,31 @@ const InitSend = struct {
         errdefer self.wake_set.deinit();
         self.session = try ipc.egress_shared.createSessionForWorker(&self.wake_set);
         errdefer self.session.deinit();
+        self.table = null;
+        if (routes != null) {
+            self.table = try ipc.route_table.buildSealed(std.testing.allocator, &.{.{
+                .entry_specifier = "/__collo_route/demo/entry.js",
+                .bindings = &.{},
+            }});
+        }
+        errdefer if (self.table) |table| table.close();
 
         self.machine = posed(.idle, false);
         self.machine.memory_limit_bytes = 64 * 1024 * 1024;
-        self.machine.route_bindings_blob_len = ipc.route_bindings.empty_blob.len;
         self.machine.options.egress = switch (egress) {
             .detached => .{ .detached = &self.wake_set },
             .attached => .{ .attached = .{ .shared_fds = self.session.rawForWorker(), .boot = boot_egress } },
         };
-        self.machine.options.route_entry = if (route_entry_specifier) |specifier|
-            .{ .fd = self.stand_in_fd, .specifier = specifier }
-        else
-            null;
+        if (routes) |route_options| {
+            self.machine.options.routes = .{
+                .table = self.table.?,
+                .module_pack_fd = self.stand_in_fd,
+                .isolate_realm = route_options.isolate_realm,
+            };
+            self.machine.route_table_len = self.table.?.blob_len;
+        } else {
+            self.machine.route_table_len = ipc.route_table.empty_blob.len;
+        }
         self.machine.worker_init_fd = self.pair[0];
         self.machine.metrics_fd = self.stand_in_fd;
         self.machine.completion_eventfd = self.stand_in_fd;
@@ -167,16 +189,18 @@ const InitSend = struct {
         self.machine.tmp_root_dir_fd = self.stand_in_fd;
         self.machine.cgroup_dir_fd = self.stand_in_fd;
         self.machine.placeholder_fs_index_fd = self.stand_in_fd;
-        self.machine.route_bindings_memfd = try eventFd();
-        errdefer std.posix.close(self.machine.route_bindings_memfd);
+        self.machine.route_table_memfd = try eventFd();
+        errdefer std.posix.close(self.machine.route_table_memfd);
         self.machine.fs_fault_worker_fd = try eventFd();
     }
 
     fn deinit(self: *InitSend) void {
-        if (self.machine.route_bindings_memfd >= 0)
-            std.posix.close(self.machine.route_bindings_memfd);
+        if (self.machine.route_table_memfd >= 0)
+            std.posix.close(self.machine.route_table_memfd);
         if (self.machine.fs_fault_worker_fd >= 0)
             std.posix.close(self.machine.fs_fault_worker_fd);
+        if (self.table) |table|
+            table.close();
         self.session.deinit();
         self.wake_set.deinit();
         std.posix.close(self.stand_in_fd);
@@ -189,24 +213,31 @@ const InitSend = struct {
     }
 };
 
-test "a launch with a route entry tells the child it serves routes and sends the pack" {
-    var send: InitSend = undefined;
-    const specifier = "/__collo_route/demo/entry.js";
-    try send.init(specifier, .attached);
-    defer send.deinit();
+test "a launch with routes tells the child it serves them and in which realm mode, and sends the pack" {
+    for ([_]bool{ false, true }) |isolate_realm| {
+        var send: InitSend = undefined;
+        try send.init(.{ .isolate_realm = isolate_realm }, .attached);
+        defer send.deinit();
 
-    try expectEffects(send.machine.sendInit(), &.{ .arm_init_poll, .arm_pidfd_poll });
-    try std.testing.expectEqual(LaunchPhase.awaiting_ready, send.machine.phase);
+        try expectEffects(send.machine.sendInit(), &.{ .arm_init_poll, .arm_pidfd_poll });
+        try std.testing.expectEqual(LaunchPhase.awaiting_ready, send.machine.phase);
+        // The send closed the machine's dup of the table.
+        try std.testing.expectEqual(@as(std.posix.fd_t, -1), send.machine.route_table_memfd);
 
-    var received = try ipc.recvWorkerInit(send.pair[1]);
-    defer received.deinit();
-    try received.message.validate();
-    try std.testing.expect(received.message.servesRoutes());
-    try std.testing.expectEqualStrings(specifier, received.routeEntrySpecifier());
-    try std.testing.expect(received.route_entry_fd != null);
+        var received = try ipc.recvWorkerInit(send.pair[1]);
+        defer received.deinit();
+        try received.message.validate();
+        try std.testing.expect(received.message.servesRoutes());
+        try std.testing.expectEqual(isolate_realm, received.message.isolatesRealms());
+        // The send carries the length the fixture recorded in `prepare`'s
+        // place; server/tests/supervisor/launcher.zig follows a real
+        // `prepare` from the table to the child.
+        try std.testing.expectEqual(send.table.?.blob_len, received.message.route_table_len);
+        try std.testing.expect(received.module_pack_fd != null);
+    }
 }
 
-test "a launch without a route entry leaves the serves-routes flag clear" {
+test "a launch without routes sends the empty table and leaves the serves-routes flag clear" {
     var send: InitSend = undefined;
     try send.init(null, .attached);
     defer send.deinit();
@@ -217,7 +248,9 @@ test "a launch without a route entry leaves the serves-routes flag clear" {
     defer received.deinit();
     try received.message.validate();
     try std.testing.expect(!received.message.servesRoutes());
-    try std.testing.expect(received.route_entry_fd == null);
+    try std.testing.expect(!received.message.isolatesRealms());
+    try std.testing.expectEqual(@as(u64, ipc.route_table.empty_blob.len), received.message.route_table_len);
+    try std.testing.expect(received.module_pack_fd == null);
 }
 
 test "an attached launch sends the session's half beside a boot token that expires with the child window (#48)" {
@@ -369,7 +402,7 @@ test "abandon hands back the pidfd and the cgroup leaf and releases everything e
         try eventFd(), try eventFd(), try eventFd(), try eventFd(),
     };
     machine.worker_init_fd = released[0];
-    machine.route_bindings_memfd = released[1];
+    machine.route_table_memfd = released[1];
     machine.metrics_fd = released[2];
     machine.completion_eventfd = released[3];
     machine.ingress_payload_fd = released[4];

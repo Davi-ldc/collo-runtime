@@ -1,7 +1,8 @@
 //! A whole ingress lane driven from the test thread, for the suites that need
 //! the lane's own handlers: `worker_faults.zig`, `lane_commands.zig`,
-//! `request_deadlines.zig`, `completion_ring.zig`, `fs_fault.zig` and
-//! `egress_tokens.zig`. Not a suite of its own.
+//! `lane_connections.zig`, `lane_ring.zig`, `request_deadlines.zig`,
+//! `completion_ring.zig`, `fs_fault.zig` and `egress_tokens.zig`. Not a
+//! suite of its own.
 //!
 //! Each lane is a `runner.LaneWorker` over `TestService`, which stands in for
 //! the ingress service: it holds the fixture supervisor and the lanes, posts
@@ -14,13 +15,15 @@
 //! read back deterministically: the handler's return, the frames the client
 //! reads, the commands waiting in a lane's queue, the deadlines in its wheel,
 //! the worker's entry in its pool and the retirements queued to the reaper.
-//! A lane still owns an io_uring, because its handlers arm polls on it, and
-//! the harness discards the completions those polls post.
+//! A lane still owns its ring (`event_sources.LaneRing`), because its
+//! handlers prepare polls and closes on it, and the harness discards the
+//! completions those post.
 //!
 //! Each of those calls is one pass of the loop: after the handler, the
 //! harness runs what the loop runs after the completions of a pass, the
 //! connections the handler queued for a turn and the worker faults it
-//! deferred (`ring_driver.runQueuedWork`).
+//! deferred (`ring_driver.runQueuedWork`), and ends the pass with the ring's
+//! one submit, as the loop does.
 //!
 //! A client connection sits in a lane connection slot already in HTTP/2
 //! state, over a socketpair with no TLS. A stub worker is a real worker handle
@@ -80,11 +83,6 @@ pub const lanes_max: usize = 2;
 /// Stub workers and client connections one harness tracks.
 pub const stubs_max: usize = 4;
 pub const clients_max: usize = 4;
-/// A harness lane's slabs, far below a serving lane's so a test allocates
-/// little: each connection slot carries its streams' state.
-const connections_per_lane: usize = 8;
-const requests_per_lane: usize = 16;
-const ring_entries: u16 = 64;
 /// Streams one client tracks, by stream id.
 const client_streams_max: usize = 16;
 /// Bytes a client keeps of what the lane wrote and it has not parsed yet:
@@ -254,6 +252,14 @@ pub const TestService = struct {
         return posted;
     }
 
+    /// Raises wake bit `bit` on lane `lane_id` through `LaneWorker.raiseWake`,
+    /// as the service does.
+    pub fn raiseLaneWake(self: *TestService, lane_id: pool.LaneId, bit: u32) PostError!void {
+        if (lane_id >= self.lanes.len)
+            return error.InvalidLaneId;
+        try self.lanes[lane_id].raiseWake(bit);
+    }
+
     /// Posts `dispatch_ready` for a slot a pool handed to a waiting request.
     /// A lane that refuses it gives the slot back at once with the grant it
     /// carried (`Pool.returnHandoff`), and a slot handed on again posts
@@ -405,9 +411,8 @@ pub const Reaper = struct {
     /// learned the reason from a `worker_died` notice.
     fn faultRecordedFor(self: *const Reaper, worker_key: lifecycle.WorkerKey) ?fault.WorkerFaultReason {
         for (self.lanes) |*lane_runner| {
-            const count = lane_runner.completion_registration_count;
-            for (lane_runner.completion_registrations[0..count]) |*registration| {
-                if (registration.worker == null) continue;
+            for (lane_runner.registrations.touched()) |*registration| {
+                if (!registration.inUse() or registration.worker == null) continue;
                 if (!registration.worker_key.eql(worker_key)) continue;
                 if (registration.fault) |recorded| return recorded;
             }
@@ -448,9 +453,9 @@ pub const Harness = struct {
     launcher: Launcher,
     reaper: Reaper,
     service: TestService,
-    /// Heap memory: a lane carries its registration table inline.
+    /// Heap memory, since every lane keeps a pointer to `service`.
     lanes: []Lane,
-    rings: [lanes_max]linux.IoUring,
+    rings: [lanes_max]runner.event_sources.LaneRing,
     lanes_started: u16,
     stubs: [stubs_max]?*StubWorker,
     clients: [clients_max]?*Client,
@@ -460,6 +465,12 @@ pub const Harness = struct {
         /// The limits every fixture definition gets: `concurrency` sets the
         /// slots of each stub worker.
         routes: fixture.RoutesOptions = .{},
+        /// The capacities of each lane's tables, a serving lane's unless a
+        /// test fills one.
+        table_capacities: runner.TableCapacities = .{},
+        /// Each lane's connection timeouts, a serving lane's unless a test
+        /// shortens them.
+        connection_timeouts: runner.deadline_driver.ConnectionTimeouts = .{},
     };
 
     /// Builds the harness in place, since every lane keeps a pointer to
@@ -504,7 +515,7 @@ pub const Harness = struct {
         };
         errdefer self.stopLanes();
         while (self.lanes_started < options.lane_count) : (self.lanes_started += 1)
-            try self.startLane(self.lanes_started);
+            try self.startLane(self.lanes_started, options);
     }
 
     /// Tears the lanes down first, which finishes every request still open as
@@ -520,25 +531,26 @@ pub const Harness = struct {
             if (entry.*) |stub| stub.destroy();
             entry.* = null;
         }
+        // A test reads a stopped lane's access records, so each ring goes
+        // only now; a lane that never started holds an empty one.
+        for (self.lanes) |*lane_runner|
+            lane_runner.access_ring.deinit();
         self.gpa.free(self.lanes);
         self.egress_gateways.deinit();
         fixture.deinitMinimal(&self.supervisor);
         self.* = undefined;
     }
 
-    fn startLane(self: *Harness, index: u16) !void {
+    fn startLane(self: *Harness, index: u16, options: Options) !void {
         const lane_runner = &self.lanes[index];
-        lane_runner.* = .{ .listener_index = index };
+        lane_runner.* = try Lane.init(index, null);
+        errdefer lane_runner.access_ring.deinit();
+        lane_runner.table_capacities = options.table_capacities;
+        lane_runner.connection_timeouts = options.connection_timeouts;
         lane_runner.service = &self.service;
-        lane_runner.lane = try ingress.lane.IngressLane.init(self.gpa, .{
-            .lane_id = index,
-            .max_connections = connections_per_lane,
-            .max_requests = requests_per_lane,
-            .command_obligation_reserve = ingress.lane.obligationReserve(self.supervisor.routes.definitionCount()),
-        }, os.process.monotonicNowNsOrZero());
-        lane_runner.lane_initialized = true;
+        try runner.ring_driver.Methods(Lane).initLane(lane_runner);
         errdefer runner.ring_driver.Methods(Lane).deinitLane(lane_runner);
-        self.rings[index] = try linux.IoUring.init(ring_entries, 0);
+        self.rings[index] = try runner.event_sources.LaneRing.init();
         errdefer self.rings[index].deinit();
         try runner.ring_driver.Methods(Lane).initRuntime(lane_runner);
         lane_runner.runtime_ring = &self.rings[index];
@@ -572,14 +584,16 @@ pub const Harness = struct {
     /// completion queue would eventually refuse new polls.
     pub fn discardPollCompletions(self: *Harness, index: u16) !void {
         var cqes: [64]linux.io_uring_cqe = undefined;
-        while (try self.rings[index].copy_cqes(&cqes, 0) != 0) {}
+        while (try self.rings[index].copyCompletions(&cqes) != 0) {}
     }
 
     /// Ends the loop pass a handler call stands for: the connections the
     /// handler queued for a turn, then the worker faults it deferred, then
-    /// the `request_ended` batch of the requests the pass finished.
+    /// the `request_ended` batch of the requests the pass finished, then the
+    /// submit of what the pass prepared on the ring.
     pub fn finishPass(self: *Harness, index: u16) !void {
         _ = try runner.ring_driver.Methods(Lane).runQueuedWork(self.lane(index));
+        try self.rings[index].submit();
     }
 
     /// Runs what a pass runs first: lane `index` renews its egress lease
@@ -635,6 +649,50 @@ pub const Harness = struct {
         }
         try client.start();
         return client;
+    }
+
+    pub const OpenedConnection = struct {
+        /// The client's end of the socket pair, which the caller owns.
+        client_fd: std.posix.fd_t,
+        key: lifecycle.ConnectionKey,
+    };
+
+    /// Takes a connection slot on lane `lane_index` for the server's end of a
+    /// fresh socket pair, as an accepted socket's past its TLS handshake
+    /// (`accept_flow.startConnection`), so the connection speaks HTTP/2 at
+    /// once. The slot owns the server's end, which the lane's close or its
+    /// teardown closes.
+    pub fn openConnectionSlot(self: *Harness, lane_index: u16) !OpenedConnection {
+        const lane_runner = self.lane(lane_index);
+        const pair = try os.fd.socketPairType(std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC | std.posix.SOCK.NONBLOCK);
+        errdefer std.posix.close(pair[1]);
+        const acquired = lane_runner.connections.acquire() orelse {
+            std.posix.close(pair[0]);
+            return error.ConnectionSlabFull;
+        };
+        const key: lifecycle.ConnectionKey = .{
+            .lane_id = lane_index,
+            .slot = acquired.index,
+            .generation = acquired.generation,
+        };
+        const runtime = acquired.entry;
+        const now = os.process.monotonicNowNsOrZero();
+        runtime.key = key;
+        runtime.fd = pair[0];
+        runtime.streams = &lane_runner.h2_lane.streams;
+        runtime.state = .http2_connection;
+        runtime.wait_events = runner.event_sources.read_events;
+        runtime.accepted_ns = now;
+        runtime.last_progress_ns = now;
+        return .{ .client_fd = pair[1], .key = key };
+    }
+
+    /// Runs the handler the lane runs when the connection in `slot` is
+    /// readable.
+    pub fn driveConnection(self: *Harness, lane_index: u16, slot: u32) !void {
+        try self.discardPollCompletions(lane_index);
+        try self.lane(lane_index).handleConnectionReadable(slot);
+        try self.finishPass(lane_index);
     }
 
     pub fn poolOf(self: *Harness, stub: *const StubWorker) *WorkerPool {
@@ -750,8 +808,8 @@ pub const Harness = struct {
     /// The slot of the request the lane of `client` admitted for stream
     /// `stream_id`, null once that request ended or if it never began.
     pub fn requestSlotOf(self: *Harness, client: *const Client, stream_id: u32) ?*const runner.request_slot.RequestSlot {
-        for (self.lane(client.lane_index).dynamic_requests) |*request| {
-            if (!request.active) continue;
+        for (self.lane(client.lane_index).requests.touched()) |*request| {
+            if (!request.isLive()) continue;
             if (request.ingress_channel_id != stream_id) continue;
             if (!request.connection_key.eql(client.key)) continue;
             return request;
@@ -764,8 +822,8 @@ pub const Harness = struct {
     /// second entry fails with `error.TwoDeadlinesForOneRequest`.
     pub fn deadlineArmedFor(self: *Harness, lane_index: u16, request_key: lifecycle.RequestKey) !?u64 {
         var armed: ?u64 = null;
-        for (self.lane(lane_index).lane.deadline_wheel.entries) |*entry| {
-            if (!entry.active) continue;
+        for (self.lane(lane_index).lane.deadline_wheel.entries.touched()) |*entry| {
+            if (!entry.slab_link.live) continue;
             if (!entry.request_key.eql(request_key)) continue;
             if (armed != null) return error.TwoDeadlinesForOneRequest;
             armed = entry.deadline_monotonic_ns;
@@ -787,11 +845,15 @@ pub const Harness = struct {
         const queue = &self.lane(lane_index).lane.command_queue;
         queue.mutex.lock();
         defer queue.mutex.unlock();
-        if (queue.len > out.len)
+        if (queue.fifo.len > out.len)
             return error.TooManyQueuedCommands;
-        for (out[0..queue.len], 0..) |*command, offset|
-            command.* = queue.items[(queue.head + offset) % queue.items.len];
-        return out[0..queue.len];
+        var place = queue.fifo.head;
+        for (out[0..queue.fifo.len]) |*command| {
+            const node = &queue.nodes.entries[place];
+            command.* = node.command;
+            place = node.slab_link.queue_next;
+        }
+        return out[0..queue.fifo.len];
     }
 
     /// Asserts that lane `lane_index`'s queue holds commands of exactly the
@@ -1221,10 +1283,15 @@ pub const StubWorker = struct {
 
     /// Reads every packet waiting on the control socket, each of which must
     /// carry body chunks of `request`, and appends their payloads to
-    /// `out[body.len..]`, inline or from the server-to-worker ring.
+    /// `out[body.len..]`, inline or from the server-to-worker ring. A release
+    /// of ring bytes a lane marked itself waiting for writes the completion
+    /// eventfd, as a worker's does (`worker/scheduler/loop.zig`).
     pub fn readBody(self: *StubWorker, request: Dispatched, out: []u8, body: *Body) !void {
         const gpa = self.harness.gpa;
-        const readers = ingress_channel.SharedPayloadReaders{ .server_to_worker = &self.payload };
+        const readers = ingress_channel.SharedPayloadReaders{
+            .server_to_worker = &self.payload,
+            .server_to_worker_credit_eventfd = self.record.handle.completion_eventfd,
+        };
         while (true) {
             var packet = ipc.recvPacketWithFdsScratch(gpa, self.control, self.recv_scratch) catch |err| switch (err) {
                 error.WouldBlock => return,
@@ -1305,6 +1372,18 @@ pub const StubWorker = struct {
             self.send_scratch,
             self.payload.writer(.worker_to_server),
         );
+    }
+
+    /// Whether the server wrote the worker's credit eventfd since the last
+    /// call, which it does only when it frees room in the worker-to-server
+    /// ring the worker marked itself waiting for. The read clears the count.
+    pub fn creditSignalled(self: *StubWorker) !bool {
+        var count: u64 = 0;
+        _ = std.posix.read(self.record.handle.ingress_payload_credit_eventfd, std.mem.asBytes(&count)) catch |err| switch (err) {
+            error.WouldBlock => return false,
+            else => return err,
+        };
+        return count != 0;
     }
 
     /// The worker-to-server ring's cursors, the read one the server's.
@@ -1441,6 +1520,8 @@ pub const Client = struct {
     inbox_len: usize = 0,
     streams: [client_streams_max]ClientStream = @splat(.{}),
     goaway_code: ?u32 = null,
+    /// The last stream id the lane's GOAWAY says it processed.
+    goaway_last_stream_id: ?u32 = null,
     peer_closed: bool = false,
 
     pub const Options = struct {
@@ -1452,31 +1533,9 @@ pub const Client = struct {
 
     fn create(harness: *Harness, lane_index: u16, options: Options) !*Client {
         const gpa = harness.gpa;
-        const lane_runner = harness.lane(lane_index);
-        const pair = try os.fd.socketPairType(std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC | std.posix.SOCK.NONBLOCK);
-        var server_end_owned = true;
-        errdefer if (server_end_owned) std.posix.close(pair[0]);
-        errdefer std.posix.close(pair[1]);
-
-        const buffer_index = runner.work_queues.Methods(Lane).acquireHeaderBuffer(lane_runner) orelse return error.IngressHeaderBufferExhausted;
-        var buffer_owned = true;
-        errdefer if (buffer_owned) runner.work_queues.Methods(Lane).releaseHeaderBuffer(lane_runner, buffer_index);
-        // The slab owns the server's end from here on, as an accepted socket's.
-        const key = try lane_runner.lane.allocateAcceptedConnection(os.fd.OwnedFd.fromRaw(pair[0]));
-        server_end_owned = false;
-        buffer_owned = false;
-        // A ready-queue entry left by the slot's last connection keeps the
-        // flag, as an accept does (`accept_flow.startConnection`).
-        const queued = lane_runner.connection_slots[key.slot].queued;
-        lane_runner.connection_slots[key.slot] = .{
-            .active = true,
-            .queued = queued,
-            .key = key,
-            .fd = pair[0],
-            .state = .http2_connection,
-            .buffer_index = buffer_index,
-            .wait_events = runner.event_sources.read_events,
-        };
+        const opened = try harness.openConnectionSlot(lane_index);
+        errdefer std.posix.close(opened.client_fd);
+        const key = opened.key;
 
         const client = try gpa.create(Client);
         errdefer gpa.destroy(client);
@@ -1490,7 +1549,7 @@ pub const Client = struct {
             .lane_index = lane_index,
             .slot = key.slot,
             .key = key,
-            .fd = pair[1],
+            .fd = opened.client_fd,
             .options = options,
             .encoder = encoder,
             .decoder = decoder,
@@ -1523,17 +1582,17 @@ pub const Client = struct {
 
     /// Whether the lane still holds this connection.
     pub fn open(self: *Client) bool {
-        const runtime = &self.harness.lane(self.lane_index).connection_slots[self.slot];
-        return runtime.active and runtime.key.eql(self.key);
+        return switch (self.harness.lane(self.lane_index).connections.lookup(self.slot, self.key.generation)) {
+            .live => true,
+            .stale_generation, .vacant, .out_of_range => false,
+        };
     }
 
     /// Runs the handler the lane runs when the connection is readable.
     pub fn drive(self: *Client) !void {
         if (!self.open())
             return;
-        try self.harness.discardPollCompletions(self.lane_index);
-        try self.harness.lane(self.lane_index).handleConnectionReadable(self.slot);
-        try self.harness.finishPass(self.lane_index);
+        try self.harness.driveConnection(self.lane_index, self.slot);
     }
 
     /// Lets the lane flush what it queued for the client, then reads and
@@ -1663,7 +1722,9 @@ pub const Client = struct {
         return null;
     }
 
-    fn writeFrame(self: *Client, frame_type: h2.FrameType, flags: u8, stream_id: u32, payload: []const u8) !void {
+    /// One frame as the client sends it, for a frame the helpers above do not
+    /// write.
+    pub fn writeFrame(self: *Client, frame_type: h2.FrameType, flags: u8, stream_id: u32, payload: []const u8) !void {
         var header_bytes: [h2.frame_header_len]u8 = undefined;
         const header = h2.FrameHeader{
             .length = @intCast(payload.len),
@@ -1677,9 +1738,10 @@ pub const Client = struct {
         try self.writeAll(payload);
     }
 
-    /// Writes `bytes` whole. A full socket lets the lane read before the
-    /// next attempt, which is what a client waiting on the network does.
-    fn writeAll(self: *Client, bytes: []const u8) !void {
+    /// Writes `bytes` whole, which need not end on a frame boundary. A full
+    /// socket lets the lane read before the next attempt, which is what a
+    /// client waiting on the network does.
+    pub fn writeAll(self: *Client, bytes: []const u8) !void {
         var written: usize = 0;
         var stalls: usize = 0;
         while (written < bytes.len) {
@@ -1750,6 +1812,7 @@ pub const Client = struct {
             .goaway => {
                 if (payload.len < 8)
                     return error.MalformedGoawayFrame;
+                self.goaway_last_stream_id = std.mem.readInt(u32, payload[0..4], .big) & h2.max_window_size;
                 self.goaway_code = std.mem.readInt(u32, payload[4..8], .big);
             },
             else => {},

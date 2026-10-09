@@ -29,8 +29,11 @@
 //! side writes. Once a view has moved a cursor, its side reaches it only by
 //! pointer: a copy would keep cursors of its own and publish positions that
 //! contradict the original's. A borrowed payload stays in the ring, where the
-//! writer can still rewrite it. After each release the reader signals the
-//! credit eventfd it was given, if any (`SharedPayloadReadRelease`).
+//! writer can still rewrite it. A writer that finds no room marks the ring,
+//! and the reader's next release signals the credit eventfd it was given
+//! (`SharedPayloadReadRelease`); a release with no writer waiting signals
+//! nothing. Either process can rewrite the mark, which only delays or
+//! repeats the other side's own wake.
 
 const std = @import("std");
 const fd_mod = @import("collo_os").fd;
@@ -67,14 +70,20 @@ pub const SharedPayloadSide = enum {
     }
 };
 
-/// One ring's cursors. Both count bytes since creation; the writer advances
-/// `write_cursor` and the reader advances `read_cursor`, each storing its own
-/// with release ordering and loading the other's with acquire ordering.
+/// One ring's cursors and its writer's mark. Both cursors count bytes since
+/// creation; the writer advances `write_cursor` and the reader advances
+/// `read_cursor`, each storing its own and loading the other's
+/// (`SharedPayloadView.moveOwnCursor`, `SharedPayloadView.loadCursors`).
 pub const SharedPayloadRingHeader = extern struct {
     read_cursor: u64,
     write_cursor: u64,
     capacity: u32,
-    _reserved0: u32 = 0,
+    /// Nonzero while the writer waits for room: it sets the mark when a
+    /// payload did not fit and checks the room once more, and the reader's
+    /// next release clears it and signals the writer's credit eventfd
+    /// (`SharedPayloadReadRelease`). A release that finds no mark signals
+    /// nothing.
+    writer_waiting: u32 = 0,
     _reserved1: [2]u64 = .{ 0, 0 },
 };
 
@@ -130,8 +139,14 @@ const Cursors = struct {
 };
 
 /// Ring bytes a reader still holds. `release` advances the ring's read
-/// cursor past them and signals the credit eventfd; the default value holds
-/// nothing.
+/// cursor past them and, when the writer marked itself waiting, clears the
+/// mark and signals the credit eventfd; the default value holds nothing.
+///
+/// The release stores the cursor and then takes the mark, and a waiting
+/// writer sets the mark and then loads the cursor, all four sequentially
+/// consistent. So either the release sees the mark and signals, or the
+/// writer's check sees the room the release made: no wait is lost, and a
+/// release with no writer waiting makes no system call.
 pub const SharedPayloadReadRelease = struct {
     view: ?*SharedPayloadView = null,
     direction: SharedPayloadDirection = .server_to_worker,
@@ -142,7 +157,8 @@ pub const SharedPayloadReadRelease = struct {
         const view = self.view orelse return;
         if (self.byte_len != 0) {
             view.releaseRead(self.direction, self.byte_len);
-            notifyEventFd(self.credit_eventfd);
+            if (view.takeWriterWaiting(self.direction))
+                notifyEventFd(self.credit_eventfd);
         }
         self.* = .{};
     }
@@ -220,6 +236,37 @@ pub const SharedPayloadView = struct {
     pub fn availableCapacity(self: *SharedPayloadView, direction: SharedPayloadDirection) !usize {
         const cursors = try self.loadCursors(direction);
         return shared_payload_ring_capacity - cursors.used();
+    }
+
+    /// Whether a payload of `len` bytes fits the ring of `direction`, which
+    /// this side writes, as `write` would place it now: before the end of
+    /// the ring, or at offset 0 behind the skipped tail.
+    pub fn fits(self: *SharedPayloadView, direction: SharedPayloadDirection, len: usize) !bool {
+        std.debug.assert(direction == self.side.writes());
+        if (len > shared_payload_ring_capacity)
+            return false;
+        const cursors = try self.loadCursors(direction);
+        const free = shared_payload_ring_capacity - cursors.used();
+        const tail_len = shared_payload_ring_capacity - @as(usize, @intCast(cursors.write % shared_payload_ring_capacity));
+        if (len <= tail_len)
+            return len <= free;
+        return tail_len + len <= free;
+    }
+
+    /// Marks this side waiting for room in the ring of `direction`, which it
+    /// writes. The caller then checks the room once more: the reader's next
+    /// release signals the writer's credit eventfd, unless that check already
+    /// sees the room (`SharedPayloadReadRelease`).
+    pub fn markWriterWaiting(self: *SharedPayloadView, direction: SharedPayloadDirection) void {
+        std.debug.assert(direction == self.side.writes());
+        _ = @atomicRmw(u32, &self.ringHeader(direction).writer_waiting, .Xchg, 1, .seq_cst);
+    }
+
+    /// Clears the writer's mark on the ring of `direction`, which this side
+    /// reads, and returns whether it was set.
+    fn takeWriterWaiting(self: *SharedPayloadView, direction: SharedPayloadDirection) bool {
+        std.debug.assert(direction != self.side.writes());
+        return @atomicRmw(u32, &self.ringHeader(direction).writer_waiting, .Xchg, 0, .seq_cst) != 0;
     }
 
     /// Takes back the last `len` ring bytes this side wrote in `direction`,
@@ -340,14 +387,16 @@ pub const SharedPayloadView = struct {
     }
 
     /// The ring's cursors as this side sees them: its own, and the peer's
-    /// loaded once with acquire ordering. A peer cursor that puts the reader
-    /// past the writer, or more bytes in flight than the ring holds, fails
-    /// with `error.InvalidIngressSharedPayloadRing`.
+    /// loaded once. A writer loads the read cursor sequentially consistent,
+    /// which the waiting mark's protocol needs (`SharedPayloadReadRelease`),
+    /// and a reader loads the write cursor with acquire ordering. A peer
+    /// cursor that puts the reader past the writer, or more bytes in flight
+    /// than the ring holds, fails with `error.InvalidIngressSharedPayloadRing`.
     fn loadCursors(self: *SharedPayloadView, direction: SharedPayloadDirection) error{InvalidIngressSharedPayloadRing}!Cursors {
         const ring = self.ringHeader(direction);
         const own = self.own_cursors[@intFromEnum(direction)];
         const cursors: Cursors = if (direction == self.side.writes())
-            .{ .read = @atomicLoad(u64, &ring.read_cursor, .acquire), .write = own }
+            .{ .read = @atomicLoad(u64, &ring.read_cursor, .seq_cst), .write = own }
         else
             .{ .read = own, .write = @atomicLoad(u64, &ring.write_cursor, .acquire) };
         if (cursors.read > cursors.write)
@@ -358,14 +407,16 @@ pub const SharedPayloadView = struct {
     }
 
     /// Sets this side's own cursor of `direction` and stores it to the
-    /// memfd for the peer, which loads it with acquire ordering.
+    /// memfd for the peer: a write cursor with release ordering, a read
+    /// cursor sequentially consistent for the waiting mark's protocol
+    /// (`SharedPayloadReadRelease`).
     fn moveOwnCursor(self: *SharedPayloadView, direction: SharedPayloadDirection, cursor: u64) void {
         self.own_cursors[@intFromEnum(direction)] = cursor;
         const ring = self.ringHeader(direction);
         if (direction == self.side.writes()) {
             @atomicStore(u64, &ring.write_cursor, cursor, .release);
         } else {
-            @atomicStore(u64, &ring.read_cursor, cursor, .release);
+            @atomicStore(u64, &ring.read_cursor, cursor, .seq_cst);
         }
     }
 

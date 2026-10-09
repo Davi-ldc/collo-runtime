@@ -70,7 +70,8 @@ pub export fn collo_runtime_fetch(
 /// the caller's next microtask checkpoint. On failure `deferred` keeps the
 /// deferred when it was not taken yet.
 fn rejectRefusedFetch(vm: *bindings.Vm, deferred: *promise_deferred.DeferredOwned, message: []const u8) !void {
-    var reason = try vm.typeErrorValueUtf8(message);
+    const realm = try deferred.realm();
+    var reason = try realm.typeErrorValueUtf8(message);
     defer reason.deinit();
     const raw = try deferred.take();
     defer bindings.releasePromiseDeferred(raw);

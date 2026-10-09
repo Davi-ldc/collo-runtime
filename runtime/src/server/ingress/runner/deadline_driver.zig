@@ -1,10 +1,9 @@
 //! The deadlines of an ingress lane, on the lane thread: the wheel of request
-//! deadlines (`timer_wheel.zig`) and the heap of pre-request deadlines that
-//! close a connection which has not started a request, both served by the
-//! lane's one deadline timerfd. The timerfd is the only wake for an expiry,
-//! so adding a deadline earlier than the armed one must re-arm it
-//! (`armTimerAt`). Removing a deadline may leave it armed early, which costs
-//! one spurious wake that re-arms it.
+//! deadlines (`timer_wheel.zig`) and the heap of connection deadlines, both
+//! served by the lane's one deadline timerfd. The timerfd is the only wake
+//! for an expiry, so a deadline earlier than the armed one re-arms it.
+//! Removing a deadline may leave it armed early, which costs one spurious
+//! wake that re-arms it.
 //!
 //! A request's wheel entry falls at its deadline while it waits for a worker
 //! slot or for room to send its begin, and at the deadline plus
@@ -18,9 +17,32 @@
 //! worker takes a fault, which ends the request with 504 and the worker's
 //! other requests with 502. A healthy worker therefore never dies of a
 //! deadline.
+//!
+//! A connection has at most one deadline at a time, one entry in the heap,
+//! and which one follows from its state (`desiredDeadline`):
+//! - pre-request, from the accept until its first request starts, at the
+//!   accept plus `pre_request_timeout_ns`; nothing extends it, and it closes
+//!   the connection with GOAWAY NO_ERROR.
+//! - stall, while the lane holds something of the connection that only the
+//!   client can move (`Slot.stalled`), or while a close waits to flush its
+//!   GOAWAY, at the last byte read or written plus `stall_timeout_ns`; it
+//!   closes the connection at once, without waiting for its write queue.
+//! - idle, while the connection has no stream and nothing stalls, at the
+//!   moment it came to have none plus `idle_timeout_ns`; only a new stream
+//!   ends it, and it queues GOAWAY NO_ERROR naming the last stream and closes
+//!   once that is written, a write the stall deadline bounds.
+//! A connection with streams in flight and nothing stalled has none: its
+//! requests' deadlines govern.
+//!
+//! The heap is re-keyed lazily. A deadline that moves later, as the stall
+//! deadline does with every byte, only changes the state it follows from;
+//! the expiry of the entry finds the later deadline and files it again. Only
+//! a deadline that appears or moves earlier touches the heap at once
+//! (`syncConnectionDeadline`), which every drive of a connection calls last.
 
 const std = @import("std");
 
+const limits = @import("collo_limits");
 const fault = @import("../fault.zig");
 const timer_wheel = @import("../timer_wheel.zig");
 const command_flow = @import("command_flow.zig");
@@ -32,12 +54,16 @@ const worker_fault = @import("worker_fault.zig");
 const worker_registration = @import("worker_registration.zig");
 
 const LaneFault = fault.LaneFault;
+const Slot = connection_slot.Slot;
+const Deadline = connection_slot.Deadline;
 
-/// How long an accepted connection may go without starting its first
-/// request, which covers the TLS handshake, the HTTP/2 preface and the first
-/// stream's headers. Only the accept arms it, and the first request clears it
-/// for good.
-const pre_request_timeout_ns: u64 = 3 * std.time.ns_per_s;
+/// How long each connection deadline runs, from `limits.ingress`. A test
+/// shortens them on its lane (`LaneWorker.connection_timeouts`).
+pub const ConnectionTimeouts = struct {
+    pre_request_ns: u64 = limits.ingress.pre_request_timeout_ns,
+    idle_ns: u64 = limits.ingress.idle_timeout_ns,
+    stall_ns: u64 = limits.ingress.stall_timeout_ns,
+};
 
 /// Wheel entries one expiry pass handles. Entries past it stay due, and the
 /// wheel then reports `now` as its next wake (`nextWakeDeadlineNs`), so the
@@ -51,6 +77,25 @@ pub fn effectiveHardTimeoutDeadline(request_deadline_ns: u64, hard_timeout_grace
     return request_deadline_ns +| hard_timeout_grace_ns;
 }
 
+/// The deadline the connection's state calls for now (the file header), or
+/// null when it calls for none.
+pub fn desiredDeadline(runtime: *const Slot, timeouts: ConnectionTimeouts) ?Deadline {
+    if (runtime.closing) |closing| {
+        if (closing.flush and runtime.h2WritesPending())
+            return .{ .kind = .stall, .at_ns = runtime.last_progress_ns +| timeouts.stall_ns };
+        return null;
+    }
+    if (runtime.awaiting_first_request)
+        return .{ .kind = .pre_request, .at_ns = runtime.accepted_ns +| timeouts.pre_request_ns };
+    if (runtime.stalled())
+        return .{ .kind = .stall, .at_ns = runtime.last_progress_ns +| timeouts.stall_ns };
+    if (runtime.ingress_channel_count == 0) {
+        const since = runtime.idle_since_ns orelse return null;
+        return .{ .kind = .idle, .at_ns = since +| timeouts.idle_ns };
+    }
+    return null;
+}
+
 /// Loop handler: drains the timerfd and handles the deadlines due now. Its
 /// poll is re-armed by the loop (`ring_driver.zig`).
 pub fn handleDeadlineTimer(comptime Lane: type, lane: *Lane) LaneFault!void {
@@ -58,25 +103,23 @@ pub fn handleDeadlineTimer(comptime Lane: type, lane: *Lane) LaneFault!void {
         try fault.classifyTimerReadError(err);
         break :expirations 0;
     };
-    lane.lane.counters.real_timerfd_expirations += expirations;
     lane.lane.counters.timerfd_expirations += expirations;
     const now = lane.monotonicNowNs();
     _ = try processExpired(Lane, lane, now);
     try armTimerAt(Lane, lane, now);
 }
 
-/// Handles the deadlines due at `now`: closes the connections past their
-/// pre-request deadline and expires the requests past their wheel entry.
-/// Returns whether it did any work. A wheel entry whose request ended or
-/// whose slot holds a later request counts as stale.
+/// Handles the deadlines due at `now`: the connections past their deadline
+/// and the requests past their wheel entry. Returns whether it did any work.
+/// A wheel entry whose request ended or whose slot holds a later request
+/// counts as stale.
 pub fn processExpired(comptime Lane: type, lane: *Lane, now: u64) LaneFault!bool {
-    const did_pre_request_work = processExpiredConnectionDeadlines(Lane, lane, now);
+    const did_connection_work = try processExpiredConnectionDeadlines(Lane, lane, now);
     var expired: [expired_batch_max]timer_wheel.Expired = undefined;
     const count = lane.lane.deadline_wheel.expireDue(now, &expired);
     if (count == 0)
-        return did_pre_request_work;
+        return did_connection_work;
     lane.lane.counters.deadline_wheel_expired += count;
-    lane.lane.counters.deadline_wheel_timeout_events += count;
     for (expired[0..count]) |deadline|
         try expireRequest(Lane, lane, deadline);
     return true;
@@ -88,7 +131,9 @@ fn expireRequest(comptime Lane: type, lane: *Lane, deadline: timer_wheel.Expired
         lane.lane.counters.stale_timeout += 1;
         return;
     };
-    const request = &lane.dynamic_requests[request_index];
+    const request = &lane.requests.entries[request_index];
+    // The wheel let the entry go.
+    request.deadline = null;
     if (request.waiting()) {
         // The deadline fixed at admission passed before any worker took the
         // request. Its finish cancels the waiter; a waiter the pool already
@@ -121,7 +166,7 @@ fn expireDispatchedRequest(comptime Lane: type, lane: *Lane, deadline: timer_whe
     const WorkerRegistration = worker_registration.Methods(Lane);
     const registration_index = WorkerRegistration.findCompletionRegistrationIndex(lane, deadline.worker_key) orelse
         return error.WorkerCompletionRegistrationNotFound;
-    if (lane.completion_registrations[registration_index].reading()) {
+    if (lane.registrations.entries[registration_index].reading()) {
         switch (try worker_completions.Methods(Lane).readForBackstop(lane, registration_index)) {
             .done => {},
             .socket_busy => if (liveRequestSlot(Lane, lane, deadline)) |request_index| {
@@ -152,12 +197,13 @@ fn expireDispatchedRequest(comptime Lane: type, lane: *Lane, deadline: timer_whe
 /// Moves the backstop of the request in `request_index` out by one more
 /// grace, the first time only, and says whether it did.
 fn deferBackstop(comptime Lane: type, lane: *Lane, request_index: u32) LaneFault!bool {
-    const request = &lane.dynamic_requests[request_index];
+    const request = &lane.requests.entries[request_index];
     if (request.backstop_deferred)
         return false;
     request.backstop_deferred = true;
     const now = lane.monotonicNowNs();
-    _ = try lane.lane.insertDeadline(
+    try lane.lane.armRequestDeadline(
+        &request.deadline,
         request.request_key,
         request.connection_key,
         request.worker_key,
@@ -170,45 +216,57 @@ fn deferBackstop(comptime Lane: type, lane: *Lane, request_index: u32) LaneFault
 /// The request slot an expired wheel entry names, when that slot still
 /// holds the same request on the same worker.
 fn liveRequestSlot(comptime Lane: type, lane: *Lane, deadline: timer_wheel.Expired) ?u32 {
-    if (deadline.request_key.slot >= lane.dynamic_requests.len)
-        return null;
-    const active = &lane.dynamic_requests[deadline.request_key.slot];
-    if (!active.active)
-        return null;
-    if (!active.request_key.eql(deadline.request_key))
-        return null;
+    const active = switch (lane.requests.lookup(deadline.request_key.slot, deadline.request_key.generation)) {
+        .live => |active| active,
+        .stale_generation, .vacant, .out_of_range => return null,
+    };
     if (!active.worker_key.eql(deadline.worker_key))
         return null;
     return deadline.request_key.slot;
 }
 
-/// Closes every connection whose pre-request deadline has passed, and drops
-/// the heap entries of connections that closed or started a request. A
-/// connection's close finishes on its next turn, so its deadline leaves the
-/// heap here.
-fn processExpiredConnectionDeadlines(comptime Lane: type, lane: *Lane, now: u64) bool {
-    if (lane.pre_request_deadline_count == 0)
-        return false;
+/// Takes every connection deadline due at `now` off the heap. One whose
+/// connection's state now calls for a later deadline goes back under it; one
+/// that calls for none drops; one still due expires. Returns whether any was
+/// due.
+fn processExpiredConnectionDeadlines(comptime Lane: type, lane: *Lane, now: u64) LaneFault!bool {
+    const heap = Methods(Lane).connectionDeadlines(lane);
     var did_work = false;
-    while (Methods(Lane).peekPreRequestDeadline(lane)) |conn| {
-        if (!conn.active or !conn.pre_request_deadline_active) {
-            Methods(Lane).clearPreRequestDeadline(lane, conn);
-            did_work = true;
+    while (heap.peek()) |runtime| {
+        if (runtime.deadline.?.at_ns > now)
+            return did_work;
+        _ = heap.deleteMin();
+        runtime.deadline = null;
+        did_work = true;
+        const desired = desiredDeadline(runtime, lane.connection_timeouts) orelse continue;
+        if (desired.at_ns > now) {
+            runtime.deadline = desired;
+            heap.insertAssumeCapacity(runtime);
             continue;
         }
-        if (conn.pre_request_deadline_ns > now)
-            return did_work;
-        Methods(Lane).clearPreRequestDeadline(lane, conn);
-        did_work = true;
-        switch (conn.state) {
-            .tls_handshake, .http2_connection => {
-                lane.lane.counters.pre_request_timeouts += 1;
-                connection_flow.Methods(Lane).closeRuntimeConnection(lane, conn, .{ .reason = .idle, .goaway = .no_error });
-            },
-            .vacant => {},
-        }
+        expireConnection(Lane, lane, runtime, desired.kind);
     }
     return did_work;
+}
+
+fn expireConnection(comptime Lane: type, lane: *Lane, runtime: *Slot, kind: connection_slot.DeadlineKind) void {
+    const Connection = connection_flow.Methods(Lane);
+    switch (kind) {
+        .pre_request => {
+            lane.lane.counters.pre_request_timeouts += 1;
+            Connection.closeRuntimeConnection(lane, runtime, .{ .reason = .pre_request_timeout, .goaway = .no_error });
+        },
+        .idle => {
+            lane.lane.counters.idle_timeouts += 1;
+            Connection.closeRuntimeConnection(lane, runtime, .{ .reason = .idle_timeout, .goaway = .no_error });
+        },
+        .stall => {
+            lane.lane.counters.stall_timeouts += 1;
+            // A close already flushing stops flushing; a new one queues no
+            // GOAWAY, since the client is not taking bytes.
+            Connection.closeRuntimeConnection(lane, runtime, .{ .reason = .stall_timeout, .goaway = null });
+        },
+    }
 }
 
 pub fn armTimer(comptime Lane: type, lane: *Lane) LaneFault!void {
@@ -228,11 +286,20 @@ pub fn armTimerNoLaterThan(comptime Lane: type, lane: *Lane, now: u64, latest_ns
     try lane.runtime_events.armDeadlineTimer(@min(next, latest_ns));
 }
 
+/// Moves the timerfd earlier to `deadline_ns` when it is armed later or not
+/// at all; a deadline after the armed one keeps it.
+pub fn armTimerNoLaterThanDeadline(comptime Lane: type, lane: *Lane, deadline_ns: u64) LaneFault!void {
+    if (lane.runtime_events.timer_armed_ns) |armed| {
+        if (armed <= deadline_ns)
+            return;
+    }
+    try lane.runtime_events.armDeadlineTimer(deadline_ns);
+}
+
 fn nextDeadlineNs(comptime Lane: type, lane: *Lane, now: u64) ?u64 {
     var next_deadline_ns = lane.lane.deadline_wheel.nextWakeDeadlineNs(now);
-    if (Methods(Lane).peekPreRequestDeadline(lane)) |runtime| {
-        next_deadline_ns = minOptionalDeadline(next_deadline_ns, runtime.pre_request_deadline_ns);
-    }
+    if (Methods(Lane).connectionDeadlines(lane).peek()) |runtime|
+        next_deadline_ns = minOptionalDeadline(next_deadline_ns, runtime.deadline.?.at_ns);
     // The loop re-arms an accept parked in backoff once the backoff ends
     // (`accept_flow.zig`), and with no connection or request nothing else
     // may wake the lane by then.
@@ -250,53 +317,42 @@ fn minOptionalDeadline(current: ?u64, candidate: u64) ?u64 {
 
 pub fn Methods(comptime Self: type) type {
     return struct {
-        /// Arms the deadline that closes a connection which has not started
-        /// a request by then, replacing any it had. The heap holds one entry
-        /// per connection slot, so the insert cannot fail. The caller re-arms
-        /// the timerfd (`armTimerAt`).
-        pub fn activatePreRequestDeadline(
-            self: *Self,
-            runtime: *connection_slot.Slot,
-            now: u64,
-        ) void {
-            if (!runtime.pre_request_deadline_active) {
-                runtime.pre_request_deadline_active = true;
-                self.pre_request_deadline_count += 1;
-            } else {
-                _ = preRequestDeadlineHeap(self).remove(runtime);
+        /// Brings the connection's heap entry in step with the deadline its
+        /// state calls for: files a deadline it lacks or one earlier than its
+        /// entry at once, and leaves a later one to the entry's expiry. It
+        /// also notes the moment the connection came to have no stream, from
+        /// which its idle deadline runs, and clears it once a stream opens.
+        pub fn syncConnectionDeadline(self: *Self, runtime: *Slot) LaneFault!void {
+            if (runtime.ingress_channel_count != 0 or runtime.awaiting_first_request) {
+                runtime.idle_since_ns = null;
+            } else if (runtime.idle_since_ns == null) {
+                runtime.idle_since_ns = self.monotonicNowNs();
             }
-            runtime.pre_request_deadline_ns = now +| pre_request_timeout_ns;
-            preRequestDeadlineHeap(self).insertAssumeCapacity(runtime);
+            const desired = desiredDeadline(runtime, self.connection_timeouts) orelse return;
+            const heap = connectionDeadlines(self);
+            if (runtime.deadline) |current| {
+                if (current.at_ns <= desired.at_ns)
+                    return;
+                _ = heap.remove(runtime);
+            }
+            runtime.deadline = desired;
+            heap.insertAssumeCapacity(runtime);
+            try armTimerNoLaterThanDeadline(Self, self, desired.at_ns);
         }
 
-        /// Removes the connection's pre-request deadline if it has one, so
-        /// callers need not check first.
-        pub fn clearPreRequestDeadline(self: *Self, runtime: *connection_slot.Slot) void {
-            const removed = preRequestDeadlineHeap(self).remove(runtime);
-            if (!runtime.pre_request_deadline_active) {
-                runtime.pre_request_deadline_ns = 0;
-                if (removed and self.pre_request_deadline_count != 0)
-                    self.pre_request_deadline_count -= 1;
+        /// Removes the connection's heap entry if it has one, so callers need
+        /// not check first.
+        pub fn clearConnectionDeadline(self: *Self, runtime: *Slot) void {
+            if (runtime.deadline == null)
                 return;
-            }
-            std.debug.assert(removed);
-            runtime.pre_request_deadline_active = false;
-            runtime.pre_request_deadline_ns = 0;
-            std.debug.assert(self.pre_request_deadline_count != 0);
-            if (self.pre_request_deadline_count != 0)
-                self.pre_request_deadline_count -= 1;
-        }
-
-        pub fn peekPreRequestDeadline(self: *Self) ?*connection_slot.Slot {
-            return preRequestDeadlineHeap(self).peek();
+            _ = connectionDeadlines(self).remove(runtime);
+            runtime.deadline = null;
         }
 
         /// Valid only while the lane's runtime exists (`ring_driver.initRuntime`);
         /// a call outside it reaches `unreachable`.
-        pub fn preRequestDeadlineHeap(
-            self: *Self,
-        ) *connection_slot.PreRequestDeadlineHeap {
-            if (self.pre_request_deadlines) |*heap|
+        pub fn connectionDeadlines(self: *Self) *connection_slot.DeadlineHeap {
+            if (self.connection_deadlines) |*heap|
                 return heap;
             unreachable;
         }

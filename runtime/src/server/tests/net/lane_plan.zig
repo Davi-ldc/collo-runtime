@@ -15,6 +15,20 @@ test "static lane count follows RX queues within CPU and memory caps" {
     try std.testing.expectError(error.NoRxQueues, lane_plan.resolveStaticLaneCount(0, 4, 32, 0));
 }
 
+test "a lane's memory shape charges its tables at their limits, so a node with 10 GiB available runs a lane on each of 4 CPUs" {
+    const runner = @import("collo_server_main").ingress.runner;
+    const available_bytes: usize = 10 * 1024 * 1024 * 1024;
+    const cpu_count = 4;
+    for ([_]usize{ 1, 16 }) |definition_count| {
+        const shape = runner.laneMemoryShape(definition_count);
+        const capacity = (available_bytes / lane_plan.lane_memory_share_divisor) / shape.estimatedHeavyLaneBytes();
+        try std.testing.expectEqual(@as(usize, cpu_count), try lane_plan.resolveStaticLaneCount(cpu_count, cpu_count, capacity, 0));
+    }
+    // Each definition adds its workers' registrations and the queue places
+    // reserved for them.
+    try std.testing.expect(runner.laneMemoryShape(16).resident_cap_bytes > runner.laneMemoryShape(1).resident_cap_bytes);
+}
+
 test "explicit lane count override is capped only by allowed CPUs" {
     try std.testing.expectEqual(@as(usize, 6), try lane_plan.resolveStaticLaneCount(2, 8, 32, 6));
     try std.testing.expectEqual(@as(usize, 8), try lane_plan.resolveStaticLaneCount(2, 8, 32, 16));
@@ -123,17 +137,5 @@ test "an unspecified-address plan targets the schedulable CPUs" {
 /// A footprint small enough that the memory cap never binds below the CPU
 /// count on a test machine.
 fn testShape() lane_plan.MemoryShape {
-    return .{
-        .connection_slot_bytes = 1,
-        .request_slot_bytes = 1,
-        .deadline_entry_bytes = 1,
-        .command_bytes = 1,
-        .active_request_bytes = 1,
-        .runner_connection_bytes = 1,
-        .max_connections = 1,
-        .max_requests = 1,
-        .command_capacity = 1,
-        .header_buffer_count = 1,
-        .header_buffer_bytes = 1,
-    };
+    return .{ .resident_cap_bytes = 1 };
 }

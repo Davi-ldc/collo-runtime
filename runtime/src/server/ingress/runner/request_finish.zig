@@ -224,11 +224,9 @@ pub fn Methods(comptime Self: type) type {
         /// the pool, which may hand it to a waiter at once. A waiting request
         /// leaves its pool's FIFO. An inactive slot is left alone.
         pub fn finishRequest(self: *Self, request_slot: u32, outcome: RequestOutcome) LaneFault!void {
-            if (request_slot >= self.dynamic_requests.len)
+            if (request_slot >= self.requests.capacity())
                 return error.RequestSlotOutOfRange;
-            const slot = &self.dynamic_requests[request_slot];
-            if (!slot.active)
-                return;
+            const slot = self.requests.get(request_slot) orelse return;
             if (slot.worker) |worker|
                 return finishDispatched(self, request_slot, worker, outcome);
             return finishWaiting(self, request_slot, outcome);
@@ -237,9 +235,9 @@ pub fn Methods(comptime Self: type) type {
         /// Ends the dispatched request in `request_slot` with the completion
         /// parked on it, and returns whether one was parked.
         pub fn finishParkedCompletion(self: *Self, request_slot: u32) LaneFault!bool {
-            if (request_slot >= self.dynamic_requests.len)
+            if (request_slot >= self.requests.capacity())
                 return error.RequestSlotOutOfRange;
-            const slot = &self.dynamic_requests[request_slot];
+            const slot = self.requests.get(request_slot) orelse return false;
             if (!slot.dispatched())
                 return false;
             const outcome: RequestOutcome = .{ .worker_completion = slot.pending_worker_completion orelse return false };
@@ -248,7 +246,7 @@ pub fn Methods(comptime Self: type) type {
         }
 
         fn finishWaiting(self: *Self, request_slot: u32, outcome: RequestOutcome) LaneFault!void {
-            const slot = &self.dynamic_requests[request_slot];
+            const slot = &self.requests.entries[request_slot];
             // False when a handoff already took the waiter: its
             // `dispatch_ready` finds the request gone and gives the slot back.
             _ = self.service.supervisor.poolFor(slot.route.definition).cancelWaiter(slot.request_key);
@@ -274,7 +272,7 @@ pub fn Methods(comptime Self: type) type {
             worker: *WorkerRecord,
             outcome: RequestOutcome,
         ) LaneFault!void {
-            const slot = &self.dynamic_requests[request_slot];
+            const slot = &self.requests.entries[request_slot];
             var ended = outcome;
             if (slot.pending_worker_completion) |parked| {
                 ended = .{ .worker_completion = parked };
@@ -323,7 +321,7 @@ pub fn Methods(comptime Self: type) type {
 
             const registration_index = WorkerRegistration.findCompletionRegistrationIndex(self, slot.worker_key) orelse
                 return error.WorkerCompletionRegistrationNotFound;
-            self.completion_registrations[registration_index].removeInflight(slot.request_key);
+            self.registrations.entries[registration_index].removeInflight(slot.request_key);
             const worker_slot = slot.worker_slot;
             freeRequestSlot(self, request_slot);
             try WorkerRegistration.releaseRegistrationIfIdle(self, registration_index);
@@ -339,7 +337,7 @@ pub fn Methods(comptime Self: type) type {
             slot: *const RequestSlot,
         ) LaneFault!void {
             // A write above may have closed the connection.
-            if (!runtime.active)
+            if (!runtime.isLive())
                 return;
             switch (runtime.h2RemoveRequest(self.service.allocator, slot.request_key)) {
                 .none, .closed, .draining => {},
@@ -464,17 +462,19 @@ pub fn Methods(comptime Self: type) type {
             slot.access.request_id = 0;
         }
 
-        /// Frees what the slot owns, its wheel entry and its slab slot. A
+        /// Frees what the slot owns, its wheel entry and its slab entry. A
         /// cancelled wheel entry can leave the timerfd armed early, which
         /// costs one spurious wake that re-arms it.
         fn freeRequestSlot(self: *Self, request_slot: u32) void {
-            const slot = &self.dynamic_requests[request_slot];
+            const slot = &self.requests.entries[request_slot];
             if (slot.head) |*owned|
                 owned.deinit();
+            slot.head = null;
             if (slot.parked_begin) |*parked|
                 parked.deinit();
-            self.lane.releaseCompletedRequest(slot.request_key);
-            slot.* = .{};
+            slot.parked_begin = null;
+            _ = self.lane.cancelRequestDeadline(&slot.deadline);
+            self.requests.release(request_slot);
             // A finish that finds nothing counted means a request finished
             // that was never counted. The guard stays because underflowing
             // the count would be worse than the divergence, and the counter
@@ -482,10 +482,10 @@ pub fn Methods(comptime Self: type) type {
             // predicate precedes it: in ReleaseFast an assertion is a promise
             // to the optimizer, which could then delete the else arm and the
             // counter with it.
-            if (self.dynamic_request_count != 0) {
-                self.dynamic_request_count -= 1;
+            if (self.request_count != 0) {
+                self.request_count -= 1;
             } else {
-                self.dynamic_request_underflow += 1;
+                self.request_underflow += 1;
             }
         }
     };

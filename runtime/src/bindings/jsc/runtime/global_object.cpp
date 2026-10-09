@@ -1,7 +1,8 @@
-// Collo::GlobalObject, the JSC global object every Collo VM runs on, and VmClientData, through which a global finds
-// its ColloVm and stack frames get their public source URLs. Runs on the VM thread. VM creation installs
-// VmClientData before it creates the global, and the JSC VM deletes it only in its own destructor, so every live
-// global reaches its ColloVm; owner() aborts when it cannot.
+// Collo::GlobalObject, the JSC global object of each realm of a Collo VM, and VmClientData, through which a global
+// finds its ColloVm and stack frames get their public source URLs. Runs on the VM thread. VM creation installs
+// VmClientData before it creates the first global, and the JSC VM deletes it only in its own destructor, so every
+// live global reaches its ColloVm; owner() aborts when it cannot. A global knows its realm from its creation on, and
+// the realm, which the VM owns, outlives it.
 
 #include "jsc/runtime/state.h"
 
@@ -54,12 +55,13 @@ const JSC::GlobalObjectMethodTable GlobalObject::s_globalObjectMethodTable = {
     .trustedScriptStructure = &JSC::JSGlobalObject::trustedScriptStructure,
 };
 
-GlobalObject* GlobalObject::create(JSC::VM& vm, JSC::Structure* structure, ColloVm* owner)
+GlobalObject* GlobalObject::create(JSC::VM& vm, JSC::Structure* structure, ColloRealm* realm)
 {
     auto* client_data = static_cast<VmClientData*>(vm.clientData);
     RELEASE_ASSERT(client_data);
-    RELEASE_ASSERT(client_data->owner == owner);
-    auto* global = new (NotNull, JSC::allocateCell<GlobalObject>(vm)) GlobalObject(vm, structure);
+    RELEASE_ASSERT(realm);
+    RELEASE_ASSERT(client_data->owner == realm->vm);
+    auto* global = new (NotNull, JSC::allocateCell<GlobalObject>(vm)) GlobalObject(vm, structure, realm);
     global->finishCreation(vm);
     return global;
 }
@@ -84,8 +86,11 @@ ColloVm& GlobalObject::owner() const
     return *client_data->owner;
 }
 
-GlobalObject::GlobalObject(JSC::VM& vm, JSC::Structure* structure)
+ColloWebApiCache& GlobalObject::webApiCache() const { return m_realm->webapi_cache; }
+
+GlobalObject::GlobalObject(JSC::VM& vm, JSC::Structure* structure, ColloRealm* realm)
     : JSC::JSGlobalObject(vm, structure, &s_globalObjectMethodTable)
+    , m_realm(realm)
 {
 }
 

@@ -1,11 +1,17 @@
-//! The HTTP/2 stream table of one client connection (`Slot` in
+//! The HTTP/2 streams of one client connection (`Slot` in
 //! `connection_slot.zig`), on the lane thread that owns the connection: the
 //! client stream ids the connection has seen and opened, an entry per stream
-//! with its state, the lane request that owns it, its request body's length
-//! and END_STREAM and the lane's record of the worker's response on it, and
-//! the removal of a stream that closes, is reset or loses its request. An
-//! entry's windows and buffered request body belong to `flow_control.zig`,
-//! and its buffered response to `write_queue.zig`.
+//! in the lane's stream slab with its state, the lane request that owns it,
+//! its request body's length and END_STREAM and the lane's record of the
+//! worker's response on it, and the removal of a stream that closes, is reset
+//! or loses its request. An entry's windows and buffered request body belong
+//! to `flow_control.zig`, and its buffered response to `write_queue.zig`.
+//!
+//! The entries live in one slab per lane (`StreamSlab`, `slab.zig`), so a
+//! connection costs only the streams it has open. The connection keeps, at
+//! up to `max_h2_concurrent_streams` positions, each stream's id and its
+//! entry's index in the slab: a lookup by stream id scans the connection's
+//! ids, and only the match touches the slab.
 //!
 //! Invariants:
 //! - A stream keeps its entry while it is open in the protocol (RFC 9113
@@ -16,6 +22,11 @@
 //!   request's END_STREAM has arrived (`h2CloseStreamIfDone`), or once either
 //!   end resets it (`h2MarkStreamReset`). The lane request that served the
 //!   stream may still be finishing then.
+//! - A new stream past the connection's bound or past the lane's slab fails
+//!   (`h2ReserveStream`), and the caller refuses it with REFUSED_STREAM, which
+//!   the client may retry; the connection goes on.
+//! - A position holds a stream exactly while its id is nonzero, and then its
+//!   entry is live in the slab.
 //! - An entry is `preparing` from its HEADERS until a worker takes its
 //!   request, then `active`. A lane request may own a `preparing` entry while
 //!   it waits for a worker, and always owns an `active` one.
@@ -35,17 +46,30 @@ const http = @import("collo_http");
 const h2 = http.http2;
 const ipc = @import("collo_ipc");
 const limits = @import("collo_limits");
-const ingress_state = @import("../state.zig");
+const lifecycle = @import("collo_server_lifecycle");
+const slab = @import("../slab.zig");
 const connection_slot = @import("connection_slot.zig");
 const flow_control = @import("flow_control.zig");
 const write_queue = @import("write_queue.zig");
 
 const Slot = connection_slot.Slot;
+const RequestKey = lifecycle.RequestKey;
 
-pub const max_h2_concurrent_streams: usize = 64;
+pub const max_h2_concurrent_streams: usize = limits.ingress.streams_per_connection_max;
 /// Client stream ids, the last one and those below it, whose opening a
 /// connection remembers (`Slot.h2_opened_client_streams`, one bit each).
 pub const opened_client_streams_window: u32 = @bitSizeOf(u64);
+
+/// The lane's streams across its connections.
+pub const StreamSlab = slab.FaultInSlab(H2StreamEntry);
+/// The index of a stream's entry in its lane's slab, as a connection keeps it.
+pub const StreamRef = u16;
+
+comptime {
+    // A connection's references must reach every entry of the slab.
+    std.debug.assert(limits.ingress.streams_per_lane_max <= std.math.maxInt(StreamRef) + 1);
+    std.debug.assert(max_h2_concurrent_streams <= std.math.maxInt(u8));
+}
 
 pub fn h2AcceptClientStreamId(self: *Slot, stream_id: u32) !void {
     if (stream_id == 0 or (stream_id & 1) == 0)
@@ -74,24 +98,27 @@ pub fn h2ClientOpenedStreamId(self: *const Slot, stream_id: u32) bool {
     return (self.h2_opened_client_streams >> @intCast(distance)) & 1 == 1;
 }
 
+/// Opens a `preparing` stream. Fails with `error.Http2StreamAlreadyOpen`
+/// for an id the table holds, `error.Http2TooManyConcurrentStreams` past
+/// the connection's bound, and `error.Http2StreamSlabFull` when the lane
+/// holds `limits.ingress.streams_per_lane_max` streams already.
 pub fn h2ReserveStream(self: *Slot, stream_id: u32) !void {
     if (h2StreamIndex(self, stream_id) != null)
         return error.Http2StreamAlreadyOpen;
-    if (self.ingress_channel_count == self.ingress_channels.len)
+    if (self.ingress_channel_count == max_h2_concurrent_streams)
         return error.Http2TooManyConcurrentStreams;
-    for (&self.ingress_channels) |*entry| {
-        if (entry.state != .vacant)
-            continue;
-        entry.* = .{
-            .state = .preparing,
-            .stream_id = stream_id,
-            .send_window = self.h2_peer_settings.initial_window_size,
-            .recv_window = limits.h2.INGRESS_STREAM_RECV_WINDOW_BYTES,
-        };
-        self.ingress_channel_count += 1;
-        return;
-    }
-    unreachable;
+    const position = for (self.stream_ids, 0..) |id, index| {
+        if (id == 0)
+            break index;
+    } else unreachable;
+    const acquired = self.streams.acquire() orelse return error.Http2StreamSlabFull;
+    acquired.entry.state = .preparing;
+    acquired.entry.stream_id = stream_id;
+    acquired.entry.send_window = self.h2_peer_settings.initial_window_size;
+    acquired.entry.recv_window = limits.h2.INGRESS_STREAM_RECV_WINDOW_BYTES;
+    self.stream_ids[position] = stream_id;
+    self.stream_refs[position] = @intCast(acquired.index);
+    self.ingress_channel_count += 1;
 }
 
 pub fn h2SetRequestBodyExpectation(
@@ -101,8 +128,7 @@ pub fn h2SetRequestBodyExpectation(
     content_length: ?usize,
     end_stream: bool,
 ) !void {
-    const index = h2StreamIndex(self, stream_id) orelse return error.Http2UnknownStream;
-    const entry = &self.ingress_channels[index];
+    const entry = h2StreamEntry(self, stream_id) orelse return error.Http2UnknownStream;
     if (entry.state != .preparing)
         return error.Http2ProtocolError;
     switch (framing) {
@@ -128,8 +154,7 @@ pub fn h2SetRequestBodyExpectation(
 }
 
 pub fn h2RecordRequestBodyChunk(self: *Slot, stream_id: u32, byte_len: usize, end_stream: bool) !void {
-    const index = h2StreamIndex(self, stream_id) orelse return error.Http2UnknownStream;
-    const entry = &self.ingress_channels[index];
+    const entry = h2StreamEntry(self, stream_id) orelse return error.Http2UnknownStream;
     switch (entry.state) {
         .preparing, .active => {},
         .vacant, .draining_response => return error.Http2ProtocolError,
@@ -158,9 +183,8 @@ pub fn h2RecordRequestBodyChunk(self: *Slot, stream_id: u32, byte_len: usize, en
 /// (`h2MarkStreamReset`). Fails with `error.Http2UnknownStream` for a
 /// stream the table does not hold, and `error.Http2StreamStateMismatch`
 /// for one that is not `preparing` or already has a request.
-pub fn h2BindRequest(self: *Slot, stream_id: u32, request_key: ingress_state.RequestKey, request_id: u64) !void {
-    const index = h2StreamIndex(self, stream_id) orelse return error.Http2UnknownStream;
-    const entry = &self.ingress_channels[index];
+pub fn h2BindRequest(self: *Slot, stream_id: u32, request_key: RequestKey, request_id: u64) !void {
+    const entry = h2StreamEntry(self, stream_id) orelse return error.Http2UnknownStream;
     if (entry.state != .preparing)
         return error.Http2StreamStateMismatch;
     if (entry.request != null)
@@ -173,9 +197,8 @@ pub fn h2BindRequest(self: *Slot, stream_id: u32, request_key: ingress_state.Req
 /// holds, since it was reset or closed, and with
 /// `error.Http2StreamStateMismatch` for one that is not `preparing` or
 /// is bound to another request.
-pub fn h2ActivateStream(self: *Slot, stream_id: u32, request_key: ingress_state.RequestKey, request_id: u64) !void {
-    const index = h2StreamIndex(self, stream_id) orelse return error.Http2UnknownStream;
-    const entry = &self.ingress_channels[index];
+pub fn h2ActivateStream(self: *Slot, stream_id: u32, request_key: RequestKey, request_id: u64) !void {
+    const entry = h2StreamEntry(self, stream_id) orelse return error.Http2UnknownStream;
     if (entry.state != .preparing)
         return error.Http2StreamStateMismatch;
     if (entry.request) |bound| {
@@ -192,20 +215,18 @@ pub fn h2ActivateStream(self: *Slot, stream_id: u32, request_key: ingress_state.
 /// closed stream. Returns the lane request that owned the stream, which
 /// the caller resets toward its worker or takes out of its wait; null
 /// when the table does not hold the stream or no request owns it.
-pub fn h2MarkStreamReset(self: *Slot, allocator: std.mem.Allocator, stream_id: u32) ?ingress_state.RequestKey {
-    const index = h2StreamIndex(self, stream_id) orelse return null;
-    const entry = &self.ingress_channels[index];
-    const request = entry.request;
-    removeEntry(self, allocator, entry);
+pub fn h2MarkStreamReset(self: *Slot, allocator: std.mem.Allocator, stream_id: u32) ?RequestKey {
+    const position = h2StreamIndex(self, stream_id) orelse return null;
+    const request = streamAt(self, position).request;
+    removeEntry(self, allocator, position);
     return if (request) |owner| owner.key else null;
 }
 
 /// The request a worker serves on `stream_id`, or null when the stream
 /// is not `active`: a request still waiting for a worker buffers its body
 /// on the stream instead.
-pub fn h2ActiveRequestKey(self: *Slot, stream_id: u32) ?ingress_state.RequestKey {
-    const index = h2StreamIndex(self, stream_id) orelse return null;
-    const entry = &self.ingress_channels[index];
+pub fn h2ActiveRequestKey(self: *Slot, stream_id: u32) ?RequestKey {
+    const entry = h2StreamEntry(self, stream_id) orelse return null;
     if (entry.state != .active)
         return null;
     const request = entry.request orelse return null;
@@ -213,8 +234,7 @@ pub fn h2ActiveRequestKey(self: *Slot, stream_id: u32) ?ingress_state.RequestKey
 }
 
 pub fn h2ValidateWorkerResponseDescriptor(self: *const Slot, descriptor: ipc.ingress_channel.Descriptor) !void {
-    const index = h2StreamIndex(self, descriptor.stream_id) orelse return error.Http2UnknownStream;
-    const entry = &self.ingress_channels[index];
+    const entry = h2StreamEntryConst(self, descriptor.stream_id) orelse return error.Http2UnknownStream;
     if (entry.state != .active)
         return error.InvalidH2WorkerOutboundDescriptor;
     const request = entry.request orelse return error.InvalidH2WorkerOutboundDescriptor;
@@ -229,23 +249,20 @@ pub fn h2ValidateWorkerResponseDescriptor(self: *const Slot, descriptor: ipc.ing
 
 pub fn h2ValidateWorkerResponseHeadDescriptor(self: *const Slot, descriptor: ipc.ingress_channel.Descriptor) !void {
     try self.h2ValidateWorkerResponseDescriptor(descriptor);
-    const index = h2StreamIndex(self, descriptor.stream_id) orelse return error.Http2UnknownStream;
-    const entry = &self.ingress_channels[index];
+    const entry = h2StreamEntryConst(self, descriptor.stream_id) orelse return error.Http2UnknownStream;
     if (entry.worker_response_head_sent or entry.worker_response_ended)
         return error.InvalidH2WorkerOutboundDescriptor;
 }
 
 pub fn h2ValidateWorkerResponseBodyDescriptor(self: *const Slot, descriptor: ipc.ingress_channel.Descriptor) !void {
     try self.h2ValidateWorkerResponseDescriptor(descriptor);
-    const index = h2StreamIndex(self, descriptor.stream_id) orelse return error.Http2UnknownStream;
-    const entry = &self.ingress_channels[index];
+    const entry = h2StreamEntryConst(self, descriptor.stream_id) orelse return error.Http2UnknownStream;
     if (!entry.worker_response_head_sent or entry.worker_response_ended)
         return error.InvalidH2WorkerOutboundDescriptor;
 }
 
 pub fn h2MarkWorkerResponseHeadQueued(self: *Slot, stream_id: u32, end_stream: bool) !void {
-    const index = h2StreamIndex(self, stream_id) orelse return error.Http2UnknownStream;
-    const entry = &self.ingress_channels[index];
+    const entry = h2StreamEntry(self, stream_id) orelse return error.Http2UnknownStream;
     if (entry.state != .active or entry.worker_response_head_sent or entry.worker_response_ended)
         return error.InvalidH2WorkerOutboundDescriptor;
     entry.worker_response_head_sent = true;
@@ -254,8 +271,7 @@ pub fn h2MarkWorkerResponseHeadQueued(self: *Slot, stream_id: u32, end_stream: b
 }
 
 pub fn h2MarkWorkerResponseBodyQueued(self: *Slot, stream_id: u32, end_stream: bool) !void {
-    const index = h2StreamIndex(self, stream_id) orelse return error.Http2UnknownStream;
-    const entry = &self.ingress_channels[index];
+    const entry = h2StreamEntry(self, stream_id) orelse return error.Http2UnknownStream;
     if (entry.state != .active or !entry.worker_response_head_sent or entry.worker_response_ended)
         return error.InvalidH2WorkerOutboundDescriptor;
     if (end_stream)
@@ -263,8 +279,7 @@ pub fn h2MarkWorkerResponseBodyQueued(self: *Slot, stream_id: u32, end_stream: b
 }
 
 pub fn h2MarkWorkerResponseHeadChunkPairQueued(self: *Slot, stream_id: u32, end_stream: bool) !void {
-    const index = h2StreamIndex(self, stream_id) orelse return error.Http2UnknownStream;
-    const entry = &self.ingress_channels[index];
+    const entry = h2StreamEntry(self, stream_id) orelse return error.Http2UnknownStream;
     if (entry.state != .active or entry.worker_response_head_sent or entry.worker_response_ended)
         return error.InvalidH2WorkerOutboundDescriptor;
     entry.worker_response_head_sent = true;
@@ -273,8 +288,8 @@ pub fn h2MarkWorkerResponseHeadChunkPairQueued(self: *Slot, stream_id: u32, end_
 }
 
 pub fn h2WorkerResponseEnded(self: *const Slot, stream_id: u32) bool {
-    const index = h2StreamIndex(self, stream_id) orelse return false;
-    return self.ingress_channels[index].worker_response_ended;
+    const entry = h2StreamEntryConst(self, stream_id) orelse return false;
+    return entry.worker_response_ended;
 }
 
 /// Whether the worker's response head for `stream_id` is queued toward
@@ -283,15 +298,15 @@ pub fn h2WorkerResponseEnded(self: *const Slot, stream_id: u32) bool {
 /// is answered with RST_STREAM, never with a second head. False for a
 /// stream the table no longer holds, which has nothing left to answer.
 pub fn responseHeadQueued(self: *const Slot, stream_id: u32) bool {
-    const index = h2StreamIndex(self, stream_id) orelse return false;
-    return self.ingress_channels[index].worker_response_head_sent;
+    const entry = h2StreamEntryConst(self, stream_id) orelse return false;
+    return entry.worker_response_head_sent;
 }
 
 /// Records that the response's END_STREAM for `stream_id` is in the
 /// write queue. Nothing for a stream the table does not hold.
 pub fn h2NoteResponseEndQueued(self: *Slot, stream_id: u32) void {
-    const index = h2StreamIndex(self, stream_id) orelse return;
-    self.ingress_channels[index].response_end_queued = true;
+    const entry = h2StreamEntry(self, stream_id) orelse return;
+    entry.response_end_queued = true;
 }
 
 /// Closes an `active` stream both ends are done with: its response's
@@ -301,8 +316,8 @@ pub fn h2NoteResponseEndQueued(self: *Slot, stream_id: u32) void {
 /// its request finishes on its own when the worker's completion comes.
 /// Returns whether the stream closed.
 pub fn h2CloseStreamIfDone(self: *Slot, allocator: std.mem.Allocator, stream_id: u32) bool {
-    const index = h2StreamIndex(self, stream_id) orelse return false;
-    const entry = &self.ingress_channels[index];
+    const position = h2StreamIndex(self, stream_id) orelse return false;
+    const entry = streamAt(self, position);
     if (entry.state != .active)
         return false;
     if (!entry.response_end_queued)
@@ -311,13 +326,13 @@ pub fn h2CloseStreamIfDone(self: *Slot, allocator: std.mem.Allocator, stream_id:
         return false;
     if (entry.pending_body_len != 0 or entry.pending_body_complete)
         return false;
-    removeEntry(self, allocator, entry);
+    removeEntry(self, allocator, position);
     return true;
 }
 
 pub fn h2StreamState(self: *const Slot, stream_id: u32) ?H2StreamState {
-    const index = h2StreamIndex(self, stream_id) orelse return null;
-    return self.ingress_channels[index].state;
+    const entry = h2StreamEntryConst(self, stream_id) orelse return null;
+    return entry.state;
 }
 
 pub fn h2HasSeenClientStreamId(self: *const Slot, stream_id: u32) bool {
@@ -325,8 +340,8 @@ pub fn h2HasSeenClientStreamId(self: *const Slot, stream_id: u32) bool {
 }
 
 pub fn h2RemoveStream(self: *Slot, allocator: std.mem.Allocator, stream_id: u32) bool {
-    const index = h2StreamIndex(self, stream_id) orelse return false;
-    removeEntry(self, allocator, &self.ingress_channels[index]);
+    const position = h2StreamIndex(self, stream_id) orelse return false;
+    removeEntry(self, allocator, position);
     return true;
 }
 
@@ -336,28 +351,21 @@ pub fn h2RemoveStream(self: *Slot, allocator: std.mem.Allocator, stream_id: u32)
 /// tail carries it. A dead worker's stream where this is false needs
 /// RST_STREAM, or its client waits for the rest of the response until
 /// its own timeout.
-pub fn h2StreamWillDeliverResponseTail(self: *Slot, request_key: ingress_state.RequestKey) bool {
-    for (&self.ingress_channels) |*entry| {
-        if (entry.state != .active)
-            continue;
-        const request = entry.request orelse continue;
-        if (request.key.eql(request_key))
-            return entry.response_end_queued or entry.pending_response_end_stream;
-    }
-    return false;
+pub fn h2StreamWillDeliverResponseTail(self: *Slot, request_key: RequestKey) bool {
+    const position = requestPosition(self, request_key) orelse return false;
+    const entry = streamAt(self, position);
+    if (entry.state != .active)
+        return false;
+    return entry.response_end_queued or entry.pending_response_end_stream;
 }
 
 /// Takes the request `request_key` off its stream when the lane is done
 /// with the request, dropping the request body it still held, and says
 /// how the stream ends (`StreamRelease`). On `unfinished` the caller
 /// resets the stream (RST_STREAM).
-pub fn h2RemoveRequest(self: *Slot, allocator: std.mem.Allocator, request_key: ingress_state.RequestKey) StreamRelease {
-    for (&self.ingress_channels) |*entry| {
-        const request = entry.request orelse continue;
-        if (request.key.eql(request_key))
-            return settleRequestless(self, allocator, entry);
-    }
-    return .none;
+pub fn h2RemoveRequest(self: *Slot, allocator: std.mem.Allocator, request_key: RequestKey) StreamRelease {
+    const position = requestPosition(self, request_key) orelse return .none;
+    return settleRequestless(self, allocator, position);
 }
 
 /// Ends a `preparing` or `draining_response` stream the lane answered on
@@ -365,11 +373,10 @@ pub fn h2RemoveRequest(self: *Slot, allocator: std.mem.Allocator, request_key: i
 /// the table. Returns false when the stream is in another state or the
 /// table does not hold it.
 pub fn h2FinishLocalResponse(self: *Slot, allocator: std.mem.Allocator, stream_id: u32) bool {
-    const index = h2StreamIndex(self, stream_id) orelse return false;
-    const entry = &self.ingress_channels[index];
-    switch (entry.state) {
+    const position = h2StreamIndex(self, stream_id) orelse return false;
+    switch (streamAt(self, position).state) {
         .preparing, .draining_response => {
-            _ = settleRequestless(self, allocator, entry);
+            _ = settleRequestless(self, allocator, position);
             return true;
         },
         .active, .vacant => return false,
@@ -379,47 +386,99 @@ pub fn h2FinishLocalResponse(self: *Slot, allocator: std.mem.Allocator, stream_i
 /// Takes the request off an `active` stream the lane has just answered
 /// on its own, and returns it so the caller can cancel it toward its
 /// worker; the stream ends as `h2FinishLocalResponse` says.
-pub fn h2DetachActiveRequestForLocalResponse(self: *Slot, allocator: std.mem.Allocator, stream_id: u32) ?ingress_state.RequestKey {
-    const index = h2StreamIndex(self, stream_id) orelse return null;
-    const entry = &self.ingress_channels[index];
+pub fn h2DetachActiveRequestForLocalResponse(self: *Slot, allocator: std.mem.Allocator, stream_id: u32) ?RequestKey {
+    const position = h2StreamIndex(self, stream_id) orelse return null;
+    const entry = streamAt(self, position);
     if (entry.state != .active)
         return null;
     const request = entry.request orelse return null;
-    _ = settleRequestless(self, allocator, entry);
+    _ = settleRequestless(self, allocator, position);
     return request.key;
 }
 
-/// Ends `entry`'s tie to a request: the body it held for the request is
-/// dropped, and the stream drains a tail that carries END_STREAM or
-/// leaves the table, a tail without END_STREAM dropped with it.
-fn settleRequestless(self: *Slot, allocator: std.mem.Allocator, entry: *H2StreamEntry) StreamRelease {
+/// Ends the stream at `position`'s tie to a request: the body it held for
+/// the request is dropped, and the stream drains a tail that carries
+/// END_STREAM or leaves the table, a tail without END_STREAM dropped with
+/// it.
+fn settleRequestless(self: *Slot, allocator: std.mem.Allocator, position: usize) StreamRelease {
+    const entry = streamAt(self, position);
     flow_control.releasePendingBody(self, allocator, entry);
     entry.request = null;
     if (entry.response_end_queued) {
-        removeEntry(self, allocator, entry);
+        removeEntry(self, allocator, position);
         return .closed;
     }
     if (entry.pending_response_end_stream) {
         entry.state = .draining_response;
         return .draining;
     }
-    removeEntry(self, allocator, entry);
+    removeEntry(self, allocator, position);
     return .unfinished;
 }
 
-/// Takes `entry` out of the table, freeing what it buffered.
-pub fn removeEntry(self: *Slot, allocator: std.mem.Allocator, entry: *H2StreamEntry) void {
+/// Takes the stream at `position` out of the table, freeing what it
+/// buffered and giving its entry back to the lane's slab.
+pub fn removeEntry(self: *Slot, allocator: std.mem.Allocator, position: usize) void {
+    std.debug.assert(self.stream_ids[position] != 0);
+    const entry = streamAt(self, position);
     flow_control.releasePendingBody(self, allocator, entry);
     write_queue.releasePendingResponse(self, allocator, entry);
-    entry.* = .{};
+    self.streams.release(self.stream_refs[position]);
+    self.stream_ids[position] = 0;
     if (self.ingress_channel_count != 0)
         self.ingress_channel_count -= 1;
 }
 
+/// Gives every stream of a connection that closes back to the lane's slab,
+/// freeing what each buffered, with no credit or count kept: the
+/// connection's protocol state goes with them (`Slot.deinitProtocolState`).
+pub fn releaseAll(self: *Slot, allocator: std.mem.Allocator) void {
+    for (&self.stream_ids, self.stream_refs) |*id, ref| {
+        if (id.* == 0)
+            continue;
+        self.streams.entries[ref].deinitBuffers(allocator);
+        self.streams.release(ref);
+        id.* = 0;
+    }
+    self.ingress_channel_count = 0;
+}
+
+/// The position of `stream_id` among the connection's streams, or null.
 pub fn h2StreamIndex(self: *const Slot, stream_id: u32) ?usize {
-    for (self.ingress_channels, 0..) |entry, index| {
-        if (entry.state != .vacant and entry.stream_id == stream_id)
-            return index;
+    if (stream_id == 0)
+        return null;
+    for (self.stream_ids, 0..) |id, position| {
+        if (id == stream_id)
+            return position;
+    }
+    return null;
+}
+
+/// The entry of the stream at `position`, which holds one.
+pub fn streamAt(self: *const Slot, position: usize) *H2StreamEntry {
+    std.debug.assert(self.stream_ids[position] != 0);
+    return &self.streams.entries[self.stream_refs[position]];
+}
+
+/// The entry of `stream_id`, or null when the table does not hold it.
+pub fn h2StreamEntry(self: *Slot, stream_id: u32) ?*H2StreamEntry {
+    const position = h2StreamIndex(self, stream_id) orelse return null;
+    return streamAt(self, position);
+}
+
+fn h2StreamEntryConst(self: *const Slot, stream_id: u32) ?*const H2StreamEntry {
+    const position = h2StreamIndex(self, stream_id) orelse return null;
+    return streamAt(self, position);
+}
+
+/// The position of the stream owned by `request_key`, or null.
+fn requestPosition(self: *const Slot, request_key: RequestKey) ?usize {
+    for (self.stream_ids, 0..) |id, position| {
+        if (id == 0)
+            continue;
+        const request = streamAt(self, position).request orelse continue;
+        if (request.key.eql(request_key))
+            return position;
     }
     return null;
 }
@@ -433,7 +492,7 @@ pub const H2StreamState = enum {
 
 /// The lane request that owns a stream.
 pub const StreamRequest = struct {
-    key: ingress_state.RequestKey,
+    key: RequestKey,
     /// The request id a worker's descriptors for the stream must carry.
     id: u64,
 };
@@ -454,6 +513,7 @@ pub const StreamRelease = enum {
 };
 
 pub const H2StreamEntry = struct {
+    slab_link: slab.Link = .{},
     state: H2StreamState = .vacant,
     stream_id: u32 = 0,
     /// Set by `h2BindRequest` or `h2ActivateStream`: always for an `active`
@@ -478,11 +538,13 @@ pub const H2StreamEntry = struct {
     worker_response_head_sent: bool = false,
     worker_response_ended: bool = false,
 
-    pub fn deinit(self: *H2StreamEntry, allocator: std.mem.Allocator) void {
+    /// Frees the stream's buffered body and response.
+    pub fn deinitBuffers(self: *H2StreamEntry, allocator: std.mem.Allocator) void {
         if (self.pending_body.len != 0)
             allocator.free(self.pending_body);
         if (self.pending_response.len != 0)
             allocator.free(self.pending_response);
-        self.* = .{};
+        self.pending_body = &.{};
+        self.pending_response = &.{};
     }
 };

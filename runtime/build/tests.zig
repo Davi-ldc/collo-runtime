@@ -813,6 +813,13 @@ const stub_suites = [_]StubSuite{
         .hpack = true,
     },
     .{
+        .name = "h2-frame-reader",
+        .domain = .server,
+        .root = "runtime/src/server/tests/http2/frame_reader.zig",
+        .imports = &.{ .server_h2, .http, .limits },
+        .hpack = true,
+    },
+    .{
         .name = "ipc",
         .domain = .common,
         .root = "runtime/src/common/tests/ipc.zig",

@@ -1,9 +1,9 @@
 //! The event loop of an ingress lane thread in the server: the lane's one
 //! io_uring, the dispatch of each completion to its handler, the handlers of
 //! a worker registration's polls, the writability poll of a worker's control
-//! socket, the shutdown drain, the renewal and the sends of the lane's
-//! egress lease, and the per-lane arrays the loop serves (connection slots,
-//! request slots, header buffers, IPC scratch).
+//! socket, the wake bits other threads raise, the shutdown drain, the renewal
+//! and the sends of the lane's egress lease, and the per-lane tables and
+//! buffers the loop serves.
 //!
 //! Invariants:
 //! - The loop runs a handler per completion, per queued connection and per
@@ -19,6 +19,11 @@
 //!   while the registration still holds the worker it was armed for (its
 //!   generation) and, for a poll only a reader arms, while the lane still
 //!   reads that worker; any other completion is counted as stale.
+//! - A pass makes one `io_uring_enter` at most: handlers only prepare
+//!   submissions, and the pass ends by handing them to the kernel without
+//!   waiting when it found work, or with the wait when it found none
+//!   (`event_sources.LaneRing`). Only a pass that fills the submission queue
+//!   enters early.
 //! - A pass first renews the lane's egress lease when the manager's current
 //!   gateway is not the one the lease holds (`renewEgressLease`), and last
 //!   sends the `request_ended` entries its finishes noted (`runQueuedWork`).
@@ -36,20 +41,20 @@
 //!   egress lease. Teardown gives back what commands still queued hold,
 //!   finishes every request, closes every connection, gives its reader roles
 //!   back, sends the `request_ended` entries its finishes noted and closes
-//!   the lease's descriptor, and checks that every slab is free again,
-//!   asserting it after a clean stop; only then does it free the arrays.
+//!   the lease's descriptor, and checks that every table is empty again,
+//!   asserting it after a clean stop; only then does it free the tables.
 
 const std = @import("std");
 const linux = std.os.linux;
 
 const ipc = @import("collo_ipc");
-const http_common = @import("collo_http");
 const limits = @import("collo_limits");
 const uring_tags = @import("collo_io_uring_tags");
 const accept = @import("../accept.zig");
 const completions = @import("../completions.zig");
 const fault = @import("../fault.zig");
 const http2_writing = @import("../http2/writing.zig");
+const http2_lane = @import("../http2/lane_resources.zig");
 const lane_mod = @import("../lane.zig");
 const accept_flow = @import("accept_flow.zig");
 const command_flow = @import("command_flow.zig");
@@ -62,18 +67,15 @@ const fs_fault_control = @import("fs_fault_control.zig");
 const request_finish = @import("request_finish.zig");
 const request_slot = @import("request_slot.zig");
 const work_queues = @import("work_queues.zig");
+const worker_completions = @import("worker_completions.zig");
 const worker_control = @import("worker_control.zig");
 const worker_fault = @import("worker_fault.zig");
 const worker_registration = @import("worker_registration.zig");
+const runner = @import("root.zig");
 
 const LaneFault = fault.LaneFault;
+const LaneRing = event_sources.LaneRing;
 
-/// Submission queue entries of the lane's io_uring, which carries the accept
-/// and every poll the lane arms.
-pub const accept_queue_depth: u16 = 64;
-pub const max_header_buffers_per_lane: usize = 256;
-pub const header_buffer_bytes: usize =
-    http_common.http2.frame_header_len + limits.h2.INGRESS_MAX_FRAME_SIZE_BYTES;
 /// Completions one drain takes from the ring.
 const cqe_batch_max: usize = 64;
 /// Ring calls in a row that may fail transiently (`fault.ringErrorIsTransient`)
@@ -108,16 +110,6 @@ const RingRetries = struct {
     }
 };
 
-/// Submits what is queued and waits until the ring holds a completion. A
-/// transient failure, a signal interrupting the wait among them, ends the
-/// wait and is counted (`RingRetries`).
-fn waitForCompletion(ring: *linux.IoUring, retries: *RingRetries) LaneFault!void {
-    _ = ring.submit_and_wait(1) catch |err| {
-        try retries.note(err);
-        return;
-    };
-}
-
 pub fn Methods(comptime Self: type) type {
     return struct {
         const Accept = accept_flow.Methods(Self);
@@ -128,6 +120,7 @@ pub fn Methods(comptime Self: type) type {
         const FsFaultControl = fs_fault_control.Methods(Self);
         const Queues = work_queues.Methods(Self);
         const RequestFinish = request_finish.Methods(Self);
+        const WorkerCompletions = worker_completions.Methods(Self);
         const WorkerControl = worker_control.Methods(Self);
         const WorkerFault = worker_fault.Methods(Self);
         const WorkerRegistration = worker_registration.Methods(Self);
@@ -139,7 +132,7 @@ pub fn Methods(comptime Self: type) type {
             try initRuntime(self);
             defer deinitRuntime(self);
 
-            var ring = try linux.IoUring.init(accept_queue_depth, 0);
+            var ring = try LaneRing.init();
             defer ring.deinit();
             self.runtime_ring = &ring;
             defer self.runtime_ring = null;
@@ -164,19 +157,19 @@ pub fn Methods(comptime Self: type) type {
         /// open.
         pub fn handleStop(self: *Self) LaneFault!void {
             const ring = self.runtime_ring orelse return error.IngressRingUnavailable;
-            for (self.connection_slots) |*runtime| {
-                if (!runtime.active or runtime.state != .http2_connection)
+            for (self.connections.touched(), 0..) |*runtime, index| {
+                if (!runtime.isLive() or runtime.state != .http2_connection)
                     continue;
                 // A connection that cannot take the frame still drains its
                 // streams; the frame only spares a well-behaved client the
                 // 503 a new stream gets now. The turn flushes it.
                 try http2_writing.queueGoawayNoNewStreams(Self, self, runtime);
-                Queues.enqueueConnection(self, runtime.key.slot);
+                Queues.enqueueConnection(self, @intCast(index));
             }
             var retries: RingRetries = .{};
             while (true) {
                 try releaseIdleTenures(self);
-                if (self.dynamic_request_count == 0 and !readsAnyWorker(self)) {
+                if (self.request_count == 0 and !readsAnyWorker(self)) {
                     if (closeIfQueueEmpty(self))
                         break;
                     // A slot handed to a request that ended meanwhile is in
@@ -187,16 +180,19 @@ pub fn Methods(comptime Self: type) type {
                     _ = try runQueuedWork(self);
                     continue;
                 }
-                if (self.dynamic_request_count == 0) {
+                if (self.request_count == 0) {
                     const now = self.monotonicNowNs();
                     try deadline_driver.armTimerNoLaterThan(Self, self, now, now +| shutdown_tenure_check_ns);
                 }
                 try runPass(self, ring, &retries);
             }
-            for (self.connection_slots) |*runtime| {
-                if (runtime.active)
+            for (self.connections.touched()) |*runtime| {
+                if (runtime.isLive())
                     try Connection.tearDownConnection(self, runtime);
             }
+            // The closes above are prepared on the ring; they reach the
+            // kernel before the ring goes.
+            try ring.submit();
         }
 
         /// Loop handler: drives the connection in `slot`, whose read poll
@@ -215,7 +211,7 @@ pub fn Methods(comptime Self: type) type {
         /// re-arms its polls, or runs the death path on a fault.
         pub fn handleWorkerControlReadable(self: *Self, registration_index: u32) LaneFault!void {
             switch (try WorkerControl.drainWorkerControl(self, registration_index, .yield_to_backlog)) {
-                .ok, .would_block => _ = try WorkerRegistration.armWorkerPolls(self, registration_index),
+                .ok, .would_block => try WorkerRegistration.armWorkerPolls(self, registration_index),
                 .fault => |reason| try WorkerFault.faultWorker(self, registration_index, reason),
             }
         }
@@ -230,26 +226,9 @@ pub fn Methods(comptime Self: type) type {
         /// re-arms its polls, or runs the death path on a fault.
         pub fn handleWorkerFsFault(self: *Self, registration_index: u32) LaneFault!void {
             switch (try FsFaultControl.drainWorkerFsFault(self, registration_index)) {
-                .ok, .would_block => _ = try WorkerRegistration.armWorkerPolls(self, registration_index),
+                .ok, .would_block => try WorkerRegistration.armWorkerPolls(self, registration_index),
                 .fault => |reason| try WorkerFault.faultWorker(self, registration_index, reason),
             }
-        }
-
-        /// Loop handler: the worker's payload credit eventfd fired, so its
-        /// server-to-worker ring may have room for the bodies this lane
-        /// parked on it. Every lane polling the eventfd retries its own
-        /// bodies whatever its read of the count found, since another lane's
-        /// read may have taken the count first.
-        pub fn handleWorkerPayloadCredit(self: *Self, registration_index: u32) LaneFault!void {
-            const registration = try registrationAt(self, registration_index);
-            const wakes = event_sources.drainEventFd(registration.ingress_payload_credit_eventfd) catch |err| wakes: {
-                switch (try fault.classifyWorkerError(.{ .wake = err })) {
-                    .ok, .would_block => break :wakes 0,
-                    .fault => |reason| return WorkerFault.faultWorker(self, registration_index, reason),
-                }
-            };
-            self.lane.counters.h2_request_body_credit_wakes += wakes;
-            try Dispatch.flushBlockedSends(self, registration_index);
         }
 
         /// Loop handler: the pidfd of a worker this lane reads reported its
@@ -266,8 +245,7 @@ pub fn Methods(comptime Self: type) type {
             if (registration.control_writable_poll_registered)
                 return;
             const ring = self.runtime_ring orelse return error.IngressRingUnavailable;
-            try self.runtime_events.queuePoll(
-                ring,
+            try ring.queuePoll(
                 registration.control_fd,
                 event_sources.pollMask(event_sources.write_events),
                 .{ .kind = .worker_control_writable, .index = registration_index, .generation = registration.generation },
@@ -275,37 +253,42 @@ pub fn Methods(comptime Self: type) type {
             registration.control_writable_poll_registered = true;
         }
 
-        pub fn initRuntime(self: *Self) LaneFault!void {
-            self.connection_slots = try self.service.allocator.alloc(
-                connection_slot.Slot,
-                self.lane.state.connections.slots.len,
-            );
-            errdefer self.service.allocator.free(self.connection_slots);
-            @memset(self.connection_slots, .{});
+        /// Takes every wake bit raised since the last call and runs the
+        /// retry each one asks for: the request bodies of this lane parked
+        /// on a full payload ring, and the workers this lane reads whose
+        /// forwarding window reopened.
+        pub fn takeWakeBits(self: *Self) LaneFault!void {
+            const bits = self.wake_bits.swap(0, .seq_cst);
+            if (bits & runner.wake.payload_credit != 0) {
+                self.lane.counters.h2_request_body_credit_wakes += 1;
+                try Dispatch.retryRingBlockedSends(self);
+            }
+            if (bits & runner.wake.window_reopened != 0)
+                try WorkerCompletions.resumeWindowBlockedReaders(self);
+        }
 
-            self.pre_request_deadlines = try connection_slot.PreRequestDeadlineHeap.initCapacity(
+        pub fn initRuntime(self: *Self) LaneFault!void {
+            const capacities = self.table_capacities;
+            self.connections = try connection_slot.ConnectionSlab.init(capacities.connections);
+            errdefer self.connections.deinit();
+            self.ready_connections = .{};
+            self.connection_deadlines = try connection_slot.DeadlineHeap.initCapacity(
                 self.service.allocator,
                 {},
-                self.connection_slots.len,
+                capacities.connections,
             );
             errdefer {
-                Deadlines.preRequestDeadlineHeap(self).deinit();
-                self.pre_request_deadlines = null;
+                Deadlines.connectionDeadlines(self).deinit();
+                self.connection_deadlines = null;
             }
-
-            self.ready_connections = try work_queues.ReadyQueue.init(
-                self.service.allocator,
-                self.connection_slots.len,
-            );
-            errdefer self.ready_connections.deinit(self.service.allocator);
-
-            self.dynamic_requests = try self.service.allocator.alloc(
-                request_slot.RequestSlot,
-                self.lane.state.requests.slots.len,
-            );
-            errdefer self.service.allocator.free(self.dynamic_requests);
-            @memset(self.dynamic_requests, .{});
-            self.dynamic_request_count = 0;
+            self.requests = try request_slot.RequestSlab.init(capacities.requests);
+            errdefer self.requests.deinit();
+            self.request_count = 0;
+            self.registrations = try completions.RegistrationSlab.init(runner.max_completion_registrations);
+            errdefer self.registrations.deinit();
+            self.deferred_deaths = .{};
+            self.h2_lane = try http2_lane.LaneResources.init(capacities.streams);
+            errdefer self.h2_lane.deinit();
 
             self.ipc_send_scratch = try self.service.allocator.alloc(u8, ipc.max_message_bytes);
             errdefer {
@@ -318,14 +301,6 @@ pub fn Methods(comptime Self: type) type {
                 self.ipc_recv_scratch = &.{};
             }
 
-            self.header_buffers = try work_queues.HeaderBufferPool.init(
-                self.service.allocator,
-                self.connection_slots.len,
-                max_header_buffers_per_lane,
-                header_buffer_bytes,
-            );
-            errdefer self.header_buffers.deinit(self.service.allocator);
-
             self.runtime_events = try event_sources.EventSet.init();
         }
 
@@ -336,6 +311,7 @@ pub fn Methods(comptime Self: type) type {
                 self.service.allocator,
                 .{
                     .lane_id = self.listener_index,
+                    .max_requests = self.table_capacities.requests,
                     .command_obligation_reserve = lane_mod.obligationReserve(
                         self.service.routes.definitionCount(),
                     ),
@@ -382,23 +358,23 @@ pub fn Methods(comptime Self: type) type {
                 teardown_failed = true;
                 noteTeardownFailure(self, "give back a queued handoff", err);
             };
-            for (self.dynamic_requests, 0..) |*active, index| {
-                if (!active.active)
+            for (self.requests.touched(), 0..) |*active, index| {
+                if (!active.isLive())
                     continue;
                 RequestFinish.finishRequest(self, @intCast(index), .shutdown) catch |err| {
                     teardown_failed = true;
                     noteTeardownFailure(self, "finish a request", err);
                 };
             }
-            for (self.connection_slots) |*runtime| {
-                if (!runtime.active)
+            for (self.connections.touched()) |*runtime| {
+                if (!runtime.isLive())
                     continue;
                 Connection.tearDownConnection(self, runtime) catch |err| {
                     teardown_failed = true;
                     noteTeardownFailure(self, "close a connection", err);
                 };
             }
-            for (self.completion_registrations[0..self.completion_registration_count], 0..) |*registration, index| {
+            for (self.registrations.touched(), 0..) |*registration, index| {
                 if (!registration.inUse())
                     continue;
                 WorkerRegistration.endRegistrationAtTeardown(self, @intCast(index)) catch |err| {
@@ -406,10 +382,6 @@ pub fn Methods(comptime Self: type) type {
                     noteTeardownFailure(self, "end a worker registration", err);
                 };
             }
-            // The ring took the registrations' polls with it, and a
-            // registration owns nothing else: its descriptors are the
-            // worker's record's.
-            self.completion_registration_count = 0;
             // The finishes above noted their `request_ended` entries on the
             // lease, which sends them before it closes its descriptor. Its
             // counts move into the retained counters in the same critical
@@ -424,40 +396,37 @@ pub fn Methods(comptime Self: type) type {
                 self.egress_lease = .{};
             }
             // Every request is finished and every connection closed, so each
-            // liveness count must be zero here. The runner's count and the
-            // lane slabs' free lists are kept by different code on different
-            // paths, so their agreement is a real cross-check. Nothing else
-            // would notice a slot that never comes back: the slabs are
-            // preallocated, so a leaked slot moves no RSS, passes through no
-            // allocator and stays invisible to a leak checker until the slab
-            // runs out and new work is refused. A teardown that failed, or one
-            // after a lane fault, broke the state these counts describe, so
-            // it reports a disagreement instead of asserting.
+            // table must be empty here. The runner's count and the slabs'
+            // own are kept by different code on different paths, so their
+            // agreement is a real cross-check. Nothing else would notice an
+            // entry that never comes back: it passes through no allocator and
+            // stays invisible to a leak checker until its slab runs out and
+            // new work is refused. A teardown that failed, or one after a
+            // lane fault, broke the state these counts describe, so it
+            // reports a disagreement instead of asserting.
             if (stopped_clean and !teardown_failed) {
-                std.debug.assert(self.dynamic_request_count == 0);
-                std.debug.assert(self.lane.state.requests.free_len == self.lane.state.requests.slots.len);
-                std.debug.assert(self.lane.state.connections.free_len == self.lane.state.connections.slots.len);
-                std.debug.assert(self.header_buffers.free_count == self.header_buffers.free_slots.len);
-                std.debug.assert(self.lane.deadline_wheel.free_len == self.lane.deadline_wheel.entries.len);
+                std.debug.assert(self.request_count == 0);
+                std.debug.assert(self.requests.live_count == 0);
+                std.debug.assert(self.connections.live_count == 0);
+                std.debug.assert(self.h2_lane.streams.live_count == 0);
+                std.debug.assert(self.h2_lane.header_blocks.used == 0);
+                std.debug.assert(self.lane.deadline_wheel.liveEntries() == 0);
             } else if (!livenessCountsClear(self)) {
                 std.log.err(
-                    "ingress lane {d} tore down with state still held: requests={d} request_slots_free={d}/{d} connection_slots_free={d}/{d}",
+                    "ingress lane {d} tore down with state still held: requests={d} request_entries={d} connections={d} streams={d}",
                     .{
                         self.listener_index,
-                        self.dynamic_request_count,
-                        self.lane.state.requests.free_len,
-                        self.lane.state.requests.slots.len,
-                        self.lane.state.connections.free_len,
-                        self.lane.state.connections.slots.len,
+                        self.request_count,
+                        self.requests.live_count,
+                        self.connections.live_count,
+                        self.h2_lane.streams.live_count,
                     },
                 );
             }
-            if (self.pre_request_deadlines) |*heap| {
+            if (self.connection_deadlines) |*heap| {
                 heap.deinit();
-                self.pre_request_deadlines = null;
+                self.connection_deadlines = null;
             }
-            self.pre_request_deadline_count = 0;
-            self.header_buffers.deinit(self.service.allocator);
             self.runtime_events.deinit();
             if (self.ipc_send_scratch.len != 0) {
                 self.service.allocator.free(self.ipc_send_scratch);
@@ -467,13 +436,12 @@ pub fn Methods(comptime Self: type) type {
                 self.service.allocator.free(self.ipc_recv_scratch);
                 self.ipc_recv_scratch = &.{};
             }
-            self.service.allocator.free(self.dynamic_requests);
-            self.ready_connections.deinit(self.service.allocator);
-            self.service.allocator.free(self.connection_slots);
-            self.connection_slots = &.{};
+            self.h2_lane.deinit();
+            self.registrations.deinit();
+            self.requests.deinit();
+            self.connections.deinit();
             self.ready_connections = .{};
-            self.dynamic_requests = &.{};
-            self.header_buffers = .{};
+            self.deferred_deaths = .{};
             self.lane.accept_registration = .{};
         }
 
@@ -484,28 +452,26 @@ pub fn Methods(comptime Self: type) type {
             std.log.err("ingress lane {d} failed to " ++ what ++ " at teardown: {s}", .{ self.listener_index, @errorName(err) });
         }
 
-        /// Whether no request, request slot, connection slot, header buffer
-        /// or wheel entry of the lane is still held.
+        /// Whether no request, connection, stream or wheel entry of the lane
+        /// is still held.
         fn livenessCountsClear(self: *Self) bool {
-            if (self.dynamic_request_count != 0) return false;
-            if (self.lane.state.requests.free_len != self.lane.state.requests.slots.len) return false;
-            if (self.lane.state.connections.free_len != self.lane.state.connections.slots.len) return false;
-            if (self.header_buffers.free_count != self.header_buffers.free_slots.len) return false;
-            return self.lane.deadline_wheel.free_len == self.lane.deadline_wheel.entries.len;
+            if (self.request_count != 0) return false;
+            if (self.requests.live_count != 0) return false;
+            if (self.connections.live_count != 0) return false;
+            if (self.h2_lane.streams.live_count != 0) return false;
+            return self.lane.deadline_wheel.liveEntries() == 0;
         }
 
-        fn armCommandPoll(self: *Self, ring: *linux.IoUring) LaneFault!void {
-            try self.runtime_events.queuePoll(
-                ring,
+        fn armCommandPoll(self: *Self, ring: *LaneRing) LaneFault!void {
+            try ring.queuePoll(
                 self.lane.command_queue.commandEventFd(),
                 event_sources.pollMask(event_sources.read_events),
                 .{ .kind = .command },
             );
         }
 
-        fn armTimerPoll(self: *Self, ring: *linux.IoUring) LaneFault!void {
-            try self.runtime_events.queuePoll(
-                ring,
+        fn armTimerPoll(self: *Self, ring: *LaneRing) LaneFault!void {
+            try ring.queuePoll(
                 self.runtime_events.timer_fd,
                 event_sources.pollMask(event_sources.read_events),
                 .{ .kind = .deadline_timer },
@@ -513,24 +479,27 @@ pub fn Methods(comptime Self: type) type {
         }
 
         /// One turn of the loop: renews the egress lease when the gateway
-        /// changed, re-arms the accept when it is due, submits what a
-        /// transient failure left queued, runs the completions the ring holds
-        /// and the rest of the pass (`runQueuedWork`), and waits for a
-        /// completion when none of that found work. The completions the wait
-        /// brings run in the next pass, after its renewal.
-        fn runPass(self: *Self, ring: *linux.IoUring, retries: *RingRetries) LaneFault!void {
+        /// changed, prepares the accept's re-arm when it is due, runs the
+        /// completions the ring holds and the rest of the pass
+        /// (`runQueuedWork`), and ends in its one `io_uring_enter`: a submit
+        /// of what the pass prepared when it found work, so the next pass
+        /// starts at once, or the submit and the wait when it found none. The
+        /// completions the wait brings run in the next pass, after its
+        /// renewal.
+        fn runPass(self: *Self, ring: *LaneRing, retries: *RingRetries) LaneFault!void {
+            self.lane.counters.loop_passes += 1;
             renewEgressLease(self);
             if (!self.service.shouldStop()) {
                 _ = self.lane.accept_registration.finishBackoff(self.monotonicNowNs());
                 if (self.lane.accept_registration.state == .inactive)
                     try Accept.ensureAcceptArmed(self, ring);
             }
-            if (ring.sq_ready() != 0)
-                try event_sources.submitPending(ring);
             var did_work = try drainRingCqes(self, ring, retries);
             did_work = (try runQueuedWork(self)) or did_work;
-            if (!did_work)
-                try waitForCompletion(ring, retries);
+            defer self.lane.counters.ring_enters = ring.enters;
+            if (did_work)
+                return ring.submit();
+            ring.submitAndWait() catch |err| try retries.note(err);
         }
 
         /// Gives the lane's egress lease the current gateway's key and a
@@ -560,9 +529,9 @@ pub fn Methods(comptime Self: type) type {
         /// Takes the completions the ring holds without waiting and runs
         /// each one's handler. Returns whether it took any. A transient
         /// failure gives up this turn and is counted (`RingRetries`).
-        fn drainRingCqes(self: *Self, ring: *linux.IoUring, retries: *RingRetries) LaneFault!bool {
+        fn drainRingCqes(self: *Self, ring: *LaneRing, retries: *RingRetries) LaneFault!bool {
             var cqes: [cqe_batch_max]linux.io_uring_cqe = undefined;
-            const ready = ring.copy_cqes(&cqes, 0) catch |err| {
+            const ready = ring.copyCompletions(&cqes) catch |err| {
                 try retries.note(err);
                 return false;
             };
@@ -579,7 +548,7 @@ pub fn Methods(comptime Self: type) type {
         /// for a connection or a registration that has moved on, or one of a
         /// poll the lane cancelled, is counted as stale. Every user_data was
         /// packed by the lane, so one that decodes to nothing is a lane fault.
-        fn dispatchCqe(self: *Self, ring: *linux.IoUring, cqe: linux.io_uring_cqe) LaneFault!void {
+        fn dispatchCqe(self: *Self, ring: *LaneRing, cqe: linux.io_uring_cqe) LaneFault!void {
             if (accept.unpackAcceptUserData(cqe.user_data)) |_| {
                 return self.handleAcceptCqe(cqe);
             } else |err| switch (err) {
@@ -597,16 +566,14 @@ pub fn Methods(comptime Self: type) type {
                     try armTimerPoll(self, ring);
                 },
                 .connection_poll_cancel => self.lane.counters.connection_poll_cancel_cqes += 1,
+                .connection_close => self.lane.counters.connection_close_cqes += 1,
                 .worker_poll_cancel => self.lane.counters.worker_poll_cancel_cqes += 1,
-                .connection, .connection_read, .connection_write => {
-                    if (data.index >= self.connection_slots.len) {
+                .connection_read, .connection_write => {
+                    const runtime = self.connections.get(data.index) orelse {
                         self.lane.counters.stale_connection_cqe += 1;
                         return;
-                    }
-                    const runtime = &self.connection_slots[data.index];
-                    if (!runtime.active or
-                        connection_slot.connectionGenerationTag(runtime.key) != data.generation)
-                    {
+                    };
+                    if (connection_slot.connectionGenerationTag(runtime.key) != data.generation) {
                         self.lane.counters.stale_connection_cqe += 1;
                         return;
                     }
@@ -619,10 +586,7 @@ pub fn Methods(comptime Self: type) type {
                             runtime.registered_wait_events &= ~event_sources.read_interest;
                             try self.handleConnectionReadable(data.index);
                         },
-                        else => {
-                            runtime.registered_wait_events = 0;
-                            try self.handleConnectionReadable(data.index);
-                        },
+                        else => unreachable,
                     }
                 },
                 .worker_completion => if (workerPollReady(self, data, cqe.res))
@@ -631,8 +595,6 @@ pub fn Methods(comptime Self: type) type {
                     try self.handleWorkerControlReadable(data.index),
                 .worker_control_writable => if (workerPollReady(self, data, cqe.res))
                     try self.handleWorkerControlWritable(data.index),
-                .worker_payload_credit => if (workerPollReady(self, data, cqe.res))
-                    try self.handleWorkerPayloadCredit(data.index),
                 .worker_fs_fault => if (workerPollReady(self, data, cqe.res))
                     try self.handleWorkerFsFault(data.index),
                 .worker_pidfd => if (workerPollReady(self, data, cqe.res))
@@ -666,11 +628,7 @@ pub fn Methods(comptime Self: type) type {
         /// armed, or when the poll is one only a reader arms and the lane no
         /// longer reads the worker.
         fn registrationForCqe(self: *Self, data: event_sources.EventData) ?*completions.Registration {
-            if (data.index >= self.completion_registration_count)
-                return null;
-            const registration = &self.completion_registrations[data.index];
-            if (!registration.inUse())
-                return null;
+            const registration = self.registrations.get(data.index) orelse return null;
             if (registration.generation != data.generation)
                 return null;
             switch (data.kind) {
@@ -688,7 +646,7 @@ pub fn Methods(comptime Self: type) type {
         /// connection that queues itself again cannot hold the loop.
         fn driveQueuedConnections(self: *Self) LaneFault!bool {
             var did_work = false;
-            var budget = self.connection_slots.len;
+            var budget = self.connections.high_water;
             while (budget != 0) : (budget -= 1) {
                 const slot = Queues.popConnection(self) orelse break;
                 did_work = true;
@@ -698,9 +656,9 @@ pub fn Methods(comptime Self: type) type {
         }
 
         /// Drives the connection in `slot` (`connection_flow.driveConnection`),
-        /// counting a slot out of range as stale.
+        /// counting a slot that holds no connection as stale.
         fn driveSlot(self: *Self, slot: u32) LaneFault!void {
-            if (slot >= self.connection_slots.len) {
+            if (self.connections.get(slot) == null) {
                 self.lane.counters.stale_connection_cqe += 1;
                 return;
             }
@@ -711,19 +669,14 @@ pub fn Methods(comptime Self: type) type {
         /// worker: a handler reaches one only through a completion or a call
         /// that checked it, so anything else is the lane's own mistake.
         fn registrationAt(self: *Self, registration_index: u32) LaneFault!*completions.Registration {
-            if (registration_index >= self.completion_registration_count)
-                return error.InvalidCompletionRegistration;
-            const registration = &self.completion_registrations[registration_index];
-            if (!registration.inUse())
-                return error.InvalidCompletionRegistration;
-            return registration;
+            return self.registrations.get(registration_index) orelse error.InvalidCompletionRegistration;
         }
 
         /// Gives up every tenure over a worker on which the lane has no
         /// request, as the shutdown drain needs. A tenure over a worker other
         /// lanes still use stays (`Pool.transferReader` answers `.kept`).
         fn releaseIdleTenures(self: *Self) LaneFault!void {
-            for (self.completion_registrations[0..self.completion_registration_count], 0..) |*registration, index| {
+            for (self.registrations.touched(), 0..) |*registration, index| {
                 if (!registration.inUse() or !registration.reading())
                     continue;
                 if (registration.inflight_request_len != 0)
@@ -748,7 +701,7 @@ pub fn Methods(comptime Self: type) type {
         }
 
         fn readsAnyWorker(self: *Self) bool {
-            for (self.completion_registrations[0..self.completion_registration_count]) |*registration| {
+            for (self.registrations.touched()) |*registration| {
                 if (registration.inUse() and registration.reading())
                     return true;
             }
@@ -764,15 +717,14 @@ fn pollInFlight(registration: *completions.Registration, kind: event_sources.Eve
         .worker_completion => &registration.poll_registered,
         .worker_control => &registration.control_poll_registered,
         .worker_control_writable => &registration.control_writable_poll_registered,
-        .worker_payload_credit => &registration.ingress_payload_credit_poll_registered,
         .worker_fs_fault => &registration.fs_fault_poll_registered,
         .worker_pidfd => &registration.pidfd_poll_registered,
         .command,
         .deadline_timer,
-        .connection,
         .connection_read,
         .connection_write,
         .connection_poll_cancel,
+        .connection_close,
         .worker_poll_cancel,
         => null,
     };

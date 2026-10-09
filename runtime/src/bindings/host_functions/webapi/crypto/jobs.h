@@ -54,16 +54,17 @@ public:
     CryptoJobCost cost() const { return m_cost; }
     bool belongsTo(ColloVm* vm) const { return m_vm == vm; }
 
-    // Settles the promise on the VM thread and releases the deferred; a second call returns
-    // `COLLO_STATUS_INVALID_ARGUMENT`. The promise resolves with `resolveValue`'s result. It rejects with, in order of
-    // precedence, a value passed to `rejectWithValue`, an exception thrown while building the result, or a DOMException
-    // from `fail`'s code and message, which default to OperationError with no message. A non-OK status comes from
-    // settling the promise itself, with any exception in `*out_exception`.
-    ColloStatus settle(JSC::JSGlobalObject* global_object, ColloValue** out_exception)
+    // Settles the promise on the VM thread, building its value in the promise's realm, and releases the deferred; a
+    // second call returns `COLLO_STATUS_INVALID_ARGUMENT`. The promise resolves with `resolveValue`'s result. It
+    // rejects with, in order of precedence, a value passed to `rejectWithValue`, an exception thrown while building the
+    // result, or a DOMException from `fail`'s code and message, which default to OperationError with no message. A
+    // non-OK status comes from settling the promise itself, with any exception in `*out_exception`.
+    ColloStatus settle(ColloValue** out_exception)
     {
         if (!m_deferred)
             return COLLO_STATUS_INVALID_ARGUMENT;
 
+        JSC::JSGlobalObject* global_object = collo_promise_deferred_realm(m_deferred)->global_object;
         auto& vm = global_object->vm();
         JSC::JSLockHolder locker(vm);
         auto scope = DECLARE_TOP_EXCEPTION_SCOPE(vm);

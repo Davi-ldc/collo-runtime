@@ -295,7 +295,7 @@ JSObject* JSColloMessageEvent::ensurePorts(JSC::JSGlobalObject* global_object, J
         return ports;
     // ports is [SameObject]: event.ports === event.ports must hold, so the frozen empty array is kept on first read.
     // FIXME: every port-less MessageEvent whose ports are read pins its own empty array; one frozen empty array kept
-    // in ColloVm::webapi_cache would serve them all.
+    // in the realm's webapi_cache would serve them all.
     auto* ports = frozenEmptyArray(global_object, scope);
     RETURN_IF_EXCEPTION(scope, nullptr);
     if (!ports)
@@ -1146,10 +1146,11 @@ void installWebApiEvent(Collo::GlobalObject* global_object, JSC::VM& vm)
     RELEASE_ASSERT(global_object->getDirect(vm, target_identifier));
 
     // The global object has no listener storage of its own, so its listeners live in this EventTarget cell, which
-    // ColloVm::webapi_cache roots for the VM's lifetime together with the onerror and onmessage handlers.
+    // the realm's webapi_cache roots for the VM's lifetime together with the onerror and onmessage handlers. Each
+    // realm has its own, so one realm's listeners never hear another's events.
     auto* target_structure = JSColloEventTarget::createStructure(vm, global_object, target_prototype);
     auto* global_event_target = JSColloEventTarget::create(vm, target_structure);
-    auto& cache = global_object->owner().webapi_cache;
+    auto& cache = global_object->webApiCache();
     cache.global_event_target.set(vm, global_event_target);
     cache.global_on_error.set(vm, JSC::jsNull());
     cache.global_on_message.set(vm, JSC::jsNull());

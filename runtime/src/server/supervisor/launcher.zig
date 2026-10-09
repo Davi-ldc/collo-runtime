@@ -145,10 +145,6 @@ pub const trace_capacity: usize = 256;
 /// rewrite.
 const launch_cpu_max_cores: u32 = limits.worker.cpu_max_cores;
 
-/// A worker launches with the first route of its definition: the route whose
-/// pack WorkerInit carries and the child registers before it reports ready.
-const launch_route: config.RouteIndex = 0;
-
 /// How long the thread waits before polling again after poll(2) failed,
 /// which it does only when the kernel lacks memory for the poll table.
 /// Deadlines keep expiring meanwhile, so a launch never outlives its window.
@@ -1565,7 +1561,9 @@ pub const Launcher = struct {
         forked.cgroup_dir_fd = launch.cgroup_dir.release();
 
         const definition = self.routes.definition(launch.definition);
-        const artifact = self.routes.artifact(.{ .definition = launch.definition, .route = launch_route });
+        // Every worker of the definition serves all of its routes, so every
+        // launch carries the definition's whole route table and pack.
+        const artifact = self.routes.artifact(launch.definition);
         // WorkerInit carries the worker's wake descriptors always, and the
         // session with its boot token or neither (`LaunchEgress` in
         // `host/launch.zig`). A session whose gateway was gone when its key
@@ -1592,14 +1590,14 @@ pub const Launcher = struct {
             definition.settings.limits.memoryBytes(),
             .{
                 .egress = launch_egress,
-                .route_bindings = artifact.bindings,
+                .routes = .{
+                    .table = artifact.route_table,
+                    .module_pack_fd = artifact.module_pack.fd(),
+                    .isolate_realm = definition.settings.isolate_realm,
+                },
                 .tmpfs_size_bytes = self.tmpfs_size_bytes,
                 .cpu_max_cores = launch_cpu_max_cores,
                 .boot = self.boot,
-                .route_entry = .{
-                    .fd = artifact.module_pack.fd(),
-                    .specifier = artifact.entry_specifier,
-                },
                 .fs_index_memfd = artifact.fs_index.fd(),
             },
         );

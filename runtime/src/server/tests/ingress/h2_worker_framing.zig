@@ -20,11 +20,29 @@ const server_main = @import("collo_server_main");
 const ipc = @import("collo_ipc");
 
 const Slot = server_main.ingress.runner.connection_slot.Slot;
-const ingress_state = server_main.ingress.state;
+const LaneResources = server_main.ingress.http2.lane_resources.LaneResources;
+const RequestKey = server_main.lifecycle.RequestKey;
 
 const stream_id: u32 = 5;
-const request_key = ingress_state.RequestKey{ .lane_id = 2, .slot = 9, .generation = 3 };
+const request_key = RequestKey{ .lane_id = 2, .slot = 9, .generation = 3 };
 const request_id: u64 = 7001;
+
+/// A connection slot over lane resources of its own, as a lane's
+/// connections sit over the lane's stream slab.
+const TestConnection = struct {
+    lane: LaneResources,
+    runtime: Slot,
+
+    fn init(self: *TestConnection) !void {
+        self.lane = try LaneResources.init(64);
+        self.runtime = .{ .streams = &self.lane.streams };
+    }
+
+    fn deinit(self: *TestConnection) void {
+        self.runtime.deinitProtocolState(std.testing.allocator, &self.lane.header_blocks);
+        self.lane.deinit();
+    }
+};
 
 fn matchingIdentity() ipc.ingress_channel.RequestIdentity {
     return .{
@@ -44,7 +62,10 @@ fn chunkDescriptor(identity: ipc.ingress_channel.RequestIdentity, end_stream: bo
 }
 
 test "worker response descriptor for an unknown stream is Http2UnknownStream" {
-    var runtime = Slot{ .active = true };
+    var connection: TestConnection = undefined;
+    try connection.init();
+    defer connection.deinit();
+    const runtime = &connection.runtime;
     // No stream reserved: the validator must not read a vacant slot as active.
     try std.testing.expectError(
         error.Http2UnknownStream,
@@ -53,9 +74,10 @@ test "worker response descriptor for an unknown stream is Http2UnknownStream" {
 }
 
 test "worker response descriptor on a non-active stream is rejected" {
-    const allocator = std.testing.allocator;
-    var runtime = Slot{ .active = true };
-    defer runtime.deinitProtocolState(allocator);
+    var connection: TestConnection = undefined;
+    try connection.init();
+    defer connection.deinit();
+    const runtime = &connection.runtime;
 
     // Reserved but never activated: the server has not dispatched the request
     // yet, so no worker response can belong to the stream.
@@ -67,9 +89,10 @@ test "worker response descriptor on a non-active stream is rejected" {
 }
 
 test "worker response descriptor with a mismatched identity is InvalidH2StreamIdentity" {
-    const allocator = std.testing.allocator;
-    var runtime = Slot{ .active = true };
-    defer runtime.deinitProtocolState(allocator);
+    var connection: TestConnection = undefined;
+    try connection.init();
+    defer connection.deinit();
+    const runtime = &connection.runtime;
 
     try runtime.h2ReserveStream(stream_id);
     try runtime.h2ActivateStream(stream_id, request_key, request_id);
@@ -99,9 +122,10 @@ test "worker response descriptor with a mismatched identity is InvalidH2StreamId
 }
 
 test "head-before-body ordering: a body descriptor before any head is rejected" {
-    const allocator = std.testing.allocator;
-    var runtime = Slot{ .active = true };
-    defer runtime.deinitProtocolState(allocator);
+    var connection: TestConnection = undefined;
+    try connection.init();
+    defer connection.deinit();
+    const runtime = &connection.runtime;
 
     try runtime.h2ReserveStream(stream_id);
     try runtime.h2ActivateStream(stream_id, request_key, request_id);
@@ -115,9 +139,10 @@ test "head-before-body ordering: a body descriptor before any head is rejected" 
 }
 
 test "double-head ordering: a second head after the first is rejected" {
-    const allocator = std.testing.allocator;
-    var runtime = Slot{ .active = true };
-    defer runtime.deinitProtocolState(allocator);
+    var connection: TestConnection = undefined;
+    try connection.init();
+    defer connection.deinit();
+    const runtime = &connection.runtime;
 
     try runtime.h2ReserveStream(stream_id);
     try runtime.h2ActivateStream(stream_id, request_key, request_id);
@@ -136,9 +161,10 @@ test "double-head ordering: a second head after the first is rejected" {
 }
 
 test "after-end ordering: head and body descriptors past END_STREAM are rejected" {
-    const allocator = std.testing.allocator;
-    var runtime = Slot{ .active = true };
-    defer runtime.deinitProtocolState(allocator);
+    var connection: TestConnection = undefined;
+    try connection.init();
+    defer connection.deinit();
+    const runtime = &connection.runtime;
 
     try runtime.h2ReserveStream(stream_id);
     try runtime.h2ActivateStream(stream_id, request_key, request_id);
@@ -161,15 +187,17 @@ test "after-end ordering: head and body descriptors past END_STREAM are rejected
 
 test "a worker response descriptor that races a client reset finds no stream" {
     const allocator = std.testing.allocator;
-    var runtime = Slot{ .active = true };
-    defer runtime.deinitProtocolState(allocator);
+    var connection: TestConnection = undefined;
+    try connection.init();
+    defer connection.deinit();
+    const runtime = &connection.runtime;
 
     try runtime.h2ReserveStream(stream_id);
     try runtime.h2ActivateStream(stream_id, request_key, request_id);
     // The client's RST_STREAM takes the entry out of the table, so a worker
     // response that races the reset cannot reopen the stream and frame onto
     // it.
-    try std.testing.expectEqual(@as(?ingress_state.RequestKey, request_key), runtime.h2MarkStreamReset(allocator, stream_id));
+    try std.testing.expectEqual(@as(?RequestKey, request_key), runtime.h2MarkStreamReset(allocator, stream_id));
 
     try std.testing.expectError(
         error.Http2UnknownStream,
@@ -187,8 +215,10 @@ test "a worker response descriptor that races a client reset finds no stream" {
 
 test "the mark helpers refuse to advance a reset or unopened stream" {
     const allocator = std.testing.allocator;
-    var runtime = Slot{ .active = true };
-    defer runtime.deinitProtocolState(allocator);
+    var connection: TestConnection = undefined;
+    try connection.init();
+    defer connection.deinit();
+    const runtime = &connection.runtime;
 
     try runtime.h2ReserveStream(stream_id);
     try runtime.h2ActivateStream(stream_id, request_key, request_id);
@@ -209,11 +239,13 @@ test "the mark helpers refuse to advance a reset or unopened stream" {
 
 test "the lane records a response head as gone out from its mark until the stream leaves the table" {
     const allocator = std.testing.allocator;
-    var runtime = Slot{ .active = true };
-    defer runtime.deinitProtocolState(allocator);
+    var connection: TestConnection = undefined;
+    try connection.init();
+    defer connection.deinit();
+    const runtime = &connection.runtime;
 
     const paired_stream_id = stream_id + 2;
-    const paired_request_key = ingress_state.RequestKey{ .lane_id = 2, .slot = 10, .generation = 1 };
+    const paired_request_key = RequestKey{ .lane_id = 2, .slot = 10, .generation = 1 };
     try runtime.h2ReserveStream(stream_id);
     try runtime.h2ActivateStream(stream_id, request_key, request_id);
     try runtime.h2ReserveStream(paired_stream_id);

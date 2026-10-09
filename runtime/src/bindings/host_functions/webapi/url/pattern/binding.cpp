@@ -460,7 +460,7 @@ namespace {
         auto* collo_global = uncheckedDowncast<Collo::GlobalObject>(global_object);
         auto* new_target = call_frame->newTarget().getObject();
         auto* constructor = call_frame->jsCallee();
-        auto* base_structure = collo_global->owner().webapi_cache.url_pattern_structure.get();
+        auto* base_structure = collo_global->webApiCache().url_pattern_structure.get();
         RELEASE_ASSERT(base_structure);
         if (!new_target || new_target == constructor)
             return base_structure;
@@ -884,7 +884,7 @@ void installWebApiURLPattern(Collo::GlobalObject* global_object, JSC::VM& vm)
         JSC::PropertyAttribute::ReadOnly | JSC::PropertyAttribute::DontEnum);
 
     auto* structure = JSColloURLPattern::createStructure(vm, global_object, prototype);
-    auto& cache = global_object->owner().webapi_cache;
+    auto& cache = global_object->webApiCache();
     cache.url_pattern_constructor.set(vm, constructor);
     cache.url_pattern_prototype.set(vm, prototype);
     cache.url_pattern_structure.set(vm, structure);

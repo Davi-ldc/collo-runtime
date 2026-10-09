@@ -16,7 +16,7 @@
 //!   while the descriptor table stays full.
 
 const std = @import("std");
-const ingress_state = @import("state.zig");
+const slab = @import("slab.zig");
 const tags = @import("collo_io_uring_tags");
 
 /// IORING_CQE_F_MORE: the multishot request stays armed after this
@@ -72,7 +72,7 @@ pub const AcceptRegistration = struct {
     pub fn arm(self: *AcceptRegistration) u64 {
         if (self.state == .active)
             return self.generation;
-        self.generation = ingress_state.nextGeneration(self.generation);
+        self.generation = slab.nextGeneration(self.generation);
         self.state = .active;
         return self.generation;
     }

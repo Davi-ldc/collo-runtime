@@ -33,8 +33,8 @@ test "runtime assigns timer ids monotonically" {
     const active = try rt.ActiveRequest.init(std.testing.allocator, &runtime, 123, 1_000);
     defer active.deinit();
 
-    const first = try runtime.scheduleTimer(123, .{ .inner = .{} }, null, 5, false);
-    const second = try runtime.scheduleTimer(123, .{ .inner = .{} }, null, 10, false);
+    const first = try runtime.scheduleTimer(123, .{ .inner = .{} }, null, null, 5, false);
+    const second = try runtime.scheduleTimer(123, .{ .inner = .{} }, null, null, 10, false);
 
     try std.testing.expectEqual(@as(u64, 1), first);
     try std.testing.expectEqual(@as(u64, 2), second);
@@ -56,8 +56,8 @@ test "timer scheduling requires an active request" {
     });
     defer runtime.deinit();
 
-    try std.testing.expectError(error.TimerOutsideActiveRequest, runtime.scheduleTimer(0, .{ .inner = .{} }, null, 5, false));
-    try std.testing.expectError(error.TimerOutsideActiveRequest, runtime.scheduleTimer(999, .{ .inner = .{} }, null, 5, false));
+    try std.testing.expectError(error.TimerOutsideActiveRequest, runtime.scheduleTimer(0, .{ .inner = .{} }, null, null, 5, false));
+    try std.testing.expectError(error.TimerOutsideActiveRequest, runtime.scheduleTimer(999, .{ .inner = .{} }, null, null, 5, false));
 }
 
 test "runtime assigns ids across timers and immediates" {
@@ -79,7 +79,7 @@ test "runtime assigns ids across timers and immediates" {
     const active = try rt.ActiveRequest.init(std.testing.allocator, &runtime, 123, 1_000);
     defer active.deinit();
 
-    const timer_id = try runtime.scheduleTimer(123, .{ .inner = .{} }, null, 5, false);
+    const timer_id = try runtime.scheduleTimer(123, .{ .inner = .{} }, null, null, 5, false);
     const immediate_id = try runtime.scheduleImmediate(123, .{ .inner = .{} }, null, null);
 
     try std.testing.expectEqual(@as(u64, 1), timer_id);
@@ -135,7 +135,7 @@ test "immediate scheduling shares worker callback limit" {
     _ = try runtime.scheduleImmediate(123, .{ .inner = .{} }, null, null);
     try std.testing.expectError(
         error.TimerWorkerLimitExceeded,
-        runtime.scheduleTimer(123, .{ .inner = .{} }, null, 5, false),
+        runtime.scheduleTimer(123, .{ .inner = .{} }, null, null, 5, false),
     );
 }
 
@@ -200,10 +200,10 @@ test "running interval reserves its requeue timer capacity" {
     defer active.deinit();
 
     runtime.scheduler.executing_repeating_timer_reserved = true;
-    _ = try runtime.scheduleTimer(123, .{ .inner = .{} }, null, 5, false);
+    _ = try runtime.scheduleTimer(123, .{ .inner = .{} }, null, null, 5, false);
     try std.testing.expectError(
         error.TimerWorkerLimitExceeded,
-        runtime.scheduleTimer(123, .{ .inner = .{} }, null, 5, false),
+        runtime.scheduleTimer(123, .{ .inner = .{} }, null, null, 5, false),
     );
 }
 
@@ -233,7 +233,7 @@ test "canceling running interval releases its reserved requeue slot" {
     runtime.cancelTimeout(123, 7);
     try std.testing.expect(runtime.scheduler.executing_timer_cancelled);
     try std.testing.expect(!runtime.scheduler.executing_repeating_timer_reserved);
-    _ = try runtime.scheduleTimer(123, .{ .inner = .{} }, null, 5, false);
+    _ = try runtime.scheduleTimer(123, .{ .inner = .{} }, null, null, 5, false);
 }
 
 test "fetch scheduling requires an active request" {

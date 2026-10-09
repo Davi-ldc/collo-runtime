@@ -6,9 +6,9 @@
 //! the worker's VM thread.
 //!
 //! As abi.h requires, `collo_runtime_set_timer` and
-//! `collo_runtime_set_immediate` take the callback, an immediate's `this`
-//! value and every argument handle on every call, failures included, while
-//! the argument array itself stays the bridge's.
+//! `collo_runtime_set_immediate` take the callback, its `this` value and
+//! every argument handle on every call, failures included, while the argument
+//! array itself stays the bridge's.
 
 const bindings = @import("collo_bindings");
 const js_value = @import("collo_worker_js").value;
@@ -28,6 +28,7 @@ pub export fn collo_runtime_set_timer(
     runtime_ptr: ?*anyopaque,
     request_id: u64,
     callback_raw: ?*bindings.RawValue,
+    this_arg_raw: ?*bindings.RawValue,
     args_raw: ?[*]?*bindings.RawValue,
     args_len: usize,
     delay_ms: u32,
@@ -38,7 +39,7 @@ pub export fn collo_runtime_set_timer(
         runtime_ptr,
         request_id,
         callback_raw,
-        null,
+        this_arg_raw,
         args_raw,
         args_len,
         delay_ms,
@@ -113,9 +114,7 @@ fn scheduleCallback(
     };
 
     const runtime = host_adapter.fromOpaque(runtime_ptr) orelse return status_invalid_argument;
-    if (callback == null or out_callback_id == null)
-        return status_invalid_argument;
-    if (kind == .immediate and this_arg == null)
+    if (callback == null or this_arg == null or out_callback_id == null)
         return status_invalid_argument;
 
     var args: ?[]js_value.JsValueOwned = null;
@@ -139,12 +138,11 @@ fn scheduleCallback(
     var callback_fn = js_value.JsFunctionOwned.fromOwnedValueChecked(runtime.core.vm, callback.?) catch {
         return status_error;
     };
-    var immediate_this_arg: ?js_value.JsValueOwned = null;
-    if (kind == .immediate) {
-        owns_this_arg = false;
-        immediate_this_arg = js_value.JsValueOwned.fromOwnedValue(this_arg.?);
-    }
+    owns_this_arg = false;
+    const receiver = js_value.JsValueOwned.fromOwnedValue(this_arg.?);
 
+    // Both schedulers take the callback, the receiver and the arguments on
+    // every path, failures included.
     const schedule_args = args;
     args = null;
     initialized_args = 0;
@@ -152,6 +150,7 @@ fn scheduleCallback(
         .timer => runtime.scheduleTimer(
             request_id,
             callback_fn.take(),
+            receiver,
             schedule_args,
             delay_ms,
             repeats != 0,
@@ -159,14 +158,10 @@ fn scheduleCallback(
         .immediate => runtime.scheduleImmediate(
             request_id,
             callback_fn.take(),
-            if (immediate_this_arg) |*value| value.take() else null,
+            receiver,
             schedule_args,
         ),
-    } catch {
-        if (immediate_this_arg) |*value|
-            value.deinit();
-        return status_error;
-    };
+    } catch return status_error;
 
     out_callback_id.?.* = callback_id;
     return status_ok;

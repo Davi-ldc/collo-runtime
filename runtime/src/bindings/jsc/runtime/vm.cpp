@@ -1,10 +1,14 @@
-// ColloVm's life and its turns: VM creation with the engine options a worker needs, value handles, turns with
-// per-request CPU accounting, the microtask owner table, and the pump that runs JSC's deferred work in place of a
-// RunLoop. Runs on the VM thread, except where a comment names another thread.
+// ColloVm's life and its turns: VM creation with the engine options a worker needs, its realms, value handles, turns
+// with per-request CPU accounting, the microtask owner table, and the pump that runs JSC's deferred work in place of
+// a RunLoop. Runs on the VM thread, except where a comment names another thread.
 //
 // The JSC API lock comes before a value owner state's mutex, as destroyVmContents takes them; releaseValueHandle
 // drops the mutex before it takes the API lock so it never inverts that order. destroyVmContents clears every
-// JSC::Strong a ColloVm owns while the JSC VM is still alive.
+// JSC::Strong a ColloVm and its realms own while the JSC VM is still alive.
+//
+// Every realm ends with the same installs whenever it was created: the VM records each install it made
+// (web_apis_installed, process_installed, node_fs_enabled, the console sink, the worker's seed), applies it to every
+// realm that exists, and createRealm applies the recorded ones to each new realm.
 
 #include "host_functions/internal.h"
 #include "jsc/runtime/console_client.h"
@@ -77,6 +81,60 @@ bool shouldInstallWebApis(const ColloVmOptions* options)
     return !(options->flags & COLLO_VM_OPTION_DISABLE_WEBAPIS);
 }
 
+// The client is attached only while a sink exists. JSC's console object returns on a null client before it coerces
+// labels or arguments, so a console with no sink never re-enters user code.
+void attachConsoleClient(ColloVm* vm, ColloRealm& realm)
+{
+    if (vm->console_sink)
+        realm.global_object->setConsoleClient(WeakPtr<JSC::ConsoleClient> { *vm->console_client });
+    else
+        realm.global_object->setConsoleClient(WeakPtr<JSC::ConsoleClient> {});
+}
+
+// Installs on `realm` the worker installs the VM made that the realm still lacks.
+void applyWorkerInstalls(ColloVm* vm, ColloRealm& realm)
+{
+    if (vm->process_installed && !realm.process_installed) {
+        ColloStatus status = Collo::HostFunctions::installProcess(realm.global_object, *vm->vm);
+        RELEASE_ASSERT(status == COLLO_STATUS_OK);
+        realm.process_installed = true;
+    }
+    if (vm->node_fs_enabled && !realm.node_fs_installed) {
+        Collo::HostFunctions::installWorkerNodeBuiltins(realm.global_object, *vm->vm);
+        realm.node_fs_installed = true;
+    }
+}
+
+// Appends a realm with a new global and every install the VM made so far. Installation aborts on a failed cell
+// allocation, like the rest of the engine, so once the global exists the realm is complete.
+ColloStatus createRealm(ColloVm* vm, ColloRealm** out_realm)
+{
+    *out_realm = nullptr;
+    std::unique_ptr<ColloRealm> realm(new (std::nothrow) ColloRealm());
+    if (!realm || !vm->realms.tryReserveCapacity(vm->realms.size() + 1))
+        return COLLO_STATUS_OUT_OF_MEMORY;
+    realm->vm = vm;
+    realm->index = static_cast<uint32_t>(vm->realms.size());
+
+    // Each global has a structure of its own, since a global's structure turns into its dictionary of globals.
+    JSC::Structure* structure = Collo::GlobalObject::createStructure(*vm->vm, JSC::jsNull());
+    realm->global_object = Collo::GlobalObject::create(*vm->vm, structure, realm.get());
+    // Protected before installation allocates, so no collection can take the global while only this frame and the
+    // realm refer to it.
+    vm->vm->heap.protect(realm->global_object);
+    realm->global_object_protected = true;
+
+    if (vm->web_apis_installed)
+        Collo::HostFunctions::install(realm->global_object, *vm->vm);
+    attachConsoleClient(vm, *realm);
+    applyWorkerInstalls(vm, *realm);
+    Collo::seedRealmWeakRandom(*realm);
+
+    *out_realm = realm.get();
+    vm->realms.append(WTF::move(realm));
+    return COLLO_STATUS_OK;
+}
+
 ColloStatus initializeVm(ColloVm* vm, const ColloVmOptions* options)
 {
     if (!vm)
@@ -111,21 +169,16 @@ ColloStatus initializeVm(ColloVm* vm, const ColloVmOptions* options)
     // notifyNeedTermination cannot allocate, and the throw path's terminationException accessor asserts the object
     // exists, so it is created here, on the VM thread, before any trap can fire.
     vm->vm->ensureTerminationException();
-    JSC::Structure* structure = Collo::GlobalObject::createStructure(*vm->vm, JSC::jsNull());
-    vm->global_object = Collo::GlobalObject::create(*vm->vm, structure, vm);
-    // allocateCell aborts on exhaustion, so this check only keeps the status contract explicit.
-    if (!vm->global_object)
-        return COLLO_STATUS_OUT_OF_MEMORY;
 
     vm->web_apis_installed = shouldInstallWebApis(options);
-    if (vm->web_apis_installed)
-        Collo::HostFunctions::install(vm->global_object, *vm->vm);
-    // JSC's built-in console object is already on the global. The client that routes it to the ColloConsoleSink is
-    // created now but attached to the global only while a sink is registered. Without a client every console method
-    // returns before touching its arguments, so a VM with no sink, such as the zygote's, never coerces user values.
+    vm->hardware_concurrency = Collo::HostFunctions::readHardwareConcurrency();
+    // JSC's built-in console object is on every global. The client that routes it to the ColloConsoleSink is created
+    // now but attached to the globals only while a sink is registered. Without a client every console method returns
+    // before touching its arguments, so a VM with no sink, such as the zygote's, never coerces user values.
     vm->console_client = WTF::makeUnique<Collo::ConsoleClient>(vm);
-    vm->vm->heap.protect(vm->global_object);
-    vm->global_object_protected = true;
+    ColloStatus realm_status = createRealm(vm, &vm->main_realm);
+    if (realm_status != COLLO_STATUS_OK)
+        return realm_status;
     // Process-global and idempotent: the engine keeps one pair of function pointers, and each call resolves its VM
     // from the global it is handed.
     JSC::colloSetOwnerHooks(colloCurrentOwnerTokenHook, colloOwnerDispatcherFactoryHook);
@@ -220,21 +273,23 @@ void destroyVmContents(ColloVm* vm)
             values_lock = std::unique_lock<std::mutex>(value_owner->mutex);
 
         vm->microtask_delay_scope.reset();
-        vm->webapi_cache.clear();
-        if (vm->global_object && vm->global_object_protected) {
-            bool protect_count_is_zero = owned_vm->heap.unprotect(vm->global_object);
-            if (protect_count_is_zero)
-                owned_vm->heap.reportAbandonedObjectGraph();
-            vm->global_object_protected = false;
+        for (auto& realm : vm->realms) {
+            realm->webapi_cache.clear();
+            if (realm->global_object_protected) {
+                bool protect_count_is_zero = owned_vm->heap.unprotect(realm->global_object);
+                if (protect_count_is_zero)
+                    owned_vm->heap.reportAbandonedObjectGraph();
+                realm->global_object_protected = false;
+            }
         }
         vm->blob_object_urls.clear();
         // Includes the holders with owner 0, which no request end claims. Their roots must go while the VM is still
         // alive: a JSC::Strong left for a later destructor would touch a HandleSet that is already gone.
         vm->request_scoped_roots.clear();
-        vm->module_namespaces.clear();
+        for (auto& realm : vm->realms)
+            realm->module_namespaces.clear();
         vm->module_sources.clear();
         invalidateOutstandingValuesLocked(vm);
-        vm->global_object = nullptr;
         vm->vm = nullptr;
         // JSC expects the last reference to the VM to drop while the API lock is still held.
         owned_vm = nullptr;
@@ -242,13 +297,17 @@ void destroyVmContents(ColloVm* vm)
         std::lock_guard<std::mutex> lock(value_owner->mutex);
         value_owner->vm.store(nullptr, std::memory_order_release);
     }
+    // The realms go only after the JSC VM, whose destructor finalizes their globals, so every global's realm outlives
+    // it; every root a realm held was cleared above, under the lock.
+    vm->main_realm = nullptr;
+    vm->realms.clear();
 
     RELEASE_ASSERT(vm->module_sources.isEmpty());
+    RELEASE_ASSERT(vm->realms.isEmpty());
     vm->current_exec_ctx = nullptr;
     vm->entered_count = 0;
     vm->host_runtime.store(nullptr, std::memory_order_release);
     vm->ready = false;
-    vm->global_object_protected = false;
     vm->value_owner = nullptr;
     if (value_owner)
         releaseValueOwnerState(value_owner);
@@ -479,13 +538,40 @@ ColloStatus caughtExceptionStatus(ColloVm* vm, JSC::TopExceptionScope& scope, Co
     return statusOr(setJsException(vm, exception, out_exception), COLLO_STATUS_JS_EXCEPTION);
 }
 
-ColloStatus setInternalError(ColloVm* vm, const WTF::String& message, ColloValue** out_exception)
+ColloStatus setInternalError(ColloRealm* realm, const WTF::String& message, ColloValue** out_exception)
 {
-    if (!vm || !vm->isReady())
+    if (!realmIsReady(realm))
         return COLLO_STATUS_ERROR;
 
-    JSC::JSObject* error = JSC::createError(vm->global_object, message);
-    return setJsException(vm, error, out_exception);
+    JSC::JSObject* error = JSC::createError(realm->global_object, message);
+    return setJsException(realm->vm, error, out_exception);
+}
+
+GlobalObject* globalObjectForValue(ColloVm* vm, JSC::JSValue value)
+{
+    if (auto* object = dynamicDowncast<JSC::JSObject>(value)) {
+        if (auto* global_object = dynamicDowncast<GlobalObject>(object->realmMayBeNull()))
+            return global_object;
+    }
+    return vm->main_realm->global_object;
+}
+
+void seedRealmWeakRandom(ColloRealm& realm)
+{
+    auto worker_seed = realm.vm->worker_weak_random_seed;
+    if (!worker_seed)
+        return;
+    if (!realm.index) {
+        realm.global_object->weakRandom().setSeed(*worker_seed);
+        return;
+    }
+    // splitmix64's finalizer over the seed and the index, so realms of one worker get unrelated seeds, and the same
+    // index in a sibling worker, whose seed differs, gets another.
+    uint64_t mixed = (static_cast<uint64_t>(*worker_seed) << 32) | realm.index;
+    mixed = (mixed ^ (mixed >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    mixed = (mixed ^ (mixed >> 27)) * 0x94d049bb133111ebULL;
+    mixed ^= mixed >> 31;
+    realm.global_object->weakRandom().setSeed(static_cast<uint32_t>(mixed >> 32));
 }
 
 } // namespace Collo
@@ -570,6 +656,30 @@ extern "C" void collo_vm_destroy(ColloVm* vm)
     delete vm;
 }
 
+extern "C" ColloRealm* collo_vm_main_realm(ColloVm* vm)
+{
+    if (!vm || !vm->isReady())
+        return nullptr;
+    return vm->main_realm;
+}
+
+extern "C" ColloStatus collo_realm_create(ColloVm* vm, ColloRealm** out_realm)
+{
+    if (out_realm)
+        *out_realm = nullptr;
+    if (!vm || !vm->isReady() || !out_realm || vm->entered_count || vm->current_exec_ctx)
+        return COLLO_STATUS_INVALID_ARGUMENT;
+
+    JSC::JSLockHolder locker(*vm->vm);
+    // A termination forbids execution for good, so a new realm could never run, and creating a global defers
+    // termination while it initializes, which would clear one still pending.
+    if (vm->vm->executionForbidden() || vm->vm->hasPendingTerminationException())
+        return COLLO_STATUS_ERROR;
+    return createRealm(vm, out_realm);
+}
+
+extern "C" uint32_t collo_realm_index(const ColloRealm* realm) { return realm ? realm->index : 0; }
+
 extern "C" ColloStatus collo_vm_set_host_runtime(ColloVm* vm, void* runtime)
 {
     if (!vm || !vm->isReady())
@@ -618,14 +728,9 @@ extern "C" ColloStatus collo_vm_set_console_sink(ColloVm* vm, ColloConsoleSink s
     vm->console_request_bytes_max = sink ? request_bytes_max : 0;
     // Every registration starts the budgets afresh, so counters spent under a previous sink cannot exhaust the new
     // one in advance.
-    if (vm->console_client)
-        vm->console_client->resetRequestOutputBudgets();
-    // The client is attached only while a sink exists. JSC's console object returns on a null client before it
-    // coerces labels or arguments, so a console with no sink never re-enters user code.
-    if (sink)
-        vm->global_object->setConsoleClient(WeakPtr<JSC::ConsoleClient> { *vm->console_client });
-    else
-        vm->global_object->setConsoleClient(WeakPtr<JSC::ConsoleClient> {});
+    vm->console_client->resetRequestOutputBudgets();
+    for (auto& realm : vm->realms)
+        attachConsoleClient(vm, *realm);
     return COLLO_STATUS_OK;
 }
 
@@ -635,7 +740,10 @@ extern "C" ColloStatus collo_vm_install_process(ColloVm* vm)
         return COLLO_STATUS_INVALID_ARGUMENT;
 
     JSC::JSLockHolder locker(*vm->vm);
-    return Collo::HostFunctions::installProcess(vm->global_object, *vm->vm);
+    vm->process_installed = true;
+    for (auto& realm : vm->realms)
+        applyWorkerInstalls(vm, *realm);
+    return COLLO_STATUS_OK;
 }
 
 extern "C" ColloStatus collo_vm_enable_node_fs_for_worker(ColloVm* vm)
@@ -644,11 +752,9 @@ extern "C" ColloStatus collo_vm_enable_node_fs_for_worker(ColloVm* vm)
         return COLLO_STATUS_INVALID_ARGUMENT;
 
     JSC::JSLockHolder locker(*vm->vm);
-    if (vm->node_fs_enabled)
-        return COLLO_STATUS_OK;
-
-    Collo::HostFunctions::installWorkerNodeBuiltins(vm->global_object, *vm->vm);
     vm->node_fs_enabled = true;
+    for (auto& realm : vm->realms)
+        applyWorkerInstalls(vm, *realm);
     return COLLO_STATUS_OK;
 }
 

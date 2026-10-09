@@ -1,5 +1,5 @@
-// Private state of the JavaScriptCore bridge: ColloVm, the value handles the ABI lends to Zig, the Collo global object
-// and the per-VM registries host functions share. None of it is ABI; the exported surface is
+// Private state of the JavaScriptCore bridge: ColloVm and its realms, the value handles the ABI lends to Zig, the Collo
+// global object and the per-VM registries host functions share. None of it is ABI; the exported surface is
 // bindings/include/collo/abi.h and its Zig facade, bindings/root.zig.
 //
 // Everything here belongs to one VM thread, the zygote's before a fork and the worker's after it, and code that
@@ -9,9 +9,9 @@
 //
 // A ColloValue roots its JSValue with a JSC::Strong for as long as Zig holds a reference to it. Destroying the VM
 // clears the payload of every outstanding handle, so a handle released afterwards frees only its own memory. Every
-// other JSC::Strong here sits on a native object, never inside a cell: VM-lifetime roots on ColloVm, cleared by
-// destroyVmContents in vm.cpp, and per-request roots on ColloRequestScopedRoots holders, cleared when their request
-// ends.
+// other JSC::Strong here sits on a native object, never inside a cell: VM-lifetime roots on ColloVm and its realms,
+// cleared by destroyVmContents in vm.cpp, and per-request roots on ColloRequestScopedRoots holders, cleared when their
+// request ends.
 
 #pragma once
 
@@ -83,6 +83,9 @@ JS_EXPORT_PRIVATE void clearColloGCMaxHeapSizeOverride();
 
 } // namespace JSC
 
+struct ColloRealm;
+struct ColloWebApiCache;
+
 namespace Collo {
 
 class GlobalObject;
@@ -131,28 +134,34 @@ ColloStatus setJsException(ColloVm* vm, JSC::JSValue exception, ColloValue** out
 // pending so the VM keeps unwinding. Returns COLLO_STATUS_JS_EXCEPTION, the handle failure, or COLLO_STATUS_ERROR
 // when nothing is pending.
 ColloStatus caughtExceptionStatus(ColloVm* vm, JSC::TopExceptionScope& scope, ColloValue** out_exception);
-// Stores a new Error carrying `message` in `*out_exception`. Returns COLLO_STATUS_ERROR when the VM is not ready and
-// otherwise setJsException's status, which is COLLO_STATUS_OK when the handle was made, so a caller that fails the
-// operation must map that to its own status.
-ColloStatus setInternalError(ColloVm* vm, const WTF::String& message, ColloValue** out_exception);
+// Stores a new Error of `realm` carrying `message` in `*out_exception`. Returns COLLO_STATUS_ERROR when the VM is not
+// ready and otherwise setJsException's status, which is COLLO_STATUS_OK when the handle was made, so a caller that
+// fails the operation must map that to its own status.
+ColloStatus setInternalError(ColloRealm* realm, const WTF::String& message, ColloValue** out_exception);
 // True while `value` is a live handle of `vm`: false for null, for another VM's handle and after `vm` is destroyed.
 bool valueBelongsToVm(const ColloVm* vm, const ColloValue* value);
+// The global of the realm `value` belongs to, which an operation on the value runs in: an object's own global, or
+// the main realm's for a primitive and for an object created without one.
+GlobalObject* globalObjectForValue(ColloVm* vm, JSC::JSValue value);
+// Seeds the realm's Math.random from ColloVm::worker_weak_random_seed: the main realm takes the seed as it is, any
+// other a mix of the seed and the realm's index. Does nothing on a VM that was never reseeded.
+void seedRealmWeakRandom(ColloRealm& realm);
 
 inline ColloStatus statusOr(ColloStatus status, ColloStatus ok_status)
 {
     return status == COLLO_STATUS_OK ? ok_status : status;
 }
 
-// Settles a module promise by draining microtasks outside any turn; a turn in progress fails with
+// Settles a module promise of `realm` by draining microtasks outside any turn; a turn in progress fails with
 // COLLO_STATUS_INVALID_ARGUMENT. Fulfilled yields the result, rejected yields COLLO_STATUS_JS_EXCEPTION. A promise
 // still pending after a full drain needs host event-loop work: with `settlement_specifier` set, a settlement callback
-// that reports that specifier to the host runtime is registered (when one is attached) and the call returns
-// COLLO_STATUS_PENDING; with it null, the call fails with COLLO_STATUS_UNSUPPORTED.
-ColloStatus awaitModulePromiseSync(ColloVm* vm, JSC::JSPromise* promise, JSC::JSValue* out_value,
+// that reports the realm's index and that specifier to the host runtime is registered (when one is attached) and the
+// call returns COLLO_STATUS_PENDING; with it null, the call fails with COLLO_STATUS_UNSUPPORTED.
+ColloStatus awaitModulePromiseSync(ColloRealm* realm, JSC::JSPromise* promise, JSC::JSValue* out_value,
     const WTF::String* settlement_specifier, ColloValue** out_exception);
-// Imports and evaluates `specifier`, a canonical module key, from the host side, caching the namespace on the VM.
-// `settlement_specifier` is passed to awaitModulePromiseSync.
-ColloStatus ensureModuleNamespace(ColloVm* vm, const WTF::String& specifier, JSC::JSValue* out_namespace,
+// Imports and evaluates `specifier`, a canonical module key, from the host side in `realm`'s module registry, caching
+// the namespace on the realm. `settlement_specifier` is passed to awaitModulePromiseSync.
+ColloStatus ensureModuleNamespace(ColloRealm* realm, const WTF::String& specifier, JSC::JSValue* out_namespace,
     const WTF::String* settlement_specifier, ColloValue** out_exception);
 // Maps an import specifier and its referrer to the registry key the loader fetches by, or a null string when the
 // specifier is invalid or not allowed from that referrer. module_loader.cpp documents the key space.
@@ -167,12 +176,13 @@ WTF::String publicModuleURLForKey(const WTF::String& module_key);
 // Formats an exception as "Name: message" plus its stack without running tenant code; values.cpp explains how.
 // The result is copied as by copyWTFStringToColloString.
 ColloStatus formatExceptionString(ColloVm* vm, JSC::JSValue exception_value, ColloString* out_string);
-// Creates a pending promise in `global_object` and the deferred that settles it. On success the caller owns
-// `*out_deferred` and frees it with collo_promise_deferred_release.
+// Creates a pending promise in `global_object`, a Collo global of `vm`, and the deferred that settles it, which
+// remembers that global's realm (collo_promise_deferred_realm). On success the caller owns `*out_deferred` and frees
+// it with collo_promise_deferred_release.
 ColloStatus createPromiseDeferred(
     ColloVm* vm, JSC::JSGlobalObject* global_object, JSC::JSValue* out_promise, ColloPromiseDeferred** out_deferred);
-// Resolves or rejects the deferred's promise with `value`. The deferred settles once: afterwards it holds no
-// handles, and a second call fails with COLLO_STATUS_INVALID_ARGUMENT.
+// Resolves or rejects the deferred's promise with `value`, in the promise's realm. The deferred settles once:
+// afterwards it holds no handles, and a second call fails with COLLO_STATUS_INVALID_ARGUMENT.
 ColloStatus settlePromiseDeferred(
     ColloVm* vm, ColloPromiseDeferred* deferred, JSC::JSValue value, bool is_rejection, ColloValue** out_exception);
 
@@ -181,7 +191,7 @@ public:
     using Base = JSC::JSGlobalObject;
     static constexpr unsigned StructureFlags = Base::StructureFlags;
 
-    static GlobalObject* create(JSC::VM& vm, JSC::Structure* structure, ColloVm* owner);
+    static GlobalObject* create(JSC::VM& vm, JSC::Structure* structure, ColloRealm* realm);
     static JSC::Structure* createStructure(JSC::VM& vm, JSC::JSValue prototype);
 
     DECLARE_INFO;
@@ -202,8 +212,12 @@ public:
 
     // Aborts if the VM's clientData is missing; VM creation installs it before the global exists.
     ColloVm& owner() const;
-    // Web API installation stores what it created into ColloVm::webapi_cache through these. The getters generated
-    // from webapi_cache.def abort on an entry that was never stored, so a host function may call one only on a VM
+    // The realm this global is the global object of, which outlives it: the VM owns its realms until destruction.
+    ColloRealm& realm() const { return *m_realm; }
+    // This realm's Web API roots. Every object a host function builds from them belongs to this global's realm.
+    ColloWebApiCache& webApiCache() const;
+    // Web API installation stores what it created into the realm's cache through these. The getters generated
+    // from webapi_cache.def abort on an entry that was never stored, so a host function may call one only on a realm
     // whose Web APIs were installed.
     void cacheURLApi(JSC::JSObject* url_constructor, JSC::JSObject* url_prototype, JSC::Structure* url_structure,
         JSC::JSObject* url_search_params_constructor, JSC::JSObject* url_search_params_prototype,
@@ -278,17 +292,19 @@ public:
 #undef COLLO_WEBAPI_CACHE_FIELD
 
 private:
-    GlobalObject(JSC::VM&, JSC::Structure*);
+    GlobalObject(JSC::VM&, JSC::Structure*, ColloRealm*);
     void finishCreation(JSC::VM&);
+
+    ColloRealm* m_realm;
 };
 
 } // namespace Collo
 
-// VM-lifetime roots of the Web API constructors, prototypes and structures, plus identifiers the stream and codec
-// implementations look up. It lives on ColloVm, never in a cell, and destroyVmContents clears it while the VM is
+// The roots of one realm's Web API constructors, prototypes and structures, plus identifiers the stream and codec
+// implementations look up. It lives on the realm, never in a cell, and destroyVmContents clears it while the VM is
 // still alive. webapi_cache.def lists the roots, and this header and webapi_cache.cpp each expand it twice: a GETTER
 // row also declares the GlobalObject accessor above, which aborts while the root is empty, and a FIELD row declares
-// only the root, which host code reads through ColloVm::webapi_cache and checks itself.
+// only the root, which host code reads through GlobalObject::webApiCache and checks itself.
 struct ColloWebApiCache {
 #define COLLO_WEBAPI_CACHE_GETTER(name, field, type) JSC::Strong<type> field;
 #define COLLO_WEBAPI_CACHE_FIELD(field, type) JSC::Strong<type> field;
@@ -334,6 +350,30 @@ struct ColloWebApiCache {
     JSC::Identifier byte_length_identifier;
 
     void clear();
+};
+
+// One realm of a VM: a Collo global object, with its own globals, intrinsics and module registry, and the roots and
+// tables that belong to that global alone. Every VM has its main realm, created with it; collo_realm_create adds
+// others, each with every install the VM made so far. A realm lives as long as its VM, which owns it and clears its
+// roots in destroyVmContents, and the global it holds stays protected from collection until then.
+//
+// Realms separate state, not trust: they share the VM's heap, collector, turns, microtask queue and module sources.
+struct ColloRealm {
+    ColloVm* vm { nullptr };
+    Collo::GlobalObject* global_object { nullptr };
+    bool global_object_protected { false };
+    // Its position in ColloVm::realms, 0 for the main realm.
+    uint32_t index { 0 };
+    ColloWebApiCache webapi_cache;
+    // Namespaces evaluated in this realm, by canonical specifier, which live as long as the worker. The realm's own
+    // JSC module registry still owns the module records, so evicting an entry here does not unload the module.
+    WTF::HashMap<WTF::String, JSC::Strong<JSC::Unknown>> module_namespaces;
+    // Set once `process` and the node:fs host object are installed on this realm's global (ColloVm::process_installed
+    // and ColloVm::node_fs_enabled say whether every realm should have them).
+    bool process_installed { false };
+    bool node_fs_installed { false };
+    // This realm's console labels and groups; the VM's one console client keeps them here.
+    Collo::ConsoleRealmState console;
 };
 
 struct ColloValueOwnerState;
@@ -610,22 +650,29 @@ struct ColloDeferredWorkWakeupGate {
 
 struct ColloVm {
     WTF::RefPtr<JSC::VM> vm;
-    Collo::GlobalObject* global_object;
-    ColloWebApiCache webapi_cache;
-    bool global_object_protected;
-    // Whether VM creation installed the Web API object graph. Post-fork hooks that touch Web API objects, such as
-    // refreshWebApiNavigator, must skip when it is false: without Web APIs the navigator slot holds an uninitialized
-    // cell that crashes dynamicDowncast.
+    // Every realm of the VM in creation order, the main realm first. Realms are never removed before destruction, so
+    // a pointer to one stays valid as long as the VM.
+    WTF::Vector<std::unique_ptr<ColloRealm>> realms;
+    ColloRealm* main_realm;
+    // Whether VM creation installed the Web API object graph, on the main realm and so on every later one. Post-fork
+    // hooks that touch Web API objects, such as refreshWebApiNavigator, must skip when it is false: without Web APIs
+    // the navigator slot holds an uninitialized cell that crashes dynamicDowncast.
     bool web_apis_installed;
+    // Whether `process` belongs on every realm (collo_vm_install_process).
+    bool process_installed;
     // Set once the node:fs host object and its module aliases are installed, which happens only after the worker
-    // child has entered its chroot and seccomp filter. Until then `fs` and `node:fs` do not resolve.
+    // child has entered its chroot and seccomp filter. Until then `fs` and `node:fs` do not resolve, in any realm.
     bool node_fs_enabled;
+    // navigator.hardwareConcurrency for every realm: the CPUs of the process's affinity mask, read at VM creation and
+    // again in collo_vm_post_fork_child, before the worker's seccomp filter denies the call that reads it.
+    uint32_t hardware_concurrency;
+    // The worker's own weak random seed (collo_vm_reseed_after_fork), from which every realm derives its Math.random
+    // seed by its index, so neither sibling workers nor two realms of one worker share a sequence. Empty on a VM that
+    // was never reseeded, such as the zygote's, whose realms keep the engine's seeds.
+    std::optional<uint32_t> worker_weak_random_seed;
     // Sorted by canonical specifier for binary search. JSC receives a fresh JSSourceCode wrapper on each fetch, but
-    // the provider and its optional bytecode cache stay the one source of truth.
+    // the provider and its optional bytecode cache stay the one source of truth. Every realm fetches from it.
     WTF::Vector<ColloModuleSourceRecord> module_sources;
-    // Evaluated namespaces live as long as the worker. JSC's own module registry still owns the fetched module
-    // records, so evicting an entry here does not unload the module.
-    WTF::HashMap<WTF::String, JSC::Strong<JSC::Unknown>> module_namespaces;
     // The deploy hash of the first deploy-scoped pack registered on this VM. A VM serves one deploy: registration
     // fails closed on a second hash, because this hash is what maps public /var/task specifiers back onto internal
     // keys. Null on the zygote's VM, whose warmup corpus is not deploy-scoped.
@@ -718,10 +765,11 @@ struct ColloVm {
     bool fastmalloc_scavenger_suspended_for_fork;
 
     ColloVm()
-        : global_object(nullptr)
-        , global_object_protected(false)
+        : main_realm(nullptr)
         , web_apis_installed(false)
+        , process_installed(false)
         , node_fs_enabled(false)
+        , hardware_concurrency(1)
         , current_exec_ctx(nullptr)
         , turn_exec_ctx(nullptr)
         , owner_slots {}
@@ -749,5 +797,8 @@ struct ColloVm {
 
     ~ColloVm();
 
-    bool isReady() const { return !destroying.load(std::memory_order_acquire) && ready && vm && global_object; }
+    bool isReady() const { return !destroying.load(std::memory_order_acquire) && ready && vm && main_realm; }
 };
+
+// A realm is usable while its VM is ready.
+inline bool realmIsReady(const ColloRealm* realm) { return realm && realm->vm && realm->vm->isReady(); }

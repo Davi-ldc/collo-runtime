@@ -1,16 +1,17 @@
-//! The module domain of the worker runtime. `Modules` is its state:
-//! registered packs and route module state (`modules/state.zig`) beside the
-//! route's bindings blob and the entry specifier it belongs to. `Methods`
-//! holds the runtime's module operations, which `Runtime` declares as its
-//! own (`root.zig`): the modules context, the settlements of route module
-//! evaluations, and the worker's stop once a failed evaluation or a deadline
-//! fire has drained. It belongs to the worker's VM thread.
+//! The module domain of the worker runtime. `Modules` is its state: the
+//! routes of the worker's definition, registered packs and route module
+//! state (`modules/state.zig`). `Methods` holds the runtime's module
+//! operations, which `Runtime` declares as its own (`root.zig`): the modules
+//! context, the settlements of route module evaluations, and the worker's
+//! stop once a failed evaluation or a deadline fire has drained. It belongs
+//! to the worker's VM thread.
 //!
 //! `collo_runtime_module_eval_settled` only parks a settlement, in the
 //! middle of a JavaScript drain; the settlement runs from the scheduler loop
 //! (`collectModuleSettlements`), never inside a drain.
 
 const std = @import("std");
+const route_table = @import("collo_ipc").route_table;
 const request_context = @import("collo_worker_request").context;
 const modules_context = @import("../modules/context.zig");
 const modules_routes = @import("../modules/routes.zig");
@@ -18,20 +19,23 @@ const modules_state = @import("../modules/state.zig");
 const scheduler_resources = @import("../scheduler/resources.zig");
 
 pub const Modules = struct {
-    state: modules_state.State = .{},
-    /// The route's bindings blob, already validated
-    /// (`worker/modules/route_env.zig`). Borrowed: the boot that built the
-    /// runtime keeps it mapped until the runtime is gone.
-    route_bindings_blob: []const u8,
-    /// Entry specifier of the route the blob belongs to, borrowed like the
-    /// blob (`RuntimeOptions.route_bindings_route`).
-    route_bindings_route: []const u8,
+    state: modules_state.State,
 
-    pub fn init(route_bindings_blob: []const u8, route_bindings_route: []const u8) Modules {
-        return .{
-            .route_bindings_blob = route_bindings_blob,
-            .route_bindings_route = route_bindings_route,
-        };
+    /// Adds every route of `table`, the definition's route table, after
+    /// checking it whole (`route_table.decode`), so a malformed table or
+    /// bindings section fails the runtime's start instead of a request.
+    /// `table` stays borrowed for the runtime's life, since every route's
+    /// bindings point into it. Fails with `error.InvalidRouteTable` or
+    /// `error.OutOfMemory`.
+    pub fn init(allocator: std.mem.Allocator, table: []const u8, isolate_realm: bool) !Modules {
+        var decoded: route_table.Routes = undefined;
+        const routes = try route_table.decode(table, &decoded);
+        var state: modules_state.State = .{ .isolate_realm = isolate_realm };
+        errdefer state.deinit(allocator);
+        try state.routes.ensureTotalCapacityPrecise(allocator, routes.len);
+        for (routes) |route|
+            _ = try state.addRoute(allocator, route.entry_specifier, route.bindings);
+        return .{ .state = state };
     }
 
     pub fn deinit(self: *Modules, allocator: std.mem.Allocator) void {
@@ -65,39 +69,50 @@ pub fn Methods(comptime Runtime: type) type {
                 scheduler_resources.publishTurnOwner(self, request_context.boot_request_id);
                 defer scheduler_resources.clearTurnOwner(self);
                 while (self.modules.state.pending_settlements.pop()) |entry| {
-                    self.handleModuleEvaluationSettled(entry.specifier, entry.resolved);
+                    self.handleModuleEvaluationSettled(entry.realm_index, entry.specifier, entry.resolved);
                     self.core.allocator.free(entry.specifier);
                 }
             }
         }
 
-        /// Moves a route module to its settled state and queues every request
-        /// that waited on the evaluation. Only `collectModuleSettlements` calls
-        /// it, from the scheduler loop, never from inside a JavaScript drain.
-        pub fn handleModuleEvaluationSettled(self: *Runtime, specifier: []const u8, resolved: bool) void {
+        /// Moves every route that evaluates `specifier` in the realm
+        /// `realm_index` to its settled state and queues every request that
+        /// waited on it. Once no route's evaluation is left in flight, the
+        /// boot context closes. Only `collectModuleSettlements` calls it, from
+        /// the scheduler loop, never from inside a JavaScript drain.
+        pub fn handleModuleEvaluationSettled(
+            self: *Runtime,
+            realm_index: u32,
+            specifier: []const u8,
+            resolved: bool,
+        ) void {
             var ctx = self.modulesContext();
-            var settlement = modules_routes.settleEvaluation(&ctx, specifier, resolved);
-            defer settlement.waiters.deinit(self.core.allocator);
-            if (settlement.transition != .none) {
-                // The route entry settled, either way, so the boot context
-                // closes. The close disarms its budget too, so a deadline entry
-                // already queued for the boot id does nothing and no stale
-                // deadline reaches later work.
-                if (self.bootContext()) |boot_ctx| {
-                    if (std.mem.eql(u8, boot_ctx.dispatch_work.route_entry_specifier, specifier))
-                        self.closeBootContext();
-                }
+            var settled_any = false;
+            while (modules_routes.settleEvaluation(&ctx, realm_index, specifier, resolved)) |settled| {
+                settled_any = true;
+                var settlement = settled;
+                defer settlement.waiters.deinit(self.core.allocator);
                 // A failed evaluation recycles the worker, but only after the
                 // waiters drain with their own 500s; stopping now would turn
                 // them into errors the host synthesizes before any of them ran.
                 if (settlement.transition == .failed)
                     self.modules.state.recycle_after_drain = true;
+                queueSettledWaiters(self, settlement.waiters.items);
             }
-            const waiters = &settlement.waiters;
-            for (waiters.items) |request_id| {
+            // The boot context is the owner of every route's top-level code,
+            // so it closes only once no route evaluates any more. The close
+            // disarms its budget too, so a deadline entry already queued for
+            // the boot id does nothing and no stale deadline reaches later
+            // work.
+            if (settled_any and self.bootContext() != null and !modules_routes.anyEvaluating(&ctx))
+                self.closeBootContext();
+        }
+
+        fn queueSettledWaiters(self: *Runtime, waiters: []const u64) void {
+            for (waiters) |request_id| {
                 if (self.tryQueueReadyWork(.{ .request = request_id }))
                     continue;
-                // The queue and its backlog are both full. The settled module
+                // The queue and its backlog are both full. The settled route
                 // record no longer lists the waiter, so it is parked where the
                 // stalled retry in `collectModuleSettlements` finds it. If even
                 // that allocation fails, the request ends at its deadline, and
@@ -148,8 +163,6 @@ pub fn Methods(comptime Runtime: type) type {
                 .vm = self.core.vm,
                 .modules = &self.modules.state,
                 .clock = self.core.clock,
-                .route_bindings_blob = self.modules.route_bindings_blob,
-                .route_bindings_route = self.modules.route_bindings_route,
             };
         }
     };

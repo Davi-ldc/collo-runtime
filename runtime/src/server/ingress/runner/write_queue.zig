@@ -200,9 +200,8 @@ fn h2ClearWriteQueueRetainingCapacity(self: *Slot, allocator: std.mem.Allocator)
     self.h2_write_offset = 0;
 }
 
-pub fn h2HasPendingResponse(self: *const Slot, stream_id: u32) bool {
-    const index = stream_table.h2StreamIndex(self, stream_id) orelse return false;
-    const entry = &self.ingress_channels[index];
+pub fn h2HasPendingResponse(self: *Slot, stream_id: u32) bool {
+    const entry = stream_table.h2StreamEntry(self, stream_id) orelse return false;
     return hasUndeliveredResponse(entry);
 }
 
@@ -213,8 +212,7 @@ pub fn h2AppendPendingResponse(
     bytes: []const u8,
     end_stream: bool,
 ) !void {
-    const index = stream_table.h2StreamIndex(self, stream_id) orelse return error.Http2UnknownStream;
-    const entry = &self.ingress_channels[index];
+    const entry = stream_table.h2StreamEntry(self, stream_id) orelse return error.Http2UnknownStream;
     switch (entry.state) {
         .preparing, .active, .draining_response => {},
         .vacant => return error.Http2UnknownStream,
@@ -250,18 +248,17 @@ pub fn h2AppendPendingResponse(
 }
 
 pub fn h2PendingResponseSlice(self: *Slot, stream_id: u32) ?[]const u8 {
-    const index = stream_table.h2StreamIndex(self, stream_id) orelse return null;
-    return pendingResponseSlice(&self.ingress_channels[index]);
+    const entry = stream_table.h2StreamEntry(self, stream_id) orelse return null;
+    return pendingResponseSlice(entry);
 }
 
 pub fn h2PendingResponseEndsStream(self: *Slot, stream_id: u32) bool {
-    const index = stream_table.h2StreamIndex(self, stream_id) orelse return false;
-    return self.ingress_channels[index].pending_response_end_stream;
+    const entry = stream_table.h2StreamEntry(self, stream_id) orelse return false;
+    return entry.pending_response_end_stream;
 }
 
 pub fn h2DropPendingResponsePrefix(self: *Slot, allocator: std.mem.Allocator, stream_id: u32, count: usize) !void {
-    const index = stream_table.h2StreamIndex(self, stream_id) orelse return error.Http2UnknownStream;
-    const entry = &self.ingress_channels[index];
+    const entry = stream_table.h2StreamEntry(self, stream_id) orelse return error.Http2UnknownStream;
     const available = pendingResponseLen(entry);
     if (count > available)
         return error.Http2ProtocolError;
@@ -282,38 +279,42 @@ pub fn h2DropPendingResponsePrefix(self: *Slot, allocator: std.mem.Allocator, st
 }
 
 pub fn h2ClearPendingResponseEnd(self: *Slot, stream_id: u32) !void {
-    const index = stream_table.h2StreamIndex(self, stream_id) orelse return error.Http2UnknownStream;
-    const entry = &self.ingress_channels[index];
+    const entry = stream_table.h2StreamEntry(self, stream_id) orelse return error.Http2UnknownStream;
     if (pendingResponseLen(entry) != 0)
         return error.Http2ProtocolError;
     entry.pending_response_end_stream = false;
 }
 
+/// The id of the first stream from position `start_index.*` on that still
+/// owes the client buffered response bytes or END_STREAM, with
+/// `start_index.*` moved past it; null when none does.
 pub fn h2PendingResponseStreamId(self: *const Slot, start_index: *usize) ?u32 {
-    while (start_index.* < self.ingress_channels.len) : (start_index.* += 1) {
-        const entry = self.ingress_channels[start_index.*];
-        if (entry.state != .vacant and hasUndeliveredResponse(&entry)) {
+    while (start_index.* < self.stream_ids.len) : (start_index.* += 1) {
+        if (h2PendingResponseStreamIdAt(self, start_index.*)) |stream_id| {
             start_index.* += 1;
-            return entry.stream_id;
+            return stream_id;
         }
     }
     return null;
 }
 
-pub fn h2PendingResponseStreamIdAt(self: *const Slot, index: usize) ?u32 {
-    std.debug.assert(index < self.ingress_channels.len);
-    const entry = self.ingress_channels[index];
-    if (entry.state != .vacant and hasUndeliveredResponse(&entry))
-        return entry.stream_id;
+/// The id of the stream at `position` when it owes the client buffered
+/// response bytes or END_STREAM.
+pub fn h2PendingResponseStreamIdAt(self: *const Slot, position: usize) ?u32 {
+    const stream_id = self.stream_ids[position];
+    if (stream_id == 0)
+        return null;
+    if (hasUndeliveredResponse(stream_table.streamAt(self, position)))
+        return stream_id;
     return null;
 }
 
 pub fn h2MaybeRemoveDrainedResponseStream(self: *Slot, allocator: std.mem.Allocator, stream_id: u32) bool {
-    const index = stream_table.h2StreamIndex(self, stream_id) orelse return false;
-    const entry = &self.ingress_channels[index];
+    const position = stream_table.h2StreamIndex(self, stream_id) orelse return false;
+    const entry = stream_table.streamAt(self, position);
     if (entry.state != .draining_response or hasUndeliveredResponse(entry))
         return false;
-    stream_table.removeEntry(self, allocator, entry);
+    stream_table.removeEntry(self, allocator, position);
     return true;
 }
 

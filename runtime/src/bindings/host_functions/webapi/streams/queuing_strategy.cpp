@@ -80,7 +80,7 @@ JSC_DEFINE_HOST_FUNCTION(
 
     auto* collo_global = uncheckedDowncast<Collo::GlobalObject>(global_object);
     auto* structure = queuingStrategyStructureForNewTarget(global_object, scope, call_frame,
-        collo_global->owner().webapi_cache.byte_length_queuing_strategy_structure.get());
+        collo_global->webApiCache().byte_length_queuing_strategy_structure.get());
     RETURN_IF_EXCEPTION(scope, {});
     auto* strategy = JSColloQueuingStrategy::create(vm, structure, QueuingStrategyKind::ByteLength, high_water_mark);
     return JSValue::encode(strategy);
@@ -105,7 +105,7 @@ JSC_DEFINE_HOST_FUNCTION(
 
     auto* collo_global = uncheckedDowncast<Collo::GlobalObject>(global_object);
     auto* structure = queuingStrategyStructureForNewTarget(
-        global_object, scope, call_frame, collo_global->owner().webapi_cache.count_queuing_strategy_structure.get());
+        global_object, scope, call_frame, collo_global->webApiCache().count_queuing_strategy_structure.get());
     RETURN_IF_EXCEPTION(scope, {});
     auto* strategy = JSColloQueuingStrategy::create(vm, structure, QueuingStrategyKind::Count, high_water_mark);
     return JSValue::encode(strategy);
@@ -169,7 +169,7 @@ JSC_DEFINE_HOST_FUNCTION(
     requireQueuingStrategy(global_object, scope, call_frame->thisValue(), QueuingStrategyKind::ByteLength);
     RETURN_IF_EXCEPTION(scope, {});
     auto* collo_global = uncheckedDowncast<Collo::GlobalObject>(global_object);
-    return JSValue::encode(collo_global->owner().webapi_cache.byte_length_queuing_strategy_size_function.get());
+    return JSValue::encode(collo_global->webApiCache().byte_length_queuing_strategy_size_function.get());
 }
 
 JSC_DEFINE_HOST_FUNCTION(
@@ -180,7 +180,7 @@ JSC_DEFINE_HOST_FUNCTION(
     requireQueuingStrategy(global_object, scope, call_frame->thisValue(), QueuingStrategyKind::Count);
     RETURN_IF_EXCEPTION(scope, {});
     auto* collo_global = uncheckedDowncast<Collo::GlobalObject>(global_object);
-    return JSValue::encode(collo_global->owner().webapi_cache.count_queuing_strategy_size_function.get());
+    return JSValue::encode(collo_global->webApiCache().count_queuing_strategy_size_function.get());
 }
 
 } // namespace Collo::HostFunctions

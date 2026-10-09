@@ -48,7 +48,7 @@ test "setTimeout schedules a callback through the Zig runtime" {
         .request_headers = &request_headers,
         .body_framing = .none,
         .route_captures = &.{},
-        .route_entry_specifier = module_specifier,
+        .route_index = 0,
     });
     var dispatch_owned = true;
     errdefer if (dispatch_owned)

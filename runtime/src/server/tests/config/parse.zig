@@ -233,10 +233,59 @@ test "features the runtime lacks are rejected as not supported yet" {
     try expectRejected(withRoute("{\"entry\": \"a.js\", \"bindings\": {\"DATA\": {}}}"), "bindings.DATA: a binding needs a kind");
     try expectRejected(withRoute("{\"entry\": \"a.js\", \"bindings\": {\"DATA\": {\"text\": \"a\", \"json\": 1}}}"), "bindings.DATA: a binding has exactly one kind");
     try expectRejected(withRoute("{\"entry\": \"a.js\", \"bindings\": {\"DATA\": {\"text\": 1}}}"), "bindings.DATA.text: expected a string");
-    try expectRejected(
-        "{\"workers\": {\"api\": {\"routes\": {\"/a\": {\"entry\": \"a.js\"}, \"/b\": {\"entry\": \"b.js\"}}}}}",
-        "workers.api.routes: multi-route workers are not supported yet",
+}
+
+test "a worker declares up to routes_per_definition_max routes, in file order, each with its own bindings" {
+    var parsed = try parseOk(
+        \\{"workers": {"api": {"settings": {"isolateRealm": false}, "routes": {
+        \\  "/a": {"entry": "a.js", "bindings": {"NAME": {"text": "a"}}},
+        \\  "/b": {"entry": "b.js", "bindings": {"NAME": {"text": "b"}}},
+        \\  "/again": {"entry": "a.js"}
+        \\}}}}
     );
+    defer parsed.deinit();
+    const api = parsed.definition(0);
+    try std.testing.expect(!api.settings.isolate_realm);
+    try std.testing.expectEqual(@as(usize, 3), api.routes.len);
+    try std.testing.expectEqual(@as(u16, 3), parsed.route_count);
+    const expected = [_]struct { pattern: []const u8, entry: []const u8, bindings: usize }{
+        .{ .pattern = "/a", .entry = "/srv/app/a.js", .bindings = 1 },
+        .{ .pattern = "/b", .entry = "/srv/app/b.js", .bindings = 1 },
+        .{ .pattern = "/again", .entry = "/srv/app/a.js", .bindings = 0 },
+    };
+    for (api.routes, expected) |route, want| {
+        try std.testing.expectEqualStrings(want.pattern, route.pattern);
+        try std.testing.expectEqualStrings(want.entry, route.entry_path);
+        try std.testing.expectEqual(want.bindings, route.bindings.len);
+    }
+    try std.testing.expectEqualStrings("b", api.routes[1].bindings[0].value.text);
+
+    // A worker at the bound parses, and one route more is refused, naming
+    // the bound.
+    const allocator = std.testing.allocator;
+    const at_bound = try routesSource(allocator, server_limits.routes_per_definition_max);
+    defer allocator.free(at_bound);
+    var bounded = try parseOk(at_bound);
+    defer bounded.deinit();
+    try std.testing.expectEqual(server_limits.routes_per_definition_max, bounded.definition(0).routes.len);
+    const past_bound = try routesSource(allocator, server_limits.routes_per_definition_max + 1);
+    defer allocator.free(past_bound);
+    try expectRejected(past_bound, "routes are declared; at most 64 are allowed per worker");
+}
+
+/// A configuration whose one worker declares `count` routes on one entry;
+/// the caller frees it.
+fn routesSource(allocator: std.mem.Allocator, count: usize) ![]u8 {
+    var source: std.ArrayList(u8) = .empty;
+    errdefer source.deinit(allocator);
+    try source.appendSlice(allocator, "{\"workers\": {\"api\": {\"routes\": {");
+    for (0..count) |index| {
+        if (index != 0)
+            try source.appendSlice(allocator, ", ");
+        try source.print(allocator, "\"/r{d}\": {{\"entry\": \"a.js\"}}", .{index});
+    }
+    try source.appendSlice(allocator, "}}}}");
+    return source.toOwnedSlice(allocator);
 }
 
 test "two routes that match the same paths are rejected across workers" {

@@ -122,8 +122,8 @@ pub const State = struct {
     /// ready queue and its backlog were full; `collectCompletions` retries
     /// on the loop's next pass.
     rescan_needed: bool = false,
-    /// True only while the synchronous evaluation of the boot route entry
-    /// runs (`Runtime.evaluateBootRouteEntry`), which ends before the worker
+    /// True only while the synchronous evaluation of the routes' entries
+    /// runs (`Runtime.evaluateBootRoutes`), which ends before the worker
     /// sends its ready message. Inside it the boot context faults with the
     /// all-zero identity; after it `faultIdentity` denies the boot context,
     /// as the host end refuses that identity once the worker is ready.

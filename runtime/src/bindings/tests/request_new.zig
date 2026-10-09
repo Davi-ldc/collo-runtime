@@ -1,4 +1,4 @@
-//! `collo_request_new`, through `Vm.requestValue`: the Request a handler
+//! `collo_request_new`, through `Realm.requestValue`: the Request a handler
 //! receives has the URL `https://<authority><path>`, with `?<raw_query>` when
 //! the query is not empty, and a request without an authority or a request
 //! id is refused before anything is built. Lane: `bindings-test`; the rest of
@@ -28,7 +28,7 @@ fn requestInit(authority: []const u8, path: []const u8, raw_query: []const u8, r
 }
 
 fn expectUrl(vm: *bindings.Vm, init: *const bindings.RequestInit, expected: []const u8) !void {
-    var request = switch (try vm.requestValue(init)) {
+    var request = switch (try vm.mainRealm().requestValue(init)) {
         .success => |value| value,
         .exception => |exception| {
             var owned = exception;
@@ -66,6 +66,7 @@ test "a request without an authority or a request id is refused" {
     var vm = try support.createVm();
     defer vm.deinit();
 
-    try std.testing.expectError(error.InvalidArgument, vm.requestValue(&requestInit("", "/", "", 13)));
-    try std.testing.expectError(error.InvalidArgument, vm.requestValue(&requestInit("demo.test", "/", "", 0)));
+    const realm = vm.mainRealm();
+    try std.testing.expectError(error.InvalidArgument, realm.requestValue(&requestInit("", "/", "", 13)));
+    try std.testing.expectError(error.InvalidArgument, realm.requestValue(&requestInit("demo.test", "/", "", 0)));
 }

@@ -204,8 +204,26 @@ pub const Decoder = struct {
         try self.ensureInitialized();
         if (block.len == 0)
             return .{};
+        return self.decodeBlockScratch(allocator, try self.ensureScratch(allocator), block, max_header_count, max_header_bytes);
+    }
 
-        const scratch = try self.ensureScratch(allocator);
+    /// `decodeBlock` with the caller's room for the field being decoded,
+    /// `max_single_header_decode_bytes` long, instead of the decoder's own:
+    /// for a caller that decodes many connections' blocks one at a time and
+    /// keeps one scratch for all of them. The decoder never allocates its own
+    /// scratch on this path.
+    pub fn decodeBlockScratch(
+        self: *Decoder,
+        allocator: std.mem.Allocator,
+        scratch: []u8,
+        block: []const u8,
+        max_header_count: usize,
+        max_header_bytes: usize,
+    ) !DecodedBlock {
+        std.debug.assert(scratch.len >= max_single_header_decode_bytes);
+        try self.ensureInitialized();
+        if (block.len == 0)
+            return .{};
 
         var storage = try std.array_list.Aligned(u8, null).initCapacity(
             allocator,
@@ -406,6 +424,24 @@ pub const Encoder = struct {
         return storage[0..len];
     }
 
+    /// `encodeHeadersScratch` into the caller's `scratch` instead of the
+    /// encoder's own: for a caller that encodes many connections' heads one
+    /// at a time and keeps one scratch for all of them. The block borrows
+    /// `scratch`. Fails with `error.HpackOutputTooSmall` when the block may
+    /// not fit it.
+    pub fn encodeHeadersWithScratch(
+        self: *Encoder,
+        scratch: []u8,
+        headers: []const Header,
+        max_block_bytes: usize,
+    ) ![]const u8 {
+        const storage_len = try self.encodedStorageLen(headers, max_block_bytes);
+        if (storage_len > scratch.len)
+            return error.HpackOutputTooSmall;
+        const len = try self.encodeHeadersInto(scratch[0..storage_len], headers);
+        return scratch[0..len];
+    }
+
     pub fn encodePreparedHeaders(
         self: *Encoder,
         allocator: std.mem.Allocator,
@@ -584,7 +620,9 @@ pub const Encoder = struct {
 };
 
 const default_dynamic_table_capacity: u32 = max_dynamic_table_capacity;
-const max_single_header_decode_bytes: usize = 64 * 1024 - 1;
+/// The longest name or value one decoded field may have: the size of the
+/// decoder's scratch, its own or a caller's (`Decoder.decodeBlockScratch`).
+pub const max_single_header_decode_bytes: usize = 64 * 1024 - 1;
 
 fn encodedHeadersStorageLen(
     headers: []const Header,

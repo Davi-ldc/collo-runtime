@@ -1,16 +1,21 @@
 //! The boot context: the identity of module top-level code, kept in the
 //! runtime's active map under `request_context.boot_request_id` while the
-//! route entry evaluates, with its state in `Runtime.boot_ctx` (`root.zig`).
-//! `Methods` holds the runtime's operations on it, which `Runtime` declares
-//! as its own. They run on the worker's VM thread. The worker's boot
-//! installs the context and evaluates the route entry under it after
-//! seccomp and before it reports ready (`zygote/child_boot.zig`).
+//! routes' entries evaluate, with its state in `Runtime.boot_ctx`
+//! (`root.zig`). `Methods` holds the runtime's operations on it, which
+//! `Runtime` declares as its own. They run on the worker's VM thread. The
+//! worker's boot installs the context and evaluates every route's entry
+//! under it after seccomp and before it reports ready
+//! (`zygote/child_boot.zig`). One context serves every route and every
+//! realm: the routes of a worker share its process, its limits and its boot
+//! token.
 //!
-//! The context closes once, when the route entry's evaluation settles, and
-//! stays closed for the life of the process. The close clears the boot
-//! egress token first, so nothing in the worker can present it again, and
-//! after it a timer, an immediate, a crypto job or a fetch under the boot id
-//! is refused (`bootIdentityClosed`).
+//! The context closes once, when no route's evaluation is left in flight,
+//! and stays closed for the life of the process, so the top-level code of
+//! every route, however late its await settles, runs under this owner and
+//! its deadline. The close clears the boot egress token first, so nothing in
+//! the worker can present it again, and after it a timer, an immediate, a
+//! crypto job or a fetch under the boot id is refused
+//! (`bootIdentityClosed`).
 
 const std = @import("std");
 const ipc = @import("collo_ipc");
@@ -24,7 +29,7 @@ pub fn Methods(comptime Runtime: type) type {
         /// Installs the boot context, the identity under which module top-level
         /// code fetches and sets timers. It is keyed by `boot_request_id`, so
         /// every guard that reads request id 0 as "no request" stays intact, and
-        /// it lasts until the route entry's evaluation settles
+        /// it lasts until no route's evaluation is in flight
         /// (`closeBootContext`). The caller installs it for a worker that serves
         /// routes (`WorkerInit.servesRoutes`); without it, top-level fetches and
         /// timers are refused. Top-level fetches present `boot_egress_token`,
@@ -34,13 +39,11 @@ pub fn Methods(comptime Runtime: type) type {
         pub fn installBootContext(
             self: *Runtime,
             boot_egress_token: *const ipc.egress_token.Bytes,
-            route_entry_specifier: []const u8,
         ) !void {
             var dispatch_work = try ipc.DispatchWork.initBoot(
                 self.core.allocator,
                 request_context.boot_request_id,
                 boot_egress_token,
-                route_entry_specifier,
             );
             var dispatch_moved = false;
             errdefer if (!dispatch_moved) dispatch_work.deinit();
@@ -68,22 +71,24 @@ pub fn Methods(comptime Runtime: type) type {
             return self.requests.active.get(request_context.boot_request_id);
         }
 
-        /// Registers the route pack WorkerInit delivered and evaluates the entry
-        /// before the worker reports ready. With a top-level await, ready means
-        /// the synchronous part is done and the event loop settles the
-        /// evaluation later; the boot context's deadline is then armed to the
-        /// evaluation budget, so an await that never settles is reclaimed even
-        /// when no request waits on it.
+        /// Registers the definition's pack WorkerInit delivered and evaluates
+        /// every route's entry, in route order, before the worker reports ready
+        /// (`bootRegisterPack` and `bootEvaluateRoute` in
+        /// `worker/modules/routes.zig`). With a top-level await, ready means the
+        /// synchronous part is done and the event loop settles the evaluation
+        /// later; the boot context's deadline is then armed to the evaluation
+        /// budget, so an await that never settles is reclaimed even when no
+        /// request waits on it.
         ///
         /// A nonzero `init_deadline_mono_ns` is the host's absolute init deadline
         /// minus the child's cleanup reserve. It is armed before the pack is
-        /// registered and evaluated, so the sentinel watches the synchronous
-        /// part. Zero, as in-process tests pass, arms nothing until a top-level
-        /// await is pending.
-        pub fn evaluateBootRouteEntry(
+        /// registered and the routes evaluated, so the sentinel watches the
+        /// synchronous part of every route at once, and once it has passed no
+        /// further route is evaluated. Zero, as in-process tests pass, arms
+        /// nothing until a top-level await is pending.
+        pub fn evaluateBootRoutes(
             self: *Runtime,
-            route_entry_fd: std.posix.fd_t,
-            specifier: []const u8,
+            module_pack_fd: std.posix.fd_t,
             init_deadline_mono_ns: u64,
             marks: ?*modules_routes.BootEvalMarks,
         ) !void {
@@ -111,13 +116,24 @@ pub fn Methods(comptime Runtime: type) type {
                 self.disarmRequestDeadline(boot_ctx);
                 boot_ctx.exec.deadline_monotonic_ns = 0;
             };
-            const outcome = outcome: {
+            const pending = pending: {
                 // The evaluation runs JavaScript outside any turn, so the owner
                 // the deadline arbiter reads is published explicitly.
                 scheduler_resources.publishTurnOwner(self, request_context.boot_request_id);
                 defer scheduler_resources.clearTurnOwner(self);
                 var ctx = self.modulesContext();
-                break :outcome try modules_routes.bootEvaluateRouteEntry(&ctx, route_entry_fd, specifier, marks);
+                try modules_routes.bootRegisterPack(&ctx, module_pack_fd, marks);
+                var any_pending = false;
+                for (0..self.modules.state.routes.items.len) |index| {
+                    // Past the init deadline the sentinel has stopped the VM or
+                    // is about to, so a later route would only create its realm
+                    // and fail, inside the child's cleanup reserve.
+                    if (init_deadline_armed and self.requestDeadlineTerminationRequested(maybe_boot_ctx.?))
+                        break;
+                    if (try modules_routes.bootEvaluateRoute(&ctx, index) == .pending)
+                        any_pending = true;
+                }
+                break :pending any_pending;
             };
             // The init deadline passed during the synchronous part: the sentinel
             // already terminated the VM, so the outcome is the termination
@@ -128,15 +144,16 @@ pub fn Methods(comptime Runtime: type) type {
                 maybe_boot_ctx.?.exec.deadline_monotonic_ns = 0;
                 return error.WorkerInitDeadlineExceeded;
             }
-            if (outcome != .pending) {
-                // The entry settled within the synchronous part, so the boot
+            if (!pending) {
+                // Every entry settled within the synchronous part, so the boot
                 // context closes now, not at ready.
                 self.closeBootContext();
                 return;
             }
             const boot_ctx = maybe_boot_ctx orelse return;
             // A top-level await is pending: the init deadline gives way to the
-            // evaluation budget.
+            // evaluation budget, which starts after the last route's
+            // synchronous part and so covers every await in flight.
             self.disarmRequestDeadline(boot_ctx);
             boot_ctx.exec.deadline_monotonic_ns = self.nowMonoNs() +| modules_routes.module_eval_budget_ns;
             // Without the armed budget, an await that never settles and has no
@@ -146,8 +163,8 @@ pub fn Methods(comptime Runtime: type) type {
             try self.armRequestDeadline(boot_ctx);
         }
 
-        /// Closes the boot context when the route entry's evaluation settles,
-        /// inside `evaluateBootRouteEntry` or later when a top-level await
+        /// Closes the boot context once no route's evaluation is in flight,
+        /// inside `evaluateBootRoutes` or later when the last top-level await
         /// settles. In order, it:
         ///  1. clears the boot token where it is stored, so nothing in the worker
         ///     can present it again;

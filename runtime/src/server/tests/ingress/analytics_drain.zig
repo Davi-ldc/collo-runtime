@@ -171,7 +171,8 @@ test "a drain tick moves every lane's access records into access.jsonl" {
     const lanes = try std.testing.allocator.alloc(FakeLane, 2);
     defer std.testing.allocator.free(lanes);
     for (lanes) |*lane|
-        lane.* = .{};
+        lane.* = .{ .access_ring = try access.AccessRing.init() };
+    defer for (lanes) |*lane| lane.access_ring.deinit();
     try std.testing.expect(lanes[0].access_ring.push(makeRecord(1)));
     try std.testing.expect(lanes[1].access_ring.push(makeRecord(2)));
     try std.testing.expect(lanes[1].access_ring.push(makeRecord(3)));

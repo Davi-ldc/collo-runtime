@@ -48,6 +48,7 @@ pub const process = @import("process.zig");
 pub const http_body = @import("http_body.zig");
 pub const h2 = @import("h2.zig");
 pub const headers = @import("headers.zig");
+pub const ingress = @import("ingress.zig");
 pub const worker = @import("worker.zig");
 pub const runtime_logs = @import("runtime_logs.zig");
 pub const fs_fault = @import("fs_fault.zig");

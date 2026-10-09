@@ -14,22 +14,25 @@
 //!   and a lane that takes a slot of a worker another lane reads only asks
 //!   that reader to give the role up (`release_worker`). A dead worker's role
 //!   goes back on its death path.
-//! - A reader polls the worker's completion eventfd, control socket, fault
-//!   socket and pidfd for the whole tenure, reading the completion ring
-//!   through the record's mapping of the worker's page. Any registration
-//!   polls the payload credit eventfd or the control socket's writability
-//!   while one of its requests' sends waits on them. The launcher set the
-//!   server's ends of the worker's sockets non-blocking once, so no dispatch
-//!   changes a descriptor's flags.
-//! - A registration's generation advances when it stops reading and when it
-//!   is freed, so the completion of an earlier poll is ignored.
+//! - A reader polls the worker's completion eventfd, fault socket and pidfd
+//!   for the whole tenure, and its control socket while the worker's
+//!   forwarding window has room (`window_blocked`), reading the completion
+//!   ring through the record's mapping of the worker's page. Any
+//!   registration polls the control socket's writability while one of its
+//!   requests' sends waits for room there. A send that waits for room in the
+//!   worker's payload ring polls nothing: the reader wakes it
+//!   (`request_body.zig`). The launcher set the server's ends of the worker's
+//!   sockets non-blocking once, so no dispatch changes a descriptor's flags.
+//! - Every poll carries the registration's epoch, which is new each time
+//!   the registration is bound, stops reading or is freed (`newEpoch`), so
+//!   the completion of an earlier poll is ignored.
 
 const std = @import("std");
 
+const lifecycle = @import("collo_server_lifecycle");
 const supervision = @import("collo_server_supervisor");
 const fault = @import("../fault.zig");
 const completions = @import("../completions.zig");
-const ingress_state = @import("../state.zig");
 const admission = @import("admission.zig");
 const command_flow = @import("command_flow.zig");
 const event_sources = @import("event_sources.zig");
@@ -41,6 +44,7 @@ const pool = supervision.pool;
 const WorkerRecord = supervision.worker_table.Record;
 const RequestSlot = request_slot_mod.RequestSlot;
 const LaneFault = fault.LaneFault;
+const LaneRing = event_sources.LaneRing;
 
 pub fn Methods(comptime Self: type) type {
     return struct {
@@ -60,14 +64,14 @@ pub fn Methods(comptime Self: type) type {
                 .already => {},
                 .you_become_reader => |epoch| {
                     const registration_index = try registrationFor(self, worker);
-                    const registration = &self.completion_registrations[registration_index];
+                    const registration = &self.registrations.entries[registration_index];
                     // The pool grants a tenure only to a lane that does not
                     // read the worker, and a tenure ends in this lane's own
                     // registration.
                     if (registration.reading())
                         return error.InvalidCompletionRegistration;
                     registration.tenure = .{ .lane = self.lane.lane_id, .epoch = epoch };
-                    _ = try armWorkerPolls(self, registration_index);
+                    try armWorkerPolls(self, registration_index);
                 },
                 .transfer_from => |tenure| {
                     if (!try self.postToLane(tenure.lane, .{ .release_worker = .{
@@ -115,47 +119,30 @@ pub fn Methods(comptime Self: type) type {
         /// holding an unannounced death notice has not queued yet.
         pub fn registrationFor(self: *Self, worker: *WorkerRecord) LaneFault!u32 {
             const worker_key = worker.key();
-            var vacant: ?u32 = null;
-            for (self.completion_registrations[0..self.completion_registration_count], 0..) |*registration, index| {
-                if (registration.inUse()) {
-                    if (registration.worker == worker and registration.worker_key.eql(worker_key))
-                        return @intCast(index);
-                } else if (vacant == null) {
-                    vacant = @intCast(index);
-                }
+            for (self.registrations.touched(), 0..) |*registration, index| {
+                if (registration.inUse() and registration.worker == worker and registration.worker_key.eql(worker_key))
+                    return @intCast(index);
             }
-            const registration_index: u32 = vacant orelse grow: {
-                if (self.completion_registration_count == self.completion_registrations.len)
-                    return error.TooManyWorkerCompletionRegistrations;
-                self.completion_registrations[self.completion_registration_count] = .{};
-                self.completion_registration_count += 1;
-                break :grow @intCast(self.completion_registration_count - 1);
-            };
-            const registration = &self.completion_registrations[registration_index];
+            const acquired = self.registrations.acquire() orelse return error.TooManyWorkerCompletionRegistrations;
             // A registration is freed only with no death queued for it
-            // (`releaseRegistrationIfIdle`), so a free one carries none.
-            std.debug.assert(!registration.death_queued);
-            const generation = nextGeneration(registration.generation);
-            registration.* = .{
-                .worker = worker,
-                .worker_key = worker_key,
-                .generation = generation,
-                .event_fd = worker.handle.completion_eventfd,
-                .control_fd = worker.handle.control_fd,
-                .pidfd = worker.handle.pidfd,
-                .fs_fault_fd = worker.handle.fs_fault_fd,
-                .ingress_payload = &worker.handle.ingress_payload,
-                .ingress_payload_credit_eventfd = worker.handle.ingress_payload_credit_eventfd,
-            };
+            // (`releaseRegistrationIfIdle`), so its place carries none.
+            std.debug.assert(!acquired.entry.slab_link.queued);
+            const registration = acquired.entry;
+            registration.worker = worker;
+            registration.worker_key = worker_key;
+            registration.generation = newEpoch(self);
+            registration.event_fd = worker.handle.completion_eventfd;
+            registration.control_fd = worker.handle.control_fd;
+            registration.pidfd = worker.handle.pidfd;
+            registration.fs_fault_fd = worker.handle.fs_fault_fd;
+            registration.ingress_payload = &worker.handle.ingress_payload;
+            registration.ingress_payload_credit_eventfd = worker.handle.ingress_payload_credit_eventfd;
             self.lane.counters.worker_completion_registrations += 1;
-            return registration_index;
+            return acquired.index;
         }
 
-        pub fn findCompletionRegistrationIndex(
-            self: *Self,
-            worker_key: ingress_state.WorkerKey,
-        ) ?u32 {
-            for (self.completion_registrations[0..self.completion_registration_count], 0..) |*registration, index| {
+        pub fn findCompletionRegistrationIndex(self: *Self, worker_key: lifecycle.WorkerKey) ?u32 {
+            for (self.registrations.touched(), 0..) |*registration, index| {
                 if (registration.inUse() and registration.worker_key.eql(worker_key))
                     return @intCast(index);
             }
@@ -167,9 +154,9 @@ pub fn Methods(comptime Self: type) type {
         pub fn attachRequest(
             self: *Self,
             registration_index: u32,
-            request_key: ingress_state.RequestKey,
+            request_key: lifecycle.RequestKey,
         ) LaneFault!void {
-            const registration = &self.completion_registrations[registration_index];
+            const registration = try registrationAt(self, registration_index);
             if (registration.containsInflight(request_key))
                 return;
             // A worker has at most `concurrency` slots, within the list's
@@ -182,56 +169,42 @@ pub fn Methods(comptime Self: type) type {
 
         /// Arms every poll registration `registration_index` should have and
         /// has not: a reader's polls on the worker's completion eventfd,
-        /// control socket, fault socket and pidfd, the payload credit poll
-        /// while one of this lane's requests waits on the worker's full ring,
-        /// and the writability poll while one waits on its full control
-        /// socket. Every poll is one-shot; its completion clears its flag,
-        /// and this arms it again. Returns whether this call armed the credit
-        /// poll, which `EventSet.queuePoll` submits before it returns: the
-        /// lanes with sends parked on one worker share its credit eventfd, so
-        /// a credit written after a send's failed try and before this arm can
-        /// be read by another lane first, and the caller tries its
-        /// ring-blocked sends once more.
-        pub fn armWorkerPolls(self: *Self, registration_index: u32) LaneFault!bool {
+        /// fault socket and pidfd, and on its control socket unless the
+        /// forwarding window is full, and the writability poll while one of
+        /// this lane's requests waits on the worker's full control socket.
+        /// Every poll is one-shot; its completion clears its flag, and this
+        /// arms it again. Arming only prepares the submission, which the
+        /// pass's one `io_uring_enter` hands over.
+        pub fn armWorkerPolls(self: *Self, registration_index: u32) LaneFault!void {
             const registration = try registrationAt(self, registration_index);
             const ring = self.runtime_ring orelse return error.IngressRingUnavailable;
             if (registration.reading()) {
-                try armReadPoll(self, ring, registration_index, .worker_completion, registration.event_fd, &registration.poll_registered);
-                try armReadPoll(self, ring, registration_index, .worker_control, registration.control_fd, &registration.control_poll_registered);
-                try armReadPoll(self, ring, registration_index, .worker_fs_fault, registration.fs_fault_fd, &registration.fs_fault_poll_registered);
-                try armReadPoll(self, ring, registration_index, .worker_pidfd, registration.pidfd, &registration.pidfd_poll_registered);
+                try armReadPoll(ring, registration, registration_index, .worker_completion, registration.event_fd, &registration.poll_registered);
+                if (!registration.window_blocked)
+                    try armReadPoll(ring, registration, registration_index, .worker_control, registration.control_fd, &registration.control_poll_registered);
+                try armReadPoll(ring, registration, registration_index, .worker_fs_fault, registration.fs_fault_fd, &registration.fs_fault_poll_registered);
+                try armReadPoll(ring, registration, registration_index, .worker_pidfd, registration.pidfd, &registration.pidfd_poll_registered);
             }
-            var waits_on_ring = false;
-            var waits_on_socket = false;
             for (registration.inflight_request_keys[0..registration.inflight_request_len]) |request_key| {
                 const request_slot = Admission.findRequestSlot(self, request_key) orelse continue;
-                switch (self.dynamic_requests[request_slot].send_blocked) {
-                    .none, .failed => {},
-                    .ring => waits_on_ring = true,
-                    .socket => waits_on_socket = true,
+                if (self.requests.entries[request_slot].send_blocked == .socket) {
+                    try RingDriver.armWorkerControlWritable(self, registration_index);
+                    return;
                 }
             }
-            var credit_armed = false;
-            if (waits_on_ring and !registration.ingress_payload_credit_poll_registered) {
-                try armReadPoll(self, ring, registration_index, .worker_payload_credit, registration.ingress_payload_credit_eventfd, &registration.ingress_payload_credit_poll_registered);
-                credit_armed = true;
-            }
-            if (waits_on_socket)
-                try RingDriver.armWorkerControlWritable(self, registration_index);
-            return credit_armed;
         }
 
         /// `armWorkerPolls` for the registration of the worker of the
         /// dispatched request in `slot`.
-        pub fn armWorkerPollsFor(self: *Self, slot: *const RequestSlot) LaneFault!bool {
+        pub fn armWorkerPollsFor(self: *Self, slot: *const RequestSlot) LaneFault!void {
             const registration_index = findCompletionRegistrationIndex(self, slot.worker_key) orelse
                 return error.WorkerCompletionRegistrationNotFound;
-            return armWorkerPolls(self, registration_index);
+            try armWorkerPolls(self, registration_index);
         }
 
         fn armReadPoll(
-            self: *Self,
-            ring: *std.os.linux.IoUring,
+            ring: *LaneRing,
+            registration: *const completions.Registration,
             registration_index: u32,
             kind: event_sources.EventKind,
             fd: std.posix.fd_t,
@@ -239,18 +212,19 @@ pub fn Methods(comptime Self: type) type {
         ) LaneFault!void {
             if (registered.*)
                 return;
-            try self.runtime_events.queuePoll(ring, fd, event_sources.pollMask(event_sources.read_events), .{
+            try ring.queuePoll(fd, event_sources.pollMask(event_sources.read_events), .{
                 .kind = kind,
                 .index = registration_index,
-                .generation = self.completion_registrations[registration_index].generation,
+                .generation = registration.generation,
             });
             registered.* = true;
         }
 
-        /// Submits the cancel of a registration's poll of `kind` that is in
+        /// Prepares the cancel of a registration's poll of `kind` that is in
         /// flight. Without a ring, at teardown, the poll went with it.
         fn cancelPoll(
             self: *Self,
+            registration: *const completions.Registration,
             registration_index: u32,
             kind: event_sources.EventKind,
             in_flight: *bool,
@@ -259,35 +233,30 @@ pub fn Methods(comptime Self: type) type {
                 return;
             in_flight.* = false;
             const ring = self.runtime_ring orelse return;
-            const generation = self.completion_registrations[registration_index].generation;
-            try self.runtime_events.queuePollCancel(
-                ring,
-                .{ .kind = .worker_poll_cancel, .index = registration_index, .generation = generation },
-                .{ .kind = kind, .index = registration_index, .generation = generation },
+            try ring.queuePollCancel(
+                .{ .kind = .worker_poll_cancel, .index = registration_index, .generation = registration.generation },
+                .{ .kind = kind, .index = registration_index, .generation = registration.generation },
             );
         }
 
         /// Cancels every poll of registration `registration_index` still in
-        /// flight and moves it to its next generation, so a completion that
-        /// was already on its way reads as stale.
+        /// flight and gives it a new epoch, so a completion that was already
+        /// on its way reads as stale.
         fn cancelPolls(self: *Self, registration_index: u32) LaneFault!void {
-            const registration = &self.completion_registrations[registration_index];
-            try cancelPoll(self, registration_index, .worker_completion, &registration.poll_registered);
-            try cancelPoll(self, registration_index, .worker_control, &registration.control_poll_registered);
-            try cancelPoll(self, registration_index, .worker_fs_fault, &registration.fs_fault_poll_registered);
-            try cancelPoll(self, registration_index, .worker_pidfd, &registration.pidfd_poll_registered);
-            try cancelPoll(self, registration_index, .worker_control_writable, &registration.control_writable_poll_registered);
-            try cancelPoll(self, registration_index, .worker_payload_credit, &registration.ingress_payload_credit_poll_registered);
-            registration.generation = nextGeneration(registration.generation);
+            const registration = &self.registrations.entries[registration_index];
+            try cancelPoll(self, registration, registration_index, .worker_completion, &registration.poll_registered);
+            try cancelPoll(self, registration, registration_index, .worker_control, &registration.control_poll_registered);
+            try cancelPoll(self, registration, registration_index, .worker_fs_fault, &registration.fs_fault_poll_registered);
+            try cancelPoll(self, registration, registration_index, .worker_pidfd, &registration.pidfd_poll_registered);
+            try cancelPoll(self, registration, registration_index, .worker_control_writable, &registration.control_writable_poll_registered);
+            registration.generation = newEpoch(self);
         }
 
+        /// The registration at `registration_index`, which must hold a
+        /// worker: a caller reaches one only through a completion or a call
+        /// that checked it, so anything else is the lane's own mistake.
         pub fn registrationAt(self: *Self, registration_index: u32) LaneFault!*completions.Registration {
-            if (registration_index >= self.completion_registration_count)
-                return error.InvalidCompletionRegistration;
-            const registration = &self.completion_registrations[registration_index];
-            if (!registration.inUse())
-                return error.InvalidCompletionRegistration;
-            return registration;
+            return self.registrations.get(registration_index) orelse error.InvalidCompletionRegistration;
         }
 
         /// Stops reading the worker of registration `registration_index`:
@@ -295,13 +264,13 @@ pub fn Methods(comptime Self: type) type {
         /// forwarding losses it kept, and re-arms what the registration still
         /// needs for this lane's own requests.
         fn stopReading(self: *Self, registration_index: u32) LaneFault!void {
-            const registration = &self.completion_registrations[registration_index];
+            const registration = &self.registrations.entries[registration_index];
             if (!registration.reading())
                 return;
             try cancelPolls(self, registration_index);
             registration.endTenure();
             if (registration.inflight_request_len != 0)
-                _ = try armWorkerPolls(self, registration_index);
+                try armWorkerPolls(self, registration_index);
         }
 
         /// Frees a registration that neither reads its worker nor holds a
@@ -310,22 +279,21 @@ pub fn Methods(comptime Self: type) type {
         /// reason and the death notice that path needs, until the path runs
         /// (`worker_fault.processDeferredWorkerFaults`).
         pub fn releaseRegistrationIfIdle(self: *Self, registration_index: u32) LaneFault!void {
-            const registration = &self.completion_registrations[registration_index];
-            if (!registration.inUse() or registration.reading() or registration.inflight_request_len != 0)
+            const registration = self.registrations.get(registration_index) orelse return;
+            if (registration.reading() or registration.inflight_request_len != 0)
                 return;
-            if (registration.death_queued)
+            if (registration.slab_link.queued)
                 return;
             try cancelPolls(self, registration_index);
-            const generation = registration.generation;
-            registration.* = .{ .generation = generation };
+            self.registrations.release(registration_index);
         }
 
         /// Gives this lane's reader role over a dead `worker` back to its
         /// pool. A role granted to this lane with no tenure registered here
         /// is named only in the pool, and only this lane can end it.
         pub fn endReading(self: *Self, registration_index: u32, worker: *WorkerRecord) LaneFault!void {
-            const registration = &self.completion_registrations[registration_index];
-            if (registration.worker == worker and registration.reading()) {
+            const registration = &self.registrations.entries[registration_index];
+            if (registration.inUse() and registration.worker == worker and registration.reading()) {
                 _ = try Command.giveUpTenure(self, registration_index);
                 return;
             }
@@ -349,7 +317,7 @@ pub fn Methods(comptime Self: type) type {
         /// stays named until its death or its last request's backstop
         /// (`Pool.transferReader` answers `.kept`).
         pub fn endRegistrationAtTeardown(self: *Self, registration_index: u32) LaneFault!void {
-            const registration = &self.completion_registrations[registration_index];
+            const registration = &self.registrations.entries[registration_index];
             const worker = registration.worker orelse return;
             if (registration.death_notice) |notice| {
                 registration.death_notice = null;
@@ -360,10 +328,14 @@ pub fn Methods(comptime Self: type) type {
             if (registration.reading())
                 _ = try Command.giveUpTenure(self, registration_index);
         }
-    };
-}
 
-fn nextGeneration(generation: u32) u32 {
-    const next = generation +% 1;
-    return if (next == 0) 1 else next;
+        /// The lane's next poll epoch, never 0, which no poll was armed
+        /// under before it wraps.
+        fn newEpoch(self: *Self) u32 {
+            self.registration_epoch +%= 1;
+            if (self.registration_epoch == 0)
+                self.registration_epoch = 1;
+            return self.registration_epoch;
+        }
+    };
 }

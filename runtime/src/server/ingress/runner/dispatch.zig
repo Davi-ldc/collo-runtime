@@ -20,9 +20,11 @@
 //!   socket, `send_mutex` and payload ring), so a lane sends to workers that
 //!   another lane reads.
 //! - A send that would block is backpressure and never a fault. Its bytes
-//!   wait on the request (`RequestSlot.send_blocked`) behind a writability or
-//!   credit poll, under the request's deadline, and the request's later sends
-//!   queue behind them in order: its begin, a reset, then its stream's
+//!   wait on the request (`RequestSlot.send_blocked`) under the request's
+//!   deadline, behind a writability poll on the worker's control socket or,
+//!   for room in the worker's payload ring, behind the `payload_credit` wake
+//!   the worker's reader raises (`request_body.zig`), and the request's later
+//!   sends queue behind them in order: its begin, a reset, then its stream's
 //!   buffered body.
 //! - A send that fails for the worker's doing stops the request's sends. Met
 //!   inside a stream handler, it queues the worker's death path for after the
@@ -38,19 +40,18 @@
 //!   the pool's mutex when it reattaches the worker to a new gateway.
 
 const std = @import("std");
+const lifecycle = @import("collo_server_lifecycle");
 const supervision = @import("collo_server_supervisor");
 const ipc = @import("collo_ipc");
 const policy = @import("collo_egress_gateway").policy;
 const fault = @import("../fault.zig");
 const completions = @import("../completions.zig");
-const ingress_state = @import("../state.zig");
 const admission = @import("admission.zig");
 const deadline_driver = @import("deadline_driver.zig");
 const request_body = @import("request_body.zig");
 const request_finish = @import("request_finish.zig");
 const request_slot_mod = @import("request_slot.zig");
 const ring_driver = @import("ring_driver.zig");
-const work_queues = @import("work_queues.zig");
 const worker_fault = @import("worker_fault.zig");
 const worker_registration = @import("worker_registration.zig");
 
@@ -70,7 +71,8 @@ pub const Sent = union(enum) {
     /// The worker's control socket is full: its writability poll wakes the
     /// retry.
     socket_full,
-    /// The worker's payload ring is full: its credit eventfd wakes the retry.
+    /// The worker's payload ring is full: the reader's `payload_credit` wake
+    /// retries it (`request_body.zig`).
     ring_full,
     /// The send failed for the worker's doing.
     fault: fault.WorkerFaultReason,
@@ -106,7 +108,6 @@ pub fn requestTokenFields(slot: *const RequestSlot, session_id: u64) ipc.egress_
 pub fn Methods(comptime Self: type) type {
     return struct {
         const Admission = admission.Methods(Self);
-        const Queues = work_queues.Methods(Self);
         const RequestBody = request_body.Methods(Self);
         const RequestFinish = request_finish.Methods(Self);
         const RingDriver = ring_driver.Methods(Self);
@@ -146,9 +147,7 @@ pub fn Methods(comptime Self: type) type {
             worker: *WorkerRecord,
             worker_slot: pool.Slot,
         ) LaneFault!HandoffUse {
-            if (request_slot >= self.dynamic_requests.len)
-                return error.RequestSlotOutOfRange;
-            const slot = &self.dynamic_requests[request_slot];
+            const slot = self.requests.get(request_slot) orelse return error.RequestSlotVacant;
             if (!slot.waiting())
                 return error.RequestSlotVacant;
             // A slot handed on before `markDead` can reach its lane after it.
@@ -187,7 +186,7 @@ pub fn Methods(comptime Self: type) type {
             worker_slot: pool.Slot,
             head: DispatchHead,
         ) LaneFault!void {
-            const slot = &self.dynamic_requests[request_slot];
+            const slot = &self.requests.entries[request_slot];
             std.debug.assert(slot.waiting());
             // Every caller saw the request's stream `.preparing` on this
             // thread just before.
@@ -201,10 +200,6 @@ pub fn Methods(comptime Self: type) type {
             slot.worker = worker;
             slot.worker_slot = worker_slot;
             slot.worker_key = worker_key;
-            switch (self.lane.state.requests.lookup(slot.request_key)) {
-                .live => |request| request.worker_key = worker_key,
-                .stale_generation, .vacant, .out_of_range => return error.RequestSlotVacant,
-            }
             try WorkerRegistration.attachRequest(self, registration_index, slot.request_key);
             // Until its begin reaches the worker, the request ends at its own
             // deadline: a worker that never heard of it cannot answer it
@@ -252,7 +247,10 @@ pub fn Methods(comptime Self: type) type {
                 .request_headers = head.request_headers,
                 .body_framing = head.body_framing,
                 .route_captures = head.route_captures,
-                .route_entry_specifier = self.service.routes.artifact(slot.route).entry_specifier,
+                // The worker serves every route of its definition and finds
+                // this one at the same index in the route table WorkerInit
+                // carried (`server/routes/artifacts.zig`).
+                .route_index = slot.route.route,
             };
             const egress = self.service.supervisor.workerEgress(worker);
             if (egress.session_id != 0) {
@@ -312,9 +310,15 @@ pub fn Methods(comptime Self: type) type {
         /// its worker's key, which a dispatched request's entry carries. The
         /// entry only moves later, so the timerfd keeps its wake
         /// (`admission.insertWheelEntry`).
-        fn moveWheelEntry(self: *Self, slot: *const RequestSlot, deadline_ns: u64, now: u64) LaneFault!void {
-            _ = self.lane.cancelRequestDeadline(slot.request_key);
-            _ = try self.lane.insertDeadline(slot.request_key, slot.connection_key, slot.worker_key, deadline_ns, now);
+        fn moveWheelEntry(self: *Self, slot: *RequestSlot, deadline_ns: u64, now: u64) LaneFault!void {
+            try self.lane.armRequestDeadline(
+                &slot.deadline,
+                slot.request_key,
+                slot.connection_key,
+                slot.worker_key,
+                deadline_ns,
+                now,
+            );
         }
 
         /// Records that the request's `request_begin` is in its worker's
@@ -342,7 +346,7 @@ pub fn Methods(comptime Self: type) type {
         /// back. A reset that would block waits behind the worker's
         /// writability poll, and the stream's body is dropped either way.
         pub fn cancelRequestToWorker(self: *Self, request_slot: u32, error_code: u32) LaneFault!void {
-            const slot = &self.dynamic_requests[request_slot];
+            const slot = &self.requests.entries[request_slot];
             if (!slot.dispatched())
                 return error.RequestSlotVacant;
             switch (slot.send_blocked) {
@@ -363,28 +367,42 @@ pub fn Methods(comptime Self: type) type {
             }
         }
 
-        /// Loop handlers' retry of the sends of this lane's requests on the
-        /// worker of registration `registration_index` that waited for room,
-        /// after the poll on the worker's control socket or payload credit
-        /// fired; it then arms the polls the requests still wait on. A
-        /// request's sends go out in their order: its begin, a reset, then
-        /// its stream's buffered body. A send that fails for the worker's
-        /// doing runs the death path here, outside any stream handler.
+        /// Retries the sends of this lane's requests on the worker of
+        /// registration `registration_index` that wait for room, after the
+        /// writability poll on the worker's control socket fired or the
+        /// worker freed room in its payload ring; it then arms the polls the
+        /// requests still wait on. A request's sends go out in their order:
+        /// its begin, a reset, then its stream's buffered body. A send that
+        /// fails for the worker's doing runs the death path here, outside
+        /// any stream handler.
         pub fn flushBlockedSends(self: *Self, registration_index: u32) LaneFault!void {
-            if (registration_index >= self.completion_registration_count)
-                return error.InvalidCompletionRegistration;
-            if (!self.completion_registrations[registration_index].inUse())
-                return error.InvalidCompletionRegistration;
+            _ = try WorkerRegistration.registrationAt(self, registration_index);
             if (try retryBlockedSends(self, registration_index)) |reason|
                 return WorkerFault.faultWorker(self, registration_index, reason);
-            if (!try WorkerRegistration.armWorkerPolls(self, registration_index))
-                return;
-            // The credit poll went live after the tries above, and a credit
-            // written in between may have gone to another lane's poll, so
-            // what still waits gets one more try (`armWorkerPolls`).
-            if (try retryBlockedSends(self, registration_index)) |reason|
-                return WorkerFault.faultWorker(self, registration_index, reason);
-            _ = try WorkerRegistration.armWorkerPolls(self, registration_index);
+            try WorkerRegistration.armWorkerPolls(self, registration_index);
+        }
+
+        /// Handles this lane's `payload_credit` wake: a worker freed room in
+        /// a payload ring one of this lane's requests waits on. The wake does
+        /// not say which worker, so every registration with a send parked on
+        /// a full ring retries its blocked sends.
+        pub fn retryRingBlockedSends(self: *Self) LaneFault!void {
+            for (self.registrations.touched(), 0..) |*registration, index| {
+                if (!registration.inUse() or !waitsOnRing(self, registration))
+                    continue;
+                try flushBlockedSends(self, @intCast(index));
+            }
+        }
+
+        /// Whether one of this lane's requests on the worker of
+        /// `registration` waits for room in its payload ring.
+        fn waitsOnRing(self: *Self, registration: *const completions.Registration) bool {
+            for (registration.inflight_request_keys[0..registration.inflight_request_len]) |request_key| {
+                const request_slot = Admission.findRequestSlot(self, request_key) orelse continue;
+                if (self.requests.entries[request_slot].send_blocked == .ring)
+                    return true;
+            }
+            return false;
         }
 
         /// Tries, in order, the sends of this lane's requests on the worker
@@ -392,12 +410,12 @@ pub fn Methods(comptime Self: type) type {
         /// returns the fault of the first one that failed for the worker's
         /// doing.
         fn retryBlockedSends(self: *Self, registration_index: u32) LaneFault!?fault.WorkerFaultReason {
-            const registration = &self.completion_registrations[registration_index];
-            var request_keys: [completions.max_worker_inflight_requests]ingress_state.RequestKey = undefined;
+            const registration = &self.registrations.entries[registration_index];
+            var request_keys: [completions.max_worker_inflight_requests]lifecycle.RequestKey = undefined;
             const request_count = registration.copyInflight(&request_keys);
             for (request_keys[0..request_count]) |request_key| {
                 const request_slot = Admission.findRequestSlot(self, request_key) orelse continue;
-                switch (self.dynamic_requests[request_slot].send_blocked) {
+                switch (self.requests.entries[request_slot].send_blocked) {
                     .none, .failed => continue,
                     .socket, .ring => {},
                 }
@@ -412,7 +430,7 @@ pub fn Methods(comptime Self: type) type {
         /// Sends what the dispatched request in `request_slot` has waiting,
         /// in order, until a send would block again or fails.
         pub fn flushRequestSends(self: *Self, request_slot: u32) LaneFault!WorkerOutcome {
-            const slot = &self.dynamic_requests[request_slot];
+            const slot = &self.requests.entries[request_slot];
             const worker = slot.worker orelse return error.RequestSlotVacant;
             if (slot.parked_begin) |*parked| {
                 switch (try sendBegin(self, worker, parked.descriptor, parked.payload)) {
@@ -466,16 +484,11 @@ pub fn Methods(comptime Self: type) type {
         }
 
         /// Arms the polls the worker of the dispatched request in `slot`
-        /// needs for the sends its requests wait on. A credit poll armed now
-        /// went live after the send's failed try, and a credit written in
-        /// between may have gone to another lane's poll, so the request's
-        /// connection gets a turn, whose drive tries the bodies parked on the
-        /// ring again (`request_body.flushPendingH2RequestBodies`).
+        /// needs for the sends its requests wait on. A send parked on the
+        /// payload ring needs none: it registered for the reader's wake
+        /// before it gave up (`request_body.zig`).
         pub fn armSendPolls(self: *Self, slot: *const RequestSlot) LaneFault!void {
-            if (!try WorkerRegistration.armWorkerPollsFor(self, slot))
-                return;
-            if (Admission.requestConnection(self, slot)) |runtime|
-                Queues.enqueueConnection(self, runtime.key.slot);
+            try WorkerRegistration.armWorkerPollsFor(self, slot);
         }
 
         /// Sends a request's `request_begin` with its DispatchWork payload.

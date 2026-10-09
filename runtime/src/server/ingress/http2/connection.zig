@@ -7,8 +7,8 @@
 //! that return receive credit.
 //!
 //! The driver is generic over `Worker`, the lane. It reads the lane's
-//! `header_buffers` and `service.allocator`, and calls on it the stream
-//! handlers of `runner/admission.zig` (`startDynamicH2`) and
+//! `h2_lane` (`lane_resources.zig`) and `service.allocator`, and calls on it
+//! the stream handlers of `runner/admission.zig` (`startDynamicH2`) and
 //! `runner/request_body.zig` (`handleH2DataFrame`, `handleH2DataFrameBatch`,
 //! `handleH2ResetFrame`, `flushPendingH2RequestBodies`),
 //! `updateConnectionInterest` and `closeRuntimeConnection`, each of which
@@ -26,8 +26,9 @@
 //! caller knows the worker.
 //!
 //! Invariants:
-//! - Reading stops while queued writes remain, so a client that does not
-//!   read its responses is not read either.
+//! - No read starts while queued writes remain, so a client that does not
+//!   read its responses is not read either. A read once made is handled to
+//!   its last byte (`reading.zig`).
 //! - A connection closes in two steps (`runner/connection_flow.zig`). The
 //!   driver only asks the lane to close it, and from then on the connection
 //!   reads no frame and queues none; its queue is written only while the
@@ -49,8 +50,8 @@ pub const Http2Failure = fault.LaneFault || fault.Http2Error;
 const Slot = connection_slot.Slot;
 
 /// Socket reads one drive makes before it gives the lane back to its other
-/// connections. One read takes at most a header buffer, a frame header and
-/// `limits.h2.INGRESS_MAX_FRAME_SIZE_BYTES` of payload.
+/// connections. One read takes at most the lane's read buffer
+/// (`lane_resources.zig:LaneResources.read_buffer_bytes`).
 const reads_per_drive_max: usize = 8;
 
 /// What the lane did with a DATA frame's payload, which decides when its

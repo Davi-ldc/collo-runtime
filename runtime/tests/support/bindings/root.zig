@@ -44,12 +44,18 @@ pub fn registerModule(vm: *bindings.Vm, specifier: []const u8, source: []const u
     try vm.registerModulePack(pack);
 }
 
-/// Evaluates `specifier`, which must complete synchronously. A thrown exception,
-/// or the one an `.unsupported` result carries, is released and fails with
+/// Evaluates `specifier` in the VM's main realm, as every helper below does,
+/// and it must complete synchronously. A thrown exception, or the one an
+/// `.unsupported` result carries, is released and fails with
 /// `error.UnexpectedJsException`; a top-level await still in flight fails with
 /// `error.UnexpectedPendingEvaluation`.
 pub fn evaluateOk(vm: *bindings.Vm, specifier: []const u8) !void {
-    switch (try vm.evaluateModule(specifier)) {
+    try evaluateInRealmOk(vm.mainRealm(), specifier);
+}
+
+/// `evaluateOk` in `realm`.
+pub fn evaluateInRealmOk(realm: bindings.Realm, specifier: []const u8) !void {
+    switch (try realm.evaluateModule(specifier)) {
         .success => {},
         .exception => |exception| {
             var owned = exception;
@@ -68,7 +74,7 @@ pub fn evaluateOk(vm: *bindings.Vm, specifier: []const u8) !void {
 /// Evaluates `specifier` and returns the exception it throws, which the caller
 /// owns. Any other outcome is an error.
 pub fn evaluateException(vm: *bindings.Vm, specifier: []const u8) !bindings.Value {
-    return switch (try vm.evaluateModule(specifier)) {
+    return switch (try vm.mainRealm().evaluateModule(specifier)) {
         .success => error.UnexpectedJsException,
         .exception => |exception| exception,
         .unsupported => error.UnexpectedJsException,
@@ -80,7 +86,7 @@ pub fn evaluateException(vm: *bindings.Vm, specifier: []const u8) !bindings.Valu
 /// result (`COLLO_STATUS_UNSUPPORTED`), which the caller owns. Any other
 /// outcome is an error.
 pub fn evaluateUnsupported(vm: *bindings.Vm, specifier: []const u8) !bindings.Value {
-    return switch (try vm.evaluateModule(specifier)) {
+    return switch (try vm.mainRealm().evaluateModule(specifier)) {
         .success => error.UnexpectedJsException,
         .exception => error.UnexpectedJsException,
         .unsupported => |exception| exception,
@@ -90,7 +96,7 @@ pub fn evaluateUnsupported(vm: *bindings.Vm, specifier: []const u8) !bindings.Va
 
 /// Evaluates `specifier` and expects its top-level await to be still in flight.
 pub fn evaluatePending(vm: *bindings.Vm, specifier: []const u8) !void {
-    switch (try vm.evaluateModule(specifier)) {
+    switch (try vm.mainRealm().evaluateModule(specifier)) {
         .success => return error.UnexpectedEvaluationSuccess,
         .exception, .unsupported => |exception| {
             var owned = exception;
@@ -105,7 +111,12 @@ pub fn evaluatePending(vm: *bindings.Vm, specifier: []const u8) !void {
 /// caller owns. A thrown exception is released and fails with
 /// `error.UnexpectedJsException`.
 pub fn getExportOk(vm: *bindings.Vm, specifier: []const u8, export_name: []const u8) !bindings.Value {
-    return switch (try vm.moduleGetExport(specifier, export_name)) {
+    return getExportInRealmOk(vm.mainRealm(), specifier, export_name);
+}
+
+/// `getExportOk` in `realm`.
+pub fn getExportInRealmOk(realm: bindings.Realm, specifier: []const u8, export_name: []const u8) !bindings.Value {
+    return switch (try realm.moduleGetExport(specifier, export_name)) {
         .success => |value| value,
         .exception => |exception| {
             var owned = exception;

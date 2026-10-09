@@ -1,10 +1,11 @@
-//! The slot an ingress lane holds for each request it admits, at the index of
-//! the request's slot in the lane's request slab (`state.zig`), on the lane
-//! thread that owns both. Admission fills it (`admission.zig`) and
-//! `finishRequest` in `request_finish.zig` empties it, once.
+//! The slot an ingress lane holds for each request it admits, an entry of the
+//! lane's request slab (`slab.zig`) whose index and generation make the
+//! request's key, on the lane thread that owns it. Admission fills it
+//! (`admission.zig`) and `finishRequest` in `request_finish.zig` gives it
+//! back, once.
 //!
 //! Invariants:
-//! - An active slot is waiting while `worker` is null and dispatched once it
+//! - A live slot is waiting while `worker` is null and dispatched once it
 //!   is set. A waiting request is this lane's own state in its pool's waiter
 //!   FIFO and owns a copy of its head (`head`), because the HTTP/2 decoder's
 //!   buffers are gone by the time a worker slot reaches it. A dispatched
@@ -14,8 +15,8 @@
 //!   are the lane's own, assigned at admission; nothing a worker sends
 //!   changes them.
 //! - The request's one deadline is `deadline_ns`, fixed at admission. Its
-//!   wheel entry fires there while the request waits for a worker slot or
-//!   for room to send its begin, and at the deadline plus
+//!   wheel entry (`deadline`) fires there while the request waits for a
+//!   worker slot or for room to send its begin, and at the deadline plus
 //!   `hard_timeout_grace_ns` once the begin reached the worker.
 //! - Sends toward the worker keep the request's order: while `send_blocked`
 //!   waits for room, the parked begin, then a parked reset, then the
@@ -29,22 +30,27 @@
 const std = @import("std");
 
 const ipc = @import("collo_ipc");
+const lifecycle = @import("collo_server_lifecycle");
 const server_config = @import("collo_server_config");
 const supervision = @import("collo_server_supervisor");
 const access_log = @import("collo_server_analytics").access;
 const worker_shared_page = @import("collo_worker_state").page;
-const ingress_state = @import("../state.zig");
+const slab = @import("../slab.zig");
+const timer_wheel = @import("../timer_wheel.zig");
 
 const pool = supervision.pool;
 const WorkerRecord = supervision.worker_table.Record;
 
+/// The lane's requests.
+pub const RequestSlab = slab.FaultInSlab(RequestSlot);
+
 pub const RequestSlot = struct {
-    active: bool = false,
-    request_key: ingress_state.RequestKey = .{ .lane_id = 0, .slot = 0, .generation = 0 },
+    slab_link: slab.Link = .{},
+    request_key: lifecycle.RequestKey = .{ .lane_id = 0, .slot = 0, .generation = 0 },
     /// The server's id for the request (`Service.allocateRequestId`), never 0
-    /// on an active slot.
+    /// on a live slot.
     request_id: u64 = 0,
-    connection_key: ingress_state.ConnectionKey = .{ .lane_id = 0, .slot = 0, .generation = 0 },
+    connection_key: lifecycle.ConnectionKey = .{ .lane_id = 0, .slot = 0, .generation = 0 },
     /// The client's HTTP/2 stream.
     ingress_channel_id: u32 = 0,
     route: server_config.RouteKey = .{ .definition = 0, .route = 0 },
@@ -53,13 +59,15 @@ pub const RequestSlot = struct {
     deadline_ns: u64 = 0,
     /// When the lane admitted the request (CLOCK_MONOTONIC).
     admitted_ns: u64 = 0,
+    /// The request's entry in the lane's deadline wheel, while it has one.
+    deadline: ?timer_wheel.Handle = null,
     /// The head of a request that waits. A request dispatched at admission
     /// sends its head straight from the decoder and never has one.
     head: ?OwnedHead = null,
     worker: ?*WorkerRecord = null,
     worker_slot: pool.Slot = 0,
     /// `worker.key()` at dispatch; zero while the request waits.
-    worker_key: ingress_state.WorkerKey = .{ .worker_id = 0, .worker_generation = 0 },
+    worker_key: lifecycle.WorkerKey = .{ .worker_id = 0, .worker_generation = 0 },
     /// The gateway generation and the worker session the request's egress
     /// token was minted for, both 0 when its dispatch carried
     /// `egress_token.none` or it was never dispatched. Its finish owes that
@@ -92,12 +100,16 @@ pub const RequestSlot = struct {
     /// `request_id` 0 means nothing to emit.
     access: access_log.AccessFacts = .{},
 
+    pub fn isLive(self: *const RequestSlot) bool {
+        return self.slab_link.live;
+    }
+
     pub fn waiting(self: *const RequestSlot) bool {
-        return self.active and self.worker == null;
+        return self.slab_link.live and self.worker == null;
     }
 
     pub fn dispatched(self: *const RequestSlot) bool {
-        return self.active and self.worker != null;
+        return self.slab_link.live and self.worker != null;
     }
 
     /// The identity every descriptor of the request carries toward its

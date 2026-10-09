@@ -18,10 +18,15 @@ pub const TimerEntry = struct {
     delay_ms: u32 = 0,
     repeats: bool = false,
     callback: js_value.JsFunctionOwned,
+    /// The callback's `this`: the globalThis of the realm that scheduled it,
+    /// or undefined when null.
+    receiver: ?js_value.JsValueOwned = null,
     args: ?[]js_value.JsValueOwned = null,
 
     pub fn deinit(self: *TimerEntry, allocator: std.mem.Allocator) void {
         self.callback.deinit();
+        if (self.receiver) |*receiver|
+            receiver.deinit();
         if (self.args) |args| {
             for (args) |*arg|
                 arg.deinit();
@@ -209,7 +214,13 @@ pub fn executeCallback(runtime: anytype, timer_id: u64) !void {
     }
 
     var callback_err: ?anyerror = null;
-    callbacks.invokeDiscard(runtime, timer.request_id, &timer.callback, timer.args) catch |err| {
+    callbacks.invokeDiscard(
+        runtime,
+        timer.request_id,
+        &timer.callback,
+        if (timer.receiver) |*receiver| receiver.ptr() else null,
+        timer.args,
+    ) catch |err| {
         callback_err = err;
     };
 

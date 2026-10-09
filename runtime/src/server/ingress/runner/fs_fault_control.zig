@@ -24,10 +24,10 @@
 const std = @import("std");
 
 const ipc = @import("collo_ipc");
+const lifecycle = @import("collo_server_lifecycle");
 
 const completions = @import("../completions.zig");
 const fault = @import("../fault.zig");
-const ingress_state = @import("../state.zig");
 
 const LaneFault = fault.LaneFault;
 const WorkerOutcome = fault.WorkerOutcome;
@@ -74,7 +74,7 @@ pub fn Methods(comptime Self: type) type {
             registration: *const completions.Registration,
             request: *const ipc.FsFaultRequest,
         ) ipc.FsFaultResponseStatus {
-            const worker_key: ingress_state.WorkerKey = .{
+            const worker_key: lifecycle.WorkerKey = .{
                 .worker_id = request.worker_id,
                 .worker_generation = request.worker_generation,
             };
@@ -96,11 +96,10 @@ pub fn Methods(comptime Self: type) type {
             request: *const ipc.FsFaultRequest,
         ) bool {
             for (registration.inflight_request_keys[0..registration.inflight_request_len]) |key| {
-                if (key.slot >= self.dynamic_requests.len)
-                    continue;
-                const active = &self.dynamic_requests[key.slot];
-                if (!active.active or !active.request_key.eql(key))
-                    continue;
+                const active = switch (self.requests.lookup(key.slot, key.generation)) {
+                    .live => |active| active,
+                    .stale_generation, .vacant, .out_of_range => continue,
+                };
                 if (!active.worker_key.eql(registration.worker_key))
                     continue;
                 if (active.request_id != request.request_id)
@@ -137,10 +136,9 @@ pub fn Methods(comptime Self: type) type {
         /// worker: only the reader may read a worker's fault socket, and only
         /// its polls call the drain.
         fn readerRegistration(self: *Self, registration_index: u32) LaneFault!*completions.Registration {
-            if (registration_index >= self.completion_registration_count)
+            const registration = self.registrations.get(registration_index) orelse
                 return error.InvalidCompletionRegistration;
-            const registration = &self.completion_registrations[registration_index];
-            if (!registration.inUse() or !registration.reading() or registration.fs_fault_fd < 0)
+            if (!registration.reading() or registration.fs_fault_fd < 0)
                 return error.InvalidCompletionRegistration;
             return registration;
         }

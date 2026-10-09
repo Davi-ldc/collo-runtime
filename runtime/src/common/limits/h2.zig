@@ -21,9 +21,9 @@ pub const INGRESS_STREAM_RECV_WINDOW_BYTES: u32 = 512 * 1024;
 pub const INGRESS_CONNECTION_RECV_WINDOW_BYTES: u32 = 2 * 1024 * 1024;
 
 /// SETTINGS_MAX_FRAME_SIZE the ingress server advertises and enforces on
-/// every inbound frame. It also sizes the ingress header buffers
-/// (`header_buffer_bytes` in `server/ingress/runner/ring_driver.zig`).
-/// Outbound frames follow the client's own SETTINGS_MAX_FRAME_SIZE instead.
+/// every inbound frame. It also sizes the read buffer each ingress lane shares
+/// across its connections (`read_buffer_bytes` in
+/// `server/ingress/http2/lane_resources.zig`). Outbound frames follow the client's own SETTINGS_MAX_FRAME_SIZE instead.
 pub const INGRESS_MAX_FRAME_SIZE_BYTES: u32 = 64 * 1024;
 
 /// Per-stream receive window of the egress fetch client, and the default cap

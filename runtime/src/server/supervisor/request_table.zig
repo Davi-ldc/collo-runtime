@@ -4,7 +4,8 @@
 //! request ended, whether the worker's own record for it is still to come.
 //! Every supervisor worker record holds one (`worker_table.Record.requests`).
 //! The worker's reader also claims here the one completion of a request it
-//! forwards to another lane (`claimCompletion`).
+//! forwards to another lane (`claimCompletion`), and checks each descriptor
+//! it forwards against the request it names (`forwardCheck`).
 //!
 //! The table decides which worker-written usage records the server keeps. A
 //! worker appends a request's record to its usage ring before it publishes
@@ -126,6 +127,20 @@ pub const CompletionClaim = enum {
     /// The request gave its slot back or has no entry, or a completion of
     /// it was claimed already.
     stale,
+    /// The table holds the request id under another request key, which only
+    /// a worker that rewrote the identity of a request it was sent names.
+    mismatch,
+};
+
+/// What `forwardCheck` found for a descriptor a worker addressed to a request
+/// of another lane.
+pub const ForwardCheck = enum {
+    /// The request holds its slot under the descriptor's key.
+    live,
+    /// The request gave its slot back or has no entry. Its owner would drop
+    /// the descriptor, so the reader drops it instead of taking a place in
+    /// the owner's queue.
+    absent,
     /// The table holds the request id under another request key, which only
     /// a worker that rewrote the identity of a request it was sent names.
     mismatch,
@@ -256,6 +271,26 @@ pub const RequestTable = struct {
             return .stale;
         entry.completion_claimed = true;
         return .claimed;
+    }
+
+    /// Checks a descriptor the worker's reader is about to forward to the
+    /// lane that owns its request (`server/ingress/runner/h2_worker_ipc.zig`):
+    /// the request `request_id` names must hold its slot under
+    /// `request_key`.
+    pub fn forwardCheck(
+        self: *RequestTable,
+        request_id: u64,
+        request_key: lifecycle.RequestKey,
+    ) ForwardCheck {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const entry = findLocked(self, request_id) orelse return .absent;
+        if (!entry.dispatched.request_key.eql(request_key))
+            return .mismatch;
+        return switch (entry.state) {
+            .in_flight, .synthesizing, .recorded => .live,
+            .free, .awaiting_record => .absent,
+        };
     }
 
     /// What the server dispatched for `request_id`, or null when the table

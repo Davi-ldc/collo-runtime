@@ -1,7 +1,8 @@
-// Retains a timer's or immediate's callback, arguments and, for an immediate, its receiver as value handles and passes
-// them to collo_runtime_set_timer or collo_runtime_set_immediate, on the VM thread. The runtime consumes every handle
-// it receives, also when it fails; a handle that cannot be made releases the ones made before it, so no handle
-// outlives a failed schedule.
+// Retains a timer's or immediate's callback, receiver and arguments as value handles and passes them to
+// collo_runtime_set_timer or collo_runtime_set_immediate, on the VM thread. A timer's receiver is the globalThis of the
+// realm whose setTimeout or setInterval ran, an immediate's its Immediate object. The runtime consumes every handle it
+// receives, also when it fails; a handle that cannot be made releases the ones made before it, so no handle outlives a
+// failed schedule.
 
 #include "host_functions/runtime/timers.h"
 
@@ -73,21 +74,21 @@ std::optional<JSC::EncodedJSValue> scheduleCallbackValue(JSC::JSGlobalObject* gl
     }
 
     ColloValue* this_handle = nullptr;
-    if (kind == ScheduleKind::Immediate) {
-        if (Collo::makeValueHandle(runtime.owner, this_value, &this_handle) != COLLO_STATUS_OK || !this_handle) {
-            for (size_t release_index = 0; release_index < retained_args; ++release_index)
-                Collo::releaseValueHandle(args[release_index]);
-            Collo::releaseValueHandle(callback_handle);
-            Collo::HostFunctions::throwRuntimeError(global_object, scope, "Failed to retain immediate receiver."_s);
-            return std::nullopt;
-        }
+    JSC::JSValue receiver = kind == ScheduleKind::Timer ? global_object->globalThis() : this_value;
+    if (Collo::makeValueHandle(runtime.owner, receiver, &this_handle) != COLLO_STATUS_OK || !this_handle) {
+        for (size_t release_index = 0; release_index < retained_args; ++release_index)
+            Collo::releaseValueHandle(args[release_index]);
+        Collo::releaseValueHandle(callback_handle);
+        Collo::HostFunctions::throwRuntimeError(global_object, scope,
+            scheduleMessage(kind, "Failed to retain timer receiver."_s, "Failed to retain immediate receiver."_s));
+        return std::nullopt;
     }
 
     uint64_t callback_id = 0;
     // From here the runtime owns every handle, including on a failed status.
     ColloStatus status = kind == ScheduleKind::Timer
-        ? collo_runtime_set_timer(runtime.host_runtime, runtime.exec_ctx->request_id, callback_handle, args, args_len,
-              delay_ms, repeats ? 1 : 0, &callback_id)
+        ? collo_runtime_set_timer(runtime.host_runtime, runtime.exec_ctx->request_id, callback_handle, this_handle,
+              args, args_len, delay_ms, repeats ? 1 : 0, &callback_id)
         : collo_runtime_set_immediate(runtime.host_runtime, runtime.exec_ctx->request_id, callback_handle, this_handle,
               args, args_len, &callback_id);
     if (status != COLLO_STATUS_OK) {

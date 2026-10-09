@@ -1,11 +1,13 @@
 //! The worker runtime harness (`collo_test_harness`): a host for tests that
 //! run a worker runtime in process, or talk to a forked worker through the
-//! host client (`host.dispatch`). A dispatch names its route's entry and
-//! carries no pack, so a route's pack reaches the worker first: a forked
-//! worker takes it in WorkerInit (`host.LaunchOptions.route_entry`), and an
-//! in-process runtime through `registerRoutePack`, which runs the
-//! registration a worker's boot runs on WorkerInit's route entry and leaves
-//! the entry for the route's first request to evaluate. The harness builds
+//! host client (`host.dispatch`). A dispatch names its route by its index in
+//! the worker's route table and carries no pack, so the routes and their
+//! pack reach the worker first: a forked worker takes them in WorkerInit
+//! (`host.launch.LaunchOptions.routes`, which `SingleRoute` builds for one
+//! route), and an in-process runtime through `registerRoutePack`, which
+//! registers the pack as a worker's boot does, adds the route unless the
+//! runtime already has one with that entry, and leaves the entry for the
+//! route's first request to evaluate. The harness builds
 //! dispatches with test defaults, each carrying an egress token minted under
 //! `test_egress_key` for `LocalEgressGateway`'s session, reads responses and
 //! completion records back within a bounded budget, and stands in for the
@@ -136,7 +138,10 @@ pub const RequestParts = struct {
 
 pub const DispatchParts = struct {
     request_id: u64,
-    route_entry_specifier: []const u8,
+    /// The route's index in the worker's route table: what
+    /// `registerRoutePack` returned for an in-process runtime, or the
+    /// route's position in the table a forked worker launched with.
+    route_index: u16 = 0,
     request_generation: u64 = 1,
     worker_id: u64 = 1,
     worker_generation: u64 = 1,
@@ -172,7 +177,7 @@ fn toHostRequest(request: RequestParts) host.dispatch.Request {
 pub fn initDispatchWork(allocator: std.mem.Allocator, parts: DispatchParts) !ipc.DispatchWork {
     var work = try host.dispatch.initDispatchWork(allocator, .{
         .request_id = parts.request_id,
-        .route_entry_specifier = parts.route_entry_specifier,
+        .route_index = parts.route_index,
         .deadline_monotonic_ns = parts.deadline_monotonic_ns,
         .authority = parts.authority,
         .request_generation = parts.request_generation,
@@ -207,10 +212,7 @@ pub const ActiveRequest = struct {
         request_id: u64,
         started_mono_ns: u64,
     ) !ActiveRequest {
-        var dispatch = try initDispatchWork(allocator, .{
-            .request_id = request_id,
-            .route_entry_specifier = "/__collo_route/demo/active.js",
-        });
+        var dispatch = try initDispatchWork(allocator, .{ .request_id = request_id });
         var dispatch_owned = true;
         errdefer if (dispatch_owned) dispatch.deinit();
 
@@ -253,25 +255,78 @@ pub fn createModulePackGraphFd(modules: []const ipc.module_pack.Module, entry_in
 }
 
 /// Registers the pack in `route_fd`, which stays the caller's, with the
-/// in-process `runtime` as permanent, through the registration a worker's
-/// boot runs on WorkerInit's route entry (`registerRoutePack` in
-/// `worker/modules/routes.zig`), and leaves `specifier` unevaluated: the
-/// route's first request evaluates it. Does nothing when a registered pack
-/// already holds `specifier`. Fails as that registration does, for instance
-/// on an fd that is not a sealed memfd or a pack that does not hold
-/// `specifier`.
-pub fn registerRoutePack(runtime: *worker.Runtime, route_fd: std.posix.fd_t, specifier: []const u8) !void {
+/// in-process `runtime` as permanent, as a worker's boot registers its
+/// definition's pack (`registerRoutePack` in `worker/modules/routes.zig`),
+/// and returns the index of the runtime's route whose entry is `specifier`,
+/// added with no bindings when the runtime has none. The entry stays
+/// unevaluated: the route's first request evaluates it. Registers nothing
+/// when a registered pack already holds `specifier`. Fails as that
+/// registration does, for instance on an fd that is not a sealed memfd or a
+/// pack that does not hold `specifier`.
+pub fn registerRoutePack(runtime: *worker.Runtime, route_fd: std.posix.fd_t, specifier: []const u8) !u16 {
     var modules_ctx = runtime.modulesContext();
-    try worker.testing.module_routes.registerRoutePack(&modules_ctx, route_fd, specifier, null);
+    try worker.testing.module_routes.registerRoutePack(&modules_ctx, route_fd, specifier);
+    return routeIndex(runtime, specifier) orelse addRoute(runtime, specifier);
+}
+
+/// Adds a route whose entry is `specifier`, with no bindings, to the
+/// in-process `runtime`, as the route table WorkerInit carries declares a
+/// forked worker's routes, and returns its index. Its pack is registered
+/// apart: by `registerRoutePack`, or by a boot evaluation
+/// (`Runtime.evaluateBootRoutes`).
+pub fn addRoute(runtime: *worker.Runtime, specifier: []const u8) !u16 {
+    return runtime.modules.state.addRoute(runtime.core.allocator, specifier, &ipc.route_bindings.empty_blob);
+}
+
+/// The module state of the first route of `runtime` whose entry is
+/// `specifier`, or null when it has none.
+pub fn routeModule(runtime: *worker.Runtime, specifier: []const u8) ?*const worker.testing.module_routes.RouteModuleState {
+    const index = routeIndex(runtime, specifier) orelse return null;
+    return &runtime.modules.state.routes.items[index].module;
 }
 
 /// Registers a one-module pack of `source` at `specifier` with `runtime`
-/// (`registerRoutePack`).
-pub fn registerRoute(runtime: *worker.Runtime, specifier: []const u8, source: []const u8) !void {
+/// and returns the route's index (`registerRoutePack`).
+pub fn registerRoute(runtime: *worker.Runtime, specifier: []const u8, source: []const u8) !u16 {
     const route_fd = try createModulePackFd(specifier, source);
     defer std.posix.close(route_fd);
-    try registerRoutePack(runtime, route_fd, specifier);
+    return registerRoutePack(runtime, route_fd, specifier);
 }
+
+/// The index of the first route of `runtime` whose entry is `specifier`.
+pub fn routeIndex(runtime: *const worker.Runtime, specifier: []const u8) ?u16 {
+    for (runtime.modules.state.routes.items, 0..) |route, index| {
+        if (std.mem.eql(u8, route.entry_specifier, specifier))
+            return @intCast(index);
+    }
+    return null;
+}
+
+/// The routes of a forked worker that serves one route with no bindings:
+/// the sealed table of that route, which this owns, and the pack holding
+/// its entry, which stays the caller's.
+pub const SingleRoute = struct {
+    table: ipc.route_table.Sealed,
+    pack_fd: std.posix.fd_t,
+
+    pub fn init(pack_fd: std.posix.fd_t, specifier: []const u8) !SingleRoute {
+        const table = try ipc.route_table.buildSealed(std.testing.allocator, &.{.{
+            .entry_specifier = specifier,
+            .bindings = &.{},
+        }});
+        return .{ .table = table, .pack_fd = pack_fd };
+    }
+
+    /// What `host.launch.LaunchOptions.routes` takes; borrows both memfds.
+    pub fn launchRoutes(self: *const SingleRoute) host.launch.LaunchRoutes {
+        return .{ .table = self.table, .module_pack_fd = self.pack_fd, .isolate_realm = false };
+    }
+
+    pub fn deinit(self: *SingleRoute) void {
+        self.table.close();
+        self.* = undefined;
+    }
+};
 
 /// `specifier` itself when it already carries a pack hash, otherwise the
 /// same path under `/__collo_route/test/`; the caller frees the result.
@@ -432,11 +487,11 @@ pub fn runRouteAndReadIngressResponseWithRequest(
 ) !IngressResponse {
     const route_specifier = try routeSpecifier(std.testing.allocator, specifier);
     defer std.testing.allocator.free(route_specifier);
-    try registerRoute(runtime, route_specifier, source);
+    const route_index = try registerRoute(runtime, route_specifier, source);
 
     var dispatch = try initDispatchWork(std.testing.allocator, .{
         .request_id = request_id,
-        .route_entry_specifier = route_specifier,
+        .route_index = route_index,
         .request = request,
     });
     defer dispatch.deinit();
@@ -462,11 +517,11 @@ pub fn runRouteAndReadBodyWithRequestCaptures(
 ) ![]u8 {
     const route_specifier = try routeSpecifier(std.testing.allocator, specifier);
     defer std.testing.allocator.free(route_specifier);
-    try registerRoute(runtime, route_specifier, source);
+    const route_index = try registerRoute(runtime, route_specifier, source);
 
     var dispatch = try initDispatchWork(std.testing.allocator, .{
         .request_id = request_id,
-        .route_entry_specifier = route_specifier,
+        .route_index = route_index,
         .route_captures = captures,
         .request = request,
     });
@@ -480,9 +535,10 @@ pub fn runRouteAndReadBodyWithRequestCaptures(
     return readIngressResponseBody(runtime, server_control_fd, request_id);
 }
 
-/// Runs one request against the route at `specifier`, whose pack the
-/// runtime registered already, to completion and returns the response
-/// body, which the caller owns.
+/// Runs one request against the runtime's route whose entry is
+/// `specifier`, which it holds already, to completion and returns the
+/// response body, which the caller owns. Fails with `error.TestRouteMissing`
+/// when the runtime has no such route.
 pub fn runRegisteredRouteAndReadBody(
     runtime: *worker.Runtime,
     server_control_fd: std.posix.fd_t,
@@ -492,7 +548,7 @@ pub fn runRegisteredRouteAndReadBody(
 ) ![]u8 {
     var dispatch = try initDispatchWork(std.testing.allocator, .{
         .request_id = request_id,
-        .route_entry_specifier = specifier,
+        .route_index = routeIndex(runtime, specifier) orelse return error.TestRouteMissing,
         .request = request,
     });
     defer dispatch.deinit();
@@ -507,7 +563,7 @@ pub fn runRegisteredRouteAndReadBody(
 
 /// Hands `dispatch` to the in-process `runtime` as a request begin with its
 /// encoded bytes inline, then `request.body` as one chunk when it is not
-/// empty. The route's pack must be registered already (`registerRoutePack`).
+/// empty. The runtime must hold the route already (`registerRoutePack`).
 /// The caller keeps `dispatch`.
 pub fn enqueueIngressRoute(
     runtime: *worker.Runtime,
@@ -560,8 +616,8 @@ pub fn enqueueIngressRoute(
 }
 
 /// Sends `dispatch` and `request.body` on a forked worker's control socket
-/// (`host.dispatch.sendRequest`). The worker took its route's pack in
-/// WorkerInit.
+/// (`host.dispatch.sendRequest`). The worker took its routes and their pack
+/// in WorkerInit.
 pub fn sendIngressRoute(
     control_fd: std.posix.fd_t,
     dispatch: *ipc.DispatchWork,
@@ -626,11 +682,11 @@ pub fn runH2Route(
 ) !void {
     const route_specifier = try routeSpecifier(std.testing.allocator, specifier);
     defer std.testing.allocator.free(route_specifier);
-    try registerRoute(runtime, route_specifier, source);
+    const route_index = try registerRoute(runtime, route_specifier, source);
 
     var dispatch = try initDispatchWork(std.testing.allocator, .{
         .request_id = request_id,
-        .route_entry_specifier = route_specifier,
+        .route_index = route_index,
         .request = request,
     });
     defer dispatch.deinit();

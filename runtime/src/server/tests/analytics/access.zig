@@ -202,9 +202,9 @@ test "the user agent is the first user-agent header, or empty" {
 }
 
 test "the access ring hands records over in order and drops the newest when full" {
-    const ring = try std.testing.allocator.create(AccessRing);
-    defer std.testing.allocator.destroy(ring);
-    ring.* = .{};
+    var storage = try AccessRing.init();
+    defer storage.deinit();
+    const ring = &storage;
 
     var index: u64 = 0;
     while (index < AccessRing.capacity) : (index += 1)
@@ -227,6 +227,32 @@ test "the access ring hands records over in order and drops the newest when full
     }
     try std.testing.expectEqual(AccessRing.capacity, drained);
     try std.testing.expectEqual(@as(u64, 9003), last_id);
+}
+
+/// Pages of the ring's slots the kernel holds for it.
+fn residentSlotPages(ring: *const AccessRing) !usize {
+    const page = std.heap.pageSize();
+    const vector = try std.testing.allocator.alloc(u8, AccessRing.slot_bytes / page);
+    defer std.testing.allocator.free(vector);
+    const start: [*]align(std.heap.page_size_min) u8 = @ptrCast(@alignCast(ring.slots.ptr));
+    try std.posix.mincore(start, AccessRing.slot_bytes, vector.ptr);
+    var count: usize = 0;
+    for (vector) |state| {
+        if (state & 1 != 0)
+            count += 1;
+    }
+    return count;
+}
+
+test "an access ring holds none of its slots' memory until records land on them" {
+    var ring = try AccessRing.init();
+    defer ring.deinit();
+    try std.testing.expectEqual(@as(usize, 0), try residentSlotPages(&ring));
+
+    try std.testing.expect(ring.push(access.recordFromFacts(makeFacts(1), 200, .worker, 2_000_000_000)));
+    const resident = try residentSlotPages(&ring);
+    // One record spans at most two pages.
+    try std.testing.expect(resident >= 1 and resident <= 2);
 }
 
 const SinkHarness = struct {
@@ -258,9 +284,9 @@ test "a ring drain writes every record to access.jsonl and counts the ring's ref
     var output: SinkHarness = undefined;
     try output.init(true);
     defer output.deinit();
-    const ring = try std.testing.allocator.create(AccessRing);
-    defer std.testing.allocator.destroy(ring);
-    ring.* = .{};
+    var storage = try AccessRing.init();
+    defer storage.deinit();
+    const ring = &storage;
 
     var index: u64 = 0;
     while (index < AccessRing.capacity + 2) : (index += 1)
@@ -288,9 +314,9 @@ test "without an access file a ring drain pops the records and counts them as di
     var output: SinkHarness = undefined;
     try output.init(false);
     defer output.deinit();
-    const ring = try std.testing.allocator.create(AccessRing);
-    defer std.testing.allocator.destroy(ring);
-    ring.* = .{};
+    var storage = try AccessRing.init();
+    defer storage.deinit();
+    const ring = &storage;
 
     _ = ring.push(access.recordFromFacts(makeFacts(1), 200, .worker, 2_000_000_000));
     _ = ring.push(access.recordFromFacts(makeFacts(2), 404, .server, 2_000_000_000));

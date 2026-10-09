@@ -1,10 +1,10 @@
 //! The host side of one request: describe it, send it down the worker's
 //! control socket, and read the response back over the worker's two
 //! completion channels. It also builds the sealed module packs a host hands
-//! a worker. A worker registers its route's pack before its first request,
-//! from WorkerInit's route entry (`LaunchOptions.route_entry` in
-//! `launch.zig`), so a request names its route's entry by specifier and
-//! carries no pack.
+//! a worker. A worker registers its definition's pack and learns its routes
+//! before its first request, from WorkerInit (`LaunchOptions.routes` in
+//! `launch.zig`), so a request names its route by its index in the route
+//! table and carries no pack.
 //!
 //! Response frames (head, chunks, end) arrive as ingress-channel packets on
 //! the control fd; the completion record is published on the shared metrics
@@ -34,9 +34,9 @@ pub const Request = struct {
 /// host that multiplexes must set them.
 pub const Dispatch = struct {
     request_id: u64,
-    /// The route's entry, in a pack the worker has registered
-    /// (`ipc.DispatchWorkView.route_entry_specifier`).
-    route_entry_specifier: []const u8,
+    /// The route's index in the worker's route table
+    /// (`ipc.DispatchWorkView.route_index`).
+    route_index: u16 = 0,
     /// Absolute CLOCK_MONOTONIC deadline the worker enforces on the request.
     deadline_monotonic_ns: u64,
     /// The request's authority, the host part of the `request.url` the
@@ -67,7 +67,7 @@ pub fn initDispatchWork(allocator: std.mem.Allocator, parts: Dispatch) !ipc.Disp
         .request_headers = parts.request.headers,
         .body_framing = bodyFraming(parts.request),
         .route_captures = parts.route_captures,
-        .route_entry_specifier = parts.route_entry_specifier,
+        .route_index = parts.route_index,
     });
 }
 

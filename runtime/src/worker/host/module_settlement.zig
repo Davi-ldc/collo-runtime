@@ -11,8 +11,9 @@ const host_adapter = @import("adapter.zig");
 /// Only records the settlement and wakes the loop. Settling reads the
 /// module's exports, which runs JavaScript, so it waits for
 /// `Runtime.collectModuleSettlements` in the loop's collect pass instead of
-/// running inside the drain that reported it. `specifier` is borrowed for the
-/// call and copied.
+/// running inside the drain that reported it. `realm_index` names the realm
+/// that evaluated the module, and `specifier`, borrowed for the call, is
+/// copied.
 ///
 /// A settlement dropped for lack of memory leaves the module evaluating: its
 /// waiting requests run into their deadlines, and the first deadline that
@@ -20,6 +21,7 @@ const host_adapter = @import("adapter.zig");
 /// worker (`evaluationZombie` in `worker/modules/routes.zig`).
 pub export fn collo_runtime_module_eval_settled(
     runtime_ptr: ?*anyopaque,
+    realm_index: u32,
     specifier: bindings.RawString,
     resolved: u8,
 ) void {
@@ -30,6 +32,7 @@ pub export fn collo_runtime_module_eval_settled(
         return;
     };
     runtime.modules.state.pending_settlements.append(runtime.core.allocator, .{
+        .realm_index = realm_index,
         .specifier = owned,
         .resolved = resolved != 0,
     }) catch {

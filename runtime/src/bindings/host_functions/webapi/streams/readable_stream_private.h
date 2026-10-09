@@ -1057,7 +1057,7 @@ public:
     static JSColloReadableStreamAsyncIterator* create(JSC::VM& vm, Collo::GlobalObject* global_object,
         JSColloReadableStreamDefaultReader* reader, bool prevent_cancel)
     {
-        auto* structure = global_object->owner().webapi_cache.readable_stream_async_iterator_structure.get();
+        auto* structure = global_object->webApiCache().readable_stream_async_iterator_structure.get();
         RELEASE_ASSERT(structure);
         auto* object = new (NotNull, JSC::allocateCell<JSColloReadableStreamAsyncIterator>(vm))
             JSColloReadableStreamAsyncIterator(vm, structure, prevent_cancel);

@@ -1,16 +1,16 @@
 //! Covers how the worker runtime loads route modules and a handler's dynamic
-//! imports. A route pack stays permanent, any module of a pack can be the
-//! entry, bytecode in a pack serves and falls back to source when JSC
+//! imports. A registered pack stays permanent, any module of a pack can be
+//! the entry, bytecode in a pack serves and falls back to source when JSC
 //! refuses it, a pack in an unsealed memfd is refused before it is mapped, a
-//! request for a route no registered pack holds fails without stopping the
-//! worker, and a top-level await parks requests until the evaluation
-//! settles, after which a rejection fails them for good. A handler's
-//! `import()` resolves a module of its route's pack, also after a timer
-//! continuation, and rejects a module the pack lacks, or a bare specifier,
-//! at once inside the worker: nothing but the response reaches the control
-//! socket. Runs in `worker-test`; the boot evaluation of a route entry is
-//! covered by `boot_eval.zig`, and the engine's module loader by the
-//! `bindings` lane.
+//! request for a route whose entry no registered pack holds fails without
+//! stopping the worker, and a top-level await parks requests until the
+//! evaluation settles, after which a rejection fails them for good. A
+//! handler's `import()` resolves a module of the registered pack, also after
+//! a timer continuation, and rejects a module the pack lacks, or a bare
+//! specifier, at once inside the worker: nothing but the response reaches the
+//! control socket. Runs in `worker-test`; the boot evaluation of the routes
+//! is covered by `boot_eval.zig` and `routes.zig`, and the engine's module
+//! loader by the `bindings` lane.
 
 const std = @import("std");
 const support = @import("bindings_support");
@@ -41,8 +41,8 @@ fn expectControlSilent(fd: std.posix.fd_t) !void {
 }
 
 /// Registers the pack in `route_fd` as the runtime's route at
-/// `route_entry_specifier`, as WorkerInit's route entry does, and enqueues
-/// one request for it.
+/// `route_entry_specifier`, as a worker's boot registers its definition's
+/// pack, and enqueues one request for it.
 fn registerAndEnqueueRoute(
     runtime: *worker.Runtime,
     request_id: u64,
@@ -50,10 +50,10 @@ fn registerAndEnqueueRoute(
     route_fd: std.posix.fd_t,
     path: []const u8,
 ) !void {
-    try rt.registerRoutePack(runtime, route_fd, route_entry_specifier);
+    const route_index = try rt.registerRoutePack(runtime, route_fd, route_entry_specifier);
     var dispatch = try initDispatchWork(std.testing.allocator, .{
         .request_id = request_id,
-        .route_entry_specifier = route_entry_specifier,
+        .route_index = route_index,
         .request = .{ .path = path },
     });
     defer dispatch.deinit();
@@ -286,9 +286,9 @@ test "top level await route module parks the request and settles through the cal
 
     // The synchronous part ran (gate resolver stashed), the evaluation
     // promise is parked, and the request joined the waiter list.
-    const parked = runtime.modules.state.route_modules.get(specifier) orelse
+    const parked = rt.routeModule(&runtime, specifier) orelse
         return error.MissingEvaluatingRecord;
-    try std.testing.expect(parked == .evaluating);
+    try std.testing.expect(parked.* == .evaluating);
     try std.testing.expect(runtime.requests.active.contains(501));
 
     // Resolving the gate from another module evaluation drives the JSC
@@ -302,21 +302,23 @@ test "top level await route module parks the request and settles through the cal
     try std.testing.expectEqual(@as(usize, 1), runtime.modules.state.pending_settlements.items.len);
 
     runtime.collectModuleSettlements();
-    const ready = runtime.modules.state.route_modules.get(specifier) orelse
+    const ready = rt.routeModule(&runtime, specifier) orelse
         return error.MissingReadyRecord;
-    try std.testing.expect(ready == .ready);
+    try std.testing.expect(ready.* == .ready);
 
     const response = try completeRequestResponse(&runtime, control_pair[1], 501);
     defer std.testing.allocator.free(response);
     try std.testing.expect(std.mem.containsAtLeast(u8, response, 1, "settled"));
 
-    // Late/duplicate settlement is a no-op on both a ready record and an
-    // unknown specifier.
-    runtime.handleModuleEvaluationSettled(specifier, true);
-    runtime.handleModuleEvaluationSettled("/__collo_route/demo/unknown.js", false);
-    const still_ready = runtime.modules.state.route_modules.get(specifier) orelse
+    // Late/duplicate settlement is a no-op on a ready record, an unknown
+    // specifier, and the right specifier under a realm that never evaluated
+    // it.
+    runtime.handleModuleEvaluationSettled(0, specifier, true);
+    runtime.handleModuleEvaluationSettled(0, "/__collo_route/demo/unknown.js", false);
+    runtime.handleModuleEvaluationSettled(7, specifier, false);
+    const still_ready = rt.routeModule(&runtime, specifier) orelse
         return error.MissingReadyRecord;
-    try std.testing.expect(still_ready == .ready);
+    try std.testing.expect(still_ready.* == .ready);
 }
 
 test "top level await rejection settles waiters into the per-request exception path" {
@@ -364,9 +366,9 @@ test "top level await rejection settles waiters into the per-request exception p
     // `worker/modules/routes.zig` says why re-evaluating is unsafe), so
     // waiters and later requests fail fast with a 500.
     runtime.collectModuleSettlements();
-    const failed = runtime.modules.state.route_modules.get(specifier) orelse
+    const failed = rt.routeModule(&runtime, specifier) orelse
         return error.MissingFailedRecord;
-    if (failed != .failed)
+    if (failed.* != .failed)
         return error.RecordNotFailed;
 
     const response = try completeRequestResponse(&runtime, control_pair[1], 502);
@@ -532,9 +534,10 @@ test "a route pack in an unsealed memfd fails the boot evaluation without being 
     try fd_mod.writeAllRaw(unsealed_fd, pack);
 
     const mappings_before = bindings.liveMappingCount();
+    _ = try rt.addRoute(&runtime, specifier);
     try std.testing.expectError(
         error.MissingFdSeals,
-        runtime.evaluateBootRouteEntry(unsealed_fd, specifier, 0, null),
+        runtime.evaluateBootRoutes(unsealed_fd, 0, null),
     );
     try std.testing.expectEqual(mappings_before, bindings.liveMappingCount());
     try std.testing.expect(!runtime.modules.state.loaded_sources.contains(specifier));
@@ -558,11 +561,14 @@ test "a request for a route no registered pack holds answers 500 and the worker 
     defer runtime.deinit();
     try runtime.attachHostRuntime();
 
+    // The route is in the runtime's table, but no pack holding its entry was
+    // ever registered.
     const unregistered = "/__collo_route/demo/never-registered.js";
+    _ = try rt.addRoute(&runtime, unregistered);
     const refused = try rt.runRegisteredRouteAndReadBody(&runtime, control_pair[1], 320, unregistered, .{});
     defer std.testing.allocator.free(refused);
     try std.testing.expect(std.mem.containsAtLeast(u8, refused, 1, "internal server error"));
-    try std.testing.expect(!runtime.modules.state.route_modules.contains(unregistered));
+    try std.testing.expect(rt.routeModule(&runtime, unregistered).?.* == .idle);
     try std.testing.expect(runtime.core.running);
 
     const served = try runRouteAndReadBody(&runtime, control_pair[1],

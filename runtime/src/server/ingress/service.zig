@@ -155,11 +155,11 @@ pub const Service = struct {
 
         const lanes = try allocator.alloc(LaneRunner, lane_count);
         errdefer allocator.free(lanes);
+        var lanes_made: usize = 0;
+        errdefer for (lanes[0..lanes_made]) |*lane| lane.deinit();
         for (lanes, 0..) |*lane, index| {
-            lane.* = .{
-                .listener_index = @intCast(index),
-                .cpu_id = lane_cpu_ids[index],
-            };
+            lane.* = try LaneRunner.init(@intCast(index), lane_cpu_ids[index]);
+            lanes_made += 1;
         }
 
         return .{
@@ -295,6 +295,7 @@ pub const Service = struct {
     pub const countersSnapshot = Observability.countersSnapshot;
     pub const takeLaunchTraces = Observability.takeLaunchTraces;
     pub const postToLane = Deps.postToLane;
+    pub const raiseLaneWake = Deps.raiseLaneWake;
     pub const postHandoff = Deps.postHandoff;
     pub const strandWaiters = Deps.strandWaiters;
     pub const announceWorkerDeath = Deps.announceWorkerDeath;

@@ -114,6 +114,12 @@ fn addVmBenches(b: *std.Build, ctx: *const context_mod.Context, bench_step: *std
             .step_name = "bench-zygote-cow",
             .step_desc = "Measure Collo zygote WebAPI copy-on-write memory",
         },
+        .{
+            .file = "runtime/bench/realm_cost.zig",
+            .name = "realm_cost",
+            .step_name = "bench-realm-cost",
+            .step_desc = "Measure what a realm costs a forked worker, fresh or prewarmed in the zygote",
+        },
     };
 
     for (vm_benches) |bench| {

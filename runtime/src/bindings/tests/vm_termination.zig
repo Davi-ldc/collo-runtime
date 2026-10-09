@@ -5,8 +5,8 @@
 //! drives the trap directly through the ABI, and the hung timer tests in
 //! `worker/tests/runtime/arbiter.zig` drive it through the sentinel; a broken trap would turn
 //! every deadline into a wedged worker. As in a worker, the test thread is the VM thread and
-//! spins in JavaScript while another thread requests termination, and the interrupted invoke
-//! returns an exception.
+//! spins in JavaScript while another thread requests termination, the interrupted invoke
+//! returns an exception, and the terminated VM then refuses to add a realm.
 //!
 //! The VM forbids execution after a termination (`forbidExecutionOnTermination` in
 //! `jsc/runtime/vm.cpp`), JSC's mode for a VM that never recovers from a termination exception.
@@ -71,7 +71,8 @@ test "requestTermination interrupts a spinning turn instead of hanging" {
     // Deferred before the watchdog's join, so it runs after the join on every path:
     // `collo_vm_destroy` asserts that no turn is open, and the turn must not close while a
     // termination request is still in flight.
-    defer vm.turnExit() catch {};
+    var turn_open = true;
+    defer if (turn_open) vm.turnExit() catch {};
 
     var invoke_started = std.atomic.Value(bool).init(false);
     var watchdog = Watchdog{ .vm = &vm, .invoke_started = &invoke_started };
@@ -97,4 +98,10 @@ test "requestTermination interrupts a spinning turn instead of hanging" {
 
     try std.testing.expectEqual(@as(?anyerror, null), watchdog.request_error);
     try std.testing.expect(elapsed_ns >= min_observed_spin_ns);
+
+    // The termination forbids execution for good, so the VM adds no realm: one could never
+    // run, and creating its global would clear the termination still pending.
+    turn_open = false;
+    vm.turnExit() catch {};
+    try std.testing.expectError(error.Internal, vm.createRealm());
 }

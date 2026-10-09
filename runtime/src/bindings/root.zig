@@ -1,23 +1,25 @@
 //! The Zig side of the C ABI in `include/collo/abi.h`, used by every process
 //! that runs JavaScript: the zygote, the workers it forks, and the test and
 //! benchmark binaries. It holds an `extern struct` mirror of each struct the
-//! header declares and the `Vm` and `Value` wrappers the rest of the runtime
-//! calls instead of the raw functions; the egress gateway uses only some of
-//! the mirrors. This file and `abi.h` are never compiled against each other:
-//! the `comptime` block below and the header's pins check each side against
-//! the same sizes and offsets, and nothing compares the function
+//! header declares and the `Vm`, `Realm` and `Value` wrappers the rest of the
+//! runtime calls instead of the raw functions; the egress gateway uses only
+//! some of the mirrors. This file and `abi.h` are never compiled against each
+//! other: the `comptime` block below and the header's pins check each side
+//! against the same sizes and offsets, and nothing compares the function
 //! declarations, so an ABI change edits both in one change.
 //!
-//! A `Vm` is used on the thread that owns it; `requestTermination` is the
-//! one call made from another thread. A `Value` owns its handle and releases
-//! it once with `deinit`. A JavaScript exception, and on some calls an
-//! unsupported operation, comes back as a result variant that owns its
-//! value; `turnExit` is the one wrapper that releases the exception and
-//! returns `error.JsException` instead. Any other failing status becomes a
-//! Zig error through `statusToError`. The worker exports the
-//! `collo_runtime_*` functions the bridge calls (`worker/host/`), except
-//! `collo_runtime_mapping_release`, which lives here with the mappings it
-//! ends.
+//! A `Vm` and its realms are used on the thread that owns the VM;
+//! `requestTermination` is the one call made from another thread. A `Realm`
+//! creates objects in its own globals and lives as long as its VM, while
+//! operations on an existing value run in that value's realm through the
+//! `Vm`. A `Value` owns its handle and releases it once with `deinit`. A
+//! JavaScript exception, and on some calls an unsupported operation, comes
+//! back as a result variant that owns its value; `turnExit` is the one
+//! wrapper that releases the exception and returns `error.JsException`
+//! instead. Any other failing status becomes a Zig error through
+//! `statusToError`. The worker exports the `collo_runtime_*` functions the
+//! bridge calls (`worker/host/`), except `collo_runtime_mapping_release`,
+//! which lives here with the mappings it ends.
 
 const std = @import("std");
 
@@ -68,6 +70,7 @@ pub const TerminationReason = enum(u8) {
 };
 
 pub const RawVm = opaque {};
+pub const RawRealm = opaque {};
 pub const RawValue = opaque {};
 pub const RawPromiseDeferred = opaque {};
 pub const RawCryptoJob = opaque {};
@@ -225,7 +228,7 @@ pub const ModuleEvictStats = extern struct {
     namespaces_removed: usize = 0,
 };
 
-/// Mirror of `ColloRequestInit`, the input of `Vm.requestValue`. Every
+/// Mirror of `ColloRequestInit`, the input of `Realm.requestValue`. Every
 /// string and array is borrowed for the call; the bridge copies them.
 /// `authority` is the request's normalized authority, which `request.url`
 /// is built from.
@@ -424,6 +427,9 @@ pub const ResponseExtractLimits = extern struct {
 
 extern fn collo_vm_create(options: *const VmOptions, out_vm: *?*RawVm) RawStatus;
 extern fn collo_vm_destroy(vm: *RawVm) void;
+extern fn collo_vm_main_realm(vm: *RawVm) ?*RawRealm;
+extern fn collo_realm_create(vm: *RawVm, out_realm: *?*RawRealm) RawStatus;
+extern fn collo_realm_index(realm: *const RawRealm) u32;
 extern fn collo_vm_prepare_for_fork(vm: *RawVm) RawStatus;
 extern fn collo_vm_post_fork_child(vm: *RawVm) RawStatus;
 extern fn collo_vm_reseed_after_fork(vm: *RawVm, seeds: *const RandomSeeds) RawStatus;
@@ -468,8 +474,8 @@ extern fn collo_tool_bytecode_release(bytes: ?[*]u8) void;
 extern fn collo_module_register_pack(vm: *RawVm, pack: Mapping, options: *const ModuleRegisterOptions) RawStatus;
 extern fn collo_module_evict_specifier(vm: *RawVm, specifier: RawString, out_stats: *ModuleEvictStats) RawStatus;
 extern fn collo_module_evict_lifetime(vm: *RawVm, lifetime: u8, out_stats: *ModuleEvictStats) RawStatus;
-extern fn collo_module_evaluate(vm: *RawVm, specifier: RawString, out_exception: *?*RawValue) RawStatus;
-extern fn collo_module_get_export(vm: *RawVm, specifier: RawString, export_name: RawString, out_value: *?*RawValue, out_exception: *?*RawValue) RawStatus;
+extern fn collo_module_evaluate(realm: *RawRealm, specifier: RawString, out_exception: *?*RawValue) RawStatus;
+extern fn collo_module_get_export(realm: *RawRealm, specifier: RawString, export_name: RawString, out_value: *?*RawValue, out_exception: *?*RawValue) RawStatus;
 
 extern fn collo_turn_enter(vm: *RawVm, exec_ctx: *ExecCtx) RawStatus;
 extern fn collo_invoke(vm: *RawVm, expected_ctx: *const ExecCtx, callable: *const RawValue, this_value: ?*const RawValue, argv: ?[*]const ?*const RawValue, argc: usize, out_result: *?*RawValue, out_exception: *?*RawValue, out_call_started_ns: ?*u64) RawStatus;
@@ -485,44 +491,45 @@ extern fn collo_value_is_thenable(vm: *RawVm, value: *const RawValue, out_is_the
 extern fn collo_promise_await_sync(vm: *RawVm, promise: *const RawValue, out_value: *?*RawValue, out_exception: *?*RawValue) RawStatus;
 extern fn collo_promise_deferred_resolve(vm: *RawVm, deferred: *RawPromiseDeferred, value: *const RawValue, out_exception: *?*RawValue) RawStatus;
 extern fn collo_promise_deferred_reject(vm: *RawVm, deferred: *RawPromiseDeferred, reason: *const RawValue, out_exception: *?*RawValue) RawStatus;
+extern fn collo_promise_deferred_realm(deferred: *const RawPromiseDeferred) ?*RawRealm;
 extern fn collo_promise_deferred_release(deferred: *RawPromiseDeferred) void;
 extern fn collo_request_task_settle_thenable(vm: *RawVm, token: *const RequestCompletionToken, value: *const RawValue, out_exception: *?*RawValue) RawStatus;
 extern fn collo_crypto_job_run(job: *RawCryptoJob) void;
 extern fn collo_crypto_job_settle(vm: *RawVm, job: *RawCryptoJob, out_exception: *?*RawValue) RawStatus;
 extern fn collo_crypto_job_destroy(job: *RawCryptoJob) void;
-extern fn collo_json_parse_utf8(vm: *RawVm, source: RawString, out_value: *?*RawValue, out_exception: *?*RawValue) RawStatus;
+extern fn collo_json_parse_utf8(realm: *RawRealm, source: RawString, out_value: *?*RawValue, out_exception: *?*RawValue) RawStatus;
 
 extern fn collo_undefined(vm: *RawVm, out_value: *?*RawValue) RawStatus;
 extern fn collo_null(vm: *RawVm, out_value: *?*RawValue) RawStatus;
 extern fn collo_bool_new(vm: *RawVm, value: u8, out_value: *?*RawValue) RawStatus;
 extern fn collo_number_new(vm: *RawVm, value: f64, out_value: *?*RawValue) RawStatus;
 extern fn collo_string_new_utf8(vm: *RawVm, utf8: RawString, out_value: *?*RawValue) RawStatus;
-extern fn collo_type_error_new_utf8(vm: *RawVm, message: RawString, out_value: *?*RawValue) RawStatus;
+extern fn collo_type_error_new_utf8(realm: *RawRealm, message: RawString, out_value: *?*RawValue) RawStatus;
 extern fn collo_array_buffer_new_copy(
-    vm: *RawVm,
+    realm: *RawRealm,
     bytes: RawBuffer,
     out_value: *?*RawValue,
     out_exception: *?*RawValue,
 ) RawStatus;
 extern fn collo_uint8_array_new_copy(
-    vm: *RawVm,
+    realm: *RawRealm,
     bytes: RawBuffer,
     out_value: *?*RawValue,
     out_exception: *?*RawValue,
 ) RawStatus;
 extern fn collo_blob_new_copy(
-    vm: *RawVm,
+    realm: *RawRealm,
     bytes: RawBuffer,
     content_type: RawString,
     out_value: *?*RawValue,
     out_exception: *?*RawValue,
 ) RawStatus;
-extern fn collo_fetch_read_result_new_copy(vm: *RawVm, bytes: RawBuffer, done: u8, out_value: *?*RawValue, out_exception: *?*RawValue) RawStatus;
-extern fn collo_form_data_new_from_bytes(vm: *RawVm, bytes: RawBuffer, content_type: RawString, out_value: *?*RawValue, out_exception: *?*RawValue) RawStatus;
-extern fn collo_object_new(vm: *RawVm, out_value: *?*RawValue) RawStatus;
-extern fn collo_array_new(vm: *RawVm, out_value: *?*RawValue) RawStatus;
-extern fn collo_global_this(vm: *RawVm, out_value: *?*RawValue) RawStatus;
-extern fn collo_env_object_new(vm: *RawVm, entries: ?[*]const NameValuePair, entry_count: usize, out_value: *?*RawValue) RawStatus;
+extern fn collo_fetch_read_result_new_copy(realm: *RawRealm, bytes: RawBuffer, done: u8, out_value: *?*RawValue, out_exception: *?*RawValue) RawStatus;
+extern fn collo_form_data_new_from_bytes(realm: *RawRealm, bytes: RawBuffer, content_type: RawString, out_value: *?*RawValue, out_exception: *?*RawValue) RawStatus;
+extern fn collo_object_new(realm: *RawRealm, out_value: *?*RawValue) RawStatus;
+extern fn collo_array_new(realm: *RawRealm, out_value: *?*RawValue) RawStatus;
+extern fn collo_global_this(realm: *RawRealm, out_value: *?*RawValue) RawStatus;
+extern fn collo_env_object_new(realm: *RawRealm, entries: ?[*]const NameValuePair, entry_count: usize, out_value: *?*RawValue) RawStatus;
 
 extern fn collo_object_get_utf8(vm: *RawVm, object: *const RawValue, key: RawString, out_value: *?*RawValue, out_exception: *?*RawValue) RawStatus;
 extern fn collo_object_set_utf8(vm: *RawVm, object: *const RawValue, key: RawString, value: *const RawValue, out_exception: *?*RawValue) RawStatus;
@@ -531,9 +538,9 @@ extern fn collo_array_set(vm: *RawVm, array: *const RawValue, index: usize, valu
 extern fn collo_value_to_utf8_copy(vm: *RawVm, value: *const RawValue, out_string: *RawString, out_exception: *?*RawValue) RawStatus;
 extern fn collo_exception_format(vm: *RawVm, exception: *const RawValue, out_string: *RawString) RawStatus;
 extern fn collo_free_buffer(ptr: ?*const anyopaque) void;
-extern fn collo_request_new(vm: *RawVm, init: *const RequestInit, out_value: *?*RawValue, out_exception: *?*RawValue) RawStatus;
-extern fn collo_response_new(vm: *RawVm, init: *const ResponseInit, out_value: *?*RawValue, out_exception: *?*RawValue) RawStatus;
-extern fn collo_fetch_response_new(vm: *RawVm, init: *const FetchResponseInit, out_value: *?*RawValue, out_exception: *?*RawValue) RawStatus;
+extern fn collo_request_new(realm: *RawRealm, init: *const RequestInit, out_value: *?*RawValue, out_exception: *?*RawValue) RawStatus;
+extern fn collo_response_new(realm: *RawRealm, init: *const ResponseInit, out_value: *?*RawValue, out_exception: *?*RawValue) RawStatus;
+extern fn collo_fetch_response_new(realm: *RawRealm, init: *const FetchResponseInit, out_value: *?*RawValue, out_exception: *?*RawValue) RawStatus;
 extern fn collo_response_extract(vm: *RawVm, value: *const RawValue, limits: *const ResponseExtractLimits, out_response: *ExtractedResponse, out_exception: *?*RawValue) RawStatus;
 extern fn collo_response_extract_free(response: *ExtractedResponse) void;
 extern fn collo_owned_byte_segments_destroy(owner: *RawOwnedByteSegments) void;
@@ -928,6 +935,19 @@ pub const Vm = struct {
         self.* = .{};
     }
 
+    /// The realm created with the VM.
+    pub fn mainRealm(self: *Vm) Realm {
+        return .{ .raw = collo_vm_main_realm(self.ptr()).? };
+    }
+
+    /// Adds a realm with every install the VM made so far, outside any turn
+    /// (`collo_realm_create` in `abi.h`). It lives as long as the VM.
+    pub fn createRealm(self: *Vm) Error!Realm {
+        var raw_realm: ?*RawRealm = null;
+        try statusToError(collo_realm_create(self.ptr(), &raw_realm));
+        return .{ .raw = raw_realm orelse return error.Internal };
+    }
+
     pub fn prepareForFork(self: *Vm) Error!void {
         try statusToError(collo_vm_prepare_for_fork(self.ptr()));
     }
@@ -1055,9 +1075,9 @@ pub const Vm = struct {
     /// Registers the modules of a pack mapping and consumes `pack` on every
     /// path, error included: the bridge keeps it while any registered module
     /// reads from it and releases it otherwise, so the caller must not read
-    /// `pack` afterwards. Workers load their route packs this way: every
-    /// worker of a route maps the same sealed memfd, and providers that read
-    /// the mapping in place keep those pages in the shared page cache. The
+    /// `pack` afterwards. Workers load their definition's pack this way: every
+    /// worker of a definition maps the same sealed memfd, and providers that
+    /// read the mapping in place keep those pages in the shared page cache. The
     /// `local-e2e` benchmark "private bytes per byte of module pack" measures
     /// what a worker pays per pack byte.
     pub fn registerModulePackMapping(self: *Vm, pack: Mapping, options: ModuleRegisterOptions) Error!void {
@@ -1091,33 +1111,6 @@ pub const Vm = struct {
         var stats: ModuleEvictStats = .{};
         try statusToError(collo_module_evict_lifetime(self.ptr(), @intFromEnum(lifetime), &stats));
         return stats;
-    }
-
-    pub fn evaluateModule(self: *Vm, specifier: []const u8) Error!EvalResult {
-        var exception: ?*RawValue = null;
-        return switch (collo_module_evaluate(self.ptr(), borrowedString(specifier), &exception)) {
-            status_ok => .success,
-            status_js_exception => .{ .exception = try Value.fromRawOwned(exception) },
-            status_unsupported => .{ .unsupported = Value.fromRawOwnedNonNull(exception orelse return error.Unsupported) },
-            status_pending => .pending,
-            else => |status| {
-                try statusToError(status);
-                unreachable;
-            },
-        };
-    }
-
-    pub fn moduleGetExport(self: *Vm, specifier: []const u8, export_name: []const u8) Error!ValueResult {
-        var value: ?*RawValue = null;
-        var exception: ?*RawValue = null;
-        return switch (collo_module_get_export(self.ptr(), borrowedString(specifier), borrowedString(export_name), &value, &exception)) {
-            status_ok => .{ .success = try Value.fromRawOwned(value) },
-            status_js_exception => .{ .exception = try Value.fromRawOwned(exception) },
-            else => |status| {
-                try statusToError(status);
-                unreachable;
-            },
-        };
     }
 
     pub fn turnEnter(self: *Vm, exec_ctx: *ExecCtx) Error!void {
@@ -1337,19 +1330,6 @@ pub const Vm = struct {
         };
     }
 
-    pub fn jsonParseUtf8(self: *Vm, source: []const u8) Error!ValueResult {
-        var value: ?*RawValue = null;
-        var exception: ?*RawValue = null;
-        return switch (collo_json_parse_utf8(self.ptr(), borrowedString(source), &value, &exception)) {
-            status_ok => .{ .success = try Value.fromRawOwned(value) },
-            status_js_exception => .{ .exception = try Value.fromRawOwned(exception) },
-            else => |status| {
-                try statusToError(status);
-                unreachable;
-            },
-        };
-    }
-
     pub fn undefinedValue(self: *Vm) Error!Value {
         var raw_value: ?*RawValue = null;
         return outValueNoException(collo_undefined(self.ptr(), &raw_value), raw_value);
@@ -1376,172 +1356,6 @@ pub const Vm = struct {
         var raw_value: ?*RawValue = null;
         try statusToError(collo_string_new_utf8(self.ptr(), borrowedString(utf8), &raw_value));
         return try Value.fromRawOwned(raw_value);
-    }
-
-    /// A TypeError whose message is `message`, which may be empty. The caller
-    /// owns the value. Runs no JavaScript, so it works outside a turn; invalid
-    /// UTF-8 fails with `error.InvalidArgument`.
-    pub fn typeErrorValueUtf8(self: *Vm, message: []const u8) Error!Value {
-        var raw_value: ?*RawValue = null;
-        try statusToError(collo_type_error_new_utf8(self.ptr(), borrowedString(message), &raw_value));
-        return try Value.fromRawOwned(raw_value);
-    }
-
-    pub fn arrayBufferValueCopy(self: *Vm, bytes: []const u8) Error!ValueResult {
-        var raw_value: ?*RawValue = null;
-        var exception: ?*RawValue = null;
-        return switch (collo_array_buffer_new_copy(
-            self.ptr(),
-            borrowedBuffer(bytes),
-            &raw_value,
-            &exception,
-        )) {
-            status_ok => .{ .success = try Value.fromRawOwned(raw_value) },
-            status_js_exception => .{ .exception = try Value.fromRawOwned(exception) },
-            else => |status| {
-                try statusToError(status);
-                unreachable;
-            },
-        };
-    }
-
-    pub fn uint8ArrayValueCopy(self: *Vm, bytes: []const u8) Error!ValueResult {
-        var raw_value: ?*RawValue = null;
-        var exception: ?*RawValue = null;
-        return switch (collo_uint8_array_new_copy(
-            self.ptr(),
-            borrowedBuffer(bytes),
-            &raw_value,
-            &exception,
-        )) {
-            status_ok => .{ .success = try Value.fromRawOwned(raw_value) },
-            status_js_exception => .{ .exception = try Value.fromRawOwned(exception) },
-            else => |status| {
-                try statusToError(status);
-                unreachable;
-            },
-        };
-    }
-
-    pub fn fetchReadResultValueCopy(self: *Vm, bytes: ?[]const u8, done: bool) Error!ValueResult {
-        var raw_value: ?*RawValue = null;
-        var exception: ?*RawValue = null;
-        const raw_bytes = if (bytes) |chunk| borrowedBuffer(chunk) else borrowedBuffer(&.{});
-        return switch (collo_fetch_read_result_new_copy(
-            self.ptr(),
-            raw_bytes,
-            if (done) 1 else 0,
-            &raw_value,
-            &exception,
-        )) {
-            status_ok => .{ .success = try Value.fromRawOwned(raw_value) },
-            status_js_exception => .{ .exception = try Value.fromRawOwned(exception) },
-            else => |status| {
-                try statusToError(status);
-                unreachable;
-            },
-        };
-    }
-
-    pub fn blobValueCopy(self: *Vm, bytes: []const u8, content_type: []const u8) Error!ValueResult {
-        var raw_value: ?*RawValue = null;
-        var exception: ?*RawValue = null;
-        return switch (collo_blob_new_copy(
-            self.ptr(),
-            borrowedBuffer(bytes),
-            borrowedString(content_type),
-            &raw_value,
-            &exception,
-        )) {
-            status_ok => .{ .success = try Value.fromRawOwned(raw_value) },
-            status_js_exception => .{ .exception = try Value.fromRawOwned(exception) },
-            else => |status| {
-                try statusToError(status);
-                unreachable;
-            },
-        };
-    }
-
-    pub fn formDataValueFromBytes(self: *Vm, bytes: []const u8, content_type: []const u8) Error!ValueResult {
-        var raw_value: ?*RawValue = null;
-        var exception: ?*RawValue = null;
-        return switch (collo_form_data_new_from_bytes(self.ptr(), borrowedBuffer(bytes), borrowedString(content_type), &raw_value, &exception)) {
-            status_ok => .{ .success = try Value.fromRawOwned(raw_value) },
-            status_js_exception => .{ .exception = try Value.fromRawOwned(exception) },
-            else => |status| {
-                try statusToError(status);
-                unreachable;
-            },
-        };
-    }
-
-    pub fn objectValue(self: *Vm) Error!Value {
-        var raw_value: ?*RawValue = null;
-        return outValueNoException(collo_object_new(self.ptr(), &raw_value), raw_value);
-    }
-
-    pub fn arrayValue(self: *Vm) Error!Value {
-        var raw_value: ?*RawValue = null;
-        return outValueNoException(collo_array_new(self.ptr(), &raw_value), raw_value);
-    }
-
-    pub fn globalThisValue(self: *Vm) Error!Value {
-        var raw_value: ?*RawValue = null;
-        return outValueNoException(collo_global_this(self.ptr(), &raw_value), raw_value);
-    }
-
-    /// A frozen object mapping each entry's name to its value as a string,
-    /// built without running JavaScript (`collo_env_object_new` in `abi.h`
-    /// owns the rules). `entries` is borrowed for the call; the caller owns
-    /// the returned value. Fails with `error.InvalidArgument` for an empty or
-    /// index-like name or for bytes that are not UTF-8.
-    pub fn envObjectValue(self: *Vm, entries: []const NameValuePair) Error!Value {
-        var raw_value: ?*RawValue = null;
-        return outValueNoException(collo_env_object_new(
-            self.ptr(),
-            if (entries.len == 0) null else entries.ptr,
-            entries.len,
-            &raw_value,
-        ), raw_value);
-    }
-
-    pub fn requestValue(self: *Vm, init: *const RequestInit) Error!ValueResult {
-        var value: ?*RawValue = null;
-        var exception: ?*RawValue = null;
-        return switch (collo_request_new(self.ptr(), init, &value, &exception)) {
-            status_ok => .{ .success = try Value.fromRawOwned(value) },
-            status_js_exception => .{ .exception = try Value.fromRawOwned(exception) },
-            else => |status| {
-                try statusToError(status);
-                unreachable;
-            },
-        };
-    }
-
-    pub fn responseValue(self: *Vm, init: *const ResponseInit) Error!ValueResult {
-        var value: ?*RawValue = null;
-        var exception: ?*RawValue = null;
-        return switch (collo_response_new(self.ptr(), init, &value, &exception)) {
-            status_ok => .{ .success = try Value.fromRawOwned(value) },
-            status_js_exception => .{ .exception = try Value.fromRawOwned(exception) },
-            else => |status| {
-                try statusToError(status);
-                unreachable;
-            },
-        };
-    }
-
-    pub fn fetchResponseValue(self: *Vm, init: *const FetchResponseInit) Error!ValueResult {
-        var value: ?*RawValue = null;
-        var exception: ?*RawValue = null;
-        return switch (collo_fetch_response_new(self.ptr(), init, &value, &exception)) {
-            status_ok => .{ .success = try Value.fromRawOwned(value) },
-            status_js_exception => .{ .exception = try Value.fromRawOwned(exception) },
-            else => |status| {
-                try statusToError(status);
-                unreachable;
-            },
-        };
     }
 
     pub fn extractResponse(self: *Vm, value: *const Value, limits: ResponseExtractLimits) Error!ExtractResponseResult {
@@ -1628,6 +1442,235 @@ pub const Vm = struct {
         return self.raw.?;
     }
 };
+
+/// One realm of a `Vm`: a global object with its own globals, intrinsics and
+/// module registry. Everything a realm creates belongs to its globals, so a
+/// value meant for one route's code comes from that route's realm. A copy of
+/// the handle names the same realm; the VM owns it.
+pub const Realm = struct {
+    raw: *RawRealm,
+
+    /// The realm's position in its VM's creation order, 0 for the main realm.
+    pub fn index(self: Realm) u32 {
+        return collo_realm_index(self.raw);
+    }
+
+    /// Imports and evaluates `specifier` in this realm's registry, once per
+    /// realm. `.pending` means a top-level await is in flight, and
+    /// `collo_runtime_module_eval_settled` reports its settlement under this
+    /// realm's index.
+    pub fn evaluateModule(self: Realm, specifier: []const u8) Error!EvalResult {
+        var exception: ?*RawValue = null;
+        return switch (collo_module_evaluate(self.raw, borrowedString(specifier), &exception)) {
+            status_ok => .success,
+            status_js_exception => .{ .exception = try Value.fromRawOwned(exception) },
+            status_unsupported => .{ .unsupported = Value.fromRawOwnedNonNull(exception orelse return error.Unsupported) },
+            status_pending => .pending,
+            else => |status| {
+                try statusToError(status);
+                unreachable;
+            },
+        };
+    }
+
+    pub fn moduleGetExport(self: Realm, specifier: []const u8, export_name: []const u8) Error!ValueResult {
+        var value: ?*RawValue = null;
+        var exception: ?*RawValue = null;
+        return switch (collo_module_get_export(self.raw, borrowedString(specifier), borrowedString(export_name), &value, &exception)) {
+            status_ok => .{ .success = try Value.fromRawOwned(value) },
+            status_js_exception => .{ .exception = try Value.fromRawOwned(exception) },
+            else => |status| {
+                try statusToError(status);
+                unreachable;
+            },
+        };
+    }
+
+    pub fn jsonParseUtf8(self: Realm, source: []const u8) Error!ValueResult {
+        var value: ?*RawValue = null;
+        var exception: ?*RawValue = null;
+        return switch (collo_json_parse_utf8(self.raw, borrowedString(source), &value, &exception)) {
+            status_ok => .{ .success = try Value.fromRawOwned(value) },
+            status_js_exception => .{ .exception = try Value.fromRawOwned(exception) },
+            else => |status| {
+                try statusToError(status);
+                unreachable;
+            },
+        };
+    }
+
+    /// A TypeError whose message is `message`, which may be empty. The caller
+    /// owns the value. Runs no JavaScript, so it works outside a turn; invalid
+    /// UTF-8 fails with `error.InvalidArgument`.
+    pub fn typeErrorValueUtf8(self: Realm, message: []const u8) Error!Value {
+        var raw_value: ?*RawValue = null;
+        try statusToError(collo_type_error_new_utf8(self.raw, borrowedString(message), &raw_value));
+        return try Value.fromRawOwned(raw_value);
+    }
+
+    pub fn arrayBufferValueCopy(self: Realm, bytes: []const u8) Error!ValueResult {
+        var raw_value: ?*RawValue = null;
+        var exception: ?*RawValue = null;
+        return switch (collo_array_buffer_new_copy(
+            self.raw,
+            borrowedBuffer(bytes),
+            &raw_value,
+            &exception,
+        )) {
+            status_ok => .{ .success = try Value.fromRawOwned(raw_value) },
+            status_js_exception => .{ .exception = try Value.fromRawOwned(exception) },
+            else => |status| {
+                try statusToError(status);
+                unreachable;
+            },
+        };
+    }
+
+    pub fn uint8ArrayValueCopy(self: Realm, bytes: []const u8) Error!ValueResult {
+        var raw_value: ?*RawValue = null;
+        var exception: ?*RawValue = null;
+        return switch (collo_uint8_array_new_copy(
+            self.raw,
+            borrowedBuffer(bytes),
+            &raw_value,
+            &exception,
+        )) {
+            status_ok => .{ .success = try Value.fromRawOwned(raw_value) },
+            status_js_exception => .{ .exception = try Value.fromRawOwned(exception) },
+            else => |status| {
+                try statusToError(status);
+                unreachable;
+            },
+        };
+    }
+
+    pub fn fetchReadResultValueCopy(self: Realm, bytes: ?[]const u8, done: bool) Error!ValueResult {
+        var raw_value: ?*RawValue = null;
+        var exception: ?*RawValue = null;
+        const raw_bytes = if (bytes) |chunk| borrowedBuffer(chunk) else borrowedBuffer(&.{});
+        return switch (collo_fetch_read_result_new_copy(
+            self.raw,
+            raw_bytes,
+            if (done) 1 else 0,
+            &raw_value,
+            &exception,
+        )) {
+            status_ok => .{ .success = try Value.fromRawOwned(raw_value) },
+            status_js_exception => .{ .exception = try Value.fromRawOwned(exception) },
+            else => |status| {
+                try statusToError(status);
+                unreachable;
+            },
+        };
+    }
+
+    pub fn blobValueCopy(self: Realm, bytes: []const u8, content_type: []const u8) Error!ValueResult {
+        var raw_value: ?*RawValue = null;
+        var exception: ?*RawValue = null;
+        return switch (collo_blob_new_copy(
+            self.raw,
+            borrowedBuffer(bytes),
+            borrowedString(content_type),
+            &raw_value,
+            &exception,
+        )) {
+            status_ok => .{ .success = try Value.fromRawOwned(raw_value) },
+            status_js_exception => .{ .exception = try Value.fromRawOwned(exception) },
+            else => |status| {
+                try statusToError(status);
+                unreachable;
+            },
+        };
+    }
+
+    pub fn formDataValueFromBytes(self: Realm, bytes: []const u8, content_type: []const u8) Error!ValueResult {
+        var raw_value: ?*RawValue = null;
+        var exception: ?*RawValue = null;
+        return switch (collo_form_data_new_from_bytes(self.raw, borrowedBuffer(bytes), borrowedString(content_type), &raw_value, &exception)) {
+            status_ok => .{ .success = try Value.fromRawOwned(raw_value) },
+            status_js_exception => .{ .exception = try Value.fromRawOwned(exception) },
+            else => |status| {
+                try statusToError(status);
+                unreachable;
+            },
+        };
+    }
+
+    pub fn objectValue(self: Realm) Error!Value {
+        var raw_value: ?*RawValue = null;
+        return outValueNoException(collo_object_new(self.raw, &raw_value), raw_value);
+    }
+
+    pub fn arrayValue(self: Realm) Error!Value {
+        var raw_value: ?*RawValue = null;
+        return outValueNoException(collo_array_new(self.raw, &raw_value), raw_value);
+    }
+
+    pub fn globalThisValue(self: Realm) Error!Value {
+        var raw_value: ?*RawValue = null;
+        return outValueNoException(collo_global_this(self.raw, &raw_value), raw_value);
+    }
+
+    /// A frozen object mapping each entry's name to its value as a string,
+    /// built without running JavaScript (`collo_env_object_new` in `abi.h`
+    /// owns the rules). `entries` is borrowed for the call; the caller owns
+    /// the returned value. Fails with `error.InvalidArgument` for an empty or
+    /// index-like name or for bytes that are not UTF-8.
+    pub fn envObjectValue(self: Realm, entries: []const NameValuePair) Error!Value {
+        var raw_value: ?*RawValue = null;
+        return outValueNoException(collo_env_object_new(
+            self.raw,
+            if (entries.len == 0) null else entries.ptr,
+            entries.len,
+            &raw_value,
+        ), raw_value);
+    }
+
+    pub fn requestValue(self: Realm, init: *const RequestInit) Error!ValueResult {
+        var value: ?*RawValue = null;
+        var exception: ?*RawValue = null;
+        return switch (collo_request_new(self.raw, init, &value, &exception)) {
+            status_ok => .{ .success = try Value.fromRawOwned(value) },
+            status_js_exception => .{ .exception = try Value.fromRawOwned(exception) },
+            else => |status| {
+                try statusToError(status);
+                unreachable;
+            },
+        };
+    }
+
+    pub fn responseValue(self: Realm, init: *const ResponseInit) Error!ValueResult {
+        var value: ?*RawValue = null;
+        var exception: ?*RawValue = null;
+        return switch (collo_response_new(self.raw, init, &value, &exception)) {
+            status_ok => .{ .success = try Value.fromRawOwned(value) },
+            status_js_exception => .{ .exception = try Value.fromRawOwned(exception) },
+            else => |status| {
+                try statusToError(status);
+                unreachable;
+            },
+        };
+    }
+
+    pub fn fetchResponseValue(self: Realm, init: *const FetchResponseInit) Error!ValueResult {
+        var value: ?*RawValue = null;
+        var exception: ?*RawValue = null;
+        return switch (collo_fetch_response_new(self.raw, init, &value, &exception)) {
+            status_ok => .{ .success = try Value.fromRawOwned(value) },
+            status_js_exception => .{ .exception = try Value.fromRawOwned(exception) },
+            else => |status| {
+                try statusToError(status);
+                unreachable;
+            },
+        };
+    }
+};
+
+/// The realm the deferred's promise belongs to, where the value that settles
+/// it is created.
+pub fn promiseDeferredRealm(raw: *const RawPromiseDeferred) Realm {
+    return .{ .raw = collo_promise_deferred_realm(raw).? };
+}
 
 pub fn releasePromiseDeferred(raw: *RawPromiseDeferred) void {
     collo_promise_deferred_release(raw);

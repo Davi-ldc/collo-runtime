@@ -201,10 +201,17 @@ test "a submitted launch claims once, forks once into its leaf and publishes the
     try testing.expectEqual(board.attached_session_id, published.worker.egress_session_id);
     try testing.expectEqual(ipc.max_message_bytes, published.worker.dispatch_send_scratch.len);
 
-    // WorkerInit carried the route's entry and the leaf the child was born
-    // in, and the handle cleans that same leaf.
-    const artifact = harness.routes.?.routes.artifact(.{ .definition = launch_definition, .route = 0 });
-    try testing.expectEqualStrings(artifact.entry_specifier, board.initSpecifier());
+    // WorkerInit carried the definition's route table and pack, the files
+    // the server built at boot, with the definition's realm mode, and the
+    // leaf the child was born in, and the handle cleans that same leaf.
+    const routes = &harness.routes.?.routes;
+    const artifact = routes.artifact(launch_definition);
+    const init_routes = board.init_routes;
+    try testing.expect(init_routes.serves_routes);
+    try testing.expectEqual(routes.definition(launch_definition).settings.isolate_realm, init_routes.isolate_realm);
+    try testing.expectEqual(artifact.route_table.blob_len, init_routes.table_len);
+    try testing.expectEqual(try inodeOf(artifact.route_table.fd), init_routes.table_inode);
+    try testing.expectEqual(try inodeOf(artifact.module_pack.fd()), init_routes.pack_inode);
     var leaf_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const leaf = try harness.leafPath(&leaf_buffer, child.fork_job_id);
     try testing.expectEqualStrings(leaf, board.initLeaf());
@@ -1291,12 +1298,22 @@ const StandInChild = struct {
 
 /// What the stand-in child read in WorkerInit.
 const InitSeen = struct {
-    specifier: []const u8,
+    /// The routes WorkerInit announced: the table's length and inode, the
+    /// pack's inode (0 without one), and the realm mode.
+    routes: InitRoutes,
     leaf: []const u8,
     boot_egress_token: egress_token.Bytes,
     init_deadline_ns: u64,
     /// WorkerInit carried the worker's half of an egress session.
     carried_egress: bool,
+};
+
+const InitRoutes = struct {
+    serves_routes: bool = false,
+    isolate_realm: bool = false,
+    table_len: u64 = 0,
+    table_inode: u64 = 0,
+    pack_inode: u64 = 0,
 };
 
 /// A session the board's gateway handed out through `attachEgress`, with
@@ -1457,8 +1474,7 @@ const Board = struct {
     inits_received: usize = 0,
     /// Children whose init socket the launcher closed before any WorkerInit.
     inits_abandoned: usize = 0,
-    init_specifier_buffer: [ipc.WorkerInit.max_route_entry_specifier_bytes]u8 = undefined,
-    init_specifier_len: usize = 0,
+    init_routes: InitRoutes = .{},
     init_leaf_buffer: [std.fs.max_path_bytes]u8 = undefined,
     init_leaf_len: usize = 0,
     init_boot_egress_token: egress_token.Bytes = egress_token.none,
@@ -1851,8 +1867,7 @@ const Board = struct {
     fn noteInit(self: *Board, seen: InitSeen) void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        self.init_specifier_len = @min(seen.specifier.len, self.init_specifier_buffer.len);
-        @memcpy(self.init_specifier_buffer[0..self.init_specifier_len], seen.specifier[0..self.init_specifier_len]);
+        self.init_routes = seen.routes;
         self.init_leaf_len = @min(seen.leaf.len, self.init_leaf_buffer.len);
         @memcpy(self.init_leaf_buffer[0..self.init_leaf_len], seen.leaf[0..self.init_leaf_len]);
         self.init_boot_egress_token = seen.boot_egress_token;
@@ -1873,10 +1888,6 @@ const Board = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.answered_ns = process.monotonicNowNsOrZero();
-    }
-
-    fn initSpecifier(self: *const Board) []const u8 {
-        return self.init_specifier_buffer[0..self.init_specifier_len];
     }
 
     fn initLeaf(self: *const Board) []const u8 {
@@ -2568,7 +2579,13 @@ fn awaitWorkerInit(harness: *Harness, worker_end: std.posix.fd_t) !InitOutcome {
                 var leaf_buffer: [std.fs.max_path_bytes]u8 = undefined;
                 const leaf = try fd_mod.procFdTarget(init.cgroup_dir_fd, &leaf_buffer);
                 harness.board.noteInit(.{
-                    .specifier = init.routeEntrySpecifier(),
+                    .routes = .{
+                        .serves_routes = init.message.servesRoutes(),
+                        .isolate_realm = init.message.isolatesRealms(),
+                        .table_len = init.message.route_table_len,
+                        .table_inode = try inodeOf(init.route_table_fd),
+                        .pack_inode = if (init.module_pack_fd) |fd| try inodeOf(fd) else 0,
+                    },
                     .leaf = leaf,
                     .boot_egress_token = init.message.boot_egress_token,
                     .init_deadline_ns = init.message.init_deadline_mono_ns,

@@ -251,7 +251,7 @@ pub fn executeCallback(runtime: anytype, immediate_id: u64) !void {
     defer immediate.deinit(runtime.core.allocator);
 
     markDestroyed(runtime, &immediate);
-    try callbacks.invokeDiscardWithThis(
+    try callbacks.invokeDiscard(
         runtime,
         immediate.request_id,
         &immediate.callback,

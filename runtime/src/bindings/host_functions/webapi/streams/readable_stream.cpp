@@ -30,7 +30,7 @@ JSColloReadableStreamBYOBRequest* JSColloReadableStreamBYOBRequest::create(
     JSC::VM& vm, JSC::JSGlobalObject* global_object, JSColloReadableStream* stream, JSC::JSArrayBufferView* view)
 {
     auto* collo_global = uncheckedDowncast<Collo::GlobalObject>(global_object);
-    auto* structure = collo_global->owner().webapi_cache.readable_stream_byob_request_structure.get();
+    auto* structure = collo_global->webApiCache().readable_stream_byob_request_structure.get();
     RELEASE_ASSERT(structure);
     auto* object = new (NotNull, JSC::allocateCell<JSColloReadableStreamBYOBRequest>(vm))
         JSColloReadableStreamBYOBRequest(vm, structure);

@@ -7,8 +7,9 @@
 //! - No entry expires before its absolute deadline. A bucket visit files an
 //!   entry with rounds left, or with a deadline still ahead, back into the
 //!   bucket.
-//! - Entries and buckets are allocated once at init, so inserting never
-//!   allocates. `IngressLane` gives the wheel one entry per request slot.
+//! - Entries live in a fault-in slab and buckets are allocated once at init,
+//!   so inserting never allocates. `IngressLane` gives the wheel one entry
+//!   per request the lane can hold.
 //! - A handle carries its entry's generation, so cancelling after the entry
 //!   expired or was reused changes nothing.
 //! - While entries are armed, the wheel's clock moves only in `expireDue`,
@@ -16,13 +17,13 @@
 //!   next insert.
 
 const std = @import("std");
-const ingress_state = @import("state.zig");
+const lifecycle = @import("collo_server_lifecycle");
+const slab = @import("slab.zig");
 
 /// Deadline resolution: a deadline fires on the first tick at or after it.
 pub const tick_ns: u64 = 5 * std.time.ns_per_ms;
-pub const fallback_grace_ns: u64 = 50 * std.time.ns_per_ms;
 pub const minimum_slots: usize = 1024;
-const invalid_index: u32 = ingress_state.invalid_slot;
+const invalid_index: u32 = slab.none;
 
 pub const Handle = struct {
     slot: u32,
@@ -30,9 +31,9 @@ pub const Handle = struct {
 };
 
 pub const Expired = struct {
-    request_key: ingress_state.RequestKey,
-    connection_key: ingress_state.ConnectionKey,
-    worker_key: ingress_state.WorkerKey,
+    request_key: lifecycle.RequestKey,
+    connection_key: lifecycle.ConnectionKey,
+    worker_key: lifecycle.WorkerKey,
     deadline_monotonic_ns: u64,
 };
 
@@ -48,17 +49,15 @@ pub const Counters = struct {
 };
 
 const Entry = struct {
-    generation: u64 = 1,
-    active: bool = false,
+    slab_link: slab.Link = .{},
     cancelled: bool = false,
-    next_free: u32 = invalid_index,
     bucket: u32 = invalid_index,
     next: u32 = invalid_index,
     prev: u32 = invalid_index,
     rounds_remaining: u64 = 0,
-    request_key: ingress_state.RequestKey = .{ .lane_id = 0, .slot = 0, .generation = 0 },
-    connection_key: ingress_state.ConnectionKey = .{ .lane_id = 0, .slot = 0, .generation = 0 },
-    worker_key: ingress_state.WorkerKey = .{ .worker_id = 0, .worker_generation = 0 },
+    request_key: lifecycle.RequestKey = .{ .lane_id = 0, .slot = 0, .generation = 0 },
+    connection_key: lifecycle.ConnectionKey = .{ .lane_id = 0, .slot = 0, .generation = 0 },
+    worker_key: lifecycle.WorkerKey = .{ .worker_id = 0, .worker_generation = 0 },
     deadline_monotonic_ns: u64 = 0,
 };
 
@@ -68,10 +67,8 @@ pub fn entrySizeBytes() usize {
 
 pub const DeadlineWheel = struct {
     allocator: std.mem.Allocator,
-    entries: []Entry,
+    entries: slab.FaultInSlab(Entry),
     buckets: []u32,
-    free_head: u32,
-    free_len: usize,
     cursor: u32 = 0,
     current_time_ns: u64,
     pending_due_head: u32 = invalid_index,
@@ -88,27 +85,19 @@ pub const DeadlineWheel = struct {
         slot_count: usize,
         now_monotonic_ns: u64,
     ) !DeadlineWheel {
-        if (capacity == 0 or capacity > std.math.maxInt(u32))
+        if (capacity == 0 or capacity >= std.math.maxInt(u32))
             return error.InvalidDeadlineCapacity;
         if (slot_count < minimum_slots or slot_count > std.math.maxInt(u32))
             return error.InvalidDeadlineWheelSlots;
-        const entries = try allocator.alloc(Entry, capacity);
-        errdefer allocator.free(entries);
+        var entries = try slab.FaultInSlab(Entry).init(@intCast(capacity));
+        errdefer entries.deinit();
         const buckets = try allocator.alloc(u32, slot_count);
         errdefer allocator.free(buckets);
         @memset(buckets, invalid_index);
-        for (entries, 0..) |*entry, index| {
-            entry.* = .{
-                .generation = 1,
-                .next_free = if (index + 1 < capacity) @intCast(index + 1) else invalid_index,
-            };
-        }
         return .{
             .allocator = allocator,
             .entries = entries,
             .buckets = buckets,
-            .free_head = 0,
-            .free_len = capacity,
             .current_time_ns = now_monotonic_ns,
         };
     }
@@ -119,8 +108,13 @@ pub const DeadlineWheel = struct {
         // which lane teardown asserts against (`deinitRuntime` in
         // `runner/ring_driver.zig`).
         self.allocator.free(self.buckets);
-        self.allocator.free(self.entries);
+        self.entries.deinit();
         self.* = undefined;
+    }
+
+    /// Entries armed now, cancelled ones the wheel has not swept included.
+    pub fn liveEntries(self: *const DeadlineWheel) u32 {
+        return self.entries.live_count;
     }
 
     /// Arms `absolute_deadline_ns` for a request and returns the handle that
@@ -128,42 +122,32 @@ pub const DeadlineWheel = struct {
     /// armed.
     pub fn insert(
         self: *DeadlineWheel,
-        request_key: ingress_state.RequestKey,
-        connection_key: ingress_state.ConnectionKey,
-        worker_key: ingress_state.WorkerKey,
+        request_key: lifecycle.RequestKey,
+        connection_key: lifecycle.ConnectionKey,
+        worker_key: lifecycle.WorkerKey,
         now_monotonic_ns: u64,
         absolute_deadline_ns: u64,
     ) !Handle {
-        if (self.free_head == invalid_index)
-            return error.DeadlineWheelFull;
         self.syncIdleClock(now_monotonic_ns);
-
-        const entry_index = self.free_head;
-        const entry = &self.entries[entry_index];
-        self.free_head = entry.next_free;
-        self.free_len -= 1;
+        const acquired = self.entries.acquire() orelse return error.DeadlineWheelFull;
+        const entry = acquired.entry;
 
         const delta_ns = absolute_deadline_ns -| self.current_time_ns;
         const ticks_from_now = @max(@as(u64, 1), ceilDiv(delta_ns, tick_ns));
         const bucket: u32 = @intCast((@as(u64, self.cursor) + ticks_from_now) % self.buckets.len);
         const rounds = (ticks_from_now - 1) / self.buckets.len;
-        entry.* = .{
-            .generation = entry.generation,
-            .active = true,
-            .cancelled = false,
-            .bucket = bucket,
-            .rounds_remaining = rounds,
-            .request_key = request_key,
-            .connection_key = connection_key,
-            .worker_key = worker_key,
-            .deadline_monotonic_ns = absolute_deadline_ns,
-        };
-        self.push(bucket, entry_index);
+        entry.bucket = bucket;
+        entry.rounds_remaining = rounds;
+        entry.request_key = request_key;
+        entry.connection_key = connection_key;
+        entry.worker_key = worker_key;
+        entry.deadline_monotonic_ns = absolute_deadline_ns;
+        self.push(bucket, acquired.index);
         self.active_len += 1;
         self.counters.inserts += 1;
         self.noteInsertedDeadline(absolute_deadline_ns);
         self.setArmed(true);
-        return .{ .slot = entry_index, .generation = entry.generation };
+        return .{ .slot = acquired.index, .generation = acquired.generation };
     }
 
     /// Disarms the entry `handle` names; false when the handle is stale.
@@ -230,8 +214,8 @@ pub const DeadlineWheel = struct {
         var index = self.buckets[self.cursor];
         self.buckets[self.cursor] = invalid_index;
         while (index != invalid_index) {
-            const next = self.entries[index].next;
-            const entry = &self.entries[index];
+            const entry = self.at(index);
+            const next = entry.next;
             entry.next = invalid_index;
             entry.prev = invalid_index;
             if (entry.cancelled) {
@@ -261,7 +245,7 @@ pub const DeadlineWheel = struct {
         var emitted: usize = 0;
         while (self.pending_due_head != invalid_index and emitted < out.len) {
             const index = self.pending_due_head;
-            const entry = &self.entries[index];
+            const entry = self.at(index);
             self.pending_due_head = entry.next;
             if (self.pending_due_head == invalid_index)
                 self.pending_due_tail = invalid_index;
@@ -284,14 +268,14 @@ pub const DeadlineWheel = struct {
     }
 
     fn enqueuePendingDue(self: *DeadlineWheel, index: u32) void {
-        const entry = &self.entries[index];
+        const entry = self.at(index);
         entry.bucket = invalid_index;
         entry.prev = self.pending_due_tail;
         entry.next = invalid_index;
         if (self.pending_due_tail == invalid_index)
             self.pending_due_head = index
         else
-            self.entries[self.pending_due_tail].next = index;
+            self.at(self.pending_due_tail).next = index;
         self.pending_due_tail = index;
     }
 
@@ -306,45 +290,45 @@ pub const DeadlineWheel = struct {
 
     fn push(self: *DeadlineWheel, bucket: u32, index: u32) void {
         const old_head = self.buckets[bucket];
-        const entry = &self.entries[index];
+        const entry = self.at(index);
         entry.bucket = bucket;
         entry.prev = invalid_index;
         entry.next = old_head;
         if (old_head != invalid_index)
-            self.entries[old_head].prev = index;
+            self.at(old_head).prev = index;
         self.buckets[bucket] = index;
     }
 
     fn unlink(self: *DeadlineWheel, index: u32) void {
-        const entry = &self.entries[index];
+        const entry = self.at(index);
         if (entry.bucket == invalid_index) {
             self.unlinkPendingDue(index);
             return;
         }
         if (entry.prev != invalid_index)
-            self.entries[entry.prev].next = entry.next
+            self.at(entry.prev).next = entry.next
         else
             self.buckets[entry.bucket] = entry.next;
         if (entry.next != invalid_index)
-            self.entries[entry.next].prev = entry.prev;
+            self.at(entry.next).prev = entry.prev;
         entry.bucket = invalid_index;
         entry.next = invalid_index;
         entry.prev = invalid_index;
     }
 
     fn unlinkPendingDue(self: *DeadlineWheel, index: u32) void {
-        const entry = &self.entries[index];
-        std.debug.assert(entry.active);
+        const entry = self.at(index);
+        std.debug.assert(entry.slab_link.live);
         std.debug.assert(entry.bucket == invalid_index);
         std.debug.assert(self.pending_due_head != invalid_index);
         if (entry.prev != invalid_index) {
-            self.entries[entry.prev].next = entry.next;
+            self.at(entry.prev).next = entry.next;
         } else {
             std.debug.assert(self.pending_due_head == index);
             self.pending_due_head = entry.next;
         }
         if (entry.next != invalid_index) {
-            self.entries[entry.next].prev = entry.prev;
+            self.at(entry.next).prev = entry.prev;
         } else {
             std.debug.assert(self.pending_due_tail == index);
             self.pending_due_tail = entry.prev;
@@ -354,15 +338,8 @@ pub const DeadlineWheel = struct {
     }
 
     fn releaseEntry(self: *DeadlineWheel, index: u32) void {
-        const entry = &self.entries[index];
-        self.noteRemovedDeadline(entry.deadline_monotonic_ns);
-        entry.* = .{
-            .generation = ingress_state.nextGeneration(entry.generation),
-            .active = false,
-            .next_free = self.free_head,
-        };
-        self.free_head = index;
-        self.free_len += 1;
+        self.noteRemovedDeadline(self.at(index).deadline_monotonic_ns);
+        self.entries.release(index);
         std.debug.assert(self.active_len > 0);
         self.active_len -= 1;
     }
@@ -420,9 +397,9 @@ pub const DeadlineWheel = struct {
         var index = head;
         var inspected: usize = 0;
         while (index != invalid_index) {
-            std.debug.assert(inspected < self.entries.len);
-            const entry = &self.entries[index];
-            std.debug.assert(entry.active);
+            std.debug.assert(inspected < self.entries.high_water);
+            const entry = self.at(index);
+            std.debug.assert(entry.slab_link.live);
             if (!entry.cancelled) {
                 active_count.* += 1;
                 if (best.*) |current| {
@@ -438,12 +415,14 @@ pub const DeadlineWheel = struct {
     }
 
     fn entryForHandle(self: *DeadlineWheel, handle: Handle) ?*Entry {
-        if (handle.slot >= self.entries.len)
-            return null;
-        const entry = &self.entries[handle.slot];
-        if (!entry.active or entry.generation != handle.generation)
-            return null;
-        return entry;
+        return switch (self.entries.lookup(handle.slot, handle.generation)) {
+            .live => |entry| entry,
+            .stale_generation, .vacant, .out_of_range => null,
+        };
+    }
+
+    fn at(self: *DeadlineWheel, index: u32) *Entry {
+        return &self.entries.entries[index];
     }
 
     fn setArmed(self: *DeadlineWheel, armed: bool) void {

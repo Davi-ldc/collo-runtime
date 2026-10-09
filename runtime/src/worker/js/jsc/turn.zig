@@ -166,31 +166,34 @@ pub fn settlePromiseValueResult(
     }
 }
 
-/// Parses `source` as JSON in a turn and returns the value or the parse
-/// exception, owned by the caller. When the drain throws, the parse result is
-/// released and the drain's exception is logged and returned as
+/// Parses `source` as JSON into `realm` in a turn and returns the value or the
+/// parse exception, owned by the caller. When the drain throws, the parse
+/// result is released and the drain's exception is logged and returned as
 /// `error.JsException`.
 pub fn jsonParseUtf8(
     vm: *bindings.Vm,
+    realm: bindings.Realm,
     exec_ctx: *bindings.ExecCtx,
     source: []const u8,
 ) !bindings.ValueResult {
     try vm.turnEnter(exec_ctx);
-    const parse_result = vm.jsonParseUtf8(source);
+    const parse_result = realm.jsonParseUtf8(source);
     try finishValueResultTurn(vm, exec_ctx, "request body json parse", parse_result);
     return try parse_result;
 }
 
-/// Builds a FormData from the body bytes `source` of type `content_type`, in
-/// a turn, with the results and failures of `jsonParseUtf8`.
+/// Builds a FormData of `realm` from the body bytes `source` of type
+/// `content_type`, in a turn, with the results and failures of
+/// `jsonParseUtf8`.
 pub fn formDataFromBytes(
     vm: *bindings.Vm,
+    realm: bindings.Realm,
     exec_ctx: *bindings.ExecCtx,
     source: []const u8,
     content_type: []const u8,
 ) !bindings.ValueResult {
     try vm.turnEnter(exec_ctx);
-    const parse_result = vm.formDataValueFromBytes(source, content_type);
+    const parse_result = realm.formDataValueFromBytes(source, content_type);
     try finishValueResultTurn(vm, exec_ctx, "request body formData parse", parse_result);
     return try parse_result;
 }

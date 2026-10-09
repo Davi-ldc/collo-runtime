@@ -190,10 +190,15 @@ extern "C" ColloStatus collo_vm_post_fork_child(ColloVm* vm)
     vm->current_exec_ctx = nullptr;
     vm->entered_count = 0;
     vm->microtask_delay_scope.reset();
+    // Read again here, the last point before the worker's seccomp filter denies the call, so the value describes the
+    // worker's CPUs rather than the zygote's.
+    vm->hardware_concurrency = Collo::HostFunctions::readHardwareConcurrency();
     // Web API objects are refreshed only when they were installed: on a VM created without them the navigator slot
     // holds an uninitialized cell that passes isCell() but crashes dynamicDowncast in refreshWebApiNavigator.
-    if (vm->web_apis_installed)
-        Collo::HostFunctions::refreshWebApiNavigator(vm->global_object, *vm->vm);
+    if (vm->web_apis_installed) {
+        for (auto& realm : vm->realms)
+            Collo::HostFunctions::refreshWebApiNavigator(realm->global_object, *vm->vm);
+    }
     vm->vm->finalizeSynchronousJSExecution();
     return COLLO_STATUS_OK;
 }
@@ -204,7 +209,9 @@ extern "C" ColloStatus collo_vm_reseed_after_fork(ColloVm* vm, const ColloRandom
         return COLLO_STATUS_INVALID_ARGUMENT;
 
     JSC::JSLockHolder locker(*vm->vm);
-    vm->global_object->weakRandom().setSeed(seeds->weak_random_seed);
+    vm->worker_weak_random_seed = seeds->weak_random_seed;
+    for (auto& realm : vm->realms)
+        Collo::seedRealmWeakRandom(*realm);
     vm->vm->random().setSeed(seeds->vm_random_seed);
     vm->vm->heapRandom().setSeed(seeds->heap_random_seed);
     return COLLO_STATUS_OK;

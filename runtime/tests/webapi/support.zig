@@ -260,7 +260,7 @@ pub fn runCompatSuiteWithPrelude(prelude: []const u8, source: []const u8, specif
     };
     const route_fd = try rt.createModulePackGraphFd(&modules, 3);
     defer std.posix.close(route_fd);
-    try rt.registerRoutePack(&runtime, route_fd, collo_test_entry_specifier);
+    _ = try rt.registerRoutePack(&runtime, route_fd, collo_test_entry_specifier);
 
     const request_id = requestIdForSpecifier(specifier);
     const response = try rt.runRegisteredRouteAndReadBody(
@@ -347,7 +347,7 @@ pub fn runCompatLeakSuiteWithPrelude(prelude: []const u8, source: []const u8, sp
     };
     const route_fd = try rt.createModulePackGraphFd(&modules, 4);
     defer std.posix.close(route_fd);
-    try rt.registerRoutePack(&runtime, route_fd, collo_test_entry_specifier);
+    _ = try rt.registerRoutePack(&runtime, route_fd, collo_test_entry_specifier);
 
     const count_response = try rt.runRegisteredRouteAndReadBody(
         &runtime,

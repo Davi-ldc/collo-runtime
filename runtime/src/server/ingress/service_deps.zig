@@ -2,19 +2,20 @@
 //! reaper's `Deps`, and the posts that carry a worker pool's results to the
 //! lanes. The service is the one place that reaches every lane, so it posts
 //! the commands that pools and other threads address to a lane
-//! (`postToLane`, `postHandoff`, `strandWaiters`, `announceWorkerDeath`) and
-//! hands the reaper the retirements a pool call answers (`queueRetirement`);
-//! the launcher and the reaper reach the supervisor, the lanes and each
-//! other through it.
+//! (`postToLane`, `postHandoff`, `strandWaiters`, `announceWorkerDeath`),
+//! raises a lane's wake bits (`raiseLaneWake`), and hands the reaper the
+//! retirements a pool call answers (`queueRetirement`); the launcher and the
+//! reaper reach the supervisor, the lanes and each other through it.
 //!
 //! `Methods(Service)` holds all of it, and each part has its thread: the
 //! `launch*` callbacks run on the launcher thread and the `reaper*` ones on
 //! the reaper thread, which hold none of their own locks across the call.
-//! `postToLane` runs on any thread, `postHandoff` on the launcher thread for
-//! a publish, `strandWaiters` on the launcher thread and the metrics thread,
-//! `announceWorkerDeath` on the metrics thread (`analytics_drain.zig`) and
-//! the launcher thread (an egress retirement), and `queueRetirement` on a
-//! lane thread, the launcher thread or the metrics thread.
+//! `postToLane` and `raiseLaneWake` run on any thread, `postHandoff` on the
+//! launcher thread for a publish, `strandWaiters` on the launcher thread and
+//! the metrics thread, `announceWorkerDeath` on the metrics thread
+//! (`analytics_drain.zig`) and the launcher thread (an egress retirement),
+//! and `queueRetirement` on a lane thread, the launcher thread or the
+//! metrics thread.
 //!
 //! Invariants:
 //! - Every post goes through `postToLane`, which no pool mutex may be held
@@ -61,6 +62,15 @@ pub fn Methods(comptime Self: type) type {
                 return error.InvalidLaneId;
             }
             return self.lanes[lane_id].post(command);
+        }
+
+        /// Raises the wake bit `bit` (`runner.wake`) on lane `lane_id` from
+        /// any thread (`LaneWorker.raiseWake`). A lane that is not running
+        /// has nothing to retry and takes no wake.
+        pub fn raiseLaneWake(self: *Self, lane_id: pool.LaneId, bit: u32) PostError!void {
+            if (lane_id >= self.lanes.len)
+                return error.InvalidLaneId;
+            try self.lanes[lane_id].raiseWake(bit);
         }
 
         /// Posts `dispatch_ready` for a slot a pool handed to a waiting request

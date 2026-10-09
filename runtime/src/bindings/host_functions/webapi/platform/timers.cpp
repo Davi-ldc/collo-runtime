@@ -1,6 +1,6 @@
 // The timer globals on the VM thread. They validate arguments and pass the callback to the worker's Zig timer runtime
-// through `host_functions/runtime/timers.cpp`; from then on the runtime owns the retained callback, its arguments and
-// an immediate's receiver (`collo_runtime_set_timer` and `collo_runtime_set_immediate` in abi.h). Scheduling requires
+// through `host_functions/runtime/timers.cpp`; from then on the runtime owns the retained callback, its receiver and
+// its arguments (`collo_runtime_set_timer` and `collo_runtime_set_immediate` in abi.h). Scheduling requires
 // an active request turn and ties the timer to that request. Outside a turn, or for an id the runtime does not know,
 // a clear call cancels nothing, and the runtime's status is discarded because HTML's clear steps are best effort.
 // setTimeout and setInterval draw from one id space, so either clear function cancels either kind of timer.

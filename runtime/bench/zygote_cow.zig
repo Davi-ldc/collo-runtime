@@ -282,6 +282,10 @@ fn runVariant(
     try zygote.vm.prepareForFork();
     std.Thread.sleep(fork_helper_timeout_ns);
     try os.process.waitForSingleThreadedSelf(fork_drain_max_checks, fork_drain_check_interval_ns);
+    // The engine reserves its heaps with MADV_DONTFORK, which the zygote
+    // undoes before its first fork (`prepareZygoteAtBoot`); without this a
+    // child faults on the first cell it touches.
+    _ = try os.process.makeAddressSpaceForkInheritable();
     zygote.prepared_for_fork = true;
     zygote.prepare_count += 1;
 
@@ -732,7 +736,7 @@ fn buildSource(
 }
 
 fn evaluateModuleOk(vm: *bindings.Vm, specifier: []const u8) !void {
-    switch (try vm.evaluateModule(specifier)) {
+    switch (try vm.mainRealm().evaluateModule(specifier)) {
         .success => {},
         .exception => |exception| {
             var owned = exception;
@@ -755,7 +759,7 @@ fn evaluateModuleOk(vm: *bindings.Vm, specifier: []const u8) !void {
 }
 
 fn getExportOk(vm: *bindings.Vm, specifier: []const u8, export_name: []const u8) !bindings.Value {
-    return switch (try vm.moduleGetExport(specifier, export_name)) {
+    return switch (try vm.mainRealm().moduleGetExport(specifier, export_name)) {
         .success => |value| value,
         .exception => |exception| {
             var owned = exception;

@@ -70,8 +70,8 @@ const request_timeout_ms: u32 = 5_000;
 const placeholder_lane: supervision.pool.LaneId = 0;
 /// A request key no request of `placeholder_lane` ever holds: a request
 /// slot's generation starts at 1 and never returns to 0
-/// (`server/ingress/state.zig`), so the lane finds the slot vacant or of
-/// another generation and treats the request as gone.
+/// (`nextGeneration` in `server/ingress/slab.zig`), so the lane finds the
+/// slot vacant or of another generation and treats the request as gone.
 const placeholder_waiter = supervision.pool.RequestKey{
     .lane_id = placeholder_lane,
     .slot = 0,

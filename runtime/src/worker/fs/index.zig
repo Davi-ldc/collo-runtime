@@ -198,7 +198,7 @@ fn initWorkerImpl(index_fd: std.posix.fd_t, fault_fd: std.posix.fd_t, setup_name
     // Before Linux 6.7, a shared mapping of a write-sealed memfd fails with
     // EPERM while the fd is open read-write, because mprotect could later
     // make it writable. A private read-only mapping works on every kernel and
-    // shows the same bytes, as for the route bindings blob in
+    // shows the same bytes, as for the route table in
     // `zygote/child_boot.zig`.
     const mapped = try std.posix.mmap(
         null,

@@ -1,19 +1,19 @@
 //! The WorkerInit handoff as a machine: from a forked child to a ready
 //! worker, or to a typed failure that hands the child back to its caller.
 //!
-//! The local steps (bindings memfd, tmp root, cgroup adopt, shared pages, the
-//! WorkerInit sendmsg) are microsecond syscalls and run inline in `start`.
-//! The wait for the child's answer belongs to the host: an evented host (the
-//! server's launcher, `server/supervisor/launcher.zig`) polls the init socket
-//! and the pidfd among its own descriptors and feeds `onEvent`, and the
-//! synchronous driver `runToReady` drives the same transition table with
-//! poll(2). The route's pack and the worker's egress descriptors ride
-//! WorkerInit itself: every pack is resident, every launch sends the worker's
-//! wake descriptors, and a launch with an egress session, which the host
-//! attaches before it starts the launch, sends the session's regions too
-//! (`LaunchEgress`). The boot token for the session is minted here, when
-//! WorkerInit is sent, because its deadline is the child window this file
-//! fixes. A launch without a session boots its child detached.
+//! The local steps (route table dup, tmp root, cgroup adopt, shared pages,
+//! the WorkerInit sendmsg) are microsecond syscalls and run inline in
+//! `start`. The wait for the child's answer belongs to the host: an evented
+//! host (the server's launcher, `server/supervisor/launcher.zig`) polls the
+//! init socket and the pidfd among its own descriptors and feeds `onEvent`,
+//! and the synchronous driver `runToReady` drives the same transition table
+//! with poll(2). The definition's route table and pack and the worker's
+//! egress descriptors ride WorkerInit itself: both are resident, every launch
+//! sends the worker's wake descriptors, and a launch with an egress session,
+//! which the host attaches before it starts the launch, sends the session's
+//! regions too (`LaunchEgress`). The boot token for the session is minted
+//! here, when WorkerInit is sent, because its deadline is the child window
+//! this file fixes. A launch without a session boots its child detached.
 //!
 //! A launch that fails neither kills, waits nor removes a cgroup on the
 //! host's thread: `abandon` releases what the machine holds and hands the
@@ -40,7 +40,7 @@ const cgroup = @import("cgroup.zig");
 const cgroup_root = @import("cgroup_root.zig");
 const handle_mod = @import("handle.zig");
 
-const route_bindings = ipc.route_bindings;
+const route_table = ipc.route_table;
 
 const TMP_ROOT_RANDOM_SUFFIX_BYTES: usize = 16;
 const WORKER_TMP_ROOT_MODE: u32 = zygote.worker_boot.sandbox.tmp_root.required_mode;
@@ -73,7 +73,7 @@ pub const DrainOutcome = enum {
 
 /// Host-side cold-start spans, recorded from phase-entry timestamps.
 pub const LaunchSpans = struct {
-    route_bindings_memfd_ns: u64 = 0,
+    route_table_ns: u64 = 0,
     tmp_root_ns: u64 = 0,
     cgroup_adopt_ns: u64 = 0,
     /// The inside of `cgroup_adopt_ns`: probe, rewrite, path resolution.
@@ -180,15 +180,32 @@ pub const LaunchEgress = union(enum) {
     };
 };
 
+/// The routes a worker serves: its definition's route table and module
+/// pack, both sealed memfds the server builds once per definition
+/// (`server/routes/artifacts.zig`) and borrowed for the length of `start`.
+pub const LaunchRoutes = struct {
+    /// Every route's entry and bindings (`ipc.route_table`); the machine
+    /// dups it and owns the copy. The worker builds each route's `env` from
+    /// the route's own bindings and never `process.env`.
+    table: route_table.Sealed,
+    /// The pack holding every route's entry and every module they reach.
+    module_pack_fd: std.posix.fd_t,
+    /// Each route but the first runs in a realm of its own
+    /// (`WorkerInit.flag_isolate_realm`).
+    isolate_realm: bool,
+};
+
 pub const LaunchOptions = struct {
     /// Every launch sends the worker's wake descriptors, so every host
     /// passes the worker's wake set or a session built on it.
     egress: LaunchEgress,
-    /// The route's sealed bindings blob (`ipc.route_bindings`), borrowed for
-    /// the length of `start`; the machine dups it and owns the copy. null
-    /// means a route with no bindings, whose empty blob is built inline. The
-    /// worker builds the route's `env` from it and never `process.env`.
-    route_bindings: ?route_bindings.Sealed = null,
+    /// The routes the worker launches with. A launch with routes sets
+    /// `flag_serves_routes`, and the child evaluates every route's entry
+    /// before it reports ready, with timers for module top-level code and,
+    /// when the child is attached, fetch under the boot token. null launches
+    /// a worker with the empty table and no pack, which serves no route,
+    /// since no dispatch can name one.
+    routes: ?LaunchRoutes = null,
     /// null = `WorkerInit.defaultTmpfsSizeBytes(memory_limit_bytes)`; any
     /// other value is clamped to the memory limit.
     tmpfs_size_bytes: ?u64 = null,
@@ -198,14 +215,6 @@ pub const LaunchOptions = struct {
     /// Runtime limits and diagnostic flags the child boots with; validated
     /// before WorkerInit is sent.
     boot: ipc.WorkerRuntimeBootOptions = ipc.WorkerRuntimeBootOptions.default(),
-    /// The route the worker launches with, its pack borrowed for the length
-    /// of `start`. A launch with a route entry serves routes: WorkerInit
-    /// carries `flag_serves_routes`, and the child evaluates the entry before
-    /// it reports ready, with timers for module top-level code and, when the
-    /// child is attached, fetch under the boot token. null launches a worker
-    /// with no route pack, which serves no route, since no dispatch carries
-    /// one.
-    route_entry: ?ipc.zygote_worker.RouteEntryInit = null,
     /// The sealed fs index, borrowed; null sends the placeholder index of a
     /// tree with no files.
     fs_index_memfd: ?std.posix.fd_t = null,
@@ -319,8 +328,8 @@ pub const Machine = struct {
     worker_init_fd: std.posix.fd_t = -1,
 
     // Local resources, owned until handle assembly or `abandon`.
-    route_bindings_memfd: std.posix.fd_t = -1,
-    route_bindings_blob_len: u64 = 0,
+    route_table_memfd: std.posix.fd_t = -1,
+    route_table_len: u64 = 0,
     tmp_root: ?[]u8 = null,
     tmp_root_dir_fd: std.posix.fd_t = -1,
     cgroup_dir: ?[]u8 = null,
@@ -363,7 +372,7 @@ pub const Machine = struct {
     }
 
     /// Takes every descriptor `forked` holds, so `forked` is empty whatever
-    /// the outcome, runs the local steps (bindings memfd, tmp root, cgroup
+    /// the outcome, runs the local steps (route table, tmp root, cgroup
     /// adopt, shared resources) and sends WorkerInit. The result asks the
     /// host to poll the init socket and the pidfd, or reports the failure;
     /// after a failure the host calls `abandon`.
@@ -421,13 +430,13 @@ pub const Machine = struct {
 
         var span_cursor_ns = started;
 
-        const blob = if (self.options.route_bindings) |shared|
-            shared.dupCloexec() catch |err| return mapResourceError(err)
+        const table = if (self.options.routes) |routes|
+            routes.table.dupCloexec() catch |err| return mapResourceError(err)
         else
-            route_bindings.createEmptySealed() catch |err| return mapResourceError(err);
-        self.route_bindings_memfd = blob.fd;
-        self.route_bindings_blob_len = blob.blob_len;
-        self.spans.route_bindings_memfd_ns = spanDelta(&span_cursor_ns);
+            route_table.createEmptySealed() catch |err| return mapResourceError(err);
+        self.route_table_memfd = table.fd;
+        self.route_table_len = table.blob_len;
+        self.spans.route_table_ns = spanDelta(&span_cursor_ns);
 
         const tmp_root = makeTmpRoot(self.allocator, self.pid) catch return error.OutOfMemory;
         self.tmp_root = tmp_root;
@@ -545,16 +554,19 @@ pub const Machine = struct {
         // The child checks its own cgroup against both limits.
         message.cpu_max_cores = self.options.cpu_max_cores;
         message.tmpfs_size_bytes = resolveTmpfsSizeBytes(self.memory_limit_bytes, self.options.tmpfs_size_bytes);
-        message.route_bindings_blob_len = self.route_bindings_blob_len;
+        message.route_table_len = self.route_table_len;
         message.init_deadline_mono_ns = self.child_init_deadline_abs_ns;
         message.boot_egress_token = switch (self.options.egress) {
             .detached => ipc.egress_token.none,
             .attached => |*attached| self.mintBootToken(&attached.boot),
         };
         message.enableEgressGatewaySandbox();
-        if (self.options.route_entry != null)
+        if (self.options.routes) |routes| {
             message.flags |= ipc.WorkerInit.flag_serves_routes;
-        ipc.sendWorkerInitWithRouteBindingsAndEgressShared(
+            if (routes.isolate_realm)
+                message.flags |= ipc.WorkerInit.flag_isolate_realm;
+        }
+        ipc.sendWorkerInitWithRouteTableAndEgressShared(
             self.worker_init_fd,
             &message,
             self.metrics_fd,
@@ -563,21 +575,21 @@ pub const Machine = struct {
             self.ingress_payload_credit_eventfd,
             self.tmp_root_dir_fd,
             self.cgroup_dir_fd,
-            self.route_bindings_memfd,
+            self.route_table_memfd,
             egress_fds,
-            self.options.route_entry,
             self.options.fs_index_memfd orelse self.placeholder_fs_index_fd,
             self.fs_fault_worker_fd,
+            if (self.options.routes) |routes| routes.module_pack_fd else null,
         ) catch |err| return zygoteProtocolError(err);
         self.trace("host.worker_init.sent");
         self.spans.init_send_ns = spanDelta(&span_cursor_ns);
 
-        // The worker end only had to survive the SCM_RIGHTS dup; the
-        // bindings memfd likewise (the child holds its own reference now).
+        // The worker end only had to survive the SCM_RIGHTS dup; the route
+        // table's dup likewise (the child holds its own reference now).
         std.posix.close(self.fs_fault_worker_fd);
         self.fs_fault_worker_fd = -1;
-        std.posix.close(self.route_bindings_memfd);
-        self.route_bindings_memfd = -1;
+        std.posix.close(self.route_table_memfd);
+        self.route_table_memfd = -1;
     }
 
     /// The boot token for `boot`'s session, whose deadline is the child
@@ -819,7 +831,7 @@ pub const Machine = struct {
         if (self.ingress_payload) |*payload| payload.deinit();
         self.ingress_payload = null;
         self.worker_init_fd = closeIfHeld(self.worker_init_fd);
-        self.route_bindings_memfd = closeIfHeld(self.route_bindings_memfd);
+        self.route_table_memfd = closeIfHeld(self.route_table_memfd);
         self.metrics_fd = closeIfHeld(self.metrics_fd);
         self.completion_eventfd = closeIfHeld(self.completion_eventfd);
         self.ingress_payload_fd = closeIfHeld(self.ingress_payload_fd);

@@ -1,5 +1,6 @@
-//! The state one ingress lane owns: the connection and request slabs
-//! (`state.zig`), the deadline wheel (`timer_wheel.zig`), the command queue
+//! The state one ingress lane owns besides its tables of connections,
+//! requests, streams and worker registrations (`runner/root.zig`): the
+//! request deadline wheel (`timer_wheel.zig`), the command queue
 //! (`commands.zig`), the multishot accept registration (`uring.zig`) and the
 //! lane's counters. The lane thread creates it when it starts
 //! (`LaneWorker.lane` in `runner/root.zig`) and is its only writer. Other
@@ -7,35 +8,34 @@
 //! counters through `LaneWorker.countersSnapshot`.
 
 const std = @import("std");
+const limits = @import("collo_limits");
+const lifecycle = @import("collo_server_lifecycle");
 const commands = @import("commands.zig");
-const completions = @import("completions.zig");
-const fd_mod = @import("collo_os").fd;
-const ingress_state = @import("state.zig");
 const timer_wheel = @import("timer_wheel.zig");
 const uring = @import("uring.zig");
 const supervision = @import("collo_server_supervisor");
-const worker_shared_page = @import("collo_worker_state").page;
 
-/// Sizes of a lane's preallocated state. A serving lane uses the defaults,
-/// which `laneMemoryShape` in `runner/root.zig` also reads, and reserves
-/// command places for its configuration (`obligationReserve`).
+/// Sizes of a lane's state besides its tables. A serving lane uses the
+/// defaults and reserves command places for its configuration
+/// (`obligationReserve`).
 pub const Config = struct {
     lane_id: u16 = 0,
-    max_connections: usize = 4096,
-    max_requests: usize = 4096,
+    /// Deadline wheel entries: one per request the lane can hold.
+    max_requests: usize = limits.ingress.requests_per_lane_max,
     deadline_wheel_slots: usize = timer_wheel.minimum_slots,
-    command_queue_capacity: usize = 1024,
-    /// Command places only a worker's death or a reader grant may fill
-    /// (`commands.Queue`).
+    command_queue_capacity: usize = limits.ingress.commands_per_lane_max,
+    /// Command places only the commands that discharge an obligation may
+    /// fill (`commands.Queue`).
     command_obligation_reserve: usize = 0,
 };
 
 /// The command places a lane reserves for `definition_count` worker
-/// definitions: one death, one reader grant and one forwarded completion per
-/// slot for each entry of each pool's worker table (`commands.zig` says why
-/// that bounds them).
+/// definitions: for each entry of each pool's worker table, one death, one
+/// reader grant, one forwarded completion per slot, and the forwarding
+/// window of the entry's output (`commands.zig` says why that bounds them).
 pub fn obligationReserve(definition_count: usize) usize {
-    const per_entry = 2 + @as(usize, supervision.pool.slots_per_worker_max);
+    const per_entry = 2 + @as(usize, supervision.pool.slots_per_worker_max) +
+        limits.ingress.forwarded_commands_per_worker_max;
     return per_entry * definition_count * supervision.scheduler_limits.capacity.pool_workers_max;
 }
 
@@ -43,20 +43,17 @@ pub fn obligationReserve(definition_count: usize) usize {
 /// the lanes, and `diff` gives the counts between two snapshots.
 pub const CounterSnapshot = struct {
     accepted_connections: u64 = 0,
-    accepted_header_buffer_exhaustion: u64 = 0,
     accepted_connection_slab_exhaustion: u64 = 0,
     accepted_during_shutdown: u64 = 0,
     accepted_tcp_notsent_lowat_failures: u64 = 0,
     /// Accepted sockets closed because their descriptor flags, socket
     /// options, peer address or TLS session could not be set up.
     accepted_setup_failures: u64 = 0,
-    request_heap_allocations: u64 = 0,
-    connection_heap_allocations: u64 = 0,
-    done_buffer_allocations: u64 = 0,
-    per_request_worker_done_polls: u64 = 0,
-    per_request_pidfd_polls: u64 = 0,
-    per_request_hard_timeout_submissions: u64 = 0,
-    accepted_stale_worker_generations: u64 = 0,
+    /// Passes of the lane's loop.
+    loop_passes: u64 = 0,
+    /// `io_uring_enter` calls the lane made: one per pass at most, unless a
+    /// pass filled the submission queue (`event_sources.LaneRing`).
+    ring_enters: u64 = 0,
     /// Streams whose path matched a route in the route table.
     route_matches: u64 = 0,
     /// Requests that took a worker slot at admission (`Pool.acquire` answered
@@ -91,6 +88,8 @@ pub const CounterSnapshot = struct {
     stale_connection_cqe: u64 = 0,
     connection_poll_cancel_attempts: u64 = 0,
     connection_poll_cancel_cqes: u64 = 0,
+    /// Completions of the closes of connection sockets the lane submitted.
+    connection_close_cqes: u64 = 0,
     /// Completions of the cancels the lane submitted for a worker
     /// registration's polls.
     worker_poll_cancel_cqes: u64 = 0,
@@ -105,29 +104,26 @@ pub const CounterSnapshot = struct {
     /// response, so their worker took no fault.
     completion_before_timeout: u64 = 0,
     worker_completion_registrations: u64 = 0,
-    connection_slot_scans: u64 = 0,
-    active_request_slot_scans: u64 = 0,
-    runtime_pollfd_rebuilds: u64 = 0,
-    runtime_pollfd_connection_slots_inspected: u64 = 0,
-    runtime_pollfd_worker_slots_inspected: u64 = 0,
-    sync_pidfd_poll_calls: u64 = 0,
-    manual_deadline_scan_checks: u64 = 0,
-    normal_scheduler_sleeps: u64 = 0,
-    hot_path_allocations: u64 = 0,
     silent_queue_overflows: u64 = 0,
     worker_completion_eventfd_wakes: u64 = 0,
     command_eventfd_wakes: u64 = 0,
     timerfd_expirations: u64 = 0,
-    real_timerfd_expirations: u64 = 0,
     deadline_wheel_expired: u64 = 0,
-    deadline_wheel_timeout_events: u64 = 0,
     readiness_cqes_processed: u64 = 0,
+    /// Connections closed at their pre-request, idle and stall deadlines.
     pre_request_timeouts: u64 = 0,
+    idle_timeouts: u64 = 0,
+    stall_timeouts: u64 = 0,
+    /// Connections closed because their header block would have passed the
+    /// lane's header block budget.
+    header_block_budget_closes: u64 = 0,
     h2_server_protocol_time_ns: u64 = 0,
     ingress_channels_started: u64 = 0,
     h2_request_body_frames: u64 = 0,
     h2_request_body_bytes: u64 = 0,
     h2_request_body_ring_full: u64 = 0,
+    /// Wakes that retried this lane's request bodies parked on a full
+    /// payload ring.
     h2_request_body_credit_wakes: u64 = 0,
     h2_request_body_deferred_flushes: u64 = 0,
     h2_worker_descriptor_batches: u64 = 0,
@@ -137,8 +133,12 @@ pub const CounterSnapshot = struct {
     worker_descriptors_forwarded: u64 = 0,
     /// Descriptors this lane's reader dropped instead of forwarding: the
     /// owner's queue refused one, or refused an earlier one of the same
-    /// response.
+    /// response, or the worker's request table no longer held the request.
     forwarded_descriptor_drops: u64 = 0,
+    /// Times this lane's reader stopped receiving a worker's packets because
+    /// its forwarding window had no room for one more
+    /// (`limits.ingress.forwarded_commands_per_worker_max`).
+    forward_window_waits: u64 = 0,
     /// `payload_consumed` answers a reader's full queue refused; the ring
     /// bytes they would free stay held.
     payload_answer_drops: u64 = 0,
@@ -171,21 +171,12 @@ pub const CounterSnapshot = struct {
 pub const IngressLane = struct {
     allocator: std.mem.Allocator,
     lane_id: u16,
-    state: ingress_state.LaneState,
     deadline_wheel: timer_wheel.DeadlineWheel,
     command_queue: commands.Queue,
     accept_registration: uring.AcceptRegistration = .{},
-    completion_counters: completions.Counters = .{},
     counters: CounterSnapshot = .{},
 
     pub fn init(allocator: std.mem.Allocator, config: Config, now_monotonic_ns: u64) !IngressLane {
-        var state = try ingress_state.LaneState.init(
-            allocator,
-            config.lane_id,
-            config.max_connections,
-            config.max_requests,
-        );
-        errdefer state.deinit();
         var wheel = try timer_wheel.DeadlineWheel.init(
             allocator,
             config.max_requests,
@@ -194,7 +185,6 @@ pub const IngressLane = struct {
         );
         errdefer wheel.deinit();
         var queue = try commands.Queue.init(
-            allocator,
             config.command_queue_capacity,
             config.command_obligation_reserve,
         );
@@ -202,7 +192,6 @@ pub const IngressLane = struct {
         return .{
             .allocator = allocator,
             .lane_id = config.lane_id,
-            .state = state,
             .deadline_wheel = wheel,
             .command_queue = queue,
         };
@@ -211,105 +200,37 @@ pub const IngressLane = struct {
     pub fn deinit(self: *IngressLane) void {
         self.command_queue.deinit();
         self.deadline_wheel.deinit();
-        self.state.deinit();
         self.* = undefined;
     }
 
-    /// Moves `fd` into the connection slab on success; on error the caller
-    /// still owns it.
-    pub fn allocateAcceptedConnection(self: *IngressLane, fd: fd_mod.OwnedFd) !ingress_state.ConnectionKey {
-        const key = try self.state.connections.alloc(fd);
-        self.counters.accepted_connections += 1;
-        return key;
-    }
-
-    /// Arms the request's deadline in the wheel and records the handle on its
-    /// request slot.
-    pub fn insertDeadline(
+    /// Arms the request's deadline in the wheel and stores its handle in
+    /// `handle`, cancelling the one it held.
+    pub fn armRequestDeadline(
         self: *IngressLane,
-        request_key: ingress_state.RequestKey,
-        connection_key: ingress_state.ConnectionKey,
-        worker_key: ingress_state.WorkerKey,
+        handle: *?timer_wheel.Handle,
+        request_key: lifecycle.RequestKey,
+        connection_key: lifecycle.ConnectionKey,
+        worker_key: lifecycle.WorkerKey,
         deadline_ns: u64,
         now_ns: u64,
-    ) !timer_wheel.Handle {
-        const handle = try self.deadline_wheel.insert(
+    ) !void {
+        _ = self.cancelRequestDeadline(handle);
+        handle.* = try self.deadline_wheel.insert(
             request_key,
             connection_key,
             worker_key,
             now_ns,
             deadline_ns,
         );
-        try self.state.requests.setDeadlineHandle(request_key, handle);
         self.counters.deadline_wheel_inserts += 1;
-        return handle;
     }
 
-    /// Cancels the request's armed deadline and returns whether there was
-    /// one. A key that is no longer live counts as a stale timeout.
-    pub fn cancelRequestDeadline(self: *IngressLane, request_key: ingress_state.RequestKey) bool {
-        const request = switch (self.state.requests.lookup(request_key)) {
-            .live => |request| request,
-            .stale_generation, .vacant, .out_of_range => {
-                self.counters.stale_timeout += 1;
-                return false;
-            },
-        };
-        if (request.deadline_slot == ingress_state.invalid_slot)
-            return false;
-        const handle = timer_wheel.Handle{ .slot = request.deadline_slot, .generation = request.deadline_generation };
-        request.deadline_slot = ingress_state.invalid_slot;
-        request.deadline_generation = 0;
-        return self.deadline_wheel.cancel(handle);
-    }
-
-    /// Cancels the request's deadline and returns its slot to the slab.
-    pub fn releaseCompletedRequest(self: *IngressLane, request_key: ingress_state.RequestKey) void {
-        _ = self.cancelRequestDeadline(request_key);
-        _ = self.state.requests.release(request_key);
-    }
-
-    /// Marks a request completed by its worker and cancels its deadline. The
-    /// record is the worker's claim, so it settles nothing unless its request
-    /// key is live, its worker key is the one the request went to and the
-    /// request is still active; anything else counts as stale and returns
-    /// false.
-    pub fn applySharedCompletionRecord(
-        self: *IngressLane,
-        record: worker_shared_page.WorkerCompletionRecord,
-    ) bool {
-        const request_key = ingress_state.RequestKey{
-            .lane_id = record.request_lane_id,
-            .slot = record.request_slot,
-            .generation = record.request_generation,
-        };
-        const worker_key = ingress_state.WorkerKey{
-            .worker_id = record.worker_id,
-            .worker_generation = record.worker_generation,
-        };
-        switch (self.state.requests.lookup(request_key)) {
-            .live => |request| {
-                if (!request.worker_key.eql(worker_key)) {
-                    self.counters.stale_worker_completion += 1;
-                    self.completion_counters.stale_worker_generation += 1;
-                    return false;
-                }
-                if (request.terminal != .active) {
-                    self.counters.stale_worker_completion += 1;
-                    self.completion_counters.stale_request_generation += 1;
-                    return false;
-                }
-                _ = self.cancelRequestDeadline(request_key);
-                _ = request.markTerminal(.completed_by_worker);
-                self.recordCompletionDrained(1);
-                return true;
-            },
-            .stale_generation, .vacant, .out_of_range => {
-                self.counters.stale_worker_completion += 1;
-                self.completion_counters.stale_request_generation += 1;
-                return false;
-            },
-        }
+    /// Cancels the deadline `handle` holds, if any, and returns whether one
+    /// was armed.
+    pub fn cancelRequestDeadline(self: *IngressLane, handle: *?timer_wheel.Handle) bool {
+        const armed = handle.* orelse return false;
+        handle.* = null;
+        return self.deadline_wheel.cancel(armed);
     }
 
     pub fn recordDispatchHandoff(self: *IngressLane) void {
@@ -323,10 +244,6 @@ pub const IngressLane = struct {
 
     pub fn countersSnapshot(self: *const IngressLane) CounterSnapshot {
         var snapshot = self.counters;
-        snapshot.request_heap_allocations += self.state.counters.request_heap_allocations;
-        snapshot.connection_heap_allocations += self.state.counters.connection_heap_allocations;
-        snapshot.stale_worker_completion += self.completion_counters.stale_request_generation +
-            self.completion_counters.stale_worker_generation;
         snapshot.stale_timeout += self.deadline_wheel.counters.stale_timers;
         snapshot.command_eventfd_wakes += self.command_queue.counters.eventfd_wakes;
         return snapshot;

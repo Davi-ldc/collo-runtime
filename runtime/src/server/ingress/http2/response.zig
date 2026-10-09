@@ -18,14 +18,15 @@ const hpack = @import("collo_hpack");
 const ipc = @import("collo_ipc");
 const limits = @import("collo_limits");
 
-/// Encodes `:status` followed by `headers` into a block that borrows the
-/// encoder's scratch and stays valid only until the encoder's next encode.
-/// Fails with `error.InvalidHttp2ResponseHeader` before encoding anything
-/// when a header is invalid, and with `error.HpackEncoderPoisoned` once an
-/// encode has failed midway and the connection's HPACK state is lost.
+/// Encodes `:status` followed by `headers` into a block that borrows
+/// `scratch`, the lane's encode scratch, and stays valid only until its next
+/// encode. Fails with `error.InvalidHttp2ResponseHeader` before encoding
+/// anything when a header is invalid, and with `error.HpackEncoderPoisoned`
+/// once an encode has failed midway and the connection's HPACK state is lost.
 pub fn encodeResponseHeadersScratch(
     allocator: std.mem.Allocator,
     encoder: *hpack.Encoder,
+    scratch: []u8,
     status_value: []const u8,
     headers: []const ipc.ingress_channel.ResponseHeader,
 ) ![]const u8 {
@@ -38,7 +39,7 @@ pub fn encodeResponseHeadersScratch(
         try validateResponseHeader(header);
         hpack_headers[index + 1] = .{ .name = header.name, .value = header.value };
     }
-    return encoder.encodeHeadersScratch(allocator, hpack_headers, limits.headers.INGRESS_H2_RESPONSE_HEADER_BLOCK_BYTES);
+    return encoder.encodeHeadersWithScratch(scratch, hpack_headers, limits.headers.INGRESS_H2_RESPONSE_HEADER_BLOCK_BYTES);
 }
 
 fn validateResponseHeader(header: ipc.ingress_channel.ResponseHeader) !void {

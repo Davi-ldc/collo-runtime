@@ -93,15 +93,21 @@ pub const ForwardedPayload = union(enum) {
 /// lane owns.
 ///
 /// Sent by the reader lane to the owner, `request_key.lane_id`, in the order
-/// the reader read it. The owner checks both keys and applies the descriptor
-/// as one it read itself (`runner/h2_worker_ipc.zig`), taking a `ring`
-/// payload from the worker's ring through the record its request slot holds.
-/// For a `ring` payload it answers `payload_consumed` to `reader_lane_id`
-/// whether it used the bytes or not, and before it gives the request's slot
-/// back.
+/// the reader read it, and only while the worker's request table holds the
+/// request under that key (`RequestTable.forwardCheck`). The owner checks
+/// both keys and applies the descriptor as one it read itself
+/// (`runner/h2_worker_ipc.zig`), taking a `ring` payload from the worker's
+/// ring through the record its request slot holds. For a `ring` payload it
+/// answers `payload_consumed` to `reader_lane_id` whether it used the bytes
+/// or not, and before it gives the request's slot back.
 ///
-/// A reader whose post fails frees a `ring` payload's bytes itself, in ring
-/// order, and drops the descriptor; the owner's deadline ends the request.
+/// The command holds one unit of the worker's forwarding window
+/// (`Record.forwarded_in_queues`) from before its post: the owner releases it
+/// once it applied or dropped the descriptor, or hands it on to its
+/// `payload_consumed`. The post may take the queue's reserve
+/// (`commands.zig`), so a refusal means the owner lane is not running: the
+/// reader then releases the unit, frees a `ring` payload's bytes itself, in
+/// ring order, and drops the descriptor.
 ///
 /// A descriptor that shows the worker faulty is a worker fault on the owner.
 /// An owner with no request on the worker takes it out of service through
@@ -158,10 +164,17 @@ pub const ForwardedCompletion = struct {
 /// nothing, because the worker died and the reader gave the role up, is
 /// dropped.
 ///
-/// An owner whose post fails leaves the bytes held: the worker's later ring
-/// payloads stall until their requests' deadlines end them.
+/// The command holds the forwarding window's unit its descriptor held, and
+/// the reader releases it through `worker` whether the answer matched or
+/// not. An owner whose post fails releases the unit and leaves the bytes
+/// held: the worker's later ring payloads stall until their requests'
+/// deadlines end them.
 pub const PayloadConsumed = struct {
     worker_key: WorkerKey,
+    /// The record whose window holds the command's unit. A record serves
+    /// its pool entry for the server's life, so the pointer stays valid
+    /// whatever worker the record holds by the time the reader runs it.
+    worker: *WorkerRecord,
     ring: RingRef,
 };
 

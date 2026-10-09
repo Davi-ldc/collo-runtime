@@ -1,13 +1,12 @@
 //! The server's side of a worker's completion ring
 //! (`common/worker_state/page/completion_ring.zig`): one drain per eventfd
-//! wake, a record out of sequence or an overflow turning the ring fatal, and
-//! the checks that drop a record of an older worker or request
-//! (`IngressLane.applySharedCompletionRecord`). Through a whole lane
-//! (`lane_harness.zig`): a record out of sequence is a worker fault that
-//! leaves its request to the death path, a record naming another worker
-//! generation is dropped and the next one applies, the lane drains from its
-//! own tail whatever the worker stores in the page's, and a completion the
-//! worker published before the deadline backstop fired wins over it. Lane
+//! wake, and a record out of sequence or an overflow turning the ring fatal.
+//! Through a whole lane (`lane_harness.zig`): a record out of sequence is a
+//! worker fault that leaves its request to the death path, a record naming
+//! another worker generation or a request that ended is dropped and the next
+//! one applies, the lane drains from its own tail whatever the worker stores
+//! in the page's, and a completion the worker published before the deadline
+//! backstop fired wins over it. Lane
 //! `server-ingress-test`; a fatal ring and the races between a completion
 //! and a worker's death are in `worker_faults.zig`, completions read for
 //! another lane in `lane_commands.zig`, and the backstop itself in
@@ -87,48 +86,28 @@ test "worker completion ring overflow marks shared page fatal" {
     try std.testing.expectEqual(@as(u64, 1), @atomicLoad(u64, &view.completion_header.overflow_count, .acquire));
 }
 
-test "worker shared-page stale worker generation is ignored and counted" {
-    var lane = try ingress.lane.IngressLane.init(std.testing.allocator, .{ .lane_id = 0, .max_connections = 1, .max_requests = 1 }, 0);
-    defer lane.deinit();
-    const conn = try lane.allocateAcceptedConnection(.{});
-    const worker = ingress.state.WorkerKey{ .worker_id = 1, .worker_generation = 2 };
-    const req = try lane.state.requests.alloc(1, conn, worker, 0, 1);
-    const completion = worker_shared_page.WorkerCompletionRecord{
-        .sequence = 1,
-        .external_request_id = 1,
-        .request_generation = req.generation,
-        .worker_id = worker.worker_id,
-        .worker_generation = 1,
-        .request_slot = req.slot,
-        .request_lane_id = req.lane_id,
-        .http_status = 200,
-        .status = 0,
-    };
-    try std.testing.expect(!lane.applySharedCompletionRecord(completion));
-    try std.testing.expectEqual(@as(u64, 1), lane.completion_counters.stale_worker_generation);
-}
+test "a completion naming a request that ended is dropped, also once a later request holds its slot" {
+    var scene: OneWorker = undefined;
+    try scene.init(.{});
+    defer scene.deinit();
+    const first = try scene.get(1);
+    try scene.stub.answer(first, 200, "first");
+    try scene.harness.serveWorker(0, scene.stub);
+    try scene.expectStatus(1, 200);
+    try std.testing.expectEqual(@as(?u16, 200), scene.harness.takeAccessStatus(0));
 
-test "worker shared-page stale request generation is ignored and counted" {
-    var lane = try ingress.lane.IngressLane.init(std.testing.allocator, .{ .lane_id = 0, .max_connections = 1, .max_requests = 1 }, 0);
-    defer lane.deinit();
-    const conn = try lane.allocateAcceptedConnection(.{});
-    const worker = ingress.state.WorkerKey{ .worker_id = 1, .worker_generation = 1 };
-    const req = try lane.state.requests.alloc(1, conn, worker, 0, 1);
-    _ = lane.state.requests.release(req);
-    _ = try lane.state.requests.alloc(2, conn, worker, 0, 1);
-    const completion = worker_shared_page.WorkerCompletionRecord{
-        .sequence = 1,
-        .external_request_id = 1,
-        .request_generation = req.generation,
-        .worker_id = worker.worker_id,
-        .worker_generation = worker.worker_generation,
-        .request_slot = req.slot,
-        .request_lane_id = req.lane_id,
-        .http_status = 200,
-        .status = 0,
-    };
-    try std.testing.expect(!lane.applySharedCompletionRecord(completion));
-    try std.testing.expectEqual(@as(u64, 1), lane.completion_counters.stale_request_generation);
+    // The next request takes the place the first one left, under a later
+    // generation, and the worker repeats the first request's completion.
+    const second = try scene.get(3);
+    try std.testing.expectEqual(first.identity.request_slot, second.identity.request_slot);
+    try std.testing.expect(second.identity.request_generation != first.identity.request_generation);
+    try scene.stub.publishCompletion(first, .{});
+    try scene.harness.serveWorker(0, scene.stub);
+
+    try scene.harness.expectLanesRunning();
+    try scene.harness.expectServing(scene.stub);
+    try std.testing.expect(scene.harness.requestKeyOf(scene.client, 3) != null);
+    try std.testing.expectEqual(@as(u64, 1), scene.harness.lane(0).lane.counters.stale_worker_completion);
 }
 
 test "a completion record out of sequence faults its worker and leaves its request to the death path (#34)" {

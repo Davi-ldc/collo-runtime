@@ -15,15 +15,15 @@
 
 const std = @import("std");
 const limits = @import("collo_limits");
-const route_bindings = @import("route_bindings.zig");
+const route_table = @import("route_table.zig");
 const egress_token = @import("egress_token.zig");
 
 pub const max_message_bytes: usize = 1024 * 1024;
 pub const max_route_capture_count: usize = 64;
 pub const max_request_header_count: usize = 256;
-/// Sized by the packet with the most descriptors, a WorkerInit with a route
-/// entry, whose descriptor table `zygote_worker.zig` defines and checks
-/// against this bound at compile time.
+/// Sized by the packet with the most descriptors, a WorkerInit of a worker
+/// that serves routes, whose descriptor table `zygote_worker.zig` defines and
+/// checks against this bound at compile time.
 pub const max_fds_per_message: usize = 30;
 
 /// Values 8, 9, 10, 13, 21 and 22 name no message, and `decodeMessageKind`
@@ -69,7 +69,7 @@ pub const WorkerInitFailedReason = enum(u32) {
     /// The child's evaluation watchdog, armed at
     /// `WorkerInit.init_deadline_mono_ns` less
     /// `limits.process.WORKER_INIT_CLEANUP_RESERVE_NS`, stopped the VM while
-    /// it evaluated the route entry. The child reports this and exits by
+    /// it evaluated the route entries. The child reports this and exits by
     /// itself before the init deadline. The server's launcher does not wait
     /// for that exit: it hands the child to the reaper, which kills it at
     /// once. Only the synchronous driver (`runToReady` in `host/launch.zig`)
@@ -162,10 +162,9 @@ pub const DispatchWorkView = struct {
     request_headers: []const RequestHeader,
     body_framing: RequestBodyFraming,
     route_captures: []const RouteCapture,
-    /// The route's entry module, in the pack the worker registered before it
-    /// reported ready (WorkerInit's route entry). No dispatch carries a pack.
-    /// The decoder refuses an empty one.
-    route_entry_specifier: []const u8,
+    /// The request's route: its position in the route table of the worker's
+    /// definition (`route_table.zig`), which WorkerInit delivered.
+    route_index: u16,
 };
 
 pub const ZygoteReady = extern struct {
@@ -279,27 +278,23 @@ pub const WorkerRuntimeBootOptions = extern struct {
 };
 
 /// Host to child, once, on the init socket of a fresh fork: the limits and
-/// descriptors the child boots with. The packet is this struct followed by
-/// `route_entry_specifier_len` specifier bytes, with the descriptor table
-/// `zygote_worker.zig` defines.
+/// descriptors the child boots with. The packet is this struct alone, with
+/// the descriptor table `zygote_worker.zig` defines. The reserved field names
+/// the struct's padding, and `validate` refuses it nonzero.
 pub const WorkerInit = extern struct {
     kind: u32,
     flags: u32 = 0,
     memory_limit_bytes: u64,
     tmpfs_size_bytes: u64,
-    /// Length of the route's bindings blob (`route_bindings.zig`), the sealed
-    /// memfd in the descriptor table; at least the empty blob and at most
-    /// `route_bindings.bytes_max`.
-    route_bindings_blob_len: u64,
-    /// Length of the route-entry specifier that follows this struct. Nonzero
-    /// means the packet's last descriptor is the route's module pack, and the
-    /// child registers and evaluates the entry before it reports ready. Zero
-    /// means the packet carries neither the specifier nor the pack.
-    route_entry_specifier_len: u32 = 0,
+    /// Length of the route table of the worker's definition
+    /// (`route_table.zig`), the sealed memfd in the descriptor table; at least
+    /// the empty table and at most `route_table.bytes_max`.
+    route_table_len: u64,
     /// The `cpu.max` quota, in cores over the cgroup period, the child must
     /// find on its own cgroup. It travels beside the memory limit so the child
     /// checks the limits it was actually given.
     cpu_max_cores: u32 = limits.worker.cpu_max_cores,
+    _reserved0: u32 = 0,
     /// The boot token (`egress_token.zig`, kind boot) that fetches made while the route's
     /// modules evaluate present, minted when this message is sent with `init_deadline_mono_ns`
     /// as its deadline. `egress_token.none` means no egress grant, and those fetches are denied.
@@ -316,16 +311,22 @@ pub const WorkerInit = extern struct {
 
     pub const flag_isolated_network: u32 = 1 << 0;
     pub const flag_deny_direct_egress: u32 = 1 << 1;
-    /// The child serves routes, so module top-level code gets timers, and
-    /// fetch when `boot_egress_token` is not `egress_token.none`. The host
-    /// sets it on every launch that carries a route entry; a harness that
-    /// wants a VM without them leaves it clear. `validate` refuses it without
-    /// a route entry, because the boot context it installs closes only when
-    /// the route entry's evaluation settles.
+    /// The child serves the routes of its route table: the packet's last
+    /// descriptor is the definition's module pack, the child registers it and
+    /// evaluates every route's entry before it reports ready, and module
+    /// top-level code gets timers, and fetch when `boot_egress_token` is not
+    /// `egress_token.none`. Set exactly when the route table holds a route
+    /// (`validate`): the host sets it on every launch that carries routes,
+    /// and a harness that wants a VM without them sends the empty table.
     pub const flag_serves_routes: u32 = 1 << 2;
-    pub const valid_flags: u32 = flag_isolated_network | flag_deny_direct_egress | flag_serves_routes;
+    /// Each route of the table runs in a realm of its own, with its own
+    /// globals, intrinsics and module registry; clear, every route shares the
+    /// VM's main realm. Fixed for the worker's life, and set only beside
+    /// `flag_serves_routes` (`validate`).
+    pub const flag_isolate_realm: u32 = 1 << 3;
+    pub const valid_flags: u32 = flag_isolated_network | flag_deny_direct_egress | flag_serves_routes |
+        flag_isolate_realm;
     pub const default_tmpfs_size_bytes: u64 = 256 * 1024 * 1024;
-    pub const max_route_entry_specifier_bytes: u32 = 4096;
     /// Keeps a corrupt value from becoming a cgroup quota; far above the
     /// core count of any machine Collo runs on.
     pub const max_cpu_max_cores: u32 = 256;
@@ -338,7 +339,7 @@ pub const WorkerInit = extern struct {
         // overwrites it.
         message.cpu_max_cores = limits.worker.cpu_max_cores;
         message.tmpfs_size_bytes = defaultTmpfsSizeBytes(memory_limit_bytes);
-        message.route_bindings_blob_len = route_bindings.empty_blob.len;
+        message.route_table_len = route_table.empty_blob.len;
         message.runtime = runtime;
         return message;
     }
@@ -363,8 +364,14 @@ pub const WorkerInit = extern struct {
         return (self.flags & flag_serves_routes) != 0;
     }
 
+    pub fn isolatesRealms(self: *const WorkerInit) bool {
+        return (self.flags & flag_isolate_realm) != 0;
+    }
+
     pub fn validate(self: *const WorkerInit) !void {
         if ((self.flags & ~valid_flags) != 0)
+            return error.InvalidWorkerInitFlags;
+        if (self._reserved0 != 0)
             return error.InvalidWorkerInitFlags;
         if (self.wantsDenyDirectEgress() and !self.wantsIsolatedNetwork())
             return error.InvalidWorkerInitFlags;
@@ -374,13 +381,15 @@ pub const WorkerInit = extern struct {
             return error.InvalidWorkerInitFlags;
         if (self.tmpfs_size_bytes > self.memory_limit_bytes)
             return error.InvalidWorkerInitFlags;
-        if (self.route_bindings_blob_len < route_bindings.empty_blob.len)
+        if (self.route_table_len < route_table.empty_blob.len)
             return error.InvalidWorkerInitFlags;
-        if (self.route_bindings_blob_len > route_bindings.bytes_max)
+        if (self.route_table_len > route_table.bytes_max)
             return error.InvalidWorkerInitFlags;
-        if (self.route_entry_specifier_len > max_route_entry_specifier_bytes)
+        // A valid table that holds a route is longer than the empty one, and
+        // a worker serves routes exactly when its table holds some.
+        if (self.servesRoutes() != (self.route_table_len != route_table.empty_blob.len))
             return error.InvalidWorkerInitFlags;
-        if (self.servesRoutes() and self.route_entry_specifier_len == 0)
+        if (self.isolatesRealms() and !self.servesRoutes())
             return error.InvalidWorkerInitFlags;
         if (self.cpu_max_cores == 0 or self.cpu_max_cores > max_cpu_max_cores)
             return error.InvalidWorkerInitCpuQuota;
@@ -427,14 +436,14 @@ pub const DispatchPacketHeader = extern struct {
     deadline_monotonic_ns: u64,
     accounting_flags: u32,
     request_lane_id: u16,
-    _reserved0: u16,
+    route_index: u16,
     authority_len: u32,
     method_len: u32,
     path_len: u32,
     raw_query_len: u32,
     route_capture_count: u32,
     route_captures_bytes_len: u32,
-    route_entry_specifier_len: u32,
+    _reserved0: u32,
     request_header_count: u32,
     request_headers_bytes_len: u32,
     body_framing: u32,
@@ -740,10 +749,12 @@ comptime {
         @compileError("ipc.WorkerRuntimeBootOptions size mismatch");
     if (@sizeOf(WorkerInit) != 184)
         @compileError("ipc.WorkerInit size mismatch");
-    if (@offsetOf(WorkerInit, "route_entry_specifier_len") != 32)
-        @compileError("ipc.WorkerInit route_entry_specifier_len offset mismatch");
-    if (@offsetOf(WorkerInit, "cpu_max_cores") != 36)
+    if (@offsetOf(WorkerInit, "route_table_len") != 24)
+        @compileError("ipc.WorkerInit route_table_len offset mismatch");
+    if (@offsetOf(WorkerInit, "cpu_max_cores") != 32)
         @compileError("ipc.WorkerInit cpu_max_cores offset mismatch");
+    if (@offsetOf(WorkerInit, "_reserved0") != 36)
+        @compileError("ipc.WorkerInit _reserved0 offset mismatch");
     if (@offsetOf(WorkerInit, "boot_egress_token") != 40)
         @compileError("ipc.WorkerInit boot_egress_token offset mismatch");
     if (@offsetOf(WorkerInit, "init_deadline_mono_ns") != 96)
@@ -822,8 +833,8 @@ comptime {
         @compileError("ipc.DispatchPacketHeader.accounting_flags offset mismatch");
     if (@offsetOf(DispatchPacketHeader, "request_lane_id") != 108)
         @compileError("ipc.DispatchPacketHeader.request_lane_id offset mismatch");
-    if (@offsetOf(DispatchPacketHeader, "_reserved0") != 110)
-        @compileError("ipc.DispatchPacketHeader._reserved0 offset mismatch");
+    if (@offsetOf(DispatchPacketHeader, "route_index") != 110)
+        @compileError("ipc.DispatchPacketHeader.route_index offset mismatch");
     if (@offsetOf(DispatchPacketHeader, "authority_len") != 112)
         @compileError("ipc.DispatchPacketHeader.authority_len offset mismatch");
     if (@offsetOf(DispatchPacketHeader, "method_len") != 116)
@@ -836,8 +847,8 @@ comptime {
         @compileError("ipc.DispatchPacketHeader.route_capture_count offset mismatch");
     if (@offsetOf(DispatchPacketHeader, "route_captures_bytes_len") != 132)
         @compileError("ipc.DispatchPacketHeader.route_captures_bytes_len offset mismatch");
-    if (@offsetOf(DispatchPacketHeader, "route_entry_specifier_len") != 136)
-        @compileError("ipc.DispatchPacketHeader.route_entry_specifier_len offset mismatch");
+    if (@offsetOf(DispatchPacketHeader, "_reserved0") != 136)
+        @compileError("ipc.DispatchPacketHeader._reserved0 offset mismatch");
     if (@offsetOf(DispatchPacketHeader, "request_header_count") != 140)
         @compileError("ipc.DispatchPacketHeader.request_header_count offset mismatch");
     if (@offsetOf(DispatchPacketHeader, "request_headers_bytes_len") != 144)

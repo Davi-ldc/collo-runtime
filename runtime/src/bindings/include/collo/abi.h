@@ -12,9 +12,12 @@
  * The zygote, the workers it forks, and the test and benchmark binaries that
  * create a VM call these functions. The egress gateway calls none of them and
  * uses only some of the struct layouts, through the mirrors in root.zig. A
- * function that takes a ColloVm* runs on the thread that owns the VM unless
- * its comment says otherwise. Input handles are borrowed. An output ColloValue*
- * belongs to the caller, who releases it with collo_value_release(); once
+ * function that takes a ColloVm* or a ColloRealm* runs on the thread that
+ * owns the VM unless its comment says otherwise. A function that creates an
+ * object takes the ColloRealm* the object belongs to; one that reads or calls
+ * an object works in that object's own realm. Input handles are borrowed. An
+ * output ColloValue* belongs to the caller, who releases it with
+ * collo_value_release(); once
  * collo_vm_destroy() has run, that is the only call still valid for it. An
  * output ColloString or ColloBuffer is caller-owned memory, released with
  * collo_free_buffer(ptr). A function with an out_exception parameter reports a
@@ -78,6 +81,10 @@ enum {
 };
 
 typedef struct ColloVm ColloVm;
+/* One global object of a VM with its own globals, intrinsics and module
+   registry. The VM owns every realm until collo_vm_destroy, so a realm pointer
+   stays valid as long as its VM. */
+typedef struct ColloRealm ColloRealm;
 typedef struct ColloValue ColloValue;
 typedef struct ColloPromiseDeferred ColloPromiseDeferred;
 typedef struct ColloCryptoJob ColloCryptoJob;
@@ -509,9 +516,11 @@ ColloStatus collo_runtime_complete_request_task(void* runtime, uint32_t slot, ui
     uint64_t request_generation, ColloValue* value, uint8_t is_error);
 /* Settlement of a module evaluation previously returned as
    COLLO_STATUS_PENDING, called on the VM thread from inside a microtask
-   drain. specifier is valid only for the duration of the call; the runtime
-   copies what it needs and only enqueues, so no JS runs. */
-void collo_runtime_module_eval_settled(void* runtime, ColloString specifier, uint8_t resolved);
+   drain. realm_index is the evaluating realm's (collo_realm_index), since one
+   specifier evaluates once per realm. specifier is valid only for the
+   duration of the call; the runtime copies what it needs and only enqueues,
+   so no JS runs. */
+void collo_runtime_module_eval_settled(void* runtime, uint32_t realm_index, ColloString specifier, uint8_t resolved);
 /* Runtime owns job on OK. On non-OK, caller still owns job. */
 ColloStatus collo_runtime_crypto_job_enqueue(void* runtime, uint64_t request_id, ColloCryptoJob* job);
 /* If deferred is non-null, Zig owns once passed, including non-OK. On OK,
@@ -550,10 +559,12 @@ ColloStatus collo_runtime_request_blob(void* runtime, uint64_t request_id, uint6
     ColloString type, ColloPromiseDeferred* deferred, uint64_t* out_task_id);
 ColloStatus collo_runtime_request_form_data(void* runtime, uint64_t request_id, uint64_t request_generation,
     ColloString content_type, ColloPromiseDeferred* deferred, uint64_t* out_task_id);
-/* Runtime consumes callback and each args[i] handle on every call, including non-OK.
-   The args array storage itself is borrowed. */
-ColloStatus collo_runtime_set_timer(void* runtime, uint64_t request_id, ColloValue* callback, ColloValue** args,
-    size_t args_len, uint32_t delay_ms, uint8_t repeats, uint64_t* out_timer_id);
+/* Runtime consumes callback, this_arg, and each args[i] handle on every call,
+   including non-OK. this_arg is the callback's receiver: the globalThis of
+   the realm whose setTimeout or setInterval scheduled it. The args array
+   storage itself is borrowed. */
+ColloStatus collo_runtime_set_timer(void* runtime, uint64_t request_id, ColloValue* callback, ColloValue* this_arg,
+    ColloValue** args, size_t args_len, uint32_t delay_ms, uint8_t repeats, uint64_t* out_timer_id);
 ColloStatus collo_runtime_clear_timeout(void* runtime, uint64_t request_id, uint64_t timer_id);
 /* Runtime consumes callback, this_arg, and each args[i] handle on every call,
    including non-OK. The args array storage itself is borrowed. */
@@ -561,16 +572,17 @@ ColloStatus collo_runtime_set_immediate(void* runtime, uint64_t request_id, Coll
     ColloValue** args, size_t args_len, uint64_t* out_immediate_id);
 ColloStatus collo_runtime_clear_immediate(void* runtime, uint64_t request_id, uint64_t immediate_id);
 ColloStatus collo_webapi_immediate_mark_destroyed(ColloVm* vm, const ColloValue* value);
-/* Builds a handler's Request from init (see ColloRequestInit). A VM that is not
-   ready, a zero request id, an empty authority, or a nonzero length or count
-   with a null pointer fails with COLLO_STATUS_INVALID_ARGUMENT. On success
-   *out_value is a new handle the caller releases with collo_value_release. */
+/* Builds a handler's Request in `realm` from init (see ColloRequestInit). A
+   VM that is not ready, a zero request id, an empty authority, or a nonzero
+   length or count with a null pointer fails with
+   COLLO_STATUS_INVALID_ARGUMENT. On success *out_value is a new handle the
+   caller releases with collo_value_release. */
 ColloStatus collo_request_new(
-    ColloVm* vm, const ColloRequestInit* init, ColloValue** out_value, ColloValue** out_exception);
+    ColloRealm* realm, const ColloRequestInit* init, ColloValue** out_value, ColloValue** out_exception);
 ColloStatus collo_response_new(
-    ColloVm* vm, const ColloResponseInit* init, ColloValue** out_value, ColloValue** out_exception);
+    ColloRealm* realm, const ColloResponseInit* init, ColloValue** out_value, ColloValue** out_exception);
 ColloStatus collo_fetch_response_new(
-    ColloVm* vm, const ColloFetchResponseInit* init, ColloValue** out_value, ColloValue** out_exception);
+    ColloRealm* realm, const ColloFetchResponseInit* init, ColloValue** out_value, ColloValue** out_exception);
 ColloStatus collo_response_extract(ColloVm* vm, const ColloValue* value, const ColloResponseExtractLimits* limits,
     ColloExtractedResponse* out_response, ColloValue** out_exception);
 void collo_response_extract_free(ColloExtractedResponse* response);
@@ -580,8 +592,22 @@ void collo_owned_header_block_destroy(ColloOwnedHeaderBlock* owner);
 ColloStatus collo_webapi_cleanup_request(ColloVm* vm, uint64_t request_id);
 
 /* Creates a fully initialized VM in *out_vm, which the caller owns until
-   collo_vm_destroy. */
+   collo_vm_destroy, with its main realm. */
 ColloStatus collo_vm_create(const ColloVmOptions* options, ColloVm** out_vm);
+/* The realm created with the VM, or null when the VM is not ready. */
+ColloRealm* collo_vm_main_realm(ColloVm* vm);
+/* Adds a realm to the VM and stores it in *out_realm. The new global gets
+   every install the VM made so far: the Web APIs unless the VM was created
+   without them, `process`, node:fs, the console client while a sink is
+   registered, and a Math.random seed derived from the worker's
+   (collo_vm_reseed_after_fork). Realms share the VM's heap, turns, microtask
+   queue, module sources and limits: they separate state, not trust. Outside
+   any turn; a VM that is not ready or inside a turn fails with
+   COLLO_STATUS_INVALID_ARGUMENT, and one a termination stopped with
+   COLLO_STATUS_ERROR. */
+ColloStatus collo_realm_create(ColloVm* vm, ColloRealm** out_realm);
+/* The realm's position in its VM's creation order, 0 for the main realm. */
+uint32_t collo_realm_index(const ColloRealm* realm);
 /* Invalidates outstanding handles. The caller must serialize destroy against
    every API call that takes this ColloVm*. Calling this while a turn is active
    aborts the process because the VM is already in an unrecoverable teardown
@@ -590,6 +616,10 @@ ColloStatus collo_vm_create(const ColloVmOptions* options, ColloVm** out_vm);
 void collo_vm_destroy(ColloVm* vm);
 ColloStatus collo_vm_prepare_for_fork(ColloVm* vm);
 ColloStatus collo_vm_post_fork_child(ColloVm* vm);
+/* Gives the VM the worker's own random state. The main realm's Math.random
+   takes seeds->weak_random_seed as it is, and every other realm, existing or
+   created later, a seed derived from it and the realm's index, so neither
+   sibling workers nor two realms of one worker share a sequence. */
 ColloStatus collo_vm_reseed_after_fork(ColloVm* vm, const ColloRandomSeeds* seeds);
 /* Forces every compiler thread the process will use, for the JS tiers and
    wasm, to exist now, without compiling anything. Each thread polls once, finds
@@ -618,9 +648,10 @@ ColloStatus collo_vm_set_host_runtime(ColloVm* vm, void* runtime);
    calls this, so evaluation on a bare VM finds no context. */
 ColloStatus collo_vm_set_boot_exec_ctx(ColloVm* vm, uint64_t request_id);
 /* Workers only: uninstalls the boot exec context when the boot context closes,
-   once the route entry's evaluation settles. From then on turnless JS finds no
-   context, and the dynamic-import fallback and the console's boot exemption
-   close with it. Idempotent: clearing a context never installed is OK. */
+   once the evaluation of every route's entry settled. From then on turnless
+   JS finds no context, and the dynamic-import fallback and the console's boot
+   exemption close with it. Idempotent: clearing a context never installed is
+   OK. */
 ColloStatus collo_vm_clear_boot_exec_ctx(ColloVm* vm);
 /* Registers exec_ctx as a microtask owner and returns its token, or 0 if the
    table is full. Idempotent: the same pointer always maps to the same live
@@ -689,11 +720,13 @@ ColloStatus collo_vm_set_console_sink(ColloVm* vm, ColloConsoleSink sink, void* 
     size_t request_lines_max, size_t request_bytes_max);
 
 /* Workers only: installs the global `process` with `platform`, `version`,
-   the calling process's `pid` and an empty `env`. A route's bindings reach
-   only its handler's `env` argument, never `process.env`. */
+   the calling process's `pid` and an empty `env`, on every realm, including
+   the ones created later. A route's bindings reach only its handler's `env`
+   argument, never `process.env`. Idempotent. */
 ColloStatus collo_vm_install_process(ColloVm* vm);
-/* Workers only: installs and exposes node:fs once the worker is inside its
-   chroot and seccomp confinement. No other VM calls it. */
+/* Workers only: installs and exposes node:fs, on every realm, once the
+   worker is inside its chroot and seccomp confinement. No other VM calls it.
+   Idempotent. */
 ColloStatus collo_vm_enable_node_fs_for_worker(ColloVm* vm);
 ColloStatus collo_prepare_process_for_fork(void);
 ColloStatus collo_set_helper_threads_timeout_override_ns(uint64_t timeout_ns);
@@ -705,8 +738,8 @@ void collo_clear_gc_max_heap_size_override(void);
 /* Modules live in memory only and are registered a pack at a time. A module
    that no registered pack holds fails to load with an Error that names it. */
 /* Registers the modules of a pack from a mapping of its sealed memfd. The
-   SourceProviders read the mapping in place, so every worker of a route shares
-   the pack's page cache instead of keeping a private copy.
+   SourceProviders read the mapping in place, so every worker of a definition
+   shares the pack's page cache instead of keeping a private copy.
    pack is consumed on every call, including non-OK: the bridge validates the
    bytes in place, then releases the mapping before returning unless a
    registered module keeps it, in which case the release comes when the last
@@ -718,9 +751,18 @@ ColloStatus collo_module_register_pack(ColloVm* vm, ColloMapping pack, const Col
    already-fetched/evaluated module records alive until the VM is recycled. */
 ColloStatus collo_module_evict_specifier(ColloVm* vm, ColloString specifier, ColloModuleEvictStats* out_stats);
 ColloStatus collo_module_evict_lifetime(ColloVm* vm, ColloModuleLifetime lifetime, ColloModuleEvictStats* out_stats);
-ColloStatus collo_module_evaluate(ColloVm* vm, ColloString specifier, ColloValue** out_exception);
-ColloStatus collo_module_get_export(
-    ColloVm* vm, ColloString specifier, ColloString export_name, ColloValue** out_value, ColloValue** out_exception);
+/* Imports and evaluates the module `specifier` in `realm`'s registry, once
+   per realm: the same specifier in another realm is another module instance
+   with its own top-level state. A top-level await that needs the worker's
+   event loop returns COLLO_STATUS_PENDING, and
+   collo_runtime_module_eval_settled reports the settlement under this realm's
+   index and the specifier as the caller spelled it. */
+ColloStatus collo_module_evaluate(ColloRealm* realm, ColloString specifier, ColloValue** out_exception);
+/* Reads an export of the module `specifier` as evaluated in `realm`,
+   evaluating it first if needed; a pending top-level await fails with
+   COLLO_STATUS_UNSUPPORTED. */
+ColloStatus collo_module_get_export(ColloRealm* realm, ColloString specifier, ColloString export_name,
+    ColloValue** out_value, ColloValue** out_exception);
 
 ColloStatus collo_turn_enter(ColloVm* vm, ColloExecCtx* exec_ctx);
 /* Optional diagnostic output, borrowed for this call only. A non-null output
@@ -785,6 +827,10 @@ ColloStatus collo_promise_deferred_resolve(
     ColloVm* vm, ColloPromiseDeferred* deferred, const ColloValue* value, ColloValue** out_exception);
 ColloStatus collo_promise_deferred_reject(
     ColloVm* vm, ColloPromiseDeferred* deferred, const ColloValue* reason, ColloValue** out_exception);
+/* The realm the deferred's promise belongs to, where the caller creates the
+   value that settles it. Valid for an unsettled or settled deferred until
+   collo_promise_deferred_release. */
+ColloRealm* collo_promise_deferred_realm(const ColloPromiseDeferred* deferred);
 void collo_promise_deferred_release(ColloPromiseDeferred* deferred);
 ColloStatus collo_request_task_settle_thenable(
     ColloVm* vm, const ColloRequestCompletionToken* token, const ColloValue* value, ColloValue** out_exception);
@@ -792,37 +838,39 @@ ColloStatus collo_request_task_settle_thenable(
    thread, so the job carries only native data; collo_crypto_job_settle later
    settles its promise on the VM thread. */
 void collo_crypto_job_run(ColloCryptoJob* job);
-/* Consumes job on every call, including non-OK. */
+/* Consumes job on every call, including non-OK. The result is built in the
+   realm of the job's promise. */
 ColloStatus collo_crypto_job_settle(ColloVm* vm, ColloCryptoJob* job, ColloValue** out_exception);
 /* Must run on the VM thread because jobs may own JSC Strong handles. */
 void collo_crypto_job_destroy(ColloCryptoJob* job);
-ColloStatus collo_json_parse_utf8(ColloVm* vm, ColloString source, ColloValue** out_value, ColloValue** out_exception);
+ColloStatus collo_json_parse_utf8(
+    ColloRealm* realm, ColloString source, ColloValue** out_value, ColloValue** out_exception);
 
 ColloStatus collo_undefined(ColloVm* vm, ColloValue** out_value);
 ColloStatus collo_null(ColloVm* vm, ColloValue** out_value);
 ColloStatus collo_bool_new(ColloVm* vm, uint8_t value, ColloValue** out_value);
 ColloStatus collo_number_new(ColloVm* vm, double value, ColloValue** out_value);
 ColloStatus collo_string_new_utf8(ColloVm* vm, ColloString utf8, ColloValue** out_value);
-/* Creates a TypeError whose message is `message`, UTF-8 borrowed for the call;
-   the message may be empty. A null pointer with a non-zero length or invalid
-   UTF-8 fails with COLLO_STATUS_INVALID_ARGUMENT. *out_value is cleared on
-   entry and, on success, holds a new handle the caller releases with
-   collo_value_release. Runs no JavaScript, so it works inside or outside a
-   turn; takes the API lock. */
-ColloStatus collo_type_error_new_utf8(ColloVm* vm, ColloString message, ColloValue** out_value);
+/* Creates a TypeError of `realm` whose message is `message`, UTF-8 borrowed
+   for the call; the message may be empty. A null pointer with a non-zero
+   length or invalid UTF-8 fails with COLLO_STATUS_INVALID_ARGUMENT.
+   *out_value is cleared on entry and, on success, holds a new handle the
+   caller releases with collo_value_release. Runs no JavaScript, so it works
+   inside or outside a turn; takes the API lock. */
+ColloStatus collo_type_error_new_utf8(ColloRealm* realm, ColloString message, ColloValue** out_value);
 ColloStatus collo_array_buffer_new_copy(
-    ColloVm* vm, ColloBuffer bytes, ColloValue** out_value, ColloValue** out_exception);
+    ColloRealm* realm, ColloBuffer bytes, ColloValue** out_value, ColloValue** out_exception);
 ColloStatus collo_uint8_array_new_copy(
-    ColloVm* vm, ColloBuffer bytes, ColloValue** out_value, ColloValue** out_exception);
+    ColloRealm* realm, ColloBuffer bytes, ColloValue** out_value, ColloValue** out_exception);
 ColloStatus collo_blob_new_copy(
-    ColloVm* vm, ColloBuffer bytes, ColloString type, ColloValue** out_value, ColloValue** out_exception);
+    ColloRealm* realm, ColloBuffer bytes, ColloString type, ColloValue** out_value, ColloValue** out_exception);
 ColloStatus collo_fetch_read_result_new_copy(
-    ColloVm* vm, ColloBuffer bytes, uint8_t done, ColloValue** out_value, ColloValue** out_exception);
-ColloStatus collo_form_data_new_from_bytes(
-    ColloVm* vm, ColloBuffer bytes, ColloString content_type, ColloValue** out_value, ColloValue** out_exception);
-ColloStatus collo_object_new(ColloVm* vm, ColloValue** out_value);
-ColloStatus collo_array_new(ColloVm* vm, ColloValue** out_value);
-ColloStatus collo_global_this(ColloVm* vm, ColloValue** out_value);
+    ColloRealm* realm, ColloBuffer bytes, uint8_t done, ColloValue** out_value, ColloValue** out_exception);
+ColloStatus collo_form_data_new_from_bytes(ColloRealm* realm, ColloBuffer bytes, ColloString content_type,
+    ColloValue** out_value, ColloValue** out_exception);
+ColloStatus collo_object_new(ColloRealm* realm, ColloValue** out_value);
+ColloStatus collo_array_new(ColloRealm* realm, ColloValue** out_value);
+ColloStatus collo_global_this(ColloRealm* realm, ColloValue** out_value);
 /* Builds a route's `env` object: an ordinary object whose own enumerable data properties map each entry's name to
    its value as a string, in entry order, frozen before it is returned. It runs no JavaScript: properties are defined
    directly, so no setter on the prototype chain runs, and freezing an ordinary object reaches no trap. `entries` and
@@ -832,7 +880,7 @@ ColloStatus collo_global_this(ColloVm* vm, ColloValue** out_value);
    success, holds a new handle the caller releases with collo_value_release; a pending termination fails the call
    with COLLO_STATUS_ERROR. Takes the API lock; inside or outside a turn. */
 ColloStatus collo_env_object_new(
-    ColloVm* vm, const ColloNameValuePair* entries, size_t entry_count, ColloValue** out_value);
+    ColloRealm* realm, const ColloNameValuePair* entries, size_t entry_count, ColloValue** out_value);
 
 ColloStatus collo_object_get_utf8(
     ColloVm* vm, const ColloValue* object, ColloString key, ColloValue** out_value, ColloValue** out_exception);

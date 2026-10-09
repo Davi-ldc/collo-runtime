@@ -100,31 +100,16 @@ pub const InterfaceName = struct {
     }
 };
 
-/// The element sizes and capacities of a lane's fixed tables, filled by
-/// `laneMemoryShape` in `ingress/runner/root.zig`.
+/// A lane's memory with every table full and every buffer used, for the
+/// configuration the server boots: `laneMemoryShape` in
+/// `ingress/runner/root.zig` fills it.
 pub const MemoryShape = struct {
-    connection_slot_bytes: usize,
-    request_slot_bytes: usize,
-    deadline_entry_bytes: usize,
-    command_bytes: usize,
-    active_request_bytes: usize,
-    runner_connection_bytes: usize,
-    max_connections: usize,
-    max_requests: usize,
-    command_capacity: usize,
-    header_buffer_count: usize,
-    header_buffer_bytes: usize,
+    resident_cap_bytes: usize,
 
-    /// A lane's footprint with every table at capacity, the cost the memory
-    /// cap charges per lane.
+    /// A lane's footprint at its busiest, the cost the memory cap charges
+    /// per lane.
     pub fn estimatedHeavyLaneBytes(self: MemoryShape) usize {
-        return self.connection_slot_bytes * self.max_connections +
-            self.request_slot_bytes * self.max_requests +
-            self.deadline_entry_bytes * self.max_requests +
-            self.command_bytes * self.command_capacity +
-            self.active_request_bytes * self.max_requests +
-            self.runner_connection_bytes * self.max_connections +
-            self.header_buffer_count * self.header_buffer_bytes;
+        return self.resident_cap_bytes;
     }
 };
 

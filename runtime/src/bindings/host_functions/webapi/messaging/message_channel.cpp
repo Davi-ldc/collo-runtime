@@ -508,7 +508,7 @@ namespace {
         auto* collo_global = uncheckedDowncast<Collo::GlobalObject>(global_object);
         auto* new_target = call_frame->newTarget().getObject();
         auto* constructor = call_frame->jsCallee();
-        auto* base = collo_global->owner().webapi_cache.message_channel_structure.get();
+        auto* base = collo_global->webApiCache().message_channel_structure.get();
         RELEASE_ASSERT(base);
         if (!new_target || new_target == constructor)
             return base;
@@ -568,7 +568,7 @@ namespace {
         auto* structure = messageChannelStructureForNewTarget(global_object, scope, call_frame);
         RETURN_IF_EXCEPTION(scope, {});
         auto* port_structure
-            = uncheckedDowncast<Collo::GlobalObject>(global_object)->owner().webapi_cache.message_port_structure.get();
+            = uncheckedDowncast<Collo::GlobalObject>(global_object)->webApiCache().message_port_structure.get();
         RELEASE_ASSERT(port_structure);
         return JSValue::encode(JSColloMessageChannel::create(vm, structure, port_structure));
     }
@@ -842,7 +842,7 @@ JSC::JSObject* webApiCreateMessagePortTransferClone(
         return nullptr;
     }
     auto* structure
-        = uncheckedDowncast<Collo::GlobalObject>(global_object)->owner().webapi_cache.message_port_structure.get();
+        = uncheckedDowncast<Collo::GlobalObject>(global_object)->webApiCache().message_port_structure.get();
     RELEASE_ASSERT(structure);
     return JSColloMessagePort::create(global_object->vm(), structure);
 }
@@ -943,7 +943,7 @@ void installWebApiMessageChannel(Collo::GlobalObject* global_object, JSC::VM& vm
 
     auto* channel_structure = JSColloMessageChannel::createStructure(vm, global_object, channel_prototype);
     auto* port_structure = JSColloMessagePort::createStructure(vm, global_object, port_prototype);
-    auto& cache = global_object->owner().webapi_cache;
+    auto& cache = global_object->webApiCache();
     cache.message_channel_constructor.set(vm, channel_constructor);
     cache.message_channel_prototype.set(vm, channel_prototype);
     cache.message_channel_structure.set(vm, channel_structure);

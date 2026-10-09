@@ -21,7 +21,8 @@
 //! - `module_pack.zig`: the module pack format.
 //! - `fs_index.zig`, `fs_fault.zig`: a worker's file index and its file
 //!   requests.
-//! - `route_bindings.zig`: a route's bindings blob.
+//! - `route_table.zig`: the routes of a worker's definition, each with its
+//!   entry and its bindings (`route_bindings.zig`).
 //! - `packet.zig`, `outbound_queue.zig`: SEQPACKET framing with SCM_RIGHTS,
 //!   and the owned packet queues of nonblocking writers, bounded by the
 //!   limits their callers pass.
@@ -33,6 +34,7 @@ pub const messages = @import("messages.zig");
 pub const fs_fault = @import("fs_fault.zig");
 pub const fs_index = @import("fs_index.zig");
 pub const route_bindings = @import("route_bindings.zig");
+pub const route_table = @import("route_table.zig");
 pub const outbound_queue = @import("outbound_queue.zig");
 pub const packet = @import("packet.zig");
 pub const zygote_worker = @import("zygote_worker.zig");
@@ -107,8 +109,8 @@ pub const sendForkReply = zygote_worker.sendForkReply;
 pub const sendForkFailed = zygote_worker.sendForkFailed;
 pub const recvForkReply = zygote_worker.recvForkReply;
 pub const sendWorkerInitWithEgressShared = zygote_worker.sendWorkerInitWithEgressShared;
-pub const sendWorkerInitWithRouteBindingsAndEgressShared =
-    zygote_worker.sendWorkerInitWithRouteBindingsAndEgressShared;
+pub const sendWorkerInitWithRouteTableAndEgressShared =
+    zygote_worker.sendWorkerInitWithRouteTableAndEgressShared;
 pub const recvWorkerInit = zygote_worker.recvWorkerInit;
 pub const sendWorkerReady = zygote_worker.sendWorkerReady;
 pub const recvWorkerReady = zygote_worker.recvWorkerReady;

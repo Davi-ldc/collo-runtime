@@ -2462,22 +2462,24 @@ static std::span<const uint8_t> formDataBufferSpan(ColloBuffer buffer)
     return { buffer.ptr, buffer.len };
 }
 
-extern "C" ColloStatus collo_form_data_new_from_bytes(
-    ColloVm* vm, ColloBuffer bytes, ColloString content_type, ColloValue** out_value, ColloValue** out_exception)
+extern "C" ColloStatus collo_form_data_new_from_bytes(ColloRealm* realm, ColloBuffer bytes, ColloString content_type,
+    ColloValue** out_value, ColloValue** out_exception)
 {
     if (out_value)
         *out_value = nullptr;
     Collo::clearOutException(out_exception);
-    if (!vm || !vm->isReady() || !out_value || (bytes.len != 0 && !bytes.ptr))
+    if (!realmIsReady(realm) || !out_value || (bytes.len != 0 && !bytes.ptr))
         return COLLO_STATUS_INVALID_ARGUMENT;
 
     WTF::String type;
     if (Collo::stringToWTFString(content_type, type) != COLLO_STATUS_OK)
         return COLLO_STATUS_INVALID_ARGUMENT;
 
+    ColloVm* vm = realm->vm;
     JSC::JSLockHolder locker(*vm->vm);
     auto scope = DECLARE_THROW_SCOPE(*vm->vm);
-    auto* form_data = createFormDataFromBodyBytes(vm->global_object, scope, formDataBufferSpan(bytes), WTF::move(type));
+    auto* form_data
+        = createFormDataFromBodyBytes(realm->global_object, scope, formDataBufferSpan(bytes), WTF::move(type));
     if (scope.exception())
         return consumeExceptionStatus(vm, scope, out_exception);
     if (!form_data)

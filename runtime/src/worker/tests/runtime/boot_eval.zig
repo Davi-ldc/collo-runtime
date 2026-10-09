@@ -1,11 +1,13 @@
 //! Covers the boot context, under which module top-level code may fetch and
 //! set timers: its install with WorkerInit's boot token, which every fetch of
 //! module top-level code presents, the evaluation budget, the close when the
-//! route entry settles, the refusal of anything under its id afterwards or
-//! when it was never installed, and the refusal of fetch alone, with a
+//! route's evaluation settles, the refusal of anything under its id afterwards
+//! or when it was never installed, and the refusal of fetch alone, with a
 //! TypeError and before anything leaves the worker, when the boot token is
-//! `none`. A top-level `import()` loads from the route's pack and sends
-//! nothing to the server. Runs in `worker-test`.
+//! `none`. A top-level `import()` loads from the registered pack and sends
+//! nothing to the server. Each test boots one route; a table of several, and
+//! the context held open until the last of them settles, are covered in
+//! `routes.zig`. Runs in `worker-test`.
 //!
 //! These tests drive the worker side end to end (install, evaluate, settle,
 //! serve). The `LocalEgressGateway` harness submits straight to the engine
@@ -55,10 +57,10 @@ fn pumpOnce(runtime: *worker.Runtime) !void {
 fn pumpUntilRouteReady(runtime: *worker.Runtime, specifier: []const u8) !void {
     var attempts: usize = 0;
     while (attempts < 5000) : (attempts += 1) {
-        if (runtime.modules.state.route_modules.get(specifier)) |record| {
-            if (record == .ready)
+        if (rt.routeModule(runtime, specifier)) |record| {
+            if (record.* == .ready)
                 return;
-            if (record == .failed)
+            if (record.* == .failed)
                 return error.BootEvaluationFailed;
         }
         try pumpOnce(runtime);
@@ -76,6 +78,20 @@ fn expectControlSilent(fd: std.posix.fd_t, timeout_ms: i32) !void {
     try std.testing.expectEqual(@as(usize, 0), try std.posix.poll(&pollfds, timeout_ms));
 }
 
+/// Adds `specifier` as the runtime's route, as the route table WorkerInit
+/// carries would, and evaluates it as the worker's boot does, from the pack
+/// in `route_fd`.
+fn bootEvaluate(runtime: *worker.Runtime, route_fd: std.posix.fd_t, specifier: []const u8) !void {
+    _ = try rt.addRoute(runtime, specifier);
+    try runtime.evaluateBootRoutes(route_fd, 0, null);
+}
+
+/// The module state of the route at `specifier`, which the runtime holds.
+fn routeRecord(runtime: *worker.Runtime, specifier: []const u8) !worker.testing.module_routes.RouteModuleState {
+    const record = rt.routeModule(runtime, specifier) orelse return error.MissingRouteRecord;
+    return record.*;
+}
+
 fn enqueueRoute(
     runtime: *worker.Runtime,
     request_id: u64,
@@ -84,7 +100,7 @@ fn enqueueRoute(
 ) !void {
     var dispatch = try rt.initDispatchWork(std.testing.allocator, .{
         .request_id = request_id,
-        .route_entry_specifier = route_entry_specifier,
+        .route_index = rt.routeIndex(runtime, route_entry_specifier) orelse return error.TestRouteMissing,
         .request = .{ .path = path },
     });
     defer dispatch.deinit();
@@ -137,7 +153,7 @@ test "a top-level await fetch at boot presents WorkerInit's boot token" {
     defer std.posix.close(route_fd);
 
     const boot_token = rt.bootEgressToken(boot_window_end_ns);
-    try runtime.installBootContext(&boot_token, specifier);
+    try runtime.installBootContext(&boot_token);
     const boot_ctx = runtime.bootContext() orelse return error.MissingBootContext;
 
     // These fields differ from a dispatched request's, each for the reason
@@ -150,7 +166,7 @@ test "a top-level await fetch at boot presents WorkerInit's boot token" {
     try std.testing.expectEqual(@as(u64, 0), boot_ctx.exec.deadline_monotonic_ns);
     try std.testing.expectEqualSlices(u8, &boot_token, &boot_ctx.dispatch_work.egress_token);
 
-    try runtime.evaluateBootRouteEntry(route_fd, specifier, 0, null);
+    try bootEvaluate(&runtime, route_fd, specifier);
     // A top-level await is in flight, so the evaluation budget is armed.
     try std.testing.expect(boot_ctx.deadline_armed);
     try std.testing.expectEqual(now_mono_ns + module_eval_budget_ns, boot_ctx.exec.deadline_monotonic_ns);
@@ -212,8 +228,8 @@ test "boot top-level timer is canceled when the root entry settles" {
     defer std.posix.close(route_fd);
 
     const boot_token = rt.bootEgressToken(boot_window_end_ns);
-    try runtime.installBootContext(&boot_token, specifier);
-    try runtime.evaluateBootRouteEntry(route_fd, specifier, 0, null);
+    try runtime.installBootContext(&boot_token);
+    try bootEvaluate(&runtime, route_fd, specifier);
     try pumpUntilRouteReady(&runtime, specifier);
     try std.testing.expect(runtime.boot_ctx == .closed);
 
@@ -281,14 +297,13 @@ test "boot fire-and-forget fetch is canceled when the root entry settles" {
     defer std.posix.close(route_fd);
 
     const boot_token = rt.bootEgressToken(boot_window_end_ns);
-    try runtime.installBootContext(&boot_token, specifier);
-    try runtime.evaluateBootRouteEntry(route_fd, specifier, 0, null);
+    try runtime.installBootContext(&boot_token);
+    try bootEvaluate(&runtime, route_fd, specifier);
 
     // Without a top-level await the module settles synchronously, and the
     // close reaps the fetch started during evaluation while it is in flight,
     // telling the gateway to drop it.
-    const record = runtime.modules.state.route_modules.get(specifier) orelse
-        return error.MissingRouteRecord;
+    const record = try routeRecord(&runtime, specifier);
     try std.testing.expect(record == .ready);
     try std.testing.expect(runtime.boot_ctx == .closed);
 
@@ -368,7 +383,7 @@ test "top-level fetch without an installed boot context stays denied" {
     // No boot context was installed, as for a launch that does not serve
     // routes, so the VM refuses top-level host calls.
     try std.testing.expect(runtime.bootContext() == null);
-    try runtime.evaluateBootRouteEntry(route_fd, specifier, 0, null);
+    try bootEvaluate(&runtime, route_fd, specifier);
 
     const body = try rt.runRegisteredRouteAndReadBody(&runtime, control_pair[1], 61, specifier, .{});
     defer std.testing.allocator.free(body);
@@ -427,10 +442,10 @@ test "a boot context with the none boot token gives top-level code timers and re
 
     // A launch without an egress grant sends WorkerInit with the none boot
     // token (`host/launch.zig`). The context still exists, for timers.
-    try runtime.installBootContext(&ipc.egress_token.none, specifier);
+    try runtime.installBootContext(&ipc.egress_token.none);
     const boot_ctx = runtime.bootContext() orelse return error.MissingBootContext;
     try std.testing.expect(ipc.egress_token.isNone(&boot_ctx.dispatch_work.egress_token));
-    try runtime.evaluateBootRouteEntry(route_fd, specifier, 0, null);
+    try bootEvaluate(&runtime, route_fd, specifier);
     try pumpUntilRouteReady(&runtime, specifier);
 
     const body = try rt.runRegisteredRouteAndReadBody(&runtime, control_pair[1], 62, specifier, .{});
@@ -478,9 +493,9 @@ test "hung top-level await recycles the worker at the eval budget" {
     defer std.posix.close(route_fd);
 
     const boot_token = rt.bootEgressToken(boot_window_end_ns);
-    try runtime.installBootContext(&boot_token, specifier);
+    try runtime.installBootContext(&boot_token);
     const boot_ctx = runtime.bootContext() orelse return error.MissingBootContext;
-    try runtime.evaluateBootRouteEntry(route_fd, specifier, 0, null);
+    try bootEvaluate(&runtime, route_fd, specifier);
     try std.testing.expect(boot_ctx.deadline_armed);
 
     // With no request waiting, the boot context's armed budget is the one
@@ -494,8 +509,7 @@ test "hung top-level await recycles the worker at the eval budget" {
     try std.testing.expect(runtime.requests.active.contains(boot_request_id));
     try std.testing.expect(!boot_ctx.finish_started);
     try std.testing.expectEqual(@as(u64, 0), boot_ctx.exec.deadline_monotonic_ns);
-    const record = runtime.modules.state.route_modules.get(specifier) orelse
-        return error.MissingRouteRecord;
+    const record = try routeRecord(&runtime, specifier);
     try std.testing.expect(record == .evaluating);
     // No frame was sent for the boot id.
     try expectControlSilent(control_pair[1], 25);
@@ -531,9 +545,9 @@ test "eval-budget deadline after settlement is a no-op" {
     defer std.posix.close(route_fd);
 
     const boot_token = rt.bootEgressToken(boot_window_end_ns);
-    try runtime.installBootContext(&boot_token, specifier);
+    try runtime.installBootContext(&boot_token);
     const boot_ctx = runtime.bootContext() orelse return error.MissingBootContext;
-    try runtime.evaluateBootRouteEntry(route_fd, specifier, 0, null);
+    try bootEvaluate(&runtime, route_fd, specifier);
     try std.testing.expect(boot_ctx.deadline_armed);
 
     try support.registerModule(&vm, "/boot-gate-resolve.js",
@@ -543,8 +557,7 @@ test "eval-budget deadline after settlement is a no-op" {
     try support.evaluateOk(&vm, "/boot-gate-resolve.js");
     runtime.collectModuleSettlements();
 
-    const record = runtime.modules.state.route_modules.get(specifier) orelse
-        return error.MissingRouteRecord;
+    const record = try routeRecord(&runtime, specifier);
     try std.testing.expect(record == .ready);
     // The settlement's close disarmed the budget and destroyed the context,
     // so the deadline entry already queued finds no request and does nothing.
@@ -589,9 +602,9 @@ test "failed boot evaluation drains waiters with worker-side 500 then recycles" 
     defer std.posix.close(route_fd);
 
     const boot_token = rt.bootEgressToken(boot_window_end_ns);
-    try runtime.installBootContext(&boot_token, specifier);
+    try runtime.installBootContext(&boot_token);
     try std.testing.expect(runtime.bootContext() != null);
-    try runtime.evaluateBootRouteEntry(route_fd, specifier, 0, null);
+    try bootEvaluate(&runtime, route_fd, specifier);
 
     // A request that arrives during evaluation waits on it.
     try enqueueRoute(&runtime, 71, specifier, "/boot-fail");
@@ -608,8 +621,7 @@ test "failed boot evaluation drains waiters with worker-side 500 then recycles" 
     // The failure stays with the module and the recycle after the drain is
     // armed; the failed settlement also closed and destroyed the boot
     // context.
-    const record = runtime.modules.state.route_modules.get(specifier) orelse
-        return error.MissingRouteRecord;
+    const record = try routeRecord(&runtime, specifier);
     try std.testing.expect(record == .failed);
     try std.testing.expect(runtime.modules.state.recycle_after_drain);
     try std.testing.expect(runtime.boot_ctx == .closed);
@@ -674,8 +686,8 @@ test "a top-level import() at boot loads a packed module and refuses a missing o
     defer std.posix.close(route_fd);
 
     const boot_token = rt.bootEgressToken(boot_window_end_ns);
-    try runtime.installBootContext(&boot_token, specifier);
-    try runtime.evaluateBootRouteEntry(route_fd, specifier, 0, null);
+    try runtime.installBootContext(&boot_token);
+    try bootEvaluate(&runtime, route_fd, specifier);
     try pumpUntilRouteReady(&runtime, specifier);
 
     // Both imports settled from the registered pack: nothing crossed the
@@ -708,9 +720,8 @@ test "chokepoint guards drop response-path work for the boot context" {
     defer runtime.deinit();
     try runtime.attachHostRuntime();
 
-    const specifier = "/__collo_route/demo/boot-chokepoint.js";
     const boot_token = rt.bootEgressToken(boot_window_end_ns);
-    try runtime.installBootContext(&boot_token, specifier);
+    try runtime.installBootContext(&boot_token);
     const boot_ctx = runtime.bootContext() orelse return error.MissingBootContext;
 
     // A failure of boot work, which `requestFailureCallback` can report (for
@@ -786,10 +797,9 @@ test "teardown with an in-flight boot fetch reaps cleanly" {
     defer std.posix.close(route_fd);
 
     const boot_token = rt.bootEgressToken(boot_window_end_ns);
-    try runtime.installBootContext(&boot_token, specifier);
-    try runtime.evaluateBootRouteEntry(route_fd, specifier, 0, null);
-    const record = runtime.modules.state.route_modules.get(specifier) orelse
-        return error.MissingRouteRecord;
+    try runtime.installBootContext(&boot_token);
+    try bootEvaluate(&runtime, route_fd, specifier);
+    const record = try routeRecord(&runtime, specifier);
     try std.testing.expect(record == .ready);
 
     // Wait until the FetchStart crossed the wire: the gateway then holds a
@@ -890,10 +900,9 @@ test "closed boot context denies surviving-reference scheduling and the boot tok
     defer std.posix.close(route_fd);
 
     const boot_token = rt.bootEgressToken(boot_window_end_ns);
-    try runtime.installBootContext(&boot_token, specifier);
-    try runtime.evaluateBootRouteEntry(route_fd, specifier, 0, null);
-    const record = runtime.modules.state.route_modules.get(specifier) orelse
-        return error.MissingRouteRecord;
+    try runtime.installBootContext(&boot_token);
+    try bootEvaluate(&runtime, route_fd, specifier);
+    const record = try routeRecord(&runtime, specifier);
     try std.testing.expect(record == .ready);
     // The settlement was synchronous: the state is closed and the context
     // destroyed, so the worker's copy of the boot token is gone and nothing

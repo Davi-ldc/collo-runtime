@@ -26,6 +26,14 @@ pub const DeferredOwned = struct {
         self.* = .{};
     }
 
+    /// The realm of the deferred's promise, where the value that settles it
+    /// must be created, so the code awaiting it receives an object of its own
+    /// globals. Fails with `error.InvalidPromiseDeferred` when the handle is
+    /// empty.
+    pub fn realm(self: *const DeferredOwned) !bindings.Realm {
+        return bindings.promiseDeferredRealm(self.raw orelse return error.InvalidPromiseDeferred);
+    }
+
     /// Moves the deferred to the caller and leaves the handle empty. The
     /// caller must release it, settling it first when it can. Fails with
     /// `error.InvalidPromiseDeferred` when the handle is already empty.

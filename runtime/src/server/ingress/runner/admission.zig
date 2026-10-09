@@ -43,13 +43,13 @@
 
 const std = @import("std");
 const process = @import("collo_os").process;
+const lifecycle = @import("collo_server_lifecycle");
 const server_config = @import("collo_server_config");
 const routes_mod = @import("collo_server_routes");
 const supervision = @import("collo_server_supervisor");
 const ipc = @import("collo_ipc");
 const hpack = @import("collo_hpack");
 const fault = @import("../fault.zig");
-const ingress_state = @import("../state.zig");
 const PeerAddress = @import("../peer_address.zig").PeerAddress;
 const server_responses = @import("../server_responses.zig");
 const h2_request = @import("../http2/root.zig").request_head;
@@ -80,7 +80,7 @@ const pool = supervision.pool;
 pub const StreamError = fault.LaneFault || fault.Http2Error;
 
 /// The worker identity of a request that has no worker yet.
-const no_worker: ingress_state.WorkerKey = .{ .worker_id = 0, .worker_generation = 0 };
+const no_worker: lifecycle.WorkerKey = .{ .worker_id = 0, .worker_generation = 0 };
 
 /// Waiters one `takeStranded` call moves out of the pool.
 const stranded_batch_len: usize = 16;
@@ -178,9 +178,10 @@ pub fn Methods(comptime Self: type) type {
         /// Admits a new stream. A stream whose path matches a route takes its
         /// lane request slot and its deadline, then a worker slot from its
         /// definition's pool or a place in the pool's FIFO; every other
-        /// stream gets the lane's own answer. Returns false when the stream
-        /// cannot be opened, which the connection driver answers as a
-        /// protocol error.
+        /// stream gets the lane's own answer. A stream the connection or the
+        /// lane has no room for is refused alone (REFUSED_STREAM), so the
+        /// client may retry it. Returns false when the stream cannot be
+        /// opened, which the connection driver answers as a protocol error.
         pub fn startDynamicH2(
             self: *Self,
             runtime: *ConnectionSlot,
@@ -188,7 +189,7 @@ pub fn Methods(comptime Self: type) type {
             head: *const h2_request.ParsedHead,
         ) StreamError!bool {
             runtime.h2ReserveStream(stream_id) catch |err| switch (err) {
-                error.Http2TooManyConcurrentStreams => {
+                error.Http2TooManyConcurrentStreams, error.Http2StreamSlabFull => {
                     try http2_writing.queueRstStream(Self, self, runtime, stream_id, .refused_stream);
                     return true;
                 },
@@ -200,7 +201,10 @@ pub fn Methods(comptime Self: type) type {
             };
             runtime.h2SetRequestBodyExpectation(stream_id, head.body_framing, head.content_length, head.end_stream) catch return false;
             self.lane.counters.ingress_channels_started += 1;
-            Deadlines.clearPreRequestDeadline(self, runtime);
+            // The connection's first stream ends its pre-request deadline; the
+            // drive that called this files the next one
+            // (`deadline_driver.syncConnectionDeadline`).
+            runtime.awaiting_first_request = false;
 
             var captures: routes_mod.Captures = undefined;
             const matched = switch (streamTarget(&self.service.routes.table, head.path, &captures)) {
@@ -256,49 +260,41 @@ pub fn Methods(comptime Self: type) type {
             const definition = self.service.routes.definition(matched.key.definition);
             const deadline_ns = now +| definition.settings.limits.timeoutNs();
             const request_id = self.service.allocateRequestId();
-            const request_key = admit: {
-                const key = self.lane.state.requests.alloc(
-                    request_id,
-                    runtime.key,
-                    no_worker,
-                    now,
-                    deadline_ns,
-                ) catch |err| switch (err) {
-                    // The lane request slab is full. Only this stream is shed,
-                    // with REFUSED_STREAM, so the client may retry it; the
-                    // connection and every other stream on the lane stay.
-                    error.RequestSlabFull => {
-                        try http2_writing.queueRstStream(Self, self, runtime, stream_id, .refused_stream);
-                        return true;
-                    },
-                };
-                errdefer self.lane.releaseCompletedRequest(key);
-                try insertWheelEntry(self, key, runtime.key, deadline_ns, now);
-                try runtime.h2BindRequest(stream_id, key, request_id);
-                break :admit key;
+            const acquired = self.requests.acquire() orelse {
+                // The lane request slab is full. Only this stream is shed,
+                // with REFUSED_STREAM, so the client may retry it; the
+                // connection and every other stream on the lane stay.
+                try http2_writing.queueRstStream(Self, self, runtime, stream_id, .refused_stream);
+                return true;
             };
+            const slot = acquired.entry;
+            slot.request_key = .{ .lane_id = self.lane.lane_id, .slot = acquired.index, .generation = acquired.generation };
+            slot.request_id = request_id;
+            slot.connection_key = runtime.key;
+            slot.ingress_channel_id = stream_id;
+            slot.route = matched.key;
+            slot.deadline_ns = deadline_ns;
+            slot.admitted_ns = now;
+            {
+                errdefer {
+                    _ = self.lane.cancelRequestDeadline(&slot.deadline);
+                    self.requests.release(acquired.index);
+                }
+                try insertWheelEntry(self, slot, deadline_ns, now);
+                try runtime.h2BindRequest(stream_id, slot.request_key, request_id);
+            }
             // From here the request owns the stream: its finish answers or
             // removes it.
             stream_unclaimed = false;
-            self.dynamic_requests[request_key.slot] = .{
-                .active = true,
-                .request_key = request_key,
+            slot.access = stampAccessFacts(self, runtime, matched.key, .{
                 .request_id = request_id,
-                .connection_key = runtime.key,
-                .ingress_channel_id = stream_id,
-                .route = matched.key,
-                .deadline_ns = deadline_ns,
-                .admitted_ns = now,
-                .access = stampAccessFacts(self, runtime, matched.key, .{
-                    .request_id = request_id,
-                    .method = head.method,
-                    .path = head.path,
-                    .user_agent = access_log.userAgent(head.headers),
-                    .started_mono_ns = now,
-                }),
-            };
-            self.dynamic_request_count += 1;
-            try placeRequest(self, request_key.slot, .{
+                .method = head.method,
+                .path = head.path,
+                .user_agent = access_log.userAgent(head.headers),
+                .started_mono_ns = now,
+            });
+            self.request_count += 1;
+            try placeRequest(self, acquired.index, .{
                 .authority = head.authority(),
                 .method = head.method,
                 .path = head.path,
@@ -319,7 +315,7 @@ pub fn Methods(comptime Self: type) type {
         /// is borrowed for the call, from the decoder or from the request's
         /// own copy.
         fn placeRequest(self: *Self, request_slot: u32, head: DispatchHead) LaneFault!void {
-            const slot = &self.dynamic_requests[request_slot];
+            const slot = &self.requests.entries[request_slot];
             const definition = slot.route.definition;
             const definition_pool = self.service.supervisor.poolFor(definition);
             switch (definition_pool.acquire(self.lane.lane_id, slot.request_key, slot.deadline_ns)) {
@@ -345,7 +341,7 @@ pub fn Methods(comptime Self: type) type {
         /// Asks the pool again for a waiting request whose handed slot came
         /// from a worker that left service before the request could use it.
         pub fn placeWaitingRequest(self: *Self, request_slot: u32) LaneFault!void {
-            const slot = &self.dynamic_requests[request_slot];
+            const slot = &self.requests.entries[request_slot];
             if (!slot.waiting())
                 return;
             // A request that waits owns its head (`placeRequest`).
@@ -396,16 +392,10 @@ pub fn Methods(comptime Self: type) type {
         /// earliest entry left, that entry's deadline. A later entry never
         /// needs a re-arm, and a removed one leaves the timerfd early, which
         /// costs one spurious wake that re-arms it.
-        fn insertWheelEntry(
-            self: *Self,
-            request_key: ingress_state.RequestKey,
-            connection_key: ingress_state.ConnectionKey,
-            deadline_ns: u64,
-            now: u64,
-        ) LaneFault!void {
+        fn insertWheelEntry(self: *Self, slot: *RequestSlot, deadline_ns: u64, now: u64) LaneFault!void {
             const earliest = self.lane.deadline_wheel.next_deadline_monotonic_ns;
             const re_arm = if (earliest) |earliest_ns| deadline_ns < earliest_ns else true;
-            _ = try self.lane.insertDeadline(request_key, connection_key, no_worker, deadline_ns, now);
+            try self.lane.armRequestDeadline(&slot.deadline, slot.request_key, slot.connection_key, no_worker, deadline_ns, now);
             if (re_arm)
                 try deadline_driver.armTimerAt(Self, self, now);
         }
@@ -484,23 +474,21 @@ pub fn Methods(comptime Self: type) type {
         }
 
         /// The slot of the request `request_key` names when it is still
-        /// this lane's and active, waiting or dispatched.
-        pub fn findRequestSlot(self: *Self, request_key: ingress_state.RequestKey) ?u32 {
+        /// this lane's and live, waiting or dispatched.
+        pub fn findRequestSlot(self: *Self, request_key: lifecycle.RequestKey) ?u32 {
             if (request_key.lane_id != self.lane.lane_id)
                 return null;
-            if (request_key.slot >= self.dynamic_requests.len)
-                return null;
-            const slot = &self.dynamic_requests[request_key.slot];
-            if (!slot.active or !slot.request_key.eql(request_key))
-                return null;
-            return request_key.slot;
+            return switch (self.requests.lookup(request_key.slot, request_key.generation)) {
+                .live => request_key.slot,
+                .stale_generation, .vacant, .out_of_range => null,
+            };
         }
 
         /// `findRequestSlot` for a request that still waits for a worker
         /// slot, which a `dispatch_ready` or `dispatch_failed` for it needs.
-        pub fn waitingRequestSlot(self: *Self, request_key: ingress_state.RequestKey) ?u32 {
+        pub fn waitingRequestSlot(self: *Self, request_key: lifecycle.RequestKey) ?u32 {
             const request_slot = findRequestSlot(self, request_key) orelse return null;
-            if (!self.dynamic_requests[request_slot].waiting())
+            if (!self.requests.entries[request_slot].waiting())
                 return null;
             return request_slot;
         }
@@ -508,11 +496,10 @@ pub fn Methods(comptime Self: type) type {
         /// The HTTP/2 connection of the request in `slot`, or null once it
         /// closed.
         pub fn requestConnection(self: *Self, slot: *const RequestSlot) ?*ConnectionSlot {
-            if (slot.connection_key.slot >= self.connection_slots.len)
-                return null;
-            const runtime = &self.connection_slots[slot.connection_key.slot];
-            if (!runtime.active or !runtime.key.eql(slot.connection_key))
-                return null;
+            const runtime = switch (self.connections.lookup(slot.connection_key.slot, slot.connection_key.generation)) {
+                .live => |runtime| runtime,
+                .stale_generation, .vacant, .out_of_range => return null,
+            };
             if (runtime.state != .http2_connection)
                 return null;
             return runtime;

@@ -19,13 +19,12 @@ pub const worker_definitions_max: usize = 256;
 /// packed under.
 pub const worker_name_bytes_max: usize = 64;
 
-/// Most routes one worker definition may declare once workers serve several
-/// routes; until then the parser accepts exactly one.
+/// Most routes one worker definition may declare. A worker of the definition
+/// serves all of them and boots every one before it reports ready, so this
+/// also bounds a cold start's module work and a worker's realms.
 pub const routes_per_definition_max: usize = 64;
 
-/// Most routes across every definition. Every route holds two sealed memfds
-/// (its module pack and its bindings) open in the server for its whole life,
-/// so this bound is also a bound on those descriptors.
+/// Most routes across every definition.
 pub const routes_max: usize = 256;
 
 /// Longest route pattern, in bytes.
@@ -38,7 +37,7 @@ pub const route_pattern_bytes_max: usize = 1024;
 /// captures of one match.
 pub const route_path_segments_max: usize = 64;
 
-/// Bytes of every route's module pack together. Packs stay resident in
+/// Bytes of every definition's module pack together. Packs stay resident in
 /// sealed memfds from boot until shutdown, so this bounds the shared memory
 /// the server pins for code. One pack is also bounded by
 /// `max_pack_bytes` in `common/ipc/module_pack.zig`.

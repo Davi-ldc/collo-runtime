@@ -1,23 +1,22 @@
-//! The bindings blob (`common/ipc/route_bindings.zig`): the name grammar,
-//! the builder's checks on its input, the round trip through the sealed
-//! memfd, and the decode that re-checks every rule on bytes the builder
-//! would refuse. The worker building `env` from a blob is covered by
+//! A route's bindings section (`common/ipc/route_bindings.zig`): the name
+//! grammar, the encoder's checks on its input, the round trip, and the
+//! decode that re-checks every rule on bytes the encoder would refuse. The
+//! route table that carries one section per route is covered by
+//! `route_table.zig`, the worker building `env` from a section by
 //! `worker/tests/runtime/env.zig`, and WorkerInit delivering it by
 //! local-e2e.
 
 const std = @import("std");
 const ipc = @import("collo_ipc");
-const fd_mod = @import("collo_os").fd;
 
 const route_bindings = ipc.route_bindings;
 const Entry = route_bindings.Entry;
 
-/// The bytes of a sealed blob, read back the way a worker sees them.
-fn readSealed(sealed: route_bindings.Sealed) ![]u8 {
-    const bytes = try std.testing.allocator.alloc(u8, @intCast(sealed.blob_len));
-    errdefer std.testing.allocator.free(bytes);
-    if (try std.posix.pread(sealed.fd, bytes, 0) != bytes.len)
-        return error.ShortBlobRead;
+/// `entries` encoded as the route table builder writes a route's section;
+/// the caller frees the result.
+fn encodeSection(entries: []const Entry) ![]u8 {
+    const bytes = try std.testing.allocator.alloc(u8, try route_bindings.encodedLen(entries));
+    route_bindings.encode(bytes, entries);
     return bytes;
 }
 
@@ -34,16 +33,13 @@ test "binding names are identifiers within the name bound" {
     try std.testing.expect(!route_bindings.isBindingName("x" ** (route_bindings.name_bytes_max + 1)));
 }
 
-test "a built blob is sealed read-only and decodes to its entries in order" {
+test "an encoded section decodes to its entries in order" {
     const entries = [_]Entry{
         .{ .name = "SECRET", .value = "s3cr3t" },
         .{ .name = "GREETING", .value = "olá" },
         .{ .name = "EMPTY", .value = "" },
     };
-    const sealed = try route_bindings.buildSealed(std.testing.allocator, &entries);
-    defer sealed.close();
-    try fd_mod.requireSeals(sealed.fd, fd_mod.memfd_readonly_seals);
-    const bytes = try readSealed(sealed);
+    const bytes = try encodeSection(&entries);
     defer std.testing.allocator.free(bytes);
 
     var storage: route_bindings.Entries = undefined;
@@ -55,19 +51,13 @@ test "a built blob is sealed read-only and decodes to its entries in order" {
     }
 }
 
-test "a route without bindings gets the empty blob" {
-    const empty = try route_bindings.createEmptySealed();
-    defer empty.close();
-    const built = try route_bindings.buildSealed(std.testing.allocator, &.{});
-    defer built.close();
-    for ([_]route_bindings.Sealed{ empty, built }) |sealed| {
-        const bytes = try readSealed(sealed);
-        defer std.testing.allocator.free(bytes);
-        try std.testing.expectEqualSlices(u8, &route_bindings.empty_blob, bytes);
-    }
+test "a route without bindings gets the empty section" {
+    const bytes = try encodeSection(&.{});
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqualSlices(u8, &route_bindings.empty_blob, bytes);
 }
 
-test "the builder refuses entries a worker would refuse" {
+test "the encoder refuses entries a worker would refuse" {
     var too_many: [route_bindings.entries_max + 1]Entry = undefined;
     var names: [too_many.len][8]u8 = undefined;
     for (&too_many, &names, 0..) |*entry, *name, index|
@@ -84,7 +74,7 @@ test "the builder refuses entries a worker would refuse" {
         &.{.{ .name = "BIG", .value = oversized }},
     };
     for (cases) |entries|
-        try std.testing.expectError(error.InvalidRouteBindings, route_bindings.buildSealed(std.testing.allocator, entries));
+        try std.testing.expectError(error.InvalidRouteBindings, route_bindings.encodedLen(entries));
 }
 
 test "decode refuses truncated, oversized and trailing layouts" {

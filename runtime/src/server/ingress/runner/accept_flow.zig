@@ -1,9 +1,13 @@
 //! The multishot accept of an ingress lane and the setup of each accepted
 //! connection, on the lane thread. The lane keeps one multishot accept armed
 //! on its listener and re-arms it whenever the kernel ends it, except while
-//! the server is stopping. An accepted socket belongs to the accept path
-//! until `startConnection` gives it a connection slot, and from then on to
-//! that slot, whose close also closes the socket.
+//! the server is stopping; arming only prepares the submission, which the
+//! pass's one `io_uring_enter` hands over (`event_sources.LaneRing`). An
+//! accepted socket belongs to the accept path until `startConnection` gives
+//! it a connection slot, and from then on to that slot, whose close also
+//! closes the socket. A connection costs no buffer until it reads: every
+//! read goes into the lane's one read buffer, so the connection slab's
+//! capacity is the only bound on connections.
 //!
 //! A socket that cannot be set up concerns only itself: its error is a
 //! connection outcome (`fault.classifyConnectionError`, `.accept`), the
@@ -15,7 +19,6 @@
 
 const std = @import("std");
 const linux = std.os.linux;
-const fd_mod = @import("collo_os").fd;
 const process = @import("collo_os").process;
 const socket_mod = @import("collo_os").socket;
 
@@ -33,7 +36,6 @@ const LaneFault = fault.LaneFault;
 /// How long the lane waits before re-arming an accept that the kernel ended
 /// on EMFILE or ENFILE.
 const accept_backoff_ns: u64 = 25 * std.time.ns_per_ms;
-const ConnectionSlot = connection_slot.Slot;
 
 pub fn Methods(comptime Self: type) type {
     return struct {
@@ -41,21 +43,21 @@ pub fn Methods(comptime Self: type) type {
         const Deadlines = deadline_driver.Methods(Self);
         const Queues = work_queues.Methods(Self);
 
-        /// Arms the lane's multishot accept unless it is already active.
+        /// Prepares the lane's multishot accept unless it is already active.
         /// Accepted sockets arrive nonblocking and close-on-exec.
-        pub fn ensureAcceptArmed(self: *Self, ring: *linux.IoUring) LaneFault!void {
+        pub fn ensureAcceptArmed(self: *Self, ring: *event_sources.LaneRing) LaneFault!void {
             if (self.lane.accept_registration.state == .active)
                 return;
             const generation = self.lane.accept_registration.arm();
             const user_data = try accept.packAcceptUserData(self.lane.lane_id, generation);
-            _ = try ring.accept_multishot(
-                user_data,
+            const sqe = try ring.prepare();
+            sqe.prep_multishot_accept(
                 self.listener.stream.handle,
                 null,
                 null,
                 std.posix.SOCK.NONBLOCK | std.posix.SOCK.CLOEXEC,
             );
-            try event_sources.submitPending(ring);
+            sqe.user_data = user_data;
         }
 
         /// Loop handler for one accept completion. A completion of an earlier
@@ -137,10 +139,7 @@ pub fn Methods(comptime Self: type) type {
             switch (try fault.classifyConnectionError(.{ .accept = err })) {
                 .keep => {},
                 .close => |close| switch (close.reason) {
-                    .connection_limit => switch (err) {
-                        error.IngressHeaderBufferExhausted => self.lane.counters.accepted_header_buffer_exhaustion += 1,
-                        else => self.lane.counters.accepted_connection_slab_exhaustion += 1,
-                    },
+                    .connection_limit => self.lane.counters.accepted_connection_slab_exhaustion += 1,
                     else => {
                         self.lane.counters.accepted_setup_failures += 1;
                         std.log.warn(
@@ -155,55 +154,37 @@ pub fn Methods(comptime Self: type) type {
         /// Gives the accepted socket `fd`, which it owns from the call, a
         /// connection slot and starts its TLS handshake under the
         /// pre-request deadline. On every error the socket is closed: before
-        /// the connection slab takes it here, after that by the slab.
+        /// the slot takes it here, after that by the slot's close.
         pub fn startConnection(self: *Self, fd: std.posix.fd_t) (LaneFault || fault.AcceptError)!void {
-            const buffer_index = Queues.acquireHeaderBuffer(self) orelse {
+            const acquired = self.connections.acquire() orelse {
                 std.posix.close(fd);
-                return error.IngressHeaderBufferExhausted;
+                return error.ConnectionSlabFull;
             };
-            var transferred_to_runtime = false;
-            errdefer if (!transferred_to_runtime) Queues.releaseHeaderBuffer(self, buffer_index);
-
-            const connection_key = self.lane.allocateAcceptedConnection(fd_mod.OwnedFd.fromRaw(fd)) catch |err| {
-                std.posix.close(fd);
-                return err;
-            };
-            errdefer if (!transferred_to_runtime) {
-                _ = self.lane.state.connections.closeConnection(connection_key);
-                _ = self.lane.state.connections.release(connection_key);
+            const runtime = acquired.entry;
+            runtime.key = .{ .lane_id = self.lane.lane_id, .slot = acquired.index, .generation = acquired.generation };
+            runtime.fd = fd;
+            runtime.streams = &self.h2_lane.streams;
+            runtime.wait_events = event_sources.read_write_events;
+            self.lane.counters.accepted_connections += 1;
+            const now = monotonicNowNs();
+            runtime.accepted_ns = now;
+            runtime.last_progress_ns = now;
+            // What fails below is the socket's setup or its TLS session
+            // (`fault.AcceptError`), whose rows are this close, or the lane
+            // itself. The close runs on the slot's next turn.
+            var runtime_owned = true;
+            errdefer if (runtime_owned) {
+                Connection.closeRuntimeConnection(self, runtime, .{ .reason = .setup_failed, .goaway = null });
             };
             try socket_mod.setTcpNoDelay(fd);
             configureAcceptedTcpNotSentLowAt(self, fd);
             // `ensureAcceptArmed` passes no address buffer, so the peer
             // address is read here, once per connection.
-            const peer_address = try PeerAddress.fromSocket(fd);
-
-            const runtime: *ConnectionSlot = &self.connection_slots[connection_key.slot];
-            // A ready-queue entry left by the slot's last connection keeps
-            // the flag (`enqueueConnection` in `work_queues.zig`).
-            const queued = runtime.queued;
-            runtime.* = .{
-                .active = true,
-                .queued = queued,
-                .key = connection_key,
-                .fd = fd,
-                .peer_address = peer_address,
-                .state = .tls_handshake,
-                .buffer_index = buffer_index,
-                .wait_events = event_sources.read_write_events,
-            };
-            const now = monotonicNowNs();
-            Deadlines.activatePreRequestDeadline(self, runtime, now);
-            transferred_to_runtime = true;
-            var runtime_owned = true;
-            // What fails below is the TLS session (`fault.AcceptError`), whose
-            // row is this close, or the lane itself.
-            errdefer if (runtime_owned) Connection.closeRuntimeConnection(self, runtime, .{ .reason = .setup_failed, .goaway = null });
-
+            runtime.peer_address = try PeerAddress.fromSocket(fd);
             runtime.tls_connection = try self.service.tls_context.start(fd);
-            try deadline_driver.armTimerAt(Self, self, now);
+            try Deadlines.syncConnectionDeadline(self, runtime);
             try Connection.updateConnectionInterest(self, runtime);
-            Queues.enqueueConnection(self, connection_key.slot);
+            Queues.enqueueConnection(self, acquired.index);
             runtime_owned = false;
         }
 

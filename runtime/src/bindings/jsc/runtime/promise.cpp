@@ -2,9 +2,10 @@
 // reports a handler's result to the Zig runtime once it settles. Runs on the VM thread.
 //
 // A ColloPromiseDeferred holds a value handle to each of its promise's resolve and reject functions until it settles;
-// collo_promise_deferred_release frees it, settled or not. The settler functions capture the request's completion
-// token by value, and the Zig runtime checks its slot and generations, so a settlement that arrives after its request
-// ended cannot complete a later one.
+// collo_promise_deferred_release frees it, settled or not. It also names its promise's realm, where the value that
+// settles it is created, for its whole life. The settler functions capture the request's completion token by value,
+// and the Zig runtime checks its slot and generations, so a settlement that arrives after its request ended cannot
+// complete a later one.
 
 #include "host_functions/internal.h"
 #include "jsc/runtime/state.h"
@@ -15,11 +16,13 @@ using namespace JSC;
 
 struct ColloPromiseDeferred {
     ColloVm* owner;
+    ColloRealm* realm;
     ColloValue* resolve;
     ColloValue* reject;
 
-    ColloPromiseDeferred(ColloVm* vm, ColloValue* resolve_handle, ColloValue* reject_handle)
-        : owner(vm)
+    ColloPromiseDeferred(ColloRealm* promise_realm, ColloValue* resolve_handle, ColloValue* reject_handle)
+        : owner(promise_realm->vm)
+        , realm(promise_realm)
         , resolve(resolve_handle)
         , reject(reject_handle)
     {
@@ -98,6 +101,9 @@ ColloStatus createPromiseDeferred(
         *out_deferred = nullptr;
     if (!vm || !vm->isReady() || !global_object || !out_promise || !out_deferred)
         return COLLO_STATUS_INVALID_ARGUMENT;
+    auto* collo_global = dynamicDowncast<Collo::GlobalObject>(global_object);
+    if (!collo_global || &collo_global->owner() != vm)
+        return COLLO_STATUS_INVALID_ARGUMENT;
 
     auto data = JSC::JSPromise::createDeferredData(global_object, global_object->promiseConstructor());
     if (!data.promise || !data.resolve || !data.reject)
@@ -112,7 +118,7 @@ ColloStatus createPromiseDeferred(
         return COLLO_STATUS_OUT_OF_MEMORY;
     }
 
-    auto* deferred = new (std::nothrow) ColloPromiseDeferred(vm, resolve_handle, reject_handle);
+    auto* deferred = new (std::nothrow) ColloPromiseDeferred(&collo_global->realm(), resolve_handle, reject_handle);
     if (!deferred) {
         Collo::releaseValueHandle(reject_handle);
         Collo::releaseValueHandle(resolve_handle);
@@ -150,7 +156,7 @@ ColloStatus settlePromiseDeferred(
         return COLLO_STATUS_OUT_OF_MEMORY;
 
     auto scope = DECLARE_TOP_EXCEPTION_SCOPE(*vm->vm);
-    JSC::call(vm->global_object, callback_object, call_data, JSC::jsUndefined(), arguments);
+    JSC::call(deferred->realm->global_object, callback_object, call_data, JSC::jsUndefined(), arguments);
     if (scope.exception()) {
         ColloStatus status = Collo::caughtExceptionStatus(vm, scope, out_exception);
         deferred->clear();
@@ -178,7 +184,8 @@ extern "C" ColloStatus collo_value_is_thenable(
         return COLLO_STATUS_OK;
 
     auto scope = DECLARE_TOP_EXCEPTION_SCOPE(*vm->vm);
-    JSC::JSValue then_value = object->get(vm->global_object, JSC::Identifier::fromString(*vm->vm, "then"_s));
+    JSC::JSValue then_value
+        = object->get(Collo::globalObjectForValue(vm, object), JSC::Identifier::fromString(*vm->vm, "then"_s));
     if (scope.exception())
         return Collo::caughtExceptionStatus(vm, scope, out_exception);
 
@@ -205,6 +212,11 @@ extern "C" ColloStatus collo_promise_deferred_reject(
     return Collo::settlePromiseDeferred(vm, deferred, Collo::toJSValue(reason), true, out_exception);
 }
 
+extern "C" ColloRealm* collo_promise_deferred_realm(const ColloPromiseDeferred* deferred)
+{
+    return deferred ? deferred->realm : nullptr;
+}
+
 extern "C" void collo_promise_deferred_release(ColloPromiseDeferred* deferred)
 {
     if (!deferred)
@@ -224,20 +236,24 @@ extern "C" ColloStatus collo_request_task_settle_thenable(
     JSC::JSLockHolder locker(*vm->vm);
     auto scope = DECLARE_TOP_EXCEPTION_SCOPE(*vm->vm);
 
-    auto* resolve_function = requestTaskSettlerFunction(*vm, vm->global_object, *token, false);
-    auto* reject_function = requestTaskSettlerFunction(*vm, vm->global_object, *token, true);
+    // The handler's own realm, so a promise it returned is adopted as it is: PromiseResolve wraps a promise whose
+    // constructor is another realm's, which would cost the settlement an extra round of microtasks.
+    JSC::JSValue js_value = Collo::toJSValue(value);
+    auto* global_object = Collo::globalObjectForValue(vm, js_value);
+    auto* resolve_function = requestTaskSettlerFunction(*vm, global_object, *token, false);
+    auto* reject_function = requestTaskSettlerFunction(*vm, global_object, *token, true);
     if (!resolve_function || !reject_function)
         return COLLO_STATUS_OUT_OF_MEMORY;
 
-    JSC::JSObject* promise_object = JSC::JSPromise::promiseResolve(
-        vm->global_object, vm->global_object->promiseConstructor(), Collo::toJSValue(value));
+    JSC::JSObject* promise_object
+        = JSC::JSPromise::promiseResolve(global_object, global_object->promiseConstructor(), js_value);
     if (scope.exception())
         return Collo::caughtExceptionStatus(vm, scope, out_exception);
 
     auto* promise = dynamicDowncast<JSC::JSPromise>(promise_object);
     if (!promise)
         return COLLO_STATUS_ERROR;
-    promise->performPromiseThen(*vm->vm, vm->global_object, resolve_function, reject_function, JSC::jsUndefined());
+    promise->performPromiseThen(*vm->vm, global_object, resolve_function, reject_function, JSC::jsUndefined());
     if (scope.exception())
         return Collo::caughtExceptionStatus(vm, scope, out_exception);
     return COLLO_STATUS_OK;

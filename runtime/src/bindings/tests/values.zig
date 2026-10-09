@@ -67,7 +67,7 @@ test "a TypeError made outside a turn is a TypeError to JavaScript and keeps its
     // decode into the engine and an encode back out.
     const messages = [_][]const u8{ "fetch failed: r\u{e9}sum\u{e9} \u{2713}", "" };
     inline for (messages) |message| {
-        var type_error = try vm.typeErrorValueUtf8(message);
+        var type_error = try vm.mainRealm().typeErrorValueUtf8(message);
         defer type_error.deinit();
 
         try vm.turnEnter(&exec_ctx);
@@ -83,14 +83,14 @@ test "a TypeError message that is not UTF-8 is refused" {
     var vm = try support.createVm();
     defer vm.deinit();
 
-    try std.testing.expectError(error.InvalidArgument, vm.typeErrorValueUtf8("fetch failed: \xff"));
+    try std.testing.expectError(error.InvalidArgument, vm.mainRealm().typeErrorValueUtf8("fetch failed: \xff"));
 }
 
 test "empty string object property key is valid" {
     var vm = try support.createVm();
     defer vm.deinit();
 
-    var object = try vm.objectValue();
+    var object = try vm.mainRealm().objectValue();
     defer object.deinit();
 
     var value = try vm.stringValueUtf8("blank-key");

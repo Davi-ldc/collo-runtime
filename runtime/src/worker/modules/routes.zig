@@ -1,15 +1,28 @@
-//! Registration and evaluation of a route's entry module, and the table of
-//! route module states (`State.route_modules`) that caches each ready
-//! route's handler and `env` object (`RouteModule`). Runs on the worker's VM
-//! thread. A route's pack is registered once, as permanent, before any
-//! request names the route: the worker's boot registers the pack of
-//! WorkerInit's route entry (`bootEvaluateRouteEntry`), and its specifiers
-//! are recorded in `State.loaded_sources`. A dispatch names its route's
-//! entry and carries no pack, so a request for a route no registered pack
-//! holds fails. The pack holds every module the route's code names with a
-//! string literal, so a handler's `import()` loads from the registered packs
-//! alone, in the engine's loader (`moduleLoaderFetch` in
+//! The routes of the worker's definition: the registration of the
+//! definition's module pack, and the evaluation of each route's entry in the
+//! route's realm, with the route records (`State.routes`) that cache each
+//! ready route's handler and `env` (`RouteModule`). Runs on the worker's VM
+//! thread.
+//!
+//! The worker's boot registers the pack WorkerInit delivered, as permanent
+//! (`bootRegisterPack`), and evaluates every route's entry before the worker
+//! reports ready (`bootEvaluateRoute`, which `Runtime.evaluateBootRoutes`
+//! calls in route order); the pack's specifiers are recorded in
+//! `State.loaded_sources`. A dispatch names its route by its index in the
+//! route table and carries no pack, so a request for a route whose entry no
+//! registered pack holds fails. The pack holds every module the routes' code
+//! names with a string literal, so a handler's `import()` loads from the
+//! registered packs alone, in the engine's loader (`moduleLoaderFetch` in
 //! `bindings/jsc/runtime/module_loader.cpp`), with no message to the server.
+//!
+//! In a worker that isolates realms (`State.isolate_realm`), every route but
+//! the first evaluates its entry in a realm of its own, with its own globals,
+//! intrinsics and module registry, so two routes never share a module
+//! instance. Otherwise every route runs in the VM's main realm, and routes
+//! with the same entry share its instance and receive the same handler, each
+//! with its own `env`. Realms separate state, not trust: every realm runs in
+//! the same process under the same limits.
+//!
 //! Exports are read only after the evaluation settles, and a failed
 //! evaluation stays failed for the worker's life (`RouteModuleState` in
 //! `state.zig` says why).
@@ -29,16 +42,24 @@ const process = @import("collo_os").process;
 const module_pack = ipc.module_pack;
 
 pub const RouteModule = modules_state.RouteModule;
+pub const RouteModuleState = modules_state.RouteModuleState;
+
+/// A route ready to serve: its handler and `env`, and the realm the request's
+/// `Request` is built in.
+pub const ReadyRoute = struct {
+    /// Points into the route list, which the runtime never changes after it
+    /// starts, and stays valid until the route's record next changes, which
+    /// happens only when its evaluation starts or settles.
+    module: *const RouteModule,
+    realm: bindings.Realm,
+};
 
 pub const RouteHandlerResult = union(enum) {
-    /// Points into the route-module table and stays valid until the table
-    /// next changes, which happens only when a route's evaluation starts or
-    /// settles.
-    ready: *const modules_state.RouteModule,
+    ready: ReadyRoute,
     /// Owned by the caller.
     exception: bindings.Value,
     /// The entry's top-level await is in flight: the request joined the
-    /// module's waiter list and runs again when the settlement queues it.
+    /// route's waiter list and runs again when the settlement queues it.
     pending,
 };
 
@@ -50,54 +71,52 @@ pub const RouteHandlerResult = union(enum) {
 pub const module_eval_budget_ns: u64 = 10 * std.time.ns_per_s;
 
 /// The handler and `env` of the route `request_ctx` dispatches to. A route
-/// with no record yet has its entry evaluated from the pack the worker
-/// registered (`registerRoutePack`). Returns `.pending` after parking the
-/// request on an evaluation in flight, and `.exception` when the evaluation
-/// or the export read threw, after pinning the route failed. Fails with
-/// `error.RouteModuleEvaluationFailed` for a route already failed,
-/// `error.RoutePackNotRegistered` when no registered pack holds the route's
-/// entry, and otherwise with the error of the step that failed: reading the
-/// handler or building `env`.
+/// still `idle` has its entry evaluated from the packs the worker
+/// registered. Returns `.pending` after parking the request on an evaluation
+/// in flight, and `.exception` when the evaluation or the export read threw,
+/// after pinning the route failed. Fails with `error.UnknownRoute` for an
+/// index past the route table, `error.RouteModuleEvaluationFailed` for a
+/// route already failed, `error.RoutePackNotRegistered` when no registered
+/// pack holds the route's entry, and otherwise with the error of the step
+/// that failed: creating the route's realm, reading the handler or building
+/// `env`.
 pub fn ensureRouteHandler(
     ctx: *module_context.Context,
     request_ctx: *request_context.RequestContext,
 ) !RouteHandlerResult {
-    const specifier = request_ctx.dispatch_work.route_entry_specifier;
-
-    if (ctx.modules.route_modules.getPtr(specifier)) |module_state| {
-        switch (module_state.*) {
-            .ready => {},
-            .evaluating => |*evaluating| {
-                try evaluating.waiters.append(ctx.allocator, request_ctx.exec.request_id);
-                return .pending;
-            },
-            .failed => return error.RouteModuleEvaluationFailed,
-        }
-        return .{ .ready = readyRoute(ctx, specifier) orelse return error.HandlerNotCallable };
+    const index = request_ctx.dispatch_work.route_index;
+    if (index >= ctx.modules.routes.items.len)
+        return error.UnknownRoute;
+    const route = &ctx.modules.routes.items[index];
+    switch (route.module) {
+        .idle => {},
+        .ready => |*module| return .{ .ready = .{ .module = module, .realm = route.realm.? } },
+        .evaluating => |*evaluating| {
+            try evaluating.waiters.append(ctx.allocator, request_ctx.exec.request_id);
+            return .pending;
+        },
+        .failed => return error.RouteModuleEvaluationFailed,
     }
 
-    if (!sourceLoaded(ctx, specifier))
+    if (!sourceLoaded(ctx, route.entry_specifier))
         return error.RoutePackNotRegistered;
 
-    switch (try evaluateRouteModule(ctx, specifier, request_ctx.exec.request_id)) {
+    switch (try evaluateRoute(ctx, index, request_ctx.exec.request_id)) {
         .ready => {},
         .pending => return .pending,
         .exception => |exception| {
             // The route is pinned failed before the exception is served, so
             // later requests fail with `error.RouteModuleEvaluationFailed`
             // instead of importing the module again (`RouteModuleState` in
-            // `state.zig`). A failure to pin, out of memory, propagates as on
-            // the boot path: served without the pin, the route's failure would
-            // rest on what JSC returns when the next request imports it again.
-            var owned = exception;
-            errdefer owned.deinit();
-            try markRouteModuleFailed(ctx, specifier);
-            return .{ .exception = owned };
+            // `state.zig`).
+            markRouteFailed(ctx, index);
+            return .{ .exception = exception };
         },
     }
     tracing.mark(ctx, request_ctx, "evaluate_module_done_ns");
 
-    return .{ .ready = readyRoute(ctx, specifier) orelse return error.HandlerNotCallable };
+    const ready = &ctx.modules.routes.items[index];
+    return .{ .ready = .{ .module = &ready.module.ready, .realm = ready.realm.? } };
 }
 
 const EvaluateOutcome = union(enum) {
@@ -106,35 +125,34 @@ const EvaluateOutcome = union(enum) {
     exception: bindings.Value,
 };
 
-/// The one place a route module is evaluated. A synchronous success reads
-/// the handler at once through `finishReadyModule`; a top-level await parks
-/// an `evaluating` record that `settleEvaluation` finishes later.
-/// `waiter_request_id` is the request to park on that record, null on the
-/// boot path, which has no request.
-fn evaluateRouteModule(
+/// The one place a route's entry is evaluated, in the route's realm. A
+/// synchronous success reads the handler at once through `finishReadyRoute`;
+/// a top-level await moves the route to `evaluating`, which
+/// `settleEvaluation` finishes later. `waiter_request_id` is the request to
+/// park on that record, null on the boot path, which has no request. Fails
+/// with `error.HandlerNotCallable` when the default export is not a function,
+/// leaving the route `idle`.
+fn evaluateRoute(
     ctx: *module_context.Context,
-    specifier: []const u8,
+    index: usize,
     waiter_request_id: ?u64,
 ) !EvaluateOutcome {
-    switch (try ctx.vm.evaluateModule(specifier)) {
-        .success => switch (try finishReadyModule(ctx, specifier)) {
+    const realm = try routeRealm(ctx, index);
+    const route = &ctx.modules.routes.items[index];
+    std.debug.assert(route.module == .idle);
+    switch (try realm.evaluateModule(route.entry_specifier)) {
+        .success => switch (try finishReadyRoute(ctx, index)) {
             .ready => return .ready,
             .exception => |exception| return .{ .exception = exception },
         },
         .pending => {
-            const owned_specifier = try ctx.allocator.dupe(u8, specifier);
-            errdefer ctx.allocator.free(owned_specifier);
             var evaluating = modules_state.RouteModuleState.Evaluating{
                 .deadline_mono_ns = ctx.nowMonoNs() +| module_eval_budget_ns,
             };
             errdefer evaluating.waiters.deinit(ctx.allocator);
             if (waiter_request_id) |request_id|
                 try evaluating.waiters.append(ctx.allocator, request_id);
-            try ctx.modules.route_modules.putNoClobber(
-                ctx.allocator,
-                owned_specifier,
-                .{ .evaluating = evaluating },
-            );
+            route.module = .{ .evaluating = evaluating };
             return .pending;
         },
         .exception => |exception| return .{ .exception = exception },
@@ -142,80 +160,92 @@ fn evaluateRouteModule(
     }
 }
 
+/// The realm the route at `index` runs in, created on its first use: in a
+/// worker that isolates realms every route but the first gets a new realm,
+/// and every other route runs in the VM's main realm. Creating a realm runs
+/// no JavaScript.
+fn routeRealm(ctx: *module_context.Context, index: usize) !bindings.Realm {
+    const route = &ctx.modules.routes.items[index];
+    if (route.realm) |realm|
+        return realm;
+    const realm = if (ctx.modules.isolate_realm and index != 0)
+        try ctx.vm.createRealm()
+    else
+        ctx.vm.mainRealm();
+    route.realm = realm;
+    return realm;
+}
+
 const ReadyOutcome = union(enum) {
     ready,
     exception: bindings.Value,
 };
 
-/// The only reader of a route module's exports. Exports are live bindings,
-/// still in their temporal dead zone or undefined until the evaluation
-/// promise settles, so this runs only after settlement: a synchronous
-/// success or `settleEvaluation`. The route's `env` is built here as well,
-/// so it exists once per ready route; building it runs no JavaScript, which
-/// keeps this safe outside a turn.
-fn finishReadyModule(ctx: *module_context.Context, specifier: []const u8) !ReadyOutcome {
-    // The worker's one bindings blob belongs to one route (`route_env.zig`).
-    // Any other route fails, since it would otherwise receive that route's
-    // secrets; a blob without bindings has none to give away.
-    if (ctx.route_bindings_blob.len > route_env.empty_blob.len) {
-        if (!std.mem.eql(u8, specifier, ctx.route_bindings_route))
-            return error.RouteBindingsBelongToAnotherRoute;
-    }
-    const handler_value = switch (try ctx.vm.moduleGetExport(specifier, "default")) {
+/// The only reader of a route's exports. Exports are live bindings, still in
+/// their temporal dead zone or undefined until the evaluation promise
+/// settles, so this runs only after settlement: a synchronous success or
+/// `settleEvaluation`. The route's `env` is built here as well, from the
+/// route's own bindings in the route's realm, so it exists once per ready
+/// route; building it runs no JavaScript, which keeps this safe outside a
+/// turn. Leaves the route `idle` on every path but `.ready`.
+fn finishReadyRoute(ctx: *module_context.Context, index: usize) !ReadyOutcome {
+    const route = &ctx.modules.routes.items[index];
+    const realm = route.realm.?;
+    const handler_value = switch (try realm.moduleGetExport(route.entry_specifier, "default")) {
         .success => |value| value,
         .exception => |exception| return .{ .exception = exception },
     };
     var handler = try js_value.JsFunctionOwned.fromOwnedValueChecked(ctx.vm, handler_value);
     errdefer handler.deinit();
-    var env = try route_env.build(ctx.vm, ctx.route_bindings_blob);
-    errdefer env.deinit();
-
-    const owned_specifier = try ctx.allocator.dupe(u8, specifier);
-    errdefer ctx.allocator.free(owned_specifier);
-    try ctx.modules.route_modules.putNoClobber(ctx.allocator, owned_specifier, .{
-        .ready = .{ .handler = handler, .env = env },
-    });
+    const env = try route_env.build(realm, route.bindings);
+    route.module = .{ .ready = .{ .handler = handler, .env = env } };
     return .ready;
 }
 
 pub const Settlement = struct {
-    waiters: std.ArrayListUnmanaged(u64) = .{},
-    /// `.none` for a settlement that came late or twice, after the record
-    /// had already left `.evaluating`; the caller must not act on it.
+    /// Owned by the caller.
+    waiters: std.ArrayListUnmanaged(u64),
     /// `.ready` means the await resolved, even when reading the handler then
     /// failed and left the next request to try again.
-    transition: enum { none, ready, failed } = .none,
+    transition: enum { ready, failed },
 };
 
-/// Finishes a pending evaluation that `collo_runtime_module_eval_settled`
-/// reported, when `Runtime.collectModuleSettlements` handles it. A resolved
-/// await moves the record to ready through `finishReadyModule`; a rejected
-/// one pins it failed (`RouteModuleState` in `state.zig`). Returns the
-/// parked request ids for the caller to queue again; the caller owns and
-/// frees the list.
+/// Finishes the evaluation of the next route whose entry is `specifier` and
+/// whose realm has index `realm_index`, among the routes still evaluating,
+/// when `Runtime.collectModuleSettlements` handles the settlement that
+/// `collo_runtime_module_eval_settled` reported. Routes that share a realm and
+/// an entry share one module instance, so one settlement finishes each of
+/// them, one call at a time. A resolved await makes the route ready through
+/// `finishReadyRoute`; a rejected one pins it failed (`RouteModuleState` in
+/// `state.zig`). Returns the route's parked request ids for the caller to
+/// queue again, or null once no route matches, as for a settlement that came
+/// late or twice.
 pub fn settleEvaluation(
     ctx: *module_context.Context,
+    realm_index: u32,
     specifier: []const u8,
     resolved: bool,
-) Settlement {
-    const module_state = ctx.modules.route_modules.getPtr(specifier) orelse return .{};
-    if (module_state.* != .evaluating)
-        return .{};
-    const waiters = module_state.evaluating.waiters;
-    module_state.evaluating.waiters = .{};
-
+) ?Settlement {
+    const index = for (ctx.modules.routes.items, 0..) |*candidate, candidate_index| {
+        if (candidate.module != .evaluating)
+            continue;
+        const realm = candidate.realm orelse continue;
+        if (realm.index() == realm_index and std.mem.eql(u8, candidate.entry_specifier, specifier))
+            break candidate_index;
+    } else return null;
+    const route = &ctx.modules.routes.items[index];
+    const waiters = route.module.evaluating.waiters;
+    // The waiters move to the caller; the evaluating record owns nothing
+    // else, so the tag flips in place.
+    route.module = if (resolved) .idle else .failed;
     if (!resolved) {
-        // The waiters were moved out above; the empty evaluating record owns
-        // nothing else, so the tag flips in place.
-        module_state.* = .failed;
-        std.log.warn("route module evaluation rejected specifier={s}", .{specifier});
+        std.log.warn("route module evaluation rejected route={d} specifier={s}", .{ index, specifier });
         return .{ .waiters = waiters, .transition = .failed };
     }
 
-    const removed = ctx.modules.route_modules.fetchRemove(specifier).?;
-    ctx.allocator.free(removed.key);
-    const outcome = finishReadyModule(ctx, specifier) catch |err| blk: {
-        std.log.warn("route module settlement finish failed specifier={s}: {s}", .{
+    const outcome = finishReadyRoute(ctx, index) catch |err| blk: {
+        std.log.warn("route module settlement finish failed route={d} specifier={s}: {s}", .{
+            index,
             specifier,
             @errorName(err),
         });
@@ -226,84 +256,172 @@ pub fn settleEvaluation(
         .exception => |exception| {
             var owned = exception;
             owned.deinit();
-            std.log.warn("route module default export raised at settlement specifier={s}", .{specifier});
+            std.log.warn("route module default export raised at settlement route={d} specifier={s}", .{ index, specifier });
         },
     };
     return .{ .waiters = waiters, .transition = .ready };
 }
 
-/// Whether the route's module has stayed pending past
+/// Whether the route at `index` has stayed pending past
 /// `module_eval_budget_ns`, in which case the caller recycles the worker.
 /// `deadlineTimeout` in `worker/serve/dispatch.zig` checks it and says why
 /// a request's deadline is the wake that reaches it.
-pub fn evaluationZombie(ctx: *module_context.Context, specifier: []const u8) bool {
-    const module_state = ctx.modules.route_modules.getPtr(specifier) orelse return false;
-    if (module_state.* != .evaluating)
+pub fn evaluationZombie(ctx: *module_context.Context, index: usize) bool {
+    if (index >= ctx.modules.routes.items.len)
         return false;
-    return ctx.nowMonoNs() >= module_state.evaluating.deadline_mono_ns;
+    return routeZombie(ctx, &ctx.modules.routes.items[index]);
 }
 
-fn readyRoute(ctx: *module_context.Context, specifier: []const u8) ?*const modules_state.RouteModule {
-    const module_state = ctx.modules.route_modules.getPtr(specifier) orelse return null;
-    if (module_state.* != .ready)
-        return null;
-    return &module_state.ready;
+/// Whether any route has stayed pending past `module_eval_budget_ns`: the
+/// check of the boot context's deadline, which bounds every route the boot
+/// evaluated.
+pub fn anyEvaluationZombie(ctx: *module_context.Context) bool {
+    for (ctx.modules.routes.items) |*route| {
+        if (routeZombie(ctx, route))
+            return true;
+    }
+    return false;
 }
 
-/// The result of `bootEvaluateRouteEntry`, which registers the pack
-/// WorkerInit delivered and evaluates the route's entry before the ready
-/// handshake, so a cold-started worker serves its first request without
-/// module work.
-///
-/// A failure to map, parse, check or register the pack propagates and fails
-/// the init: no dispatch carries a pack, so a worker without its route's
-/// pack could serve none of the route's requests. A synchronous throw pins
-/// the route failed, as a rejected top-level await does, and the worker
-/// still reports ready but never serves that handler. A default export that
-/// is not callable is logged and left uncached, so each request evaluates
-/// the entry again and fails on its own.
-pub const BootEvaluateOutcome = enum {
-    /// Nothing is left in flight: the entry is ready or failed, its default
-    /// export is not callable, or the route-module table already held it.
-    settled,
-    /// A top-level await is in flight with an `.evaluating` record parked;
-    /// the caller arms `module_eval_budget_ns` on the boot context.
-    pending,
-};
+fn routeZombie(ctx: *module_context.Context, route: *const modules_state.Route) bool {
+    if (route.module != .evaluating)
+        return false;
+    return ctx.nowMonoNs() >= route.module.evaluating.deadline_mono_ns;
+}
 
-/// Monotonic stamps of the steps of a pack registration
-/// (`registerRoutePack`), which the boot evaluation's caller records as boot
-/// phases of their own. A zero stamp means the step did not run, because the
-/// pack was already registered, or the clock could not be read.
+/// Whether any route's top-level await is still in flight. The boot context
+/// closes once none is (`Runtime.handleModuleEvaluationSettled`).
+pub fn anyEvaluating(ctx: *module_context.Context) bool {
+    for (ctx.modules.routes.items) |route| {
+        if (route.module == .evaluating)
+            return true;
+    }
+    return false;
+}
+
+/// Monotonic stamps of the steps of the boot's pack registration
+/// (`bootRegisterPack`), which its caller records as boot phases of their
+/// own. A zero stamp means the clock could not be read.
 pub const BootEvalMarks = struct {
     pack_mapped_ns: u64 = 0,
     pack_parsed_ns: u64 = 0,
     pack_registered_ns: u64 = 0,
 };
 
-/// Registers the route pack in `route_entry_fd`, a sealed memfd that stays
-/// the caller's, with the VM as permanent, and records its specifiers in
-/// `loaded_sources`. When a registered pack already holds `specifier`, the
-/// call does nothing. The pack must hold `specifier`, and its modules must
-/// share the entry's deploy scope. A non-null `marks` receives the step
-/// stamps. Fails with the error of the step that failed: mapping, parsing or
-/// checking the pack, or registering it.
+/// Registers the definition's pack in `pack_fd`, a sealed memfd that stays
+/// the caller's (`registerPack`), before the boot evaluates the routes. The
+/// worker must hold at least one route, and the pack every route's entry. A
+/// failure fails the init: no dispatch carries a pack, so a worker without
+/// its routes' pack could serve none of their requests. A non-null `marks`
+/// receives the registration's stamps.
+pub fn bootRegisterPack(
+    ctx: *module_context.Context,
+    pack_fd: std.posix.fd_t,
+    marks: ?*BootEvalMarks,
+) !void {
+    const routes = ctx.modules.routes.items;
+    if (routes.len == 0)
+        return error.NoRoutes;
+    try registerPack(ctx, pack_fd, routes[0].entry_specifier, routes, marks);
+}
+
+/// What the boot left a route in (`bootEvaluateRoute`).
+pub const BootRouteOutcome = enum {
+    /// Nothing of the route is in flight: it is ready, failed or `idle`.
+    settled,
+    /// Its top-level await is in flight with the route `evaluating`; the
+    /// caller arms `module_eval_budget_ns` on the boot context.
+    pending,
+};
+
+/// Evaluates the entry of the route at `index` in the route's realm, after
+/// `bootRegisterPack`, so a cold-started worker serves its first request
+/// without module work. The caller evaluates every route in route order.
+///
+/// A failure to create the route's realm fails the init. A synchronous throw
+/// pins the route failed, as a rejected top-level await does, and the worker
+/// still reports ready but never serves that handler; the other routes are
+/// unaffected. A default export that is not callable is logged and left
+/// uncached, so each request for the route evaluates the entry again and
+/// fails on its own. A route the boot already moved out of `idle` is left as
+/// it is.
+pub fn bootEvaluateRoute(ctx: *module_context.Context, index: usize) !BootRouteOutcome {
+    if (ctx.modules.routes.items[index].module != .idle)
+        return .settled;
+    switch (evaluateRoute(ctx, index, null) catch |err| switch (err) {
+        // An uncallable default export is the tenant's mistake and is left
+        // to each request; every other error fails the init.
+        error.HandlerNotCallable => {
+            std.log.warn("boot route handler not callable route={d} specifier={s}", .{
+                index,
+                ctx.modules.routes.items[index].entry_specifier,
+            });
+            return .settled;
+        },
+        else => return err,
+    }) {
+        .ready => return .settled,
+        // The event loop settles the top-level await after ready; a request
+        // that arrives first parks as a waiter.
+        .pending => return .pending,
+        .exception => |exception| {
+            var owned = exception;
+            owned.deinit();
+            // A synchronous throw pins the same failed record a rejected
+            // top-level await does (`RouteModuleState` in `state.zig`), so the
+            // route's requests fail at once with
+            // `error.RouteModuleEvaluationFailed` and the worker answers each
+            // with a 500.
+            markRouteFailed(ctx, index);
+            std.log.warn("boot route evaluation raised; route pinned failed route={d} specifier={s}", .{
+                index,
+                ctx.modules.routes.items[index].entry_specifier,
+            });
+            return .settled;
+        },
+    }
+}
+
+/// Registers the one-entry pack in `pack_fd`, which stays the caller's, as
+/// `registerPack` does, for a runtime whose route list names `specifier`
+/// without a boot: the pack must hold `specifier` and share its deploy
+/// scope. Does nothing when a registered pack already holds `specifier`.
 pub fn registerRoutePack(
     ctx: *module_context.Context,
-    route_entry_fd: std.posix.fd_t,
+    pack_fd: std.posix.fd_t,
     specifier: []const u8,
-    marks: ?*BootEvalMarks,
 ) !void {
     if (sourceLoaded(ctx, specifier))
         return;
-    var pack = try module_pack_io.mapFdReadOnly(route_entry_fd, module_pack.max_pack_bytes);
+    try registerPack(ctx, pack_fd, specifier, &.{}, null);
+}
+
+/// Registers the pack in `pack_fd`, a sealed memfd that stays the caller's,
+/// with the VM as permanent, and records its specifiers in `loaded_sources`.
+/// Every module of the pack must share the deploy scope of `scope_specifier`,
+/// and the pack must hold `scope_specifier` and the entry of every route in
+/// `routes`. A non-null `marks` receives the step stamps. Fails with the
+/// error of the step that failed: mapping, parsing or checking the pack, or
+/// registering it.
+fn registerPack(
+    ctx: *module_context.Context,
+    pack_fd: std.posix.fd_t,
+    scope_specifier: []const u8,
+    routes: []const modules_state.Route,
+    marks: ?*BootEvalMarks,
+) !void {
+    var pack = try module_pack_io.mapFdReadOnly(pack_fd, module_pack.max_pack_bytes);
     defer pack.deinit();
     if (marks) |m| m.pack_mapped_ns = process.monotonicNowNsOrZero();
 
     const parsed_pack = try module_pack.parse(pack.bytes());
-    try module_pack.validateSameDeployScopedPack(parsed_pack, specifier);
-    if (!module_pack.containsSpecifier(parsed_pack, specifier))
+    try module_pack.validateSameDeployScopedPack(parsed_pack, scope_specifier);
+    if (!module_pack.containsSpecifier(parsed_pack, scope_specifier))
         return error.ModulePackEntryMismatch;
+    for (routes) |route| {
+        if (!module_pack.containsSpecifier(parsed_pack, route.entry_specifier))
+            return error.ModulePackEntryMismatch;
+    }
     if (marks) |m| m.pack_parsed_ns = process.monotonicNowNsOrZero();
 
     var staged = try stageLoadedSources(ctx, parsed_pack);
@@ -316,57 +434,13 @@ pub fn registerRoutePack(
     if (marks) |m| m.pack_registered_ns = process.monotonicNowNsOrZero();
 }
 
-/// Registers the pack in `route_entry_fd`, which stays the caller's
-/// (`registerRoutePack`), and evaluates `specifier`; `BootEvaluateOutcome`
-/// says what each failure does. A non-null `marks` receives the step stamps.
-pub fn bootEvaluateRouteEntry(
-    ctx: *module_context.Context,
-    route_entry_fd: std.posix.fd_t,
-    specifier: []const u8,
-    marks: ?*BootEvalMarks,
-) !BootEvaluateOutcome {
-    if (ctx.modules.route_modules.contains(specifier))
-        return .settled;
-    try registerRoutePack(ctx, route_entry_fd, specifier, marks);
-
-    switch (evaluateRouteModule(ctx, specifier, null) catch |err| switch (err) {
-        // An uncallable default export is the tenant's mistake and is left
-        // to each request; every other error fails the init.
-        error.HandlerNotCallable => {
-            std.log.warn("boot route entry handler not callable specifier={s}", .{specifier});
-            return .settled;
-        },
-        else => return err,
-    }) {
-        .ready => {},
-        // The event loop settles the top-level await after ready; a request
-        // that arrives first parks as a waiter.
-        .pending => return .pending,
-        .exception => |exception| {
-            var owned = exception;
-            owned.deinit();
-            // A synchronous throw pins the same failed record a rejected
-            // top-level await does (`RouteModuleState` in `state.zig`), so
-            // requests fail at once with `error.RouteModuleEvaluationFailed`
-            // and the worker answers each with a 500. A failure to pin, out
-            // of memory, fails the init: in a ready worker without the pin,
-            // the route's failure would rest on what JSC returns when each
-            // request imports the module again.
-            try markRouteModuleFailed(ctx, specifier);
-            std.log.warn("boot route entry evaluation raised; route pinned failed specifier={s}", .{specifier});
-        },
-    }
-    return .settled;
-}
-
-/// Pins a route failed after a synchronous throw, when no `.evaluating`
-/// record exists for `settleEvaluation` to flip. Both callers,
-/// `bootEvaluateRouteEntry` and `ensureRouteHandler`, return early when the
-/// specifier already has a record, so this always inserts a new one.
-fn markRouteModuleFailed(ctx: *module_context.Context, specifier: []const u8) !void {
-    const owned_specifier = try ctx.allocator.dupe(u8, specifier);
-    errdefer ctx.allocator.free(owned_specifier);
-    try ctx.modules.route_modules.putNoClobber(ctx.allocator, owned_specifier, .failed);
+/// Pins the `idle` route at `index` failed after a synchronous throw, when
+/// no `evaluating` record exists for `settleEvaluation` to flip. Changes the
+/// tag in place and allocates nothing.
+fn markRouteFailed(ctx: *module_context.Context, index: usize) void {
+    const route = &ctx.modules.routes.items[index];
+    std.debug.assert(route.module == .idle);
+    route.module = .failed;
 }
 
 /// Whether a pack the worker registered holds `specifier`.

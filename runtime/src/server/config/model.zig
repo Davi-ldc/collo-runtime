@@ -76,8 +76,10 @@ pub const Analytics = struct {
 /// Settings that cascade from `globalSettings` to a worker definition. A
 /// definition overrides only the fields it names.
 pub const Settings = struct {
-    /// Whether each route of a worker gets its own realm. With one route per
-    /// worker both values behave the same.
+    /// Whether each route of a worker runs in a realm of its own, with its
+    /// own globals, intrinsics and module registry; false runs every route of
+    /// the worker in one realm. Fixed when the worker starts. Realms separate
+    /// state, not trust: a worker's routes share its process and its limits.
     isolate_realm: bool,
     limits: Limits,
 };

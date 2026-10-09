@@ -644,6 +644,7 @@ const registered_test_roots = [_][]const u8{
     "runtime/src/common/tests/ipc.zig",
     "runtime/src/server/tests/http2/request.zig",
     "runtime/src/server/tests/http2/connection.zig",
+    "runtime/src/server/tests/http2/frame_reader.zig",
     "runtime/src/server/tests/analytics/all.zig",
     "runtime/src/server/tests/config/all.zig",
     "runtime/src/server/tests/routes/all.zig",

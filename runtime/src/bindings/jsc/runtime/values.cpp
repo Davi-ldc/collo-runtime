@@ -1,5 +1,6 @@
 // The ABI's value constructors and accessors, a route's frozen `env` object, JSON parsing and exception formatting.
-// Runs on the VM thread; each entry point takes the JSC API lock itself.
+// Runs on the VM thread; each entry point takes the JSC API lock itself. A constructor of an object builds it in the
+// realm it is given, and an accessor runs in the realm of the object it reads or writes.
 //
 // Exception formatting runs after the turn that threw has ended, where no deadline bounds the VM, so it must never
 // run tenant JavaScript: every read of the exception object is a VMInquiry lookup that runs no getter and no Proxy
@@ -26,10 +27,13 @@ namespace {
 // final length.
 constexpr unsigned kExceptionPartUnitsMax = 4112;
 
+// Only ever handed a primitive, whose conversion runs no user code and creates nothing but a string, so the global
+// it runs in is not observable.
 WTF::String boundedExceptionPart(ColloVm* vm, JSC::JSValue value)
 {
+    auto* global_object = vm->main_realm->global_object;
     auto scope = DECLARE_TOP_EXCEPTION_SCOPE(*vm->vm);
-    JSC::JSString* string = value.toString(vm->global_object);
+    JSC::JSString* string = value.toString(global_object);
     if (scope.exception()) {
         scope.clearExceptionExceptTermination();
         return WTF::String();
@@ -39,7 +43,7 @@ WTF::String boundedExceptionPart(ColloVm* vm, JSC::JSValue value)
         unsigned copied = string->colloCopyPrefix(std::span { buffer });
         return WTF::String(std::span { buffer }.first(copied));
     }
-    WTF::String flat = string->value(vm->global_object);
+    WTF::String flat = string->value(global_object);
     if (scope.exception()) {
         scope.clearExceptionExceptTermination();
         return WTF::String();
@@ -57,18 +61,19 @@ WTF::String boundedExceptionPart(ColloVm* vm, JSC::JSValue value)
 // receives strings, on which toString is the identity.
 JSC::JSValue inertStringProperty(ColloVm* vm, JSC::JSObject* object, JSC::PropertyName property)
 {
+    auto* global_object = Collo::globalObjectForValue(vm, object);
     auto scope = DECLARE_TOP_EXCEPTION_SCOPE(*vm->vm);
     JSC::JSValue value;
     {
         JSC::PropertySlot slot(object, JSC::PropertySlot::InternalMethodType::VMInquiry, vm->vm.get());
-        bool found = object->getPropertySlot(vm->global_object, property, slot);
+        bool found = object->getPropertySlot(global_object, property, slot);
         if (scope.exception()) {
             scope.clearExceptionExceptTermination();
             return {};
         }
         if (!found || !slot.isValue())
             return {};
-        value = slot.getValue(vm->global_object, property);
+        value = slot.getValue(global_object, property);
     }
     if (scope.exception()) {
         scope.clearExceptionExceptTermination();
@@ -79,14 +84,16 @@ JSC::JSValue inertStringProperty(ColloVm* vm, JSC::JSObject* object, JSC::Proper
     return value;
 }
 
-ColloStatus setTypeError(ColloVm* vm, const WTF::String& message, ColloValue** out_exception)
+// A TypeError of the realm `value` belongs to, the value the failed operation was handed.
+ColloStatus setTypeError(ColloVm* vm, JSC::JSValue value, const WTF::String& message, ColloValue** out_exception)
 {
-    return Collo::setJsException(vm, JSC::createTypeError(vm->global_object, message), out_exception);
+    auto* global_object = Collo::globalObjectForValue(vm, value);
+    return Collo::setJsException(vm, JSC::createTypeError(global_object, message), out_exception);
 }
 
-ColloStatus typeError(ColloVm* vm, const WTF::String& message, ColloValue** out_exception)
+ColloStatus typeError(ColloVm* vm, JSC::JSValue value, const WTF::String& message, ColloValue** out_exception)
 {
-    return Collo::statusOr(setTypeError(vm, message, out_exception), COLLO_STATUS_JS_EXCEPTION);
+    return Collo::statusOr(setTypeError(vm, value, message, out_exception), COLLO_STATUS_JS_EXCEPTION);
 }
 
 } // namespace
@@ -151,30 +158,31 @@ ColloStatus formatExceptionString(ColloVm* vm, JSC::JSValue exception_value, Col
 } // namespace Collo
 
 extern "C" ColloStatus collo_json_parse_utf8(
-    ColloVm* vm, ColloString source, ColloValue** out_value, ColloValue** out_exception)
+    ColloRealm* realm, ColloString source, ColloValue** out_value, ColloValue** out_exception)
 {
     if (out_value)
         *out_value = nullptr;
     Collo::clearOutException(out_exception);
-    if (!vm || !vm->isReady() || !out_value)
+    if (!realmIsReady(realm) || !out_value)
         return COLLO_STATUS_INVALID_ARGUMENT;
 
     WTF::String input;
     if (Collo::stringToWTFString(source, input) != COLLO_STATUS_OK)
         return COLLO_STATUS_INVALID_ARGUMENT;
 
+    ColloVm* vm = realm->vm;
     JSC::JSLockHolder locker(*vm->vm);
     auto scope = DECLARE_TOP_EXCEPTION_SCOPE(*vm->vm);
-    JSC::JSValue parsed = JSC::JSONParse(vm->global_object, input);
+    JSC::JSValue parsed = JSC::JSONParse(realm->global_object, input);
     if (scope.exception()) {
         JSC::JSValue exception = scope.exception()->value();
         scope.clearExceptionExceptTermination();
         if (!exception)
-            exception = JSC::createSyntaxError(vm->global_object, "Invalid JSON"_s);
+            exception = JSC::createSyntaxError(realm->global_object, "Invalid JSON"_s);
         return Collo::statusOr(Collo::setJsException(vm, exception, out_exception), COLLO_STATUS_JS_EXCEPTION);
     }
     if (!parsed) {
-        JSC::JSValue exception = JSC::createSyntaxError(vm->global_object, "Invalid JSON"_s);
+        JSC::JSValue exception = JSC::createSyntaxError(realm->global_object, "Invalid JSON"_s);
         return Collo::statusOr(Collo::setJsException(vm, exception, out_exception), COLLO_STATUS_JS_EXCEPTION);
     }
     return Collo::makeValueHandle(vm, parsed, out_value);
@@ -213,9 +221,10 @@ extern "C" ColloStatus collo_promise_await_sync(
     JSC::JSLockHolder locker(*vm->vm);
     Collo::clearOutException(out_exception);
 
-    auto* promise = dynamicDowncast<JSC::JSPromise>(Collo::toJSValue(promise_value));
+    JSC::JSValue value = Collo::toJSValue(promise_value);
+    auto* promise = dynamicDowncast<JSC::JSPromise>(value);
     if (!promise)
-        return typeError(vm, "Expected a Promise."_s, out_exception);
+        return typeError(vm, value, "Expected a Promise."_s, out_exception);
 
     switch (promise->status()) {
     case JSC::JSPromise::Status::Fulfilled:
@@ -224,7 +233,7 @@ extern "C" ColloStatus collo_promise_await_sync(
         return Collo::statusOr(Collo::setJsException(vm, promise->result(), out_exception), COLLO_STATUS_JS_EXCEPTION);
     case JSC::JSPromise::Status::Pending:
         return Collo::statusOr(
-            setTypeError(vm, "Only already-settled promises can be awaited synchronously."_s, out_exception),
+            setTypeError(vm, value, "Only already-settled promises can be awaited synchronously."_s, out_exception),
             COLLO_STATUS_UNSUPPORTED);
     }
     return COLLO_STATUS_ERROR;
@@ -275,66 +284,71 @@ extern "C" ColloStatus collo_string_new_utf8(ColloVm* vm, ColloString utf8, Coll
     return Collo::makeValueHandle(vm, JSC::jsString(*vm->vm, string), out_value);
 }
 
-extern "C" ColloStatus collo_type_error_new_utf8(ColloVm* vm, ColloString message, ColloValue** out_value)
+extern "C" ColloStatus collo_type_error_new_utf8(ColloRealm* realm, ColloString message, ColloValue** out_value)
 {
     if (out_value)
         *out_value = nullptr;
-    if (!vm || !vm->isReady() || !out_value)
+    if (!realmIsReady(realm) || !out_value)
         return COLLO_STATUS_INVALID_ARGUMENT;
 
     WTF::String text;
     if (Collo::stringToWTFString(message, text) != COLLO_STATUS_OK)
         return COLLO_STATUS_INVALID_ARGUMENT;
 
+    ColloVm* vm = realm->vm;
     JSC::JSLockHolder locker(*vm->vm);
     // JSC::createTypeError asserts that its message is not empty, so the error is created directly, with the
     // arguments createTypeError passes.
-    JSC::Structure* structure = vm->global_object->errorStructure(JSC::ErrorType::TypeError);
+    JSC::Structure* structure = realm->global_object->errorStructure(JSC::ErrorType::TypeError);
     JSC::ErrorInstance* error = JSC::ErrorInstance::create(
         *vm->vm, structure, text, JSC::JSValue(), nullptr, JSC::TypeNothing, JSC::ErrorType::TypeError);
     return Collo::makeValueHandle(vm, error, out_value);
 }
 
-extern "C" ColloStatus collo_object_new(ColloVm* vm, ColloValue** out_value)
+extern "C" ColloStatus collo_object_new(ColloRealm* realm, ColloValue** out_value)
 {
-    if (!vm || !vm->isReady())
+    if (!realmIsReady(realm))
         return COLLO_STATUS_INVALID_ARGUMENT;
 
+    ColloVm* vm = realm->vm;
     JSC::JSLockHolder locker(*vm->vm);
-    return Collo::makeValueHandle(vm, JSC::constructEmptyObject(vm->global_object), out_value);
+    return Collo::makeValueHandle(vm, JSC::constructEmptyObject(realm->global_object), out_value);
 }
 
-extern "C" ColloStatus collo_array_new(ColloVm* vm, ColloValue** out_value)
+extern "C" ColloStatus collo_array_new(ColloRealm* realm, ColloValue** out_value)
 {
-    if (!vm || !vm->isReady())
+    if (!realmIsReady(realm))
         return COLLO_STATUS_INVALID_ARGUMENT;
 
+    ColloVm* vm = realm->vm;
     JSC::JSLockHolder locker(*vm->vm);
     JSC::JSArray* array = JSC::JSArray::create(
-        *vm->vm, vm->global_object->arrayStructureForIndexingTypeDuringAllocation(JSC::ArrayWithUndecided), 0);
+        *vm->vm, realm->global_object->arrayStructureForIndexingTypeDuringAllocation(JSC::ArrayWithUndecided), 0);
     return Collo::makeValueHandle(vm, array, out_value);
 }
 
-extern "C" ColloStatus collo_global_this(ColloVm* vm, ColloValue** out_value)
+extern "C" ColloStatus collo_global_this(ColloRealm* realm, ColloValue** out_value)
 {
-    if (!vm || !vm->isReady())
+    if (!realmIsReady(realm))
         return COLLO_STATUS_INVALID_ARGUMENT;
 
+    ColloVm* vm = realm->vm;
     JSC::JSLockHolder locker(*vm->vm);
-    return Collo::makeValueHandle(vm, vm->global_object->globalThis(), out_value);
+    return Collo::makeValueHandle(vm, realm->global_object->globalThis(), out_value);
 }
 
 extern "C" ColloStatus collo_env_object_new(
-    ColloVm* vm, const ColloNameValuePair* entries, size_t entry_count, ColloValue** out_value)
+    ColloRealm* realm, const ColloNameValuePair* entries, size_t entry_count, ColloValue** out_value)
 {
     if (out_value)
         *out_value = nullptr;
-    if (!vm || !vm->isReady() || !out_value || (!entries && entry_count))
+    if (!realmIsReady(realm) || !out_value || (!entries && entry_count))
         return COLLO_STATUS_INVALID_ARGUMENT;
 
+    ColloVm* vm = realm->vm;
     JSC::JSLockHolder locker(*vm->vm);
     auto scope = DECLARE_TOP_EXCEPTION_SCOPE(*vm->vm);
-    JSC::JSObject* env = JSC::constructEmptyObject(vm->global_object);
+    JSC::JSObject* env = JSC::constructEmptyObject(realm->global_object);
     // Every entry is checked before it is defined, and the object is published only after the last one, so a bad
     // entry leaves nothing behind for JavaScript to see.
     for (const ColloNameValuePair& entry : std::span { entries, entry_count }) {
@@ -352,7 +366,7 @@ extern "C" ColloStatus collo_env_object_new(
     }
     // A fresh ordinary object with named properties only takes the freeze fast path, which raises nothing; a
     // pending termination is the only exception this scope can see.
-    JSC::objectConstructorFreeze(vm->global_object, env);
+    JSC::objectConstructorFreeze(realm->global_object, env);
     if (scope.exception()) {
         scope.clearExceptionExceptTermination();
         return COLLO_STATUS_ERROR;
@@ -375,12 +389,14 @@ extern "C" ColloStatus collo_object_get_utf8(
         return COLLO_STATUS_INVALID_ARGUMENT;
 
     JSC::JSLockHolder locker(*vm->vm);
-    auto* js_object = dynamicDowncast<JSC::JSObject>(Collo::toJSValue(object));
+    JSC::JSValue object_value = Collo::toJSValue(object);
+    auto* js_object = dynamicDowncast<JSC::JSObject>(object_value);
     if (!js_object)
-        return typeError(vm, "collo_object_get_utf8 expects an object."_s, out_exception);
+        return typeError(vm, object_value, "collo_object_get_utf8 expects an object."_s, out_exception);
 
     auto scope = DECLARE_TOP_EXCEPTION_SCOPE(*vm->vm);
-    JSC::JSValue value = js_object->get(vm->global_object, JSC::Identifier::fromString(*vm->vm, property_name));
+    JSC::JSValue value = js_object->get(
+        Collo::globalObjectForValue(vm, js_object), JSC::Identifier::fromString(*vm->vm, property_name));
     if (scope.exception())
         return Collo::caughtExceptionStatus(vm, scope, out_exception);
 
@@ -400,14 +416,15 @@ extern "C" ColloStatus collo_object_set_utf8(
         return COLLO_STATUS_INVALID_ARGUMENT;
 
     JSC::JSLockHolder locker(*vm->vm);
-    auto* js_object = dynamicDowncast<JSC::JSObject>(Collo::toJSValue(object));
+    JSC::JSValue object_value = Collo::toJSValue(object);
+    auto* js_object = dynamicDowncast<JSC::JSObject>(object_value);
     if (!js_object)
-        return typeError(vm, "collo_object_set_utf8 expects an object."_s, out_exception);
+        return typeError(vm, object_value, "collo_object_set_utf8 expects an object."_s, out_exception);
 
     JSC::Identifier identifier = JSC::Identifier::fromString(*vm->vm, property_name);
     JSC::PutPropertySlot slot(js_object, false, JSC::PutPropertySlot::PutById);
     auto scope = DECLARE_TOP_EXCEPTION_SCOPE(*vm->vm);
-    JSC::JSObject::put(js_object, vm->global_object, identifier, Collo::toJSValue(value), slot);
+    JSC::JSObject::put(js_object, Collo::globalObjectForValue(vm, js_object), identifier, Collo::toJSValue(value), slot);
     if (scope.exception())
         return Collo::caughtExceptionStatus(vm, scope, out_exception);
 
@@ -423,16 +440,17 @@ extern "C" ColloStatus collo_array_set(
         return COLLO_STATUS_INVALID_ARGUMENT;
 
     JSC::JSLockHolder locker(*vm->vm);
-    auto* js_array = dynamicDowncast<JSC::JSArray>(Collo::toJSValue(array));
+    JSC::JSValue array_value = Collo::toJSValue(array);
+    auto* js_array = dynamicDowncast<JSC::JSArray>(array_value);
     if (!js_array)
-        return typeError(vm, "collo_array_set expects an array."_s, out_exception);
+        return typeError(vm, array_value, "collo_array_set expects an array."_s, out_exception);
     constexpr uint64_t max_js_array_index = static_cast<uint64_t>(MAX_ARRAY_INDEX);
     if (static_cast<uint64_t>(index) > max_js_array_index)
-        return typeError(vm, "Array index exceeds JavaScript array length limit."_s, out_exception);
+        return typeError(vm, array_value, "Array index exceeds JavaScript array length limit."_s, out_exception);
 
     auto scope = DECLARE_TOP_EXCEPTION_SCOPE(*vm->vm);
-    js_array->putDirectIndex(
-        vm->global_object, static_cast<uint64_t>(index), Collo::toJSValue(value), 0, JSC::PutDirectIndexShouldThrow);
+    js_array->putDirectIndex(Collo::globalObjectForValue(vm, js_array), static_cast<uint64_t>(index),
+        Collo::toJSValue(value), 0, JSC::PutDirectIndexShouldThrow);
     if (scope.exception())
         return Collo::caughtExceptionStatus(vm, scope, out_exception);
 
@@ -454,7 +472,8 @@ extern "C" ColloStatus collo_value_to_utf8_copy(
 
     JSC::JSLockHolder locker(*vm->vm);
     auto scope = DECLARE_TOP_EXCEPTION_SCOPE(*vm->vm);
-    WTF::String string = Collo::toJSValue(value).toWTFString(vm->global_object);
+    JSC::JSValue js_value = Collo::toJSValue(value);
+    WTF::String string = js_value.toWTFString(Collo::globalObjectForValue(vm, js_value));
     if (scope.exception())
         return Collo::caughtExceptionStatus(vm, scope, out_exception);
 

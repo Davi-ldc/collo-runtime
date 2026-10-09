@@ -231,6 +231,7 @@ pub fn Methods(comptime Runtime: type) type {
             self: *Runtime,
             request_id: u64,
             callback: js_value.JsFunctionOwned,
+            receiver: ?js_value.JsValueOwned,
             args: ?[]js_value.JsValueOwned,
             delay_ms: u32,
             repeats: bool,
@@ -238,10 +239,14 @@ pub fn Methods(comptime Runtime: type) type {
             if (self.bootIdentityClosed(request_id)) {
                 var owned_callback = callback;
                 owned_callback.deinit();
+                if (receiver) |owned_receiver| {
+                    var owned = owned_receiver;
+                    owned.deinit();
+                }
                 releaseOwnedJsValues(self.core.allocator, args);
                 return error.TimerOutsideActiveRequest;
             }
-            return scheduler_resources.scheduleTimer(self, request_id, callback, args, delay_ms, repeats);
+            return scheduler_resources.scheduleTimer(self, request_id, callback, receiver, args, delay_ms, repeats);
         }
 
         pub fn scheduleImmediate(
@@ -262,15 +267,6 @@ pub fn Methods(comptime Runtime: type) type {
                 return error.TimerOutsideActiveRequest;
             }
             return scheduler_resources.scheduleImmediate(self, request_id, callback, this_arg, args);
-        }
-
-        pub fn scheduleTimeout(self: *Runtime, request_id: u64, callback: bindings.Value, delay_ms: u32) !u64 {
-            if (self.bootIdentityClosed(request_id)) {
-                var owned_callback = callback;
-                owned_callback.deinit();
-                return error.TimerOutsideActiveRequest;
-            }
-            return scheduler_resources.scheduleTimeout(self, request_id, callback, delay_ms);
         }
 
         /// The request a ready item belongs to, for the timeline and the turn

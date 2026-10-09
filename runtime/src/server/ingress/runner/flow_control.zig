@@ -87,8 +87,7 @@ fn h2AppendPendingBody(
     window_credit_len: usize,
     expected_state: H2StreamState,
 ) !void {
-    const index = stream_table.h2StreamIndex(self, stream_id) orelse return error.Http2UnknownStream;
-    const entry = &self.ingress_channels[index];
+    const entry = stream_table.h2StreamEntry(self, stream_id) orelse return error.Http2UnknownStream;
     if (entry.state != expected_state)
         return error.Http2StreamStateMismatch;
     try h2CheckPendingBodyAppend(self, entry, payload.len);
@@ -115,12 +114,11 @@ fn h2AppendPendingBody(
 }
 
 pub fn h2EnsureActivePendingBodyCapacity(
-    self: *const Slot,
+    self: *Slot,
     stream_id: u32,
     payload_len: usize,
 ) !void {
-    const index = stream_table.h2StreamIndex(self, stream_id) orelse return error.Http2UnknownStream;
-    const entry = &self.ingress_channels[index];
+    const entry = stream_table.h2StreamEntry(self, stream_id) orelse return error.Http2UnknownStream;
     if (entry.state != .active)
         return error.Http2StreamStateMismatch;
     try h2CheckPendingBodyAppend(self, entry, payload_len);
@@ -143,15 +141,13 @@ fn h2CheckPendingBodyAppend(
     }
 }
 
-pub fn h2HasPendingBody(self: *const Slot, stream_id: u32) bool {
-    const index = stream_table.h2StreamIndex(self, stream_id) orelse return false;
-    const entry = &self.ingress_channels[index];
+pub fn h2HasPendingBody(self: *Slot, stream_id: u32) bool {
+    const entry = stream_table.h2StreamEntry(self, stream_id) orelse return false;
     return entry.pending_body_len != 0 or entry.pending_body_complete;
 }
 
 pub fn h2PendingBodyView(self: *Slot, stream_id: u32) ?PendingH2BodyView {
-    const index = stream_table.h2StreamIndex(self, stream_id) orelse return null;
-    const entry = &self.ingress_channels[index];
+    const entry = stream_table.h2StreamEntry(self, stream_id) orelse return null;
     if (entry.pending_body_len == 0 and !entry.pending_body_complete)
         return null;
     return .{
@@ -162,8 +158,7 @@ pub fn h2PendingBodyView(self: *Slot, stream_id: u32) ?PendingH2BodyView {
 }
 
 pub fn h2TakePendingBody(self: *Slot, stream_id: u32) ?PendingH2Body {
-    const index = stream_table.h2StreamIndex(self, stream_id) orelse return null;
-    const entry = &self.ingress_channels[index];
+    const entry = stream_table.h2StreamEntry(self, stream_id) orelse return null;
     if (entry.pending_body_len == 0 and !entry.pending_body_complete)
         return null;
     const body = PendingH2Body{
@@ -187,7 +182,10 @@ pub fn h2ApplyPeerInitialStreamWindow(self: *Slot, old_value: u32, new_value: u3
     if (old_value == new_value)
         return;
     const delta = @as(i64, new_value) - @as(i64, old_value);
-    for (&self.ingress_channels) |*entry| {
+    for (self.stream_ids, 0..) |id, position| {
+        if (id == 0)
+            continue;
+        const entry = stream_table.streamAt(self, position);
         switch (entry.state) {
             .preparing, .active, .draining_response => {
                 const updated = entry.send_window + delta;
@@ -212,8 +210,7 @@ pub fn h2IncreaseConnectionSendWindow(self: *Slot, increment: u32) !void {
 pub fn h2IncreaseStreamSendWindow(self: *Slot, stream_id: u32, increment: u32) !void {
     if (increment == 0)
         return error.Http2ProtocolError;
-    const index = stream_table.h2StreamIndex(self, stream_id) orelse return;
-    const entry = &self.ingress_channels[index];
+    const entry = stream_table.h2StreamEntry(self, stream_id) orelse return;
     switch (entry.state) {
         .preparing, .active, .draining_response => {
             const updated = entry.send_window + @as(i64, increment);
@@ -225,11 +222,10 @@ pub fn h2IncreaseStreamSendWindow(self: *Slot, stream_id: u32, increment: u32) !
     }
 }
 
-pub fn h2AvailableOutboundWindow(self: *const Slot, stream_id: u32, byte_len: usize) !usize {
+pub fn h2AvailableOutboundWindow(self: *Slot, stream_id: u32, byte_len: usize) !usize {
     if (byte_len == 0)
         return 0;
-    const index = stream_table.h2StreamIndex(self, stream_id) orelse return error.Http2UnknownStream;
-    const entry = &self.ingress_channels[index];
+    const entry = stream_table.h2StreamEntry(self, stream_id) orelse return error.Http2UnknownStream;
     switch (entry.state) {
         .preparing, .active, .draining_response => {},
         .vacant => return 0,
@@ -244,8 +240,7 @@ pub fn h2AvailableOutboundWindow(self: *const Slot, stream_id: u32, byte_len: us
 pub fn h2ConsumeOutboundWindow(self: *Slot, stream_id: u32, byte_len: usize) !void {
     if (byte_len == 0)
         return;
-    const index = stream_table.h2StreamIndex(self, stream_id) orelse return error.Http2UnknownStream;
-    const entry = &self.ingress_channels[index];
+    const entry = stream_table.h2StreamEntry(self, stream_id) orelse return error.Http2UnknownStream;
     if (self.h2_connection_send_window < byte_len or entry.send_window < byte_len)
         return error.Http2FlowControlError;
     self.h2_connection_send_window -= @intCast(byte_len);
@@ -255,8 +250,7 @@ pub fn h2ConsumeOutboundWindow(self: *Slot, stream_id: u32, byte_len: usize) !vo
 pub fn h2ConsumeInboundWindow(self: *Slot, stream_id: u32, byte_len: usize) !void {
     if (byte_len == 0)
         return;
-    const index = stream_table.h2StreamIndex(self, stream_id) orelse return error.Http2UnknownStream;
-    const entry = &self.ingress_channels[index];
+    const entry = stream_table.h2StreamEntry(self, stream_id) orelse return error.Http2UnknownStream;
     switch (entry.state) {
         .preparing, .active => {},
         .vacant, .draining_response => return error.Http2ProtocolError,
@@ -298,12 +292,11 @@ pub fn h2BufferInboundWindowUpdate(self: *Slot, stream_id: ?u32, byte_len: usize
         increment,
     ) catch return error.Http2FlowControlError;
 
-    var stream_index: ?usize = null;
+    var stream_entry: ?*H2StreamEntry = null;
     var stream_recv_window: i64 = 0;
     var pending_stream_update: u32 = 0;
     if (stream_id) |id| {
-        if (stream_table.h2StreamIndex(self, id)) |stream_index_value| {
-            const entry = &self.ingress_channels[stream_index_value];
+        if (stream_table.h2StreamEntry(self, id)) |entry| {
             switch (entry.state) {
                 .preparing, .active => {
                     const stream_updated = entry.recv_window + @as(i64, increment);
@@ -314,7 +307,7 @@ pub fn h2BufferInboundWindowUpdate(self: *Slot, stream_id: ?u32, byte_len: usize
                         entry.pending_recv_window_update,
                         increment,
                     ) catch return error.Http2FlowControlError;
-                    stream_index = stream_index_value;
+                    stream_entry = entry;
                     stream_recv_window = stream_updated;
                     pending_stream_update = pending_update;
                 },
@@ -325,8 +318,7 @@ pub fn h2BufferInboundWindowUpdate(self: *Slot, stream_id: ?u32, byte_len: usize
 
     self.h2_connection_recv_window = connection_updated;
     self.h2_pending_connection_window_update = pending_connection_update;
-    if (stream_index) |index| {
-        const entry = &self.ingress_channels[index];
+    if (stream_entry) |entry| {
         entry.recv_window = stream_recv_window;
         entry.pending_recv_window_update = pending_stream_update;
     }

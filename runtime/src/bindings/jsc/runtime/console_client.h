@@ -29,6 +29,16 @@ struct ColloVm;
 
 namespace Collo {
 
+// The console state of one realm, which ColloRealm holds: its count() and time() labels and the depth of its open
+// groups, which indents its lines. A realm keeps its own, like the rest of its globals, so one route's labels and
+// groups never reach another route's console.
+struct ConsoleRealmState {
+    unsigned group_depth { 0 };
+    bool label_cap_warned { false };
+    WTF::HashMap<WTF::String, uint64_t> counts;
+    WTF::HashMap<WTF::String, WTF::MonotonicTime> timers;
+};
+
 // One instance per VM, owned by ColloVm; the global object holds only a WeakPtr, and only while a sink is registered.
 // Without a sink JSC's console object returns before calling the client, so the console keeps its observable
 // behavior and emits nothing.
@@ -69,17 +79,20 @@ public:
     void resetRequestOutputBudgets();
 
 private:
+    // The state of the realm whose console made the call: every global this client is attached to is a Collo global.
+    static ConsoleRealmState& realmState(JSC::JSGlobalObject*);
     bool sinkActive() const;
-    void emitLine(uint8_t level, const WTF::String& body);
+    // Emits one line, indented by `console`'s open groups.
+    void emitLine(const ConsoleRealmState& console, uint8_t level, const WTF::String& body);
     WTF::String normalizedLabel(const WTF::String&);
-    bool labelStateAtCap(size_t map_size, bool label_exists);
+    bool labelStateAtCap(ConsoleRealmState& console, size_t map_size, bool label_exists);
     uint64_t currentRequestId() const;
     bool budgetExempt(uint64_t request_id) const;
     bool requestOutputExhausted(uint64_t request_id) const;
     void emitBudgetDropMarker(uint64_t request_id);
 
-    // Tenant code chooses the labels, so their state is bounded: labels are truncated, and past the cap the maps
-    // accept no new label, with one warning per VM.
+    // Tenant code chooses the labels, so their state is bounded: labels are truncated, and past the cap a realm's
+    // maps accept no new label, with one warning per realm.
     static constexpr unsigned label_units_max = 256;
     static constexpr unsigned label_entries_max = 1024;
     // Request-end cleanup removes budget entries, but a late asynchronous turn can add a cleared id again, so the map
@@ -96,10 +109,6 @@ private:
     };
 
     ColloVm* owner;
-    unsigned group_depth { 0 };
-    bool label_cap_warned { false };
-    WTF::HashMap<WTF::String, uint64_t> counts;
-    WTF::HashMap<WTF::String, WTF::MonotonicTime> timers;
     WTF::HashMap<uint64_t, RequestOutputSpent, WTF::IntHash<uint64_t>, WTF::UnsignedWithZeroKeyHashTraits<uint64_t>>
         request_output_spent;
 };

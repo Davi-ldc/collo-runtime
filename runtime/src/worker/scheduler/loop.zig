@@ -215,6 +215,21 @@ fn collectFast(runtime: *state.Runtime) !void {
     try runtime.collectDueRequestDeadlines();
 }
 
+/// The ring a request descriptor's payload may sit in, with the eventfd its
+/// release signals when a lane marked the ring waiting for room: the
+/// completion eventfd, which the worker's reader lane polls already, so a
+/// lane parked on the ring needs no poll of its own
+/// (`server/ingress/runner/request_body.zig`).
+fn requestPayloadReaders(
+    runtime: *state.Runtime,
+    ingress_payload: *ipc.ingress_channel.SharedPayloadView,
+) ipc.ingress_channel.SharedPayloadReaders {
+    return .{
+        .server_to_worker = ingress_payload,
+        .server_to_worker_credit_eventfd = runtime.egress.completion_eventfd,
+    };
+}
+
 /// Takes one packet from the control socket: the ingress descriptors it
 /// carries join the request queue, and an `egress_attach` attaches the worker
 /// to the session it brings. Call it once each time the read poll reports
@@ -243,9 +258,11 @@ pub fn collectControlPacket(runtime: *state.Runtime) !void {
             packet_alive = false;
             if (ipc.ingress_channel.isDescriptorBatchPacket(packet.bytes)) {
                 var batch = if (runtime.requests.ingress_payload) |*ingress_payload|
-                    try ipc.ingress_channel.decodeReceivedBatchPacketWithSharedPayload(runtime.core.allocator, &packet, .{
-                        .server_to_worker = ingress_payload,
-                    })
+                    try ipc.ingress_channel.decodeReceivedBatchPacketWithSharedPayload(
+                        runtime.core.allocator,
+                        &packet,
+                        requestPayloadReaders(runtime, ingress_payload),
+                    )
                 else
                     try ipc.ingress_channel.decodeReceivedBatchPacket(runtime.core.allocator, &packet);
                 defer batch.deinit();
@@ -255,9 +272,11 @@ pub fn collectControlPacket(runtime: *state.Runtime) !void {
                 }
             } else {
                 const received = if (runtime.requests.ingress_payload) |*ingress_payload|
-                    try ipc.ingress_channel.decodeReceivedPacketWithSharedPayload(runtime.core.allocator, &packet, .{
-                        .server_to_worker = ingress_payload,
-                    })
+                    try ipc.ingress_channel.decodeReceivedPacketWithSharedPayload(
+                        runtime.core.allocator,
+                        &packet,
+                        requestPayloadReaders(runtime, ingress_payload),
+                    )
                 else
                     try ipc.ingress_channel.decodeReceivedPacket(runtime.core.allocator, &packet);
                 try runtime.enqueueIngressDescriptor(received);

@@ -162,7 +162,7 @@ const JSC::Identifier& cachedReadableStreamIdentifier(
     JSC::JSGlobalObject* global_object, JSC::Identifier ColloWebApiCache::* field, WTF::ASCIILiteral name)
 {
     auto& vm = global_object->vm();
-    auto& cache = uncheckedDowncast<Collo::GlobalObject>(global_object)->owner().webapi_cache;
+    auto& cache = uncheckedDowncast<Collo::GlobalObject>(global_object)->webApiCache();
     auto& identifier = cache.*field;
     if (identifier.isNull())
         identifier = JSC::Identifier::fromString(vm, name);

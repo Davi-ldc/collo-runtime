@@ -1058,7 +1058,7 @@ void installWebApiReadableStream(Collo::GlobalObject* global_object, JSC::VM& vm
         byteLengthQueuingStrategyHighWaterMark, nullptr, static_cast<unsigned>(JSC::PropertyAttribute::Accessor));
     auto* byte_length_size_function = JSC::JSFunction::create(
         vm, global_object, 1, "size"_s, byteLengthQueuingStrategySize, JSC::ImplementationVisibility::Public);
-    global_object->owner().webapi_cache.byte_length_queuing_strategy_size_function.set(vm, byte_length_size_function);
+    global_object->webApiCache().byte_length_queuing_strategy_size_function.set(vm, byte_length_size_function);
     // The strategies' IDL declares size as a readonly attribute, so it is an
     // accessor whose getter returns the cached function above.
     putWebApiAccessor(global_object, byte_length_strategy_prototype, vm, "size"_s, byteLengthQueuingStrategySizeGetter,
@@ -1080,7 +1080,7 @@ void installWebApiReadableStream(Collo::GlobalObject* global_object, JSC::VM& vm
         nullptr, static_cast<unsigned>(JSC::PropertyAttribute::Accessor));
     auto* count_size_function = JSC::JSFunction::create(
         vm, global_object, 0, "size"_s, countQueuingStrategySize, JSC::ImplementationVisibility::Public);
-    global_object->owner().webapi_cache.count_queuing_strategy_size_function.set(vm, count_size_function);
+    global_object->webApiCache().count_queuing_strategy_size_function.set(vm, count_size_function);
     putWebApiAccessor(global_object, count_strategy_prototype, vm, "size"_s, countQueuingStrategySizeGetter, nullptr,
         static_cast<unsigned>(JSC::PropertyAttribute::Accessor));
     count_strategy_prototype->putDirect(vm, vm.propertyNames->toStringTagSymbol,
@@ -1164,24 +1164,24 @@ void installWebApiReadableStream(Collo::GlobalObject* global_object, JSC::VM& vm
         JSColloTransformStream::createStructure(vm, global_object, transform_stream_prototype),
         transform_controller_constructor, transform_controller_prototype,
         JSColloTransformStreamDefaultController::createStructure(vm, global_object, transform_controller_prototype));
-    global_object->owner().webapi_cache.compression_stream_constructor.set(vm, compression_stream_constructor);
-    global_object->owner().webapi_cache.compression_stream_prototype.set(vm, compression_stream_prototype);
-    global_object->owner().webapi_cache.compression_stream_structure.set(
+    global_object->webApiCache().compression_stream_constructor.set(vm, compression_stream_constructor);
+    global_object->webApiCache().compression_stream_prototype.set(vm, compression_stream_prototype);
+    global_object->webApiCache().compression_stream_structure.set(
         vm, JSColloCompressionStream::createStructure(vm, global_object, compression_stream_prototype));
-    global_object->owner().webapi_cache.decompression_stream_constructor.set(vm, decompression_stream_constructor);
-    global_object->owner().webapi_cache.decompression_stream_prototype.set(vm, decompression_stream_prototype);
-    global_object->owner().webapi_cache.decompression_stream_structure.set(
+    global_object->webApiCache().decompression_stream_constructor.set(vm, decompression_stream_constructor);
+    global_object->webApiCache().decompression_stream_prototype.set(vm, decompression_stream_prototype);
+    global_object->webApiCache().decompression_stream_structure.set(
         vm, JSColloCompressionStream::createStructure(vm, global_object, decompression_stream_prototype));
-    global_object->owner().webapi_cache.byte_length_queuing_strategy_constructor.set(
+    global_object->webApiCache().byte_length_queuing_strategy_constructor.set(
         vm, byte_length_strategy_constructor);
-    global_object->owner().webapi_cache.byte_length_queuing_strategy_prototype.set(vm, byte_length_strategy_prototype);
-    global_object->owner().webapi_cache.byte_length_queuing_strategy_structure.set(
+    global_object->webApiCache().byte_length_queuing_strategy_prototype.set(vm, byte_length_strategy_prototype);
+    global_object->webApiCache().byte_length_queuing_strategy_structure.set(
         vm, JSColloQueuingStrategy::createStructure(vm, global_object, byte_length_strategy_prototype));
-    global_object->owner().webapi_cache.count_queuing_strategy_constructor.set(vm, count_strategy_constructor);
-    global_object->owner().webapi_cache.count_queuing_strategy_prototype.set(vm, count_strategy_prototype);
-    global_object->owner().webapi_cache.count_queuing_strategy_structure.set(
+    global_object->webApiCache().count_queuing_strategy_constructor.set(vm, count_strategy_constructor);
+    global_object->webApiCache().count_queuing_strategy_prototype.set(vm, count_strategy_prototype);
+    global_object->webApiCache().count_queuing_strategy_structure.set(
         vm, JSColloQueuingStrategy::createStructure(vm, global_object, count_strategy_prototype));
-    global_object->owner().webapi_cache.pipe_to_state_structure.set(
+    global_object->webApiCache().pipe_to_state_structure.set(
         vm, JSColloPipeToState::createStructure(vm, global_object, global_object->objectPrototype()));
 }
 } // namespace Collo::HostFunctions

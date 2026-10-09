@@ -1,8 +1,11 @@
-//! What a worker needs to run one route, built once at boot from the
-//! configuration and immutable until shutdown: the route's entry specifier,
-//! a sealed memfd with the module pack of every module the entry can load
-//! (`module_graph.zig`), a sealed memfd with the route's bindings, and the
-//! filesystem index.
+//! What every worker of one definition needs, built once at boot from the
+//! configuration and immutable until shutdown: a sealed memfd with the
+//! module pack of every module the definition's routes can load
+//! (`module_graph.zig`), a sealed memfd with the definition's route table
+//! (each route's entry specifier and text bindings, in route order;
+//! `common/ipc/route_table.zig`), and the filesystem index. A worker serves
+//! every route of its definition, so these are per definition, not per
+//! route, and a dispatch names its route by its index in the table.
 //!
 //! Module specifiers follow the engine's transport layout (the header of
 //! `bindings/jsc/runtime/module_loader.cpp`): every module of a definition's
@@ -11,21 +14,24 @@
 //! deepest directory holding every module of the definition
 //! (`Graph.commonDirectory`). A relative import then resolves in key space to
 //! the key of the file it names on disk, and tenant code sees the same path
-//! under `/var/task/`.
+//! under `/var/task/`. Two routes with the same entry file share its key.
 //!
-//! `<worker>` is one segment per definition because a worker process can
-//! serve any route of its definition and its VM accepts a single segment:
-//! the first pack it registers pins it, and a later pack under another one
-//! is refused (`registerModulePackLocked` in
+//! `<worker>` is one segment per definition because a worker process serves
+//! every route of its definition and its VM accepts a single segment: the
+//! first pack it registers pins it, and a later pack under another one is
+//! refused (`registerModulePackLocked` in
 //! `bindings/jsc/runtime/module_loader.cpp`). Within a pack, every module
-//! must share its entry's segment (`validateSameDeployScopedPack` in
+//! must share one segment (`validateSameDeployScopedPack` in
 //! `common/ipc/module_pack.zig`).
 //!
-//! The pack is built with the host's graph pack builder
-//! (`createModulePackGraphFd` in `host/dispatch.zig`) with the entry first,
-//! and the bindings blob with `ipc.route_bindings`, one entry per text
-//! binding. The filesystem index is the empty placeholder every route shares
-//! until filesystem bindings exist; `Routes` owns it.
+//! The pack holds each module some route reaches exactly once: route 0's
+//! entry and what it reaches first, breadth first, then whatever each later
+//! route adds, in route order. It is built with the host's graph pack builder
+//! (`createModulePackGraphFd` in `host/dispatch.zig`) with route 0's entry as
+//! its entry. The route table is built with `ipc.route_table`, one section
+//! per route with one entry per text binding. The filesystem index is the
+//! empty placeholder every definition shares until filesystem bindings
+//! exist; `Routes` owns it.
 //!
 //! The memfds are sealed read-only, so any thread may duplicate them or pass
 //! them over SCM_RIGHTS while the server runs; nobody reads them through the
@@ -41,35 +47,32 @@ const module_graph = @import("module_graph.zig");
 
 const module_pack = ipc.module_pack;
 const route_bindings = ipc.route_bindings;
+const route_table = ipc.route_table;
 const Diagnostic = config.Diagnostic;
 
 pub const Error = module_graph.Error;
 
-pub const RouteArtifact = struct {
-    /// The specifier the worker registers and evaluates the entry under;
-    /// owned by the `Routes` arena.
-    entry_specifier: []const u8,
-    /// Sealed read-only memfd holding the pack; the entry is its module 0.
+pub const DefinitionArtifact = struct {
+    /// Sealed read-only memfd holding every module the definition's routes
+    /// reach, each once; route 0's entry is its module 0.
     module_pack: fd_mod.OwnedFd,
     module_pack_bytes: u64,
     module_count: u32,
-    /// Sealed read-only memfd with the route's text bindings, name and
-    /// value per entry, in configuration order.
-    bindings: route_bindings.Sealed,
+    /// Sealed read-only memfd with every route's entry specifier and text
+    /// bindings, in route order.
+    route_table: route_table.Sealed,
     /// The shared placeholder index; borrowed from `Routes`.
     fs_index: fd_mod.FdRef,
 
-    pub fn deinit(self: *RouteArtifact) void {
+    pub fn deinit(self: *DefinitionArtifact) void {
         self.module_pack.deinit();
-        self.bindings.close();
+        self.route_table.close();
         self.* = undefined;
     }
 };
 
 pub const BuildContext = struct {
     gpa: std.mem.Allocator,
-    /// Holds the entry specifiers for as long as the artifacts live.
-    arena: std.mem.Allocator,
     fs_index: fd_mod.FdRef,
     /// Pack bytes built so far for every definition, bounded by
     /// `pack_bytes_total_max`.
@@ -77,16 +80,13 @@ pub const BuildContext = struct {
     diagnostic: *Diagnostic,
 };
 
-/// Builds the artifacts of every route of `definition` into `out`, in route
-/// order. On error the artifacts this call built are closed again, and on
-/// `error.RouteBuildFailed` the diagnostic names the worker and the route or
-/// module at fault.
+/// Builds the artifact of `definition`. On `error.RouteBuildFailed` the
+/// diagnostic names the worker, and the route or module at fault when one
+/// is.
 pub fn buildDefinition(
     context: BuildContext,
     definition: *const config.WorkerDefinition,
-    out: []RouteArtifact,
-) Error!void {
-    std.debug.assert(out.len == definition.routes.len);
+) Error!DefinitionArtifact {
     var scratch_state: std.heap.ArenaAllocator = .init(context.gpa);
     defer scratch_state.deinit();
     const scratch = scratch_state.allocator();
@@ -111,30 +111,49 @@ pub fn buildDefinition(
         };
     }
 
-    var built: usize = 0;
-    errdefer for (out[0..built]) |*artifact| artifact.deinit();
-    for (definition.routes, entries, out) |*route, entry, *artifact| {
-        const label: module_graph.Label = .{ .worker = definition.name, .pattern = route.pattern };
-        artifact.* = try buildRoute(context, scratch, &graph, keys, route, entry, label);
-        built += 1;
-    }
+    var pack = try buildPack(context, scratch, definition, &graph, keys, entries);
+    errdefer pack.fd.deinit();
+    const table = try buildRouteTable(context, scratch, definition, keys, entries);
+    return .{
+        .module_pack = pack.fd,
+        .module_pack_bytes = pack.bytes,
+        .module_count = pack.module_count,
+        .route_table = table,
+        .fs_index = context.fs_index,
+    };
 }
 
-fn buildRoute(
+const BuiltPack = struct {
+    fd: fd_mod.OwnedFd,
+    bytes: u64,
+    module_count: u32,
+};
+
+/// The definition's pack: every module some route reaches, once, in the
+/// order the file header gives.
+fn buildPack(
     context: BuildContext,
     scratch: std.mem.Allocator,
+    definition: *const config.WorkerDefinition,
     graph: *const module_graph.Graph,
     keys: []const []const u8,
-    route: *const config.Route,
-    entry: u32,
-    label: module_graph.Label,
-) Error!RouteArtifact {
-    const entry_key = keys[entry];
-    if (entry_key.len > ipc.WorkerInit.max_route_entry_specifier_bytes)
-        return fail(context.diagnostic, label, "the entry specifier {s} exceeds {d} bytes", .{ entry_key, ipc.WorkerInit.max_route_entry_specifier_bytes });
-
+    entries: []const u32,
+) Error!BuiltPack {
     var order: std.ArrayList(u32) = .empty;
-    try graph.reachable(entry, &order);
+    var included = try std.DynamicBitSetUnmanaged.initEmpty(scratch, graph.modules.items.len);
+    var reached: std.ArrayList(u32) = .empty;
+    for (entries) |entry| {
+        reached.clearRetainingCapacity();
+        try graph.reachable(entry, &reached);
+        for (reached.items) |module_index| {
+            if (included.isSet(module_index))
+                continue;
+            included.set(module_index);
+            try order.append(scratch, module_index);
+        }
+    }
+    std.debug.assert(order.items[0] == entries[0]);
+
     const modules = try scratch.alloc(module_pack.Module, order.items.len);
     for (order.items, modules) |module_index, *packed_module| {
         const module = graph.modules.items[module_index];
@@ -150,37 +169,47 @@ fn buildRoute(
 
     const raw_pack = host.dispatch.createModulePackGraphFd(context.gpa, modules, 0) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.ModulePackTooLarge => return fail(context.diagnostic, label, "the module pack exceeds {d} bytes", .{module_pack.max_pack_bytes}),
-        else => return fail(context.diagnostic, label, "cannot build the module pack: {s}", .{@errorName(err)}),
+        error.ModulePackTooLarge => return failWorker(context.diagnostic, definition, "the module pack exceeds {d} bytes", .{module_pack.max_pack_bytes}),
+        else => return failWorker(context.diagnostic, definition, "cannot build the module pack: {s}", .{@errorName(err)}),
     };
     var pack = fd_mod.OwnedFd.fromRaw(raw_pack);
     errdefer pack.deinit();
     const pack_stat = std.posix.fstat(pack.fd()) catch |err|
-        return fail(context.diagnostic, label, "cannot read the module pack size: {s}", .{@errorName(err)});
+        return failWorker(context.diagnostic, definition, "cannot read the module pack size: {s}", .{@errorName(err)});
     const pack_bytes: u64 = @intCast(pack_stat.size);
     context.pack_bytes_total.* += pack_bytes;
     if (context.pack_bytes_total.* > server_limits.pack_bytes_total_max)
-        return fail(context.diagnostic, label, "the module packs of all routes exceed {d} bytes", .{server_limits.pack_bytes_total_max});
+        return failWorker(context.diagnostic, definition, "the module packs of all workers exceed {d} bytes", .{server_limits.pack_bytes_total_max});
+    return .{ .fd = pack, .bytes = pack_bytes, .module_count = @intCast(order.items.len) };
+}
 
-    const binding_entries = try scratch.alloc(route_bindings.Entry, route.bindings.len);
-    for (route.bindings, binding_entries) |binding, *binding_entry| {
-        binding_entry.* = switch (binding.value) {
-            .text => |text| .{ .name = binding.name, .value = text },
-        };
+/// The definition's route table: each route's entry key and text bindings,
+/// in route order.
+fn buildRouteTable(
+    context: BuildContext,
+    scratch: std.mem.Allocator,
+    definition: *const config.WorkerDefinition,
+    keys: []const []const u8,
+    entries: []const u32,
+) Error!route_table.Sealed {
+    const inputs = try scratch.alloc(route_table.RouteInput, definition.routes.len);
+    for (definition.routes, entries, inputs) |*route, entry, *input| {
+        const entry_key = keys[entry];
+        if (entry_key.len > route_table.entry_specifier_bytes_max) {
+            const label: module_graph.Label = .{ .worker = definition.name, .pattern = route.pattern };
+            return failRoute(context.diagnostic, label, "the entry specifier {s} exceeds {d} bytes", .{ entry_key, route_table.entry_specifier_bytes_max });
+        }
+        const binding_entries = try scratch.alloc(route_bindings.Entry, route.bindings.len);
+        for (route.bindings, binding_entries) |binding, *binding_entry| {
+            binding_entry.* = switch (binding.value) {
+                .text => |text| .{ .name = binding.name, .value = text },
+            };
+        }
+        input.* = .{ .entry_specifier = entry_key, .bindings = binding_entries };
     }
-    const bindings = route_bindings.buildSealed(context.gpa, binding_entries) catch |err| switch (err) {
+    return route_table.buildSealed(context.gpa, inputs) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return fail(context.diagnostic, label, "cannot build the bindings blob: {s}", .{@errorName(err)}),
-    };
-    errdefer bindings.close();
-
-    return .{
-        .entry_specifier = try context.arena.dupe(u8, entry_key),
-        .module_pack = pack,
-        .module_pack_bytes = pack_bytes,
-        .module_count = @intCast(order.items.len),
-        .bindings = bindings,
-        .fs_index = context.fs_index,
+        else => return failWorker(context.diagnostic, definition, "cannot build the route table: {s}", .{@errorName(err)}),
     };
 }
 
@@ -192,7 +221,12 @@ fn moduleKey(allocator: std.mem.Allocator, worker: []const u8, root: []const u8,
     return std.mem.concat(allocator, u8, &.{ module_pack.route_specifier_prefix, worker, "/", relative });
 }
 
-fn fail(diagnostic: *Diagnostic, label: module_graph.Label, comptime format: []const u8, args: anytype) Error {
+fn failWorker(diagnostic: *Diagnostic, definition: *const config.WorkerDefinition, comptime format: []const u8, args: anytype) Error {
+    diagnostic.set("worker '{s}': " ++ format, .{definition.name} ++ args);
+    return error.RouteBuildFailed;
+}
+
+fn failRoute(diagnostic: *Diagnostic, label: module_graph.Label, comptime format: []const u8, args: anytype) Error {
     diagnostic.set("worker '{s}' route '{s}': " ++ format, .{ label.worker, label.pattern } ++ args);
     return error.RouteBuildFailed;
 }

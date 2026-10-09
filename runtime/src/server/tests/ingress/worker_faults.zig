@@ -267,7 +267,7 @@ test "a send fault on a lane that only sends to its worker takes the worker out 
     try harness.expectFaulted(scene.stub, .payload_ring_invalid);
 }
 
-test "two lanes whose bodies wait on one worker's full payload ring both send once it has room, whichever lane read the one credit" {
+test "two lanes whose bodies wait on one worker's full payload ring both send once the worker frees room, woken by its reader and polling nothing" {
     var scene: lane_harness.TwoLanes = undefined;
     try scene.init(.{});
     defer scene.deinit();
@@ -292,7 +292,7 @@ test "two lanes whose bodies wait on one worker's full payload ring both send on
     // Lane 0 streams until a chunk waits on the full ring, and lane 1's
     // first chunk finds it full too.
     var chunks_sent: usize = 0;
-    while (harness.lane(0).dynamic_requests[first_key.slot].send_blocked != .ring) : (chunks_sent += 1) {
+    while (harness.lane(0).requests.entries[first_key.slot].send_blocked != .ring) : (chunks_sent += 1) {
         if (chunks_sent == 64)
             return error.RingNeverFilled;
         try scene.first.data(1, chunk, false);
@@ -300,27 +300,26 @@ test "two lanes whose bodies wait on one worker's full payload ring both send on
     }
     try scene.second.data(1, chunk, false);
     try scene.second.drive();
-    try std.testing.expect(harness.lane(1).dynamic_requests[second_key.slot].send_blocked == .ring);
+    try std.testing.expect(harness.lane(1).requests.entries[second_key.slot].send_blocked == .ring);
 
-    // The worker reads what lane 0 sent, which frees the ring, and writes
-    // one credit to the eventfd both lanes poll.
+    // The worker reads what lane 0 sent. The lanes marked the ring waiting,
+    // so the release writes the worker's completion eventfd, the one its
+    // reader, lane 0, polls already; nothing writes the credit eventfd.
     const received = try std.testing.allocator.alloc(u8, content_length);
     defer std.testing.allocator.free(received);
     var body: lane_harness.Body = .{};
     try scene.stub.readBody(first, received, &body);
-    const credit: u64 = 1;
-    _ = try std.posix.write(scene.stub.record.handle.ingress_payload_credit_eventfd, std.mem.asBytes(&credit));
+    try std.testing.expect(!try scene.stub.creditSignalled());
 
-    // Lane 0's handler reads the count; lane 1's, whose poll fired for the
-    // same write, finds it empty and still tries its own body.
-    for ([_]u16{ 0, 1 }) |lane_index| {
-        const registration_index = try harness.expectRegistration(lane_index, scene.stub);
-        try harness.discardPollCompletions(lane_index);
-        try harness.lane(lane_index).handleWorkerPayloadCredit(registration_index);
-        try harness.finishPass(lane_index);
-    }
-    try std.testing.expect(harness.lane(0).dynamic_requests[first_key.slot].send_blocked == .none);
-    try std.testing.expect(harness.lane(1).dynamic_requests[second_key.slot].send_blocked == .none);
+    // The reader's completion wake raises both lanes' credit wake, and each
+    // lane's next command wake retries its body. No client byte moves.
+    try harness.handleCompletions(0, scene.stub);
+    try harness.handleCommands(0);
+    try harness.handleCommands(1);
+    try std.testing.expect(harness.lane(0).requests.entries[first_key.slot].send_blocked == .none);
+    try std.testing.expect(harness.lane(1).requests.entries[second_key.slot].send_blocked == .none);
+    try std.testing.expectEqual(@as(u64, 1), harness.lane(0).lane.counters.h2_request_body_credit_wakes);
+    try std.testing.expectEqual(@as(u64, 1), harness.lane(1).lane.counters.h2_request_body_credit_wakes);
     try harness.expectLanesRunning();
     try harness.expectServing(scene.stub);
 }

@@ -12,14 +12,14 @@
 //!
 //! WorkerInit's descriptor table, in order: the base descriptors (metrics
 //! page, completion eventfd, ingress payload memfd, payload credit eventfd,
-//! tmp root, cgroup directory, bindings blob), the region descriptors of the
+//! tmp root, cgroup directory, route table), the region descriptors of the
 //! worker's egress session (`egress_shared.region_fd_count`), present exactly
 //! when `WorkerInit.boot_egress_token` is not `egress_token.none`, the
 //! worker's wake descriptors (`egress_shared.wake_fd_count`), which every
 //! table has, the fs index memfd and the worker end of the fs fault pair, and
-//! last the route's module pack, present exactly when
-//! `WorkerInit.route_entry_specifier_len` is nonzero. With a session, the
-//! regions and the wake descriptors together are the worker's half in
+//! last the definition's module pack, present exactly when the message sets
+//! `WorkerInit.flag_serves_routes`. With a session, the regions and the wake
+//! descriptors together are the worker's half in
 //! `egress_shared.RawFds.asArray` order. The message alone decides the table,
 //! so the sender refuses a boot token without the regions and the regions
 //! without a token, and the receiver rejects any count but the one the
@@ -32,7 +32,7 @@ const messages = @import("messages.zig");
 const egress_shared = @import("egress_shared.zig");
 const egress_token = @import("egress_token.zig");
 const fs_index = @import("fs_index.zig");
-const route_bindings = @import("route_bindings.zig");
+const route_table = @import("route_table.zig");
 const fd_mod = @import("collo_os").fd;
 
 const worker_init_base_fd_count: usize = 7;
@@ -40,10 +40,10 @@ const worker_init_base_fd_count: usize = 7;
 /// `fs_index.placeholder_bytes`), and the worker end of the fs fault
 /// SEQPACKET pair.
 const worker_init_fs_fd_count: usize = 2;
-/// The route's module pack, after the fs pair.
-const worker_init_route_entry_fd_count: usize = 1;
+/// The definition's module pack, after the fs pair.
+const worker_init_module_pack_fd_count: usize = 1;
 const worker_init_fd_count_max: usize = worker_init_base_fd_count + egress_shared.shared_fd_count +
-    worker_init_fs_fd_count + worker_init_route_entry_fd_count;
+    worker_init_fs_fd_count + worker_init_module_pack_fd_count;
 
 comptime {
     std.debug.assert(worker_init_fd_count_max <= messages.max_fds_per_message);
@@ -51,7 +51,7 @@ comptime {
 
 /// Where each part of WorkerInit's descriptor table sits for one message,
 /// which announces the two optional parts: the session's regions by the boot
-/// token, the route's pack by its specifier length.
+/// token, the definition's pack by `flag_serves_routes`.
 const WorkerInitTable = struct {
     /// Index of the first region descriptor; null when the message carries
     /// no boot token.
@@ -60,15 +60,14 @@ const WorkerInitTable = struct {
     wake_first: usize,
     fs_index: usize,
     fs_fault: usize,
-    /// Index of the route's pack; null when the message carries no route
-    /// entry.
-    route_entry: ?usize,
+    /// Index of the definition's pack; null when the worker serves no route.
+    module_pack: ?usize,
     /// Descriptors in the whole table.
     count: usize,
 
     fn of(message: *const messages.WorkerInit) WorkerInitTable {
         const has_regions = !egress_token.isNone(&message.boot_egress_token);
-        const has_route_entry = message.route_entry_specifier_len != 0;
+        const has_module_pack = message.servesRoutes();
         const wake_first = worker_init_base_fd_count +
             @as(usize, if (has_regions) egress_shared.region_fd_count else 0);
         const fs_first = wake_first + egress_shared.wake_fd_count;
@@ -78,8 +77,8 @@ const WorkerInitTable = struct {
             .wake_first = wake_first,
             .fs_index = fs_first,
             .fs_fault = fs_first + 1,
-            .route_entry = if (has_route_entry) fs_end else null,
-            .count = fs_end + @as(usize, if (has_route_entry) worker_init_route_entry_fd_count else 0),
+            .module_pack = if (has_module_pack) fs_end else null,
+            .count = fs_end + @as(usize, if (has_module_pack) worker_init_module_pack_fd_count else 0),
         };
     }
 };
@@ -108,26 +107,20 @@ pub const WorkerInitWithFds = struct {
     ingress_payload_credit_eventfd: std.posix.fd_t,
     tmp_root_fd: std.posix.fd_t,
     cgroup_dir_fd: std.posix.fd_t,
-    /// Sealed read-only memfd holding the route's bindings blob
-    /// (`route_bindings.zig`), `message.route_bindings_blob_len` bytes long.
-    route_bindings_fd: std.posix.fd_t,
+    /// Sealed read-only memfd holding the route table of the worker's
+    /// definition (`route_table.zig`), `message.route_table_len` bytes long.
+    route_table_fd: std.posix.fd_t,
     /// Sealed read-only fs index memfd.
     fs_index_fd: std.posix.fd_t = -1,
     /// Worker end of the fs fault SEQPACKET pair.
     fs_fault_fd: std.posix.fd_t = -1,
-    /// The route's sealed module pack; null when the packet carries no route
-    /// entry (`message.route_entry_specifier_len` is zero).
-    route_entry_fd: ?std.posix.fd_t = null,
-    route_entry_specifier_buffer: [messages.WorkerInit.max_route_entry_specifier_bytes]u8 = undefined,
+    /// The definition's sealed module pack; null when the worker serves no
+    /// route (`WorkerInit.flag_serves_routes` clear).
+    module_pack_fd: ?std.posix.fd_t = null,
     /// The worker's egress descriptors: its wake descriptors always, and the
     /// regions of its session exactly when the message carries a boot token
     /// (`egress_shared.RawFds.regionCount`).
     egress_shared_fds: egress_shared.RawFds = .{},
-
-    /// Empty when the packet carries no route entry.
-    pub fn routeEntrySpecifier(self: *const WorkerInitWithFds) []const u8 {
-        return self.route_entry_specifier_buffer[0..self.message.route_entry_specifier_len];
-    }
 
     pub fn deinit(self: *WorkerInitWithFds) void {
         if (self.metrics_fd >= 0)
@@ -142,21 +135,21 @@ pub const WorkerInitWithFds = struct {
             std.posix.close(self.tmp_root_fd);
         if (self.cgroup_dir_fd >= 0)
             std.posix.close(self.cgroup_dir_fd);
-        if (self.route_bindings_fd >= 0)
-            std.posix.close(self.route_bindings_fd);
+        if (self.route_table_fd >= 0)
+            std.posix.close(self.route_table_fd);
         if (self.fs_index_fd >= 0)
             std.posix.close(self.fs_index_fd);
         if (self.fs_fault_fd >= 0)
             std.posix.close(self.fs_fault_fd);
-        if (self.route_entry_fd) |fd|
+        if (self.module_pack_fd) |fd|
             std.posix.close(fd);
         self.egress_shared_fds.close();
         self.* = undefined;
     }
 
-    pub fn takeRouteEntryFd(self: *WorkerInitWithFds) ?std.posix.fd_t {
-        const fd = self.route_entry_fd;
-        self.route_entry_fd = null;
+    pub fn takeModulePackFd(self: *WorkerInitWithFds) ?std.posix.fd_t {
+        const fd = self.module_pack_fd;
+        self.module_pack_fd = null;
         return fd;
     }
 
@@ -208,9 +201,9 @@ pub const WorkerInitWithFds = struct {
         return fd;
     }
 
-    pub fn takeRouteBindingsFd(self: *WorkerInitWithFds) std.posix.fd_t {
-        const fd = self.route_bindings_fd;
-        self.route_bindings_fd = -1;
+    pub fn takeRouteTableFd(self: *WorkerInitWithFds) std.posix.fd_t {
+        const fd = self.route_table_fd;
+        self.route_table_fd = -1;
         return fd;
     }
 
@@ -375,12 +368,13 @@ pub fn recvForkReply(fd: std.posix.fd_t) !ForkReplyWithFds {
     };
 }
 
-/// Sends WorkerInit for a launch with no bindings, no files and no route
-/// entry: it builds the empty bindings blob, the placeholder fs index and an
-/// fs fault socketpair whose ends close once SCM_RIGHTS duplicated them. The
-/// zygote integration tests launch this way; a host sends through
-/// `sendWorkerInitWithRouteBindingsAndEgressShared`, whose rule for
-/// `shared_fds` and failures this function shares.
+/// Sends WorkerInit for a launch that serves no route and has no files: it
+/// builds the empty route table, the placeholder fs index and an fs fault
+/// socketpair whose ends close once SCM_RIGHTS duplicated them. The zygote
+/// integration tests launch this way; a host sends through
+/// `sendWorkerInitWithRouteTableAndEgressShared`, whose rules for
+/// `shared_fds` and failures this function shares, so a message that sets
+/// `flag_serves_routes` fails here.
 pub fn sendWorkerInitWithEgressShared(
     fd: std.posix.fd_t,
     message: *const messages.WorkerInit,
@@ -392,16 +386,16 @@ pub fn sendWorkerInitWithEgressShared(
     cgroup_dir_fd: std.posix.fd_t,
     shared_fds: egress_shared.RawFds,
 ) !void {
-    const empty_bindings = try route_bindings.createEmptySealed();
-    defer empty_bindings.close();
+    const empty_table = try route_table.createEmptySealed();
+    defer empty_table.close();
     const fs_index_fd = try createPlaceholderFsIndexMemfd();
     defer std.posix.close(fs_index_fd);
     const fs_fault_pair = try fd_mod.socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
     defer std.posix.close(fs_fault_pair[0]);
     defer std.posix.close(fs_fault_pair[1]);
     var message_copy = message.*;
-    message_copy.route_bindings_blob_len = empty_bindings.blob_len;
-    try sendWorkerInitWithRouteBindingsAndEgressShared(
+    message_copy.route_table_len = empty_table.blob_len;
+    try sendWorkerInitWithRouteTableAndEgressShared(
         fd,
         &message_copy,
         metrics_fd,
@@ -410,36 +404,30 @@ pub fn sendWorkerInitWithEgressShared(
         ingress_payload_credit_eventfd,
         tmp_root_fd,
         cgroup_dir_fd,
-        empty_bindings.fd,
+        empty_table.fd,
         shared_fds,
-        null,
         fs_index_fd,
         fs_fault_pair[1],
+        null,
     );
 }
 
-/// The route's module pack, delivered at init: the child registers and
-/// evaluates `specifier` before it reports ready. The fd is borrowed, since
-/// SCM_RIGHTS duplicates it.
-pub const RouteEntryInit = struct {
-    fd: std.posix.fd_t,
-    specifier: []const u8,
-};
-
 /// Sends WorkerInit with its descriptor table. Every fd is borrowed, since
-/// SCM_RIGHTS duplicates them: `route_bindings_fd` is the sealed bindings
-/// blob of `message.route_bindings_blob_len` bytes, `shared_fds` the worker's
-/// egress descriptors, its wake descriptors always and the regions of its
-/// session exactly when the message carries a boot token, `fs_index_fd` the
-/// sealed fs index (a tree with no files still sends the placeholder index)
-/// and `fs_fault_fd` the worker end of the fs fault socketpair. With
-/// `route_entry`, the specifier follows the struct and the pack closes the
-/// table; this function sets `route_entry_specifier_len` from it. Fails with
+/// SCM_RIGHTS duplicates them: `route_table_fd` is the sealed route table of
+/// `message.route_table_len` bytes, `shared_fds` the worker's egress
+/// descriptors, its wake descriptors always and the regions of its session
+/// exactly when the message carries a boot token, `fs_index_fd` the sealed
+/// fs index (a tree with no files still sends the placeholder index),
+/// `fs_fault_fd` the worker end of the fs fault socketpair, and
+/// `module_pack_fd` the definition's sealed module pack, which closes the
+/// table exactly when the message sets `flag_serves_routes`. Fails with
 /// `error.InvalidEgressSharedEndpoint` for missing wake descriptors or some
 /// regions without the rest, and `error.InvalidWorkerInit` for regions the
-/// boot token does not announce, a boot token without them, a negative fs fd
-/// or an empty, oversized or fd-less route entry.
-pub fn sendWorkerInitWithRouteBindingsAndEgressShared(
+/// boot token does not announce, a boot token without them, a pack the flag
+/// does not announce, the flag without a pack or with the empty table's
+/// length, or a negative descriptor among the route table, the fs pair and
+/// the pack.
+pub fn sendWorkerInitWithRouteTableAndEgressShared(
     fd: std.posix.fd_t,
     message: *const messages.WorkerInit,
     metrics_fd: std.posix.fd_t,
@@ -448,11 +436,11 @@ pub fn sendWorkerInitWithRouteBindingsAndEgressShared(
     ingress_payload_credit_eventfd: std.posix.fd_t,
     tmp_root_fd: std.posix.fd_t,
     cgroup_dir_fd: std.posix.fd_t,
-    route_bindings_fd: std.posix.fd_t,
+    route_table_fd: std.posix.fd_t,
     shared_fds: egress_shared.RawFds,
-    route_entry: ?RouteEntryInit,
     fs_index_fd: std.posix.fd_t,
     fs_fault_fd: std.posix.fd_t,
+    module_pack_fd: ?std.posix.fd_t,
 ) !void {
     const has_boot_token = !egress_token.isNone(&message.boot_egress_token);
     if (!shared_fds.wakeFds().isValid())
@@ -462,19 +450,19 @@ pub fn sendWorkerInitWithRouteBindingsAndEgressShared(
         egress_shared.region_fd_count => if (!has_boot_token) return error.InvalidWorkerInit,
         else => return error.InvalidEgressSharedEndpoint,
     }
-    if (fs_index_fd < 0 or fs_fault_fd < 0)
+    if (route_table_fd < 0 or fs_index_fd < 0 or fs_fault_fd < 0)
         return error.InvalidWorkerInit;
-    if (route_entry) |entry| {
-        if (entry.specifier.len == 0 or
-            entry.specifier.len > messages.WorkerInit.max_route_entry_specifier_bytes or
-            entry.fd < 0)
+    // The flag, the pack and a table that holds a route come together or not
+    // at all; the child would refuse any other combination after the fork.
+    if (message.servesRoutes() != (module_pack_fd != null))
+        return error.InvalidWorkerInit;
+    if (message.servesRoutes() != (message.route_table_len != route_table.empty_blob.len))
+        return error.InvalidWorkerInit;
+    if (module_pack_fd) |pack_fd| {
+        if (pack_fd < 0)
             return error.InvalidWorkerInit;
     }
-
-    var message_copy = message.*;
-    message_copy.route_entry_specifier_len =
-        if (route_entry) |entry| @intCast(entry.specifier.len) else 0;
-    const table = WorkerInitTable.of(&message_copy);
+    const table = WorkerInitTable.of(message);
 
     var fds: [worker_init_fd_count_max]std.posix.fd_t = undefined;
     fds[0] = metrics_fd;
@@ -483,7 +471,7 @@ pub fn sendWorkerInitWithRouteBindingsAndEgressShared(
     fds[3] = ingress_payload_credit_eventfd;
     fds[4] = tmp_root_fd;
     fds[5] = cgroup_dir_fd;
-    fds[6] = route_bindings_fd;
+    fds[6] = route_table_fd;
     if (table.regions_first) |first| {
         // The checks above paired the regions with the boot token the table
         // reads, so the half is whole.
@@ -494,21 +482,10 @@ pub fn sendWorkerInitWithRouteBindingsAndEgressShared(
     @memcpy(fds[table.wake_first..][0..wake_fds.len], &wake_fds);
     fds[table.fs_index] = fs_index_fd;
     fds[table.fs_fault] = fs_fault_fd;
-    if (route_entry) |entry|
-        fds[table.route_entry.?] = entry.fd;
+    if (module_pack_fd) |pack_fd|
+        fds[table.module_pack.?] = pack_fd;
 
-    var packet_buffer: [@sizeOf(messages.WorkerInit) + messages.WorkerInit.max_route_entry_specifier_bytes]u8 = undefined;
-    @memcpy(packet_buffer[0..@sizeOf(messages.WorkerInit)], std.mem.asBytes(&message_copy));
-    var packet_len: usize = @sizeOf(messages.WorkerInit);
-    if (route_entry) |entry| {
-        @memcpy(packet_buffer[packet_len..][0..entry.specifier.len], entry.specifier);
-        packet_len += entry.specifier.len;
-    }
-    try packet.sendWithFds(
-        fd,
-        packet_buffer[0..packet_len],
-        fds[0..table.count],
-    );
+    try packet.sendWithFds(fd, std.mem.asBytes(message), fds[0..table.count]);
 }
 
 /// `fs_index.placeholder_bytes`, the index of a tree with no files, sealed
@@ -525,28 +502,25 @@ pub fn createPlaceholderFsIndexMemfd() !std.posix.fd_t {
     return fd;
 }
 
-/// Receives WorkerInit on the child's init socket; every descriptor and the
-/// specifier move into the result. The table must be the one the message
-/// announces (see the file header): a short one fails as
-/// `checkWorkerInitFdCount` describes, so a boot token without the session's
-/// regions, or a table without the wake descriptors, fails with
-/// `error.MissingEgressSharedFd` and the regions without a token with
-/// `error.InvalidFdCount`. A specifier length that disagrees with
-/// the packet fails with `error.ShortRead` or `error.InvalidWorkerInit`. The
+/// Receives WorkerInit on the child's init socket; every descriptor moves
+/// into the result. The table must be the one the message announces (see
+/// the file header): a short one fails as `checkWorkerInitFdCount`
+/// describes, so a boot token without the session's regions, or a table
+/// without the wake descriptors, fails with `error.MissingEgressSharedFd`,
+/// `flag_serves_routes` without the pack with `error.MissingModulePackFd`,
+/// and the regions without a token or a pack without the flag with
+/// `error.InvalidFdCount`. A packet shorter than the struct fails with
+/// `error.ShortRead` and a longer one with `error.TruncatedMessage`. The
 /// fields are not checked here: the caller runs `WorkerInit.validate`.
 pub fn recvWorkerInit(fd: std.posix.fd_t) !WorkerInitWithFds {
-    var scratch: [@sizeOf(messages.WorkerInit) + messages.WorkerInit.max_route_entry_specifier_bytes]u8 = undefined;
+    var scratch: [@sizeOf(messages.WorkerInit)]u8 = undefined;
     var received = try packet.recvPacketWithFdsScratch(std.heap.smp_allocator, fd, &scratch);
     defer received.deinit();
-    if (received.bytes.len < @sizeOf(messages.WorkerInit))
+    if (received.bytes.len != @sizeOf(messages.WorkerInit))
         return error.ShortRead;
-    const message = packet.readStruct(messages.WorkerInit, received.bytes[0..@sizeOf(messages.WorkerInit)]);
+    const message = packet.readStruct(messages.WorkerInit, received.bytes);
     if (try messages.decodeMessageKind(message.kind) != .worker_init)
         return error.InvalidMessageKind;
-    if (message.route_entry_specifier_len > messages.WorkerInit.max_route_entry_specifier_bytes)
-        return error.InvalidWorkerInit;
-    if (received.bytes.len != @sizeOf(messages.WorkerInit) + @as(usize, message.route_entry_specifier_len))
-        return error.ShortRead;
     const table = WorkerInitTable.of(&message);
     try checkWorkerInitFdCount(received.fd_count, table);
 
@@ -557,16 +531,16 @@ pub fn recvWorkerInit(fd: std.posix.fd_t) !WorkerInitWithFds {
     var ingress_payload_credit_eventfd = received.takeFd(3);
     var tmp_root_fd = received.takeFd(4);
     var cgroup_dir_fd = received.takeFd(5);
-    var route_bindings_fd = received.takeFd(6);
+    var route_table_fd = received.takeFd(6);
     const egress_shared_fds = takeEgressFds(&received, table);
     var fs_index_fd = received.takeFd(table.fs_index);
     var fs_fault_fd = received.takeFd(table.fs_fault);
-    var route_entry_fd: ?std.posix.fd_t = null;
-    if (table.route_entry) |index| {
-        var owned_route_entry_fd = received.takeFd(index);
-        route_entry_fd = owned_route_entry_fd.release();
+    var module_pack_fd: ?std.posix.fd_t = null;
+    if (table.module_pack) |index| {
+        var owned_module_pack_fd = received.takeFd(index);
+        module_pack_fd = owned_module_pack_fd.release();
     }
-    var result: WorkerInitWithFds = .{
+    return .{
         .message = message,
         .metrics_fd = metrics_fd.release(),
         .completion_eventfd = completion_eventfd.release(),
@@ -574,17 +548,12 @@ pub fn recvWorkerInit(fd: std.posix.fd_t) !WorkerInitWithFds {
         .ingress_payload_credit_eventfd = ingress_payload_credit_eventfd.release(),
         .tmp_root_fd = tmp_root_fd.release(),
         .cgroup_dir_fd = cgroup_dir_fd.release(),
-        .route_bindings_fd = route_bindings_fd.release(),
+        .route_table_fd = route_table_fd.release(),
         .egress_shared_fds = egress_shared_fds,
         .fs_index_fd = fs_index_fd.release(),
         .fs_fault_fd = fs_fault_fd.release(),
-        .route_entry_fd = route_entry_fd,
+        .module_pack_fd = module_pack_fd,
     };
-    @memcpy(
-        result.route_entry_specifier_buffer[0..message.route_entry_specifier_len],
-        received.bytes[@sizeOf(messages.WorkerInit)..][0..message.route_entry_specifier_len],
-    );
-    return result;
 }
 
 /// Moves the worker's egress descriptors out of `received`: the regions when
@@ -615,7 +584,7 @@ fn checkWorkerInitFdCount(fd_count: usize, table: WorkerInitTable) !void {
         3 => return error.MissingIngressPayloadCreditFd,
         4 => return error.MissingTmpRootFd,
         5 => return error.MissingCgroupDirFd,
-        6 => return error.MissingRouteBindingsFd,
+        6 => return error.MissingRouteTableFd,
         else => {},
     }
     if (fd_count < table.fs_index)
@@ -624,9 +593,9 @@ fn checkWorkerInitFdCount(fd_count: usize, table: WorkerInitTable) !void {
         return error.MissingFsIndexFd;
     if (fd_count == table.fs_fault)
         return error.MissingFsFaultFd;
-    if (table.route_entry) |route_entry| {
-        if (fd_count == route_entry)
-            return error.MissingRouteEntryFd;
+    if (table.module_pack) |module_pack| {
+        if (fd_count == module_pack)
+            return error.MissingModulePackFd;
     }
     if (fd_count != table.count)
         return error.InvalidFdCount;

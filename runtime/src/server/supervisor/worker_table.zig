@@ -23,14 +23,17 @@
 //! view (`page.HostCursors`), and spans every drain of the worker's usage
 //! and console rings: the metrics thread's, a lane's settle, the reaper's
 //! final drain and the exiting thread's. The view's completion cursor
-//! belongs to the worker's reader lane. Lock order: `metrics_mutex` before
-//! the request table's own lock (`request_table.zig`); `send_mutex` never
-//! nests with either.
+//! belongs to the worker's reader lane. The forwarding window
+//! (`forwarded_in_queues`, `window_waiter`) and the body waiters are atomics
+//! any lane reads and writes without a lock. Lock order: `metrics_mutex`
+//! before the request table's own lock (`request_table.zig`); `send_mutex`
+//! never nests with either.
 
 const std = @import("std");
 const ipc = @import("collo_ipc");
 const process = @import("collo_os").process;
 const process_limits = @import("collo_limits").process;
+const server_limits = @import("collo_limits").server;
 const server_lifecycle = @import("collo_server_lifecycle");
 const config = @import("collo_server_config");
 
@@ -83,6 +86,26 @@ pub const Record = struct {
     /// usage record is still expected (`request_table.zig`).
     /// Locks itself.
     requests: request_table.RequestTable = .{},
+    /// The forwarding window: the commands carrying this storage's workers'
+    /// output that wait in lanes' queues. A descriptor the reader forwards is
+    /// one unit from its post until its owner applies it, and a ring
+    /// payload's unit moves on to the owner's answer until the reader takes
+    /// it (`server/ingress/runner/h2_worker_ipc.zig`). The reader receives the
+    /// worker's next packet only while a packet's worth of units still fits
+    /// under `limits.ingress.forwarded_commands_per_worker_max`, which bounds
+    /// the places one worker's output takes in any lane's queue. Units of one
+    /// occupant can still be queued when the next one starts, so the count is
+    /// never reset; every unit added is released once.
+    forwarded_in_queues: std.atomic.Value(u32) = .init(0),
+    /// The reader lane, plus one, that stopped receiving for want of room in
+    /// the window, 0 for none. The release that makes room wakes it.
+    window_waiter: std.atomic.Value(u16) = .init(0),
+    /// For each worker slot, the lane, plus one, whose request on that slot
+    /// waits for room in the server-to-worker payload ring, 0 for none. The
+    /// worker writes its completion eventfd when it frees ring bytes after a
+    /// writer marked the ring, and the reader lane wakes every lane named
+    /// here (`server/ingress/runner/request_body.zig`).
+    body_waiters: [server_limits.worker_concurrency_max]std.atomic.Value(u16) = @splat(.init(0)),
     created_mono_ns: u64 = 0,
     /// The worker's own boot as it stamped it on its page, from entering its
     /// namespaces to sending `WorkerReady`; 0 when a stamp was missing. A
@@ -157,6 +180,12 @@ pub const Record = struct {
         // The previous worker's table is left behind with its page: no lane
         // holds a slot of a vacant record, and no drain passes `page_mapped`.
         self.requests = .{};
+        // No lane waits on a worker it holds no slot of and does not read.
+        // The window's count stays: units of the previous worker may still be
+        // queued, and their release counts against it.
+        self.window_waiter.store(0, .monotonic);
+        for (&self.body_waiters) |*waiter|
+            waiter.store(0, .monotonic);
         self.created_mono_ns = occupant.created_mono_ns;
         self.boot_work_ns = occupant.boot_work_ns;
         self.log_drops_reported = 0;

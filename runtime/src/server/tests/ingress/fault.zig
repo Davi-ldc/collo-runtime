@@ -255,11 +255,13 @@ const http2_table = struct {
             error.HpackHeaderListTooLarge,
         } },
         .{ .expected = close(.header_too_large, .compression_error), .errors = &.{error.HpackOutputTooSmall} },
+        .{ .expected = close(.header_block_budget, .enhance_your_calm), .errors = &.{error.Http2HeaderBlockBudgetExceeded} },
         .{ .expected = close(.settings_error, .enhance_your_calm), .errors = &.{error.TooManyHttp2Settings} },
         .{ .expected = close(.settings_error, .frame_size_error), .errors = &.{error.ShortHttp2Setting} },
         .{ .expected = close(.write_backpressure, null), .errors = &.{error.Http2WriteBackpressure} },
         .{ .expected = close(.allocation_failed, .internal_error), .errors = &.{error.OutOfMemory} },
         .{ .expected = close(.internal_error, .internal_error), .errors = &.{
+            error.Http2StreamSlabFull,
             error.Http2StreamAlreadyOpen,
             error.Http2StreamStateMismatch,
             error.Http2PendingBodyTooLarge,
@@ -405,10 +407,7 @@ const accept_table = struct {
         return fault.classifyConnectionError(.{ .accept = err });
     }
     const rows = [_]Row(Set, Outcome){
-        .{ .expected = close(.connection_limit, null), .errors = &.{
-            error.IngressHeaderBufferExhausted,
-            error.ConnectionSlabFull,
-        } },
+        .{ .expected = close(.connection_limit, null), .errors = &.{error.ConnectionSlabFull} },
         .{ .expected = close(.setup_failed, null), .errors = &.{
             error.BoringSslInitFailed,
             error.PermissionDenied,
@@ -663,7 +662,10 @@ const connection_close_labels = [_]Label(fault.ConnectionCloseReason){
     .{ .write_backpressure, "write_backpressure" },
     .{ .allocation_failed, "allocation_failed" },
     .{ .peer_closed, "peer_closed" },
-    .{ .idle, "idle" },
+    .{ .pre_request_timeout, "pre_request_timeout" },
+    .{ .idle_timeout, "idle_timeout" },
+    .{ .stall_timeout, "stall_timeout" },
+    .{ .header_block_budget, "header_block_budget" },
     .{ .server_stop, "server_stop" },
     .{ .internal_error, "internal_error" },
     .{ .connection_limit, "connection_limit" },
@@ -827,7 +829,7 @@ fn ErrorsOfCall(comptime Result: type) type {
 // sets reflected from the HTTP/2 driver above are its own.
 const StubLane = struct {
     service: struct { allocator: std.mem.Allocator },
-    header_buffers: StubHeaderBuffers,
+    h2_lane: server_main.ingress.http2.lane_resources.LaneResources,
 
     pub fn updateConnectionInterest(_: *StubLane, _: *Slot) error{}!void {}
 
@@ -854,12 +856,6 @@ const StubLane = struct {
     }
 };
 
-const StubHeaderBuffers = struct {
-    pub fn buffer(_: *StubHeaderBuffers, _: u32) []u8 {
-        return &.{};
-    }
-};
-
 // Only their types are taken; nothing reads them.
 const stub_lane: *StubLane = undefined;
 const stub_slot: *Slot = undefined;
@@ -876,6 +872,5 @@ const HandlerLane = struct {
     pub fn handleWorkerFsFault(_: *HandlerLane, _: u32) fault.LaneFault!void {}
     pub fn handleWorkerPidfd(_: *HandlerLane, _: u32) fault.LaneFault!void {}
     pub fn handleDeadlineTimer(_: *HandlerLane) fault.LaneFault!void {}
-    pub fn handleWorkerPayloadCredit(_: *HandlerLane, _: u32) fault.LaneFault!void {}
     pub fn handleStop(_: *HandlerLane) fault.LaneFault!void {}
 };

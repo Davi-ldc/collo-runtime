@@ -152,13 +152,16 @@ fn deliver(runtime: *egress_context.Context, task: *Task, result: *Result) !void
         },
         .failure => |failure| {
             _ = fetch_body_runtime.release(runtime, task.response_body_identity);
-            var error_value = try runtime.vm.typeErrorValueUtf8(failure.message);
+            const realm = try task.deferred.realm();
+            var error_value = try realm.typeErrorValueUtf8(failure.message);
             defer error_value.deinit();
             try turn.rejectPromise(runtime.vm, exec_ctx_ptr, &task.deferred, &error_value);
         },
     }
 }
 
+/// The `Response` of a fetch that succeeded, in the realm of the `fetch()`
+/// call's promise.
 fn makeFetchResponse(
     runtime: *egress_context.Context,
     task: *const Task,
@@ -182,7 +185,8 @@ fn makeFetchResponse(
         },
         .body_identity = payload.body_identity,
     };
-    return switch (try runtime.vm.fetchResponseValue(&init)) {
+    const realm = try task.deferred.realm();
+    return switch (try realm.fetchResponseValue(&init)) {
         .success => |value| value,
         .exception => |exception| {
             var owned = exception;

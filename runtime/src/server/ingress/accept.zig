@@ -21,7 +21,6 @@ pub fn shouldRearmMultishot(action: AcceptAction) bool {
 
 /// Why a lane closed a socket it accepted instead of setting up a connection.
 pub const RejectReason = enum {
-    header_buffer_exhaustion,
     connection_slab_exhaustion,
     shutting_down,
 };
@@ -30,12 +29,10 @@ pub const RejectReason = enum {
 /// refusal under `reason`.
 pub fn closeRejectedAcceptedFd(fd: std.posix.fd_t, counters: *lane.CounterSnapshot, reason: RejectReason) void {
     switch (reason) {
-        .header_buffer_exhaustion => counters.accepted_header_buffer_exhaustion += 1,
         .connection_slab_exhaustion => counters.accepted_connection_slab_exhaustion += 1,
         // Expected while a graceful shutdown drains: the lane refuses new
         // connections once `shouldStop()` trips (`runner/accept_flow.zig`).
-        // Its own counter keeps a shutdown from reading as slab or buffer
-        // exhaustion.
+        // Its own counter keeps a shutdown from reading as slab exhaustion.
         .shutting_down => counters.accepted_during_shutdown += 1,
     }
     counters.silent_queue_overflows += 1;

@@ -568,10 +568,11 @@ test "top level await returns pending evaluation" {
     try support.registerModule(&vm, "/await.js", source);
     // With no host runtime, as on the zygote's VM, evaluation registers no settlement callback
     // but still reports pending (`awaitModulePromiseSync` in `jsc/runtime/module_loader.cpp`).
-    // Evaluating again while pending is not tested: the worker never does it, because
-    // `ensureRouteHandler` in `worker/modules/routes.zig` queues behind the `.evaluating`
-    // record, and JSC fulfills a re-import of an async-evaluating module instead of returning
-    // the pending capability.
+    try support.evaluatePending(&vm, "/await.js");
+    // Evaluating it again while pending reports pending again: JSC hands a re-import of an
+    // async-evaluating module its pending capability, and with a host runtime each evaluation
+    // registers a settlement of its own. Routes that share an entry in one realm rely on this
+    // (`worker/tests/runtime/routes.zig`).
     try support.evaluatePending(&vm, "/await.js");
 }
 

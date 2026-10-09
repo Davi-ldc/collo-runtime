@@ -349,9 +349,11 @@ fn runRouteAndReadBody(
     try std.posix.lseek_SET(route_fd, 0);
     try fd_mod.addSeals(route_fd, fd_mod.memfd_readonly_seals);
 
-    // A worker's boot registers and evaluates its route from WorkerInit's
-    // route entry before any request names it.
-    try runtime.evaluateBootRouteEntry(route_fd, route_specifier, 0, null);
+    // A worker's boot registers its definition's pack and evaluates every
+    // route of the table WorkerInit carried before any request names one;
+    // this runtime's table is the one route.
+    const route_index = try runtime.modules.state.addRoute(allocator, route_specifier, &ipc.route_bindings.empty_blob);
+    try runtime.evaluateBootRoutes(route_fd, 0, null);
 
     var dispatch = try ipc.DispatchWork.initOwned(allocator, .{
         .request_id = request_id,
@@ -369,7 +371,7 @@ fn runRouteAndReadBody(
         .request_headers = &request_headers,
         .body_framing = .none,
         .route_captures = &.{},
-        .route_entry_specifier = route_specifier,
+        .route_index = route_index,
     });
     defer dispatch.deinit();
 

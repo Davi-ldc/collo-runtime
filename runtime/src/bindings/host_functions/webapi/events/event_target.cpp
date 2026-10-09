@@ -447,7 +447,7 @@ static bool globalEventTargetHandle(JSC::JSGlobalObject* global_object, WebApiEv
 {
     auto* collo_global = uncheckedDowncast<Collo::GlobalObject>(global_object);
     auto* global_target
-        = dynamicDowncast<JSColloEventTarget>(collo_global->owner().webapi_cache.global_event_target.get());
+        = dynamicDowncast<JSColloEventTarget>(collo_global->webApiCache().global_event_target.get());
     if (!global_target)
         return false;
     handle.object = collo_global;
@@ -459,7 +459,7 @@ static bool globalEventTargetHandle(JSC::JSGlobalObject* global_object, WebApiEv
 JSC_DEFINE_HOST_FUNCTION(globalGetOnError, (JSC::JSGlobalObject * global_object, JSC::CallFrame*))
 {
     auto* collo_global = uncheckedDowncast<Collo::GlobalObject>(global_object);
-    auto value = collo_global->owner().webapi_cache.global_on_error.get();
+    auto value = collo_global->webApiCache().global_on_error.get();
     return JSValue::encode(value ? value : JSC::jsNull());
 }
 
@@ -467,14 +467,14 @@ JSC_DEFINE_HOST_FUNCTION(globalSetOnError, (JSC::JSGlobalObject * global_object,
 {
     auto& vm = global_object->vm();
     auto* collo_global = uncheckedDowncast<Collo::GlobalObject>(global_object);
-    collo_global->owner().webapi_cache.global_on_error.set(vm, normalizedGlobalEventHandler(call_frame->argument(0)));
+    collo_global->webApiCache().global_on_error.set(vm, normalizedGlobalEventHandler(call_frame->argument(0)));
     return JSValue::encode(JSC::jsUndefined());
 }
 
 JSC_DEFINE_HOST_FUNCTION(globalGetOnMessage, (JSC::JSGlobalObject * global_object, JSC::CallFrame*))
 {
     auto* collo_global = uncheckedDowncast<Collo::GlobalObject>(global_object);
-    auto value = collo_global->owner().webapi_cache.global_on_message.get();
+    auto value = collo_global->webApiCache().global_on_message.get();
     return JSValue::encode(value ? value : JSC::jsNull());
 }
 
@@ -482,7 +482,7 @@ JSC_DEFINE_HOST_FUNCTION(globalSetOnMessage, (JSC::JSGlobalObject * global_objec
 {
     auto& vm = global_object->vm();
     auto* collo_global = uncheckedDowncast<Collo::GlobalObject>(global_object);
-    collo_global->owner().webapi_cache.global_on_message.set(vm, normalizedGlobalEventHandler(call_frame->argument(0)));
+    collo_global->webApiCache().global_on_message.set(vm, normalizedGlobalEventHandler(call_frame->argument(0)));
     return JSValue::encode(JSC::jsUndefined());
 }
 
@@ -549,7 +549,7 @@ void clearWebApiEventTargetListeners(WebApiEventTargetHandle target)
 static JSValue globalEventHandler(JSC::JSGlobalObject* global_object, const String& event_type)
 {
     auto* collo_global = uncheckedDowncast<Collo::GlobalObject>(global_object);
-    auto& cache = collo_global->owner().webapi_cache;
+    auto& cache = collo_global->webApiCache();
     if (event_type == "error"_s)
         return cache.global_on_error.get() ? cache.global_on_error.get() : JSC::jsNull();
     if (event_type == "message"_s)

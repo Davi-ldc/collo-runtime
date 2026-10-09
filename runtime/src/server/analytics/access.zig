@@ -21,6 +21,9 @@
 //!   answers alone emits at that one answer.
 //! - Each lane's ring has one producer, the lane thread, and one consumer, the
 //!   metrics thread. A full ring drops the newest record and counts it.
+//! - A ring's slots are one MAP_NORESERVE mapping, so a page of it costs
+//!   memory only once a record lands on it: a lane that served nothing holds
+//!   none of its ring.
 //!
 //! Records in `access.jsonl`, one JSON object per line:
 //!
@@ -46,6 +49,8 @@ const sink_mod = @import("sink.zig");
 const CompletedStatus = worker_shared_page.CompletedStatus;
 const Clock = record.Clock;
 const Sink = sink_mod.Sink;
+
+const page_size = std.heap.page_size_min;
 
 /// A request's access facts, carried in its ingress request slot from
 /// admission to the end of the request. `request_id` 0 means nothing to emit:
@@ -323,18 +328,44 @@ const record_end = "}";
 /// `capacity` requests in it, at about 1.4 KiB per slot.
 pub const AccessRing = struct {
     pub const capacity: usize = 2048;
+    /// The address space the slots reserve, all of which a ring that has
+    /// taken `capacity` records has written.
+    pub const slot_bytes: usize = std.mem.alignForward(usize, capacity * @sizeOf(AccessRecord), page_size);
 
     comptime {
         std.debug.assert(std.math.isPowerOfTwo(capacity));
     }
 
-    slots: [capacity]AccessRecord = undefined,
+    /// Empty until `init` maps them.
+    slots: []AccessRecord = &.{},
     /// Producer cursor: the lane thread writes it, release-published.
     head: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// Consumer cursor: the metrics thread writes it, release-published.
     tail: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// Records refused while full. The producer adds; the consumer takes.
     dropped: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+    /// An empty ring whose slots are reserved and none written.
+    pub fn init() !AccessRing {
+        const mapping = try std.posix.mmap(
+            null,
+            slot_bytes,
+            std.posix.PROT.READ | std.posix.PROT.WRITE,
+            .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .NORESERVE = true },
+            -1,
+            0,
+        );
+        const records: [*]AccessRecord = @ptrCast(@alignCast(mapping.ptr));
+        return .{ .slots = records[0..capacity] };
+    }
+
+    pub fn deinit(self: *AccessRing) void {
+        if (self.slots.len != 0) {
+            const mapping: [*]align(page_size) u8 = @ptrCast(@alignCast(self.slots.ptr));
+            std.posix.munmap(mapping[0..slot_bytes]);
+        }
+        self.* = undefined;
+    }
 
     /// Lane thread only. Returns false, and counts the record, when the ring
     /// is full.

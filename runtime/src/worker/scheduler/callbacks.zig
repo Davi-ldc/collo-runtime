@@ -8,25 +8,13 @@ const bindings = @import("collo_bindings");
 const js_value = @import("collo_worker_js").value;
 const turn = @import("collo_worker_js").turn;
 
-/// `invokeDiscardWithThis` with globalThis as `this`.
-pub fn invokeDiscard(
-    runtime: anytype,
-    request_id: u64,
-    callback: *const js_value.JsFunctionOwned,
-    args: ?[]js_value.JsValueOwned,
-) !void {
-    var global_this = try runtime.core.vm.globalThisValue();
-    defer global_this.deinit();
-    try invokeDiscardWithThis(runtime, request_id, callback, &global_this, args);
-}
-
 /// Calls `callback` with `this_value` and `args` in a turn of `request_id`
 /// and discards the result; does nothing when the request is no longer
-/// active. The callback and the arguments stay the caller's. A thrown
-/// exception is logged and returned as `error.JsException`; more arguments
-/// than the stack array holds cost one allocation, which can fail with
-/// OutOfMemory.
-pub fn invokeDiscardWithThis(
+/// active. The callback, its receiver and the arguments stay the caller's. A
+/// thrown exception is logged and returned as `error.JsException`; more
+/// arguments than the stack array holds cost one allocation, which can fail
+/// with OutOfMemory.
+pub fn invokeDiscard(
     runtime: anytype,
     request_id: u64,
     callback: *const js_value.JsFunctionOwned,

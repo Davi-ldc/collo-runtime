@@ -9,6 +9,7 @@ comptime {
     _ = @import("microtask_owner.zig");
     _ = @import("module_loader.zig");
     _ = @import("module_pack_mapping.zig");
+    _ = @import("realms.zig");
     _ = @import("request_new.zig");
     _ = @import("request_scoped_roots.zig");
     _ = @import("reseed.zig");

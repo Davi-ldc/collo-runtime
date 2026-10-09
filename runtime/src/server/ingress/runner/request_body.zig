@@ -16,6 +16,13 @@
 //! - A body chunk is one of its request's sends (`dispatch.zig`): it goes to
 //!   the worker only when nothing of the request waits ahead of it, and
 //!   otherwise waits on its stream behind the request's earlier bytes.
+//! - A chunk that finds the worker's payload ring full registers its request
+//!   in the worker's record (`Record.body_waiters`), marks the ring waiting
+//!   and tries once more (`waitForRingRoom`). The worker's next release of
+//!   ring bytes then writes its completion eventfd, and the worker's reader
+//!   raises this lane's `payload_credit` wake (`worker_completions.zig`),
+//!   whose retry sends the chunk (`dispatch.retryRingBlockedSends`). No lane
+//!   polls a credit eventfd.
 //! - The handlers the HTTP/2 driver calls return `StreamError`
 //!   (`admission.zig`). A connection that must close is only marked closing
 //!   here (`closeRuntimeConnection`); its next turn finishes the close.
@@ -28,6 +35,7 @@
 const std = @import("std");
 const http_common = @import("collo_http");
 const ipc = @import("collo_ipc");
+const supervision = @import("collo_server_supervisor");
 const fault = @import("../fault.zig");
 const server_responses = @import("../server_responses.zig");
 const http2_connection = @import("../http2/connection.zig");
@@ -42,6 +50,7 @@ const request_slot_mod = @import("request_slot.zig");
 
 const ConnectionSlot = connection_slot.Slot;
 const RequestSlot = request_slot_mod.RequestSlot;
+const WorkerRecord = supervision.worker_table.Record;
 const LaneFault = fault.LaneFault;
 const WorkerOutcome = fault.WorkerOutcome;
 const StreamError = admission.StreamError;
@@ -157,7 +166,7 @@ pub fn Methods(comptime Self: type) type {
             chunks: []const http2_connection.DataFrameChunk,
             total_payload_len: usize,
         ) StreamError!http2_connection.DataFrameHandling {
-            const slot = &self.dynamic_requests[request_slot];
+            const slot = &self.requests.entries[request_slot];
             if (slot.h2_client_reset)
                 return .consumed;
             switch (slot.send_blocked) {
@@ -207,7 +216,7 @@ pub fn Methods(comptime Self: type) type {
             chunks: []const http2_connection.DataFrameChunk,
             total_payload_len: usize,
         ) StreamError!http2_connection.DataFrameHandling {
-            const slot = &self.dynamic_requests[request_slot];
+            const slot = &self.requests.entries[request_slot];
             const stream_id = slot.ingress_channel_id;
             runtime.h2EnsureActivePendingBodyCapacity(stream_id, total_payload_len) catch |err| switch (err) {
                 error.Http2PendingBodyTooLarge => {
@@ -271,7 +280,7 @@ pub fn Methods(comptime Self: type) type {
         pub fn handleH2ResetFrame(self: *Self, runtime: *ConnectionSlot, stream_id: u32, error_code: u32) StreamError!bool {
             const request_key = runtime.h2MarkStreamReset(self.service.allocator, stream_id) orelse return true;
             const request_slot = Admission.findRequestSlot(self, request_key) orelse return true;
-            const slot = &self.dynamic_requests[request_slot];
+            const slot = &self.requests.entries[request_slot];
             if (slot.waiting()) {
                 try RequestFinish.finishRequest(self, request_slot, .stream_gone);
                 return true;
@@ -292,7 +301,7 @@ pub fn Methods(comptime Self: type) type {
         fn cancelActiveH2RequestForLocalResponse(self: *Self, runtime: *ConnectionSlot, stream_id: u32, error_code: u32) StreamError!void {
             const request_key = runtime.h2DetachActiveRequestForLocalResponse(self.service.allocator, stream_id) orelse return;
             const request_slot = Admission.findRequestSlot(self, request_key) orelse return;
-            const slot = &self.dynamic_requests[request_slot];
+            const slot = &self.requests.entries[request_slot];
             if (!slot.dispatched() or slot.h2_client_reset)
                 return;
             slot.h2_client_reset = true;
@@ -302,18 +311,19 @@ pub fn Methods(comptime Self: type) type {
         }
 
         /// Retries the bodies of a connection's dispatched streams that wait
-        /// on a full payload ring, before the connection driver reads more.
-        /// A body behind a full control socket waits for its writability
-        /// poll instead.
+        /// on a full payload ring, before the connection driver reads more,
+        /// so room the worker made since the lane's last wake is used at
+        /// once. A body behind a full control socket waits for its
+        /// writability poll instead.
         pub fn flushPendingH2RequestBodies(self: *Self, runtime: *ConnectionSlot) StreamError!bool {
             var did_work = false;
-            for (&runtime.ingress_channels) |*entry| {
-                if (entry.state != .active)
+            for (runtime.stream_ids, 0..) |stream_id, position| {
+                if (stream_id == 0 or runtime.streamAt(position).state != .active)
                     continue;
-                if (!runtime.h2HasPendingBody(entry.stream_id))
+                if (!runtime.h2HasPendingBody(stream_id))
                     continue;
-                const request_slot = findActiveH2Request(self, runtime, entry.stream_id) orelse continue;
-                const slot = &self.dynamic_requests[request_slot];
+                const request_slot = findActiveH2Request(self, runtime, stream_id) orelse continue;
+                const slot = &self.requests.entries[request_slot];
                 if (slot.h2_client_reset or slot.send_blocked != .ring)
                     continue;
                 switch (try Dispatch.flushRequestSends(self, request_slot)) {
@@ -330,7 +340,7 @@ pub fn Methods(comptime Self: type) type {
         /// the bytes. A send that would block leaves the bytes where they
         /// are and says what the request waits for (`send_blocked`).
         pub fn flushPendingBody(self: *Self, request_slot: u32) LaneFault!WorkerOutcome {
-            const slot = &self.dynamic_requests[request_slot];
+            const slot = &self.requests.entries[request_slot];
             const runtime = Admission.requestConnection(self, slot) orelse return .ok;
             if (slot.h2_client_reset)
                 return .ok;
@@ -379,7 +389,8 @@ pub fn Methods(comptime Self: type) type {
         /// Sends one body chunk inline, or through the payload ring above
         /// `shared_payload_threshold`. The ring takes one producer at a time,
         /// and requests of two lanes can stream to one worker, so the send
-        /// takes `Record.send_mutex`.
+        /// takes `Record.send_mutex`. A full ring registers the request for
+        /// the reader's wake and gets one more try (`waitForRingRoom`).
         fn sendBodyChunk(
             self: *Self,
             slot: *const RequestSlot,
@@ -398,14 +409,23 @@ pub fn Methods(comptime Self: type) type {
             const send_error = send: {
                 worker.send_mutex.lock();
                 defer worker.send_mutex.unlock();
-                ipc.ingress_channel.sendDescriptorPayloadRequireRing(
-                    worker.handle.control_fd,
-                    descriptor,
-                    payload,
-                    self.ipc_send_scratch,
-                    worker.handle.ingress_payload.writer(.server_to_worker),
-                ) catch |err| break :send err;
-                return .sent;
+                var waiting = false;
+                while (true) {
+                    ipc.ingress_channel.sendDescriptorPayloadRequireRing(
+                        worker.handle.control_fd,
+                        descriptor,
+                        payload,
+                        self.ipc_send_scratch,
+                        worker.handle.ingress_payload.writer(.server_to_worker),
+                    ) catch |err| {
+                        if (err != error.IngressSharedPayloadRingFull or waiting)
+                            break :send err;
+                        waitForRingRoom(self, worker, slot);
+                        waiting = true;
+                        continue;
+                    };
+                    return .sent;
+                }
             };
             return Dispatch.sendResult(self, worker, send_error);
         }
@@ -437,15 +457,37 @@ pub fn Methods(comptime Self: type) type {
             const send_error = send: {
                 worker.send_mutex.lock();
                 defer worker.send_mutex.unlock();
-                ipc.ingress_channel.sendDescriptorBatchPayloadsWithRing(
-                    worker.handle.control_fd,
-                    entries,
-                    self.ipc_send_scratch,
-                    worker.handle.ingress_payload.writer(.server_to_worker),
-                ) catch |err| break :send err;
-                return .sent;
+                var waiting = false;
+                while (true) {
+                    ipc.ingress_channel.sendDescriptorBatchPayloadsWithRing(
+                        worker.handle.control_fd,
+                        entries,
+                        self.ipc_send_scratch,
+                        worker.handle.ingress_payload.writer(.server_to_worker),
+                    ) catch |err| {
+                        if (err != error.IngressSharedPayloadRingFull or waiting)
+                            break :send err;
+                        waitForRingRoom(self, worker, slot);
+                        waiting = true;
+                        continue;
+                    };
+                    return .sent;
+                }
             };
             return Dispatch.sendResult(self, worker, send_error);
+        }
+
+        /// Registers the request in `slot` for the `payload_credit` wake its
+        /// worker's reader raises (`Record.body_waiters`) and marks the
+        /// worker's server-to-worker ring waiting, under `Record.send_mutex`.
+        /// The caller then tries its send once more: room the worker made
+        /// before the mark shows in that try, and a release after it writes
+        /// the worker's completion eventfd, which the reader polls
+        /// (`SharedPayloadReadRelease`). The registration precedes the mark,
+        /// so the reader that the eventfd wakes finds it.
+        fn waitForRingRoom(self: *Self, worker: *WorkerRecord, slot: *const RequestSlot) void {
+            worker.body_waiters[slot.worker_slot].store(self.lane.lane_id + 1, .seq_cst);
+            worker.handle.ingress_payload.markWriterWaiting(.server_to_worker);
         }
 
         /// Acts on an HTTP/2 error met on `runtime` outside the connection
@@ -464,7 +506,7 @@ pub fn Methods(comptime Self: type) type {
         fn findActiveH2Request(self: *Self, runtime: *ConnectionSlot, stream_id: u32) ?u32 {
             const request_key = runtime.h2ActiveRequestKey(stream_id) orelse return null;
             const request_slot = Admission.findRequestSlot(self, request_key) orelse return null;
-            const slot = &self.dynamic_requests[request_slot];
+            const slot = &self.requests.entries[request_slot];
             if (!slot.dispatched())
                 return null;
             if (slot.ingress_channel_id != stream_id or !slot.connection_key.eql(runtime.key))
@@ -475,16 +517,15 @@ pub fn Methods(comptime Self: type) type {
         /// The slot of the waiting request bound to the `.preparing` stream
         /// `stream_id` of `runtime`'s connection.
         fn preparingRequestSlot(self: *Self, runtime: *const ConnectionSlot, stream_id: u32) ?u32 {
-            for (&runtime.ingress_channels) |*entry| {
-                if (entry.state != .preparing or entry.stream_id != stream_id)
-                    continue;
-                const request = entry.request orelse return null;
-                const request_slot = Admission.findRequestSlot(self, request.key) orelse return null;
-                if (!self.dynamic_requests[request_slot].waiting())
-                    return null;
-                return request_slot;
-            }
-            return null;
+            const position = runtime.h2StreamIndex(stream_id) orelse return null;
+            const entry = runtime.streamAt(position);
+            if (entry.state != .preparing)
+                return null;
+            const request = entry.request orelse return null;
+            const request_slot = Admission.findRequestSlot(self, request.key) orelse return null;
+            if (!self.requests.entries[request_slot].waiting())
+                return null;
+            return request_slot;
         }
     };
 }

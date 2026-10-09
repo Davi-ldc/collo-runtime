@@ -30,7 +30,8 @@ pub fn runCorpus(vm: *bindings.Vm) !void {
     defer boot_allocator.free(pack);
     try vm.registerModulePack(pack);
 
-    switch (try vm.evaluateModule(corpus_specifier)) {
+    const realm = vm.mainRealm();
+    switch (try realm.evaluateModule(corpus_specifier)) {
         .success => {},
         .exception, .unsupported => |exception| return failWithException(exception),
         // The corpus is synchronous; a pending evaluation means someone added
@@ -38,7 +39,7 @@ pub fn runCorpus(vm: *bindings.Vm) !void {
         .pending => return error.WarmupCorpusAsyncEvaluation,
     }
 
-    var entry = switch (try vm.moduleGetExport(corpus_specifier, "default")) {
+    var entry = switch (try realm.moduleGetExport(corpus_specifier, "default")) {
         .success => |value| value,
         .exception => |exception| return failWithException(exception),
     };

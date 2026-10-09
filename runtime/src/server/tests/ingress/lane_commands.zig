@@ -5,15 +5,18 @@
 //! forwards to the lane that owns the request (`forwarded_descriptor`,
 //! `forwarded_completion`), a reader asked to give its role up
 //! (`release_worker`), and a death another lane saw (`worker_died`), with the
-//! reserve a forwarded completion may take and the queue a stopping lane runs
-//! dry before it closes. A command that crosses lanes runs between two lanes
-//! sharing one stub worker, or two stub workers when a worker's output names
-//! a request on the other.
+//! reserve a worker's forwarded output takes, the window that stops its
+//! reader while too much of that output waits, the reader's check of a
+//! descriptor against the worker's request table, and the queue a stopping
+//! lane runs dry before it closes. A command that crosses lanes runs between
+//! two lanes sharing one stub worker, or two stub workers when a worker's
+//! output names a request on the other.
 //! Lane `server-ingress-test`, through `lane_harness.zig`; the pool's side of
 //! each exchange is pinned in `server/tests/supervisor/pool.zig`, and the
 //! queue itself in `command_queue.zig`.
 
 const std = @import("std");
+const limits = @import("collo_limits");
 const lane_harness = @import("lane_harness.zig");
 
 const commands = lane_harness.commands;
@@ -241,7 +244,7 @@ test "a ring chunk for another lane's request travels by reference, and its read
     try harness.expectQueued(1, &.{ .forwarded_descriptor, .forwarded_descriptor });
     // Lane 0, the reader, holds the chunk's ring bytes until lane 1 answers.
     const reader_index = try harness.expectRegistration(0, scene.stub);
-    const holds = &harness.lane(0).completion_registrations[reader_index].ring_payloads;
+    const holds = &harness.lane(0).registrations.entries[reader_index].ring_payloads;
     try std.testing.expect(!holds.isEmpty());
     const cursors = scene.stub.responseRingCursors();
     try std.testing.expect(cursors.read < cursors.write);
@@ -261,7 +264,7 @@ test "a ring chunk for another lane's request travels by reference, and its read
     try harness.expectServing(scene.stub);
 }
 
-test "a forwarded descriptor naming a request on another worker takes its sender out of service from a lane that holds nothing of it" {
+test "a descriptor naming another lane's request its worker was never sent drops at the reader and costs that lane nothing" {
     var harness: Harness = undefined;
     try harness.init(std.testing.allocator, .{ .lane_count = 2, .routes = .{ .concurrency = 1 } });
     defer harness.deinit();
@@ -279,31 +282,46 @@ test "a forwarded descriptor naming a request on another worker takes its sender
     const victim = try other.readRequestBegin();
 
     // The sender answers lane 1's request, which runs on the other worker.
-    // Its reader forwards the head to the lane the descriptor names.
+    // Its request table holds no such request, so its reader drops the head
+    // instead of taking a place in lane 1's queue.
     try sender.sendHead(victim, 200, true);
     try harness.handleControl(0, sender);
-    try harness.expectQueued(1, &.{.forwarded_descriptor});
+    try harness.expectQueued(1, &.{});
+    try std.testing.expectEqual(@as(u64, 1), harness.lane(0).lane.counters.forwarded_descriptor_drops);
+    try std.testing.expectEqual(@as(u32, 0), sender.record.forwarded_in_queues.load(.seq_cst));
 
-    // Lane 1 neither reads the sender nor holds a slot of it, so it takes the
-    // sender out of service itself and tells lane 0, which holds one.
-    try harness.handleCommands(1);
+    // The named request, its worker and the sender's own request go on.
     try harness.expectLanesRunning();
-    try std.testing.expectEqual(pool.EntryState.dead, harness.workerView(sender).?.state);
-    try std.testing.expect(harness.registration(1, sender) == null);
-    try harness.expectQueued(0, &.{.worker_died});
-    // The named request and its worker go on untouched.
+    try harness.expectServing(sender);
     try harness.expectServing(other);
     try std.testing.expect(harness.requestKeyOf(second, 1) != null);
     try second.collect();
     try std.testing.expectEqual(@as(?u16, null), (try second.stream(1)).status);
+    try std.testing.expect(harness.requestKeyOf(first, 1) != null);
+}
 
-    // Lane 0 ends its own request on the sender and queues the retirement.
-    try harness.handleCommands(0);
-    try first.expectStatus(1, 502);
-    const record = harness.takeAccessRecord(0) orelse return error.AccessRecordMissing;
-    try std.testing.expectEqualStrings("descriptor_names_no_request", record.facts.worker_fault);
-    try harness.expectFaulted(sender, .descriptor_names_no_request);
-    try harness.expectServing(other);
+test "a descriptor naming a request its worker holds under another key takes the worker out of service at its reader" {
+    var scene: TwoLanes = undefined;
+    try scene.init(.{});
+    defer scene.deinit();
+    const harness = &scene.harness;
+    // Lane 0 reads the worker, and both lanes hold a request on it.
+    const own = try scene.get(scene.first, 1);
+    const other = try scene.get(scene.second, 1);
+
+    // The worker names lane 1's request with the id of lane 0's: its table
+    // holds that id under lane 0's key.
+    var crossed = other;
+    crossed.identity.request_id = own.identity.request_id;
+    try scene.stub.sendHead(crossed, 200, true);
+    try harness.handleControl(0, scene.stub);
+
+    try harness.expectQueued(1, &.{.worker_died});
+    try harness.handleCommands(1);
+    try scene.first.expectStatus(1, 502);
+    try scene.second.expectStatus(1, 502);
+    try harness.expectLanesRunning();
+    try harness.expectFaulted(scene.stub, .descriptor_names_no_request);
 }
 
 test "release_worker leaves the reader role with a lane while the worker has a request in flight" {
@@ -442,7 +460,7 @@ test "a stopping lane runs the dispatch_ready queued for a request that ended, s
     try harness.expectServing(scene.stub);
 }
 
-test "a forwarded completion takes the owner lane's reserve, so a queue full of other commands cannot leave a worker that answered to the backstop" {
+test "a worker's output takes reserved places of the owner lane's queue, so a queue full of other commands still delivers its whole response" {
     var scene: TwoLanes = undefined;
     try scene.init(.{});
     defer scene.deinit();
@@ -450,30 +468,73 @@ test "a forwarded completion takes the owner lane's reserve, so a queue full of 
     _ = try scene.get(scene.first, 1);
     const other = try scene.get(scene.second, 1);
 
-    // Stale `dispatch_failed` notices, which hold nothing, fill every place
-    // of lane 1's queue a command outside the reserve may take.
-    const queue_places = harness.lane(1).lane.command_queue.items.len;
+    // Stale `dispatch_failed` notices, which hold nothing, fill every
+    // ordinary place of lane 1's queue.
+    const queue = &harness.lane(1).lane.command_queue;
+    const ordinary_places = queue.capacity() - queue.reserve;
     var posted: usize = 0;
-    while (posted < queue_places) : (posted += 1) {
+    while (posted <= ordinary_places) : (posted += 1) {
         if (!try harness.service.postToLane(1, .{ .dispatch_failed = .{
             .request_key = .{ .lane_id = 1, .slot = 0, .generation = 0 },
             .reason = .growth_refused,
         } }))
             break;
     }
-    try std.testing.expect(posted < queue_places);
+    try std.testing.expectEqual(ordinary_places, posted);
 
-    // The worker answers lane 1's request. Its descriptors find no place and
-    // drop, but its completion takes the reserve.
+    // The worker answers lane 1's request. Its descriptors and its
+    // completion take reserved places, so nothing of it drops.
     try scene.stub.answer(other, 200, "lane one");
     try harness.serveWorker(0, scene.stub);
     try harness.handleCommands(1);
-    // The completion ended the request at once; the head it would have
-    // carried was lost, so the lane answered for the worker.
     try std.testing.expect(harness.requestKeyOf(scene.second, 1) == null);
-    try scene.second.expectStatus(1, 502);
-    try std.testing.expectEqual(@as(?u16, 502), harness.takeAccessStatus(1));
+    try scene.second.expectStatus(1, 200);
+    try std.testing.expectEqual(@as(?u16, 200), harness.takeAccessStatus(1));
+    try std.testing.expectEqual(@as(u64, 0), harness.lane(0).lane.counters.forwarded_descriptor_drops);
+    // Every forwarded command was applied, so the worker's window is empty.
+    try std.testing.expectEqual(@as(u32, 0), scene.stub.record.forwarded_in_queues.load(.seq_cst));
     try std.testing.expectEqual(@as(u8, 1), harness.workerView(scene.stub).?.slots_held);
+    try harness.expectLanesRunning();
+    try harness.expectServing(scene.stub);
+}
+
+test "a reader stops receiving a worker whose forwarded output fills its window, and receives again once the owner lane applied it" {
+    var scene: TwoLanes = undefined;
+    try scene.init(.{});
+    defer scene.deinit();
+    const harness = &scene.harness;
+    _ = try scene.get(scene.first, 1);
+    const other = try scene.get(scene.second, 1);
+
+    // One descriptor per packet, more of them than the window holds.
+    const chunk_count = 40;
+    try scene.stub.sendHead(other, 200, false);
+    for (0..chunk_count) |index| try scene.stub.sendChunk(other, "c", index + 1 == chunk_count);
+    try harness.handleControl(0, scene.stub);
+
+    // The reader received packets while a whole batch still fit, then
+    // stopped with the rest left in the worker's socket.
+    const window = &scene.stub.record.forwarded_in_queues;
+    const window_units = limits.ingress.forwarded_commands_per_worker_max;
+    try std.testing.expectEqual(window_units - lane_harness.ingress_channel.max_batch_descriptors + 1, window.load(.seq_cst));
+    const reader_index = try harness.expectRegistration(0, scene.stub);
+    const reader = &harness.lane(0).registrations.entries[reader_index];
+    try std.testing.expect(reader.window_blocked);
+    try std.testing.expectEqual(@as(u64, 1), harness.lane(0).lane.counters.forward_window_waits);
+
+    // Lane 1 applies what its queue holds, and the release that reopens the
+    // window wakes lane 0, whose next commands pass receives the rest.
+    try harness.handleCommands(1);
+    try std.testing.expectEqual(@as(u32, 0), window.load(.seq_cst));
+    try harness.handleCommands(0);
+    try std.testing.expect(!reader.window_blocked);
+    try harness.handleCommands(1);
+    try scene.second.expectStatus(1, 200);
+    const received = try scene.second.stream(1);
+    try std.testing.expect(received.ended);
+    try std.testing.expectEqual(@as(usize, chunk_count), received.body_len);
+    try std.testing.expectEqual(@as(u32, 0), window.load(.seq_cst));
+    try std.testing.expectEqual(@as(u64, 0), harness.lane(0).lane.counters.forwarded_descriptor_drops);
     try harness.expectLanesRunning();
     try harness.expectServing(scene.stub);
 }

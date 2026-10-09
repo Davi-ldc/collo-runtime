@@ -1,31 +1,35 @@
-//! One client connection of an ingress lane in the server, as the lane's
-//! runner holds it (`Slot`), on the lane's io_uring thread, which alone
-//! touches it and takes no lock. A slot sits at its connection's index in
-//! the lane's connection slab (`state.zig`) under the same key, and borrows
-//! the socket the slab owns. This file holds the slot's own state: the
-//! socket with its TLS session, peer address and kTLS rekey state, its phase
-//! from the TLS handshake to HTTP/2, its read buffer, its polls and its
-//! place on the ready queue, the lane's decision to close it, its
-//! pre-request deadline, and the connection-level HTTP/2 state, which is the
-//! preface and SETTINGS exchange, the HPACK coders and the header block
-//! being reassembled. The stream table is in `stream_table.zig`, flow
-//! control and the buffered request bodies in `flow_control.zig`, and the
-//! write queue and the buffered responses in `write_queue.zig`. `Slot`
-//! declares as its methods the functions of those files that the rest of
-//! the lane calls on a connection; the helpers the four files share, such as
-//! `stream_table.removeEntry`, stay off it.
+//! One client connection of an ingress lane in the server (`Slot`), in the
+//! lane's connection slab, on the lane's io_uring thread, which alone touches
+//! it and takes no lock. The slot owns the socket, from the accept that gave
+//! it the slot until the close that gives the slot back
+//! (`connection_flow.zig`). This file holds the slot's own state: the socket
+//! with its TLS session, peer address and kTLS rekey state, its phase from
+//! the TLS handshake to HTTP/2, its polls and its place on the ready queue
+//! (its slab link), the lane's decision to close it, its one deadline, and
+//! the connection-level HTTP/2 state: the frame reader, the SETTINGS
+//! exchange, the HPACK coders and the header block being assembled. Its
+//! streams live in the lane's stream slab, which `stream_table.zig` keeps;
+//! flow control and the buffered request bodies are in `flow_control.zig`,
+//! and the write queue and the buffered responses in `write_queue.zig`.
+//! `Slot` declares as its methods the functions of those files that the rest
+//! of the lane calls on a connection; the helpers the four files share, such
+//! as `stream_table.removeEntry`, stay off it.
 //!
 //! Invariants:
 //! - A connection the lane decided to close (`closing`) reads and queues no
 //!   more frames; `connection_flow.zig` finishes the close.
-//! - The slot is in the lane's pre-request deadline heap exactly while
-//!   `pre_request_deadline_active` is set (`deadline_driver.zig`).
-//! - One header block at a time is reassembled, on one stream, within
+//! - The slot is in the lane's deadline heap exactly while `deadline` is set
+//!   (`deadline_driver.zig`), and leaves it before the slot goes back to the
+//!   slab.
+//! - One header block at a time is assembled, on one stream, within
 //!   `limits.headers.INGRESS_H2_REQUEST_HEADER_BLOCK_BYTES` and
-//!   `max_h2_header_block_frames` frames.
+//!   `limits.ingress.header_block_frames_max` frames, and the bytes it
+//!   holds are charged to the lane's header block budget
+//!   (`lane_resources.HeaderBlockBudget`) until it is taken or dropped.
 //! - `deinitProtocolState` frees whatever the connection's HTTP/2 state
-//!   allocated, and the teardown (`connection_flow.zig`) runs it before it
-//!   resets the slot, so a field that allocates is freed there.
+//!   allocated and gives its streams and its header block's charge back, and
+//!   the teardown (`connection_flow.zig`) runs it before it releases the
+//!   slot, so a field that allocates is freed there.
 
 const std = @import("std");
 
@@ -35,44 +39,68 @@ const hpack = @import("collo_hpack");
 const tls_mod = @import("../../tls/root.zig");
 const ktls = @import("collo_ktls");
 const limits = @import("collo_limits");
+const lifecycle = @import("collo_server_lifecycle");
 const fault = @import("../fault.zig");
-const ingress_state = @import("../state.zig");
+const slab = @import("../slab.zig");
 const PeerAddress = @import("../peer_address.zig").PeerAddress;
+const frame_reader = @import("../http2/frame_reader.zig");
+const lane_resources = @import("../http2/lane_resources.zig");
 const flow_control = @import("flow_control.zig");
 const stream_table = @import("stream_table.zig");
 const write_queue = @import("write_queue.zig");
 
-const H2StreamEntry = stream_table.H2StreamEntry;
 const H2WriteSegment = write_queue.H2WriteSegment;
+const HeaderBlockBudget = lane_resources.HeaderBlockBudget;
 const max_h2_concurrent_streams = stream_table.max_h2_concurrent_streams;
 
-pub const max_h2_header_block_frames: usize = 128;
+pub const max_h2_header_block_frames: usize = limits.ingress.header_block_frames_max;
+
+/// The lane's connections.
+pub const ConnectionSlab = slab.FaultInSlab(Slot);
+/// The connections that wait for a turn of the lane's loop.
+pub const ReadyQueue = slab.Fifo(Slot);
 
 pub const Phase = enum {
-    vacant,
     tls_handshake,
     http2_connection,
 };
 
-pub fn connectionGenerationTag(key: ingress_state.ConnectionKey) u32 {
+pub fn connectionGenerationTag(key: lifecycle.ConnectionKey) u32 {
     return @truncate(key.generation);
 }
 
+/// Which of a connection's deadlines its one heap entry stands for
+/// (`deadline_driver.zig`).
+pub const DeadlineKind = enum {
+    /// From the accept until the first request starts.
+    pre_request,
+    /// While the connection has no stream.
+    idle,
+    /// While the lane holds something of the connection that only the
+    /// client can move, and no byte moves.
+    stall,
+};
+
+pub const Deadline = struct {
+    kind: DeadlineKind,
+    at_ns: u64,
+};
+
 pub const Slot = struct {
-    active: bool = false,
-    key: ingress_state.ConnectionKey = .{ .lane_id = 0, .slot = 0, .generation = 0 },
+    slab_link: slab.Link = .{},
+    key: lifecycle.ConnectionKey = .{ .lane_id = 0, .slot = 0, .generation = 0 },
+    /// The socket, owned by the slot while it is live.
     fd: std.posix.fd_t = -1,
     /// Read once at accept; the access log records it as the client IP.
     peer_address: PeerAddress = .{},
-    state: Phase = .vacant,
-    buffer_index: u32 = ingress_state.invalid_slot,
-    queued: bool = false,
+    state: Phase = .tls_handshake,
     wait_events: i16 = 0,
     registered_wait_events: i16 = 0,
-    read_len: usize = 0,
-    scan_start: usize = 0,
     tls_connection: ?tls_mod.BoringSslConnection = null,
-    h2_preface_complete: bool = false,
+    ktls_rekey_state: ktls.RekeyState = ktls.RekeyState.disabled(),
+    /// The lane's slab of streams, which this connection's positions index.
+    streams: *stream_table.StreamSlab = undefined,
+    frame_reader: frame_reader.State = .{},
     h2_sent_initial_settings: bool = false,
     h2_received_initial_client_settings: bool = false,
     h2_last_client_stream_id: u32 = 0,
@@ -91,7 +119,11 @@ pub const Slot = struct {
     h2_header_block: []u8 = &.{},
     h2_header_block_len: usize = 0,
     h2_header_block_frame_count: usize = 0,
-    ingress_channels: [max_h2_concurrent_streams]H2StreamEntry = [_]H2StreamEntry{.{}} ** max_h2_concurrent_streams,
+    /// The id of the stream at each position, 0 where none is
+    /// (`stream_table.zig`).
+    stream_ids: [max_h2_concurrent_streams]u32 = @splat(0),
+    /// The slab index of the entry of the stream at each position.
+    stream_refs: [max_h2_concurrent_streams]stream_table.StreamRef = undefined,
     ingress_channel_count: usize = 0,
     h2_pending_body_bytes: usize = 0,
     h2_pending_response_bytes: usize = 0,
@@ -109,98 +141,115 @@ pub const Slot = struct {
     /// Set once the lane decided to close the connection, and kept until
     /// `connection_flow.zig` tears it down.
     closing: ?Closing = null,
-    pre_request_deadline_active: bool = false,
-    pre_request_deadline_ns: u64 = 0,
-    pre_request_deadline_heap: common_io.heap.IntrusiveHeapField(Slot) = .{},
-    ktls_rekey_state: ktls.RekeyState = ktls.RekeyState.disabled(),
+    /// The connection's entry in the lane's deadline heap, while it has one.
+    deadline: ?Deadline = null,
+    deadline_heap: common_io.heap.IntrusiveHeapField(Slot) = .{},
+    /// When the lane accepted the connection (CLOCK_MONOTONIC).
+    accepted_ns: u64 = 0,
+    /// Set from the accept until the connection starts its first request.
+    awaiting_first_request: bool = true,
+    /// When the connection last came to have no stream, while it has none
+    /// and has started a request; null otherwise.
+    idle_since_ns: ?u64 = null,
+    /// When a byte of the connection was last read or written.
+    last_progress_ns: u64 = 0,
 
     /// The connection is live and the lane has not decided to close it: it
     /// reads frames and takes new ones to queue.
     pub fn isOpen(self: *const Slot) bool {
-        return self.active and self.closing == null;
+        return self.slab_link.live and self.closing == null;
     }
 
-    pub fn deinitProtocolState(self: *Slot, allocator: std.mem.Allocator) void {
+    pub fn isLive(self: *const Slot) bool {
+        return self.slab_link.live;
+    }
+
+    /// Records that a byte of the connection moved at `now_ns`, which
+    /// restarts its stall deadline.
+    pub fn noteProgress(self: *Slot, now_ns: u64) void {
+        self.last_progress_ns = now_ns;
+    }
+
+    /// Whether the lane holds something of the connection that only the
+    /// client can move: part of a frame or of a header block, writes the
+    /// socket has not taken, or response bytes flow control holds back.
+    pub fn stalled(self: *const Slot) bool {
+        return self.frame_reader.midFrame() or
+            self.h2HasPendingHeaderBlock() or
+            self.h2WritesPending() or
+            self.h2_pending_response_bytes != 0;
+    }
+
+    /// Frees what the connection's HTTP/2 state holds: its HPACK coders, its
+    /// header block, with its charge back to `header_blocks`, its write
+    /// queue, and every stream, back to the lane's slab.
+    pub fn deinitProtocolState(self: *Slot, allocator: std.mem.Allocator, header_blocks: *HeaderBlockBudget) void {
         self.h2_hpack_decoder.deinit();
         self.h2_hpack_encoder.deinit();
-        self.h2ClearHeaderBlock(allocator);
+        self.h2ClearHeaderBlock(allocator, header_blocks);
         write_queue.h2DeinitWriteQueue(self, allocator);
-        self.h2_received_initial_client_settings = false;
-        self.h2_last_client_stream_id = 0;
-        self.h2_opened_client_streams = 0;
-        self.h2_header_block_stream_id = 0;
-        self.h2_header_block_kind = .request_headers;
-        self.h2_header_block_end_stream = false;
-        self.h2_header_block_len = 0;
-        self.h2_header_block_frame_count = 0;
-        for (&self.ingress_channels) |*entry|
-            entry.deinit(allocator);
-        self.ingress_channels = [_]H2StreamEntry{.{}} ** max_h2_concurrent_streams;
-        self.ingress_channel_count = 0;
+        stream_table.releaseAll(self, allocator);
         self.h2_pending_body_bytes = 0;
         self.h2_pending_response_bytes = 0;
-        self.h2_response_rr_cursor = 0;
-        self.h2_connection_send_window = h2.default_initial_window_size;
-        self.h2_connection_recv_window = limits.h2.INGRESS_CONNECTION_RECV_WINDOW_BYTES;
-        self.h2_pending_connection_window_update = 0;
     }
 
     pub fn h2HasPendingHeaderBlock(self: *const Slot) bool {
         return self.h2_header_block_stream_id != 0;
     }
 
+    /// Opens the header block of a HEADERS frame on `stream_id`, empty; its
+    /// fragments follow (`h2AppendHeaderBlock`).
     pub fn h2BeginHeaderBlock(
         self: *Slot,
-        allocator: std.mem.Allocator,
         stream_id: u32,
-        payload: []const u8,
         end_stream: bool,
         kind: H2HeaderBlockKind,
     ) !void {
         if (self.h2HasPendingHeaderBlock())
             return error.Http2ProtocolError;
-        if (payload.len > limits.headers.INGRESS_H2_REQUEST_HEADER_BLOCK_BYTES)
-            return error.Http2HeaderBlockTooLarge;
-        if (payload.len != 0) {
-            self.h2_header_block = try allocator.alloc(u8, payload.len);
-            @memcpy(self.h2_header_block, payload);
-            self.h2_header_block_len = payload.len;
-        } else {
-            self.h2_header_block = &.{};
-            self.h2_header_block_len = 0;
-        }
         self.h2_header_block_stream_id = stream_id;
         self.h2_header_block_kind = kind;
         self.h2_header_block_end_stream = end_stream;
+        self.h2_header_block_len = 0;
         self.h2_header_block_frame_count = 1;
     }
 
+    /// Counts a CONTINUATION frame of the open header block, past
+    /// `max_h2_header_block_frames` a flood (ENHANCE_YOUR_CALM).
+    pub fn h2CountHeaderBlockFrame(self: *Slot) !void {
+        if (self.h2_header_block_frame_count >= max_h2_header_block_frames)
+            return error.Http2EnhanceYourCalm;
+        self.h2_header_block_frame_count += 1;
+    }
+
+    /// Appends a fragment of the open header block. A block past
+    /// `INGRESS_H2_REQUEST_HEADER_BLOCK_BYTES` fails with
+    /// `error.Http2HeaderBlockTooLarge`, and growth the lane's budget cannot
+    /// take with `error.Http2HeaderBlockBudgetExceeded`; either closes the
+    /// connection.
     pub fn h2AppendHeaderBlock(
         self: *Slot,
         allocator: std.mem.Allocator,
-        stream_id: u32,
-        payload: []const u8,
+        header_blocks: *HeaderBlockBudget,
+        fragment: []const u8,
     ) !void {
-        if (self.h2_header_block_stream_id == 0 or self.h2_header_block_stream_id != stream_id)
+        if (self.h2_header_block_stream_id == 0)
             return error.Http2ProtocolError;
-        if (self.h2_header_block_frame_count >= max_h2_header_block_frames)
-            return error.Http2EnhanceYourCalm;
-        const new_frame_count = self.h2_header_block_frame_count + 1;
-        const new_len = std.math.add(usize, self.h2_header_block_len, payload.len) catch return error.Http2HeaderBlockTooLarge;
+        const new_len = std.math.add(usize, self.h2_header_block_len, fragment.len) catch return error.Http2HeaderBlockTooLarge;
         if (new_len > limits.headers.INGRESS_H2_REQUEST_HEADER_BLOCK_BYTES)
             return error.Http2HeaderBlockTooLarge;
-        if (payload.len == 0) {
-            self.h2_header_block_frame_count = new_frame_count;
+        if (fragment.len == 0)
             return;
-        }
         const old_len = self.h2_header_block_len;
-        try self.h2EnsureHeaderBlockCapacity(allocator, new_len);
-        @memcpy(self.h2_header_block[old_len..new_len], payload);
+        try self.h2EnsureHeaderBlockCapacity(allocator, header_blocks, new_len);
+        @memcpy(self.h2_header_block[old_len..new_len], fragment);
         self.h2_header_block_len = new_len;
-        self.h2_header_block_frame_count = new_frame_count;
     }
 
-    pub fn h2TakeHeaderBlock(self: *Slot) PendingH2HeaderBlock {
+    /// Takes the assembled header block, which the caller decodes and frees,
+    /// and gives its charge back to `header_blocks`.
+    pub fn h2TakeHeaderBlock(self: *Slot, header_blocks: *HeaderBlockBudget) PendingH2HeaderBlock {
+        header_blocks.release(self.h2_header_block.len);
         const block = PendingH2HeaderBlock{
             .stream_id = self.h2_header_block_stream_id,
             .kind = self.h2_header_block_kind,
@@ -208,18 +257,19 @@ pub const Slot = struct {
             .allocation = self.h2_header_block,
             .end_stream = self.h2_header_block_end_stream,
         };
-        self.h2_header_block_stream_id = 0;
-        self.h2_header_block_kind = .request_headers;
-        self.h2_header_block_end_stream = false;
-        self.h2_header_block = &.{};
-        self.h2_header_block_len = 0;
-        self.h2_header_block_frame_count = 0;
+        self.resetHeaderBlock();
         return block;
     }
 
-    pub fn h2ClearHeaderBlock(self: *Slot, allocator: std.mem.Allocator) void {
-        if (self.h2_header_block.len != 0)
+    pub fn h2ClearHeaderBlock(self: *Slot, allocator: std.mem.Allocator, header_blocks: *HeaderBlockBudget) void {
+        if (self.h2_header_block.len != 0) {
+            header_blocks.release(self.h2_header_block.len);
             allocator.free(self.h2_header_block);
+        }
+        self.resetHeaderBlock();
+    }
+
+    fn resetHeaderBlock(self: *Slot) void {
         self.h2_header_block_stream_id = 0;
         self.h2_header_block_kind = .request_headers;
         self.h2_header_block_end_stream = false;
@@ -228,7 +278,12 @@ pub const Slot = struct {
         self.h2_header_block_frame_count = 0;
     }
 
-    fn h2EnsureHeaderBlockCapacity(self: *Slot, allocator: std.mem.Allocator, needed_len: usize) !void {
+    fn h2EnsureHeaderBlockCapacity(
+        self: *Slot,
+        allocator: std.mem.Allocator,
+        header_blocks: *HeaderBlockBudget,
+        needed_len: usize,
+    ) !void {
         if (needed_len <= self.h2_header_block.len)
             return;
         var new_capacity = @max(self.h2_header_block.len * 2, needed_len);
@@ -238,6 +293,9 @@ pub const Slot = struct {
             new_capacity = limits.headers.INGRESS_H2_REQUEST_HEADER_BLOCK_BYTES;
         if (new_capacity < needed_len)
             return error.Http2HeaderBlockTooLarge;
+        const growth = new_capacity - self.h2_header_block.len;
+        try header_blocks.charge(growth);
+        errdefer header_blocks.release(growth);
         self.h2_header_block = try allocator.realloc(self.h2_header_block, new_capacity);
     }
 
@@ -246,6 +304,9 @@ pub const Slot = struct {
     pub const h2AcceptClientStreamId = stream_table.h2AcceptClientStreamId;
     pub const h2ClientOpenedStreamId = stream_table.h2ClientOpenedStreamId;
     pub const h2ReserveStream = stream_table.h2ReserveStream;
+    pub const h2StreamEntry = stream_table.h2StreamEntry;
+    pub const h2StreamIndex = stream_table.h2StreamIndex;
+    pub const streamAt = stream_table.streamAt;
     pub const h2SetRequestBodyExpectation = stream_table.h2SetRequestBodyExpectation;
     pub const h2RecordRequestBodyChunk = stream_table.h2RecordRequestBodyChunk;
     pub const h2BindRequest = stream_table.h2BindRequest;
@@ -336,17 +397,20 @@ pub const PendingH2HeaderBlock = struct {
     }
 };
 
-fn preRequestDeadlineLess(_: void, a: *const Slot, b: *const Slot) bool {
-    if (a.pre_request_deadline_ns != b.pre_request_deadline_ns)
-        return a.pre_request_deadline_ns < b.pre_request_deadline_ns;
+fn deadlineLess(_: void, a: *const Slot, b: *const Slot) bool {
+    const a_at = a.deadline.?.at_ns;
+    const b_at = b.deadline.?.at_ns;
+    if (a_at != b_at)
+        return a_at < b_at;
     if (a.key.generation != b.key.generation)
         return a.key.generation < b.key.generation;
     return a.key.slot < b.key.slot;
 }
 
-pub const PreRequestDeadlineHeap = common_io.heap.IntrusiveHeapWithField(
+/// The lane's connection deadlines, one entry per connection at most.
+pub const DeadlineHeap = common_io.heap.IntrusiveHeapWithField(
     Slot,
-    "pre_request_deadline_heap",
+    "deadline_heap",
     void,
-    preRequestDeadlineLess,
+    deadlineLess,
 );

@@ -4,7 +4,7 @@ This reference describes the trust boundary around a worker as the code keeps it
 
 ## The boundary
 
-A worker runs one tenant's code and is untrusted from its first instruction. The process is the hard boundary: a worker runs the route of one worker definition (`server/supervisor/launcher.zig:launch_route`), and the workers of one definition share a security cell at the gateway (`server/gateway/manager.zig:securityCellIdForDefinition`). Code that escapes the engine reaches everything in its process, the bindings of its route, the tokens of its requests in flight, its sockets and its mappings among them, so every layer outside the process is built to hold against a worker that runs native code: the kernel confines the process, and the server and the gateway take every byte it writes as hostile input.
+A worker runs one tenant's code and is untrusted from its first instruction. The process is the hard boundary: a worker runs the routes of one worker definition, every one of them (`server/supervisor/launcher.zig:receiveForkReply` hands it the definition's whole route table), and the workers of one definition share a security cell at the gateway (`server/gateway/manager.zig:securityCellIdForDefinition`). Realms inside a worker separate the routes' state, not their trust: code that escapes the engine reaches everything in its process, the bindings of every route of its definition, the tokens of its requests in flight, its sockets and its mappings among them, so every layer outside the process is built to hold against a worker that runs native code: the kernel confines the process, and the server and the gateway take every byte it writes as hostile input.
 
 ## Birth and confinement
 
@@ -14,7 +14,7 @@ The launcher creates the worker's cgroup leaf with its limits before the fork. T
 | --- | --- | --- | --- |
 | 1 | unshare user, mount and network namespaces, mapping uid and gid 0 to the server's own | `zygote/worker_boot/sandbox.zig:applyPostForkNamespaces` | `unshare(CLONE_NEWUSER)` refuses a multithreaded process, and engine work later restarts threads |
 | 2 | receive `WorkerInit` within `WORKER_INIT_TIMEOUT_MS`, close every descriptor but the init socket, the trace pipe and those `WorkerInit` brought, check the message, its isolated-network and no-direct-egress flags and each descriptor's kind | `child_boot.zig:closeUnexpectedWorkerFds`, `validateWorkerInit`, `validateWorkerInitFds` | nothing else the zygote holds reaches the worker |
-| 3 | map the route's bindings read-only from a sealed memfd, clear the environment to `TZ=UTC` and `LANG=C.UTF-8`, map the page | `child_boot.zig:mapRouteBindingsReadOnly`, `applyWorkerEnvironmentPolicy` | bindings reach only the handler's `env`, and `process.env` is empty |
+| 3 | map the route table, with every route's bindings, read-only from a sealed memfd, clear the environment to `TZ=UTC` and `LANG=C.UTF-8`, map the page | `child_boot.zig:mapRouteTableReadOnly`, `applyWorkerEnvironmentPolicy` | each route's bindings reach only that route's handler `env`, and `process.env` is empty |
 | 4 | check that the child is the leaf's only member and that `memory.high`, `memory.max`, `cpu.max` and `pids.max` hold what `WorkerInit` says, and keep `memory.events.local` open | `worker_boot/cgroup.zig:validateAndOpenWorkerMemoryEventsAt` | no engine or tenant code runs under limits nobody set |
 | 5 | prove the process single-threaded | `child_boot.zig` | the next privileges are per thread, and `/proc` is still there to read |
 | 6 | set `RLIMIT_NOFILE` to `limits.DEFAULT_MAX_OPEN_FILES` and `RLIMIT_CORE` to 0, set no-new-privileges, make mounts private, mount a tmpfs of `WorkerInit`'s size with mode 0700 and `nosuid,nodev,noexec` over the tmp root the host made, `chroot` into it, drop every capability | `worker_boot/sandbox.zig:applyPreThread` | the namespace's capabilities allow the mount and the chroot, and then go |
@@ -77,7 +77,7 @@ Together the layers close these paths:
 | egress wake descriptors | the worker's wake set | write both eventfds, hold the gateway's liveness pipe open |
 | trace pipe write end | the zygote (`zygote/trace.zig`) | write lines |
 | `memory.events.local` | step 4 | read |
-| bindings and fs index | sealed memfds, mapped read-only | read |
+| route table and fs index | sealed memfds, mapped read-only | read |
 | completion and credit eventfds, timerfd, ring, wake eventfd | `WorkerInit` and its own boot | write the eventfds |
 
 ## Surfaces and their readers

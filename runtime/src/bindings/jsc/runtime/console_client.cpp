@@ -595,7 +595,12 @@ void ConsoleClient::clearRequestOutputBudget(uint64_t request_id) { request_outp
 
 void ConsoleClient::resetRequestOutputBudgets() { request_output_spent.clear(); }
 
-void ConsoleClient::emitLine(uint8_t level, const WTF::String& body)
+ConsoleRealmState& ConsoleClient::realmState(JSGlobalObject* global)
+{
+    return uncheckedDowncast<GlobalObject>(global)->realm().console;
+}
+
+void ConsoleClient::emitLine(const ConsoleRealmState& console, uint8_t level, const WTF::String& body)
 {
     ColloConsoleSink sink = owner->console_sink;
     if (!sink)
@@ -616,7 +621,7 @@ void ConsoleClient::emitLine(uint8_t level, const WTF::String& body)
     WTF::String line = body;
     if (line.length() > unit_cap)
         line = StringView(line).left(static_cast<unsigned>(unit_cap)).toString();
-    unsigned indent_depth = std::min(group_depth, group_indent_max_depth);
+    unsigned indent_depth = std::min(console.group_depth, group_indent_max_depth);
     if (indent_depth) {
         StringBuilder indented;
         for (unsigned i = 0; i < indent_depth; ++i)
@@ -662,9 +667,10 @@ void ConsoleClient::emitLine(uint8_t level, const WTF::String& body)
 void ConsoleClient::messageWithTypeAndLevel(
     MessageType type, MessageLevel level, JSGlobalObject* global, Ref<ScriptArguments>&& arguments)
 {
+    ConsoleRealmState& console = realmState(global);
     if (type == MessageType::EndGroup) {
-        if (group_depth)
-            --group_depth;
+        if (console.group_depth)
+            --console.group_depth;
         return;
     }
     if (type == MessageType::Clear)
@@ -673,7 +679,7 @@ void ConsoleClient::messageWithTypeAndLevel(
     bool start_group = type == MessageType::StartGroup || type == MessageType::StartGroupCollapsed;
     if (!sinkActive()) {
         if (start_group)
-            ++group_depth;
+            ++console.group_depth;
         return;
     }
 
@@ -683,7 +689,7 @@ void ConsoleClient::messageWithTypeAndLevel(
     if (requestOutputExhausted(currentRequestId())) {
         emitBudgetDropMarker(currentRequestId());
         if (start_group)
-            ++group_depth;
+            ++console.group_depth;
         return;
     }
 
@@ -708,9 +714,9 @@ void ConsoleClient::messageWithTypeAndLevel(
         appendStackTrace(state, body);
 
     if (!start_group || arguments->argumentCount())
-        emitLine(sinkLevelFor(level), body.toString());
+        emitLine(console, sinkLevelFor(level), body.toString());
     if (start_group)
-        ++group_depth;
+        ++console.group_depth;
 }
 
 WTF::String ConsoleClient::normalizedLabel(const WTF::String& label)
@@ -723,50 +729,54 @@ WTF::String ConsoleClient::normalizedLabel(const WTF::String& label)
     return key;
 }
 
-bool ConsoleClient::labelStateAtCap(size_t map_size, bool label_exists)
+bool ConsoleClient::labelStateAtCap(ConsoleRealmState& console, size_t map_size, bool label_exists)
 {
     if (label_exists || map_size < label_entries_max)
         return false;
-    if (!label_cap_warned) {
-        label_cap_warned = true;
-        emitLine(COLLO_CONSOLE_WARN, "console label state cap reached; new count()/time() labels are dropped"_s);
+    if (!console.label_cap_warned) {
+        console.label_cap_warned = true;
+        emitLine(
+            console, COLLO_CONSOLE_WARN, "console label state cap reached; new count()/time() labels are dropped"_s);
     }
     return true;
 }
 
-void ConsoleClient::count(JSGlobalObject*, const String& label)
+void ConsoleClient::count(JSGlobalObject* global, const String& label)
 {
     if (!sinkActive())
         return;
+    ConsoleRealmState& console = realmState(global);
     String key = normalizedLabel(label);
-    if (labelStateAtCap(counts.size(), counts.contains(key)))
+    if (labelStateAtCap(console, console.counts.size(), console.counts.contains(key)))
         return;
-    auto result = counts.add(key, 0);
+    auto result = console.counts.add(key, 0);
     ++result.iterator->value;
-    emitLine(COLLO_CONSOLE_INFO, makeString(key, ": "_s, result.iterator->value));
+    emitLine(console, COLLO_CONSOLE_INFO, makeString(key, ": "_s, result.iterator->value));
 }
 
-void ConsoleClient::countReset(JSGlobalObject*, const String& label)
+void ConsoleClient::countReset(JSGlobalObject* global, const String& label)
 {
     if (!sinkActive())
         return;
+    ConsoleRealmState& console = realmState(global);
     String key = normalizedLabel(label);
-    if (!counts.remove(key))
-        emitLine(COLLO_CONSOLE_WARN, makeString("Count for '"_s, key, "' does not exist"_s));
+    if (!console.counts.remove(key))
+        emitLine(console, COLLO_CONSOLE_WARN, makeString("Count for '"_s, key, "' does not exist"_s));
 }
 
-void ConsoleClient::time(JSGlobalObject*, const String& label)
+void ConsoleClient::time(JSGlobalObject* global, const String& label)
 {
     if (!sinkActive())
         return;
+    ConsoleRealmState& console = realmState(global);
     String key = normalizedLabel(label);
-    if (timers.contains(key)) {
-        emitLine(COLLO_CONSOLE_WARN, makeString("Timer '"_s, key, "' already exists"_s));
+    if (console.timers.contains(key)) {
+        emitLine(console, COLLO_CONSOLE_WARN, makeString("Timer '"_s, key, "' already exists"_s));
         return;
     }
-    if (labelStateAtCap(timers.size(), false))
+    if (labelStateAtCap(console, console.timers.size(), false))
         return;
-    timers.add(key, WTF::MonotonicTime::now());
+    console.timers.add(key, WTF::MonotonicTime::now());
 }
 
 void ConsoleClient::timeLog(JSGlobalObject* global, const String& label, Ref<ScriptArguments>&& arguments)
@@ -778,10 +788,11 @@ void ConsoleClient::timeLog(JSGlobalObject* global, const String& label, Ref<Scr
         emitBudgetDropMarker(currentRequestId());
         return;
     }
+    ConsoleRealmState& console = realmState(global);
     String key = normalizedLabel(label);
-    auto it = timers.find(key);
-    if (it == timers.end()) {
-        emitLine(COLLO_CONSOLE_WARN, makeString("Timer '"_s, key, "' does not exist"_s));
+    auto it = console.timers.find(key);
+    if (it == console.timers.end()) {
+        emitLine(console, COLLO_CONSOLE_WARN, makeString("Timer '"_s, key, "' does not exist"_s));
         return;
     }
     double ms = (WTF::MonotonicTime::now() - it->value).milliseconds();
@@ -795,22 +806,23 @@ void ConsoleClient::timeLog(JSGlobalObject* global, const String& label, Ref<Scr
     }
     if (state.saw_termination)
         return;
-    emitLine(COLLO_CONSOLE_INFO, body.toString());
+    emitLine(console, COLLO_CONSOLE_INFO, body.toString());
 }
 
-void ConsoleClient::timeEnd(JSGlobalObject*, const String& label)
+void ConsoleClient::timeEnd(JSGlobalObject* global, const String& label)
 {
     if (!sinkActive())
         return;
+    ConsoleRealmState& console = realmState(global);
     String key = normalizedLabel(label);
-    auto it = timers.find(key);
-    if (it == timers.end()) {
-        emitLine(COLLO_CONSOLE_WARN, makeString("Timer '"_s, key, "' does not exist"_s));
+    auto it = console.timers.find(key);
+    if (it == console.timers.end()) {
+        emitLine(console, COLLO_CONSOLE_WARN, makeString("Timer '"_s, key, "' does not exist"_s));
         return;
     }
     double ms = (WTF::MonotonicTime::now() - it->value).milliseconds();
-    timers.remove(it);
-    emitLine(COLLO_CONSOLE_INFO, makeString(key, ": "_s, WTF::FormattedNumber::fixedWidth(ms, 3), "ms"_s));
+    console.timers.remove(it);
+    emitLine(console, COLLO_CONSOLE_INFO, makeString(key, ": "_s, WTF::FormattedNumber::fixedWidth(ms, 3), "ms"_s));
 }
 
 void ConsoleClient::profile(JSGlobalObject*, const String&) { }

@@ -19,11 +19,11 @@
 //! - Every retirement is the reaper's (`queueRetirement`). No kill, exit
 //!   wait, usage drain or cgroup removal runs on the lane.
 
+const lifecycle = @import("collo_server_lifecycle");
 const supervision = @import("collo_server_supervisor");
 const worker_shared_page = @import("collo_worker_state").page;
 const fault = @import("../fault.zig");
 const completions = @import("../completions.zig");
-const ingress_state = @import("../state.zig");
 const admission = @import("admission.zig");
 const request_finish = @import("request_finish.zig");
 const work_queues = @import("work_queues.zig");
@@ -160,7 +160,7 @@ pub fn Methods(comptime Self: type) type {
         pub fn faultWorkerSeenElsewhere(
             self: *Self,
             worker: *WorkerRecord,
-            worker_key: ingress_state.WorkerKey,
+            worker_key: lifecycle.WorkerKey,
             reason: fault.WorkerFaultReason,
         ) LaneFault!void {
             const definition = worker.definition_index;
@@ -199,7 +199,7 @@ pub fn Methods(comptime Self: type) type {
         pub fn processDeferredWorkerFaults(self: *Self) LaneFault!bool {
             var did_work = false;
             var popped: usize = 0;
-            while (popped < self.completion_registrations.len) : (popped += 1) {
+            while (popped < self.registrations.capacity()) : (popped += 1) {
                 const registration_index = Queues.popDeath(self) orelse break;
                 // A registration with a deferred fault stays bound to its
                 // worker until this runs
@@ -283,9 +283,9 @@ pub fn Methods(comptime Self: type) type {
             worker: *WorkerRecord,
             reason: fault.WorkerFaultReason,
         ) LaneFault!void {
-            const registration = &self.completion_registrations[registration_index];
+            const registration = &self.registrations.entries[registration_index];
             const worker_key = registration.worker_key;
-            var request_keys: [completions.max_worker_inflight_requests]ingress_state.RequestKey = undefined;
+            var request_keys: [completions.max_worker_inflight_requests]lifecycle.RequestKey = undefined;
             const request_count = registration.copyInflight(&request_keys);
             if (request_count == 0)
                 return;
@@ -293,7 +293,7 @@ pub fn Methods(comptime Self: type) type {
             const now = self.monotonicNowNs();
             for (request_keys[0..request_count]) |request_key| {
                 const request_slot = Admission.findRequestSlot(self, request_key) orelse continue;
-                const slot = &self.dynamic_requests[request_slot];
+                const slot = &self.requests.entries[request_slot];
                 if (!slot.dispatched() or !slot.worker_key.eql(worker_key))
                     continue;
                 const outcome: RequestOutcome = if (reason == .deadline_grace_expired and now >= slot.deadline_ns)

@@ -1,8 +1,9 @@
 //! An ingress lane's commands, on the lane thread: the drain of the lane's
 //! queue and the handler of each command (the queue is `commands.zig`, the
-//! payloads and their protocol `lane_commands.zig`), and the reader role the
-//! lane gives up when another lane or the reaper asks for it, or when the
-//! lane stops.
+//! payloads and their protocol `lane_commands.zig`), the wake bits that
+//! share the queue's eventfd (`ring_driver.takeWakeBits`), and the reader
+//! role the lane gives up when another lane or the reaper asks for it, or
+//! when the lane stops.
 //!
 //! A command waits in the queue while its subject moves on, so each handler
 //! checks the keys the command carries against the lane's own state before
@@ -30,6 +31,7 @@ const admission = @import("admission.zig");
 const dispatch = @import("dispatch.zig");
 const h2_worker_ipc = @import("h2_worker_ipc.zig");
 const request_finish = @import("request_finish.zig");
+const ring_driver = @import("ring_driver.zig");
 const worker_completions = @import("worker_completions.zig");
 const worker_fault = @import("worker_fault.zig");
 const worker_registration = @import("worker_registration.zig");
@@ -44,15 +46,18 @@ pub fn Methods(comptime Self: type) type {
         const Completions = worker_completions.Methods(Self);
         const Dispatch = dispatch.Methods(Self);
         const RequestFinish = request_finish.Methods(Self);
+        const RingDriver = ring_driver.Methods(Self);
         const WorkerFault = worker_fault.Methods(Self);
         const WorkerIpc = h2_worker_ipc.Methods(Self);
         const WorkerRegistration = worker_registration.Methods(Self);
 
-        /// Loop handler: reads the command eventfd and runs the commands
-        /// queued now. A command posted meanwhile has written its own wake
-        /// and waits for the next call.
+        /// Loop handler: reads the command eventfd, runs the retries the wake
+        /// bits raised since ask for, then the commands queued now. The
+        /// eventfd goes first: a command posted or a bit raised meanwhile has
+        /// written its own wake and waits for the next call.
         pub fn handleCommands(self: *Self) LaneFault!void {
             _ = try self.lane.command_queue.drainWake();
+            try RingDriver.takeWakeBits(self);
             var remaining = self.lane.command_queue.pending();
             while (remaining != 0) : (remaining -= 1) {
                 var command = self.lane.command_queue.dequeue() orelse return;
@@ -72,7 +77,7 @@ pub fn Methods(comptime Self: type) type {
         /// order, and the pool is asked again, all while the role is still
         /// this lane's.
         pub fn giveUpTenure(self: *Self, registration_index: u32) LaneFault!pool.Transfer {
-            const registration = &self.completion_registrations[registration_index];
+            const registration = &self.registrations.entries[registration_index];
             const tenure = registration.tenure orelse return .stale;
             const worker = registration.worker orelse return error.InvalidCompletionRegistration;
             const worker_pool = self.service.supervisor.poolFor(worker.definition_index);
@@ -91,10 +96,11 @@ pub fn Methods(comptime Self: type) type {
 
         /// Gives back what the commands still queued when the lane tears
         /// down hold for others: each `dispatch_ready`'s slot, with the reader
-        /// grant it carried (`request_finish.returnHandoff`), and each
-        /// forwarded ring payload's answer, so its reader frees the bytes. The
-        /// lane takes no post any more, so the queue only empties. The rest
-        /// hold nothing beyond their memory, which `Command.deinit` frees.
+        /// grant it carried (`request_finish.returnHandoff`), each forwarded
+        /// descriptor's window unit, with a ring payload's answer so its
+        /// reader frees the bytes, and each answer's window unit. The lane
+        /// takes no post any more, so the queue only empties. The rest hold
+        /// nothing beyond their memory, which `Command.deinit` frees.
         pub fn returnQueuedHandoffs(self: *Self) LaneFault!void {
             var remaining = self.lane.command_queue.pending();
             while (remaining != 0) : (remaining -= 1) {
@@ -103,11 +109,11 @@ pub fn Methods(comptime Self: type) type {
                 switch (command) {
                     .dispatch_ready => |ready| try RequestFinish.returnHandoff(self, ready.worker, ready.slot, ready.reader),
                     .forwarded_descriptor => |*forwarded| try WorkerIpc.abandonForwardedDescriptor(self, forwarded),
+                    .payload_consumed => |consumed| try WorkerIpc.releaseForwardUnit(self, consumed.worker),
                     .empty,
                     .worker_died,
                     .dispatch_failed,
                     .forwarded_completion,
-                    .payload_consumed,
                     .release_worker,
                     .shutdown,
                     => {},
@@ -208,7 +214,7 @@ pub fn Methods(comptime Self: type) type {
                 self.lane.counters.stale_commands += 1;
                 return;
             };
-            const tenure = self.completion_registrations[registration_index].tenure orelse {
+            const tenure = self.registrations.entries[registration_index].tenure orelse {
                 self.lane.counters.stale_commands += 1;
                 return;
             };
@@ -221,9 +227,10 @@ pub fn Methods(comptime Self: type) type {
 
         /// Answers, oldest first, every ring payload the reader still holds,
         /// through the reader's own answer path, so the ring's read cursor
-        /// moves over them in ring order.
+        /// moves over them in ring order. Their window units went with the
+        /// answers that were lost, so none is released here.
         fn freeAbandonedRingPayloads(self: *Self, registration_index: u32) LaneFault!void {
-            const registration = &self.completion_registrations[registration_index];
+            const registration = &self.registrations.entries[registration_index];
             const worker_key = registration.worker_key;
             const holds = &registration.ring_payloads;
             var abandoned: [ipc.ingress_channel.SharedPayloadHolds.capacity]lane_commands.RingRef = undefined;
@@ -231,7 +238,7 @@ pub fn Methods(comptime Self: type) type {
             for (holds.entries[0..count], abandoned[0..count]) |entry, *ring|
                 ring.* = .{ .offset = entry.offset, .len = entry.len };
             for (abandoned[0..count]) |ring|
-                try WorkerIpc.handlePayloadConsumed(self, .{ .worker_key = worker_key, .ring = ring });
+                WorkerIpc.answerHeldPayload(self, worker_key, ring);
         }
 
         /// Gives back a tenure the pool granted over a worker that left

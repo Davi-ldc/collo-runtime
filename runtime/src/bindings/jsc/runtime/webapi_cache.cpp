@@ -1,8 +1,10 @@
-// Stores and reads the Web API objects that installation creates on ColloVm::webapi_cache. Runs on the VM thread with
-// the JSC API lock held.
+// Stores and reads the Web API objects that installation creates in a realm's ColloRealm::webapi_cache. Runs on the VM
+// thread with the JSC API lock held.
 //
-// Every entry is a JSC::Strong on ColloVm, rooted for the VM's lifetime and cleared by destroyVmContents. A
-// generated getter aborts on an entry that was never stored, since its callers use the result as a live cell.
+// Every entry is a JSC::Strong on the realm, rooted for the VM's lifetime and cleared by destroyVmContents. A global
+// reads and writes only its own realm's cache, so an object a host function builds always takes its prototype from
+// the realm it was called in. A generated getter aborts on an entry that was never stored, since its callers use the
+// result as a live cell.
 
 #include "jsc/runtime/state.h"
 
@@ -13,7 +15,7 @@ void GlobalObject::cacheURLApi(JSC::JSObject* url_constructor, JSC::JSObject* ur
     JSC::JSObject* url_search_params_prototype, JSC::Structure* url_search_params_structure,
     JSC::JSObject* url_search_params_iterator_prototype, JSC::Structure* url_search_params_iterator_structure)
 {
-    auto& cache = owner().webapi_cache;
+    auto& cache = webApiCache();
     cache.url_constructor.set(vm(), url_constructor);
     cache.url_prototype.set(vm(), url_prototype);
     cache.url_structure.set(vm(), url_structure);
@@ -28,7 +30,7 @@ void GlobalObject::cacheHeadersApi(JSC::JSObject* headers_constructor, JSC::JSOb
     JSC::Structure* headers_structure, JSC::JSObject* headers_iterator_prototype,
     JSC::Structure* headers_iterator_structure)
 {
-    auto& cache = owner().webapi_cache;
+    auto& cache = webApiCache();
     cache.headers_constructor.set(vm(), headers_constructor);
     cache.headers_prototype.set(vm(), headers_prototype);
     cache.headers_structure.set(vm(), headers_structure);
@@ -39,7 +41,7 @@ void GlobalObject::cacheHeadersApi(JSC::JSObject* headers_constructor, JSC::JSOb
 void GlobalObject::cacheRequestApi(
     JSC::JSObject* request_constructor, JSC::JSObject* request_prototype, JSC::Structure* request_structure)
 {
-    auto& cache = owner().webapi_cache;
+    auto& cache = webApiCache();
     cache.request_constructor.set(vm(), request_constructor);
     cache.request_prototype.set(vm(), request_prototype);
     cache.request_structure.set(vm(), request_structure);
@@ -48,7 +50,7 @@ void GlobalObject::cacheRequestApi(
 void GlobalObject::cacheResponseApi(
     JSC::JSObject* response_constructor, JSC::JSObject* response_prototype, JSC::Structure* response_structure)
 {
-    auto& cache = owner().webapi_cache;
+    auto& cache = webApiCache();
     cache.response_constructor.set(vm(), response_constructor);
     cache.response_prototype.set(vm(), response_prototype);
     cache.response_structure.set(vm(), response_structure);
@@ -68,7 +70,7 @@ void GlobalObject::cacheReadableStreamApi(JSC::JSObject* readable_stream_constru
     JSC::JSObject* readable_byte_stream_controller_prototype, JSC::Structure* readable_byte_stream_controller_structure,
     JSC::JSObject* readable_stream_async_iterator_prototype, JSC::Structure* readable_stream_async_iterator_structure)
 {
-    auto& cache = owner().webapi_cache;
+    auto& cache = webApiCache();
     cache.readable_stream_constructor.set(vm(), readable_stream_constructor);
     cache.readable_stream_prototype.set(vm(), readable_stream_prototype);
     cache.readable_stream_structure.set(vm(), readable_stream_structure);
@@ -99,7 +101,7 @@ void GlobalObject::cacheWritableStreamApi(JSC::JSObject* writable_stream_constru
     JSC::JSObject* writable_stream_default_controller_prototype,
     JSC::Structure* writable_stream_default_controller_structure)
 {
-    auto& cache = owner().webapi_cache;
+    auto& cache = webApiCache();
     cache.writable_stream_constructor.set(vm(), writable_stream_constructor);
     cache.writable_stream_prototype.set(vm(), writable_stream_prototype);
     cache.writable_stream_structure.set(vm(), writable_stream_structure);
@@ -117,7 +119,7 @@ void GlobalObject::cacheTransformStreamApi(JSC::JSObject* transform_stream_const
     JSC::JSObject* transform_stream_default_controller_prototype,
     JSC::Structure* transform_stream_default_controller_structure)
 {
-    auto& cache = owner().webapi_cache;
+    auto& cache = webApiCache();
     cache.transform_stream_constructor.set(vm(), transform_stream_constructor);
     cache.transform_stream_prototype.set(vm(), transform_stream_prototype);
     cache.transform_stream_structure.set(vm(), transform_stream_structure);
@@ -129,7 +131,7 @@ void GlobalObject::cacheTransformStreamApi(JSC::JSObject* transform_stream_const
 void GlobalObject::cacheDOMExceptionApi(JSC::JSObject* dom_exception_constructor,
     JSC::JSObject* dom_exception_prototype, JSC::Structure* dom_exception_structure)
 {
-    auto& cache = owner().webapi_cache;
+    auto& cache = webApiCache();
     cache.dom_exception_constructor.set(vm(), dom_exception_constructor);
     cache.dom_exception_prototype.set(vm(), dom_exception_prototype);
     cache.dom_exception_structure.set(vm(), dom_exception_structure);
@@ -144,7 +146,7 @@ void GlobalObject::cacheEventApi(JSC::JSObject* event_constructor, JSC::JSObject
     JSC::JSObject* event_target_constructor, JSC::JSObject* event_target_prototype,
     JSC::Structure* event_target_structure)
 {
-    auto& cache = owner().webapi_cache;
+    auto& cache = webApiCache();
     cache.event_constructor.set(vm(), event_constructor);
     cache.event_prototype.set(vm(), event_prototype);
     cache.event_structure.set(vm(), event_structure);
@@ -169,7 +171,7 @@ void GlobalObject::cacheAbortApi(JSC::JSObject* abort_controller_constructor, JS
     JSC::Structure* abort_controller_structure, JSC::JSObject* abort_signal_constructor,
     JSC::JSObject* abort_signal_prototype, JSC::Structure* abort_signal_structure)
 {
-    auto& cache = owner().webapi_cache;
+    auto& cache = webApiCache();
     cache.abort_controller_constructor.set(vm(), abort_controller_constructor);
     cache.abort_controller_prototype.set(vm(), abort_controller_prototype);
     cache.abort_controller_structure.set(vm(), abort_controller_structure);
@@ -185,7 +187,7 @@ void GlobalObject::cacheTextCodecApi(JSC::JSObject* text_encoder_constructor, JS
     JSC::Structure* text_encoder_stream_structure, JSC::JSObject* text_decoder_stream_constructor,
     JSC::JSObject* text_decoder_stream_prototype, JSC::Structure* text_decoder_stream_structure)
 {
-    auto& cache = owner().webapi_cache;
+    auto& cache = webApiCache();
     cache.text_encoder_constructor.set(vm(), text_encoder_constructor);
     cache.text_encoder_prototype.set(vm(), text_encoder_prototype);
     cache.text_encoder_structure.set(vm(), text_encoder_structure);
@@ -203,7 +205,7 @@ void GlobalObject::cacheTextCodecApi(JSC::JSObject* text_encoder_constructor, JS
 void GlobalObject::cacheBlobApi(
     JSC::JSObject* blob_constructor, JSC::JSObject* blob_prototype, JSC::Structure* blob_structure)
 {
-    auto& cache = owner().webapi_cache;
+    auto& cache = webApiCache();
     cache.blob_constructor.set(vm(), blob_constructor);
     cache.blob_prototype.set(vm(), blob_prototype);
     cache.blob_structure.set(vm(), blob_structure);
@@ -212,7 +214,7 @@ void GlobalObject::cacheBlobApi(
 void GlobalObject::cacheFileApi(
     JSC::JSObject* file_constructor, JSC::JSObject* file_prototype, JSC::Structure* file_structure)
 {
-    auto& cache = owner().webapi_cache;
+    auto& cache = webApiCache();
     cache.file_constructor.set(vm(), file_constructor);
     cache.file_prototype.set(vm(), file_prototype);
     cache.file_structure.set(vm(), file_structure);
@@ -222,7 +224,7 @@ void GlobalObject::cacheFormDataApi(JSC::JSObject* form_data_constructor, JSC::J
     JSC::Structure* form_data_structure, JSC::JSObject* form_data_iterator_prototype,
     JSC::Structure* form_data_iterator_structure)
 {
-    auto& cache = owner().webapi_cache;
+    auto& cache = webApiCache();
     cache.form_data_constructor.set(vm(), form_data_constructor);
     cache.form_data_prototype.set(vm(), form_data_prototype);
     cache.form_data_structure.set(vm(), form_data_structure);
@@ -234,7 +236,7 @@ void GlobalObject::cacheCryptoApi(JSC::JSObject* subtle_crypto_constructor, JSC:
     JSC::Structure* subtle_crypto_structure, JSC::JSObject* crypto_key_constructor, JSC::JSObject* crypto_key_prototype,
     JSC::Structure* crypto_key_structure)
 {
-    auto& cache = owner().webapi_cache;
+    auto& cache = webApiCache();
     cache.subtle_crypto_constructor.set(vm(), subtle_crypto_constructor);
     cache.subtle_crypto_prototype.set(vm(), subtle_crypto_prototype);
     cache.subtle_crypto_structure.set(vm(), subtle_crypto_structure);
@@ -246,7 +248,7 @@ void GlobalObject::cacheCryptoApi(JSC::JSObject* subtle_crypto_constructor, JSC:
 #define COLLO_WEBAPI_CACHE_GETTER(name, field, type)                                                                   \
     type* GlobalObject::name() const                                                                                   \
     {                                                                                                                  \
-        auto* value = owner().webapi_cache.field.get();                                                                \
+        auto* value = webApiCache().field.get();                                                                       \
         RELEASE_ASSERT(value);                                                                                         \
         return value;                                                                                                  \
     }

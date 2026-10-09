@@ -4,8 +4,9 @@
 //! its shared payload rings, the egress fetch messages and shared rings, the
 //! egress token's place in WorkerInit, DispatchWork and the fetch start, fs
 //! faults, module packs and packet framing. The token itself, the
-//! `egress_attach` packet, the fs index, the route bindings and the copy of a
-//! pool slot have their own files under `ipc/`. Everything runs over
+//! `egress_attach` packet, the fs index, the route table and its bindings
+//! sections, and the copy of a pool slot have their own files under `ipc/`.
+//! Everything runs over
 //! in-process socketpairs and memfds; the zygote integration lane covers the
 //! same handshakes against a real zygote and worker.
 
@@ -19,6 +20,7 @@ test {
     _ = @import("ipc/egress_token.zig");
     _ = @import("ipc/fs_index.zig");
     _ = @import("ipc/route_bindings.zig");
+    _ = @import("ipc/route_table.zig");
     _ = @import("ipc/slot_snapshot.zig");
 }
 
@@ -141,16 +143,13 @@ fn createRouteMemfd(bytes: []const u8) !std.posix.fd_t {
     return fd;
 }
 
-fn createRouteBindingsMemfd() !std.posix.fd_t {
-    const fd = try std.posix.memfd_create(
-        "test-route-bindings",
-        std.os.linux.MFD.CLOEXEC | std.os.linux.MFD.ALLOW_SEALING,
-    );
-    errdefer std.posix.close(fd);
-    try writeAllFd(fd, &.{ 0, 0, 0, 0 });
-    try std.posix.lseek_SET(fd, 0);
-    try fd_mod.addSeals(fd, fd_mod.memfd_readonly_seals);
-    return fd;
+/// A sealed one-route table naming `/__collo_route/demo/entry.js` with no
+/// bindings, as a host sends for a worker that serves routes.
+fn createRouteTable() !ipc.route_table.Sealed {
+    return ipc.route_table.buildSealed(std.testing.allocator, &.{.{
+        .entry_specifier = "/__collo_route/demo/entry.js",
+        .bindings = &.{},
+    }});
 }
 
 test "route memfd helper seals module bytes read-only" {
@@ -378,7 +377,7 @@ test "ingress channel stream lifecycle uses bidirectional shared rings without c
         .request_headers = &headers,
         .body_framing = .ingress_channel,
         .route_captures = &.{},
-        .route_entry_specifier = "/__collo_route/demo/h2.js",
+        .route_index = 0,
     });
     defer dispatch.deinit();
 
@@ -1595,6 +1594,61 @@ test "a payload past the writer's cursor reads short" {
     try std.testing.expectError(error.ShortRead, views.server.readBorrowAt(.worker_to_server, 0, 0, payload.len + 1));
 }
 
+/// Reads the worker's payload at `reservation` from the server's side and
+/// releases it, as a reader frees a payload once its consumer is done.
+fn releaseWorkerPayload(views: *PayloadViews, reservation: ingress_channel.SharedPayloadWriteReservation, len: usize, credit_eventfd: std.posix.fd_t) !void {
+    const cursor = views.server.readCursor(.worker_to_server);
+    const borrowed = try views.server.readBorrowAt(.worker_to_server, cursor, reservation.offset, @intCast(len));
+    var release: ingress_channel.SharedPayloadReadRelease = .{
+        .view = &views.server,
+        .direction = .worker_to_server,
+        .byte_len = borrowed.reserved_len,
+        .credit_eventfd = credit_eventfd,
+    };
+    release.release();
+}
+
+/// Whether the eventfd was signalled since its last read, which clears it.
+fn takeEventFdSignal(fd: std.posix.fd_t) !bool {
+    var value: u64 = 0;
+    _ = std.posix.read(fd, std.mem.asBytes(&value)) catch |err| switch (err) {
+        error.WouldBlock => return false,
+        else => return err,
+    };
+    return value != 0;
+}
+
+test "a release signals the writer's credit eventfd only while the writer waits, once per wait" {
+    var views = try PayloadViews.init();
+    defer views.deinit();
+    const credit = try std.posix.eventfd(0, std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK);
+    defer std.posix.close(credit);
+    const small = [_]u8{0x66} ** 64;
+    const large = try std.testing.allocator.alloc(u8, ingress_channel.shared_payload_ring_capacity / 2 + 1);
+    defer std.testing.allocator.free(large);
+    @memset(large, 0x77);
+
+    // No writer waits, so a release makes no system call.
+    const first = try views.worker.write(.worker_to_server, &small);
+    try releaseWorkerPayload(&views, first, small.len, credit);
+    try std.testing.expect(!try takeEventFdSignal(credit));
+
+    // A second large payload finds no room behind the first; the writer
+    // marks itself waiting and checks again, and the release wakes it.
+    const held = try views.worker.write(.worker_to_server, large);
+    try std.testing.expect(!try views.worker.fits(.worker_to_server, large.len));
+    views.worker.markWriterWaiting(.worker_to_server);
+    try std.testing.expect(!try views.worker.fits(.worker_to_server, large.len));
+    try releaseWorkerPayload(&views, held, large.len, credit);
+    try std.testing.expect(try takeEventFdSignal(credit));
+    try std.testing.expect(try views.worker.fits(.worker_to_server, large.len));
+
+    // The release took the mark, so the next one signals nothing.
+    const last = try views.worker.write(.worker_to_server, &small);
+    try releaseWorkerPayload(&views, last, small.len, credit);
+    try std.testing.expect(!try takeEventFdSignal(credit));
+}
+
 test "a memfd whose rings are not empty does not map" {
     var written = try PayloadViews.init();
     defer written.deinit();
@@ -1643,7 +1697,7 @@ test "decoded dispatch work stores slices in one compact packet copy" {
         .request_headers = &headers,
         .body_framing = .ingress_channel,
         .route_captures = &captures,
-        .route_entry_specifier = "/__collo_route/demo/hello.js",
+        .route_index = 0,
     };
 
     var scratch: [max_message_bytes]u8 = undefined;
@@ -1656,7 +1710,6 @@ test "decoded dispatch work stores slices in one compact packet copy" {
     try std.testing.expect(sliceWithin(decoded.storage, decoded.method));
     try std.testing.expect(sliceWithin(decoded.storage, decoded.path));
     try std.testing.expect(sliceWithin(decoded.storage, decoded.raw_query));
-    try std.testing.expect(sliceWithin(decoded.storage, decoded.route_entry_specifier));
     try std.testing.expect(sliceWithin(decoded.storage, decoded.request_headers[0].name));
     try std.testing.expect(sliceWithin(decoded.storage, decoded.request_headers[0].value));
     try std.testing.expect(sliceWithin(decoded.storage, decoded.route_captures[0].name));
@@ -1666,8 +1719,9 @@ test "decoded dispatch work stores slices in one compact packet copy" {
     try std.testing.expectEqualStrings("hello", decoded.route_captures[0].value);
 }
 
-test "a dispatch packet ends at its route-entry specifier and the decoder refuses a byte after it" {
+test "a dispatch packet ends at its route captures, names its route in the header, and the decoder refuses a byte after it" {
     const headers = [_]RequestHeader{.{ .name = "accept", .value = "*/*" }};
+    const captures = [_]RouteCapture{.{ .name = "id", .value = "7" }};
     const view = ipc.DispatchWorkView{
         .request_id = 9,
         .request_lane_id = 1,
@@ -1682,20 +1736,23 @@ test "a dispatch packet ends at its route-entry specifier and the decoder refuse
         .raw_query = "",
         .request_headers = &headers,
         .body_framing = .none,
-        .route_captures = &.{},
-        .route_entry_specifier = "/entry.js",
+        .route_captures = &captures,
+        .route_index = 63,
     };
     var scratch: [max_message_bytes]u8 = undefined;
     const encoded = try encodeDispatchWorkInto(&scratch, &view);
     const sections_len = view.authority.len + view.method.len + view.path.len + view.raw_query.len +
         @sizeOf(ipc.messages.NameValuePacket) + headers[0].name.len + headers[0].value.len +
-        view.route_entry_specifier.len;
+        @sizeOf(ipc.messages.NameValuePacket) + captures[0].name.len + captures[0].value.len;
     try std.testing.expectEqual(@sizeOf(DispatchPacketHeader) + sections_len, encoded.len);
+    const header = std.mem.bytesToValue(DispatchPacketHeader, encoded[0..@sizeOf(DispatchPacketHeader)]);
+    try std.testing.expectEqual(@as(u16, 63), header.route_index);
 
     var decoded = try decodeDispatchWork(std.testing.allocator, encoded);
     defer decoded.deinit();
-    try std.testing.expectEqualStrings("/entry.js", decoded.route_entry_specifier);
+    try std.testing.expectEqual(@as(u16, 63), decoded.route_index);
     try std.testing.expectEqualStrings("*/*", decoded.request_headers[0].value);
+    try std.testing.expectEqualStrings("7", decoded.route_captures[0].value);
 
     scratch[encoded.len] = 0;
     try std.testing.expectError(error.InvalidPacket, decodeDispatchWork(std.testing.allocator, scratch[0 .. encoded.len + 1]));
@@ -1713,14 +1770,14 @@ test "the dispatch header keeps its pinned size and offsets, with the egress tok
     try expectOffset(DispatchPacketHeader, "deadline_monotonic_ns", 96);
     try expectOffset(DispatchPacketHeader, "accounting_flags", 104);
     try expectOffset(DispatchPacketHeader, "request_lane_id", 108);
-    try expectOffset(DispatchPacketHeader, "_reserved0", 110);
+    try expectOffset(DispatchPacketHeader, "route_index", 110);
     try expectOffset(DispatchPacketHeader, "authority_len", 112);
     try expectOffset(DispatchPacketHeader, "method_len", 116);
     try expectOffset(DispatchPacketHeader, "path_len", 120);
     try expectOffset(DispatchPacketHeader, "raw_query_len", 124);
     try expectOffset(DispatchPacketHeader, "route_capture_count", 128);
     try expectOffset(DispatchPacketHeader, "route_captures_bytes_len", 132);
-    try expectOffset(DispatchPacketHeader, "route_entry_specifier_len", 136);
+    try expectOffset(DispatchPacketHeader, "_reserved0", 136);
     try expectOffset(DispatchPacketHeader, "request_header_count", 140);
     try expectOffset(DispatchPacketHeader, "request_headers_bytes_len", 144);
     try expectOffset(DispatchPacketHeader, "body_framing", 148);
@@ -1744,7 +1801,7 @@ test "dispatch work carries a minted egress token through encode and decode unch
         .request_headers = &.{},
         .body_framing = .none,
         .route_captures = &.{},
-        .route_entry_specifier = "/__collo_route/demo/token.js",
+        .route_index = 0,
     });
     defer dispatch.deinit();
     try std.testing.expectEqualSlices(u8, &minted, &dispatch.egress_token);
@@ -1779,7 +1836,7 @@ test "dispatch work without a token carries none through encode and decode" {
         .request_headers = &.{},
         .body_framing = .none,
         .route_captures = &.{},
-        .route_entry_specifier = "/__collo_route/demo/entry.js",
+        .route_index = 0,
     };
     try std.testing.expect(egress_token.isNone(&view.egress_token));
 
@@ -1795,10 +1852,9 @@ test "dispatch work without a token carries none through encode and decode" {
 }
 
 test "a boot context's dispatch work keeps its own copy of the boot token" {
-    const entry = "/__collo_route/demo/entry.js";
     var boot_token = bootTokenBytes();
     const minted = boot_token;
-    var boot = try DispatchWork.initBoot(std.testing.allocator, 1, &boot_token, entry);
+    var boot = try DispatchWork.initBoot(std.testing.allocator, 1, &boot_token);
     defer boot.deinit();
 
     // The caller's bytes change after the call and the copy does not.
@@ -1809,9 +1865,9 @@ test "a boot context's dispatch work keeps its own copy of the boot token" {
     try std.testing.expectEqual(egress_token.Kind.boot, fields.kind);
     try std.testing.expectEqual(@as(u64, 0), fields.request_id);
     try std.testing.expectEqual(@as(u64, 0), fields.request_generation);
-    try std.testing.expectEqualStrings(entry, boot.route_entry_specifier);
+    try std.testing.expectEqual(@as(u16, 0), boot.route_index);
 
-    var detached = try DispatchWork.initBoot(std.testing.allocator, 1, &egress_token.none, entry);
+    var detached = try DispatchWork.initBoot(std.testing.allocator, 1, &egress_token.none);
     defer detached.deinit();
     try std.testing.expect(egress_token.isNone(&detached.egress_token));
 }
@@ -1825,7 +1881,6 @@ test "dispatch capture section is validated before capture allocation" {
     header.authority_len = 1;
     header.route_capture_count = 1;
     header.route_captures_bytes_len = 0;
-    header.route_entry_specifier_len = 1;
 
     var cursor: usize = 0;
     cursor += writeStruct(packet[cursor..], &header);
@@ -1861,7 +1916,7 @@ test "dispatch decode refuses an empty authority and a nonzero reserved field" {
         .request_headers = &.{},
         .body_framing = .none,
         .route_captures = &.{},
-        .route_entry_specifier = "/__collo_route/demo/entry.js",
+        .route_index = 0,
     };
     var scratch: [max_message_bytes]u8 = undefined;
     const encoded = try encodeDispatchWorkInto(&scratch, &view);
@@ -1898,7 +1953,7 @@ test "dispatch encode rejects too many request headers" {
         .request_headers = headers[0..],
         .body_framing = .none,
         .route_captures = captures[0..],
-        .route_entry_specifier = empty[0..],
+        .route_index = 0,
     };
 
     var view = message.view();
@@ -1921,7 +1976,7 @@ test "dispatch encode rejects overflowing length accumulation" {
         .request_headers = &.{},
         .body_framing = .none,
         .route_captures = captures[0..],
-        .route_entry_specifier = empty[0..],
+        .route_index = 0,
     };
 
     var view = message.view();
@@ -2167,11 +2222,12 @@ test "worker init transfers the egress shared endpoint, the boot token and the r
     try std.testing.expect(received_cgroup_dir_fd >= 0);
     std.posix.close(received_cgroup_dir_fd);
 
-    // Every table carries a sealed fs index memfd, the placeholder here, and
-    // the worker end of the fs fault pair; a launch with no route entry
-    // carries no pack.
-    try std.testing.expect(received.route_entry_fd == null);
-    try std.testing.expectEqual(@as(usize, 0), received.routeEntrySpecifier().len);
+    // Every table carries a sealed route table, the empty one here, a sealed
+    // fs index memfd, the placeholder here, and the worker end of the fs
+    // fault pair; a launch that serves no route carries no pack.
+    try std.testing.expect(received.module_pack_fd == null);
+    try std.testing.expectEqual(@as(u64, ipc.route_table.empty_blob.len), received.message.route_table_len);
+    try fd_mod.requireSeals(received.route_table_fd, fd_mod.memfd_readonly_seals);
     const received_fs_index_fd = received.takeFsIndexFd();
     try std.testing.expect(received_fs_index_fd >= 0);
     try fd_mod.requireSeals(received_fs_index_fd, fd_mod.memfd_readonly_seals);
@@ -2276,8 +2332,9 @@ test "egress shared gateway retained body-pool data fd is cloexec" {
 /// through the host's sender or build a table by hand. The table's shape lives
 /// here alone: the base descriptors, the session's regions a boot token
 /// announces, the wake descriptors every table carries, the fs pair and the
-/// route's pack. The control pair is nonblocking, so a receive finds nothing
-/// when a send was refused. Initialized in place; `deinit` closes everything.
+/// definition's pack. The control pair is nonblocking, so a receive finds
+/// nothing when a send was refused. Initialized in place; `deinit` closes
+/// everything.
 const WorkerInitTableFixture = struct {
     control_pair: [2]std.posix.fd_t,
     metrics_pair: [2]std.posix.fd_t,
@@ -2290,7 +2347,7 @@ const WorkerInitTableFixture = struct {
     ingress_payload_fd: std.posix.fd_t,
     ingress_payload_credit_eventfd: std.posix.fd_t,
     tmp_root: std.testing.TmpDir,
-    route_bindings_fd: std.posix.fd_t,
+    route_table: ipc.route_table.Sealed,
     fs_index_fd: std.posix.fd_t,
     fs_fault_pair: [2]std.posix.fd_t,
     pack_fd: std.posix.fd_t,
@@ -2298,7 +2355,7 @@ const WorkerInitTableFixture = struct {
     /// Descriptors every WorkerInit carries ahead of its egress descriptors.
     const base_fd_count: usize = 7;
     /// Descriptors of a WorkerInit with a boot token, which carries the
-    /// session's whole half; the route's pack comes after them.
+    /// session's whole half; the definition's pack comes after them.
     const attached_fd_count: usize = base_fd_count + ipc.egress_shared.shared_fd_count + 2;
     /// Descriptors of a WorkerInit without a boot token: the same table
     /// without the session's regions, its wake descriptors kept.
@@ -2324,8 +2381,8 @@ const WorkerInitTableFixture = struct {
         errdefer std.posix.close(self.ingress_payload_credit_eventfd);
         self.tmp_root = std.testing.tmpDir(.{});
         errdefer self.tmp_root.cleanup();
-        self.route_bindings_fd = try createRouteBindingsMemfd();
-        errdefer std.posix.close(self.route_bindings_fd);
+        self.route_table = try createRouteTable();
+        errdefer self.route_table.close();
         self.fs_index_fd = try ipc.zygote_worker.createPlaceholderFsIndexMemfd();
         errdefer std.posix.close(self.fs_index_fd);
         self.fs_fault_pair = try fd_mod.socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
@@ -2339,7 +2396,7 @@ const WorkerInitTableFixture = struct {
         std.posix.close(self.pack_fd);
         closePair(self.fs_fault_pair);
         std.posix.close(self.fs_index_fd);
-        std.posix.close(self.route_bindings_fd);
+        self.route_table.close();
         self.tmp_root.cleanup();
         std.posix.close(self.ingress_payload_credit_eventfd);
         std.posix.close(self.ingress_payload_fd);
@@ -2373,7 +2430,7 @@ const WorkerInitTableFixture = struct {
         fds[3] = self.ingress_payload_credit_eventfd;
         fds[4] = self.tmp_root.dir.fd;
         fds[5] = self.tmp_root.dir.fd;
-        fds[6] = self.route_bindings_fd;
+        fds[6] = self.route_table.fd;
         const egress_fds = self.attachedHalf().asArray();
         @memcpy(fds[base_fd_count..][0..ipc.egress_shared.shared_fd_count], &egress_fds);
         fds[attached_fd_count - 2] = self.fs_index_fd;
@@ -2397,14 +2454,15 @@ const WorkerInitTableFixture = struct {
     }
 
     /// Sends `message` through the sender a host uses, with `half` as its
-    /// egress descriptors and the fixture's files for every other one.
+    /// egress descriptors, `module_pack_fd` as its pack and the fixture's
+    /// files for every other one.
     fn send(
         self: *WorkerInitTableFixture,
         message: *const WorkerInit,
         half: ipc.egress_shared.RawFds,
-        route_entry: ?ipc.zygote_worker.RouteEntryInit,
+        module_pack_fd: ?std.posix.fd_t,
     ) !void {
-        try ipc.sendWorkerInitWithRouteBindingsAndEgressShared(
+        try ipc.sendWorkerInitWithRouteTableAndEgressShared(
             self.control_pair[0],
             message,
             self.metrics_pair[1],
@@ -2413,30 +2471,22 @@ const WorkerInitTableFixture = struct {
             self.ingress_payload_credit_eventfd,
             self.tmp_root.dir.fd,
             self.tmp_root.dir.fd,
-            self.route_bindings_fd,
+            self.route_table.fd,
             half,
-            route_entry,
             self.fs_index_fd,
             self.fs_fault_pair[1],
+            module_pack_fd,
         );
     }
 
-    /// Sends `message` followed by `specifier` by hand, with `fds` as the
-    /// table, so the table can disagree with the message.
+    /// Sends `message` by hand, with `fds` as the table, so the table can
+    /// disagree with the message.
     fn sendRaw(
         self: *WorkerInitTableFixture,
         message: WorkerInit,
-        specifier: []const u8,
         fds: []const std.posix.fd_t,
     ) !void {
-        var packet_bytes: [@sizeOf(WorkerInit) + 64]u8 = undefined;
-        @memcpy(packet_bytes[0..@sizeOf(WorkerInit)], std.mem.asBytes(&message));
-        @memcpy(packet_bytes[@sizeOf(WorkerInit)..][0..specifier.len], specifier);
-        try ipc.packet.sendWithFds(
-            self.control_pair[0],
-            packet_bytes[0 .. @sizeOf(WorkerInit) + specifier.len],
-            fds,
-        );
+        try ipc.packet.sendWithFds(self.control_pair[0], std.mem.asBytes(&message), fds);
     }
 
     fn closePair(pair: [2]std.posix.fd_t) void {
@@ -2481,7 +2531,16 @@ fn expectSameFiles(sent: []const std.posix.fd_t, received: []const std.posix.fd_
     }
 }
 
-test "an attached worker init carries the egress half beside its boot token and the route's pack last" {
+/// `message` set to serve the fixture's one-route table, as a host sets it
+/// for a launch with routes.
+fn servingRoutes(message: WorkerInit, fixture: *const WorkerInitTableFixture) WorkerInit {
+    var serving = message;
+    serving.flags |= WorkerInit.flag_serves_routes;
+    serving.route_table_len = fixture.route_table.blob_len;
+    return serving;
+}
+
+test "an attached worker init carries the egress half beside its boot token and the definition's pack last" {
     var fixture: WorkerInitTableFixture = undefined;
     try fixture.init();
     defer fixture.deinit();
@@ -2490,12 +2549,8 @@ test "an attached worker init carries the egress half beside its boot token and 
     init.enableEgressGatewaySandbox();
     const boot_token = bootTokenBytes();
     init.boot_egress_token = boot_token;
-    const entry = "/__collo_route/demo/entry.js";
-    const route_entry: ipc.zygote_worker.RouteEntryInit = .{
-        .fd = fixture.pack_fd,
-        .specifier = entry,
-    };
-    try fixture.send(&init, fixture.attachedHalf(), route_entry);
+    init = servingRoutes(init, &fixture);
+    try fixture.send(&init, fixture.attachedHalf(), fixture.pack_fd);
 
     var received = try recvWorkerInit(fixture.control_pair[1]);
     defer received.deinit();
@@ -2511,13 +2566,14 @@ test "an attached worker init carries the egress half beside its boot token and 
     try std.testing.expectEqual(@as(usize, 0), taken_again.regionCount());
     try std.testing.expect(!taken_again.wakeFds().isValid());
 
-    try std.testing.expectEqualStrings(entry, received.routeEntrySpecifier());
-    const pack_fd = received.takeRouteEntryFd() orelse return error.MissingRouteEntryFd;
+    // The route table and the pack are new descriptors of the files sent.
+    try expectSameFiles(&.{fixture.route_table.fd}, &.{received.route_table_fd});
+    const pack_fd = received.takeModulePackFd() orelse return error.MissingModulePackFd;
     defer std.posix.close(pack_fd);
     var buffer: [16]u8 = undefined;
     const read_len = try std.posix.pread(pack_fd, &buffer, 0);
     try std.testing.expectEqualStrings("pack-bytes", buffer[0..read_len]);
-    try std.testing.expect(received.takeRouteEntryFd() == null);
+    try std.testing.expect(received.takeModulePackFd() == null);
 }
 
 test "a detached worker init carries its wake descriptors and neither a region nor a boot token" {
@@ -2537,7 +2593,7 @@ test "a detached worker init carries its wake descriptors and neither a region n
     try std.testing.expectEqual(@as(usize, 0), wake.regionCount());
     try std.testing.expect(wake.wakeFds().isValid());
     try expectSameEgressFiles(fixture.detachedHalf(), wake);
-    try std.testing.expect(received.route_entry_fd == null);
+    try std.testing.expect(received.module_pack_fd == null);
     // The fs pair follows the wake descriptors.
     const fs_index_fd = received.takeFsIndexFd();
     defer std.posix.close(fs_index_fd);
@@ -2550,25 +2606,64 @@ test "a detached worker init carries its wake descriptors and neither a region n
     try std.testing.expectEqualStrings("fault", buffer[0..read_len]);
 }
 
-test "a detached worker init carries the route's pack right after the fs pair" {
+test "a detached worker init carries the definition's pack right after the fs pair" {
     var fixture: WorkerInitTableFixture = undefined;
     try fixture.init();
     defer fixture.deinit();
 
     var init = try WorkerInit.init(64, ipc.WorkerRuntimeBootOptions.default());
     init.enableEgressGatewaySandbox();
-    const entry = "/__collo_route/demo/entry.js";
-    try fixture.send(&init, fixture.detachedHalf(), .{ .fd = fixture.pack_fd, .specifier = entry });
+    init = servingRoutes(init, &fixture);
+    init.flags |= WorkerInit.flag_isolate_realm;
+    try fixture.send(&init, fixture.detachedHalf(), fixture.pack_fd);
 
     var received = try recvWorkerInit(fixture.control_pair[1]);
     defer received.deinit();
     try std.testing.expectEqual(@as(usize, 0), received.egress_shared_fds.regionCount());
-    try std.testing.expectEqualStrings(entry, received.routeEntrySpecifier());
-    const pack_fd = received.takeRouteEntryFd() orelse return error.MissingRouteEntryFd;
+    try std.testing.expect(received.message.isolatesRealms());
+    try std.testing.expectEqual(fixture.route_table.blob_len, received.message.route_table_len);
+    const pack_fd = received.takeModulePackFd() orelse return error.MissingModulePackFd;
     defer std.posix.close(pack_fd);
     var buffer: [16]u8 = undefined;
     const read_len = try std.posix.pread(pack_fd, &buffer, 0);
     try std.testing.expectEqualStrings("pack-bytes", buffer[0..read_len]);
+}
+
+test "the host's sender refuses a pack the message does not announce, and the flag without a pack or a route" {
+    var fixture: WorkerInitTableFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+
+    var plain = try WorkerInit.init(64, ipc.WorkerRuntimeBootOptions.default());
+    plain.enableEgressGatewaySandbox();
+    const serving = servingRoutes(plain, &fixture);
+    var routeless = serving;
+    routeless.route_table_len = ipc.route_table.empty_blob.len;
+    try std.testing.expectError(error.InvalidWorkerInit, fixture.send(&plain, fixture.detachedHalf(), fixture.pack_fd));
+    try std.testing.expectError(error.InvalidWorkerInit, fixture.send(&serving, fixture.detachedHalf(), null));
+    try std.testing.expectError(error.InvalidWorkerInit, fixture.send(&serving, fixture.detachedHalf(), -1));
+    try std.testing.expectError(error.InvalidWorkerInit, fixture.send(&routeless, fixture.detachedHalf(), fixture.pack_fd));
+    try std.testing.expectError(error.WouldBlock, recvWorkerInit(fixture.control_pair[1]));
+}
+
+test "the receiver refuses a WorkerInit packet longer or shorter than the struct" {
+    var fixture: WorkerInitTableFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    var message = try WorkerInit.init(64, ipc.WorkerRuntimeBootOptions.default());
+    message.enableEgressGatewaySandbox();
+    const table = fixture.detachedTable();
+    const fds = table[0..WorkerInitTableFixture.detached_fd_count];
+
+    var longer: [@sizeOf(WorkerInit) + 1]u8 = undefined;
+    @memcpy(longer[0..@sizeOf(WorkerInit)], std.mem.asBytes(&message));
+    longer[@sizeOf(WorkerInit)] = 'x';
+    const open_before = try openFdCount();
+    try ipc.packet.sendWithFds(fixture.control_pair[0], &longer, fds);
+    try std.testing.expectError(error.TruncatedMessage, recvWorkerInit(fixture.control_pair[1]));
+    try ipc.packet.sendWithFds(fixture.control_pair[0], longer[0 .. @sizeOf(WorkerInit) - 1], fds);
+    try std.testing.expectError(error.ShortRead, recvWorkerInit(fixture.control_pair[1]));
+    try std.testing.expectEqual(open_before, try openFdCount());
 }
 
 test "both senders refuse regions without a boot token, a token without regions and an incomplete set" {
@@ -2638,19 +2733,19 @@ test "the receiver reads the descriptor table the boot token announces" {
     const detached_cases = [_]TableCase{
         .{ .name = "no tmp root", .fd_count = 4, .expected = error.MissingTmpRootFd },
         .{ .name = "no cgroup dir", .fd_count = 5, .expected = error.MissingCgroupDirFd },
-        .{ .name = "no bindings", .fd_count = base - 1, .expected = error.MissingRouteBindingsFd },
+        .{ .name = "no route table", .fd_count = base - 1, .expected = error.MissingRouteTableFd },
         .{ .name = "wake cut", .fd_count = base + wake - 2, .expected = error.MissingEgressSharedFd },
         .{ .name = "no fs index", .fd_count = base + wake, .expected = error.MissingFsIndexFd },
         .{ .name = "no fs fault", .fd_count = base + wake + 1, .expected = error.MissingFsFaultFd },
         .{ .name = "whole", .fd_count = detached, .expected = null },
-        .{ .name = "pack, no entry", .fd_count = detached + 1, .expected = error.InvalidFdCount },
+        .{ .name = "pack, no flag", .fd_count = detached + 1, .expected = error.InvalidFdCount },
         .{
-            .name = "entry, no pack",
-            .route_entry = true,
+            .name = "flag, no pack",
+            .serves_routes = true,
             .fd_count = detached,
-            .expected = error.MissingRouteEntryFd,
+            .expected = error.MissingModulePackFd,
         },
-        .{ .name = "entry and pack", .route_entry = true, .fd_count = detached + 1, .expected = null },
+        .{ .name = "flag and pack", .serves_routes = true, .fd_count = detached + 1, .expected = null },
     };
     for (detached_cases) |case|
         try expectTableReceived(&fixture, false, &detached_table, case);
@@ -2660,14 +2755,14 @@ test "the receiver reads the descriptor table the boot token announces" {
         .{ .name = "no fs index", .fd_count = attached - 2, .expected = error.MissingFsIndexFd },
         .{ .name = "no fs fault", .fd_count = attached - 1, .expected = error.MissingFsFaultFd },
         .{ .name = "whole", .fd_count = attached, .expected = null },
-        .{ .name = "pack, no entry", .fd_count = attached + 1, .expected = error.InvalidFdCount },
+        .{ .name = "pack, no flag", .fd_count = attached + 1, .expected = error.InvalidFdCount },
         .{
-            .name = "entry, no pack",
-            .route_entry = true,
+            .name = "flag, no pack",
+            .serves_routes = true,
             .fd_count = attached,
-            .expected = error.MissingRouteEntryFd,
+            .expected = error.MissingModulePackFd,
         },
-        .{ .name = "entry and pack", .route_entry = true, .fd_count = attached + 1, .expected = null },
+        .{ .name = "flag and pack", .serves_routes = true, .fd_count = attached + 1, .expected = null },
     };
     for (attached_cases) |case|
         try expectTableReceived(&fixture, true, &attached_table, case);
@@ -2688,7 +2783,8 @@ test "the receiver reads the descriptor table the boot token announces" {
 /// One hand-built WorkerInit table and what `recvWorkerInit` makes of it.
 const TableCase = struct {
     name: []const u8,
-    route_entry: bool = false,
+    /// The message sets `flag_serves_routes`, which announces the pack.
+    serves_routes: bool = false,
     /// Descriptors sent, a prefix of the table the case is run with.
     fd_count: usize,
     /// Null for a table the receiver takes.
@@ -2711,11 +2807,11 @@ fn expectTableReceived(
     message.enableEgressGatewaySandbox();
     if (token)
         message.boot_egress_token = bootTokenBytes();
-    const specifier: []const u8 = if (case.route_entry) "a.js" else "";
-    message.route_entry_specifier_len = @intCast(specifier.len);
+    if (case.serves_routes)
+        message = servingRoutes(message, fixture);
 
     const open_before = try openFdCount();
-    try fixture.sendRaw(message, specifier, table[0..case.fd_count]);
+    try fixture.sendRaw(message, table[0..case.fd_count]);
     if (case.expected) |expected| {
         try std.testing.expectError(expected, recvWorkerInit(fixture.control_pair[1]));
     } else {
@@ -2724,7 +2820,7 @@ fn expectTableReceived(
         try std.testing.expect(received.egress_shared_fds.wakeFds().isValid());
         const regions: usize = if (token) ipc.egress_shared.region_fd_count else 0;
         try std.testing.expectEqual(regions, received.egress_shared_fds.regionCount());
-        try std.testing.expectEqual(case.route_entry, received.route_entry_fd != null);
+        try std.testing.expectEqual(case.serves_routes, received.module_pack_fd != null);
     }
     try std.testing.expectEqual(open_before, try openFdCount());
 }
@@ -4212,7 +4308,7 @@ test "module pack deploy scope holds only route keys of one worker segment" {
     try std.testing.expectError(error.InvalidModuleSpecifier, module_pack.validateSameDeployScopedPack(parsed, "/loose-entry.js"));
 
     // A valid key under any other prefix belongs to no worker's scope, so a
-    // pack holding one fails the check that every route's pack passes.
+    // pack holding one fails the check that every definition's pack passes.
     const loose = try module_pack.buildAlloc(std.testing.allocator, &.{
         .{ .specifier = "/__collo_route/demo/entry.js", .source = "import value from '/elsewhere/demo/dep.js'; export default value;" },
         .{ .specifier = "/elsewhere/demo/dep.js", .source = "export default 1;" },
@@ -4342,13 +4438,19 @@ test "worker init starts with every optional authority absent and bounds tmpfs b
     // `messages.zig` pins the offsets beside this size, so a field added or
     // removed has to update both.
     try std.testing.expectEqual(@as(usize, 184), @sizeOf(ipc.WorkerInit));
+    try expectOffset(ipc.WorkerInit, "route_table_len", 24);
+    try expectOffset(ipc.WorkerInit, "cpu_max_cores", 32);
+    try expectOffset(ipc.WorkerInit, "_reserved0", 36);
     try expectOffset(ipc.WorkerInit, "boot_egress_token", 40);
     try expectOffset(ipc.WorkerInit, "init_deadline_mono_ns", 96);
     try expectOffset(ipc.WorkerInit, "runtime", 104);
-    // No boot token, no route serving, and no init deadline: `validate`
-    // refuses a zero deadline, so every sender sets one explicitly.
+    // No boot token, the empty route table, no route serving, and no init
+    // deadline: `validate` refuses a zero deadline, so every sender sets one
+    // explicitly.
     try std.testing.expect(egress_token.isNone(&message.boot_egress_token));
+    try std.testing.expectEqual(@as(u64, ipc.route_table.empty_blob.len), message.route_table_len);
     try std.testing.expect(!message.servesRoutes());
+    try std.testing.expect(!message.isolatesRealms());
     try std.testing.expectEqual(@as(u64, 0), message.init_deadline_mono_ns);
 
     message.tmpfs_size_bytes = 0;
@@ -4358,17 +4460,39 @@ test "worker init starts with every optional authority absent and bounds tmpfs b
     try std.testing.expectError(error.InvalidWorkerInitFlags, message.validate());
 }
 
-test "worker init serves routes only with a route entry and refuses an unknown flag" {
+test "worker init serves routes exactly when its route table holds one, takes a realm mode only with routes, and refuses an unknown flag or a reserved byte" {
     var message = try ipc.WorkerInit.init(1024, ipc.WorkerRuntimeBootOptions.default());
     message.init_deadline_mono_ns = 1;
+    try message.validate();
     message.flags |= ipc.WorkerInit.flag_serves_routes;
     try std.testing.expect(message.servesRoutes());
-    // Without a route entry nothing would close the boot context the flag
-    // installs.
+    // The empty table holds no route, and nothing would close the boot
+    // context the flag installs.
     try std.testing.expectError(error.InvalidWorkerInitFlags, message.validate());
 
-    message.route_entry_specifier_len = 4;
+    // Any table that holds a route is longer than the empty one.
+    message.route_table_len = ipc.route_table.empty_blob.len + 1;
     try message.validate();
+    message.flags |= ipc.WorkerInit.flag_isolate_realm;
+    try message.validate();
+    try std.testing.expect(message.isolatesRealms());
+
+    // Routes without the flag would arrive without their pack.
+    message.flags &= ~ipc.WorkerInit.flag_serves_routes;
+    try std.testing.expectError(error.InvalidWorkerInitFlags, message.validate());
+    // A realm mode means nothing to a worker that serves no route.
+    message.route_table_len = ipc.route_table.empty_blob.len;
+    try std.testing.expectError(error.InvalidWorkerInitFlags, message.validate());
+    message.flags |= ipc.WorkerInit.flag_serves_routes;
+
+    message.route_table_len = ipc.route_table.bytes_max + 1;
+    try std.testing.expectError(error.InvalidWorkerInitFlags, message.validate());
+    message.route_table_len = ipc.route_table.bytes_max;
+    try message.validate();
+
+    message._reserved0 = 1;
+    try std.testing.expectError(error.InvalidWorkerInitFlags, message.validate());
+    message._reserved0 = 0;
 
     message.flags |= 1 << 31;
     try std.testing.expectError(error.InvalidWorkerInitFlags, message.validate());

@@ -2,10 +2,14 @@
 // registered key, refuses every other key as a module not found, and evaluates modules for the host. Runs on the VM
 // thread with the JSC API lock held.
 //
-// A pack arrives as a mapping of a sealed memfd that every worker of a route maps. Registration checks every offset
-// before reading through it and changes no state until the whole pack is accepted; afterwards the SourceProviders
-// read the mapping in place, and it is released when the last of them dies, or on return when none kept it. The
-// pack layout and specifier hash are defined in common/ipc/module_pack.zig, and the copies here must match that file.
+// Sources belong to the VM and every realm fetches from them, while each realm's JSC module registry holds its own
+// module records: a module evaluates once per realm that imports it, with top-level state of its own there.
+//
+// A pack arrives as a mapping of a sealed memfd that every worker of a definition maps. Registration checks every
+// offset before reading through it and changes no state until the whole pack is accepted; afterwards the
+// SourceProviders read the mapping in place, and it is released when the last of them dies, or on return when none
+// kept it. The pack layout and specifier hash are defined in common/ipc/module_pack.zig, and the copies here must
+// match that file.
 
 #include "jsc/runtime/state.h"
 
@@ -572,7 +576,7 @@ private:
 class ColloModulePackData final : public WTF::ThreadSafeRefCounted<ColloModulePackData> {
 public:
     // Takes over the pack's mapping. The memfd behind it is sealed against
-    // writes and resizes and every worker of a route maps the same one, so
+    // writes and resizes and every worker of a definition maps the same one, so
     // these pages are shared page cache, not per-worker heap. The mapping ends
     // with this object, when the last SourceProvider pointing into it drops
     // its reference, on whatever thread that happens. On allocation failure
@@ -1135,8 +1139,10 @@ bool evictModuleSourceLocked(ColloVm* vm, const WTF::String& specifier, ColloMod
     if (outStats)
         ++outStats->sources_removed;
 
-    if (vm->module_namespaces.remove(specifier) && outStats)
-        ++outStats->namespaces_removed;
+    for (auto& realm : vm->realms) {
+        if (realm->module_namespaces.remove(specifier) && outStats)
+            ++outStats->namespaces_removed;
+    }
     return true;
 }
 
@@ -1257,8 +1263,9 @@ WTF::String resolveRegisteredSpecifier(ColloVm& vm, const WTF::String& specifier
 }
 
 // Fires from a promise reaction during a microtask drain. Its only action is the notification to Zig, which enqueues
-// work there, so no JS runs here. host_runtime is read when the reaction fires because worker teardown nulls it, and
-// settling an evaluation nobody can own any more is a no-op rather than an error.
+// work there, so no JS runs here. The function belongs to the evaluating realm, so its global names the realm the
+// report carries. host_runtime is read when the reaction fires because worker teardown nulls it, and settling an
+// evaluation nobody can own any more is a no-op rather than an error.
 static JSC::EncodedJSValue notifyModuleEvalSettled(
     JSC::JSGlobalObject* global_object, const WTF::String& specifier, bool resolved)
 {
@@ -1270,39 +1277,43 @@ static JSC::EncodedJSValue notifyModuleEvalSettled(
         return JSC::JSValue::encode(JSC::jsUndefined());
     WTF::CString specifier_utf8 = specifier.utf8();
     ColloString specifier_string { reinterpret_cast<const uint8_t*>(specifier_utf8.data()), specifier_utf8.length() };
-    collo_runtime_module_eval_settled(host_runtime, specifier_string, resolved ? 1 : 0);
+    collo_runtime_module_eval_settled(host_runtime, collo_global->realm().index, specifier_string, resolved ? 1 : 0);
     return JSC::JSValue::encode(JSC::jsUndefined());
 }
 
-static JSC::JSNativeStdFunction* moduleEvalSettlementFunction(ColloVm& vm, const WTF::String& specifier, bool resolved)
+static JSC::JSNativeStdFunction* moduleEvalSettlementFunction(
+    ColloRealm& realm, const WTF::String& specifier, bool resolved)
 {
-    return JSC::JSNativeStdFunction::create(*vm.vm, vm.global_object, 1,
+    return JSC::JSNativeStdFunction::create(*realm.vm->vm, realm.global_object, 1,
         resolved ? "ColloModuleEvalSettledResolve"_s : "ColloModuleEvalSettledReject"_s,
         [specifier, resolved](JSC::JSGlobalObject* global_object, JSC::CallFrame*) -> JSC::EncodedJSValue {
             return notifyModuleEvalSettled(global_object, specifier, resolved);
         });
 }
 
-static ColloStatus registerModuleEvalSettlement(ColloVm* vm, JSC::JSPromise* promise, const WTF::String& specifier)
+static ColloStatus registerModuleEvalSettlement(
+    ColloRealm* realm, JSC::JSPromise* promise, const WTF::String& specifier)
 {
-    auto scope = DECLARE_TOP_EXCEPTION_SCOPE(*vm->vm);
-    auto* resolve_function = moduleEvalSettlementFunction(*vm, specifier, true);
-    auto* reject_function = moduleEvalSettlementFunction(*vm, specifier, false);
+    JSC::VM& jsc_vm = *realm->vm->vm;
+    auto scope = DECLARE_TOP_EXCEPTION_SCOPE(jsc_vm);
+    auto* resolve_function = moduleEvalSettlementFunction(*realm, specifier, true);
+    auto* reject_function = moduleEvalSettlementFunction(*realm, specifier, false);
     if (!resolve_function || !reject_function)
         return COLLO_STATUS_OUT_OF_MEMORY;
-    promise->performPromiseThen(*vm->vm, vm->global_object, resolve_function, reject_function, JSC::jsUndefined());
+    promise->performPromiseThen(jsc_vm, realm->global_object, resolve_function, reject_function, JSC::jsUndefined());
     if (scope.exception()) {
-        scope.clearException();
+        scope.clearExceptionExceptTermination();
         return COLLO_STATUS_ERROR;
     }
     return COLLO_STATUS_OK;
 }
 
-ColloStatus awaitModulePromiseSync(ColloVm* vm, JSC::JSPromise* promise, JSC::JSValue* out_value,
+ColloStatus awaitModulePromiseSync(ColloRealm* realm, JSC::JSPromise* promise, JSC::JSValue* out_value,
     const WTF::String* settlement_specifier, ColloValue** out_exception)
 {
-    if (!vm || !vm->isReady() || !promise || !out_value)
+    if (!realmIsReady(realm) || !promise || !out_value)
         return COLLO_STATUS_INVALID_ARGUMENT;
+    ColloVm* vm = realm->vm;
     if (vm->entered_count || vm->current_exec_ctx)
         return COLLO_STATUS_INVALID_ARGUMENT;
 
@@ -1346,53 +1357,58 @@ ColloStatus awaitModulePromiseSync(ColloVm* vm, JSC::JSPromise* promise, JSC::JS
     // treats as fatal. The get_export path keeps the synchronous contract and fails closed.
     if (settlement_specifier) {
         if (vm->host_runtime.load(std::memory_order_acquire) != nullptr) {
-            ColloStatus settlement_status = registerModuleEvalSettlement(vm, promise, *settlement_specifier);
+            ColloStatus settlement_status = registerModuleEvalSettlement(realm, promise, *settlement_specifier);
             if (settlement_status != COLLO_STATUS_OK)
                 return statusOr(
-                    setInternalError(vm, "Failed to register module evaluation settlement."_s, out_exception),
+                    setInternalError(realm, "Failed to register module evaluation settlement."_s, out_exception),
                     settlement_status);
         }
         return COLLO_STATUS_PENDING;
     }
 
     return statusOr(
-        setInternalError(vm,
+        setInternalError(realm,
             "Module evaluation did not settle within the synchronous loader drain budget; asynchronous module evaluation remains unsupported."_s,
             out_exception),
         COLLO_STATUS_UNSUPPORTED);
 }
 
-ColloStatus ensureModuleNamespace(ColloVm* vm, const WTF::String& specifier, JSC::JSValue* out_namespace,
+ColloStatus ensureModuleNamespace(ColloRealm* realm, const WTF::String& specifier, JSC::JSValue* out_namespace,
     const WTF::String* settlement_specifier, ColloValue** out_exception)
 {
-    if (!vm || !vm->isReady() || !out_namespace)
+    if (!realmIsReady(realm) || !out_namespace)
         return COLLO_STATUS_INVALID_ARGUMENT;
 
     clearOutException(out_exception);
 
-    if (auto it = vm->module_namespaces.find(specifier); it != vm->module_namespaces.end()) {
+    if (auto it = realm->module_namespaces.find(specifier); it != realm->module_namespaces.end()) {
         *out_namespace = it->value.get();
         return COLLO_STATUS_OK;
     }
 
+    ColloVm* vm = realm->vm;
     auto scope = DECLARE_TOP_EXCEPTION_SCOPE(*vm->vm);
     JSC::Identifier identifier = JSC::Identifier::fromString(*vm->vm, specifier);
     // No referrer: this import is issued by the host, not by a module.
-    auto* promise = JSC::importModule(vm->global_object, identifier, JSC::Identifier(), nullptr, nullptr);
+    auto* promise = JSC::importModule(realm->global_object, identifier, JSC::Identifier(), nullptr, nullptr);
     if (scope.exception())
         return caughtExceptionStatus(vm, scope, out_exception);
+    // setInternalError reports OK once it stored the error, and these failures are the module's: the caller sees a
+    // thrown Error, as for one the module threw.
     if (!promise)
-        return setInternalError(vm, "Module import did not produce a promise."_s, out_exception);
+        return statusOr(setInternalError(realm, "Module import did not produce a promise."_s, out_exception),
+            COLLO_STATUS_JS_EXCEPTION);
 
     JSC::JSValue namespace_value = JSC::jsUndefined();
-    ColloStatus status = awaitModulePromiseSync(vm, promise, &namespace_value, settlement_specifier, out_exception);
+    ColloStatus status = awaitModulePromiseSync(realm, promise, &namespace_value, settlement_specifier, out_exception);
     if (status != COLLO_STATUS_OK)
         return status;
 
     if (!namespace_value.isObject())
-        return setInternalError(vm, "Module namespace is not an object."_s, out_exception);
+        return statusOr(setInternalError(realm, "Module namespace is not an object."_s, out_exception),
+            COLLO_STATUS_JS_EXCEPTION);
 
-    vm->module_namespaces.set(specifier, JSC::Strong<JSC::Unknown>(*vm->vm, namespace_value));
+    realm->module_namespaces.set(specifier, JSC::Strong<JSC::Unknown>(*vm->vm, namespace_value));
     *out_namespace = namespace_value;
     return COLLO_STATUS_OK;
 }
@@ -1576,11 +1592,11 @@ extern "C" ColloStatus collo_module_evict_lifetime(
     return evictModuleLifetimeLocked(vm, lifetime, out_stats);
 }
 
-extern "C" ColloStatus collo_module_evaluate(ColloVm* vm, ColloString specifier, ColloValue** out_exception)
+extern "C" ColloStatus collo_module_evaluate(ColloRealm* realm, ColloString specifier, ColloValue** out_exception)
 {
     Collo::clearOutException(out_exception);
 
-    if (!vm || !vm->isReady())
+    if (!realmIsReady(realm))
         return COLLO_STATUS_INVALID_ARGUMENT;
 
     // The settlement callback reports the specifier as the caller spelled it rather than its canonical form: the Zig
@@ -1594,19 +1610,19 @@ extern "C" ColloStatus collo_module_evaluate(ColloVm* vm, ColloString specifier,
     if (requireCanonicalSpecifier(specifier, {}, specifier_string) != COLLO_STATUS_OK)
         return COLLO_STATUS_INVALID_ARGUMENT;
 
-    JSC::JSLockHolder locker(*vm->vm);
+    JSC::JSLockHolder locker(*realm->vm->vm);
     JSC::JSValue ignored = JSC::jsUndefined();
-    return Collo::ensureModuleNamespace(vm, specifier_string, &ignored, &caller_specifier, out_exception);
+    return Collo::ensureModuleNamespace(realm, specifier_string, &ignored, &caller_specifier, out_exception);
 }
 
-extern "C" ColloStatus collo_module_get_export(
-    ColloVm* vm, ColloString specifier, ColloString export_name, ColloValue** out_value, ColloValue** out_exception)
+extern "C" ColloStatus collo_module_get_export(ColloRealm* realm, ColloString specifier, ColloString export_name,
+    ColloValue** out_value, ColloValue** out_exception)
 {
     if (out_value)
         *out_value = nullptr;
     Collo::clearOutException(out_exception);
 
-    if (!vm || !vm->isReady() || !out_value)
+    if (!realmIsReady(realm) || !out_value)
         return COLLO_STATUS_INVALID_ARGUMENT;
 
     WTF::String specifier_string;
@@ -1617,20 +1633,23 @@ extern "C" ColloStatus collo_module_get_export(
     if (Collo::stringToWTFString(export_name, export_string) != COLLO_STATUS_OK || export_string.isEmpty())
         return COLLO_STATUS_INVALID_ARGUMENT;
 
+    ColloVm* vm = realm->vm;
     JSC::JSLockHolder locker(*vm->vm);
 
     JSC::JSValue namespace_value = JSC::jsUndefined();
-    ColloStatus status = Collo::ensureModuleNamespace(vm, specifier_string, &namespace_value, nullptr, out_exception);
+    ColloStatus status
+        = Collo::ensureModuleNamespace(realm, specifier_string, &namespace_value, nullptr, out_exception);
     if (status != COLLO_STATUS_OK)
         return status;
 
     auto* namespace_object = dynamicDowncast<JSC::JSObject>(namespace_value);
     if (!namespace_object)
-        return Collo::setInternalError(vm, "Module namespace is not an object."_s, out_exception);
+        return Collo::statusOr(Collo::setInternalError(realm, "Module namespace is not an object."_s, out_exception),
+            COLLO_STATUS_JS_EXCEPTION);
 
     auto scope = DECLARE_TOP_EXCEPTION_SCOPE(*vm->vm);
     JSC::JSValue export_value
-        = namespace_object->get(vm->global_object, JSC::Identifier::fromString(*vm->vm, export_string));
+        = namespace_object->get(realm->global_object, JSC::Identifier::fromString(*vm->vm, export_string));
     if (scope.exception())
         return Collo::caughtExceptionStatus(vm, scope, out_exception);
 

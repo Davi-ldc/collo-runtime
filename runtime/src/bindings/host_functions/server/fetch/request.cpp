@@ -1381,17 +1381,18 @@ void installServerRequest(Collo::GlobalObject* global_object, JSC::VM& vm)
 }
 
 extern "C" ColloStatus collo_request_new(
-    ColloVm* vm, const ColloRequestInit* init, ColloValue** out_value, ColloValue** out_exception)
+    ColloRealm* realm, const ColloRequestInit* init, ColloValue** out_value, ColloValue** out_exception)
 {
     if (out_value)
         *out_value = nullptr;
     Collo::clearOutException(out_exception);
 
-    if (!vm || !vm->isReady() || !init || !out_value || init->identity.request_id == 0 || init->authority.len == 0)
+    if (!realmIsReady(realm) || !init || !out_value || init->identity.request_id == 0 || init->authority.len == 0)
         return COLLO_STATUS_INVALID_ARGUMENT;
     if ((init->headers_len != 0 && !init->headers) || (init->params_len != 0 && !init->params))
         return COLLO_STATUS_INVALID_ARGUMENT;
 
+    ColloVm* vm = realm->vm;
     JSC::JSLockHolder locker(*vm->vm);
     auto scope = DECLARE_THROW_SCOPE(*vm->vm);
 
@@ -1400,7 +1401,7 @@ extern "C" ColloStatus collo_request_new(
         return COLLO_STATUS_INVALID_ARGUMENT;
 
     auto* object = JSColloRequest::create(
-        *vm->vm, vm->global_object, WTF::move(data), PendingBody { BodyState::requestLazy(init->identity) });
+        *vm->vm, realm->global_object, WTF::move(data), PendingBody { BodyState::requestLazy(init->identity) });
     if (auto status = consumeExceptionStatus(vm, scope, out_exception); status != COLLO_STATUS_OK)
         return status;
     return Collo::makeValueHandle(vm, object, out_value);

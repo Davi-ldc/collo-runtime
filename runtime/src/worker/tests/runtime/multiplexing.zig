@@ -55,7 +55,7 @@ test "a continuation resumed by another request keeps its own identity" {
     try runtime.attachHostRuntime();
 
     const specifier = "/__collo_route/demo/multiplexing-identity.js";
-    try rt.registerRoute(&runtime, specifier,
+    const route_index = try rt.registerRoute(&runtime, specifier,
         \\let release;
         \\const shared = new Promise((resolve) => { release = resolve; });
         \\
@@ -78,7 +78,7 @@ test "a continuation resumed by another request keeps its own identity" {
     // A: parks on the module-scope promise and stays alive.
     var waiter = try rt.initDispatchWork(std.testing.allocator, .{
         .request_id = waiter_id,
-        .route_entry_specifier = specifier,
+        .route_index = route_index,
         .request = .{ .path = "/wait" },
     });
     defer waiter.deinit();
@@ -89,7 +89,7 @@ test "a continuation resumed by another request keeps its own identity" {
     // B: resolves it while A is still alive.
     var releaser = try rt.initDispatchWork(std.testing.allocator, .{
         .request_id = releaser_id,
-        .route_entry_specifier = specifier,
+        .route_index = route_index,
         .request_slot = 1,
         .request = .{ .path = "/release" },
     });

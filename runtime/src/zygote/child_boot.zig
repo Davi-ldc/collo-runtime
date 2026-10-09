@@ -25,8 +25,8 @@
 //! - The worker's end of the control socket stops blocking right before the
 //!   filter, which lets fcntl read flags but not set them.
 //! - The filter is the last sandbox step. The first tenant code, the
-//!   evaluation of the route's entry, runs after it and before `WorkerReady`,
-//!   so a ready worker's first request needs no module work.
+//!   evaluation of every route's entry, runs after it and before
+//!   `WorkerReady`, so a ready worker's first request needs no module work.
 
 const std = @import("std");
 const bindings = @import("collo_bindings");
@@ -153,10 +153,10 @@ fn workerChildMainImpl(zygote: *state.Zygote, child_init_fd: std.posix.fd_t, rep
             error.MissingTmpRootFd,
             error.MissingCgroupDirFd,
             error.MissingCompletionEventFd,
-            error.MissingRouteBindingsFd,
+            error.MissingRouteTableFd,
             error.MissingFsIndexFd,
             error.MissingFsFaultFd,
-            error.MissingRouteEntryFd,
+            error.MissingModulePackFd,
             error.InvalidFdCount,
             => .invalid_worker_init,
             error.MissingEgressSharedFd => .missing_egress_shared_fd,
@@ -185,18 +185,19 @@ fn workerChildMainImpl(zygote: *state.Zygote, child_init_fd: std.posix.fd_t, rep
     traceEvent(trace_fd, "child.worker_init.fds_validated");
     stampBootPhase(&boot_stamps, null, .worker_init_validated);
 
-    // The route's bindings, which only the handler's `env` receives; the
-    // runtime validates the bytes (`worker/modules/route_env.zig`).
-    const mapped_route_bindings = mapRouteBindingsReadOnly(
-        received.route_bindings_fd,
-        received.message.route_bindings_blob_len,
+    // The definition's route table: each route's entry and the bindings that
+    // only that route's `env` receives. The runtime checks the bytes when it
+    // starts (`Modules.init` in `worker/runtime/modules.zig`).
+    const mapped_route_table = mapRouteTableReadOnly(
+        received.route_table_fd,
+        received.message.route_table_len,
     ) catch {
         markInitFailedIfPossible(received.metrics_fd);
         return report.fail(.invalid_worker_init);
     };
-    std.posix.close(received.takeRouteBindingsFd());
-    defer std.posix.munmap(mapped_route_bindings);
-    traceEventFmt(trace_fd, "child.route_bindings.mapped={d}", .{mapped_route_bindings.len});
+    std.posix.close(received.takeRouteTableFd());
+    defer std.posix.munmap(mapped_route_table);
+    traceEventFmt(trace_fd, "child.route_table.mapped={d}", .{mapped_route_table.len});
 
     applyWorkerEnvironmentPolicy() catch {
         markInitFailedIfPossible(received.metrics_fd);
@@ -298,8 +299,8 @@ fn workerChildMainImpl(zygote: *state.Zygote, child_init_fd: std.posix.fd_t, rep
     };
     traceEvent(trace_fd, "child.reseed");
 
-    // `process.env` is always empty: the mapped blob holds the route's
-    // bindings, which reach only the handler's `env` argument.
+    // `process.env` is always empty: the mapped table holds the routes'
+    // bindings, each of which reaches only its route's `env` argument.
     zygote.vm.installProcess() catch {
         worker_state.metrics.?.setState(.dead, .init_failed);
         return report.fail(.internal_error);
@@ -340,10 +341,8 @@ fn workerChildMainImpl(zygote: *state.Zygote, child_init_fd: std.posix.fd_t, rep
         .egress_shared_fds = &egress_shared_fds,
         // Stays mapped until after `runtime.deinit`: the deferred munmap
         // above runs after the runtime's deferred teardown below.
-        .route_bindings_blob = mapped_route_bindings,
-        // The blob belongs to the route WorkerInit carries; `received`
-        // outlives the runtime for the same reason.
-        .route_bindings_route = received.routeEntrySpecifier(),
+        .route_table = mapped_route_table,
+        .isolate_realm = received.message.isolatesRealms(),
     });
     traceEvent(trace_fd, "child.runtime_options.resolved");
 
@@ -454,10 +453,7 @@ fn workerChildMainImpl(zygote: *state.Zygote, child_init_fd: std.posix.fd_t, rep
     // timers stay denied; a failed install degrades to that state rather than
     // failing the init.
     if (received.message.servesRoutes()) {
-        if (runtime.installBootContext(
-            &received.message.boot_egress_token,
-            received.routeEntrySpecifier(),
-        )) {
+        if (runtime.installBootContext(&received.message.boot_egress_token)) {
             traceEvent(trace_fd, "child.boot_context.installed");
         } else |err| {
             std.log.err("boot context install failed; instance-scoped fetch stays denied: {s}", .{
@@ -468,12 +464,13 @@ fn workerChildMainImpl(zygote: *state.Zygote, child_init_fd: std.posix.fd_t, rep
     }
     stampBootPhase(&boot_stamps, &maybe_metrics, .boot_context_ready);
 
-    // The route's entry is registered and evaluated before ready, so a ready
-    // worker's first request needs no module work. Registration failures, the
-    // init deadline and memory exhaustion fail the init, because a published
-    // worker that received a route pack must hold it registered; how user-code
-    // failures are kept is `BootEvaluateOutcome` in `worker/modules/routes.zig`.
-    if (received.message.route_entry_specifier_len != 0) {
+    // The definition's pack is registered and every route's entry evaluated
+    // before ready, so a ready worker's first request needs no module work.
+    // Registration failures, the init deadline and memory exhaustion fail the
+    // init, because a published worker that received a pack must hold it
+    // registered; how user-code failures are kept is `bootEvaluateRoute` in
+    // `worker/modules/routes.zig`.
+    if (received.module_pack_fd) |module_pack_fd| {
         // The evaluation deadline leaves the cleanup reserve before the host's
         // init deadline, so the child can stop the VM, report the failure and
         // exit before the host kills it. Only JavaScript can be interrupted,
@@ -482,17 +479,17 @@ fn workerChildMainImpl(zygote: *state.Zygote, child_init_fd: std.posix.fd_t, rep
         const eval_deadline_mono_ns = received.message.init_deadline_mono_ns -|
             process_limits.WORKER_INIT_CLEANUP_RESERVE_NS;
 
-        // The receiver guarantees the pack descriptor whenever the specifier
-        // length is nonzero (`ipc.recvWorkerInit`).
+        // The receiver hands over the pack exactly when the message sets
+        // `flag_serves_routes` (`ipc.recvWorkerInit`), and the message was
+        // validated to carry a route table with routes in that case.
         var eval_marks: worker_runtime.BootEvalMarks = .{};
-        runtime.evaluateBootRouteEntry(
-            received.route_entry_fd.?,
-            received.routeEntrySpecifier(),
+        runtime.evaluateBootRoutes(
+            module_pack_fd,
             eval_deadline_mono_ns,
             &eval_marks,
         ) catch |err| {
             worker_state.metrics.?.setState(.dead, .init_failed);
-            std.log.err("worker boot route entry setup failed: {s}", .{@errorName(err)});
+            std.log.err("worker boot route evaluation setup failed: {s}", .{@errorName(err)});
             // A watchdog stop is reported with its own reason, and the child
             // exits on its own within the cleanup reserve
             // (`WorkerInitFailedReason.init_deadline_exceeded` says what the
@@ -503,15 +500,14 @@ fn workerChildMainImpl(zygote: *state.Zygote, child_init_fd: std.posix.fd_t, rep
             });
         };
         // The evaluation's inner marks are stamped before the closing phase so
-        // the phases read in order. A zero mark means the pack was already
-        // registered and that step did not run.
-        stampBootPhaseAt(&boot_stamps, &maybe_metrics, .route_pack_mapped, eval_marks.pack_mapped_ns);
-        stampBootPhaseAt(&boot_stamps, &maybe_metrics, .route_pack_parsed, eval_marks.pack_parsed_ns);
-        stampBootPhaseAt(&boot_stamps, &maybe_metrics, .route_pack_registered, eval_marks.pack_registered_ns);
-        traceEvent(trace_fd, "child.route_entry.evaluated");
-        stampBootPhase(&boot_stamps, &maybe_metrics, .route_entry_evaluated);
+        // the phases read in order. A zero mark means a step did not run.
+        stampBootPhaseAt(&boot_stamps, &maybe_metrics, .module_pack_mapped, eval_marks.pack_mapped_ns);
+        stampBootPhaseAt(&boot_stamps, &maybe_metrics, .module_pack_parsed, eval_marks.pack_parsed_ns);
+        stampBootPhaseAt(&boot_stamps, &maybe_metrics, .module_pack_registered, eval_marks.pack_registered_ns);
+        traceEvent(trace_fd, "child.routes.evaluated");
+        stampBootPhase(&boot_stamps, &maybe_metrics, .routes_evaluated);
     }
-    if (received.takeRouteEntryFd()) |fd|
+    if (received.takeModulePackFd()) |fd|
         std.posix.close(fd);
 
     worker_state.metrics.?.setState(.ready, .none);
@@ -579,9 +575,9 @@ fn closeUnexpectedWorkerFds(
     len += 1;
     allow[len] = received.cgroup_dir_fd;
     len += 1;
-    allow[len] = received.route_bindings_fd;
+    allow[len] = received.route_table_fd;
     len += 1;
-    if (received.route_entry_fd) |fd| {
+    if (received.module_pack_fd) |fd| {
         allow[len] = fd;
         len += 1;
     }
@@ -627,7 +623,7 @@ fn validateWorkerInitFds(received: *const ipc.WorkerInitWithFds) !void {
     try fd_mod.requireEventFd(received.ingress_payload_credit_eventfd);
     try worker_sandbox.tmp_root.validateFd(received.tmp_root_fd);
     try worker_cgroup.validateWorkerCgroupDirFd(received.cgroup_dir_fd);
-    try fd_mod.requireSeals(received.route_bindings_fd, fd_mod.memfd_readonly_seals);
+    try fd_mod.requireSeals(received.route_table_fd, fd_mod.memfd_readonly_seals);
     // The fs index is mapped and parsed only after the sandbox, in
     // fs.initWorker; checking its seals and the fault channel's socket type
     // here makes a wrong descriptor fail the handshake instead of a later
@@ -657,24 +653,24 @@ fn validateSeqpacketSocketFd(fd: std.posix.fd_t) !void {
         return error.InvalidFsFaultFd;
 }
 
-fn mapRouteBindingsReadOnly(
+fn mapRouteTableReadOnly(
     fd: std.posix.fd_t,
     len_u64: u64,
 ) ![]align(std.heap.page_size_min) const u8 {
-    if (len_u64 < ipc.route_bindings.empty_blob.len)
-        return error.InvalidRouteBindingsBlob;
-    if (len_u64 > ipc.route_bindings.bytes_max)
-        return error.InvalidRouteBindingsBlob;
+    if (len_u64 < ipc.route_table.empty_blob.len)
+        return error.InvalidRouteTable;
+    if (len_u64 > ipc.route_table.bytes_max)
+        return error.InvalidRouteTable;
     if (len_u64 > std.math.maxInt(usize))
-        return error.InvalidRouteBindingsBlob;
+        return error.InvalidRouteTable;
     const len: usize = @intCast(len_u64);
     try fd_mod.requireSeals(fd, fd_mod.memfd_readonly_seals);
     const stat = try std.posix.fstat(fd);
     if (stat.size != len)
-        return error.InvalidRouteBindingsBlob;
+        return error.InvalidRouteTable;
     // A shared mapping of a write-sealed memfd fails with EPERM while the fd
     // is open read-write, since mprotect could later break the seal. A private
-    // read-only mapping of the sealed blob shows the same bytes.
+    // read-only mapping of the sealed table shows the same bytes.
     return std.posix.mmap(
         null,
         len,
