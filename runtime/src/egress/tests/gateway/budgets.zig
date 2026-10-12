@@ -2,8 +2,9 @@
 //! token's first fetch with the token's own budget and deadline, runs out, takes refunds up to that
 //! budget and no further, and ends at its token's `request_ended`, after which the same token starts
 //! a new one; once the boot token's budget ends, the session refuses that token although its
-//! deadline has not passed; a session whose slots are all live evicts the budget with the earliest
-//! deadline, and reuses an expired slot before it evicts any. Admission, which verifies a token and
+//! deadline has not passed; a session whose request slots are all live evicts the request budget
+//! with the earliest deadline, never the boot budget, and reuses an expired slot before it evicts
+//! any. Admission, which verifies a token and
 //! checks its deadline before it takes from a budget, is covered in `worker_flow.zig`, and
 //! `request_ended` as the control socket delivers it in `control_flow.zig`. Lane:
 //! egress-gateway-test.
@@ -180,11 +181,11 @@ test "ending a request's budget leaves the boot token and the other requests alo
     try std.testing.expectEqual(Take.exhausted, session.take(kept, now_ns));
 }
 
-test "a session whose slots are all live evicts the budget with the earliest deadline" {
+test "a session whose request slots are all live evicts the request budget with the earliest deadline" {
     var session: budgets.SessionBudgets = .{};
-    // Every slot holds a spent budget. Deadlines fall as request ids rise, so the earliest
-    // deadline sits in the last slot, not the first.
-    const count = budgets.per_session_max;
+    // Every request slot holds a spent budget. Deadlines fall as request ids rise, so the
+    // earliest deadline sits in the last slot, not the first.
+    const count = budgets.per_session_max - 1;
     for (0..count) |index| {
         const fields = requestFields(.{
             .request_id = index + 1,
@@ -221,7 +222,7 @@ test "a session whose slots are all live evicts the budget with the earliest dea
 
 test "an expired slot is reused before any live budget is evicted" {
     var session: budgets.SessionBudgets = .{};
-    const count = budgets.per_session_max;
+    const count = budgets.per_session_max - 1;
     const short_lived_request_id: u64 = 6;
     for (0..count) |index| {
         const request_id = index + 1;
@@ -249,6 +250,19 @@ test "an expired slot is reused before any live budget is evicted" {
             .deadline_monotonic_ns = 1_000 + index * 10,
         });
         try std.testing.expectEqual(Take.exhausted, session.take(fields, later_ns));
+    }
+}
+
+test "request budgets churning through every slot never refill a spent boot budget" {
+    var session: budgets.SessionBudgets = .{};
+    // The boot budget has the earliest deadline, so an eviction that considered it would pick it.
+    const boot = bootFields(100);
+    try std.testing.expectEqual(Take.taken, session.take(boot, now_ns));
+    try std.testing.expectEqual(Take.taken, session.take(boot, now_ns));
+    for (0..2 * budgets.per_session_max) |index| {
+        const request = requestFields(.{ .request_id = index + 1, .budget = 1 });
+        try std.testing.expectEqual(Take.taken, session.take(request, now_ns));
+        try std.testing.expectEqual(Take.exhausted, session.take(boot, now_ns));
     }
 }
 

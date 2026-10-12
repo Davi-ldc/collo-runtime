@@ -1266,11 +1266,28 @@ pub const StubWorker = struct {
         self.control = -1;
     }
 
+    /// Reads the next request packet, validating and consuming cumulative
+    /// response notifications that arrived before it.
+    fn nextRequestPacket(self: *StubWorker) !ipc.ReceivedPacket {
+        for (0..1024) |_| {
+            var packet = try ipc.recvPacketWithFdsScratch(self.harness.gpa, self.control, self.recv_scratch);
+            if (packet.bytes.len >= @sizeOf(u32) and
+                ipc.packet.readStruct(u32, packet.bytes[0..4]) == @intFromEnum(ipc.MessageKind.response_credit))
+            {
+                defer packet.deinit();
+                _ = try ipc.response_credit.decode(&packet);
+                continue;
+            }
+            return packet;
+        }
+        return error.TooManyCreditNotifications;
+    }
+
     /// Reads the request descriptor the lane sent and the DispatchWork it
     /// carries.
     pub fn readRequestBegin(self: *StubWorker) !Dispatched {
         const gpa = self.harness.gpa;
-        var packet = try ipc.recvPacketWithFdsScratch(gpa, self.control, self.recv_scratch);
+        var packet = try self.nextRequestPacket();
         var received = try ingress_channel.decodeReceivedPacket(gpa, &packet);
         defer received.deinit();
         const descriptor = received.descriptor;
@@ -1310,7 +1327,7 @@ pub const StubWorker = struct {
             .server_to_worker_credit_eventfd = self.record.handle.completion_eventfd,
         };
         while (true) {
-            var packet = ipc.recvPacketWithFdsScratch(gpa, self.control, self.recv_scratch) catch |err| switch (err) {
+            var packet = self.nextRequestPacket() catch |err| switch (err) {
                 error.WouldBlock => return,
                 else => return err,
             };
@@ -1362,6 +1379,14 @@ pub const StubWorker = struct {
     /// A response chunk riding inline, at most `shared_payload_threshold`
     /// bytes.
     pub fn sendChunk(self: *StubWorker, request: Dispatched, body: []const u8, end_stream: bool) !void {
+        if (body.len == 0 and end_stream) {
+            try ingress_channel.sendDescriptor(
+                self.control,
+                ingress_channel.Descriptor.responseEnd(request.identity, request.stream_id),
+                self.send_scratch,
+            );
+            return;
+        }
         const descriptor = ingress_channel.Descriptor.responseChunk(
             request.identity,
             request.stream_id,
@@ -1414,8 +1439,9 @@ pub const StubWorker = struct {
 
     /// A whole response: its head, then its body with END_STREAM.
     pub fn respond(self: *StubWorker, request: Dispatched, status: u16, body: []const u8) !void {
-        try self.sendHead(request, status, false);
-        try self.sendChunk(request, body, true);
+        try self.sendHead(request, status, body.len == 0);
+        if (body.len != 0)
+            try self.sendChunk(request, body, true);
     }
 
     /// A whole response and then its completion, what a worker that served
@@ -1620,6 +1646,11 @@ pub const Client = struct {
             try self.harness.lane(self.lane_index).handleConnectionWritable(self.slot);
             try self.harness.finishPass(self.lane_index);
         }
+        try self.receive();
+    }
+
+    /// Reads and parses available frames without driving the lane.
+    pub fn receive(self: *Client) !void {
         while (!self.peer_closed and self.inbox_len < self.inbox.len) {
             const read_len = std.posix.read(self.fd, self.inbox[self.inbox_len..]) catch |err| switch (err) {
                 error.WouldBlock => break,

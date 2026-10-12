@@ -19,6 +19,8 @@
 //! - `egress_attach.zig`: the worker half of a new egress session, sent to a
 //!   live worker after its gateway was replaced.
 //! - `worker_retiring.zig`: a worker's request to be retired.
+//! - `response_credit.zig`: the credit window of a response's body chunks
+//!   and the server's cumulative grants.
 //! - `module_pack.zig`: the module pack format.
 //! - `fs_index.zig`, `fs_fault.zig`: a worker's file index and its file
 //!   requests.
@@ -45,6 +47,7 @@ pub const egress_shared = @import("egress_shared.zig");
 pub const egress_token = @import("egress_token.zig");
 pub const egress_attach = @import("egress_attach.zig");
 pub const worker_retiring = @import("worker_retiring.zig");
+pub const response_credit = @import("response_credit.zig");
 pub const fetch_limits = @import("fetch_limits.zig");
 
 pub const max_message_bytes = messages.max_message_bytes;
@@ -68,6 +71,7 @@ pub const WorkerInit = messages.WorkerInit;
 pub const WorkerReady = messages.WorkerReady;
 pub const WorkerInitFailed = messages.WorkerInitFailed;
 pub const WorkerRetiring = messages.WorkerRetiring;
+pub const ResponseCredit = messages.ResponseCredit;
 pub const DispatchPacketHeader = messages.DispatchPacketHeader;
 pub const FsFaultResponseStatus = messages.FsFaultResponseStatus;
 pub const FsFaultRequestHeader = messages.FsFaultRequestHeader;

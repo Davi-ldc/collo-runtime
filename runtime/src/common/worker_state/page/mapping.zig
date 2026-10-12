@@ -111,6 +111,12 @@ pub const WorkerWriterView = struct {
         @atomicStore(u32, &self.header.state, @intFromEnum(state), .release);
     }
 
+    /// Worker side, from the VM thread once its startup evaluations all
+    /// ended (`worker/runtime/evaluations.zig`).
+    pub fn publishStartupEvaluationsEnded(self: *WorkerWriterView) void {
+        @atomicStore(u32, &self.header.startup_evaluations_ended, 1, .release);
+    }
+
     /// Worker side, from the VM thread at every owner change: the owner the
     /// VM thread now works for and that owner's wall deadline
     /// (CLOCK_MONOTONIC), both 0 while it works for none. The two are stored
@@ -158,6 +164,8 @@ pub const WorkerWriterView = struct {
             .owner_deadline_mono_ns = 0,
             .running_owner_id = 0,
             .running_owner_cpu_ns = 0,
+            .startup_evaluations_ended = 0,
+            ._reserved0 = 0,
         };
     }
 
@@ -371,17 +379,17 @@ fn pageOf(comptime field: []const u8, comptime last: bool) usize {
 }
 
 comptime {
-    if (@sizeOf(Page) != 234_360)
+    if (@sizeOf(Page) != 234_368)
         @compileError("worker_state.page.Page size mismatch");
-    if (@offsetOf(Page, "completion_header") != 1_088)
+    if (@offsetOf(Page, "completion_header") != 1_096)
         @compileError("worker_state.page completion header offset mismatch");
-    if (@offsetOf(Page, "completion_records") != 1_152)
+    if (@offsetOf(Page, "completion_records") != 1_160)
         @compileError("worker_state.page completion records offset mismatch");
-    if (@offsetOf(Page, "log_header") != 4_736)
+    if (@offsetOf(Page, "log_header") != 4_744)
         @compileError("worker_state.page log header offset mismatch");
-    if (@offsetOf(Page, "records") != 4_984)
+    if (@offsetOf(Page, "records") != 4_992)
         @compileError("worker_state.page usage records offset mismatch");
-    if (@offsetOf(Page, "log_bytes") != 103_288)
+    if (@offsetOf(Page, "log_bytes") != 103_296)
         @compileError("worker_state.page log bytes offset mismatch");
 
     // The first touches. Page 0, which the host's launch writes: the header,

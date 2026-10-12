@@ -486,25 +486,10 @@ pub const ResponseExtractLimits = extern struct {
     max_header_bytes: usize,
 };
 
-/// Mirror of `ColloResponseBodyChunk`.
-pub const ResponseBodyChunk = extern struct {
-    bytes: RawBuffer = .{ .ptr = null, .len = 0 },
-    owner: ?*RawOwnedByteSegments = null,
-
-    pub fn slice(self: ResponseBodyChunk) []const u8 {
-        return rawBufferSlice(self.bytes);
-    }
-
-    pub fn deinit(self: *ResponseBodyChunk) void {
-        if (self.owner) |owner| {
-            collo_owned_byte_segments_destroy(owner);
-        }
-        self.* = .{};
-    }
-};
-
+/// A read's chunk: bytes lent until the next call into the VM, or the
+/// TypeError a chunk that is not a buffer raises.
 pub const ResponseBodyChunkResult = union(enum) {
-    success: ResponseBodyChunk,
+    success: []const u8,
     exception: Value,
 };
 
@@ -535,10 +520,10 @@ pub const ResponseBodyStream = struct {
     /// The bytes of `value`, a read's chunk; lent bytes stay valid until the
     /// next call into the VM.
     pub fn chunk(self: ResponseBodyStream, value: *const Value) Error!ResponseBodyChunkResult {
-        var out_chunk = ResponseBodyChunk{};
+        var out_bytes: RawBuffer = .{ .ptr = null, .len = 0 };
         var exception: ?*RawValue = null;
-        return switch (collo_response_body_stream_chunk(self.raw, try value.ptrConst(), &out_chunk, &exception)) {
-            status_ok => .{ .success = out_chunk },
+        return switch (collo_response_body_stream_chunk(self.raw, try value.ptrConst(), &out_bytes, &exception)) {
+            status_ok => .{ .success = rawBufferSlice(out_bytes) },
             status_js_exception => .{ .exception = try Value.fromRawOwned(exception) },
             else => |status| {
                 try statusToError(status);
@@ -741,7 +726,7 @@ extern fn collo_response_extract_free(response: *ExtractedResponse) void;
 extern fn collo_owned_byte_segments_destroy(owner: *RawOwnedByteSegments) void;
 extern fn collo_owned_header_block_destroy(owner: *RawOwnedHeaderBlock) void;
 extern fn collo_response_body_stream_read(stream: *RawResponseBodyStream, request_id: u64, out_exception: *?*RawValue) RawStatus;
-extern fn collo_response_body_stream_chunk(stream: *RawResponseBodyStream, chunk: *const RawValue, out_chunk: *ResponseBodyChunk, out_exception: *?*RawValue) RawStatus;
+extern fn collo_response_body_stream_chunk(stream: *RawResponseBodyStream, chunk: *const RawValue, out_bytes: *RawBuffer, out_exception: *?*RawValue) RawStatus;
 extern fn collo_response_body_stream_cancel(stream: *RawResponseBodyStream, reason: u32, out_exception: *?*RawValue) RawStatus;
 extern fn collo_response_body_stream_destroy(stream: *RawResponseBodyStream) void;
 extern fn collo_webapi_cleanup_request(vm: *RawVm, request_id: u64) RawStatus;
@@ -934,12 +919,6 @@ comptime {
         @compileError("ResponseExtractLimits.max_header_count offset mismatch");
     if (@offsetOf(ResponseExtractLimits, "max_header_bytes") != 16)
         @compileError("ResponseExtractLimits.max_header_bytes offset mismatch");
-    if (@sizeOf(ResponseBodyChunk) != 24)
-        @compileError("ResponseBodyChunk ABI size mismatch");
-    if (@offsetOf(ResponseBodyChunk, "bytes") != 0)
-        @compileError("ResponseBodyChunk.bytes offset mismatch");
-    if (@offsetOf(ResponseBodyChunk, "owner") != 16)
-        @compileError("ResponseBodyChunk.owner offset mismatch");
     if (@sizeOf(MemoryStatus) != 16)
         @compileError("MemoryStatus ABI size mismatch");
     if (@offsetOf(MemoryStatus, "footprint_bytes") != 0)

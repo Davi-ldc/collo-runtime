@@ -4,7 +4,9 @@
 //! end of the session, or when the session needs its slot. Budgets a lost `request_ended` left
 //! behind therefore never block an honest request, and a token that comes back after its budget
 //! ended starts a new one, so a dishonest worker gains fetches only under its own tokens'
-//! policies, until their deadlines, within the session's cap on active fetches.
+//! policies, until their deadlines, within the session's cap on active fetches. The boot token's
+//! budget always takes slot 0, which no request budget evicts, so a worker cannot refill it by
+//! churning requests.
 //!
 //! The session record holds its budgets (`sessions.Worker.budgets`), and only the gateway's loop
 //! thread touches them. Nothing sweeps: a budget whose deadline has passed is a free slot, since
@@ -21,8 +23,8 @@ const egress_token = ipc.egress_token;
 
 /// Budgets one session holds at once: room for each request the worker can have in flight
 /// (`worker_concurrency_max`) and its boot token, four times over for budgets whose
-/// `request_ended` was lost. A session that needs another evicts the one with the earliest
-/// deadline, which belongs to the oldest request.
+/// `request_ended` was lost. A request that needs another evicts the request budget with the
+/// earliest deadline, which belongs to the oldest request.
 pub const per_session_max: usize = 4 * (limits.server.worker_concurrency_max + 1);
 
 /// Budgets one gateway holds at once, every slot of every session it can attach.
@@ -84,7 +86,7 @@ pub const SessionBudgets = struct {
 
     /// Takes one fetch under the token `fields` describes, which `verify` accepted for this
     /// session and which has not expired at `now_monotonic_ns`. Finds its budget or starts one,
-    /// evicting the budget with the earliest deadline when every slot is live.
+    /// evicting the request budget with the earliest deadline when every request slot is live.
     pub fn take(self: *SessionBudgets, fields: egress_token.Fields, now_monotonic_ns: u64) Take {
         const deadline = fields.deadline_monotonic_ns;
         std.debug.assert(!egress_token.deadlinePassed(deadline, now_monotonic_ns));
@@ -140,13 +142,16 @@ pub const SessionBudgets = struct {
 
     fn start(self: *SessionBudgets, fields: egress_token.Fields, now_monotonic_ns: u64) *Budget {
         var target = &self.slots[0];
-        for (&self.slots) |*slot| {
-            if (!isLive(slot, now_monotonic_ns)) {
-                target = slot;
-                break;
+        if (fields.kind == .request) {
+            target = &self.slots[1];
+            for (self.slots[1..]) |*slot| {
+                if (!isLive(slot, now_monotonic_ns)) {
+                    target = slot;
+                    break;
+                }
+                if (slot.deadline_monotonic_ns < target.deadline_monotonic_ns)
+                    target = slot;
             }
-            if (slot.deadline_monotonic_ns < target.deadline_monotonic_ns)
-                target = slot;
         }
         target.* = .{
             .request_id = fields.request_id,

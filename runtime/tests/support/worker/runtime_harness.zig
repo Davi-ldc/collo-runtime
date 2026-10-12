@@ -23,6 +23,7 @@
 //! and needs a deadline taken from it.
 
 const std = @import("std");
+const bindings = @import("collo_bindings");
 const collo_network = @import("collo_network");
 const fd_mod = @import("collo_os").fd;
 const host = @import("collo_host");
@@ -516,7 +517,6 @@ pub fn runRouteAndReadIngressResponseWithRequest(
     try enqueueIngressRoute(runtime, &dispatch, 1, request);
 
     try executeQueuedBegin(runtime);
-    try executeUntilRequestDone(runtime, request_id);
 
     return readIngressResponse(runtime, server_control_fd, request_id);
 }
@@ -546,7 +546,6 @@ pub fn runRouteAndReadBodyWithRequestCaptures(
     try enqueueIngressRoute(runtime, &dispatch, 1, request);
 
     try executeQueuedBegin(runtime);
-    try executeUntilRequestDone(runtime, request_id);
 
     return readIngressResponseBody(runtime, server_control_fd, request_id);
 }
@@ -571,7 +570,6 @@ pub fn runRegisteredRouteAndReadBody(
     try enqueueIngressRoute(runtime, &dispatch, 1, request);
 
     try executeQueuedBegin(runtime);
-    try executeUntilRequestDone(runtime, request_id);
 
     return readIngressResponseBody(runtime, server_control_fd, request_id);
 }
@@ -653,17 +651,47 @@ pub fn readIngressResponseBody(
 }
 
 pub const IngressResponse = host.dispatch.Response;
+pub const ResponseReadCredit = host.dispatch.ResponseReadCredit;
 
 pub fn readIngressResponse(
     runtime: *worker.Runtime,
     server_control_fd: std.posix.fd_t,
     request_id: u64,
 ) !IngressResponse {
-    return readIngressResponseBounded(
-        runtimeCompletionChannels(runtime, server_control_fd),
-        request_id,
-        default_read_budget_ms,
-    );
+    return host.dispatch.readResponse(std.testing.allocator, runtimeCompletionChannels(runtime, server_control_fd), request_id, .{
+        .wall_ms = default_read_budget_ms,
+        .max_body_bytes = default_read_max_body_bytes,
+        .max_headers_bytes = default_read_max_headers_bytes,
+        .progress_context = runtime,
+        .progress_fn = progressResponse,
+    });
+}
+
+/// One pass of the in-process worker for `host.dispatch.readResponse`, which
+/// grants the response's credit itself. The harness polls neither the
+/// control socket nor the payload ring, so every pass retries the responses
+/// that wait for them, and a retry that still finds no room waits again.
+fn progressResponse(context: ?*anyopaque) !void {
+    const runtime: *worker.Runtime = @ptrCast(@alignCast(context.?));
+    worker.testing.response_flow.notifyTransport(runtime, .socket);
+    worker.testing.response_flow.notifyTransport(runtime, .ring);
+    try pumpOnce(runtime);
+}
+
+/// One pass of the in-process worker, as one turn of its loop: reads the
+/// control packets its socket holds, collects what became ready and runs
+/// one work item.
+pub fn pumpOnce(runtime: *worker.Runtime) !void {
+    if (runtime.core.control_fd) |fd| {
+        for (0..32) |_| {
+            var polls = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
+            if (try std.posix.poll(&polls, 0) == 0 or (polls[0].revents & std.posix.POLL.IN) == 0)
+                break;
+            try worker.testing.scheduler.loop.collectControlPacket(runtime);
+        }
+    }
+    try collectReadyWork(runtime);
+    try executeNextReady(runtime);
 }
 
 /// Byte caps for the harness readers, set above any response a test streams,
@@ -790,6 +818,9 @@ pub fn executeUntilRequestDoneOnFakeClock(
 /// Moves everything that became ready into the ready queue, as one pass of
 /// the worker's loop does before it runs work.
 fn collectReadyWork(runtime: *worker.Runtime) !void {
+    runtime.drainReadyBacklog();
+    runtime.collectReadyIngressRequests();
+    runtime.collectReadyRequestCompletions();
     // A worker without a gateway session has no packets to collect.
     _ = try runtime.collectEgressGatewayPacketsBounded(64);
     runtime.collectModuleSettlements();
@@ -808,6 +839,91 @@ fn collectReadyWork(runtime: *worker.Runtime) !void {
 /// context, for instance, must arrive under the boot token.
 pub const FetchStartIdentity = struct {
     egress_token: ipc.egress_token.Bytes,
+};
+
+/// Both ends of a real egress session with no gateway thread: the test plays
+/// the gateway, so it decides which completions the worker gets, and the
+/// worker's command ring is never drained. `worker_raw` is the half a
+/// runtime takes at init or from an `egress_attach`.
+pub const RawSession = struct {
+    session: ipc.egress_shared.SessionFds,
+    gateway: ipc.egress_shared.Endpoint,
+    worker_raw: ipc.egress_shared.RawFds,
+
+    /// A session `local_egress_session_id` names, on a wake set of its own;
+    /// the session keeps copies of the wake set's descriptors.
+    pub fn init(self: *RawSession) !void {
+        var wake_set = try ipc.egress_shared.WakeSet.create();
+        defer wake_set.deinit();
+        try self.initOnWakeSet(&wake_set, local_egress_session_id);
+    }
+
+    /// A session `session_id` names, on `wake_set`, which the caller keeps.
+    pub fn initOnWakeSet(self: *RawSession, wake_set: *const ipc.egress_shared.WakeSet, session_id: u64) !void {
+        self.session = try ipc.egress_shared.createSessionForWorker(wake_set);
+        errdefer self.session.deinit();
+        var gateway_raw = try dupSharedFds(self.session.rawForGateway());
+        errdefer gateway_raw.close();
+        self.gateway = try ipc.egress_shared.mapEndpointTakeForGateway(&gateway_raw);
+        self.gateway.command.setSession(session_id, session_id);
+        self.gateway.completion.setSession(session_id, session_id);
+        self.gateway.body_pool.setSession(session_id, session_id);
+        self.gateway.upload_pool.setSession(session_id, session_id);
+        self.worker_raw = self.session.takeWorkerHalf();
+    }
+
+    pub fn deinit(self: *RawSession) void {
+        self.worker_raw.close();
+        self.gateway.deinit();
+        self.session.deinit();
+    }
+
+    /// Answers the runtime's only fetch with a 200 head and leaves its body open.
+    pub fn sendOpenHead(self: *RawSession, runtime: *worker.Runtime) !void {
+        try std.testing.expectEqual(@as(usize, 1), runtime.egress.state.tasks.count());
+        var tasks = runtime.egress.state.tasks.valueIterator();
+        const task = tasks.next().?.*;
+        var buffer: [4096]u8 = undefined;
+        const head = try ipc.encodeEgressFetchHeadInto(&buffer, .{
+            .fetch_id = task.id,
+            .body_id = task.response_body_identity.body_id,
+            .status = 200,
+            .status_text = "OK",
+            .url = "https://origin.test/open",
+            .headers = &.{},
+        });
+        _ = try self.gateway.completion.writePacket(head);
+        _ = try runtime.collectEgressGatewayPacketsBounded(8);
+    }
+
+    /// Ends the named body and lets the runtime read the packet.
+    pub fn sendBodyEnd(self: *RawSession, runtime: *worker.Runtime, identity: bindings.FetchBodyIdentity) !void {
+        const end = ipc.EgressBodyEnd.init(identity.fetch_id, identity.body_id);
+        _ = try self.gateway.completion.writePacket(std.mem.asBytes(&end));
+        _ = try runtime.collectEgressGatewayPacketsBounded(8);
+    }
+
+    /// Fails the runtime's only fetch before its head with `message`, for
+    /// `cause`.
+    pub fn sendError(self: *RawSession, runtime: *worker.Runtime, cause: ipc.EgressFetchErrorCause, message: []const u8) !void {
+        try std.testing.expectEqual(@as(usize, 1), runtime.egress.state.tasks.count());
+        var tasks = runtime.egress.state.tasks.valueIterator();
+        try self.sendErrorFor(runtime, tasks.next().?.*.id, cause, message);
+    }
+
+    /// Fails a fetch before its head and lets the runtime read the packet.
+    pub fn sendErrorFor(self: *RawSession, runtime: *worker.Runtime, fetch_id: u64, cause: ipc.EgressFetchErrorCause, message: []const u8) !void {
+        const task = runtime.egress.state.tasks.get(fetch_id) orelse return error.TestExpectedFetchTask;
+        var buffer: [4096]u8 = undefined;
+        const packet = try ipc.encodeEgressFetchErrorInto(&buffer, .{
+            .fetch_id = fetch_id,
+            .body_id = task.response_body_identity.body_id,
+            .message = message,
+            .cause = cause,
+        });
+        _ = try self.gateway.completion.writePacket(packet);
+        _ = try runtime.collectEgressGatewayPacketsBounded(8);
+    }
 };
 
 /// A gateway engine (`egress/gateway/engine.zig`) whose packet loop runs on

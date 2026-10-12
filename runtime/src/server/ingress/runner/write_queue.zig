@@ -2,7 +2,10 @@
 //! the client before the socket takes it, on the lane thread that owns the
 //! connection: the write queue of encoded frames, kept as segments, and each
 //! stream's buffered response, which is the body bytes the send windows hold
-//! back and the END_STREAM that ends them. `http2/writing.zig` encodes the
+//! back and the END_STREAM that ends them. A worker's body chunk keeps its
+//! bytes in one allocation (`ResponseChunk`) until the socket accepts its
+//! last byte, and queued DATA segments point into it. A server response is
+//! copied into the stream's byte buffer. `http2/writing.zig` encodes the
 //! frames it appends, writes the queue to the socket, and moves a buffered
 //! response into the queue as the windows open.
 //!
@@ -14,31 +17,138 @@
 //!   `max_h2_pending_response_bytes_per_stream` on a stream and
 //!   `max_h2_pending_response_bytes_per_connection` across the connection,
 //!   where `h2_pending_response_bytes` counts them: every append, drop and
-//!   release keeps it in step. A stream's bound holds a whole worker
-//!   response of `limits.http_body.MATERIALIZED_BODY_BYTES_MAX`.
+//!   release keeps it in step. A server response's append checks the caps;
+//!   a worker's chunks stay within them because the request's credit window
+//!   (`RequestSlot.response_credit`) and `INGRESS_RESPONSE_CHUNK_BYTES` bound
+//!   them.
 
 const std = @import("std");
 
 const ipc = @import("collo_ipc");
 const limits = @import("collo_limits");
+const lifecycle = @import("collo_server_lifecycle");
 const connection_slot = @import("connection_slot.zig");
 const stream_table = @import("stream_table.zig");
 
 const Slot = connection_slot.Slot;
 const H2StreamEntry = stream_table.H2StreamEntry;
 
+/// A worker's response body chunk, from the moment the lane takes its bytes
+/// until the client socket accepted the last of them. The stream's pending
+/// storage and each queued DATA segment that points into `bytes` hold one
+/// reference. The last release frees `bytes`. When every holder released it
+/// after delivery, the chunk waits on the connection's retired list until
+/// its credit returns (`writing.zig:retireResponseChunks`); otherwise it is
+/// destroyed with no credit.
+pub const ResponseChunk = struct {
+    owner: lifecycle.RequestKey,
+    bytes: []u8,
+    offset: usize = 0,
+    refs: usize = 1,
+    abandoned: bool = false,
+    next_retired: ?*ResponseChunk = null,
+
+    pub fn remaining(self: *const ResponseChunk) []u8 {
+        return self.bytes[self.offset..];
+    }
+};
+
+/// A stream's chunks that wait for its send windows, oldest first: at most
+/// `INGRESS_RESPONSE_CHUNKS_IN_FLIGHT_MAX`, which the request's credit
+/// window bounds.
+pub const ResponseChunks = struct {
+    items: [limits.http_body.INGRESS_RESPONSE_CHUNKS_IN_FLIGHT_MAX]?*ResponseChunk = @splat(null),
+    len: usize = 0,
+
+    pub fn first(self: *const ResponseChunks) ?*ResponseChunk {
+        return if (self.len == 0) null else self.items[0];
+    }
+
+    fn pop(self: *ResponseChunks) *ResponseChunk {
+        std.debug.assert(self.len != 0);
+        const chunk = self.items[0].?;
+        self.len -= 1;
+        std.mem.copyForwards(?*ResponseChunk, self.items[0..self.len], self.items[1 .. self.len + 1]);
+        self.items[self.len] = null;
+        return chunk;
+    }
+
+    pub fn deinit(self: *ResponseChunks, allocator: std.mem.Allocator) void {
+        while (self.len != 0)
+            releaseChunk(null, allocator, self.pop(), false);
+    }
+};
+
+fn releaseChunk(slot: ?*Slot, allocator: std.mem.Allocator, chunk: *ResponseChunk, delivered: bool) void {
+    std.debug.assert(chunk.refs != 0);
+    chunk.abandoned = chunk.abandoned or !delivered;
+    chunk.refs -= 1;
+    if (chunk.refs != 0)
+        return;
+    allocator.free(chunk.bytes);
+    chunk.bytes = &.{};
+    if (chunk.abandoned) {
+        allocator.destroy(chunk);
+        return;
+    }
+    chunk.next_retired = slot.?.h2_retired_response_chunks;
+    slot.?.h2_retired_response_chunks = chunk;
+}
+
+/// Takes a chunk off the retired list, its bytes already freed. The caller
+/// returns its credit to `owner` and destroys it.
+pub fn h2TakeRetiredResponseChunk(self: *Slot) ?*ResponseChunk {
+    const chunk = self.h2_retired_response_chunks orelse return null;
+    self.h2_retired_response_chunks = chunk.next_retired;
+    chunk.next_retired = null;
+    return chunk;
+}
+
+/// Appends a worker's body chunk to its stream. The chunk frees its bytes
+/// with `allocator`, so a payload `received` owns in `allocator` moves into
+/// it, and any other payload, borrowed ring bytes among them, is copied;
+/// `received` keeps whatever it still owns.
+pub fn h2AppendResponseChunk(self: *Slot, allocator: std.mem.Allocator, received: *ipc.ingress_channel.Received) !void {
+    const descriptor = received.descriptor;
+    const entry = stream_table.h2StreamEntry(self, descriptor.stream_id) orelse return error.Http2UnknownStream;
+    const request = entry.request orelse return error.InvalidH2WorkerOutboundDescriptor;
+    if (received.payload.len == 0 or received.payload.len > limits.http_body.INGRESS_RESPONSE_CHUNK_BYTES or
+        entry.response_chunks.len == entry.response_chunks.items.len)
+        return error.InvalidH2WorkerOutboundDescriptor;
+    const chunk = try allocator.create(ResponseChunk);
+    errdefer allocator.destroy(chunk);
+    const movable = received.payload_owned and
+        received.allocator.ptr == allocator.ptr and
+        received.allocator.vtable == allocator.vtable;
+    const bytes = if (movable) received.payload else try allocator.dupe(u8, received.payload);
+    chunk.* = .{
+        .owner = request.key,
+        .bytes = bytes,
+    };
+    if (movable)
+        received.payload_owned = false;
+    entry.response_chunks.items[entry.response_chunks.len] = chunk;
+    entry.response_chunks.len += 1;
+    self.h2_pending_response_bytes += bytes.len;
+    if (descriptor.hasFlag(ipc.ingress_channel.flags.end_stream))
+        entry.pending_response_end_stream = true;
+}
+
+pub fn h2PendingResponseChunk(self: *Slot, stream_id: u32) ?*ResponseChunk {
+    const entry = stream_table.h2StreamEntry(self, stream_id) orelse return null;
+    return entry.response_chunks.first();
+}
+
 /// Bytes a connection may hold queued toward the client.
 pub const max_queued_write_bytes: usize = 1024 * 1024;
 
-/// Holds one whole worker response, up to
-/// `limits.http_body.MATERIALIZED_BODY_BYTES_MAX`, while the client's
-/// WINDOW_UPDATE frames are still in flight; a smaller buffer would wedge a
-/// response of that size.
-pub const max_h2_pending_response_bytes_per_stream: usize = ipc.max_message_bytes * 4;
-pub const max_h2_pending_response_bytes_per_connection: usize = max_h2_pending_response_bytes_per_stream * 4;
-comptime {
-    std.debug.assert(max_h2_pending_response_bytes_per_stream >= limits.http_body.MATERIALIZED_BODY_BYTES_MAX);
-}
+/// What a stream holds when its worker's response fills its credit window.
+/// A stream holds a worker's response or a server response, never both, and
+/// the server's (`server_responses.zig`) are a few KiB.
+pub const max_h2_pending_response_bytes_per_stream: usize =
+    limits.http_body.INGRESS_RESPONSE_CHUNKS_IN_FLIGHT_MAX * limits.http_body.INGRESS_RESPONSE_CHUNK_BYTES;
+pub const max_h2_pending_response_bytes_per_connection: usize =
+    limits.ingress.streams_per_connection_max * max_h2_pending_response_bytes_per_stream;
 
 /// Bytes wait in the write queue, so reading waits too.
 pub fn h2WritesPending(self: *const Slot) bool {
@@ -52,18 +162,27 @@ pub fn h2AppendWriteCopy(self: *Slot, allocator: std.mem.Allocator, bytes: []con
     // point into that buffer.
     if (!self.h2WritesPending() and bytes.len <= self.h2_write_buffer.len) {
         @memcpy(self.h2_write_buffer[0..bytes.len], bytes);
-        return appendSegment(self, allocator, self.h2_write_buffer[0..bytes.len], false);
+        return appendSegment(self, allocator, self.h2_write_buffer[0..bytes.len], false, null);
     }
     const owned = try allocator.dupe(u8, bytes);
     errdefer allocator.free(owned);
-    try appendSegment(self, allocator, owned, true);
+    try appendSegment(self, allocator, owned, true, null);
 }
 
 /// Moves `owned` to the end of the write queue, which frees it once written,
 /// without writing it. On failure `owned` is freed.
 pub fn h2AppendOwnedWrite(self: *Slot, allocator: std.mem.Allocator, owned: []u8) !void {
     errdefer allocator.free(owned);
-    try appendSegment(self, allocator, owned, true);
+    try appendSegment(self, allocator, owned, true, null);
+}
+
+/// Queues `bytes`, a view into `chunk`, which keeps them alive until the
+/// segment is written whole or the connection discards the queue.
+pub fn h2AppendChunkWrite(self: *Slot, allocator: std.mem.Allocator, bytes: []u8, chunk: *ResponseChunk) !void {
+    if (bytes.len == 0)
+        return;
+    try appendSegment(self, allocator, bytes, false, chunk);
+    chunk.refs += 1;
 }
 
 fn appendSegment(
@@ -71,6 +190,7 @@ fn appendSegment(
     allocator: std.mem.Allocator,
     bytes: []u8,
     owned: bool,
+    chunk: ?*ResponseChunk,
 ) !void {
     if (bytes.len == 0)
         return;
@@ -85,6 +205,7 @@ fn appendSegment(
         self.h2_write_inline_segment = .{
             .bytes = bytes,
             .owned = owned,
+            .chunk = chunk,
         };
         self.h2_write_inline_active = true;
         self.h2_write_len = bytes.len;
@@ -94,6 +215,7 @@ fn appendSegment(
     try self.h2_write_queue.append(allocator, .{
         .bytes = bytes,
         .owned = owned,
+        .chunk = chunk,
     });
     self.h2_write_len = next_total_len;
 }
@@ -139,7 +261,7 @@ pub fn h2ConsumeQueuedWrite(self: *Slot, allocator: std.mem.Allocator, written: 
             return;
         }
         remaining -= segment_remaining;
-        self.h2_write_inline_segment.deinit(allocator);
+        completeSegment(self, allocator, &self.h2_write_inline_segment);
         self.h2_write_inline_active = false;
     }
     while (remaining != 0) {
@@ -151,7 +273,7 @@ pub fn h2ConsumeQueuedWrite(self: *Slot, allocator: std.mem.Allocator, written: 
             return;
         }
         remaining -= segment_remaining;
-        segment.deinit(allocator);
+        completeSegment(self, allocator, segment);
         self.h2_write_queue_start += 1;
     }
 
@@ -181,10 +303,20 @@ pub fn h2ConsumeQueuedWrite(self: *Slot, allocator: std.mem.Allocator, written: 
     }
 }
 
+fn completeSegment(self: *Slot, allocator: std.mem.Allocator, segment: *H2WriteSegment) void {
+    if (segment.chunk) |chunk| {
+        segment.chunk = null;
+        releaseChunk(self, allocator, chunk, true);
+    }
+    segment.deinit(allocator);
+}
+
 /// Frees every queued segment and the segment list.
 pub fn h2DeinitWriteQueue(self: *Slot, allocator: std.mem.Allocator) void {
     h2ClearWriteQueueRetainingCapacity(self, allocator);
     self.h2_write_queue.deinit(allocator);
+    while (h2TakeRetiredResponseChunk(self)) |chunk|
+        allocator.destroy(chunk);
 }
 
 fn h2ClearWriteQueueRetainingCapacity(self: *Slot, allocator: std.mem.Allocator) void {
@@ -254,7 +386,7 @@ pub fn h2PendingResponseSlice(self: *Slot, stream_id: u32) ?[]const u8 {
 
 pub fn h2PendingResponseEndsStream(self: *Slot, stream_id: u32) bool {
     const entry = stream_table.h2StreamEntry(self, stream_id) orelse return false;
-    return entry.pending_response_end_stream;
+    return entry.pending_response_end_stream and entry.response_chunks.len <= 1;
 }
 
 pub fn h2DropPendingResponsePrefix(self: *Slot, allocator: std.mem.Allocator, stream_id: u32, count: usize) !void {
@@ -264,6 +396,19 @@ pub fn h2DropPendingResponsePrefix(self: *Slot, allocator: std.mem.Allocator, st
         return error.Http2ProtocolError;
     if (count == 0)
         return;
+    if (entry.response_chunks.first()) |chunk| {
+        if (count > chunk.remaining().len)
+            return error.Http2ProtocolError;
+        self.h2_pending_response_bytes -= count;
+        chunk.offset += count;
+        if (chunk.offset == chunk.bytes.len) {
+            _ = entry.response_chunks.pop();
+            releaseChunk(self, allocator, chunk, true);
+            if (entry.response_chunks.len == 0)
+                entry.pending_response_end_stream = false;
+        }
+        return;
+    }
     if (count <= self.h2_pending_response_bytes)
         self.h2_pending_response_bytes -= count
     else
@@ -320,15 +465,13 @@ pub fn h2MaybeRemoveDrainedResponseStream(self: *Slot, allocator: std.mem.Alloca
 
 pub fn releasePendingResponse(self: *Slot, allocator: std.mem.Allocator, entry: *H2StreamEntry) void {
     const byte_len = pendingResponseLen(entry);
+    entry.response_chunks.deinit(allocator);
+    self.h2_pending_response_bytes -|= byte_len;
     if (entry.pending_response.len == 0) {
         entry.pending_response_end_stream = false;
         entry.pending_response_start = 0;
         return;
     }
-    if (byte_len <= self.h2_pending_response_bytes)
-        self.h2_pending_response_bytes -= byte_len
-    else
-        self.h2_pending_response_bytes = 0;
     allocator.free(entry.pending_response);
     entry.pending_response = &.{};
     entry.pending_response_start = 0;
@@ -339,6 +482,7 @@ pub const H2WriteSegment = struct {
     bytes: []u8 = &.{},
     offset: usize = 0,
     owned: bool = false,
+    chunk: ?*ResponseChunk = null,
 
     pub fn remaining(self: *const H2WriteSegment) []const u8 {
         std.debug.assert(self.offset <= self.bytes.len);
@@ -346,6 +490,8 @@ pub const H2WriteSegment = struct {
     }
 
     pub fn deinit(self: *H2WriteSegment, allocator: std.mem.Allocator) void {
+        if (self.chunk) |chunk|
+            releaseChunk(null, allocator, chunk, false);
         if (self.owned and self.bytes.len != 0)
             allocator.free(self.bytes);
         self.* = .{};
@@ -354,7 +500,10 @@ pub const H2WriteSegment = struct {
 
 fn pendingResponseLen(entry: *const H2StreamEntry) usize {
     std.debug.assert(entry.pending_response_start <= entry.pending_response.len);
-    return entry.pending_response.len - entry.pending_response_start;
+    var len = entry.pending_response.len - entry.pending_response_start;
+    for (entry.response_chunks.items[0..entry.response_chunks.len]) |chunk|
+        len += chunk.?.remaining().len;
+    return len;
 }
 
 /// Whether the stream still owes the client buffered response bytes or a
@@ -367,6 +516,8 @@ fn hasUndeliveredResponse(entry: *const H2StreamEntry) bool {
 }
 
 fn pendingResponseSlice(entry: *const H2StreamEntry) []const u8 {
+    if (entry.response_chunks.first()) |chunk|
+        return chunk.remaining();
     std.debug.assert(entry.pending_response_start <= entry.pending_response.len);
     return entry.pending_response[entry.pending_response_start..];
 }

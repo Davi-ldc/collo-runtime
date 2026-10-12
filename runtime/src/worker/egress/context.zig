@@ -19,6 +19,7 @@ const state = @import("state.zig");
 pub const RequestMap = std.AutoHashMapUnmanaged(u64, *request_context.RequestContext);
 
 pub const DisconnectFn = *const fn (?*anyopaque, []const u8) void;
+pub const ReleaseResponseHoldsBeforeDetachFn = *const fn (?*anyopaque) void;
 pub const RequestFailureFn = *const fn (?*anyopaque, u64, anyerror) void;
 pub const DenialLogFn = *const fn (?*anyopaque, u64, []const u8) void;
 
@@ -33,6 +34,9 @@ pub const Context = struct {
     /// one count of fetches under the boot token, which every evaluation's
     /// fetch adds to instead of its context's own.
     boot_fetches_started: *u64,
+    /// `Evaluations.boot_egress_token` (`runtime/evaluations.zig`), the copy
+    /// the startup evaluations take theirs from.
+    boot_egress_token: *ipc.egress_token.Bytes,
     ready_queue: *ready_queue.ReadyQueue,
     ready_backlog: *ready_queue.ReadyQueue,
     /// The runtime's one packet buffer, shared by everything the event loop
@@ -48,8 +52,16 @@ pub const Context = struct {
     wakeup_fd: ?std.posix.fd_t,
     trace_fd: ?std.posix.fd_t,
     running: *bool,
+    /// `Egress.detach_in_progress` (`runtime/egress.zig`), which every
+    /// context the VM thread builds shares.
+    detach_in_progress: *bool,
     disconnect_context: ?*anyopaque,
     disconnect_fn: DisconnectFn,
+    /// Returns the pool bytes that parked response chunks borrow, before the
+    /// endpoint is unmapped. It may queue each response's advance, but runs
+    /// no JavaScript and finishes no request.
+    response_holds_context: ?*anyopaque,
+    release_response_holds_before_detach_fn: ReleaseResponseHoldsBeforeDetachFn,
     request_failure_context: ?*anyopaque,
     request_failure_fn: RequestFailureFn,
     denial_log_context: ?*anyopaque,
@@ -74,9 +86,9 @@ pub const Context = struct {
     /// Queues `item` as `Runtime.tryQueueReadyWorkReadySince`
     /// (`runtime/scheduler.zig`) does, resolving the owner of the two egress
     /// item kinds at enqueue. `ready_since_mono_ns` is when the gateway made the
-    /// work ready, or zero for ready now. Returns false when the queue and its
-    /// backlog are both full: the item's rescan flag is then set and the loop
-    /// woken, so the caller drops its claim and leaves the item to the rescan.
+    /// work ready, or zero for ready now. When both queues are full, sets the
+    /// item's rescan flag and returns false. The caller leaves it for that
+    /// rescan; the full queue rule is in `Runtime.tryQueueReadyWorkReadySince`.
     pub fn tryQueueReadyReadySince(
         self: *Context,
         item: ready_queue.WorkItem,
@@ -109,7 +121,6 @@ pub const Context = struct {
             return true;
         }
         self.markRescanNeeded(item);
-        self.wake();
         return false;
     }
 
@@ -144,6 +155,26 @@ pub const Context = struct {
             .fetch_completion => self.egress_state.fetch_task_rescan_needed = true,
             .fetch_body_ready => self.egress_state.fetch_body_rescan_needed = true,
             else => {},
+        }
+    }
+
+    /// Releases response-side borrows while the disconnect owner still
+    /// holds the old mapping. This callback never re-enters the VM.
+    pub fn releaseResponseHoldsBeforeDetach(self: *Context) void {
+        self.release_response_holds_before_detach_fn(self.response_holds_context);
+    }
+
+    /// Clears the runtime's copy of the boot token and every evaluation's. A
+    /// replacement session refuses this token as another gateway's or another
+    /// session's, and each refusal is a strike
+    /// (`egress/gateway/runtime/worker_flow.zig`), so a disconnect clears
+    /// every copy and later startup fetches fail in the worker instead.
+    pub fn revokeBootEgress(self: *Context) void {
+        self.boot_egress_token.* = ipc.egress_token.none;
+        var iterator = self.requests.iterator();
+        while (iterator.next()) |entry| {
+            if (request_context.isEvaluationId(entry.key_ptr.*))
+                entry.value_ptr.*.dispatch_work.egress_token = ipc.egress_token.none;
         }
     }
 

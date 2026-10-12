@@ -400,6 +400,8 @@ test "the worker page gate catches a loop over the live slots and a load of the 
         ,
         \\const state = view.header.state;
         ,
+        \\const ended = view.header.startup_evaluations_ended;
+        ,
         \\const fatal = view.log_header.fatal;
         ,
         \\const record = metrics.completed_records[0];
@@ -2305,6 +2307,7 @@ fn checkWorkerPageReads(path: []const u8, bytes: []const u8, failures: *FailureL
         "records_tail",
         ".termination_reason",
         ".header.state",
+        ".startup_evaluations_ended",
         ".completion_header",
         ".completion_records",
         ".log_header",

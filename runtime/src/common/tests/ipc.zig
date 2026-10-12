@@ -4,12 +4,12 @@
 //! its shared payload rings, the egress fetch messages and shared rings, the
 //! egress token's place in WorkerInit, DispatchWork and the fetch start, fs
 //! faults, module packs and packet framing. The token itself, the
-//! `egress_attach` and `worker_retiring` packets, the fs index, the route
-//! table and its bindings sections, the copy of a pool slot and the field
-//! contracts of `messages.zig` have their own files under `ipc/`.
-//! Everything runs over
-//! in-process socketpairs and memfds; the zygote integration lane covers the
-//! same handshakes against a real zygote and worker.
+//! `egress_attach`, `worker_retiring` and `response_credit` packets with the
+//! credit window, the fs index, the route table and its bindings sections,
+//! the copy of a pool slot and the field contracts of `messages.zig` have
+//! their own files under `ipc/`. Everything runs over in-process socketpairs
+//! and memfds; the zygote integration lane covers the same handshakes
+//! against a real zygote and worker.
 
 const std = @import("std");
 const ipc = @import("collo_ipc");
@@ -21,6 +21,7 @@ test {
     _ = @import("ipc/egress_token.zig");
     _ = @import("ipc/fs_index.zig");
     _ = @import("ipc/messages.zig");
+    _ = @import("ipc/response_credit.zig");
     _ = @import("ipc/route_bindings.zig");
     _ = @import("ipc/route_table.zig");
     _ = @import("ipc/slot_snapshot.zig");
@@ -4269,14 +4270,14 @@ test "fs fault wire round-trips and rejects invalid payloads and kinds" {
 
     // Kind table: 24 and 25 decode, and the holes and the next unassigned
     // value fail with InvalidMessageKind. Kinds 8, 9 and 10 have tests of
-    // their own, `ipc/egress_attach.zig` pins 26 and
-    // `ipc/worker_retiring.zig` pins 27.
+    // their own, `ipc/egress_attach.zig` pins 26, `ipc/worker_retiring.zig`
+    // pins 27 and `ipc/response_credit.zig` pins 28.
     try std.testing.expectEqual(MessageKind.fs_fault_request, try ipc.decodeMessageKind(24));
     try std.testing.expectEqual(MessageKind.fs_fault_response, try ipc.decodeMessageKind(25));
     try std.testing.expectError(error.InvalidMessageKind, ipc.decodeMessageKind(13));
     try std.testing.expectError(error.InvalidMessageKind, ipc.decodeMessageKind(21));
     try std.testing.expectError(error.InvalidMessageKind, ipc.decodeMessageKind(22));
-    try std.testing.expectError(error.InvalidMessageKind, ipc.decodeMessageKind(28));
+    try std.testing.expectError(error.InvalidMessageKind, ipc.decodeMessageKind(29));
 }
 
 test "module pack single module parses entry source" {

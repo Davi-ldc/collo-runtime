@@ -76,6 +76,7 @@ const Fixture = struct {
         const pack_fd = try rt.createModulePackGraphFd(modules, 0);
         defer std.posix.close(pack_fd);
         try self.runtime.evaluateBootRoutes(pack_fd, 0, null);
+        self.runtime.sealStartupEvaluations();
     }
 
     /// The open evaluation that started at the route at `route_index`, or

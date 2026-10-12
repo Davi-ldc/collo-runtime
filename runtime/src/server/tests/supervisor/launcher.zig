@@ -2,12 +2,12 @@
 //! zygote and a stand-in supervisor and gateway: a submission claims a
 //! launch through `Deps.claim`, the fork request goes out with the cgroup leaf
 //! the launcher made, WorkerInit carries the egress session and a boot token
-//! minted under the key of the session's gateway with the child window as its
-//! deadline, and the ready worker reaches `Deps.publish` with its session and
-//! its trace while `Deps.egressBootEnded` ends its boot token. Each way a
-//! launch fails reaches `Deps.failed` with its reason and the child and leaf
-//! it leaves behind, the child still running, because the launcher kills no
-//! worker and waits for no exit. After a publish the launcher claims again, so
+//! minted under the key of the session's gateway, and the ready worker
+//! reaches `Deps.publish` with its session, its boot token's gateway, session
+//! and deadline, and its trace. Each way a launch fails reaches `Deps.failed`
+//! with its reason and the child and leaf it leaves behind, the child still
+//! running, because the launcher kills no worker and waits for no exit.
+//! After a publish the launcher claims again, so
 //! waiters the new worker could not serve get a launch without another
 //! submission. A failed launch's leftovers keep their room in the launch
 //! table until the reaper calls `leftoversReaped`. A zygote that misses a fork
@@ -554,7 +554,7 @@ test "a child that never answers WorkerInit fails the launch when its window clo
     try harness.expectChildHandedOverAlive(failed, 0);
 }
 
-test "WorkerInit carries a boot token for the launch's session under its gateway's key with the child window as its deadline, and WorkerReady ends it once before the publish" {
+test "WorkerInit carries a boot token for the launch's session under its gateway's key, and WorkerReady publishes the token's gateway, session and deadline without ending it" {
     var harness: Harness = undefined;
     try harness.init(.{ .root = .delegated });
     defer harness.deinit();
@@ -563,7 +563,6 @@ test "WorkerInit carries a boot token for the launch's session under its gateway
     harness.board.grantClaims(launch_definition, 1);
     harness.launcher.submit(launch_definition, .waiter);
     try harness.board.waitFor(.published, 1, wait_bound_ns);
-    try harness.board.waitFor(.boot_ended, 1, wait_bound_ns);
     harness.quiesce();
 
     const board = &harness.board;
@@ -584,7 +583,7 @@ test "WorkerInit carries a boot token for the launch's session under its gateway
         .session_id = board.attached_session_id,
         .request_id = 0,
         .request_generation = 0,
-        .deadline_monotonic_ns = board.init_deadline_ns,
+        .deadline_monotonic_ns = board.init_deadline_ns + process_limits.MODULE_EVAL_BUDGET_NS,
     }, fields);
     // The key is the one of the gateway the session belongs to.
     try testing.expectError(
@@ -592,18 +591,17 @@ test "WorkerInit carries a boot token for the launch's session under its gateway
         egress_token.verify(&keyOf(test_gateway_generation + 1), &token),
     );
 
-    try testing.expectEqual(@as(usize, 1), board.boot_ended_len);
-    try testing.expectEqual(SessionRef{
-        .generation = test_gateway_generation,
+    try testing.expectEqual(worker_table.BootToken{
+        .gateway_generation = test_gateway_generation,
         .session_id = board.attached_session_id,
-    }, board.boot_ended[0]);
-    try testing.expectEqual(@as(usize, 1), board.published[0].boot_ends_before_publish);
+        .deadline_mono_ns = fields.deadline_monotonic_ns,
+    }, board.published[0].worker.boot_egress.?);
     // The session's gateway was still current at WorkerReady, so nothing
     // followed WorkerInit on the worker's control socket.
     try testing.expect(!board.published[0].egress_attach_queued);
 }
 
-test "a definition without a network grant launches with no wake set, no attach, no session and no boot token, and its WorkerReady ends nothing" {
+test "a definition without a network grant launches with no egress descriptors, attach or boot token" {
     var granted: [fixture.definition_names.len]bool = @splat(true);
     granted[launch_definition] = false;
     var harness: Harness = undefined;
@@ -630,7 +628,7 @@ test "a definition without a network grant launches with no wake set, no attach,
     try testing.expectEqual(@as(u64, 0), published.worker.egress_generation);
     try testing.expectEqual(@as(u64, 0), published.worker.egress_session_id);
     try testing.expect(!published.worker.egress_wake_set.isValid());
-    try testing.expectEqual(@as(usize, 0), board.boot_ended_len);
+    try testing.expect(published.worker.boot_egress == null);
     try testing.expect(!published.egress_attach_queued);
 }
 
@@ -657,6 +655,7 @@ test "a launch whose gateway is lost before its key is read boots the child deta
     const next = board.sessions[1];
     try testing.expectEqual(test_gateway_generation + 1, next.generation);
     const published = &board.published[0];
+    try testing.expect(published.worker.boot_egress == null);
     try testing.expectEqual(next.generation, published.worker.egress_generation);
     try testing.expectEqual(next.session_id, published.worker.egress_session_id);
     try testing.expect(published.egress_attach_queued);
@@ -1132,8 +1131,12 @@ test "a launch whose session its gateway removed before WorkerReady gets another
     try testing.expectEqual(next.generation, published.worker.egress_generation);
     try testing.expectEqual(next.session_id, published.worker.egress_session_id);
     try testing.expect(published.egress_attach_queued);
-    // The removed session's boot token has nothing left to end at the gateway.
-    try testing.expectEqual(@as(usize, 0), board.boot_ended_len);
+    // The boot token stays the removed session's.
+    try testing.expectEqual(worker_table.BootToken{
+        .gateway_generation = first.generation,
+        .session_id = first.session_id,
+        .deadline_mono_ns = board.init_deadline_ns + process_limits.MODULE_EVAL_BUDGET_NS,
+    }, published.worker.boot_egress.?);
     const counters = harness.launcher.countersSnapshot();
     try testing.expectEqual(@as(u64, 1), counters.egress_sessions_lost);
     try testing.expectEqual(@as(u64, 1), counters.egress_reattached);
@@ -1275,9 +1278,6 @@ const Published = struct {
     /// `Deps.publish` ran. After WorkerReady only the launcher's
     /// `egress_attach` can be there.
     egress_attach_queued: bool = false,
-    /// The boot tokens `Deps.egressBootEnded` had ended when `Deps.publish`
-    /// ran.
-    boot_ends_before_publish: usize = 0,
 };
 
 /// A definition's pool whose records are the board's published workers,
@@ -1337,12 +1337,6 @@ const Session = struct {
     generation: u64,
     session_id: u64,
     command_data_inode: u64,
-};
-
-/// A session as `Deps.egressBootEnded` names it.
-const SessionRef = struct {
-    generation: u64,
-    session_id: u64,
 };
 
 /// The sessions of the `egress_attach` packets one worker received, by the
@@ -1452,8 +1446,6 @@ const Board = struct {
     attached_session_id: u64 = 0,
     sessions: [sessions_max]Session = undefined,
     sessions_len: usize = 0,
-    boot_ended: [launches_max]SessionRef = undefined,
-    boot_ended_len: usize = 0,
 
     /// The published workers a reattach pass walks; the launches of a test
     /// never add to them.
@@ -1511,7 +1503,6 @@ const Board = struct {
         failed,
         inits_received,
         zygote_exited,
-        boot_ended,
         prewarms,
         reattach_passes_finished,
         probe_claims,
@@ -1527,7 +1518,6 @@ const Board = struct {
             .zygoteExited = zygoteExited,
             .egressCurrentGeneration = egressCurrentGeneration,
             .egressPrewarm = egressPrewarm,
-            .egressBootEnded = egressBootEnded,
             .nextStaleEgressWorker = nextStaleEgressWorker,
             .setWorkerEgress = setWorkerEgress,
             .retireForEgress = retireForEgress,
@@ -1773,7 +1763,6 @@ const Board = struct {
             .failed => self.failed_len,
             .inits_received => self.inits_received,
             .zygote_exited => @intFromBool(self.zygote_exited),
-            .boot_ended => self.boot_ended_len,
             .prewarms => self.prewarms,
             .reattach_passes_finished => self.reattach_passes_finished,
             .probe_claims => self.probe_claims,
@@ -2020,17 +2009,6 @@ fn egressPrewarm(ctx: *anyopaque) anyerror!void {
     board.condition.broadcast();
 }
 
-fn egressBootEnded(ctx: *anyopaque, generation: u64, session_id: u64) void {
-    const board = boardOf(ctx);
-    board.mutex.lock();
-    defer board.mutex.unlock();
-    if (board.boot_ended_len == board.boot_ended.len)
-        return board.noteFailureLocked(error.TestTooManyBootEnds);
-    board.boot_ended[board.boot_ended_len] = .{ .generation = generation, .session_id = session_id };
-    board.boot_ended_len += 1;
-    board.condition.broadcast();
-}
-
 /// The first live worker whose session is not of gateway `generation`, with
 /// a dup of its control socket, or null when none is left, which ends the
 /// launcher's pass.
@@ -2171,7 +2149,6 @@ fn publishWorker(
         .ticket = ticket,
         .worker = worker,
         .egress_attach_queued = board.childHasPacketLocked(worker.handle.pid),
-        .boot_ends_before_publish = board.boot_ended_len,
     };
     board.published_len += 1;
     if (board.poolFor(definition)) |definition_pool| {

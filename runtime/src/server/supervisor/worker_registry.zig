@@ -68,6 +68,7 @@ pub fn buildRecord(
         .egress_wake_set = ready.egress_wake_set,
         .created_mono_ns = process.monotonicNowNsOrZero(),
         .boot_work_ns = ready.boot_work_ns,
+        .boot_egress = ready.boot_egress,
     });
     return record;
 }

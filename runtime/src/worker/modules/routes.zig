@@ -73,12 +73,7 @@ pub const RouteHandlerResult = union(enum) {
     pending,
 };
 
-/// How long a route module's top-level await may stay pending, from the
-/// moment its evaluation goes pending; it matches the cap AWS Lambda puts on
-/// a function's init phase. A hung await outlives every request that waits
-/// on it, so past this budget its route is pinned failed (`expireEvaluation`)
-/// and the requests parked on it get their 500.
-pub const module_eval_budget_ns: u64 = 10 * std.time.ns_per_s;
+pub const module_eval_budget_ns: u64 = @import("collo_limits").process.MODULE_EVAL_BUDGET_NS;
 
 /// What a route offers a request before its entry is evaluated
 /// (`lookupRouteHandler`).

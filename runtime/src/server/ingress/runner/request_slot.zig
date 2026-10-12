@@ -21,8 +21,10 @@
 //! - Sends toward the worker keep the request's order: while `send_blocked`
 //!   waits for room, the parked begin, then a parked reset, then the
 //!   stream's buffered body go out in that order before anything later.
-//!   Once a send fails for the worker's doing (`send_blocked == .failed`),
-//!   nothing more goes out, and the worker's death path ends the request.
+//!   Credit that found the control socket full (`response_credit_unsent`)
+//!   goes out after the reset and before the body. Once a send fails for
+//!   the worker's doing (`send_blocked == .failed`), nothing more goes out,
+//!   and the worker's death path ends the request.
 //! - `begin_sent` is set once the request's `request_begin` is in the
 //!   worker's socket. Until then the worker cannot have run the request, so
 //!   its finish writes no usage floor for it.
@@ -98,6 +100,12 @@ pub const RequestSlot = struct {
     parked_begin: ?ParkedBegin = null,
     /// The error code of a request reset whose send would have blocked.
     parked_reset: ?u32 = null,
+    /// The worker response's body chunks that its client has not taken yet,
+    /// counted on this lane (`dispatch.zig:responseChunkRetired`).
+    response_credit: ipc.response_credit.Window = .{},
+    /// `response_credit.granted` has not reached the worker: its send found
+    /// the control socket full, and the socket's writability poll retries it.
+    response_credit_unsent: bool = false,
     /// A worker completion that arrived after the request's response head
     /// went out and before its end did. It finishes the request when the
     /// response ends, when the stream goes away, or at the deadline, whose

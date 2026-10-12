@@ -1,16 +1,20 @@
 //! The ingress-channel sends behind a response: the head, body chunks inline
 //! or through the shared payload ring, the stream end and the stream reset.
 //! Every descriptor carries the request's identity as the dispatch assigned
-//! it (`h2Identity`). The worker's end of the control socket does not block
-//! (`zygote/child_boot.zig`), so every send here can find it full and
-//! reports that instead of failing; a body chunk above
-//! `shared_payload_threshold` travels through the ring and can find the ring
-//! full as well, after which the worker has marked itself waiting, so the
-//! reader's next release writes the credit eventfd the loop polls
-//! (`ringFits`). The step that found no room sent nothing, and the caller
-//! parks it, with everything after it, in the request's outbox
-//! (`request/ingress/response_outbox.zig`). A response is committed when its
-//! head goes out and at no other point. It runs on the worker's VM thread.
+//! it (`h2Identity`). A response is committed when its head goes out and at
+//! no other point. It runs on the worker's VM thread.
+//!
+//! Each body chunk spends the credit `common/ipc/response_credit.zig:Window`
+//! says it holds, charged only once the packet that carries it went out. A
+//! write stops before a chunk the credit does not cover and reports
+//! `credit_empty`. The worker's end of the control socket does not block
+//! (`zygote/child_boot.zig`), so every send can find it full, and a chunk
+//! above `shared_payload_threshold` can find the ring full, after which the
+//! worker has marked itself waiting, so the reader's next release writes the
+//! credit eventfd the loop polls (`ringFits`). A send that found no room sent
+//! nothing, and each stop records what the response waits for in
+//! `RequestContext.response_advance.wait`. The caller keeps the source and
+//! the offset reached for the next advance.
 
 const std = @import("std");
 const bindings = @import("collo_bindings");
@@ -60,6 +64,8 @@ pub const HeadBatch = union(enum) {
 pub const BodyProgress = enum {
     /// Every byte went out.
     sent,
+    /// The request's credit covers no further chunk.
+    credit_empty,
     /// The payload ring had no room for the next chunk.
     ring_full,
     /// The control socket had no room for the next packet.
@@ -81,13 +87,13 @@ const BodySpan = struct {
     }
 };
 
-/// Turns a send's `error.WouldBlock` into `.blocked` and marks the control
-/// channel blocked, so the loop polls the socket for room
-/// (`Requests.control_send_blocked`). The worker's end of the socket does
-/// not block (`zygote/child_boot.zig`).
-pub fn sentOrBlocked(runtime: *state.Runtime, result: anytype) !Sent {
+/// Turns a send's `error.WouldBlock` into `.blocked`, marks the response
+/// waiting for the socket and the control channel blocked, so the loop polls
+/// the socket for room (`Requests.control_send_blocked`).
+pub fn sentOrBlocked(runtime: *state.Runtime, request_ctx: *request_context.RequestContext, result: anytype) !Sent {
     result catch |err| switch (err) {
         error.WouldBlock => {
+            request_ctx.response_advance.wait = .socket;
             runtime.requests.control_send_blocked = true;
             return .blocked;
         },
@@ -106,15 +112,18 @@ const RingSent = enum { sent, socket_full, ring_full };
 /// check above).
 fn ringSentOrBlocked(
     runtime: *state.Runtime,
+    request_ctx: *request_context.RequestContext,
     ingress_payload: *ipc.ingress_channel.SharedPayloadView,
     result: anytype,
 ) !RingSent {
     result catch |err| switch (err) {
         error.WouldBlock => {
+            request_ctx.response_advance.wait = .socket;
             runtime.requests.control_send_blocked = true;
             return .socket_full;
         },
         error.IngressSharedPayloadRingFull => {
+            request_ctx.response_advance.wait = .ring;
             ingress_payload.markWriterWaiting(.worker_to_server);
             return .ring_full;
         },
@@ -172,10 +181,10 @@ pub fn writeStreamBytes(
     }, sent_len);
 }
 
-/// Sends a body held in `segments`, `total_len` bytes in all, from its
-/// start, and advances `sent_len.*` past every chunk that went out, so the
-/// caller can park the rest from there. A chunk never spans two segments.
-/// Segments that disagree with `total_len` fail with
+/// Sends a body held in `segments`, `total_len` bytes in all, from
+/// `sent_len.*` on, and advances `sent_len.*` past every chunk that went
+/// out, so a write that stops resumes there. A chunk never spans two
+/// segments. Segments that disagree with `total_len` fail with
 /// `error.InvalidResponseBody` before any of them is sent.
 pub fn writeSegmentedBody(
     runtime: *state.Runtime,
@@ -184,7 +193,7 @@ pub fn writeSegmentedBody(
     total_len: usize,
     sent_len: *usize,
 ) !BodyProgress {
-    std.debug.assert(sent_len.* == 0);
+    std.debug.assert(sent_len.* <= total_len);
     var segments_len: usize = 0;
     for (segments) |segment| {
         segments_len = std.math.add(usize, segments_len, segment.slice().len) catch
@@ -196,7 +205,11 @@ pub fn writeSegmentedBody(
     var segment_offset: usize = 0;
     for (segments) |segment| {
         const segment_bytes = segment.slice();
-        var segment_sent: usize = 0;
+        if (sent_len.* >= segment_offset + segment_bytes.len) {
+            segment_offset += segment_bytes.len;
+            continue;
+        }
+        var segment_sent = sent_len.* - segment_offset;
         const progress = try writeSpan(runtime, request_ctx, .{
             .bytes = segment_bytes,
             .body_offset = segment_offset,
@@ -205,7 +218,7 @@ pub fn writeSegmentedBody(
         sent_len.* = segment_offset + segment_sent;
         switch (progress) {
             .sent => {},
-            .ring_full, .socket_full => return progress,
+            .credit_empty, .ring_full, .socket_full => return progress,
         }
         segment_offset += segment_bytes.len;
     }
@@ -229,18 +242,25 @@ fn writeSpan(
     const chunk_limit = try chunkLimit(runtime);
     const identity = h2Identity(request_ctx);
     while (sent_len.* < span.bytes.len) {
+        const credit = request_ctx.response_credit.available();
+        if (credit == 0) {
+            request_ctx.response_advance.wait = .credit;
+            return .credit_empty;
+        }
         const chunk_start = sent_len.*;
         const chunk_len = @min(chunk_limit, span.bytes.len - chunk_start);
         if (chunk_len > ipc.ingress_channel.shared_payload_threshold) {
             const ingress_payload = if (runtime.requests.ingress_payload) |*view| view else return error.IngressSharedPayloadUnavailable;
-            if (!try ringFits(ingress_payload, chunk_len))
+            if (!try ringFits(ingress_payload, chunk_len)) {
+                request_ctx.response_advance.wait = .ring;
                 return .ring_full;
+            }
             const available_capacity = try ingress_payload.availableCapacity(.worker_to_server);
 
             var batch_entries: [ipc.ingress_channel.max_batch_descriptors]ipc.ingress_channel.BatchEntry = undefined;
             var batch_count: usize = 0;
             var batch_bytes: usize = 0;
-            while (chunk_start + batch_bytes < span.bytes.len and batch_count < batch_entries.len) {
+            while (chunk_start + batch_bytes < span.bytes.len and batch_count < @min(batch_entries.len, credit)) {
                 const next_start = chunk_start + batch_bytes;
                 const next_len = @min(chunk_limit, span.bytes.len - next_start);
                 if (next_len <= ipc.ingress_channel.shared_payload_threshold)
@@ -263,7 +283,7 @@ fn writeSpan(
                 batch_count += 1;
             }
             std.debug.assert(batch_count > 0);
-            switch (try ringSentOrBlocked(runtime, ingress_payload, ipc.ingress_channel.sendDescriptorBatchRingPayloads(
+            switch (try ringSentOrBlocked(runtime, request_ctx, ingress_payload, ipc.ingress_channel.sendDescriptorBatchRingPayloads(
                 control_fd,
                 batch_entries[0..batch_count],
                 runtime.core.dispatch_recv_scratch,
@@ -273,6 +293,7 @@ fn writeSpan(
                 .socket_full => return .socket_full,
                 .ring_full => return .ring_full,
             }
+            request_ctx.response_credit.spend(batch_count);
             request_ctx.client_served_bytes += batch_bytes;
             sent_len.* = chunk_start + batch_bytes;
             continue;
@@ -286,7 +307,7 @@ fn writeSpan(
             @intCast(chunk_len),
             span.endsStreamAt(chunk_end),
         );
-        switch (try sentOrBlocked(runtime, ipc.ingress_channel.sendDescriptorPayloadRequireRing(
+        switch (try sentOrBlocked(runtime, request_ctx, ipc.ingress_channel.sendDescriptorPayloadRequireRing(
             control_fd,
             descriptor,
             span.bytes[chunk_start..chunk_end],
@@ -296,6 +317,7 @@ fn writeSpan(
             .sent => {},
             .blocked => return .socket_full,
         }
+        request_ctx.response_credit.spend(1);
         request_ctx.client_served_bytes += chunk_len;
         sent_len.* = chunk_end;
     }
@@ -332,7 +354,9 @@ pub fn flushBufferedBody(
         head.deinit(runtime.core.allocator);
         buffered.head = null;
     }
-    return writeBody(runtime, request_ctx, buffered.body, &buffered.offset);
+    if (buffered.body.isContiguous())
+        return writeBody(runtime, request_ctx, buffered.body.contiguous(), &buffered.offset);
+    return writeSegmentedBody(runtime, request_ctx, buffered.body.segments(), buffered.body.len(), &buffered.offset);
 }
 
 /// Sends the head of `response` alone, ending the stream with it when
@@ -425,7 +449,7 @@ fn sendHead(
     descriptor: ipc.ingress_channel.Descriptor,
     payload: []const u8,
 ) !Sent {
-    const sent = try sentOrBlocked(runtime, ipc.ingress_channel.sendDescriptorPayload(
+    const sent = try sentOrBlocked(runtime, request_ctx, ipc.ingress_channel.sendDescriptorPayload(
         control_fd,
         descriptor,
         payload,
@@ -444,7 +468,7 @@ pub fn writeStreamEnd(
     request_ctx: *request_context.RequestContext,
 ) !Sent {
     const control_fd = runtime.core.control_fd orelse return error.InvalidArgument;
-    return sentOrBlocked(runtime, ipc.ingress_channel.sendDescriptor(
+    return sentOrBlocked(runtime, request_ctx, ipc.ingress_channel.sendDescriptor(
         control_fd,
         ipc.ingress_channel.Descriptor.responseEnd(
             h2Identity(request_ctx),
@@ -462,7 +486,7 @@ pub fn writeStreamReset(
     reset_code: u32,
 ) !Sent {
     const control_fd = runtime.core.control_fd orelse return error.InvalidArgument;
-    return sentOrBlocked(runtime, ipc.ingress_channel.sendDescriptor(
+    return sentOrBlocked(runtime, request_ctx, ipc.ingress_channel.sendDescriptor(
         control_fd,
         ipc.ingress_channel.Descriptor.responseReset(
             h2Identity(request_ctx),
@@ -474,8 +498,9 @@ pub fn writeStreamReset(
 }
 
 /// Sends the head and the first ring-sized chunks of `response_body` in one
-/// batch. Returns `.unbatched` when the body is small, the ring is absent or
-/// has no room, or the head does not fit the batch.
+/// batch, as many as the request's credit covers. Returns `.unbatched` when
+/// the body is small, the ring is absent or has no room, no credit is left,
+/// or the head does not fit the batch.
 pub fn trySendInitialRingBatch(
     runtime: *state.Runtime,
     request_ctx: *request_context.RequestContext,
@@ -486,6 +511,7 @@ pub fn trySendInitialRingBatch(
     const chunk_limit = try chunkLimit(runtime);
     if (response_body.len == 0 or chunk_limit <= ipc.ingress_channel.shared_payload_threshold)
         return .unbatched;
+    const credit = request_ctx.response_credit.available();
     const first_chunk_len = @min(chunk_limit, response_body.len);
     if (first_chunk_len <= ipc.ingress_channel.shared_payload_threshold)
         return .unbatched;
@@ -497,7 +523,7 @@ pub fn trySendInitialRingBatch(
     var chunk_count: usize = 0;
     var batch_body_bytes: usize = 0;
     var probe_offset: usize = 0;
-    while (probe_offset < response_body.len and chunk_count < ipc.ingress_channel.max_batch_descriptors - 1) {
+    while (probe_offset < response_body.len and chunk_count < @min(ipc.ingress_channel.max_batch_descriptors - 1, credit)) {
         const next_len = @min(chunk_limit, response_body.len - probe_offset);
         if (next_len <= ipc.ingress_channel.shared_payload_threshold)
             break;
@@ -560,7 +586,7 @@ pub fn trySendInitialRingBatch(
         };
     }
 
-    switch (try ringSentOrBlocked(runtime, ingress_payload, ipc.ingress_channel.sendDescriptorBatchPayloadsWithRing(
+    switch (try ringSentOrBlocked(runtime, request_ctx, ingress_payload, ipc.ingress_channel.sendDescriptorBatchPayloadsWithRing(
         control_fd,
         entries[0..entry_count],
         runtime.core.dispatch_recv_scratch,
@@ -571,6 +597,7 @@ pub fn trySendInitialRingBatch(
         // Nothing went out; the head goes alone and the body follows it.
         .ring_full => return .unbatched,
     }
+    request_ctx.response_credit.spend(chunk_count);
     request_ctx.client_served_bytes += body_offset;
     request_ctx.markResponseCommitted();
     return .{ .sent = body_offset };

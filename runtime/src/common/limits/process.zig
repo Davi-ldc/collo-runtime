@@ -18,6 +18,16 @@ pub const TRACE_EVENT_BUFFER_BYTES: usize = 192;
 /// outcome; the host's deadline arithmetic is in `host/launch.zig`.
 pub const WORKER_INIT_TIMEOUT_MS: i32 = 3_000;
 
+/// How long a pending module evaluation may stay pending, from the end of
+/// its synchronous part; it matches the cap AWS Lambda puts on a function's
+/// init phase. A hung await outlives every request that waits on it, so past
+/// this budget its route is pinned failed (`expireEvaluation` in
+/// `worker/modules/routes.zig`) and the requests parked on it get their 500.
+/// The host adds it to the init deadline for the boot token's deadline
+/// (`bootEgressDeadline` in `host/launch.zig`), so a worker that never
+/// reports its startup evaluations ended still loses the token.
+pub const MODULE_EVAL_BUDGET_NS: u64 = 10_000_000_000;
+
 /// Time the child keeps before the init deadline
 /// (`WorkerInit.init_deadline_mono_ns`) to stop the VM, report init_failed
 /// and exit before the host kills it: the boot evaluation's watchdog fires

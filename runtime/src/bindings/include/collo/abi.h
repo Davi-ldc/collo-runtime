@@ -367,14 +367,6 @@ enum {
     COLLO_RESPONSE_BODY_STREAM_CANCEL_INVALID_CHUNK = 2,
 };
 
-/* A chunk's bytes: lent from the chunk's buffer when `owner` is null, else
-   held by `owner`, which the caller releases with
-   collo_owned_byte_segments_destroy. */
-typedef struct ColloResponseBodyChunk {
-    ColloBuffer bytes;
-    ColloOwnedByteSegments* owner;
-} ColloResponseBodyChunk;
-
 /* What the engine measures its memory against, from collo_memory_status. */
 typedef struct ColloMemoryStatus {
     /* Bytes in use: the decimal the memory status override's descriptor
@@ -587,10 +579,6 @@ COLLO_STATIC_ASSERT(offsetof(ColloResponseExtractLimits, max_header_count) == 8,
 COLLO_STATIC_ASSERT(offsetof(ColloResponseExtractLimits, max_header_bytes) == 16,
     "ColloResponseExtractLimits.max_header_bytes offset mismatch");
 
-COLLO_STATIC_ASSERT(sizeof(ColloResponseBodyChunk) == 24, "ColloResponseBodyChunk ABI size mismatch");
-COLLO_STATIC_ASSERT(offsetof(ColloResponseBodyChunk, bytes) == 0, "ColloResponseBodyChunk.bytes offset mismatch");
-COLLO_STATIC_ASSERT(offsetof(ColloResponseBodyChunk, owner) == 16, "ColloResponseBodyChunk.owner offset mismatch");
-
 COLLO_STATIC_ASSERT(sizeof(ColloMemoryStatus) == 16, "ColloMemoryStatus ABI size mismatch");
 COLLO_STATIC_ASSERT(
     offsetof(ColloMemoryStatus, footprint_bytes) == 0, "ColloMemoryStatus.footprint_bytes offset mismatch");
@@ -772,13 +760,13 @@ void collo_response_extract_free(ColloExtractedResponse* response);
    read's result before it starts the next. */
 ColloStatus collo_response_body_stream_read(
     ColloResponseBodyStream* stream, uint64_t request_id, ColloValue** out_exception);
-/* The bytes of `chunk`, a value a read of `stream` returned. An ArrayBuffer or
-   ArrayBufferView is lent in place until the next call into the VM; a string
-   is encoded to UTF-8 in `out_chunk->owner`. Any other value, or a detached or
-   out-of-bounds buffer, fails with COLLO_STATUS_JS_EXCEPTION and a TypeError.
-   `out_chunk` is cleared on entry. */
-ColloStatus collo_response_body_stream_chunk(ColloResponseBodyStream* stream, const ColloValue* chunk,
-    ColloResponseBodyChunk* out_chunk, ColloValue** out_exception);
+/* The bytes of `chunk`, a value a read of `stream` returned: an ArrayBuffer or
+   ArrayBufferView, lent in place until the next call into the VM. Any other
+   value, a string included, or a detached or out-of-bounds buffer, fails with
+   COLLO_STATUS_JS_EXCEPTION and a TypeError, as the Fetch Standard requires of
+   a response body's chunks. `out_bytes` is cleared on entry. */
+ColloStatus collo_response_body_stream_chunk(
+    ColloResponseBodyStream* stream, const ColloValue* chunk, ColloBuffer* out_bytes, ColloValue** out_exception);
 /* Cancels `stream` with the reason `reason` names. Runs the stream's cancel
    algorithm, so the caller is inside a turn of the request that reads it. */
 ColloStatus collo_response_body_stream_cancel(
@@ -1156,8 +1144,8 @@ ColloStatus collo_blob_new_copy(
     ColloRealm* realm, ColloBuffer bytes, ColloString type, ColloValue** out_value, ColloValue** out_exception);
 ColloStatus collo_fetch_read_result_new_copy(
     ColloRealm* realm, ColloBuffer bytes, uint8_t done, ColloValue** out_value, ColloValue** out_exception);
-ColloStatus collo_form_data_new_from_bytes(ColloRealm* realm, ColloBuffer bytes, ColloString content_type,
-    ColloValue** out_value, ColloValue** out_exception);
+ColloStatus collo_form_data_new_from_bytes(
+    ColloRealm* realm, ColloBuffer bytes, ColloString content_type, ColloValue** out_value, ColloValue** out_exception);
 ColloStatus collo_object_new(ColloRealm* realm, ColloValue** out_value);
 ColloStatus collo_array_new(ColloRealm* realm, ColloValue** out_value);
 ColloStatus collo_global_this(ColloRealm* realm, ColloValue** out_value);

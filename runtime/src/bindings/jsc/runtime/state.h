@@ -100,8 +100,10 @@ struct ColloWebApiCache;
 namespace Collo {
 
 class GlobalObject;
-// The JSC VM's clientData, installed once at VM creation and deleted after heap finalization by the VM's destructor.
-// Its subspace follows sizeof(GlobalObject), including the native realm pointer, rather than sizeof(JSGlobalObject).
+// The JSC VM's clientData, installed once at VM creation. The VM deletes it after the heap has finalized and freed
+// every cell, so the subspace below outlives every GlobalObject. GlobalObject adds a field to JSGlobalObject, so its
+// cells are too large for JSC's own global object subspace and come from this one. Its cell type destroys through
+// ~JSGlobalObject, so GlobalObject may add only trivially destructible fields.
 struct VmClientData final : public JSC::VM::ClientData {
     explicit VmClientData(ColloVm*);
 
@@ -220,9 +222,7 @@ public:
 
     template <typename, JSC::SubspaceAccess> static JSC::GCClient::IsoSubspace* subspaceFor(JSC::VM& vm)
     {
-        auto* client_data = static_cast<VmClientData*>(vm.clientData);
-        RELEASE_ASSERT(client_data);
-        return &client_data->global_object_allocator;
+        return &static_cast<VmClientData*>(vm.clientData)->global_object_allocator;
     }
 
     DECLARE_INFO;

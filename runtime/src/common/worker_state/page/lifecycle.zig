@@ -67,10 +67,15 @@ pub const Header = extern struct {
     running_owner_id: u64,
     /// Sentinel thread.
     running_owner_cpu_ns: u64,
+    /// VM thread. 1 once the worker's startup evaluations all ended
+    /// (`worker/runtime/evaluations.zig`), 0 before. The host may end the
+    /// boot token early on 1; no value extends the token's deadline.
+    startup_evaluations_ended: u32,
+    _reserved0: u32,
 };
 
 comptime {
-    if (@sizeOf(Header) != 64)
+    if (@sizeOf(Header) != 72)
         @compileError("worker_state.page.Header size mismatch");
     if (@offsetOf(Header, "records_head") != 16)
         @compileError("worker_state.page.Header records_head offset mismatch");
@@ -78,6 +83,9 @@ comptime {
         @compileError("worker_state.page.Header owner_id offset mismatch");
     if (@offsetOf(Header, "running_owner_id") != 48)
         @compileError("worker_state.page.Header running_owner_id offset mismatch");
+    if (@offsetOf(Header, "startup_evaluations_ended") != 64 or
+        @offsetOf(Header, "_reserved0") != 68)
+        @compileError("worker_state.page.Header startup end offset mismatch");
 
     const zero_header = std.mem.zeroes(Header);
     if (zero_header.records_head != 0 or

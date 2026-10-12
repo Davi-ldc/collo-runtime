@@ -1,6 +1,7 @@
 //! The host's snapshots of a worker's page (`common/worker_state/page/snapshots.zig`): a live
 //! slot's raw state compared and never cast, its identity matched on the copy the caller keeps,
-//! the lifecycle tags converted only when their enums name them, the owner section's pairs, the
+//! the lifecycle tags converted only when their enums name them, the startup-end flag read as
+//! ended only at 1, the owner section's pairs, the
 //! running owner's refused while its sequence is odd, and the usage record ring's
 //! cursor, which keeps the host's tail in host memory, refuses a head no append can produce and
 //! never reloads the head between a peek and its advance. The server's use of them, the death
@@ -97,6 +98,21 @@ test "a lifecycle tag outside its enum reads as null" {
 
     header.termination_reason = std.math.maxInt(u32);
     try std.testing.expect(page.LifecycleSnapshot.load(&header).knownTerminationReason() == null);
+}
+
+test "the startup-end flag reads as ended at 1 and at no other value" {
+    const fd = try page.createMemfd("startup-completion-snapshot");
+    defer std.posix.close(fd);
+    var view = try page.mapReadWrite(fd);
+    defer view.deinit();
+    view.initializeCrashDefault();
+    try std.testing.expect(!page.LifecycleSnapshot.load(view.header).startupEnded());
+    view.publishStartupEvaluationsEnded();
+    try std.testing.expect(page.LifecycleSnapshot.load(view.header).startupEnded());
+    for ([_]u32{ 0, 2, std.math.maxInt(u32) }) |value| {
+        @atomicStore(u32, &view.header.startup_evaluations_ended, value, .release);
+        try std.testing.expect(!page.LifecycleSnapshot.load(view.header).startupEnded());
+    }
 }
 
 test "a running owner load refuses a pair the sentinel is still storing, and a pair that names no owner" {

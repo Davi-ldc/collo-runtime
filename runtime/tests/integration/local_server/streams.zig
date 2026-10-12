@@ -12,8 +12,8 @@
 //! of a streamed response runs without a server in `worker/tests/`.
 
 const std = @import("std");
+const http_body = @import("collo_limits").http_body;
 const process = @import("collo_os").process;
-const write_queue = @import("collo_server_main").ingress.runner.write_queue;
 const harness_mod = @import("harness.zig");
 
 const Harness = harness_mod.Harness;
@@ -26,12 +26,13 @@ const expectStatus = harness_mod.expectStatus;
 const h2_internal_error: u32 = 0x2;
 const h2_cancel: u32 = 0x8;
 
-/// The bytes the slow client's stream carries: twice what the server holds
-/// for one stream (`max_h2_pending_response_bytes_per_stream` in
-/// `server/ingress/runner/write_queue.zig`), a margin wider than the client's
-/// flow-control windows, so the body cannot sit between the worker and a
-/// client that reads none of it.
-const stalled_body_bytes: u64 = 2 * write_queue.max_h2_pending_response_bytes_per_stream;
+/// Twice what can leave the worker while the client reads nothing: the
+/// chunks of the response's credit, which the server holds, and what the
+/// client's flow-control windows let the server send, at most its stream
+/// window (`INITIAL_WINDOW_SIZE` in `runtime/tests/support/tls/tls_shim.cc`).
+const stalled_body_bytes: u64 = 2 * (http_body.INGRESS_RESPONSE_CHUNKS_IN_FLIGHT_MAX *
+    http_body.INGRESS_RESPONSE_CHUNK_BYTES + client_stream_window_bytes);
+const client_stream_window_bytes: usize = 1024 * 1024;
 /// How long the slow client reads nothing.
 const stall_ns: u64 = 2 * std.time.ns_per_s;
 
@@ -125,7 +126,7 @@ test "a server-sent events response delivers each event as it is produced, befor
 
 test "a slow client stalls a streamed body without losing a byte or the worker's slot, and the stream finishes once it reads" {
     var harness: Harness = undefined;
-    try harness.init(.{});
+    try harness.init(.{ .lane_count = 2 });
     defer harness.deinit();
     errdefer harness_mod.dumpZygoteTrace(&harness.spawned);
     const definition = try harness.definitionIndex("stream");
@@ -137,12 +138,21 @@ test "a slow client stalls a streamed body without losing a byte or the worker's
     const stream_id = try client.sendGet(path);
 
     // The client reads nothing for `stall_ns`, and the request keeps its
-    // slot on the worker all along. The body is larger than the server holds
-    // for one stream (`stalled_body_bytes`), so it arrives whole and without
-    // a reset only if the worker stops producing until the client reads
-    // again.
+    // slot on the worker all along. The body is larger than what can leave
+    // the worker meanwhile (`stalled_body_bytes`), so it arrives whole and
+    // without a reset only if the worker stops producing until the client
+    // reads again.
     _ = try harness_mod.waitForSlotsHeld(&harness, definition, 1);
     const stall_started_ns = try process.monotonicNowNs();
+    // A second connection must finish on the same worker while the first
+    // one reads nothing. Its request shares the worker's socket and rings.
+    var sibling_client = try Client.open(&harness);
+    defer sibling_client.close();
+    const sibling_response = try sibling_client.get("/stream?events=1");
+    try std.testing.expectEqualStrings("data: 0\n\n", try completeBody(&sibling_response));
+    var sibling_token_buffer: [64]u8 = undefined;
+    const sibling_token = try workerToken(&sibling_response, &sibling_token_buffer);
+    _ = try harness_mod.waitForSlotsHeld(&harness, definition, 1);
     while (try process.monotonicNowNs() - stall_started_ns < stall_ns) {
         std.Thread.sleep(100 * std.time.ns_per_ms);
         const worker = try harness_mod.soleLiveWorker(&harness, definition);
@@ -158,6 +168,7 @@ test "a slow client stalls a streamed body without losing a byte or the worker's
     for (response.body()) |byte| try std.testing.expectEqual(@as(u8, 'a'), byte);
     var first_token_buffer: [64]u8 = undefined;
     const first_token = try workerToken(&response, &first_token_buffer);
+    try std.testing.expectEqualStrings(first_token, sibling_token);
 
     // The worker that streamed it serves the connection's next request.
     const next = try client.get("/stream?events=1");

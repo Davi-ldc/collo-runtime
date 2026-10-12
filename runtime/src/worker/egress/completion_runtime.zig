@@ -6,7 +6,8 @@
 //! leaves the fetch promise pending for good. So once a live request owns the
 //! task, every path settles the promise, or fails the request when even a
 //! rejection cannot be made, before the task is destroyed. A task whose
-//! request is gone is destroyed without running JS.
+//! request is gone, or will run no more JavaScript, is destroyed without
+//! running JS (`discard`).
 
 const std = @import("std");
 const bindings = @import("collo_bindings");
@@ -19,27 +20,39 @@ const turn = @import("collo_worker_js").turn;
 const Task = task_mod.Task;
 const Result = task_mod.Result;
 
+/// Destroys the task of `fetch_id` with its result and response body,
+/// leaving its promise unsettled, for a request that is gone or that an
+/// ending already answered, so none of its JavaScript runs again
+/// (`serve/termination.zig:admitAtBoundary`). Does nothing when the task is
+/// already gone.
+pub fn discard(runtime: *egress_context.Context, fetch_id: u64) void {
+    const removed = runtime.egress_state.tasks.fetchRemove(fetch_id) orelse return;
+    const task = removed.value;
+    task.markCanceled();
+    if (task.result) |*stale_result| {
+        stale_result.deinit();
+        task.result = null;
+    }
+    _ = fetch_body_runtime.release(runtime, task.response_body_identity);
+    task.deinit(runtime.allocator);
+    runtime.allocator.destroy(task);
+}
+
 /// Runs the `fetch_completion` item of `fetch_id`: removes the task and
 /// settles its promise. Fails with `error.FetchCompletionNotFound` when the
 /// task is already gone, as after an evaluation's reap
 /// (`task_runtime.reapForRequest`).
 pub fn execute(runtime: *egress_context.Context, fetch_id: u64) !void {
-    const removed = runtime.egress_state.tasks.fetchRemove(fetch_id) orelse return error.FetchCompletionNotFound;
-    const task = removed.value;
+    const task = runtime.egress_state.tasks.get(fetch_id) orelse return error.FetchCompletionNotFound;
+    const request = runtime.requests.get(task.request_id) orelse {
+        discard(runtime, fetch_id);
+        return;
+    };
+    _ = runtime.egress_state.tasks.remove(fetch_id);
     defer {
         task.deinit(runtime.allocator);
         runtime.allocator.destroy(task);
     }
-
-    const request = runtime.requests.get(task.request_id) orelse {
-        task.markCanceled();
-        if (task.result) |*stale_result| {
-            stale_result.deinit();
-            task.result = null;
-        }
-        _ = fetch_body_runtime.release(runtime, task.response_body_identity);
-        return;
-    };
     if (task.isCanceled()) {
         if (task.result) |*stale_result| {
             stale_result.deinit();

@@ -9,7 +9,13 @@
 //! wired, a session the gateway hands back incomplete or an attach that fails
 //! leaves nothing open. What the launcher does with the grant is covered in
 //! `launcher.zig`, and the union a boot policy names in
-//! `server/tests/routes/network.zig`. Lane `server-supervisor-test`.
+//! `server/tests/routes/network.zig`. The supervisor ends a published
+//! worker's boot token once the worker's startup-end flag reads 1
+//! (`Supervisor.progressBootEgress`), on the launch's session whatever
+//! session the worker holds now, retries a failed send whatever the flag
+//! reads later, sends nothing for any other flag value or past the token's
+//! deadline, and an end sent for one worker leaves the record's next worker
+//! alone. Lane `server-supervisor-test`.
 
 const std = @import("std");
 const ipc = @import("collo_ipc");
@@ -120,6 +126,99 @@ test "a launch's egress fails with nothing open when no gateway is wired, the at
     try testing.expectEqual(open_before, try openFdCount());
 }
 
+const boot_deadline_ns: u64 = 10 * std.time.ns_per_s;
+const boot_token: supervision.worker_table.BootToken = .{
+    .gateway_generation = gateway_generation,
+    .session_id = first_session_id,
+    .deadline_mono_ns = boot_deadline_ns,
+};
+
+test "the startup-end flag ends the boot token once, and readiness alone does not" {
+    var supervisor = try fixture.minimalSupervisor(testing.allocator);
+    defer fixture.deinitMinimal(&supervisor);
+    const worker = try fixture.publishInertWorker(&supervisor, .{});
+    worker.boot_egress = boot_token;
+    var gateway: FakeGateway = .{};
+    gateway.wire(&supervisor);
+    worker.handle.metrics.?.setState(.ready, .none);
+    supervisor.progressBootEgress(worker, 1);
+    try testing.expectEqual(@as(usize, 0), gateway.end_attempts);
+
+    worker.handle.metrics.?.publishStartupEvaluationsEnded();
+    supervisor.progressBootEgress(worker, 2);
+    try testing.expectEqual(@as(usize, 1), gateway.end_attempts);
+    try testing.expect(worker.boot_egress == null);
+    supervisor.progressBootEgress(worker, 3);
+    try testing.expectEqual(@as(usize, 1), gateway.end_attempts);
+}
+
+test "a failed boot end is retried even if the worker clears its startup flag" {
+    var supervisor = try fixture.minimalSupervisor(testing.allocator);
+    defer fixture.deinitMinimal(&supervisor);
+    const worker = try fixture.publishInertWorker(&supervisor, .{});
+    worker.boot_egress = boot_token;
+    var gateway: FakeGateway = .{ .end_sent = false };
+    gateway.wire(&supervisor);
+    const view = &worker.handle.metrics.?;
+    view.publishStartupEvaluationsEnded();
+    supervisor.progressBootEgress(worker, 1);
+    try testing.expectEqual(@as(usize, 1), gateway.end_attempts);
+    @atomicStore(u32, &view.header.startup_evaluations_ended, 0, .release);
+    gateway.end_sent = true;
+    supervisor.progressBootEgress(worker, 2);
+    try testing.expectEqual(@as(usize, 2), gateway.end_attempts);
+    try testing.expect(worker.boot_egress == null);
+}
+
+test "a worker on a replacement session has the boot token of its launch session ended" {
+    var supervisor = try fixture.minimalSupervisor(testing.allocator);
+    defer fixture.deinitMinimal(&supervisor);
+    const worker = try fixture.publishInertWorker(&supervisor, .{});
+    worker.boot_egress = boot_token;
+    var gateway: FakeGateway = .{};
+    gateway.wire(&supervisor);
+    worker.egress_gateway_generation = gateway_generation + 1;
+    worker.egress_gateway_session_id = first_session_id + 1;
+    worker.handle.metrics.?.publishStartupEvaluationsEnded();
+    supervisor.progressBootEgress(worker, 1);
+    try testing.expectEqual(gateway_generation, gateway.ended_generation);
+    try testing.expectEqual(first_session_id, gateway.ended_session);
+}
+
+test "a startup-end flag other than 1 ends nothing, and a token past its deadline is dropped unsent" {
+    var supervisor = try fixture.minimalSupervisor(testing.allocator);
+    defer fixture.deinitMinimal(&supervisor);
+    const worker = try fixture.publishInertWorker(&supervisor, .{});
+    worker.boot_egress = boot_token;
+    var gateway: FakeGateway = .{};
+    gateway.wire(&supervisor);
+    const view = &worker.handle.metrics.?;
+    for ([_]u32{ 0, 2, std.math.maxInt(u32) }) |flag| {
+        @atomicStore(u32, &view.header.startup_evaluations_ended, flag, .release);
+        supervisor.progressBootEgress(worker, 1);
+    }
+    try testing.expectEqual(@as(usize, 0), gateway.end_attempts);
+    supervisor.progressBootEgress(worker, boot_deadline_ns);
+    try testing.expect(worker.boot_egress == null);
+    view.publishStartupEvaluationsEnded();
+    supervisor.progressBootEgress(worker, boot_deadline_ns);
+    try testing.expectEqual(@as(usize, 0), gateway.end_attempts);
+}
+
+test "an end sent for one worker leaves the boot token of the record's next worker" {
+    var supervisor = try fixture.minimalSupervisor(testing.allocator);
+    defer fixture.deinitMinimal(&supervisor);
+    const worker = try fixture.publishInertWorker(&supervisor, .{});
+    worker.boot_egress = boot_token;
+    worker.handle.metrics.?.publishStartupEvaluationsEnded();
+    const old = worker.bootEndAttempt(1).?;
+    // The record now holds another worker, whose end is not owed yet.
+    worker.generation += 1;
+    worker.boot_end_pending = false;
+    worker.completeBootEnd(old);
+    try testing.expectEqual(boot_token, worker.boot_egress.?);
+}
+
 /// One gateway behind the supervisor's egress hooks, run on the test thread:
 /// each attach builds a session on the wake set it is given, as
 /// `Manager.attachWorker` does, and the gateway's key is known only while
@@ -135,6 +234,11 @@ const FakeGateway = struct {
     definition_name: []const u8 = "",
     wake_set: ?*const WakeSet = null,
     key_asked_for: ?u64 = null,
+    /// What each boot token's end answers, as `Manager.endBoot` does.
+    end_sent: bool = true,
+    end_attempts: usize = 0,
+    ended_generation: u64 = 0,
+    ended_session: u64 = 0,
 
     fn wire(self: *FakeGateway, supervisor: *Supervisor) void {
         supervisor.setEgressGatewayHooks(.{
@@ -182,10 +286,12 @@ const FakeGateway = struct {
         return error.TestUnexpectedPrewarm;
     }
 
-    fn bootEnded(ctx: *anyopaque, generation: u64, session_id: u64) void {
-        _ = ctx;
-        _ = generation;
-        _ = session_id;
+    fn bootEnded(ctx: *anyopaque, generation: u64, session_id: u64) bool {
+        const self: *FakeGateway = @ptrCast(@alignCast(ctx));
+        self.end_attempts += 1;
+        self.ended_generation = generation;
+        self.ended_session = session_id;
+        return self.end_sent;
     }
 };
 

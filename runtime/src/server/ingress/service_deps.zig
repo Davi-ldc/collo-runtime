@@ -217,10 +217,6 @@ pub fn Methods(comptime Self: type) type {
             try fromContext(ctx).supervisor.prewarmEgressGateway();
         }
 
-        pub fn launchEgressBootEnded(ctx: *anyopaque, generation: u64, session_id: u64) void {
-            fromContext(ctx).supervisor.endEgressGatewayBootToken(generation, session_id);
-        }
-
         pub fn launchNextStaleEgressWorker(ctx: *anyopaque, generation: u64) ?launcher_mod.ReattachTarget {
             return fromContext(ctx).supervisor.nextStaleEgressWorker(generation);
         }

@@ -78,8 +78,6 @@ pub const RunnerSuite = struct {
     /// a plain path string, so the run waits on an install the object does
     /// not depend on.
     spawns_collo: bool = false,
-    /// See enableReleaseOnlyTests.
-    release_only_tests: bool = false,
 };
 
 const Skips = union(enum) {
@@ -156,8 +154,6 @@ fn addRunnerRun(
     };
     if (suite.spawns_collo)
         run.step.dependOn(ctx.install_collo_step);
-    if (suite.release_only_tests)
-        enableReleaseOnlyTests(ctx, run);
     switch (skips) {
         .inherited => {},
         .strict => |gate| {
@@ -280,7 +276,7 @@ fn createTestFixtureModules(b: *std.Build, ctx: *const context_mod.Context) Test
     });
     test_harness_module.addImport("collo_worker", ctx.jsc_set.get(.worker));
     ctx.jsc_set.importInto(test_harness_module, &.{
-        .ipc,          .os,   .http,    .egress_client, .egress_gateway,
+        .bindings,     .ipc,  .os,      .http, .egress_client, .egress_gateway,
         .worker_state, .host, .network,
     });
     test_harness_module.addImport("collo_worker_test_support", worker_test_support_module);
@@ -498,7 +494,6 @@ fn addMainSuite(
         .linked = linked_all,
         .configured_args = partition_args.items,
         .spawns_collo = true,
-        .release_only_tests = true,
     });
 
     for (domain_steps) |domain| {
@@ -507,7 +502,6 @@ fn addMainSuite(
             .linked = linked_all,
             .configured_args = filterArgs(b, domain.filters),
             .spawns_collo = true,
-            .release_only_tests = true,
         }, .inherited);
         b.step(domain.step_name, domain.description).dependOn(&run.step);
     }
@@ -647,14 +641,6 @@ fn applyGcStressProfile(
     run.setName(b.fmt("run the {s} GC stress profile" ++ name_suffix, .{profile.name}));
     for (profile.environment) |variable|
         run.setEnvironmentVariable(variable.name, variable.value);
-}
-
-/// Tests that tear down a terminated VM trip a JSC debug-build assertion, so
-/// they run only against a Release JSC; the build knows the profile, so the
-/// gate is decided here instead of by whoever remembers to set the variable.
-fn enableReleaseOnlyTests(ctx: *const context_mod.Context, run: *std.Build.Step.Run) void {
-    if (std.mem.eql(u8, ctx.jsc.cmake_build_type, "Release"))
-        run.setEnvironmentVariable("COLLO_VM_TERMINATION_RELEASE_LANE", "1");
 }
 
 // Domain partition of the `all` suite. Test names are file paths relative to

@@ -41,7 +41,6 @@ const worker_shared_page = @import("collo_worker_state").page;
 const runtime_core = @import("runtime/root.zig");
 const runtime_types = @import("runtime/types.zig");
 const scheduler_loop = @import("scheduler/loop.zig");
-const scheduler_queue = @import("scheduler/queue.zig");
 const host_completion = @import("host/completion.zig");
 const host_crypto = @import("host/crypto.zig");
 const host_fetch = @import("host/fetch.zig");
@@ -65,10 +64,11 @@ pub const RuntimeOptions = runtime_types.RuntimeOptions;
 /// evaluation (`modules/routes.zig` defines them).
 pub const BootEvalMarks = @import("modules/routes.zig").BootEvalMarks;
 
-/// Runs one work item as a turn, as the loop does (`scheduler/loop.zig`),
-/// for a caller that drives the runtime without `run`.
-pub fn executeWorkItem(runtime: *runtime_core.Runtime, item: scheduler_queue.WorkItem) !void {
-    try scheduler_loop.executeWorkItem(runtime, item);
+/// Runs one pass of the loop without waiting, for a caller that drives the
+/// runtime on its own thread instead of `run` (`runPass` in
+/// `scheduler/loop.zig` says what a pass does and what it needs).
+pub fn runPass(runtime: *runtime_core.Runtime) !void {
+    try scheduler_loop.runPass(runtime);
 }
 
 /// The internal files the worker suites reach through this module; empty
@@ -76,6 +76,7 @@ pub fn executeWorkItem(runtime: *runtime_core.Runtime, item: scheduler_queue.Wor
 pub const testing = if (builtin.is_test) struct {
     pub const request_dispatch = @import("serve/dispatch.zig");
     pub const module_routes = @import("modules/routes.zig");
+    pub const response_flow = @import("serve/response.zig");
     pub const response_finish = @import("serve/response_finish.zig");
     pub const response_payload_writer = @import("serve/response_payload_writer.zig");
     pub const sentinel = @import("runtime/sentinel.zig");

@@ -267,6 +267,14 @@ pub fn sendExact(fd: std.posix.fd_t, bytes: []const u8) !void {
         return error.ShortWrite;
 }
 
+/// Sends one atomic packet without waiting, regardless of the fd's flags.
+/// A full socket returns `error.WouldBlock` without publishing any bytes.
+pub fn sendExactNonblocking(fd: std.posix.fd_t, bytes: []const u8) !void {
+    const written = try sendCompat(fd, bytes, std.posix.MSG.NOSIGNAL | std.posix.MSG.DONTWAIT);
+    if (written != bytes.len)
+        return error.ShortWrite;
+}
+
 /// Receives one packet that must be exactly `bytes.len` long; a shorter one
 /// fails with `error.ShortRead`, a longer one with `error.TruncatedMessage`.
 pub fn recvPacketExact(fd: std.posix.fd_t, bytes: []u8) !void {

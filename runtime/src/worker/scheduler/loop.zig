@@ -20,8 +20,9 @@
 //! `egress_attach` packet on the control channel attaches it again. The
 //! worker's end of the control channel does not block
 //! (`zygote/child_boot.zig`): a response or a notice that finds it full
-//! waits, and the loop sends it when the socket turns writable or the
-//! payload ring gets room (`serve/response.zig`).
+//! waits. When the socket turns writable or the payload ring gets room, the
+//! loop queues the advance of each response that waited for it
+//! (`serve/response.zig:notifyTransport`) and sends the notice.
 
 const std = @import("std");
 const bindings = @import("collo_bindings");
@@ -35,7 +36,8 @@ const immediates = @import("immediates.zig");
 const timers = @import("timers.zig");
 const request_dispatch = @import("../serve/dispatch.zig");
 const termination = @import("../serve/termination.zig");
-const response_body_stream = @import("../serve/response_body_stream.zig");
+const response_flow = @import("../serve/response.zig");
+const request_ingress = @import("collo_worker_request").ingress.runtime;
 const egress_completion = @import("../egress/completion_runtime.zig");
 const egress_gateway = @import("../egress/gateway_runtime.zig");
 const exception_log = @import("collo_worker_js").exception_log;
@@ -204,7 +206,7 @@ fn handleEvent(
             error.ControlPeerClosed => return error.ControlPeerClosed,
             else => return err,
         },
-        .control_writable => try flushParkedResponses(runtime),
+        .control_writable => try handleControlWritable(runtime),
         .wakeup_ready => {
             runtime.drainWakeup();
             try collectFast(runtime);
@@ -218,24 +220,44 @@ fn handleEvent(
         .egress_closed => |reason| runtime.disconnectEgressGatewayWithReason(@tagName(reason)),
         .ingress_payload_credit_ready => {
             runtime.drainIngressPayloadCredit();
-            try flushParkedResponses(runtime);
+            response_flow.notifyTransport(runtime, .ring);
         },
         .fs_fault_ready => try runtime.collectFsFaultResponse(),
         .timer_deadline => try collectFast(runtime),
     }
 }
 
-/// Sends what the requests' outboxes hold (`serve/response.zig`), then a
-/// retirement notice that found the socket full (`runtime/retirement.zig`).
-/// A send that finds the server gone fails with `error.ControlPeerClosed`,
-/// which stops the loop as a hangup seen by a control poll does; the server
-/// may close between a poll's report and the send.
-pub fn flushParkedResponses(runtime: *state.Runtime) !void {
-    runtime.flushPendingIngressResponses() catch |err| switch (err) {
-        error.PeerClosed => return error.ControlPeerClosed,
+/// Handles the control socket turning writable: queues the advance of every
+/// response that waited for room in it (`serve/response.zig:notifyTransport`),
+/// then sends a retirement notice that found the socket full
+/// (`runtime/retirement.zig`). A notice whose send finds the server gone
+/// fails with `error.ControlPeerClosed`, which stops the loop as a hangup
+/// does; a response's send finds it in its advance (`runItem`).
+pub fn handleControlWritable(runtime: *state.Runtime) !void {
+    response_flow.notifyTransport(runtime, .socket);
+    try runtime.sendRetirementNotice();
+}
+
+/// One pass of the loop for a caller that drives the runtime on its own
+/// thread instead of `run`, as a bench does: takes one control packet when
+/// the socket holds one, which may be a response grant, resumes every
+/// response that waited for room in the control socket or the payload ring,
+/// collects what became ready and runs at most one work item. Such a caller
+/// polls neither the socket nor the ring, so each pass retries what waits
+/// for them, and a retry that finds no room waits again. The worker's end of
+/// the control socket must not block, as `zygote/child_boot.zig` leaves it,
+/// so a pass waits on no event. Fails as `collectControlPacket` and the
+/// collectors do.
+pub fn runPass(runtime: *state.Runtime) !void {
+    collectControlPacket(runtime) catch |err| switch (err) {
+        error.WouldBlock => {},
         else => return err,
     };
-    try runtime.sendRetirementNotice();
+    response_flow.notifyTransport(runtime, .socket);
+    response_flow.notifyTransport(runtime, .ring);
+    try collectFast(runtime);
+    if (runtime.scheduler.ready_queue.pop()) |item|
+        try executeWorkItem(runtime, item);
 }
 
 fn gatewayIpcDrainBatch(runtime: *const state.Runtime) usize {
@@ -326,6 +348,12 @@ pub fn collectControlPacket(runtime: *state.Runtime) !void {
                 try runtime.enqueueIngressDescriptor(received);
             }
         },
+        .response_credit => {
+            const credit = try ipc.response_credit.decode(&packet);
+            packet.deinit();
+            packet_alive = false;
+            try request_ingress.enqueueResponseCredit(runtime, credit);
+        },
         .egress_attach => {
             // `decode` takes the descriptors only on success; on failure they
             // stay in the packet, whose errdefer deinit closes them. A half
@@ -350,25 +378,56 @@ pub fn collectControlPacket(runtime: *state.Runtime) !void {
 /// window of its owner: the request or evaluation its queue slot names,
 /// resolved when it was queued because the handler maps may no longer hold
 /// the entry (`readyItemOwnerRequestId`). The turn consumes the ready item
-/// that enqueue counted. An item with no owner, an fs fault completion or
-/// one whose entry was gone at enqueue, opens no window. A request owner
-/// that already reached an ending, its CPU budget spent or its deadline
-/// passed, is answered first, and the item then runs with its request
-/// finished, which only releases what the item held. A request a window of
-/// the item took past its budget is answered after it. Each handler's
-/// failure is answered or logged per item and never ends the loop.
+/// that enqueue counted, and `termination.admitAtBoundary` decides whether
+/// the item runs. A skipped item is released as if its request were gone:
+/// a fetch completion frees its task here, since only its own run would,
+/// and the request's finish frees what every other kind held. An item with
+/// no owner opens no window: an fs fault completion, or one whose entry was
+/// gone at enqueue or whose work vanished, among them a withdrawn response
+/// advance, which does nothing, since its response was dropped. A request a
+/// window of the item took past its budget is answered after it. Each
+/// handler's failure is answered or logged per item, except a response send
+/// that finds the server gone, which stops the loop as a hangup does.
 pub fn executeWorkItem(runtime: *state.Runtime, item: ready_queue.WorkItem) !void {
     const owner_id = runtime.scheduler.ready_queue.last_popped_meta.owner_request_id;
     runtime.scheduler.ready_queue.last_popped_meta = .{};
     if (owner_id != 0) {
         const previous_owner_id = runtime_owner.enter(runtime, owner_id, .{ .consumes_ready_item = true });
         defer runtime_owner.leave(runtime, previous_owner_id);
-        termination.endAtBoundary(runtime, owner_id);
-        runItem(runtime, item);
-    } else {
+        if (termination.admitAtBoundary(runtime, owner_id, itemRole(runtime, owner_id, item))) {
+            runItem(runtime, item);
+        } else if (item == .fetch_completion) {
+            var egress_ctx = runtime.egressContext();
+            egress_completion.discard(&egress_ctx, item.fetch_completion);
+        }
+    } else if (item != .response_advance) {
         runItem(runtime, item);
     }
     runtime.endSpentBudgets();
+}
+
+/// What `item` does for its owner `owner_id` (`termination.ItemRole`).
+fn itemRole(runtime: *state.Runtime, owner_id: u64, item: ready_queue.WorkItem) termination.ItemRole {
+    return switch (item) {
+        .response_advance => .response,
+        .request_cancelled => .cancel,
+        .fetch_body_ready => |body_id| role: {
+            const ctx = runtime.requests.active.get(owner_id) orelse break :role .other;
+            break :role switch (ctx.response_stream) {
+                .fetch => |fetch| if (fetch.identity.body_id == body_id) .response else .other,
+                .none, .body_stream => .other,
+            };
+        },
+        .request,
+        .request_body_ready,
+        .request_deadline,
+        .request_completion,
+        .timer_callback,
+        .immediate_callback,
+        .fetch_completion,
+        .fs_fault_completion,
+        => .other,
+    };
 }
 
 fn runItem(runtime: *state.Runtime, item: ready_queue.WorkItem) void {
@@ -399,8 +458,10 @@ fn runItem(runtime: *state.Runtime, item: ready_queue.WorkItem) void {
             runtime.handleFetchBodyReadyFailure(body_id, err),
         .fs_fault_completion => |fault_id| runtime.executeFsFaultCompletion(fault_id) catch |err|
             runtime.handleFsFaultCompletionFailure(fault_id, err),
-        .response_body_stream => |request_id| response_body_stream.execute(runtime, request_id) catch |err|
-            request_dispatch.handleLocalFailure(runtime, request_id, err),
+        .response_advance => |request_id| response_flow.executeAdvance(runtime, request_id) catch |err| switch (err) {
+            error.PeerClosed => runtime.core.running = false,
+            else => request_dispatch.handleLocalFailure(runtime, request_id, err),
+        },
     }
 }
 

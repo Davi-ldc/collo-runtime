@@ -79,8 +79,8 @@ test "a gateway whose control channel fails is retired and the next attach spawn
     try std.testing.expectEqual(@as(?u64, 1), losses.waitFirst());
     try std.testing.expectEqual(@as(u64, 0), manager.currentGeneration());
     try std.testing.expect(!manager.keyFor(1, &other_key));
-    // A boot token's end for the dead gateway has nowhere to go and fails nothing.
-    manager.requestEnded(1, .{ .session_id = 1, .request_id = 0, .request_generation = 0 });
+    // A boot token's end for the dead gateway counts as done, so its worker stops retrying it.
+    try std.testing.expect(manager.endBoot(1, 1));
 
     // The next launch's attach spawns generation 2 under a key of its own.
     var wake_set = try ipc.egress_shared.WakeSet.create();
@@ -235,7 +235,7 @@ test "the supervisor's hooks reach a live gateway, whose attach leaves only the 
     // The gateway's half and the session's other descriptors closed once the gateway acknowledged.
     const worker_half_fd_count = ipc.egress_shared.region_fd_count + ipc.egress_shared.wake_fd_count;
     try std.testing.expectEqual(open_before + worker_half_fd_count, try openFdCount());
-    gateway.manager.bootEndedCallback(&manager, 1, attachment.session_id);
+    try std.testing.expect(gateway.manager.bootEndedCallback(&manager, 1, attachment.session_id));
     attachment.deinit();
     try std.testing.expectEqual(open_before, try openFdCount());
     try std.testing.expectEqual(@as(u64, 1), manager.currentGeneration());

@@ -14,6 +14,11 @@ pub const MATERIALIZED_BODY_BYTES_MAX: usize = 4 * 1024 * 1024;
 /// the shared payload ring at once.
 pub const INGRESS_RESPONSE_CHUNK_BYTES: usize = 64 * 1024;
 
+/// The response body chunks one request may hold that its client has not
+/// taken yet: the credit window `common/ipc/response_credit.zig:Window`
+/// counts, which says what holds credit and for how long.
+pub const INGRESS_RESPONSE_CHUNKS_IN_FLIGHT_MAX: u32 = 4;
+
 /// Most bytes the gateway moves from a fetch's body queue into the worker's
 /// body pool in one drain, the default of `Policy.max_body_chunk_bytes`
 /// (`egress/gateway/policy.zig`). It is separate from

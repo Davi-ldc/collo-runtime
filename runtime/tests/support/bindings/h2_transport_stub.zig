@@ -145,6 +145,35 @@ pub const ResponseBodyStream = struct {
     }
 };
 
+pub const ByteSegment = extern struct {
+    bytes: RawBuffer = .{ .ptr = null, .len = 0 },
+
+    pub fn slice(self: ByteSegment) []const u8 {
+        return if (self.bytes.len == 0) "" else self.bytes.ptr.?[0..self.bytes.len];
+    }
+};
+
+/// A response body the bridge extracted, whole or in segments. Nothing in
+/// the stub graph extracts one, so it owns no engine memory to release.
+pub const ExtractedResponseBody = struct {
+    total_len: usize = 0,
+    segments: ?[*]const ByteSegment = null,
+    segments_len: usize = 0,
+
+    pub fn deinit(self: *ExtractedResponseBody) void {
+        self.* = .{};
+    }
+
+    pub fn segmentsSlice(self: ExtractedResponseBody) []const ByteSegment {
+        return if (self.segments) |ptr| ptr[0..self.segments_len] else &.{};
+    }
+
+    pub fn firstContiguousSlice(self: ExtractedResponseBody) []const u8 {
+        const segments = self.segmentsSlice();
+        return if (segments.len == 1) segments[0].slice() else &.{};
+    }
+};
+
 /// Runs no JavaScript: `isCallable` answers true, so a test in the stub graph
 /// can check transport and bookkeeping but never a script's result.
 pub const Vm = struct {

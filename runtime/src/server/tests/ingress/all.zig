@@ -1,10 +1,10 @@
 //! Collects the suites of the server's ingress (`server/ingress/`). Lane
 //! `server-ingress-test`. `fault.zig` pins the failure-domain tables;
 //! `worker_faults.zig`, `lane_commands.zig`, `lane_connections.zig`,
-//! `lane_ring.zig`, `request_deadlines.zig`, `egress_tokens.zig` and
-//! `connection_rekey.zig` drive a whole lane through its loop handlers
-//! against stub workers (`lane_harness.zig`); a whole service with real
-//! workers runs in `local-e2e`.
+//! `lane_ring.zig`, `request_deadlines.zig`, `egress_tokens.zig`,
+//! `response_credit.zig` and `connection_rekey.zig` drive a whole lane
+//! through its loop handlers against stub workers (`lane_harness.zig`); a
+//! whole service with real workers runs in `local-e2e`.
 
 comptime {
     _ = @import("fault.zig");
@@ -18,6 +18,7 @@ comptime {
     _ = @import("health_state.zig");
     _ = @import("fs_fault.zig");
     _ = @import("h2_worker_framing.zig");
+    _ = @import("response_credit.zig");
     _ = @import("peer_address.zig");
     _ = @import("runner_contract.zig");
     _ = @import("stream_target.zig");

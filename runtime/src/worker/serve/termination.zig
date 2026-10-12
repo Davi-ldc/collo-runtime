@@ -109,22 +109,36 @@ fn endingOfCause(cause: sentinel_mod.Cause) Ending {
 }
 
 /// Ends the dispatched request `request_ctx` with `ending`'s answer; does
-/// nothing once its finish started. Its deadline is disarmed first, so the
+/// nothing once its finish started or an ending answered it already
+/// (`answeringEnding`). Its deadline is disarmed first, so the
 /// sentinel watches no deadline of a request that is being answered, and a
 /// body still arriving fails, so a read waiting on it settles in the
 /// finish's cleanup. A response whose head went out is reset at once with
 /// the ending's statuses (`response.zig:failResponse`), which runs no
 /// JavaScript for these done statuses; left to finish, its completion would
-/// park on the server until the request's grace backstop.
+/// park on the server until the request's grace backstop. When the answer
+/// fails, the request is no longer marked as answering, so its failure path
+/// (`dispatch.zig:failInternal`) answers it again or finishes it.
 pub fn end(
     runtime: *state.Runtime,
     request_ctx: *request_context.RequestContext,
     ending: Ending,
 ) !void {
     std.debug.assert(!request_context.isReservedId(request_ctx.exec.request_id));
-    if (request_ctx.finish_started)
+    if (request_ctx.finish_started or answeringEnding(request_ctx))
         return;
     const answer = answerOf(ending);
+    // A request left marked after a failed answer would make every later
+    // `end` return at the guard above, and nothing would finish it until the
+    // server's backstop faults the whole worker.
+    const previous_done_status = request_ctx.response_done_status;
+    const previous_http_status = request_ctx.response_http_status;
+    request_ctx.response_done_status = answer.done_status;
+    request_ctx.response_http_status = answer.http_status;
+    errdefer {
+        request_ctx.response_done_status = previous_done_status;
+        request_ctx.response_http_status = previous_http_status;
+    }
     runtime.disarmRequestDeadline(request_ctx);
     if (!request_ctx.body.isComplete())
         request_ctx.body.pipe.fail(answer.body_failure);
@@ -222,19 +236,60 @@ pub fn endSpentBudgets(runtime: *state.Runtime) void {
         endById(runtime, request_id);
 }
 
-/// Answers the owner of a work item about to run instead of running its
-/// JavaScript, when that owner is a dispatched request that reached an
-/// ending (`executeWorkItem` in `scheduler/loop.zig`). The item still runs
-/// afterwards and finds its request finished, which releases what it held.
-pub fn endAtBoundary(runtime: *state.Runtime, owner_id: u64) void {
+/// What a work item does for its request, which decides whether it runs
+/// once the request reached an ending (`admitAtBoundary`).
+pub const ItemRole = enum {
+    /// Moves the response toward its end without the tenant's JavaScript:
+    /// the response's advance, or the pull of the fetch body it streams.
+    response,
+    /// The client reset the request's stream. Nothing else finishes such a
+    /// request, since its advance sends nothing once the reset is recorded
+    /// (`response.zig:executeAdvance`).
+    cancel,
+    /// Any other item, which may run the tenant's JavaScript.
+    other,
+};
+
+/// Whether a work item of `owner_id` that plays `role` may run, called in
+/// the owner's window before the item (`executeWorkItem` in
+/// `scheduler/loop.zig`). The items of an evaluation, of a request that is
+/// gone or finishing, and of a request that reached no ending always run. A
+/// request that reached an ending is answered here (`end`), and from then on
+/// only its `response` and `cancel` items run: the answer may still wait for
+/// credit or room, and none of the request's JavaScript may run. The
+/// exception is a decided response under a fire for another owner, which is
+/// left to drain without an answer, as `endAfterFire` leaves it; its
+/// request's `other` items are skipped, so none of them resets it. A cancel
+/// at these boundaries runs none of the tenant's JavaScript, since the
+/// answer released the response's source and a decided response's source
+/// needs none.
+pub fn admitAtBoundary(runtime: *state.Runtime, owner_id: u64, role: ItemRole) bool {
     if (request_context.isReservedId(owner_id))
-        return;
-    const request_ctx = runtime.requests.active.get(owner_id) orelse return;
+        return true;
+    const request_ctx = runtime.requests.active.get(owner_id) orelse return true;
     if (request_ctx.finish_started)
-        return;
-    const ending = endingOf(runtime, request_ctx) orelse return;
-    end(runtime, request_ctx, ending) catch |err|
-        runtime.handleRequestFailure(owner_id, err);
+        return true;
+    if (!answeringEnding(request_ctx)) {
+        const ending = endingOf(runtime, request_ctx) orelse return true;
+        if (ending == .worker_stopped and responseDecided(request_ctx))
+            return role != .other;
+        end(runtime, request_ctx, ending) catch |err|
+            runtime.handleRequestFailure(owner_id, err);
+    }
+    const after = runtime.requests.active.get(owner_id) orelse return true;
+    if (!answeringEnding(after))
+        return true;
+    return role != .other;
+}
+
+/// Whether `end` answered the request: it records the ending's done status
+/// before it drops the old response, and the answer may still wait to be
+/// sent. A failed answer gives the previous status back.
+fn answeringEnding(request_ctx: *const request_context.RequestContext) bool {
+    return switch (request_ctx.response_done_status) {
+        .deadline_timeout, .cpu_exceeded, .worker_stopped, .worker_retiring => true,
+        else => false,
+    };
 }
 
 /// Ends request `request_id` with the ending it reached, `worker_stopped`
@@ -248,8 +303,8 @@ fn endById(runtime: *state.Runtime, request_id: u64) void {
 
 /// Whether the response of `request_ctx` can reach its end without running
 /// JavaScript: its head went out or its body streams from a fetch, or a
-/// step of it waits in its outbox for the flush, and no body stream still
-/// needs a read, which a poisoned VM can never give.
+/// step of it waits in its outbox, and no body stream still needs a read,
+/// which a poisoned VM can never give.
 fn responseDecided(request_ctx: *const request_context.RequestContext) bool {
     if (request_ctx.response_stream.needsJavaScript())
         return false;

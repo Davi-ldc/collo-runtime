@@ -105,8 +105,10 @@ pub const EgressGatewayHooks = struct {
     keyFor: *const fn (ctx: *anyopaque, generation: u64, out: *ipc.egress_token.Key) bool,
     /// `Manager.prewarm`: spawns a gateway when none is current.
     prewarm: *const fn (ctx: *anyopaque) anyerror!void,
-    /// `Manager.requestEnded` for the boot token of session `session_id`.
-    bootEnded: *const fn (ctx: *anyopaque, generation: u64, session_id: u64) void,
+    /// `Manager.endBoot`: ends the boot token of session `session_id`, true
+    /// when the end went out or gateway `generation` is gone, false when the
+    /// send failed.
+    bootEnded: *const fn (ctx: *anyopaque, generation: u64, session_id: u64) bool,
 };
 
 /// A worker's egress session as a lane mints its tokens: its gateway's
@@ -526,12 +528,16 @@ pub const Supervisor = struct {
         try hooks.prewarm(hooks.ctx);
     }
 
-    /// Ends the boot token of egress session `session_id` of gateway
-    /// `generation` at the gateway, best effort, when its worker reports
-    /// `WorkerReady`; does nothing when none is wired.
-    pub fn endEgressGatewayBootToken(self: *Supervisor, generation: u64, session_id: u64) void {
+    /// Ends `worker`'s boot token at its gateway once the worker's startup
+    /// evaluations ended (`Record.bootEndAttempt`), holding no worker lock
+    /// across the send; a send that fails is tried again on the next pass.
+    /// The metrics thread calls it on each pass
+    /// (`server/ingress/analytics_drain.zig`).
+    pub fn progressBootEgress(self: *Supervisor, worker: *WorkerRecord, now_ns: u64) void {
+        const attempt = worker.bootEndAttempt(now_ns) orelse return;
         const hooks = self.egress_gateway orelse return;
-        hooks.bootEnded(hooks.ctx, generation, session_id);
+        if (hooks.bootEnded(hooks.ctx, attempt.token.gateway_generation, attempt.token.session_id))
+            worker.completeBootEnd(attempt);
     }
 };
 

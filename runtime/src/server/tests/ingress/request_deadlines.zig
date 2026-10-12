@@ -19,6 +19,7 @@
 
 const std = @import("std");
 const h2 = @import("collo_http").http2;
+const limits = @import("collo_limits");
 const lane_harness = @import("lane_harness.zig");
 
 const Harness = lane_harness.Harness;
@@ -166,9 +167,9 @@ test "the grace backstop reads the worker's output through a slow connection's b
 
     const chunk: [1024]u8 = @splat('s');
     try scene.stub.sendHead(slow, 200, false);
-    for (0..6) |_|
-        try scene.stub.sendChunk(slow, &chunk, false);
-    try scene.stub.sendChunk(slow, &chunk, true);
+    const chunk_count = limits.http_body.INGRESS_RESPONSE_CHUNKS_IN_FLIGHT_MAX;
+    for (0..chunk_count) |index|
+        try scene.stub.sendChunk(slow, &chunk, index + 1 == chunk_count);
     try scene.stub.publishCompletion(slow, .{ .http_status = 200 });
     // Behind all of that, the worker answered stream 3's deadline itself.
     try scene.stub.sendHead(late, 504, true);

@@ -212,7 +212,6 @@ test "every error the classified callees return today is in their table or is a 
         assertCovered(ErrorsOf(ipc.fs_fault.sendResponse), fault.WorkerSendError, "WorkerSendError");
 
         assertCovered(ErrorsOfCall(@TypeOf(writing.queueWorkerResponseDescriptor(StubLane, stub_lane, stub_slot, stub_received))), fault.ResponseQueueError, "ResponseQueueError");
-        assertCovered(ErrorsOfCall(@TypeOf(writing.tryQueueWorkerResponseHeadChunkPair(StubLane, stub_lane, stub_slot, &.{}))), fault.ResponseQueueError, "ResponseQueueError");
 
         assertCovered(ErrorsOf(std.os.linux.IoUring.poll_add), fault.RingError, "RingError");
         assertCovered(ErrorsOf(std.os.linux.IoUring.poll_remove), fault.RingError, "RingError");
@@ -853,6 +852,8 @@ const StubLane = struct {
     pub fn updateConnectionInterest(_: *StubLane, _: *Slot) error{}!void {}
 
     pub fn closeRuntimeConnection(_: *StubLane, _: *Slot, _: anytype) void {}
+
+    pub fn responseChunkRetired(_: *StubLane, _: anytype) error{}!void {}
 
     pub fn startDynamicH2(_: *StubLane, _: *Slot, _: u32, _: *const request_head.ParsedHead) error{}!bool {
         return true;

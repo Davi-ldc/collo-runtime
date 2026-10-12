@@ -24,6 +24,7 @@ const body_read = @import("collo_worker_request").body_read;
 const copies = @import("../fs/copies.zig");
 const request_context = @import("collo_worker_request").context;
 const response_body_stream = @import("response_body_stream.zig");
+const response_stream = @import("collo_worker_request").response_stream;
 const runtime_owner = @import("../runtime/owner.zig");
 const state = @import("../runtime/root.zig");
 const tracing = @import("trace.zig");
@@ -140,8 +141,8 @@ pub fn finishRequest(
     // A completion reaches the host only through the shared page's
     // completion ring, followed by a signal on the completion eventfd. No
     // packet of the response follows it: a response whose steps waited in
-    // the outbox finishes its request from the flush once the last one is
-    // sent (`serve/response.zig`), and any other finish dropped what the
+    // the outbox finishes its request from the advance that sends the last
+    // one (`serve/response.zig`), and any other finish dropped what the
     // outbox held in the cleanup above.
     runtime.observability.metrics_view.publishWorkerCompletion(.{
         .external_request_id = request_id,
@@ -266,19 +267,21 @@ fn freeLiveSlotOnce(
     request_ctx.live_slot_released = true;
 }
 
-/// Frees the response steps `request_ctx` still has waiting to be sent,
-/// returning a stream chunk's credits to the gateway.
+/// Drops the response's queued advance and frees the step `request_ctx`
+/// still has waiting to be sent, returning a stream chunk's credits to the
+/// gateway.
 pub fn releasePendingIngressResponse(
     runtime: *state.Runtime,
     request_ctx: *request_context.RequestContext,
 ) void {
+    response_stream.discardAdvance(runtime, request_ctx);
     switch (request_ctx.response_outbox.take()) {
         .none, .stream_end, .stream_reset => {},
         .buffered_body => |buffered| {
             var parked = buffered;
             if (parked.head) |*head|
                 head.deinit(runtime.core.allocator);
-            runtime.core.allocator.free(parked.body);
+            parked.body.deinitOwned(runtime.core.allocator);
         },
         .stream_head => |stream_head| {
             var head = stream_head;

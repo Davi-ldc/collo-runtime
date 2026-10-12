@@ -16,7 +16,6 @@
 
 #include "host_functions/server/fetch/response_body_stream.h"
 
-#include "host_functions/server/fetch/body_utils.h"
 #include "host_functions/server/fetch/extracted_response.h"
 #include "host_functions/webapi/buffer_source.h"
 #include "host_functions/webapi/dom/dom_exception.h"
@@ -62,7 +61,7 @@ namespace {
     using JSC::JSValue;
 
     constexpr WTF::ASCIILiteral chunk_type_message
-        = "Response body stream chunks must be an ArrayBuffer, an ArrayBufferView or a string"_s;
+        = "Response body stream chunks must be an ArrayBuffer or an ArrayBufferView"_s;
 
     // Reports one read's outcome to the runtime attached to the reaction's VM, under the request the read was started
     // for. `value` is the chunk for CHUNK and the reason for ERROR; DONE carries none.
@@ -274,13 +273,13 @@ extern "C" ColloStatus collo_response_body_stream_read(
     return consumeExceptionStatus(owner, scope, out_exception);
 }
 
-extern "C" ColloStatus collo_response_body_stream_chunk(ColloResponseBodyStream* body_stream, const ColloValue* chunk,
-    ColloResponseBodyChunk* out_chunk, ColloValue** out_exception)
+extern "C" ColloStatus collo_response_body_stream_chunk(
+    ColloResponseBodyStream* body_stream, const ColloValue* chunk, ColloBuffer* out_bytes, ColloValue** out_exception)
 {
-    if (out_chunk)
-        *out_chunk = {};
+    if (out_bytes)
+        *out_bytes = {};
     Collo::clearOutException(out_exception);
-    if (!out_chunk || !bodyStreamIsUsable(body_stream) || !Collo::valueBelongsToVm(body_stream->owner, chunk))
+    if (!out_bytes || !bodyStreamIsUsable(body_stream) || !Collo::valueBelongsToVm(body_stream->owner, chunk))
         return COLLO_STATUS_INVALID_ARGUMENT;
 
     ColloVm* owner = body_stream->owner;
@@ -299,7 +298,7 @@ extern "C" ColloStatus collo_response_body_stream_chunk(ColloResponseBodyStream*
                 global_object, scope, view, "Response body stream chunk is detached or out of bounds"_s))
             return consumeExceptionStatus(owner, scope, out_exception);
         auto bytes = arrayBufferViewBytes(view);
-        out_chunk->bytes = { bytes.empty() ? nullptr : bytes.data(), bytes.size() };
+        *out_bytes = { bytes.empty() ? nullptr : bytes.data(), bytes.size() };
         return COLLO_STATUS_OK;
     }
     if (auto* array_buffer = dynamicDowncast<JSC::JSArrayBuffer>(value)) {
@@ -307,21 +306,7 @@ extern "C" ColloStatus collo_response_body_stream_chunk(ColloResponseBodyStream*
                 "Response body stream chunk must be a fixed-length attached ArrayBuffer"_s))
             return consumeExceptionStatus(owner, scope, out_exception);
         auto bytes = arrayBufferBytes(array_buffer);
-        out_chunk->bytes = { bytes.empty() ? nullptr : bytes.data(), bytes.size() };
-        return COLLO_STATUS_OK;
-    }
-    if (value.isString()) {
-        WTF::String text = value.toWTFString(global_object);
-        if (auto status = consumeExceptionStatus(owner, scope, out_exception); status != COLLO_STATUS_OK)
-            return status;
-        std::unique_ptr<ColloOwnedByteSegments> encoded { new (std::nothrow) ColloOwnedByteSegments };
-        if (!encoded)
-            return COLLO_STATUS_OUT_OF_MEMORY;
-        if (!appendStringBytes(global_object, scope, encoded->owned_bytes, text))
-            return statusOr(consumeExceptionStatus(owner, scope, out_exception), COLLO_STATUS_OUT_OF_MEMORY);
-        out_chunk->bytes = { encoded->owned_bytes.isEmpty() ? nullptr : encoded->owned_bytes.span().data(),
-            encoded->owned_bytes.size() };
-        out_chunk->owner = encoded.release();
+        *out_bytes = { bytes.empty() ? nullptr : bytes.data(), bytes.size() };
         return COLLO_STATUS_OK;
     }
 

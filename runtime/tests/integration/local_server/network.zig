@@ -5,7 +5,9 @@
 //! a grant has no egress path and no gateway runs for it; and module
 //! top-level code fetches under the union of its definition's grants, while a
 //! request fetches under its own route's, whichever route's code makes the
-//! call. Each denial rejects the handler's fetch with a TypeError whose
+//! call; top-level code still pending keeps that union after `WorkerReady`,
+//! while another route of the same worker serves, and past the init
+//! deadline. Each denial rejects the handler's fetch with a TypeError whose
 //! message is the denial text `collo_network.writeDenial` writes, and puts
 //! one `warn` line with that text in the tenant's log.
 //!
@@ -24,6 +26,8 @@
 const std = @import("std");
 const collo_network = @import("collo_network");
 const config = @import("collo_server_config");
+const process = @import("collo_os").process;
+const process_limits = @import("collo_limits").process;
 const zygote_support = @import("zygote_support");
 const harness_mod = @import("harness.zig");
 const origin_mod = @import("origin.zig");
@@ -752,7 +756,17 @@ test "local e2e network: a definition without a grant refuses every fetch at onc
     try std.testing.expectEqual(@as(u64, 0), harness.gatewayGeneration());
 }
 
-test "local e2e network: top-level code fetches under its definition's union, and a request under its own route's grant whatever code calls fetch" {
+test "local e2e network: top-level code keeps its definition's union across Ready, and requests use their own route's grant whatever code calls fetch" {
+    try startupUnionCase(.after_ready);
+}
+
+test "local e2e network: an awaited startup fetch after the init deadline still uses the union before its evaluation deadline" {
+    try startupUnionCase(.after_init_deadline);
+}
+
+const StartupRelease = enum { after_ready, after_init_deadline };
+
+fn startupUnionCase(release_at: StartupRelease) !void {
     var origin_a = try GzipOrigin.start(std.testing.allocator);
     defer origin_a.stop(std.testing.allocator);
     var origin_b = try GzipOrigin.start(std.testing.allocator);
@@ -763,9 +777,13 @@ test "local e2e network: top-level code fetches under its definition's union, an
     var harness: Harness = undefined;
     try harness.init(.{ .config_path = fixture.config_path });
     defer harness.deinit();
+    // On a failed check, answers A's held fetch before the server's teardown.
+    defer origin_b.releaseBarrier();
     errdefer harness_mod.dumpZygoteTrace(&harness.spawned);
     var client = try Client.open(&harness);
     defer client.close();
+    var ready_client = try Client.open(&harness);
+    defer ready_client.close();
 
     var url_buffer: [request_path_bytes_max]u8 = undefined;
     var path_buffer: [request_path_bytes_max]u8 = undefined;
@@ -774,24 +792,47 @@ test "local e2e network: top-level code fetches under its definition's union, an
     defer std.testing.allocator.free(url_a);
     const url_b = try std.fmt.bufPrint(&url_buffer, "http://{s}:{d}/gzip", .{ origin_b.host(), origin_b.port });
 
-    // The worker's boot evaluated route A's module, whose top-level fetch of
-    // B ran under the definition's union and reached it. A's handler runs only
-    // once that evaluation settles, and its own fetch of B runs under A's
-    // grant and is denied.
+    // A's request waits for its evaluation, whose first fetch the origin
+    // holds, so the worker reports ready with that evaluation pending, and B
+    // serves on the same worker meanwhile.
+    const stream_a = try client.sendGet(try fetchPath(&path_buffer, "/union/a", url_b, 0));
+    const definition = try harness.definitionIndex("union");
+    const worker = try harness_mod.waitForSlotsHeld(&harness, definition, 1);
+    const launch = try waitForStartupLaunch(&harness, definition);
     {
-        const response = try client.get(try fetchPath(&path_buffer, "/union/a", url_b, 0));
+        const response = try ready_client.get("/union/b?probe=1");
+        const parsed = try harness_mod.parseReply(struct { startup_pending: bool }, &response);
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.startup_pending);
+    }
+
+    // The timed case uses the launch's clock samples, so time spent starting
+    // the harness or waiting for Ready never stands in for the init window.
+    const complete_before_ns: ?u64 = switch (release_at) {
+        .after_ready => null,
+        .after_init_deadline => try waitPastInitDeadline(launch),
+    };
+    origin_b.releaseBarrier();
+
+    {
+        const response = try client.readResponse(stream_a);
+        if (complete_before_ns) |deadline_ns|
+            try std.testing.expect((try process.monotonicNowNs()) < deadline_ns);
         const parsed = try harness_mod.parseReply(struct {
             top_level: FetchOutcome,
+            follow_up: FetchOutcome,
             request_time: FetchOutcome,
         }, &response);
         defer parsed.deinit();
-        const top_level = parsed.value.top_level;
-        const reached = top_level.status == 200 and
-            std.mem.eql(u8, top_level.text orelse "", GzipOrigin.decoded_body);
-        if (!reached) {
-            std.debug.print("expected the top-level fetch of B to reach it: {s}\n", .{response.body()});
-            return error.FetchDidNotReachOrigin;
+        for ([_]FetchOutcome{ parsed.value.top_level, parsed.value.follow_up }) |outcome| {
+            const reached = outcome.status == 200 and
+                std.mem.eql(u8, outcome.text orelse "", GzipOrigin.decoded_body);
+            if (!reached) {
+                std.debug.print("expected both awaited startup fetches of B to reach it: {s}\n", .{response.body()});
+                return error.FetchDidNotReachOrigin;
+            }
         }
+        // A's request cannot use the union its two startup fetches used.
         try expectDeniedOutcome(
             parsed.value.request_time,
             denialText(&expected_buffer, .http, origin_b.host(), origin_b.port, .port_not_allowed),
@@ -802,11 +843,53 @@ test "local e2e network: top-level code fetches under its definition's union, an
     // Route B's handler calls the function route A's module put on the
     // shared global: the fetch runs under B's grant, the turn owner's.
     try expectDenied(
-        &client,
+        &ready_client,
         try fetchPath(&path_buffer, "/union/b", url_a, 0),
         denialText(&expected_buffer, .http, origin_a.host(), origin_a.port, .port_not_allowed),
     );
-    try expectReached(&client, try fetchPath(&path_buffer, "/union/b", url_b, 0));
+    try expectReached(&ready_client, try fetchPath(&path_buffer, "/union/b", url_b, 0));
+
+    // Every request ran on the one worker the first launch started.
+    const after = try harness_mod.waitForSlotsHeld(&harness, definition, 0);
+    try std.testing.expect(worker.key.eql(after.key));
+    var extra_launches: [4]harness_mod.LaunchTrace = undefined;
+    try std.testing.expectEqual(@as(usize, 0), harness.takeLaunches(&extra_launches).len);
+}
+
+const startup_poll_interval_ns: u64 = 10 * std.time.ns_per_ms;
+const startup_polls_max: usize = 500;
+
+fn waitForStartupLaunch(harness: *Harness, definition: config.DefinitionIndex) !harness_mod.LaunchTrace {
+    for (0..startup_polls_max) |_| {
+        var traces: [4]harness_mod.LaunchTrace = undefined;
+        const launches = harness.takeLaunches(&traces);
+        if (launches.len != 0) {
+            try std.testing.expectEqual(@as(usize, 1), launches.len);
+            const launch = launches[0];
+            try std.testing.expectEqual(definition, launch.definition);
+            try std.testing.expectEqual(harness_mod.LaunchTrace.Outcome.published, launch.outcome);
+            return launch;
+        }
+        std.Thread.sleep(startup_poll_interval_ns);
+    }
+    return error.StartupLaunchNotObserved;
+}
+
+/// Sleeps until the worker's init deadline has passed and returns the
+/// instant by which its startup evaluation must still finish. The init
+/// deadline is at most `init_sent_ns` plus `WORKER_INIT_TIMEOUT_MS`, and the
+/// evaluation budget starts no earlier than `fork_reply_ns`.
+fn waitPastInitDeadline(launch: harness_mod.LaunchTrace) !u64 {
+    const init_budget_ns = @as(u64, @intCast(process_limits.WORKER_INIT_TIMEOUT_MS)) * std.time.ns_per_ms;
+    const release_after_ns = launch.init_sent_ns + init_budget_ns;
+    const complete_before_ns = launch.fork_reply_ns + process_limits.MODULE_EVAL_BUDGET_NS;
+    for (0..startup_polls_max) |_| {
+        const now_ns = try process.monotonicNowNs();
+        if (now_ns >= complete_before_ns) return error.StartupEvaluationWindowMissed;
+        if (now_ns > release_after_ns) return complete_before_ns;
+        std.Thread.sleep(@min(startup_poll_interval_ns, release_after_ns - now_ns + 1));
+    }
+    return error.InitDeadlineNotObserved;
 }
 
 /// A temporary configuration with one definition of two routes in one shared
@@ -832,6 +915,7 @@ const UnionFixture = struct {
         const text = try configText(allocator, &.{.{
             .name = "union",
             .isolate_realm = false,
+            .concurrency = 2,
             .routes = &.{
                 .{ .path = "/union/a", .entry = "./a.js", .network = try originGrant(&allow_a, origin_a.host()) },
                 .{ .path = "/union/b", .entry = "./b.js", .network = try originGrant(&allow_b, origin_b.host()) },
@@ -840,7 +924,9 @@ const UnionFixture = struct {
         defer allocator.free(text);
         try dir.writeFile(.{ .sub_path = "collo.json", .data = text });
 
-        const module_a = try std.fmt.allocPrint(allocator, route_a_source_format, .{ origin_b.host(), origin_b.port });
+        const module_a = try std.fmt.allocPrint(allocator, route_a_source_format, .{
+            origin_b.host(), origin_b.port, GzipOrigin.barrier_path,
+        });
         defer allocator.free(module_a);
         try dir.writeFile(.{ .sub_path = "a.js", .data = module_a });
         try dir.writeFile(.{ .sub_path = "b.js", .data = route_b_source });
@@ -856,9 +942,9 @@ const UnionFixture = struct {
         self.* = undefined;
     }
 
-    // Route A: its top-level code fetches origin B, waiting for the outcome
-    // so it lands before the first request runs, and it puts on the shared
-    // global a function that fetches any URL.
+    // Route A: its top-level code fetches origin B twice, the first held at
+    // the origin's barrier, and puts on the shared global a function that
+    // fetches any URL. A's handler runs only once that evaluation settles.
     const route_a_source_format =
         \\async function outcome(url) {{
         \\  try {{
@@ -870,17 +956,29 @@ const UnionFixture = struct {
         \\}}
         \\
         \\globalThis.fetchOrigin = outcome;
-        \\const topLevel = await outcome("http://{s}:{d}/gzip");
+        \\globalThis.unionStartupFinished = false;
+        \\const origin = "http://{s}:{d}";
+        \\const topLevel = await outcome(origin + "{s}");
+        \\const followUp = await outcome(origin + "/gzip");
+        \\globalThis.unionStartupFinished = true;
         \\
         \\export default async function handler(req) {{
-        \\  return Response.json({{ top_level: topLevel, request_time: await outcome(req.query.get("url")) }});
+        \\  return Response.json({{
+        \\    top_level: topLevel,
+        \\    follow_up: followUp,
+        \\    request_time: await outcome(req.query.get("url")),
+        \\  }});
         \\}}
         \\
     ;
 
-    // Route B fetches through route A's function.
+    // Route B fetches through route A's function; `?probe=1` reports whether
+    // A's top-level code is still pending.
     const route_b_source =
         \\export default async function handler(req) {
+        \\  if (req.query.get("probe") === "1") {
+        \\    return Response.json({ startup_pending: globalThis.unionStartupFinished === false });
+        \\  }
         \\  return Response.json(await globalThis.fetchOrigin(req.query.get("url")));
         \\}
         \\

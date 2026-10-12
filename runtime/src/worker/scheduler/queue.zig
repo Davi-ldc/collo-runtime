@@ -23,9 +23,10 @@ pub const WorkItem = union(enum) {
     /// A response arrived for this fault id; settles the reads waiting on
     /// it (`fs/fault_completion.zig`).
     fs_fault_completion: u64,
-    /// The body stream of this request's response has a read's result to
-    /// send, or needs its next read (`serve/response_body_stream.zig`).
-    response_body_stream: u64,
+    /// The response of this request can move on: a grant, room in the
+    /// control socket or the payload ring, or a body stream's read settled
+    /// (`serve/response.zig:executeAdvance`).
+    response_advance: u64,
 };
 
 /// Metadata a slot carries from enqueue to pop. The owner is resolved once,

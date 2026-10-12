@@ -5,23 +5,40 @@
 //! refuses oversized bodies and headers, and clone fan-out and a
 //! `Response.json` body stop at their caps. The writers send small bodies
 //! inline, large ones through the shared payload ring and segmented ones
-//! without flattening, with exact bytes at chunk boundaries. When the
-//! control socket, whose worker end does not block, has no room, the
-//! response waits in the request's outbox (its head with it when the head
-//! has not gone out, and a fetch-streamed one at its head, its chunk or its
-//! end), and the flush on the writability event, run by the loop or by the
-//! test, finishes it, with the completion published after the last packet.
-//! A deadline, a client reset or a local failure drops the parked rest
-//! before it answers, a fetch aborted under a parked head fails only its own
-//! stream, and a flush that finds the server gone stops the loop as a hangup
-//! does. Runs in `worker-test`; the Web API side of `Response` is covered by
-//! the `webapi` lane.
+//! without flattening, with exact bytes at chunk boundaries.
+//!
+//! When the control socket, whose worker end does not block, has no room,
+//! the response waits in the request's outbox (its head with it when the
+//! head has not gone out, and a fetch-streamed one at its head, its chunk or
+//! its end), and the writable event, handled by the loop or by the test,
+//! queues the advance that finishes it, with the completion published after
+//! the last packet. A deadline, a client reset or a local failure drops the
+//! parked rest before it answers, and a fetch completion skipped while a
+//! deadline answer waits frees its task. A fetch aborted under a parked head
+//! fails only its own stream, and a send that finds the server gone stops
+//! the loop as a hangup does.
+//!
+//! Response credit: a buffered, segmented or JavaScript-stream response
+//! sends no fifth chunk before a grant and arms no write poll while it
+//! waits, and leaves its sibling runnable. A full ready queue wakes no loop,
+//! a grant keeps its first readiness stamp until the rescan queues it, a
+//! grant of another identity fails, and a cancel withdraws a queued advance.
+//! Endings, a fire under another request and a gateway detach at zero credit
+//! reset or finish the response and release what it held, and a held
+//! JavaScript chunk is borrowed again on each try. An ending whose answer
+//! fails still finishes its request, a client reset finishes a request whose
+//! ending's answer waits, and after a fire under another request a decided
+//! response's leftover timer leaves it to finish. The one-pass driver a bench
+//! uses (`worker.runPass`) takes a reader's grants and finishes a response
+//! past its window. Runs in `worker-test`; the Web API side of `Response` is
+//! covered by the `webapi` lane.
 
 const std = @import("std");
 const support = @import("bindings_support");
 const bindings = @import("collo_bindings");
 const fd_mod = @import("collo_os").fd;
 const h2 = @import("collo_http").http2;
+const host = @import("collo_host");
 const ipc = @import("collo_ipc");
 const limits = @import("collo_limits");
 const worker_shared_page = @import("collo_worker_state").page;
@@ -777,10 +794,8 @@ test "flushBufferedBody delivers exact bytes at chunk boundaries without overrea
             byte.* = @truncate(index *% 31 +% 7 +% case_index);
 
         var buffered = worker_request.ingress.response_outbox.BufferedBody{
-            .body = body,
+            .body = .{ .bytes = body },
             .offset = 0,
-            .done_status = .ok,
-            .http_status = 200,
         };
         const writer = worker.testing.response_payload_writer;
         try std.testing.expectEqual(writer.BodyProgress.sent, try writer.flushBufferedBody(&runtime, &ctx, &buffered));
@@ -931,7 +946,7 @@ test "a response whose head finds the control socket full waits in the outbox un
         .buffered_body => |buffered| {
             try std.testing.expect(buffered.head != null);
             try std.testing.expectEqual(@as(usize, 0), buffered.offset);
-            try std.testing.expectEqual(alphabet_body_len, buffered.body.len);
+            try std.testing.expectEqual(alphabet_body_len, buffered.body.len());
         },
         else => return error.TestUnexpectedResult,
     }
@@ -959,7 +974,7 @@ test "a response whose head finds the control socket full waits in the outbox un
     try std.testing.expectEqual(@as(u16, 201), done.http_status);
 }
 
-test "a response larger than the control socket's send buffer finishes from the flush once the server reads" {
+test "a response larger than the control socket's send buffer finishes from its advances once the server reads" {
     var fixture: SocketFullWorker = undefined;
     try fixture.init(.{});
     defer fixture.deinit();
@@ -972,7 +987,7 @@ test "a response larger than the control socket's send buffer finishes from the 
     const parked_offset = switch (request_ctx.response_outbox.pending) {
         .buffered_body => |buffered| parked: {
             try std.testing.expect(buffered.head == null);
-            try std.testing.expectEqual(parts_body_len, buffered.body.len);
+            try std.testing.expectEqual(parts_body_len, buffered.body.len());
             break :parked buffered.offset;
         },
         else => return error.TestUnexpectedResult,
@@ -989,7 +1004,7 @@ test "a response larger than the control socket's send buffer finishes from the 
     try response.readAvailable(&fixture);
     try std.testing.expectEqual(@as(?u16, 202), response.status);
     try std.testing.expectEqual(parked_offset, response.body.items.len);
-    try std.testing.expect(!response.ended);
+    try std.testing.expect(!response.credit.ended);
 
     try fixture.serveUntilFinished(&response, 402);
     try response.readUntilEnd(&fixture);
@@ -1024,7 +1039,7 @@ test "a deadline answers 504 in place of a response whose head waits in the outb
         .buffered_body => |buffered| {
             const head = buffered.head orelse return error.TestUnexpectedResult;
             try std.testing.expectEqual(@as(u16, 504), head.status);
-            try std.testing.expectEqualStrings("gateway timeout", buffered.body);
+            try std.testing.expectEqualStrings("gateway timeout", buffered.body.contiguous());
         },
         else => return error.TestUnexpectedResult,
     }
@@ -1042,6 +1057,44 @@ test "a deadline answers 504 in place of a response whose head waits in the outb
     const done = try readWorkerCompletion(runtime, fixture.control_pair[1], 403);
     try std.testing.expectEqual(@intFromEnum(ipc.RequestDoneStatus.deadline_timeout), done.status);
     try std.testing.expectEqual(@as(u16, 504), done.http_status);
+}
+
+// A task leaves the table only when its completion runs, so a completion
+// skipped without its task would hold a fetch slot for the worker's life.
+test "a fetch completion that pops while a deadline answer waits for the socket frees its task" {
+    var fixture: SocketFullWorker = undefined;
+    try fixture.init(.{});
+    defer fixture.deinit();
+    const runtime = &fixture.runtime;
+
+    try fixture.dispatch(411,
+        \\export default async function handle() {
+        \\    await fetch("https://origin.test/slow");
+        \\    return new Response("late");
+        \\}
+    , "/socket-full-deadline-fetch.js");
+    try rt.executeQueuedBegin(runtime);
+    try std.testing.expectEqual(@as(usize, 1), runtime.egress.state.tasks.count());
+
+    const filler_count = try fillSendBuffer(fixture.control_pair[0]);
+    try worker.testing.request_dispatch.deadlineTimeout(runtime, 411);
+    const request_ctx = runtime.requests.active.get(411) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!request_ctx.response_outbox.isEmpty());
+
+    try fixture.session.?.sendError(runtime, .failed, "origin unreachable");
+    try rt.executeNextReady(runtime);
+    try std.testing.expectEqual(@as(usize, 0), runtime.egress.state.tasks.count());
+    try std.testing.expect(runtime.requests.active.contains(411));
+
+    try std.testing.expectEqual(filler_count, try drainFiller(fixture.control_pair[1]));
+    var response: ReadResponse = .{};
+    defer response.deinit();
+    try fixture.serveUntilFinished(&response, 411);
+    try response.readUntilEnd(&fixture);
+    try std.testing.expectEqual(@as(?u16, 504), response.status);
+    try std.testing.expectEqualStrings("gateway timeout", response.body.items);
+    const done = try readWorkerCompletion(runtime, fixture.control_pair[1], 411);
+    try std.testing.expectEqual(@intFromEnum(ipc.RequestDoneStatus.deadline_timeout), done.status);
 }
 
 test "a local failure resets a committed response whose rest waits in the outbox, and the worker keeps running" {
@@ -1077,7 +1130,7 @@ test "a deadline resets a committed response whose rest waits in the outbox, and
     });
 }
 
-test "a fetch-streamed response waits in the outbox at its head, its chunk and its end, and each flush sends the step that waited" {
+test "a fetch-streamed response waits in the outbox at its head, its chunk and its end, and each advance sends the step that waited" {
     const origin = try rt.LocalOrigin.start(std.testing.allocator);
     defer origin.stop(std.testing.allocator);
     var fixture: SocketFullWorker = undefined;
@@ -1094,12 +1147,12 @@ test "a fetch-streamed response waits in the outbox at its head, its chunk and i
     try std.testing.expect(!request_ctx.response_committed);
     try fixture.expectWritablePollArmed();
 
-    // Each flush sends the step that waited, and the step after it waits in
-    // turn, since the test fills the socket again before the worker runs.
+    // Each advance sends the step that waited, and the step after it waits
+    // in turn, since the test fills the socket again before the worker runs.
     var response: ReadResponse = .{};
     defer response.deinit();
     try std.testing.expectEqual(filler_count, try drainFiller(fixture.control_pair[1]));
-    try fixture.flushWhenWritable();
+    try fixture.pumpWhenWritable();
     try std.testing.expect(request_ctx.response_committed);
     try response.readAvailable(&fixture);
     try std.testing.expectEqual(@as(?u16, 200), response.status);
@@ -1108,17 +1161,17 @@ test "a fetch-streamed response waits in the outbox at its head, its chunk and i
     _ = try runUntilParked(runtime, 407);
     try std.testing.expectEqual(.stream_chunk, std.meta.activeTag(request_ctx.response_outbox.pending));
     try std.testing.expectEqual(filler_count, try drainFiller(fixture.control_pair[1]));
-    try fixture.flushWhenWritable();
+    try fixture.pumpWhenWritable();
     try response.readAvailable(&fixture);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 255, 65 }, response.body.items);
-    try std.testing.expect(!response.ended);
+    try std.testing.expect(!response.credit.ended);
 
     filler_count = try fillSendBuffer(fixture.control_pair[0]);
     _ = try runUntilParked(runtime, 407);
     try std.testing.expectEqual(.stream_end, std.meta.activeTag(request_ctx.response_outbox.pending));
     try fixture.expectNoCompletion();
     try std.testing.expectEqual(filler_count, try drainFiller(fixture.control_pair[1]));
-    try fixture.flushWhenWritable();
+    try fixture.pumpWhenWritable();
     try std.testing.expect(!runtime.requests.active.contains(407));
     try response.readUntilEnd(&fixture);
     try std.testing.expect(response.reset_code == null);
@@ -1128,7 +1181,7 @@ test "a fetch-streamed response waits in the outbox at its head, its chunk and i
     try std.testing.expectEqual(@as(u16, 200), done.http_status);
 }
 
-test "a fetch aborted while its streamed response's head waits resets that one stream from the flush, and the worker keeps running" {
+test "a fetch aborted while its streamed response's head waits resets that one stream from the advance, and the worker keeps running" {
     const origin = try rt.LocalOrigin.start(std.testing.allocator);
     defer origin.stop(std.testing.allocator);
     var fixture: SocketFullWorker = undefined;
@@ -1144,7 +1197,7 @@ test "a fetch aborted while its streamed response's head waits resets that one s
     try std.testing.expectEqual(.stream_head, std.meta.activeTag(request_ctx.response_outbox.pending));
 
     // The gateway's acknowledgment of the fetch's abort releases the body's
-    // view (`gateway_runtime.handleAbortAck`), so the pull the head's flush
+    // view (`gateway_runtime.handleAbortAck`), so the pull the head's advance
     // starts cannot begin.
     const identity = switch (request_ctx.response_stream) {
         .fetch => |fetch| fetch.identity,
@@ -1172,7 +1225,7 @@ test "a fetch aborted while its streamed response's head waits resets that one s
     try std.testing.expectEqual(@as(u16, 200), done.http_status);
 }
 
-test "a flush whose send finds the server gone stops the loop as a hangup does" {
+test "an advance whose send finds the server gone stops the loop as a hangup does" {
     var fixture: SocketFullWorker = undefined;
     try fixture.init(.{});
     defer fixture.deinit();
@@ -1182,9 +1235,11 @@ test "a flush whose send finds the server gone stops the loop as a hangup does" 
     try fixture.dispatch(409, alphabet_source, "/socket-full-server-gone.js");
     _ = try runUntilParked(runtime, 409);
 
-    // The server goes away between the poll's report and the flush's send.
+    // The server goes away between the poll's report and the advance's send.
     try std.posix.shutdown(fixture.control_pair[1], .both);
-    try std.testing.expectError(error.ControlPeerClosed, worker.testing.scheduler.loop.flushParkedResponses(runtime));
+    try worker.testing.scheduler.loop.handleControlWritable(runtime);
+    try rt.executeNextReady(runtime);
+    try std.testing.expect(!runtime.core.running);
 }
 
 test "the loop sends a parked response once the server drains the socket, and publishes its completion after it" {
@@ -1220,6 +1275,554 @@ test "the loop sends a parked response once the server drains the socket, and pu
     try std.testing.expectEqual(@as(u16, 201), done.http_status);
 }
 
+const credit_chunk_bytes = limits.http_body.INGRESS_RESPONSE_CHUNK_BYTES;
+const credit_body_bytes = 6 * credit_chunk_bytes + 1;
+
+const credit_sources = [_][]const u8{
+    std.fmt.comptimePrint(
+        \\export default () => new Response(new Uint8Array({d}).fill(65));
+    , .{credit_body_bytes}),
+    std.fmt.comptimePrint(
+        \\export default () => new Response(new Blob(Array.from({{ length: 7 }}, (_, i) => new Uint8Array(i === 6 ? 1 : {d}).fill(65))));
+    , .{credit_chunk_bytes}),
+    std.fmt.comptimePrint(
+        \\export default () => new Response(new ReadableStream({{ start(c) {{ c.enqueue(new Uint8Array({d}).fill(65)); c.close(); }} }}, {{ highWaterMark: 0 }}));
+    , .{credit_body_bytes}),
+};
+
+test "buffered segmented and oversized JS responses publish no fifth chunk before cumulative credit" {
+    for (credit_sources, 0..) |source, index| {
+        var fixture: SocketFullWorker = undefined;
+        try fixture.init(.{});
+        defer fixture.deinit();
+        const request_id: u64 = 9600 + index;
+        try fixture.dispatch(request_id, source, "/response-credit.js");
+        _ = try runUntilCreditWait(&fixture, request_id);
+        try std.testing.expect(!fixture.runtime.requests.control_send_blocked);
+        try fixture.backend.arm(&fixture.runtime);
+        try std.testing.expect(!fixture.backend.control_writable_poll_armed);
+        var response: ReadResponse = .{};
+        defer response.deinit();
+        try response.readAvailable(&fixture);
+        try std.testing.expectEqual(@as(u64, 4), response.credit.window.spent);
+        try std.testing.expectEqual(@as(usize, 4 * credit_chunk_bytes), response.body.items.len);
+        try std.testing.expect(!response.credit.ended);
+        try std.testing.expect(!try socketReadable(fixture.control_pair[1], 0));
+        try fixture.serveUntilFinished(&response, request_id);
+        try response.readUntilEnd(&fixture);
+        try std.testing.expectEqual(@as(usize, credit_body_bytes), response.body.items.len);
+        try std.testing.expect(std.mem.allEqual(u8, response.body.items, 65));
+        const done = try readWorkerCompletion(&fixture.runtime, fixture.control_pair[1], request_id);
+        try std.testing.expectEqual(@intFromEnum(ipc.RequestDoneStatus.ok), done.status);
+    }
+}
+
+test "a credit-blocked response leaves its sibling runnable" {
+    var fixture: SocketFullWorker = undefined;
+    try fixture.init(.{});
+    defer fixture.deinit();
+    try fixture.dispatch(9620, credit_sources[0], "/blocked-sibling.js");
+    _ = try runUntilCreditWait(&fixture, 9620);
+    var blocked: ReadResponse = .{};
+    defer blocked.deinit();
+    try blocked.readAvailable(&fixture);
+    try fixture.dispatch(9621, "export default () => new Response('sibling');", "/ready-sibling.js");
+    try rt.executeQueuedBegin(&fixture.runtime);
+    try std.testing.expect(!fixture.runtime.requests.active.contains(9621));
+    var sibling: ReadResponse = .{};
+    defer sibling.deinit();
+    try sibling.readAvailable(&fixture);
+    try std.testing.expectEqualStrings("sibling", sibling.body.items);
+    try std.testing.expect(sibling.credit.ended);
+    _ = try readWorkerCompletion(&fixture.runtime, fixture.control_pair[1], 9621);
+    try fixture.serveUntilFinished(&blocked, 9620);
+    try blocked.readUntilEnd(&fixture);
+    _ = try readWorkerCompletion(&fixture.runtime, fixture.control_pair[1], 9620);
+}
+
+test "a full ready queue wakes no loop for any item, and a grant keeps its first readiness stamp until the rescan queues it" {
+    var fixture: SocketFullWorker = undefined;
+    try fixture.init(.{});
+    defer fixture.deinit();
+    fixture.now_mono_ns = 100;
+    try fixture.dispatch(9630, credit_sources[0], "/credit-rescan.js");
+    const ctx = try runUntilCreditWait(&fixture, 9630);
+    const runtime = &fixture.runtime;
+    while (runtime.scheduler.ready_queue.remainingCapacity() != 0 or runtime.scheduler.ready_backlog.remainingCapacity() != 0)
+        try std.testing.expect(runtime.tryQueueReadyWork(.{ .request_deadline = 0 }));
+    runtime.drainWakeup();
+    try std.testing.expect(!runtime.tryQueueReadyWork(.{ .request = 0 }));
+    try worker_request.ingress.runtime.enqueueResponseCredit(runtime, creditFor(ctx, ipc.response_credit.window + 1));
+    try std.testing.expect(!try socketReadable(runtime.scheduler.wakeup_fd.?, 0));
+    fixture.now_mono_ns = 500;
+    try rt.executeNextReady(runtime);
+    runtime.collectReadyIngressRequests();
+    try std.testing.expectEqual(.queued, ctx.response_advance.state);
+    try std.testing.expectEqual(@as(u64, 100), ctx.response_advance.ready_since_ns);
+    try std.testing.expectEqual(@as(u32, 1), ctx.ready_items);
+    try worker.testing.request_dispatch.cancelClientReset(runtime, 9630);
+}
+
+test "a grant with another identity than its live request's fails, and one naming no active request is dropped" {
+    var fixture: SocketFullWorker = undefined;
+    try fixture.init(.{});
+    defer fixture.deinit();
+    const runtime = &fixture.runtime;
+    try fixture.dispatch(9632, credit_sources[0], "/credit-identity.js");
+    const ctx = try runUntilCreditWait(&fixture, 9632);
+    const grant = creditFor(ctx, ipc.response_credit.window + 1);
+    inline for (.{ "request_generation", "request_lane_id", "request_slot", "stream_id" }) |field| {
+        var mismatched = grant;
+        @field(mismatched, field) += 1;
+        try std.testing.expectError(error.InvalidH2StreamIdentity, worker_request.ingress.runtime.enqueueResponseCredit(runtime, mismatched));
+    }
+    var unknown = grant;
+    unknown.request_id += 1;
+    try worker_request.ingress.runtime.enqueueResponseCredit(runtime, unknown);
+    try std.testing.expectEqual(.credit, ctx.response_advance.wait);
+    try std.testing.expect(runtime.scheduler.ready_queue.isEmpty());
+    try worker.testing.request_dispatch.cancelClientReset(runtime, 9632);
+}
+
+test "cancellation withdraws a response advance and a late grant queues nothing" {
+    var fixture: SocketFullWorker = undefined;
+    try fixture.init(.{});
+    defer fixture.deinit();
+    const runtime = &fixture.runtime;
+    try fixture.dispatch(9631, credit_sources[0], "/credit-cancel.js");
+    const ctx = try runUntilCreditWait(&fixture, 9631);
+    const grant = creditFor(ctx, 5);
+    try worker_request.ingress.runtime.enqueueResponseCredit(runtime, grant);
+    try worker.testing.request_dispatch.cancelClientReset(runtime, 9631);
+    // The withdrawn advance still pops, with no owner left to run it for.
+    const withdrawn = runtime.scheduler.ready_queue.pop() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(.response_advance, std.meta.activeTag(withdrawn));
+    try std.testing.expectEqual(@as(u64, 0), runtime.scheduler.ready_queue.last_popped_meta.owner_request_id);
+    try worker.testing.executeWorkItem(runtime, withdrawn);
+    try worker_request.ingress.runtime.enqueueResponseCredit(runtime, grant);
+    try std.testing.expect(runtime.scheduler.ready_queue.isEmpty());
+    try std.testing.expect(runtime.scheduler.ready_backlog.isEmpty());
+    var response: ReadResponse = .{};
+    defer response.deinit();
+    try response.readAvailable(&fixture);
+    try std.testing.expectEqual(@as(u64, 4), response.credit.window.spent);
+    try std.testing.expect(!response.credit.ended);
+    const done = try readWorkerCompletion(runtime, fixture.control_pair[1], 9631);
+    try std.testing.expectEqual(@intFromEnum(ipc.RequestDoneStatus.client_closed), done.status);
+}
+
+test "a fetch response holds borrowed bytes at zero credit and releases them on finish cancellation or failure" {
+    const ReleaseCounter = struct {
+        count: usize = 0,
+        fn release(context: ?*anyopaque, _: u64, _: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.count += 1;
+        }
+    };
+    const Ending = enum { finish, cancel, fail };
+    for ([_]Ending{ .finish, .cancel, .fail }, 0..) |ending, index| {
+        const bytes = try std.testing.allocator.alloc(u8, credit_body_bytes);
+        defer std.testing.allocator.free(bytes);
+        @memset(bytes, 'F');
+        var releases: ReleaseCounter = .{};
+        var fixture: SocketFullWorker = undefined;
+        try fixture.init(.{});
+        defer fixture.deinit();
+        const runtime = &fixture.runtime;
+        const request_id: u64 = 9640 + index;
+        try fixture.dispatch(request_id, "export default () => new Promise(() => {});", "/fetch-credit.js");
+        try rt.executeQueuedBegin(runtime);
+        const ctx = runtime.requests.active.get(request_id) orelse return error.TestUnexpectedResult;
+        const identity = try runtime.registerFetchBodyOpen(ctx, 77, null);
+        const body = runtime.egress.state.bodies.get(identity.body_id).?;
+        _ = try body.appendBorrowedChunk(std.testing.allocator, .{
+            .bytes = bytes,
+            .release = .{ .context = &releases, .seq = 1, .len = bytes.len, .release_fn = ReleaseCounter.release },
+        }, .none);
+        const last = try std.testing.allocator.dupe(u8, "Z");
+        _ = try body.appendOwnedChunk(std.testing.allocator, last, .none);
+        if (ending == .finish)
+            try runtime.completeFetchBody(identity);
+        ctx.response_stream = .{ .fetch = .{ .identity = identity } };
+        const head: worker_request.response_model.Response = .{};
+        try std.testing.expectEqual(worker.testing.response_payload_writer.Sent.sent, try worker.testing.response_payload_writer.writeStreamHead(runtime, ctx, &head));
+        try std.testing.expect(worker_request.response_stream.queueAdvance(runtime, ctx));
+        _ = try runUntilCreditWait(&fixture, request_id);
+        try std.testing.expectEqual(@as(usize, 0), releases.count);
+        var response: ReadResponse = .{};
+        defer response.deinit();
+        switch (ending) {
+            .finish => {
+                try fixture.serveUntilFinished(&response, request_id);
+                try response.readUntilEnd(&fixture);
+                try std.testing.expectEqual(@as(usize, credit_body_bytes + 1), response.body.items.len);
+                try std.testing.expectEqual(@as(u8, 'Z'), response.body.items[credit_body_bytes]);
+            },
+            .cancel => {
+                try worker.testing.request_dispatch.cancelClientReset(runtime, request_id);
+                try response.readAvailable(&fixture);
+                try std.testing.expectEqual(@as(u64, 4), response.credit.window.spent);
+            },
+            .fail => {
+                try runtime.failFetchBody(identity, "upstream failed while response waited for credit");
+                try fixture.serveUntilFinished(&response, request_id);
+                try response.readUntilEnd(&fixture);
+                try std.testing.expectEqual(@as(u64, 4), response.credit.window.spent);
+                try std.testing.expectEqual(@as(?u32, @intFromEnum(h2.ErrorCode.internal_error)), response.reset_code);
+            },
+        }
+        try std.testing.expectEqual(@as(usize, 1), releases.count);
+        _ = try readWorkerCompletion(runtime, fixture.control_pair[1], request_id);
+    }
+}
+
+test "CPU and deadline endings at zero credit publish one reset after socket readiness" {
+    for ([_]bool{ false, true }, 0..) |cpu, index| {
+        var fixture: SocketFullWorker = undefined;
+        try fixture.init(.{});
+        defer fixture.deinit();
+        const request_id: u64 = 9650 + index;
+        const runtime = &fixture.runtime;
+        try fixture.dispatch(request_id, credit_sources[0], "/credit-ending.js");
+        const ctx = try runUntilCreditWait(&fixture, request_id);
+        var response: ReadResponse = .{};
+        defer response.deinit();
+        try response.readAvailable(&fixture);
+        const filler = try fillSendBuffer(fixture.control_pair[0]);
+        if (cpu) {
+            ctx.cpu_spent = true;
+            runtime.owners.budget_overrun_pending = true;
+            runtime.endSpentBudgets();
+        } else {
+            try worker.testing.request_dispatch.deadlineTimeout(runtime, request_id);
+        }
+        const ending_ctx = runtime.requests.active.get(request_id) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(.stream_reset, std.meta.activeTag(ending_ctx.response_outbox.pending));
+        try std.testing.expectEqual(filler, try drainFiller(fixture.control_pair[1]));
+        try fixture.serveUntilFinished(&response, request_id);
+        try response.readUntilEnd(&fixture);
+        try std.testing.expectEqual(@as(u64, 4), response.credit.window.spent);
+        try std.testing.expectEqual(@as(?u32, @intFromEnum(h2.ErrorCode.internal_error)), response.reset_code);
+        try std.testing.expect(!try socketReadable(fixture.control_pair[1], 0));
+        const done = try readWorkerCompletion(runtime, fixture.control_pair[1], request_id);
+        const expected: ipc.RequestDoneStatus = if (cpu) .cpu_exceeded else .deadline_timeout;
+        try std.testing.expectEqual(@intFromEnum(expected), done.status);
+    }
+}
+
+test "a fire under another request lets a buffered response waiting for credit finish and resets an open JavaScript stream" {
+    for ([_]usize{ 0, 2 }) |source_index| {
+        var fixture: SocketFullWorker = undefined;
+        try fixture.init(.{});
+        defer fixture.deinit();
+        const runtime = &fixture.runtime;
+        const request_id: u64 = 9660 + source_index;
+        try fixture.dispatch(request_id, credit_sources[source_index], "/credit-sibling-fire.js");
+        _ = try runUntilCreditWait(&fixture, request_id);
+        var response: ReadResponse = .{};
+        defer response.deinit();
+        try response.readAvailable(&fixture);
+        // No sentinel thread runs in this fixture. Publish the same snapshot
+        // the loop observes after a different owner was terminated.
+        runtime.observability.sentinel.fired_cause.store(@intFromEnum(worker.testing.sentinel.Cause.deadline), .monotonic);
+        runtime.observability.sentinel.fired_owner_id.store(9999, .release);
+        try fixture.serveUntilFinished(&response, request_id);
+        try response.readUntilEnd(&fixture);
+        const done = try readWorkerCompletion(runtime, fixture.control_pair[1], request_id);
+        if (source_index == 0) {
+            try std.testing.expectEqual(@as(usize, credit_body_bytes), response.body.items.len);
+            try std.testing.expect(response.reset_code == null);
+            try std.testing.expectEqual(@intFromEnum(ipc.RequestDoneStatus.ok), done.status);
+        } else {
+            try std.testing.expectEqual(@as(usize, 4 * credit_chunk_bytes), response.body.items.len);
+            try std.testing.expect(response.reset_code != null);
+            try std.testing.expectEqual(@intFromEnum(ipc.RequestDoneStatus.worker_stopped), done.status);
+        }
+    }
+}
+
+test "gateway death and replacement release a credit-blocked pool lease before unmap" {
+    for ([_]bool{ false, true }, 0..) |disconnect_first, index| {
+        var fixture: SocketFullWorker = undefined;
+        try fixture.init(.{});
+        defer fixture.deinit();
+        const runtime = &fixture.runtime;
+        const old_gateway = &fixture.session.?.gateway;
+        const bytes = try std.testing.allocator.alloc(u8, credit_body_bytes);
+        defer std.testing.allocator.free(bytes);
+        @memset(bytes, 'P');
+        const old_handle = try old_gateway.body_pool.writeChunk(bytes);
+        const request_id: u64 = 9645 + index;
+        try fixture.dispatch(request_id, "export default () => new Promise(() => {});", "/fetch-detach-credit.js");
+        try rt.executeQueuedBegin(runtime);
+        const ctx = runtime.requests.active.get(request_id).?;
+        const identity = try runtime.registerFetchBodyOpen(ctx, 88, null);
+        const body = runtime.egress.state.bodies.get(identity.body_id).?;
+        const pool_bytes = try runtime.egress.state.shared.?.body_pool.borrowContiguousChunk(old_handle, bytes.len);
+        _ = try body.appendBorrowedChunk(std.testing.allocator, .{
+            .bytes = pool_bytes,
+            .release = .{
+                .context = &runtime.egress.state.body_pool_release_context,
+                .seq = old_handle,
+                .len = bytes.len,
+                .release_fn = @TypeOf(runtime.egress.state.body_pool_release_context).release,
+            },
+        }, .none);
+        try runtime.completeFetchBody(identity);
+        ctx.response_stream = .{ .fetch = .{ .identity = identity } };
+        const head: worker_request.response_model.Response = .{};
+        _ = try worker.testing.response_payload_writer.writeStreamHead(runtime, ctx, &head);
+        try std.testing.expect(worker_request.response_stream.queueAdvance(runtime, ctx));
+        _ = try runUntilCreditWait(&fixture, request_id);
+        try std.testing.expectEqual(.borrowed, std.meta.activeTag(ctx.response_outbox.pending.stream_chunk.bytes));
+        try old_gateway.body_pool.drainReleasedChunks();
+        try std.testing.expect((try old_gateway.body_pool.usage()).used != 0);
+        if (disconnect_first)
+            runtime.disconnectEgressGatewayWithReason("test_gateway_death");
+
+        var replacement: rt.RawSession = undefined;
+        try replacement.initOnWakeSet(&fixture.wake_set, 2);
+        defer replacement.deinit();
+        _ = try replacement.gateway.body_pool.writeChunk(bytes);
+        const new_used = (try replacement.gateway.body_pool.usage()).used;
+        try ipc.egress_attach.send(fixture.control_pair[1], replacement.worker_raw);
+        try worker.testing.scheduler.loop.collectControlPacket(runtime);
+        try std.testing.expect(ctx.response_outbox.isEmpty());
+        try std.testing.expect(ctx.response_stream.fetch.failed);
+        try old_gateway.body_pool.drainReleasedChunks();
+        try std.testing.expectEqual(@as(usize, 0), (try old_gateway.body_pool.usage()).used);
+        for (0..16) |_| {
+            if (!runtime.requests.active.contains(request_id))
+                break;
+            try rt.pumpOnce(runtime);
+        }
+        try std.testing.expect(!runtime.requests.active.contains(request_id));
+        try replacement.gateway.body_pool.drainReleasedChunks();
+        try std.testing.expectEqual(new_used, (try replacement.gateway.body_pool.usage()).used);
+        runtime.disconnectEgressGatewayWithReason("test_replacement_death");
+        try replacement.gateway.body_pool.drainReleasedChunks();
+        try std.testing.expectEqual(new_used, (try replacement.gateway.body_pool.usage()).used);
+        var response: ReadResponse = .{};
+        defer response.deinit();
+        try response.readAvailable(&fixture);
+        try std.testing.expectEqual(@as(u64, 4), response.credit.window.spent);
+        try std.testing.expect(response.reset_code != null);
+        _ = try readWorkerCompletion(runtime, fixture.control_pair[1], request_id);
+    }
+}
+
+test "a retained JS chunk reborrows mutations and rejects detachment before resuming" {
+    for ([_]bool{ false, true }) |detach| {
+        var fixture: SocketFullWorker = undefined;
+        try fixture.init(.{});
+        defer fixture.deinit();
+        const source = try std.fmt.allocPrint(std.testing.allocator,
+            \\export default () => {{
+            \\  if (globalThis.held) {{ {s} return new Response("changed"); }}
+            \\  globalThis.held = new Uint8Array({d}).fill(65);
+            \\  return new Response(new ReadableStream({{ start(c) {{ c.enqueue(globalThis.held); c.close(); }} }}, {{ highWaterMark: 0 }}));
+            \\}};
+        , .{
+            if (detach) "structuredClone(globalThis.held.buffer, { transfer: [globalThis.held.buffer] });" else "globalThis.held.fill(66);",
+            credit_body_bytes,
+        });
+        defer std.testing.allocator.free(source);
+        try fixture.dispatch(9670, source, "/credit-reborrow.js");
+        _ = try runUntilCreditWait(&fixture, 9670);
+        var response: ReadResponse = .{};
+        defer response.deinit();
+        try response.readAvailable(&fixture);
+        try fixture.dispatch(9671, source, "/credit-reborrow.js");
+        try rt.executeQueuedBegin(&fixture.runtime);
+        var changed: ReadResponse = .{};
+        defer changed.deinit();
+        try changed.readAvailable(&fixture);
+        try std.testing.expectEqualStrings("changed", changed.body.items);
+        _ = try readWorkerCompletion(&fixture.runtime, fixture.control_pair[1], 9671);
+        try fixture.serveUntilFinished(&response, 9670);
+        try response.readUntilEnd(&fixture);
+        try std.testing.expect(std.mem.allEqual(u8, response.body.items[0 .. 4 * credit_chunk_bytes], 65));
+        const done = try readWorkerCompletion(&fixture.runtime, fixture.control_pair[1], 9670);
+        if (detach) {
+            try std.testing.expectEqual(@as(u64, 4), response.credit.window.spent);
+            try std.testing.expect(response.reset_code != null);
+            try std.testing.expectEqual(@intFromEnum(ipc.RequestDoneStatus.js_exception), done.status);
+        } else {
+            try std.testing.expectEqual(@as(usize, credit_body_bytes), response.body.items.len);
+            try std.testing.expect(std.mem.allEqual(u8, response.body.items[4 * credit_chunk_bytes ..], 66));
+            try std.testing.expect(response.reset_code == null);
+        }
+    }
+}
+
+// An ending's statuses mark its request as answered, so a failed answer that
+// kept them would leave nothing to finish the request before the server's
+// backstop faults the whole worker.
+test "a CPU ending whose answer fails finishes its request with a 500 internal error, and the worker keeps serving" {
+    var fixture: SocketFullWorker = undefined;
+    try fixture.init(.{});
+    defer fixture.deinit();
+    const runtime = &fixture.runtime;
+    try fixture.dispatch(9680, "export default () => new Promise(() => {});", "/cpu-answer-fails.js");
+    try rt.executeQueuedBegin(runtime);
+    const ctx = runtime.requests.active.get(9680) orelse return error.TestUnexpectedResult;
+
+    // The full socket makes the 503 wait in the outbox, which allocates, and
+    // every allocation from here fails: the answer and its retry alike.
+    const filler_count = try fillSendBuffer(fixture.control_pair[0]);
+    fixture.failing.fail_index = fixture.failing.alloc_index;
+    ctx.cpu_spent = true;
+    runtime.owners.budget_overrun_pending = true;
+    runtime.endSpentBudgets();
+    fixture.failing.fail_index = std.math.maxInt(usize);
+    try std.testing.expect(fixture.failing.has_induced_failure);
+
+    try std.testing.expect(!runtime.requests.active.contains(9680));
+    try std.testing.expect(runtime.core.running);
+    const done = try readWorkerCompletion(runtime, fixture.control_pair[1], 9680);
+    try std.testing.expectEqual(@intFromEnum(ipc.RequestDoneStatus.internal_error), done.status);
+    try std.testing.expectEqual(@as(u16, 500), done.http_status);
+    try std.testing.expectEqual(filler_count, try drainFiller(fixture.control_pair[1]));
+    try std.testing.expect(!try socketReadable(fixture.control_pair[1], 0));
+
+    try fixture.dispatch(9681, "export default () => new Response('still serving');", "/after-failed-answer.js");
+    try rt.executeQueuedBegin(runtime);
+    var next: ReadResponse = .{};
+    defer next.deinit();
+    try next.readAvailable(&fixture);
+    try std.testing.expectEqualStrings("still serving", next.body.items);
+    const next_done = try readWorkerCompletion(runtime, fixture.control_pair[1], 9681);
+    try std.testing.expectEqual(@intFromEnum(ipc.RequestDoneStatus.ok), next_done.status);
+}
+
+test "after a fire under another request a decided response's leftover timer leaves it to finish" {
+    var fixture: SocketFullWorker = undefined;
+    try fixture.init(.{});
+    defer fixture.deinit();
+    const runtime = &fixture.runtime;
+    const source = std.fmt.comptimePrint(
+        \\export default () => {{
+        \\    setTimeout(() => {{}}, 0);
+        \\    return new Response(new Uint8Array({d}).fill(65));
+        \\}};
+    , .{credit_body_bytes});
+    try fixture.dispatch(9690, source, "/decided-timer.js");
+    // The handler's pass ran the collectors before the handler, so the
+    // timer is due but not yet queued.
+    const ctx = try runUntilCreditWait(&fixture, 9690);
+    try std.testing.expect(ctx.response_committed);
+    try std.testing.expectEqual(@as(usize, 1), runtime.scheduler.timers.len());
+
+    runtime.observability.sentinel.fired_cause.store(@intFromEnum(worker.testing.sentinel.Cause.deadline), .monotonic);
+    runtime.observability.sentinel.fired_owner_id.store(9999, .release);
+    // Nothing granted credit yet, so this pass runs the timer's item alone.
+    try rt.pumpOnce(runtime);
+    try std.testing.expectEqual(@as(usize, 0), runtime.scheduler.timers.len());
+    try std.testing.expect(runtime.scheduler.ready_queue.isEmpty());
+    try std.testing.expect(runtime.requests.active.contains(9690));
+    try std.testing.expectEqual(.credit, ctx.response_advance.wait);
+
+    var response: ReadResponse = .{};
+    defer response.deinit();
+    try fixture.serveUntilFinished(&response, 9690);
+    try response.readUntilEnd(&fixture);
+    try std.testing.expect(response.reset_code == null);
+    try std.testing.expectEqual(@as(usize, credit_body_bytes), response.body.items.len);
+    const done = try readWorkerCompletion(runtime, fixture.control_pair[1], 9690);
+    try std.testing.expectEqual(@intFromEnum(ipc.RequestDoneStatus.ok), done.status);
+}
+
+// A reset request's advance sends nothing, so its cancel is all that can
+// finish it, whatever answer waits in its outbox.
+test "a client reset while an ending's answer waits for the socket finishes the request as client-closed" {
+    var fixture: SocketFullWorker = undefined;
+    try fixture.init(.{});
+    defer fixture.deinit();
+    const runtime = &fixture.runtime;
+    try fixture.dispatch(9695, "export default () => new Promise(() => {});", "/reset-while-answering.js");
+    try rt.executeQueuedBegin(runtime);
+    const filler_count = try fillSendBuffer(fixture.control_pair[0]);
+    try worker.testing.request_dispatch.deadlineTimeout(runtime, 9695);
+    const ctx = runtime.requests.active.get(9695) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!ctx.response_outbox.isEmpty());
+
+    // `SocketFullWorker.dispatch` sends every request on stream 3.
+    const identity: ipc.ingress_channel.RequestIdentity = .{
+        .request_id = 9695,
+        .request_generation = ctx.dispatch_work.request_generation,
+        .request_lane_id = ctx.dispatch_work.request_lane_id,
+        .request_slot = ctx.dispatch_work.request_slot,
+    };
+    try runtime.enqueueIngressDescriptor(.{
+        .allocator = std.testing.allocator,
+        .descriptor = ipc.ingress_channel.Descriptor.requestReset(identity, 3, @intFromEnum(h2.ErrorCode.cancel)),
+    });
+    try rt.executeNextReady(runtime);
+    try std.testing.expect(!runtime.requests.active.contains(9695));
+    const done = try readWorkerCompletion(runtime, fixture.control_pair[1], 9695);
+    try std.testing.expectEqual(@intFromEnum(ipc.RequestDoneStatus.client_closed), done.status);
+
+    // The 504 that waited left with the request.
+    try std.testing.expectEqual(filler_count, try drainFiller(fixture.control_pair[1]));
+    try fixture.pumpWhenWritable();
+    try std.testing.expect(!try socketReadable(fixture.control_pair[1], 0));
+}
+
+// A bench drives an in-process worker with nothing but `worker.runPass`, so
+// one pass must take the reader's grants as well as run the work.
+test "one pass per read of the host's reader runs a response past its credit window to its end" {
+    var fixture: SocketFullWorker = undefined;
+    try fixture.init(.{});
+    defer fixture.deinit();
+    try fixture.dispatch(9700, credit_sources[0], "/run-pass.js");
+    var channels = rt.runtimeCompletionChannels(&fixture.runtime, fixture.control_pair[1]);
+    // The reader takes ring payloads through the server's mapping of the
+    // ring; the worker's own mapping writes the direction it reads.
+    channels.ingress_payload = &fixture.server_payload;
+    var response = try host.dispatch.readResponse(
+        std.testing.allocator,
+        channels,
+        9700,
+        .{
+            .wall_ms = rt.default_read_budget_ms,
+            .max_body_bytes = rt.default_read_max_body_bytes,
+            .max_headers_bytes = rt.default_read_max_headers_bytes,
+            .progress_context = &fixture.runtime,
+            .progress_fn = runPassProgress,
+        },
+    );
+    defer response.deinit();
+    try std.testing.expectEqual(ipc.RequestDoneStatus.ok, response.doneStatus());
+    try std.testing.expectEqual(@as(usize, credit_body_bytes), response.body.len);
+    try std.testing.expect(std.mem.allEqual(u8, response.body, 65));
+}
+
+fn runPassProgress(context: ?*anyopaque) !void {
+    const runtime: *worker.Runtime = @ptrCast(@alignCast(context.?));
+    try worker.runPass(runtime);
+}
+
+fn creditFor(ctx: *const worker_request.context.RequestContext, total: u64) ipc.messages.ResponseCredit {
+    return .{
+        .request_id = ctx.exec.request_id,
+        .request_generation = ctx.dispatch_work.request_generation,
+        .request_lane_id = ctx.dispatch_work.request_lane_id,
+        .request_slot = ctx.dispatch_work.request_slot,
+        .stream_id = ctx.ingress_channel_id,
+        .grant_chunks_total = total,
+    };
+}
+
+fn runUntilCreditWait(fixture: *SocketFullWorker, request_id: u64) !*worker_request.context.RequestContext {
+    for (0..max_wait_rounds) |_| {
+        const ctx = fixture.runtime.requests.active.get(request_id) orelse return error.TestUnexpectedResult;
+        if (ctx.response_advance.wait == .credit)
+            return ctx;
+        try rt.pumpOnce(&fixture.runtime);
+    }
+    return error.TestUnexpectedResult;
+}
+
 /// How `expectParkedRestDropped` ends the request whose rest waits: as the
 /// server's reset of the stream does, or as its deadline does.
 const RequestEnd = enum { client_reset, deadline, local_failure };
@@ -1242,8 +1845,8 @@ const ParkedRestCase = struct {
 
 /// Parks the rest of a committed response, ends the request as `case.end`
 /// says, which needs no frame of its own, and checks the completion, that
-/// the client got the head and a prefix of the body, and that the flush the
-/// parked send left to arm sends nothing more.
+/// the client got the head and a prefix of the body, and that the worker
+/// sends nothing more once the socket the parked send found full has room.
 fn expectParkedRestDropped(case: ParkedRestCase) !void {
     var fixture: SocketFullWorker = undefined;
     try fixture.init(.{});
@@ -1264,10 +1867,10 @@ fn expectParkedRestDropped(case: ParkedRestCase) !void {
     defer response.deinit();
     try response.readAvailable(&fixture);
     try std.testing.expectEqual(@as(?u16, 202), response.status);
-    try std.testing.expect(!response.ended);
+    try std.testing.expect(!response.credit.ended);
     try std.testing.expect(response.body.items.len < parts_body_len);
     try expectPartsBytes(response.body.items);
-    try fixture.flushWhenWritable();
+    try fixture.pumpWhenWritable();
     try std.testing.expect(!runtime.requests.control_send_blocked);
     try std.testing.expect(!(try socketReadable(fixture.control_pair[1], 0)));
 }
@@ -1275,9 +1878,9 @@ fn expectParkedRestDropped(case: ParkedRestCase) !void {
 /// Parks the rest of a committed response and ends the request as
 /// `case.end` says, which resets the client's stream: the socket is still
 /// full, so the reset waits in the outbox in place of the rest of the body,
-/// and the request finishes, publishing its completion, once the flush sends
-/// it. Checks that the client got the head, a prefix of the body and the
-/// reset, and the completion.
+/// and the request finishes, publishing its completion, once its advance
+/// sends it. Checks that the client got the head, a prefix of the body and
+/// the reset, and the completion.
 fn expectParkedRestReset(case: ParkedRestCase) !void {
     var fixture: SocketFullWorker = undefined;
     try fixture.init(.{});
@@ -1394,19 +1997,25 @@ const ring_index_bytes: []const u8 = &worker.fs.fs_index.placeholder_bytes;
 /// A worker on its restricted ring whose control socket's worker end does
 /// not block, as `zygote/child_boot.zig` leaves it, with a send buffer small
 /// enough to fill. The test plays the server on the socket's other end and
-/// on the shared payload ring. It is initialized in place, because the
-/// runtime keeps pointers to the fields beside it.
+/// on the shared payload ring, and, without a gateway, the gateway's end of
+/// the egress session. It is initialized in place, because the runtime keeps
+/// pointers to the fields beside it.
 const SocketFullWorker = struct {
     now_mono_ns: u64,
+    /// The runtime's allocator, over the testing allocator. It fails nothing
+    /// until a test sets `fail_index`.
+    failing: std.testing.FailingAllocator,
     scratch: []u8,
     control_pair: [2]std.posix.fd_t,
     ingress_payload_fd: std.posix.fd_t,
     server_payload: ipc.ingress_channel.SharedPayloadView,
     wake_set: ipc.egress_shared.WakeSet,
-    /// The worker's egress session when no gateway serves it, and empty
-    /// when one does.
-    shared: ipc.egress_shared.SessionFds,
+    /// Serves the worker's egress session, or null when the test plays the
+    /// gateway's end of `session`.
     gateway: ?*rt.LocalEgressGateway,
+    session: ?rt.RawSession,
+    /// The worker's half of the gateway's session, which `Runtime.init`
+    /// takes; empty without a gateway.
     worker_raw: ipc.egress_shared.RawFds,
     fault_pair: [2]std.posix.fd_t,
     vm: bindings.Vm,
@@ -1416,10 +2025,9 @@ const SocketFullWorker = struct {
     /// which brings a backend of its own, leaves none of these in flight.
     backend: uring_backend.UringBackend,
 
-    /// Requested for the worker's end. The kernel caps the request at
-    /// `net.core.wmem_max` and doubles it; with the default cap the buffer
-    /// holds any single packet of these tests and less than the parts body.
-    const send_buffer_request_bytes: c_int = 64 * 1024;
+    // Linux doubles SO_SNDBUF. This leaves room for individual inline
+    // packets but forces EAGAIN before all four body credits can be spent.
+    const send_buffer_request_bytes: c_int = 24 * 1024;
 
     const Options = struct {
         /// Serves the worker's egress session with a gateway that reaches a
@@ -1429,6 +2037,7 @@ const SocketFullWorker = struct {
 
     fn init(self: *SocketFullWorker, options: Options) !void {
         self.now_mono_ns = 0;
+        self.failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
         self.scratch = try std.testing.allocator.alloc(u8, ipc.max_message_bytes);
         errdefer std.testing.allocator.free(self.scratch);
 
@@ -1451,7 +2060,7 @@ const SocketFullWorker = struct {
         self.wake_set = try ipc.egress_shared.WakeSet.create();
         errdefer self.wake_set.deinit();
         if (options.with_gateway) {
-            self.shared = .{};
+            self.session = null;
             const gateway = try rt.LocalEgressGateway.startOnWakeSet(std.testing.allocator, .{
                 .network = rt.local_origin_network,
             }, &self.wake_set);
@@ -1459,11 +2068,12 @@ const SocketFullWorker = struct {
             self.worker_raw = gateway.takeWorkerSharedFds();
         } else {
             self.gateway = null;
-            self.shared = try ipc.egress_shared.createSessionForWorker(&self.wake_set);
-            self.worker_raw = self.shared.takeWorkerHalf();
+            self.worker_raw = .{};
+            self.session = @as(rt.RawSession, undefined);
+            try self.session.?.initOnWakeSet(&self.wake_set, rt.local_egress_session_id);
         }
         errdefer if (self.gateway) |gateway| gateway.deinit();
-        errdefer self.shared.deinit();
+        errdefer if (self.session) |*session| session.deinit();
         const ingress_payload_credit_fd = try std.posix.eventfd(0, std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK);
         var credit_fd_owned_by_runtime = false;
         errdefer if (!credit_fd_owned_by_runtime)
@@ -1481,7 +2091,7 @@ const SocketFullWorker = struct {
         // `Runtime.init` takes the credit eventfd, closing it on failure.
         credit_fd_owned_by_runtime = true;
         self.runtime = try worker.Runtime.init(
-            std.testing.allocator,
+            self.failing.allocator(),
             &self.vm,
             self.control_pair[0],
             &self.completion_fixture.view,
@@ -1489,7 +2099,7 @@ const SocketFullWorker = struct {
             worker.RuntimeOptions{
                 .clock = .{ .ctx = &self.now_mono_ns, .now_fn = fakeNow },
                 .ingress_payload_fd = self.ingress_payload_fd,
-                .egress_shared_fds = &self.worker_raw,
+                .egress_shared_fds = if (self.session) |*session| &session.worker_raw else &self.worker_raw,
                 .ingress_payload_credit_eventfd = ingress_payload_credit_fd,
             },
         );
@@ -1506,7 +2116,8 @@ const SocketFullWorker = struct {
         self.vm.deinit();
         worker.fs.uninstallForTest();
         closePair(self.fault_pair);
-        self.shared.deinit();
+        if (self.session) |*session|
+            session.deinit();
         if (self.gateway) |gateway|
             gateway.deinit();
         self.wake_set.deinit();
@@ -1546,10 +2157,15 @@ const SocketFullWorker = struct {
         try std.testing.expect(self.backend.control_writable_poll_armed);
     }
 
-    /// Waits for the backend to report the control socket writable, then
-    /// flushes the outboxes, as the loop does on that event
-    /// (`scheduler/loop.zig`).
-    fn flushWhenWritable(self: *SocketFullWorker) !void {
+    /// Runs one pass of the worker (`rt.pumpOnce`). When a send found the
+    /// control socket full, it first waits for the backend to report the
+    /// socket writable and handles that event as the loop does
+    /// (`scheduler/loop.zig:handleControlWritable`).
+    fn pumpWhenWritable(self: *SocketFullWorker) !void {
+        if (!self.runtime.requests.control_send_blocked) {
+            try rt.pumpOnce(&self.runtime);
+            return;
+        }
         var round: usize = 0;
         while (round < max_wait_rounds) : (round += 1) {
             try self.backend.arm(&self.runtime);
@@ -1558,7 +2174,8 @@ const SocketFullWorker = struct {
             for (events[0..ready]) |event| {
                 switch (event) {
                     .control_writable => {
-                        try self.runtime.flushPendingIngressResponses();
+                        try worker.testing.scheduler.loop.handleControlWritable(&self.runtime);
+                        try rt.pumpOnce(&self.runtime);
                         return;
                     },
                     .wakeup_ready => self.runtime.drainWakeup(),
@@ -1571,15 +2188,19 @@ const SocketFullWorker = struct {
     }
 
     /// Plays the server until `request_id` finishes: reads what the socket
-    /// holds into `response`, then lets the worker flush once the socket
-    /// has room.
+    /// holds into `response`, which grants credit for it, then runs the
+    /// worker once the socket has room. Only a gateway thread delivers
+    /// anything in real time, so only with one does a pass that finds
+    /// nothing ready wait a millisecond.
     fn serveUntilFinished(self: *SocketFullWorker, response: *ReadResponse, request_id: u64) !void {
         var round: usize = 0;
         while (self.runtime.requests.active.contains(request_id)) : (round += 1) {
             if (round == max_wait_rounds)
                 return error.TestUnexpectedResult;
             try response.readAvailable(self);
-            try self.flushWhenWritable();
+            try self.pumpWhenWritable();
+            if (self.gateway != null and self.runtime.scheduler.ready_queue.isEmpty())
+                std.Thread.sleep(std.time.ns_per_ms);
         }
     }
 };
@@ -1590,7 +2211,7 @@ const ReadResponse = struct {
     status: ?u16 = null,
     body: std.ArrayList(u8) = .empty,
     reset_code: ?u32 = null,
-    ended: bool = false,
+    credit: rt.ResponseReadCredit = .{ .request_id = 0 },
 
     fn deinit(self: *ReadResponse) void {
         self.body.deinit(std.testing.allocator);
@@ -1599,6 +2220,7 @@ const ReadResponse = struct {
 
     /// Reads the packets the server's end holds now.
     fn readAvailable(self: *ReadResponse, fixture: *SocketFullWorker) !void {
+        try self.credit.flush(fixture.control_pair[1]);
         while (try socketReadable(fixture.control_pair[1], 0))
             try self.readPacket(fixture);
     }
@@ -1606,7 +2228,7 @@ const ReadResponse = struct {
     /// Reads packets until the response ends or resets. The worker sent them
     /// all already, so a packet that does not arrive within a second fails.
     fn readUntilEnd(self: *ReadResponse, fixture: *SocketFullWorker) !void {
-        while (!self.ended) {
+        while (!self.credit.ended) {
             if (!try socketReadable(fixture.control_pair[1], 1000))
                 return error.TestUnexpectedResult;
             try self.readPacket(fixture);
@@ -1614,6 +2236,7 @@ const ReadResponse = struct {
     }
 
     fn readPacket(self: *ReadResponse, fixture: *SocketFullWorker) !void {
+        const spent_before = self.credit.window.spent;
         var raw_packet = try ipc.recvPacketWithFdsScratch(std.testing.allocator, fixture.control_pair[1], fixture.scratch);
         const readers: ipc.ingress_channel.SharedPayloadReaders = .{ .worker_to_server = &fixture.server_payload };
         if (ipc.ingress_channel.isDescriptorBatchPacket(raw_packet.bytes)) {
@@ -1626,34 +2249,25 @@ const ReadResponse = struct {
             defer single.deinit();
             try self.take(single.descriptor, single.payload);
         }
+        self.credit.retire(self.credit.window.spent - spent_before);
+        try self.credit.flush(fixture.control_pair[1]);
     }
 
     fn take(self: *ReadResponse, descriptor: ipc.ingress_channel.Descriptor, payload: []const u8) !void {
-        try std.testing.expect(!self.ended);
-        if (descriptor.op == @intFromEnum(ipc.ingress_channel.Op.response_head)) {
-            try std.testing.expect(self.status == null);
-            var head = try ipc.ingress_channel.decodeResponseHead(std.testing.allocator, payload);
-            defer head.deinit();
-            self.status = head.status;
-            self.ended = descriptor.hasFlag(ipc.ingress_channel.flags.end_stream);
-            return;
+        if (self.credit.identity == null)
+            self.credit.request_id = descriptor.request_id;
+        try self.credit.admit(descriptor);
+        switch (descriptor.op) {
+            @intFromEnum(ipc.ingress_channel.Op.response_head) => {
+                var head = try ipc.ingress_channel.decodeResponseHead(std.testing.allocator, payload);
+                defer head.deinit();
+                self.status = head.status;
+            },
+            @intFromEnum(ipc.ingress_channel.Op.response_chunk) => try self.body.appendSlice(std.testing.allocator, payload),
+            @intFromEnum(ipc.ingress_channel.Op.response_end) => {},
+            @intFromEnum(ipc.ingress_channel.Op.response_reset) => self.reset_code = descriptor.aux,
+            else => return error.TestUnexpectedResult,
         }
-        try std.testing.expect(self.status != null);
-        if (descriptor.op == @intFromEnum(ipc.ingress_channel.Op.response_chunk)) {
-            try self.body.appendSlice(std.testing.allocator, payload);
-            self.ended = descriptor.hasFlag(ipc.ingress_channel.flags.end_stream);
-            return;
-        }
-        if (descriptor.op == @intFromEnum(ipc.ingress_channel.Op.response_end)) {
-            self.ended = true;
-            return;
-        }
-        if (descriptor.op == @intFromEnum(ipc.ingress_channel.Op.response_reset)) {
-            self.reset_code = descriptor.aux;
-            self.ended = true;
-            return;
-        }
-        return error.TestUnexpectedResult;
     }
 };
 

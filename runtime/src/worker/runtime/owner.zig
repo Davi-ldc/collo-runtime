@@ -35,7 +35,7 @@
 //! faults a worker whose owner overran it. A limit already spent when a
 //! window opens is not published, because a fire then would stop the native
 //! answer the worker gives instead of running the owner's JavaScript
-//! (`termination.endAtBoundary`); only an owner that passes a limit while it
+//! (`termination.admitAtBoundary`); only an owner that passes a limit while it
 //! runs is stopped. A charge that takes a request to its CPU budget marks it
 //! `cpu_spent`, and the loop answers it after the work item
 //! (`termination.endSpentBudgets`).

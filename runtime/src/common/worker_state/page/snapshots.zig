@@ -34,19 +34,30 @@ const LiveSlotState = @import("live_slots.zig").LiveSlotState;
 const CompletedRecord = @import("usage_records.zig").CompletedRecord;
 const RECORD_RING_COUNT = @import("usage_records.zig").RECORD_RING_COUNT;
 
-/// The lifecycle header's two tags, loaded once each and kept raw.
+/// The lifecycle header's two tags and its startup-end flag, each loaded
+/// once and kept raw.
 pub const LifecycleSnapshot = struct {
     state: u32,
     termination_reason: u32,
+    startup_evaluations_ended: u32,
 
-    /// Loads `state` and then `termination_reason`, each once with acquire
-    /// ordering. The worker stores the reason first
+    /// Loads `state`, then `termination_reason`, then the startup-end flag,
+    /// each once with acquire ordering. The worker stores the reason first
     /// (`WorkerWriterView.setState`), so the reason this load sees was stored
     /// with the state it sees, or after it.
     pub fn load(header: *const Header) LifecycleSnapshot {
         const state = @atomicLoad(u32, &header.state, .acquire);
         const termination_reason = @atomicLoad(u32, &header.termination_reason, .acquire);
-        return .{ .state = state, .termination_reason = termination_reason };
+        return .{
+            .state = state,
+            .termination_reason = termination_reason,
+            .startup_evaluations_ended = @atomicLoad(u32, &header.startup_evaluations_ended, .acquire),
+        };
+    }
+
+    /// Whether the startup-end flag is 1; any other value is no end.
+    pub fn startupEnded(self: LifecycleSnapshot) bool {
+        return self.startup_evaluations_ended == 1;
     }
 
     /// The state, or null for a value `State` does not name.

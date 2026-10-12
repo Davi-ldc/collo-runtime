@@ -24,8 +24,10 @@
 //!   deadline, behind a writability poll on the worker's control socket or,
 //!   for room in the worker's payload ring, behind the `payload_credit` wake
 //!   the worker's reader raises (`request_body.zig`), and the request's later
-//!   sends queue behind them in order: its begin, a reset, then its stream's
-//!   buffered body.
+//!   sends queue behind them in order: its begin, a reset, its response
+//!   credit, then its stream's buffered body. The credit waits only for room
+//!   in the control socket, so a body that waits for ring room never holds it
+//!   back.
 //! - A send that fails for the worker's doing stops the request's sends. Met
 //!   inside a stream handler, it queues the worker's death path for after the
 //!   handler (`worker_fault.deferWorkerFault`), since that path drives other
@@ -343,6 +345,48 @@ pub fn Methods(comptime Self: type) type {
             }
         }
 
+        /// Grants the request `owner` one more body chunk once the client
+        /// socket took the last byte of one of its chunks, and sends the
+        /// worker the new total. A request that ended, a later request in its
+        /// slot, and a response that ended or was reset get no credit.
+        pub fn responseChunkRetired(self: *Self, owner: lifecycle.RequestKey) LaneFault!void {
+            const index = Admission.findRequestSlot(self, owner) orelse return;
+            const slot = &self.requests.entries[index];
+            if (!slot.dispatched() or slot.h2_client_reset or slot.send_blocked == .failed)
+                return;
+            const runtime = Admission.requestConnection(self, slot) orelse return;
+            const stream = runtime.h2StreamEntry(slot.ingress_channel_id) orelse return;
+            if (stream.worker_response_ended)
+                return;
+            _ = slot.response_credit.retire();
+            slot.response_credit_unsent = true;
+            switch (try sendResponseCredit(self, slot)) {
+                .sent => {},
+                .socket_full, .ring_full => try armSendPolls(self, slot),
+                .fault => |reason| try failSend(self, slot, reason),
+            }
+        }
+
+        /// Sends ResponseCredit straight to the control socket. It needs no
+        /// ring room, so a request body blocked on the ring does not hold it back.
+        fn sendResponseCredit(self: *Self, slot: *RequestSlot) LaneFault!Sent {
+            if (!slot.response_credit_unsent)
+                return .sent;
+            const worker = slot.worker orelse return error.RequestSlotVacant;
+            const message: ipc.ResponseCredit = .{
+                .request_lane_id = slot.request_key.lane_id,
+                .request_slot = slot.request_key.slot,
+                .stream_id = slot.ingress_channel_id,
+                .request_id = slot.request_id,
+                .request_generation = slot.request_key.generation,
+                .grant_chunks_total = slot.response_credit.granted,
+            };
+            ipc.response_credit.send(worker.handle.control_fd, message) catch |err|
+                return sendResult(self, worker, err);
+            slot.response_credit_unsent = false;
+            return .sent;
+        }
+
         /// Tells the worker of the dispatched request in `request_slot` that
         /// its client stream is gone (`request_reset`), so it can stop; the
         /// request stays until the worker completes it. A request whose begin
@@ -353,6 +397,7 @@ pub fn Methods(comptime Self: type) type {
             const slot = &self.requests.entries[request_slot];
             if (!slot.dispatched())
                 return error.RequestSlotVacant;
+            slot.response_credit_unsent = false;
             switch (slot.send_blocked) {
                 // The worker's death path ends the request.
                 .failed => return,
@@ -376,9 +421,9 @@ pub fn Methods(comptime Self: type) type {
         /// writability poll on the worker's control socket fired or the
         /// worker freed room in its payload ring; it then arms the polls the
         /// requests still wait on. A request's sends go out in their order:
-        /// its begin, a reset, then its stream's buffered body. A send that
-        /// fails for the worker's doing runs the death path here, outside
-        /// any stream handler.
+        /// its begin, a reset, its response credit, then its stream's
+        /// buffered body. A send that fails for the worker's doing runs the
+        /// death path here, outside any stream handler.
         pub fn flushBlockedSends(self: *Self, registration_index: u32) LaneFault!void {
             _ = try WorkerRegistration.registrationAt(self, registration_index);
             if (try retryBlockedSends(self, registration_index)) |reason|
@@ -420,7 +465,8 @@ pub fn Methods(comptime Self: type) type {
             for (request_keys[0..request_count]) |request_key| {
                 const request_slot = Admission.findRequestSlot(self, request_key) orelse continue;
                 switch (self.requests.entries[request_slot].send_blocked) {
-                    .none, .failed => continue,
+                    .failed => continue,
+                    .none => if (!self.requests.entries[request_slot].response_credit_unsent) continue,
                     .socket, .ring => {},
                 }
                 switch (try flushRequestSends(self, request_slot)) {
@@ -465,6 +511,11 @@ pub fn Methods(comptime Self: type) type {
                     .fault => |reason| return .{ .fault = reason },
                 }
             }
+            switch (try sendResponseCredit(self, slot)) {
+                .sent => {},
+                .socket_full, .ring_full => return .would_block,
+                .fault => |reason| return .{ .fault = reason },
+            }
             slot.send_blocked = .none;
             return RequestBody.flushPendingBody(self, request_slot);
         }
@@ -477,6 +528,7 @@ pub fn Methods(comptime Self: type) type {
             if (slot.send_blocked == .failed)
                 return;
             slot.send_blocked = .failed;
+            slot.response_credit_unsent = false;
             if (slot.parked_begin) |*parked| {
                 parked.deinit();
                 slot.parked_begin = null;

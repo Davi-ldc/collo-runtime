@@ -2,9 +2,10 @@
 //! adds has globals, intrinsics, a module registry, console labels, a blob:
 //! URL registry and a performance timeline of its own and every install the
 //! VM made; an object the ABI creates belongs to the realm it was created in,
-//! and an error it raises for a primitive to the realm that asked; and a
-//! reseed gives every realm a Math.random sequence of its own. The
-//! worker serving its routes from their realms is covered by
+//! and an error it raises for a primitive to the realm that asked; a reseed
+//! gives every realm a Math.random sequence of its own; and globals past the
+//! subspace's precise cells keep their own state across a full collection.
+//! The worker serving its routes from their realms is covered by
 //! `worker/tests/runtime/routes.zig` and by local-e2e.
 
 const std = @import("std");
@@ -178,12 +179,17 @@ test "a realm the VM adds has globals, intrinsics and a module registry of its o
     try expectOwnedBy(&vm, main, second, "ownsObject", &object);
 }
 
+/// JSC gives a subspace's first `JSCell::numberOfLowerTierPreciseCells` (8)
+/// cells precise allocations sized from the request; later ones share
+/// MarkedBlocks laid out for the subspace's cell size. Ten globals reach two
+/// block-allocated ones, where a global sized for `JSGlobalObject` would
+/// overlap its neighbour.
+const globals_past_precise_cells = 10;
+
 test "realm globals keep their own state across allocation blocks and full collection" {
     var vm = try probeVm();
     defer vm.deinit();
-    // More globals than JSCell::numberOfLowerTierPreciseCells, so both
-    // precise cells and the global subspace's block allocator are exercised.
-    var realms: [17]bindings.Realm = undefined;
+    var realms: [globals_past_precise_cells]bindings.Realm = undefined;
     realms[0] = vm.mainRealm();
     for (realms[1..]) |*realm|
         realm.* = try vm.createRealm();

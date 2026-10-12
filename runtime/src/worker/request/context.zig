@@ -142,7 +142,7 @@ pub const IncomingBody = struct {
 pub const request_id_max: u64 = worker_owner_id - evaluation_count - 1;
 
 /// One evaluation id per route a definition may hold.
-const evaluation_count: u64 = limits.server.routes_per_definition_max;
+pub const evaluation_count: u64 = limits.server.routes_per_definition_max;
 
 /// The id of the evaluation of the route at index 0; the route at index `i`
 /// gets `evaluation_id_first + i` (`evaluationId`). Routes that share a
@@ -254,6 +254,8 @@ pub const RequestContext = struct {
     /// ends: a fetch body or a ReadableStream (`response_stream.zig`).
     response_stream: response_stream.Source,
     response_outbox: response_outbox.Outbox,
+    response_credit: ipc.response_credit.Window = .{},
+    response_advance: response_stream.Advance = .{},
     response_done_status: ipc.RequestDoneStatus,
     response_http_status: u16,
     response_committed: bool,

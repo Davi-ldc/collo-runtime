@@ -2,12 +2,11 @@
 //! active map from request id to `RequestContext`, the request task table,
 //! settled handler results waiting for their turn, the shared ingress
 //! payload region with its credit eventfd, and whether a response send has
-//! found the control socket full since the outboxes were last flushed.
-//! `Methods` holds the runtime's request operations, which `Runtime`
-//! declares as its own (`root.zig`): queueing the ingress work the control
-//! channel delivers, request completions and failures, the flush of parked
-//! responses, and the end of a request context. It belongs to the worker's
-//! VM thread.
+//! found the control socket full since it last turned writable. `Methods`
+//! holds the runtime's request operations, which `Runtime` declares as its
+//! own (`root.zig`): queueing the ingress work the control channel delivers,
+//! request completions and failures, and the end of a request context. It
+//! belongs to the worker's VM thread.
 //!
 //! The active map holds the open evaluations under their evaluation ids
 //! (`evaluations.zig`) beside the dispatched requests: every owner that may
@@ -24,7 +23,6 @@ const request_completion = @import("collo_worker_request").completion;
 const request_ingress = @import("collo_worker_request").ingress.runtime;
 const request_task = @import("collo_worker_request").task;
 const request_dispatch = @import("../serve/dispatch.zig");
-const response_flow = @import("../serve/response.zig");
 const runtime_types = @import("types.zig");
 
 pub const Requests = struct {
@@ -36,15 +34,15 @@ pub const Requests = struct {
     /// Mapped read-write from `RuntimeOptions.ingress_payload_fd` as the
     /// worker's side (`SharedPayloadSide`).
     ingress_payload: ?ipc.ingress_channel.SharedPayloadView,
-    /// When it turns readable, the loop drains it and flushes the responses
-    /// parked for payload room (`scheduler/loop.zig`).
+    /// When it turns readable, the loop drains it and queues the advance of
+    /// each response that waits for payload room (`scheduler/loop.zig`).
     ingress_payload_credit_eventfd: ?std.posix.fd_t,
     /// Id of the next request body read (`request/body_read.zig`).
     next_body_task_id: u64,
-    /// A response send found the control socket full since the outboxes
-    /// were last flushed. While it holds, the loop polls the socket for room
-    /// (`scheduler/uring_backend.zig`); the flush clears it before it sends
-    /// (`serve/response.zig`).
+    /// A response send found the control socket full since it last turned
+    /// writable. While it holds, the loop polls the socket for room
+    /// (`scheduler/uring_backend.zig`), and the writable event clears it
+    /// (`serve/response.zig:notifyTransport`).
     control_send_blocked: bool = false,
 
     pub fn init(
@@ -149,10 +147,6 @@ pub fn Methods(comptime Runtime: type) type {
                 });
             ctx.deinit();
             self.core.allocator.destroy(ctx);
-        }
-
-        pub fn flushPendingIngressResponses(self: *Runtime) !void {
-            try response_flow.flushPendingIngressResponses(self);
         }
     };
 }

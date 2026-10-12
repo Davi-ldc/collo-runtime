@@ -1,19 +1,34 @@
-//! The body source a request's streamed response pulls from, held in
+//! The source a request's streamed response pulls from, held in
 //! `RequestContext.response_stream` from the moment the response streams
 //! until it ends: a fetch body the gateway delivers, or a ReadableStream the
 //! handler's Response carried, which the bridge locked at extraction
-//! (`collo_response_body_stream_*` in `abi.h`). `serve/response.zig` drives
-//! the first and `serve/response_body_stream.zig` the second; this file holds
-//! their state and the queueing a request-module file may do. It belongs to
-//! the worker's VM thread.
+//! (`collo_response_body_stream_*` in `abi.h`). It also holds the state of
+//! the request's one `response_advance` work item, which every response
+//! resumes through (`serve/response.zig:executeAdvance`), and the queueing a
+//! request-module file may do. It belongs to the worker's VM thread.
 //!
-//! A body stream is read one chunk at a time. A read's result arrives from the
-//! bridge during a microtask drain, parks here and queues the request's
-//! `response_body_stream` work item, which takes it in the request's own
-//! window; the next read starts only once the chunk before it went out whole,
-//! so the stream advances at the pace the payload ring and the client allow.
+//! A body stream is read one chunk at a time, and the next read starts only
+//! once every byte of the chunk before it went out. The chunk stays rooted
+//! here until then, and its bytes are borrowed again on each try, since a
+//! call into the VM may move or detach them.
 
 const bindings = @import("collo_bindings");
+
+/// What a stopped response waits for. A grant ends a `credit` wait
+/// (`ingress/runtime.zig:enqueueResponseCredit`), and room in the payload
+/// ring or the control socket ends the other two
+/// (`serve/response.zig:notifyTransport`).
+pub const Wait = enum { none, credit, ring, socket };
+
+/// The request's `response_advance` work item. `unqueued` marks an item
+/// that found both scheduler queues full, which the ingress rescan queues
+/// (`ingress/runtime.zig:collectReadyRequests`); `ready_since_ns` keeps its
+/// first readiness stamp until it runs.
+pub const Advance = struct {
+    state: enum { idle, unqueued, queued } = .idle,
+    ready_since_ns: u64 = 0,
+    wait: Wait = .none,
+};
 
 pub const Source = union(enum) {
     none,
@@ -45,20 +60,26 @@ pub const Fetch = struct {
     identity: bindings.FetchBodyIdentity,
     /// A pull is in flight; `executeFetchBodyStreamReady` moves its bytes.
     pull_pending: bool = false,
+    /// The gateway session detached while a chunk borrowed from its body pool
+    /// waited to be sent, so the chunk was dropped and the response cannot
+    /// end whole (`serve/response.zig:releaseFetchResponseHoldsBeforeDetach`).
+    failed: bool = false,
 };
 
 pub const BodyStream = struct {
     /// The locked stream, owned.
     stream: bindings.ResponseBodyStream,
-    /// A read's result the bridge reported that the work item has not taken.
+    /// The last read's result; a chunk stays here until all of it went out.
     result: Result = .none,
     /// A read is in flight and its result has not been reported.
     reading: bool = false,
-    /// The last chunk went out from the loop's flush, so the work item starts
-    /// the next read.
+    /// The previous chunk was sent, so the next advance starts a read.
     read_next: bool = false,
-    /// The request's `response_body_stream` work item is in the ready queue.
-    advance_queued: bool = false,
+    /// The bytes of the chunk in `result` already sent.
+    offset: usize = 0,
+    /// The chunk's length when it was first borrowed, which every later
+    /// borrow must find again.
+    chunk_len: ?usize = null,
     /// The stream has reported neither done nor an error, so an early end of
     /// the response may cancel it.
     open: bool = true,
@@ -67,18 +88,6 @@ pub const BodyStream = struct {
         self.result.deinit();
         self.stream.deinit();
         self.* = undefined;
-    }
-
-    /// Whether the work item has something to do: a result to take, or the
-    /// next read once nothing is in flight.
-    pub fn wantsAdvance(self: *const BodyStream) bool {
-        if (self.advance_queued)
-            return false;
-        if (self.result != .none)
-            return true;
-        if (self.read_next)
-            return !self.reading;
-        return false;
     }
 };
 
@@ -99,38 +108,32 @@ pub const Result = union(enum) {
         }
         self.* = .none;
     }
-
-    /// Moves the result out and leaves `.none`; the caller owns what it took.
-    pub fn take(self: *Result) Result {
-        const taken = self.*;
-        self.* = .none;
-        return taken;
-    }
 };
 
-/// Queues the `response_body_stream` work item of request `request_id`
-/// unless one is queued already or `source` is not a body stream. Returns
-/// false when the ready queue and its backlog are both full; the ingress
-/// rescan (`ingress/runtime.zig:collectReadyRequests`) then queues it from
-/// `wantsAdvance`.
-pub fn queueAdvance(runtime: anytype, request_id: u64, source: *Source) bool {
-    const body_stream = switch (source.*) {
-        .body_stream => |*held| held,
-        .none, .fetch => return true,
-    };
-    if (body_stream.advance_queued)
+/// Queues the request's `response_advance` item unless it is queued already
+/// or the request is finishing or reset. Returns false when both scheduler
+/// queues are full; the item then stays `unqueued` with its first stamp.
+/// Call it only for an event that lets the response move: one waiting for
+/// credit has nothing to run until a grant arrives.
+pub fn queueAdvance(runtime: anytype, request_ctx: anytype) bool {
+    if (request_ctx.finish_started or request_ctx.client_reset)
         return true;
-    if (!runtime.tryQueueReadyWork(.{ .response_body_stream = request_id }))
+    const advance = &request_ctx.response_advance;
+    if (advance.state == .queued)
+        return true;
+    advance.state = .unqueued;
+    if (advance.ready_since_ns == 0)
+        advance.ready_since_ns = runtime.nowMonoNs();
+    if (!runtime.tryQueueReadyWorkReadySince(.{ .response_advance = request_ctx.exec.request_id }, advance.ready_since_ns))
         return false;
-    body_stream.advance_queued = true;
+    advance.state = .queued;
     return true;
 }
 
-/// Whether `source` is a body stream whose work item has something to do and
-/// is not queued (`BodyStream.wantsAdvance`).
-pub fn wantsAdvance(source: *const Source) bool {
-    return switch (source.*) {
-        .body_stream => |body_stream| body_stream.wantsAdvance(),
-        .none, .fetch => false,
-    };
+/// Withdraws the request's queued advance and clears its wait, for a
+/// response that is dropped.
+pub fn discardAdvance(runtime: anytype, request_ctx: anytype) void {
+    if (request_ctx.response_advance.state == .queued)
+        runtime.withdrawReadyWork(.{ .response_advance = request_ctx.exec.request_id });
+    request_ctx.response_advance = .{};
 }

@@ -223,7 +223,7 @@ pub fn Methods(comptime Runtime: type) type {
                 .request_body_ready,
                 .request_cancelled,
                 .request_deadline,
-                .response_body_stream,
+                .response_advance,
                 => |request_id| request_id,
                 .request_completion => |token| if (self.requests.tasks.get(token)) |task|
                     task.request_id
@@ -281,7 +281,11 @@ pub fn Methods(comptime Runtime: type) type {
                 return true;
             }
             markReadyRescanNeeded(self, item);
-            self.wake();
+            // No wake, for any item: the full ready queue keeps the loop
+            // from blocking, and `collectFast` reruns every rescan at the top
+            // of the next tick. A wake would send the loop back to the top
+            // after its next drain (`drained_wakeup` in `scheduler/loop.zig`),
+            // where the rescan fails and wakes again, so no item would pop.
             return false;
         }
 
@@ -315,7 +319,7 @@ pub fn Methods(comptime Runtime: type) type {
 
         fn markReadyRescanNeeded(self: *Runtime, item: ready_queue_mod.WorkItem) void {
             switch (item) {
-                .request, .request_body_ready, .request_cancelled, .response_body_stream => {
+                .request, .request_body_ready, .request_cancelled, .response_advance => {
                     self.scheduler.ingress_rescan_needed = true;
                 },
                 .request_completion => {

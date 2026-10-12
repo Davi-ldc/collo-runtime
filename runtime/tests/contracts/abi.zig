@@ -64,15 +64,12 @@ test "extracted headers and bodies carry no growth fields" {
     try std.testing.expectEqual(@as(usize, 72), @offsetOf(bindings.ExtractedResponseBody, "body_stream"));
 }
 
-test "an extracted response and a streamed body's chunk keep their layouts" {
+test "an extracted response keeps its layout" {
     try std.testing.expectEqual(@as(usize, 128), @sizeOf(bindings.ExtractedResponse));
     try std.testing.expectEqual(@as(usize, 80), @offsetOf(bindings.ExtractedResponse, "headers"));
     try std.testing.expectEqual(@as(usize, 120), @offsetOf(bindings.ExtractedResponse, "status"));
     try std.testing.expectEqual(@as(usize, 122), @offsetOf(bindings.ExtractedResponse, "reserved0"));
     try std.testing.expectEqual(@as(usize, 124), @offsetOf(bindings.ExtractedResponse, "reserved1"));
-    try std.testing.expectEqual(@as(usize, 24), @sizeOf(bindings.ResponseBodyChunk));
-    try std.testing.expectEqual(@as(usize, 0), @offsetOf(bindings.ResponseBodyChunk, "bytes"));
-    try std.testing.expectEqual(@as(usize, 16), @offsetOf(bindings.ResponseBodyChunk, "owner"));
 }
 
 test "memory status, heap statistics and fs routes keep their layouts" {

@@ -1,10 +1,11 @@
-//! Writes a buffered response to the host over the ingress channel and
-//! finishes the request. A small body rides one inline batch with its head;
-//! a larger one goes as chunks, inline or through the shared payload ring.
-//! When the control socket or the ring has no room, the rest of the response
-//! waits in the request's outbox, with its head when the head has not gone
-//! out, and the outbox flush sends it and finishes the request
-//! (`serve/response.zig`). It runs on the worker's VM thread.
+//! Writes a buffered or segmented response to the host over the ingress
+//! channel and finishes the request. A small body rides one inline batch
+//! with its head; a larger one goes as chunks, inline or through the shared
+//! payload ring. When the request has no credit, or the control socket or
+//! the ring has no room, the rest of the response waits in the request's
+//! outbox, with its head when the head has not gone out, and the request's
+//! advance sends it and finishes the request (`response.zig`). It runs on
+//! the worker's VM thread.
 
 const std = @import("std");
 const ipc = @import("collo_ipc");
@@ -27,16 +28,21 @@ pub const FinishFn = *const fn (
 ) anyerror!response_finish.FinishOutcome;
 
 /// Writes `response`, whose body is not a stream, and calls `finish_request`
-/// once every byte is sent. When part of the response waits in the outbox,
-/// the outbox flush finishes the request instead.
+/// with the statuses in the request's context once every byte is sent. When
+/// part of the response waits in the outbox, the advance that sends it
+/// finishes the request instead. The request's response has not committed:
+/// this is its first write, or an answer in place of one whose head never
+/// went out (`response.zig:replaceUnsentResponse`).
 pub fn writeAndFinish(
     runtime: *state.Runtime,
     request_ctx: *request_context.RequestContext,
     response: *response_model.Response,
-    done_status: ipc.RequestDoneStatus,
-    http_status: u16,
     finish_request: FinishFn,
 ) !void {
+    // Every chunk goes out with or after the head, so a response that has
+    // not committed has spent no credit, and its first chunk always fits.
+    std.debug.assert(!request_ctx.response_committed);
+    std.debug.assert(request_ctx.response_credit.spent == 0);
     tracing.mark(runtime, request_ctx, "response_extract_done_ns");
 
     const response_body_len = response.body.len();
@@ -50,7 +56,7 @@ pub fn writeAndFinish(
     ) orelse {
         var head = try response_payload_writer.pendingHead(runtime, response, response_body_len == 0);
         errdefer head.deinit(runtime.core.allocator);
-        try parkBody(runtime, request_ctx, response, head, 0, done_status, http_status);
+        try parkBody(runtime, request_ctx, response, head, 0);
         return;
     };
     const progress = if (contiguous)
@@ -65,14 +71,14 @@ pub fn writeAndFinish(
         );
     switch (progress) {
         .sent => {},
-        .ring_full, .socket_full => {
-            try parkBody(runtime, request_ctx, response, null, body_offset, done_status, http_status);
+        .credit_empty, .ring_full, .socket_full => {
+            try parkBody(runtime, request_ctx, response, null, body_offset);
             return;
         },
     }
 
     tracing.mark(runtime, request_ctx, "response_write_done_ns");
-    _ = try finish_request(runtime, request_ctx, done_status, http_status);
+    _ = try finish_request(runtime, request_ctx, request_ctx.response_done_status, request_ctx.response_http_status);
 }
 
 /// Sends the head of `response`, with the first bytes of `contiguous_body`
@@ -104,7 +110,8 @@ fn writeHead(
 }
 
 /// Sends the head and a body of at most `shared_payload_threshold` bytes
-/// inline in one batch, which commits the response.
+/// inline in one batch, which commits the response and spends one credit;
+/// an empty body is never batched.
 fn writeSmallInlineBatch(
     runtime: *state.Runtime,
     request_ctx: *request_context.RequestContext,
@@ -127,8 +134,9 @@ fn writeSmallInlineBatch(
         small_body_batch_limit,
         &small_batch_entries,
     ) orelse return .unbatched;
+    std.debug.assert(response_body.len != 0);
 
-    switch (try response_payload_writer.sentOrBlocked(runtime, ipc.ingress_channel.sendDescriptorBatchPayloads(
+    switch (try response_payload_writer.sentOrBlocked(runtime, request_ctx, ipc.ingress_channel.sendDescriptorBatchPayloads(
         control_fd,
         entries,
         runtime.core.dispatch_recv_scratch,
@@ -136,6 +144,7 @@ fn writeSmallInlineBatch(
         .sent => {},
         .blocked => return .blocked,
     }
+    request_ctx.response_credit.spend(1);
     request_ctx.client_served_bytes += response_body.len;
     request_ctx.markResponseCommitted();
     return .{ .sent = response_body.len };
@@ -144,29 +153,24 @@ fn writeSmallInlineBatch(
 /// Moves the body out of `response` into the request's outbox with
 /// `body_offset` bytes already sent, behind `head` when the head has not
 /// gone out. The outbox owns `head` once this returns; on failure the caller
-/// still does. The outbox flush sends the rest and finishes the request with
-/// the two statuses.
+/// still does.
 fn parkBody(
     runtime: *state.Runtime,
     request_ctx: *request_context.RequestContext,
     response: *response_model.Response,
     head: ?response_outbox.PendingHead,
     body_offset: usize,
-    done_status: ipc.RequestDoneStatus,
-    http_status: u16,
 ) !void {
     const response_body_len = response.body.len();
     std.debug.assert(body_offset <= response_body_len);
-    const body = try response.body.takeOwnedBytes(runtime.core.allocator);
-    errdefer runtime.core.allocator.free(body);
-    if (body.len != response_body_len)
+    var body = try response.body.takeRetained(runtime.core.allocator);
+    errdefer body.deinitOwned(runtime.core.allocator);
+    if (body.len() != response_body_len)
         return error.InvalidResponseBody;
 
     try request_ctx.response_outbox.park(.{ .buffered_body = .{
         .head = head,
         .body = body,
         .offset = body_offset,
-        .done_status = done_status,
-        .http_status = http_status,
     } });
 }

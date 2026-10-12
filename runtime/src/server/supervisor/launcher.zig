@@ -380,6 +380,9 @@ pub const ReadyWorker = struct {
     /// starts then reaches the published worker.
     egress_generation: u64,
     egress_session_id: u64,
+    /// The boot token's gateway, session and deadline, fixed at launch
+    /// (`worker_table.BootToken`); null for a launch that minted none.
+    boot_egress: ?worker_table.BootToken = null,
     /// `ipc.max_message_bytes` bytes from the launcher's `gpa`, the
     /// supervisor's allocator, allocated before the fork so that a launch
     /// that could not build its record never forks.
@@ -434,8 +437,6 @@ pub const Deps = struct {
     egressCurrentGeneration: *const fn (ctx: *anyopaque) u64,
     /// `Manager.prewarm`: spawns a gateway when none is current.
     egressPrewarm: *const fn (ctx: *anyopaque) anyerror!void,
-    /// `Manager.requestEnded` for the boot token of a worker that reported `WorkerReady`.
-    egressBootEnded: *const fn (ctx: *anyopaque, generation: u64, session_id: u64) void,
     /// The next live worker of a definition with a grant whose egress session is not of gateway
     /// `generation`, with dups of its control socket and wake set taken under its pool's mutex,
     /// or null when none is left. Pool records are never freed, so the target stays addressable.
@@ -588,6 +589,9 @@ const Launch = struct {
     /// `WorkerReady` that its gateway is still current; 0 without one.
     egress_generation: u64 = 0,
     egress_session_id: u64 = 0,
+    /// `ReadyWorker.boot_egress`, set once `Machine.start` minted the token;
+    /// a loss or reattach that changes the session above leaves it.
+    boot_egress: ?worker_table.BootToken = null,
     /// `ReadyWorker.dispatch_send_scratch`, from before the fork until the
     /// publish takes it.
     dispatch_send_scratch: []u8 = &.{},
@@ -1646,6 +1650,17 @@ pub const Launcher = struct {
             },
         );
         const result = launch.machine.?.start(&forked);
+        if (launch.machine.?.boot_egress_deadline_abs_ns != 0) {
+            // Only an attached launch mints, under its attachment's gateway,
+            // which `dropLostSession` may already have cleared from
+            // `egress_generation`.
+            const attached = launch.egress.?;
+            launch.boot_egress = .{
+                .gateway_generation = attached.attachment.generation,
+                .session_id = attached.attachment.session_id,
+                .deadline_mono_ns = launch.machine.?.boot_egress_deadline_abs_ns,
+            };
+        }
         // `start` took every descriptor `forked` held, and the child holds
         // its own copies of the session's descriptors once WorkerInit went
         // out, so the server's copies close either way, and the boot token
@@ -1677,10 +1692,12 @@ pub const Launcher = struct {
     }
 
     /// The child reported `WorkerReady`. A launch whose session's gateway is
-    /// still current ends its boot token and publishes; one whose gateway
-    /// was lost since its attach, or whose session the gateway removed
-    /// (`dropLostSession` left its generation 0), waits for a turn of
-    /// `stepEgress`, which attaches the worker to the current gateway first.
+    /// still current publishes, and its boot token stays valid for the
+    /// startup evaluations still pending (`Supervisor.progressBootEgress`
+    /// ends it). A launch whose gateway was lost since its attach, or whose
+    /// session the gateway removed (`dropLostSession` left its generation 0),
+    /// waits for a turn of `stepEgress`, which attaches the worker to the
+    /// current gateway first.
     fn onReady(self: *Launcher, index: u32) void {
         const launch = &self.launches[index].?;
         const machine = &launch.machine.?;
@@ -1704,9 +1721,6 @@ pub const Launcher = struct {
                 launch.state = .awaiting_reattach;
                 return;
             }
-            // The boot window ends at `WorkerReady`, so the boot token is
-            // ended before any request can reach the worker.
-            self.deps.egressBootEnded(self.deps.ctx, launch.egress_generation, launch.egress_session_id);
         }
         self.publishReady(index);
     }
@@ -1722,6 +1736,7 @@ pub const Launcher = struct {
             .egress_wake_set = launch.wake_set,
             .egress_generation = launch.egress_generation,
             .egress_session_id = launch.egress_session_id,
+            .boot_egress = launch.boot_egress,
             .dispatch_send_scratch = launch.dispatch_send_scratch,
             .boot_work_ns = childBootWorkNs(&launch.trace.child_stamps),
         };

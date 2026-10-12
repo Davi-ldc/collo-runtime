@@ -28,7 +28,8 @@
 //! and no record is destroyed while an attach uses it outside `mutex`. In a server the boot thread
 //! may prewarm before the launcher exists, the launcher makes every later call, and `deinit` runs
 //! after it joined, so `serial` is never contended. `mutex` guards `current`, `retired`, `ended`
-//! and the counters, and a lane takes it only to renew its lease. `deps_mutex` guards `deps` and is
+//! and the counters; a lane takes it only to renew its lease, and the metrics thread only to send
+//! a boot token's end (`endBoot`), with no worker lock held. `deps_mutex` guards `deps` and is
 //! held across each `Deps.gatewayLost` call. The lock order is `serial`, a client's
 //! `attach_mutex`, then `mutex` or `deps_mutex`, and no thread holds those last two together.
 
@@ -88,11 +89,8 @@ pub const Manager = struct {
     current_generation: std.atomic.Value(u64) = .init(0),
     /// The generation of the next gateway; only the spawn path, under `serial`, touches it.
     next_gateway_generation: u64 = 1,
-    /// The one-entry packets of `requestEnded`, built here so the wire stays `control.zig`'s.
+    /// The one-entry packet of `endBoot`, built here so the wire stays `control.zig`'s.
     ended: control.RequestEndedBatch = .{},
-    /// `requestEnded` packets the socket refused, full or with the gateway gone.
-    ended_batches_dropped_full: u64 = 0,
-    ended_batches_dropped_closed: u64 = 0,
     /// `renewLease` calls that could not dup the control socket. Each leaves the lease empty, so
     /// its lane mints `egress_token.none` until a later pass renews it.
     lease_renewals_failed: u64 = 0,
@@ -243,29 +241,27 @@ pub const Manager = struct {
         return true;
     }
 
-    /// Sends one `request_ended` entry to gateway `generation` now, under the mutex, best effort:
-    /// nothing goes out when that gateway is gone, and a refused send is counted. The launcher ends
-    /// each boot token with it at `WorkerReady`.
-    pub fn requestEnded(self: *Manager, generation: u64, entry: control.RequestEndedEntry) void {
-        // The gateway's decoder refuses a packet with an entry of any other shape
-        // (`control.RequestEndedEntry`), so one is a server bug.
-        std.debug.assert(entry.session_id != 0);
-        if (entry.request_id == 0) std.debug.assert(entry.request_generation == 0);
-        if (entry.request_id != 0) std.debug.assert(entry.request_generation != 0);
-
+    /// Sends gateway `generation` the end of session `session_id`'s boot token, an entry whose
+    /// request id and generation are 0, without waiting. Returns true when the packet went out or
+    /// that gateway is no longer current, and false when the send failed, so the caller tries
+    /// again later (`Supervisor.progressBootEgress`).
+    pub fn endBoot(self: *Manager, generation: u64, session_id: u64) bool {
+        std.debug.assert(session_id != 0);
         self.mutex.lock();
         defer self.mutex.unlock();
-        const record = self.current orelse return;
+        const record = self.current orelse return true;
         if (record.generation != generation)
-            return;
+            return true;
         // `sendAndClear` empties the batch whatever the send does.
         std.debug.assert(self.ended.isEmpty());
-        const appended = self.ended.append(entry);
+        const appended = self.ended.append(.{
+            .session_id = session_id,
+            .request_id = 0,
+            .request_generation = 0,
+        });
         std.debug.assert(appended);
-        self.ended.sendAndClear(record.process.control_fd) catch |err| switch (err) {
-            error.WouldBlock => self.ended_batches_dropped_full += 1,
-            else => self.ended_batches_dropped_closed += 1,
-        };
+        self.ended.sendAndClear(record.process.control_fd) catch return false;
+        return true;
     }
 
     /// The current record, after destroying the retired one and spawning a gateway when none is
@@ -495,13 +491,8 @@ pub fn prewarmCallback(ctx: *anyopaque) anyerror!void {
     try manager.prewarm();
 }
 
-/// Ends the boot token of session `session_id` of gateway `generation`, whose `request_ended`
-/// entry has request id and generation 0.
-pub fn bootEndedCallback(ctx: *anyopaque, generation: u64, session_id: u64) void {
+/// `Manager.endBoot` behind the supervisor's `EgressGatewayHooks.bootEnded`.
+pub fn bootEndedCallback(ctx: *anyopaque, generation: u64, session_id: u64) bool {
     const manager: *Manager = @ptrCast(@alignCast(ctx));
-    manager.requestEnded(generation, .{
-        .session_id = session_id,
-        .request_id = 0,
-        .request_generation = 0,
-    });
+    return manager.endBoot(generation, session_id);
 }

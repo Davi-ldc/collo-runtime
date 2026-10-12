@@ -6,7 +6,7 @@
 //! the control socket's write poll, armed only while a send waits, whose
 //! hangup fails the wait as the read poll's does. The one loop run here meets a hangup
 //! before its first wait and stops cleanly. The loop running real turns, and
-//! flushing a parked response, is covered by `worker/tests/runtime/` in the
+//! resuming a parked response, is covered by `worker/tests/runtime/` in the
 //! same worker-test lane, and inside a sandboxed worker by the
 //! zygote-integration lane.
 
@@ -431,10 +431,10 @@ test "worker ring polls the control socket for room only while a send waits for 
     }
     try std.testing.expect(writable);
 
-    // The flush the event calls for finds nothing parked and clears the
-    // flag, so the next arm queues no write poll. It may queue others: the
-    // wait reaps every poll that completed, not only the write poll.
-    try runtime.flushPendingIngressResponses();
+    // The event's handler finds no response waiting and clears the flag, so
+    // the next arm queues no write poll. It may queue others: the wait reaps
+    // every poll that completed, not only the write poll.
+    try worker_testing.scheduler.loop.handleControlWritable(runtime);
     try std.testing.expect(!runtime.requests.control_send_blocked);
     try backend.arm(runtime);
     try std.testing.expect(!backend.control_writable_poll_armed);

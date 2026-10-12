@@ -14,8 +14,8 @@
 //! worker's wake descriptors, and a launch with an egress session, which the
 //! host attaches before it starts the launch, sends the session's regions
 //! too. The boot token for the session is minted here, when WorkerInit is
-//! sent, because its deadline is the child window this file fixes. A granted
-//! launch without a session boots its child detached.
+//! sent, because its deadline derives from the child window this file fixes.
+//! A granted launch without a session boots its child detached.
 //!
 //! A launch that fails neither kills, waits nor removes a cgroup on the
 //! host's thread: `abandon` releases what the machine holds and hands the
@@ -24,8 +24,9 @@
 //!
 //! Clock contract: `owner_deadline_abs_ns` bounds the whole machine;
 //! `child_init_deadline_abs_ns = min(send_time + WORKER_INIT_TIMEOUT_MS,
-//! owner_deadline_abs_ns)` is fixed when WorkerInit is sent, travels in it
-//! as the init deadline and as the boot token's deadline, and never changes
+//! owner_deadline_abs_ns)` is fixed when WorkerInit is sent and travels in it
+//! as the init deadline; the boot token's deadline adds
+//! `MODULE_EVAL_BUDGET_NS` to it (`bootEgressDeadline`). Neither changes
 //! after. The phases before the send spend the owner's budget, never the
 //! child's.
 
@@ -144,9 +145,9 @@ pub const FaultServe = union(enum) {
     };
 };
 
-/// What the boot token of a launch with an egress grant carries besides its deadline, which is
-/// the child window this launch fixes when it sends WorkerInit. The machine scrubs its copy of
-/// the key once the token is minted.
+/// What the boot token of a launch with an egress grant carries besides its deadline, which
+/// `bootEgressDeadline` derives from the child window this launch fixes when it sends WorkerInit.
+/// The machine scrubs its copy of the key once the token is minted.
 pub const BootEgress = struct {
     key: ipc.egress_token.Key,
     session_id: u64,
@@ -329,6 +330,9 @@ pub const Machine = struct {
     launch_started_ns: u64 = 0,
     phase_entered_ns: u64 = 0,
     child_init_deadline_abs_ns: u64 = 0,
+    /// The boot token's deadline, fixed with the child window; 0 for a
+    /// launch that mints no token.
+    boot_egress_deadline_abs_ns: u64 = 0,
     /// Host CLOCK_MONOTONIC immediately after consuming WorkerReady, before
     /// the post-ready fault drain and handle construction.
     ready_received_ns: u64 = 0,
@@ -513,10 +517,10 @@ pub const Machine = struct {
     /// Sends WorkerInit with its descriptors. The child window is fixed here:
     /// the wire value is min(now + WORKER_INIT_TIMEOUT_MS, owner_deadline), so
     /// the phases before the send spent the owner's budget and the child gets
-    /// its whole window. The boot token is minted here too, with that window
-    /// as its deadline, after which the machine keeps no copy of its key, and
-    /// a detached launch's wake descriptors are opened and, once the child
-    /// holds its copies, closed here.
+    /// its whole window. The boot token is minted here too, with the deadline
+    /// `bootEgressDeadline` derives from that window, after which the machine
+    /// keeps no copy of its key. A detached launch's wake descriptors are
+    /// opened and, once the child holds its copies, closed here.
     fn sendWorkerInit(self: *Machine) LaunchError!void {
         var span_cursor_ns = process.monotonicNowNsOrZero();
 
@@ -528,6 +532,10 @@ pub const Machine = struct {
                 @min(default_deadline, self.options.owner_deadline_abs_ns)
             else
                 default_deadline;
+        self.boot_egress_deadline_abs_ns = if (self.options.egress == .attached)
+            bootEgressDeadline(self.child_init_deadline_abs_ns, self.options.owner_deadline_abs_ns)
+        else
+            0;
 
         self.options.boot.validate() catch return error.InvalidBootOptions;
         var detached_wake: ipc.egress_shared.WakeFds = .{};
@@ -553,7 +561,10 @@ pub const Machine = struct {
         message.unowned_time_limit_ns = self.options.unowned_time_limit_ns;
         message.boot_egress_token = switch (self.options.egress) {
             .none, .detached => ipc.egress_token.none,
-            .attached => |*attached| self.mintBootToken(&attached.boot),
+            .attached => |*attached| token: {
+                defer std.crypto.secureZero(u8, &attached.boot.key.bytes);
+                break :token mintBootToken(&attached.boot, self.boot_egress_deadline_abs_ns);
+            },
         };
         message.enableEgressGatewaySandbox();
         if (self.options.routes) |routes| {
@@ -587,11 +598,9 @@ pub const Machine = struct {
         self.route_table_memfd = -1;
     }
 
-    /// The boot token for `boot`'s session, whose deadline is the child
-    /// window `sendWorkerInit` fixed. Scrubs `boot`'s key, the machine's only
-    /// copy, which nothing reads once the token exists.
-    fn mintBootToken(self: *const Machine, boot: *BootEgress) ipc.egress_token.Bytes {
-        defer std.crypto.secureZero(u8, &boot.key.bytes);
+    /// The boot token for `boot`'s session, admitting nothing from
+    /// `deadline_abs_ns` on.
+    fn mintBootToken(boot: *const BootEgress, deadline_abs_ns: u64) ipc.egress_token.Bytes {
         const token = ipc.egress_token.mint(&boot.key, .{
             .kind = .boot,
             .policy_id = boot.policy_id,
@@ -599,7 +608,7 @@ pub const Machine = struct {
             .session_id = boot.session_id,
             .request_id = 0,
             .request_generation = 0,
-            .deadline_monotonic_ns = self.child_init_deadline_abs_ns,
+            .deadline_monotonic_ns = deadline_abs_ns,
         });
         return ipc.egress_token.asBytes(&token).*;
     }
@@ -1028,6 +1037,16 @@ fn drainFaultChannel(
         };
         served_faults.* +|= 1;
     }
+}
+
+/// The boot token's deadline: the init deadline plus `MODULE_EVAL_BUDGET_NS`,
+/// capped by a nonzero owner deadline. Every route the boot evaluates ends
+/// its synchronous part before the init deadline and its pending budget runs
+/// from there, so the token outlives every startup evaluation; workers share
+/// the host's CLOCK_MONOTONIC.
+pub fn bootEgressDeadline(init_deadline_abs_ns: u64, owner_deadline_abs_ns: u64) u64 {
+    const deadline = init_deadline_abs_ns +| process_limits.MODULE_EVAL_BUDGET_NS;
+    return if (owner_deadline_abs_ns == 0) deadline else @min(deadline, owner_deadline_abs_ns);
 }
 
 fn closeIfHeld(fd: std.posix.fd_t) std.posix.fd_t {

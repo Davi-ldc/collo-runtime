@@ -1,16 +1,18 @@
-//! A request's response steps that wait to be sent to the host: for room in
-//! the shared payload ring, or for room in the control socket, whose worker
-//! end does not block. Each request holds at most one pending item and sends
-//! nothing else while it does: the rest of a buffered response, its head
-//! included when the head has not gone out, or the next step of a streamed
-//! one. A send that found no room sent nothing, so the item resumes at the
-//! step it holds. A response completes only after its pending item is sent,
-//! and request cleanup releases an item that never was. It belongs to the
-//! worker's VM thread.
+//! A request's response step that waits to be sent to the host: for body
+//! credit, for room in the shared payload ring, or for room in the control
+//! socket, whose worker end does not block. Each request holds at most one
+//! pending item and sends nothing else while it does: the rest of a buffered
+//! or segmented body, with its head when the head has not gone out, a
+//! streamed response's head, one fetch chunk with its upstream credits, or a
+//! stream's end or reset. A send that found no room sent nothing, so the
+//! item resumes at the step it holds. A response completes only after its
+//! pending item is sent, and request cleanup releases an item that never
+//! was. A body stream's chunk waits in `response_stream.BodyStream` instead.
+//! It belongs to the worker's VM thread.
 
 const std = @import("std");
-const ipc = @import("collo_ipc");
 const egress_core = @import("collo_egress_core");
+const response_model = @import("../response_model.zig");
 
 pub const Credit = egress_core.body_credit.Handle;
 pub const ByteLease = egress_core.ByteLease;
@@ -31,22 +33,19 @@ pub const PendingHead = struct {
 };
 
 /// The rest of a buffered response: its head when `head` is set, then
-/// `body` from `offset`. `body` is owned by the worker's base allocator, and
-/// the two statuses are what the request finishes with once all is sent.
+/// `body` from `offset`. `body` keeps the owner and segments the response
+/// had, and only a borrowed body is copied (`Body.takeRetained`).
 pub const BufferedBody = struct {
     head: ?PendingHead = null,
-    body: []u8,
+    body: response_model.Body,
     offset: usize = 0,
-    done_status: ipc.RequestDoneStatus,
-    http_status: u16,
 };
 
-/// One chunk of a streamed body and how much of it went out: a fetch body's,
-/// with the credits that return to the gateway once all of it is sent, or the
-/// unsent rest of a body stream's chunk, with none.
+/// One chunk of a fetch body, with the credits that return to the gateway
+/// once all of it is sent.
 pub const StreamChunk = struct {
     bytes: ByteLease = .empty,
-    /// The bytes of `bytes` already sent; the flush resumes here.
+    /// The bytes of `bytes` already sent; the next send resumes here.
     offset: usize = 0,
     credits: PullCredits = .{},
     done: bool,

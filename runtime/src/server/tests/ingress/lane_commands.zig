@@ -578,23 +578,29 @@ test "a worker's output takes reserved places of the owner lane's queue, so a qu
 }
 
 test "a reader stops receiving a worker whose forwarded output fills its window, and receives again once the owner lane applied it" {
+    const chunk_count = limits.http_body.INGRESS_RESPONSE_CHUNKS_IN_FLIGHT_MAX;
+    const window_units = limits.ingress.forwarded_commands_per_worker_max;
+    const request_count = @divFloor(window_units - lane_harness.ingress_channel.max_batch_descriptors, chunk_count + 1) + 1;
     var scene: TwoLanes = undefined;
-    try scene.init(.{});
+    try scene.init(.{ .concurrency = @intCast(request_count + 1) });
     defer scene.deinit();
     const harness = &scene.harness;
     _ = try scene.get(scene.first, 1);
-    const other = try scene.get(scene.second, 1);
 
-    // One descriptor per packet, more of them than the window holds.
-    const chunk_count = 40;
-    try scene.stub.sendHead(other, 200, false);
-    for (0..chunk_count) |index| try scene.stub.sendChunk(other, "c", index + 1 == chunk_count);
+    // Each response stays within its own initial credit. Together their
+    // heads and chunks fill the worker's shared forwarding window.
+    for (0..request_count) |index| {
+        const stream_id: u32 = @intCast(2 * index + 1);
+        const other = try scene.get(scene.second, stream_id);
+        try scene.stub.sendHead(other, 200, false);
+        for (0..chunk_count) |chunk_index|
+            try scene.stub.sendChunk(other, "c", chunk_index + 1 == chunk_count);
+    }
     try harness.handleControl(0, scene.stub);
 
     // The reader received packets while a whole batch still fit, then
     // stopped with the rest left in the worker's socket.
     const window = &scene.stub.record.forwarded_in_queues;
-    const window_units = limits.ingress.forwarded_commands_per_worker_max;
     try std.testing.expectEqual(window_units - lane_harness.ingress_channel.max_batch_descriptors + 1, window.load(.seq_cst));
     const reader_index = try harness.expectRegistration(0, scene.stub);
     const reader = &harness.lane(0).registrations.entries[reader_index];
@@ -608,10 +614,13 @@ test "a reader stops receiving a worker whose forwarded output fills its window,
     try harness.handleCommands(0);
     try std.testing.expect(!reader.window_blocked);
     try harness.handleCommands(1);
-    try scene.second.expectStatus(1, 200);
-    const received = try scene.second.stream(1);
-    try std.testing.expect(received.ended);
-    try std.testing.expectEqual(@as(usize, chunk_count), received.body_len);
+    for (0..request_count) |index| {
+        const stream_id: u32 = @intCast(2 * index + 1);
+        try scene.second.expectStatus(stream_id, 200);
+        const received = try scene.second.stream(stream_id);
+        try std.testing.expect(received.ended);
+        try std.testing.expectEqual(@as(usize, chunk_count), received.body_len);
+    }
     try std.testing.expectEqual(@as(u32, 0), window.load(.seq_cst));
     try std.testing.expectEqual(@as(u64, 0), harness.lane(0).lane.counters.forwarded_descriptor_drops);
     try harness.expectLanesRunning();

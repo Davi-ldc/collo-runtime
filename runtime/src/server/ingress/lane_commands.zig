@@ -68,7 +68,7 @@ pub const RingRef = struct {
 };
 
 /// A payload copied once out of the packet the reader received. The command
-/// owns it until its consumer, or `Command.deinit`, frees it.
+/// owns it until its consumer takes it or `Command.deinit` frees it.
 pub const InlineBytes = struct {
     bytes: []u8,
     allocator: std.mem.Allocator,

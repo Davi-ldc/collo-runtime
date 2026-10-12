@@ -187,7 +187,8 @@ pub fn Methods(comptime Self: type) type {
             }
             for (registration.inflight_request_keys[0..registration.inflight_request_len]) |request_key| {
                 const request_slot = Admission.findRequestSlot(self, request_key) orelse continue;
-                if (self.requests.entries[request_slot].send_blocked == .socket) {
+                const slot = &self.requests.entries[request_slot];
+                if (slot.send_blocked == .socket or slot.response_credit_unsent) {
                     try RingDriver.armWorkerControlWritable(self, registration_index);
                     return;
                 }

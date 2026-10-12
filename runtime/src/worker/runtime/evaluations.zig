@@ -11,10 +11,14 @@
 //! (`request_context.evaluationId`), so its top-level code sets timers,
 //! fetches and starts crypto jobs under that id as a request does under its
 //! own: one route's top-level code cannot clear another's timers, and a
-//! route's top-level timers end with its own evaluation. Its fetches present
-//! its copy of WorkerInit's boot token, whose request id and generation 0
-//! name the boot permit on the egress wire. While its code runs outside a
-//! turn, the evaluation is the bridge's turnless context
+//! route's top-level timers end with its own evaluation. The startup
+//! evaluations, those opened before `sealStartupEvaluations`, present their
+//! copies of WorkerInit's boot token, whose request id and generation 0 mark
+//! it as the boot token on the egress wire; a later evaluation gets none.
+//! Once the last of them closes, the worker sets the lifecycle page's
+//! startup-end flag, which lets the server end the token before its deadline
+//! (`server/supervisor/worker_table.zig:Record.bootEndAttempt`). While its
+//! code runs outside a turn, the evaluation is the bridge's turnless context
 //! (`Vm.setTurnlessExecCtx`), so host calls resolve to it and every reaction
 //! its code registers carries its token, and its owner window is open
 //! (`owner.zig`).
@@ -38,9 +42,17 @@ const runtime_owner = @import("owner.zig");
 
 pub const Evaluations = struct {
     /// WorkerInit's boot token (`RuntimeOptions.boot_egress_token`), which
-    /// each evaluation copies when it opens and clears when it closes. This
-    /// copy lives as long as the runtime, as the WorkerInit it came from does.
+    /// each startup evaluation copies when it opens. `sealStartupEvaluations`
+    /// and a gateway disconnect (`egress/context.zig:Context.revokeBootEgress`)
+    /// clear it.
     boot_egress_token: ipc.egress_token.Bytes,
+    /// The startup evaluations still open, one bit per evaluation id less
+    /// `request_context.evaluation_id_first`; routes that share a module
+    /// instance share its one evaluation.
+    startup_owners: std.bit_set.StaticBitSet(request_context.evaluation_count) = .initEmpty(),
+    /// Set once the boot evaluated every route; evaluations opened later are
+    /// not startup evaluations.
+    startup_sealed: bool = false,
     /// Fetches every evaluation together started under the boot token,
     /// finished or not, for the worker's life. The gateway keeps one budget
     /// for the token however many evaluations present a copy, so
@@ -113,6 +125,24 @@ pub fn Methods(comptime Runtime: type) type {
                 };
                 try self.armEvaluationBudget(evaluating.evaluation_id);
             }
+        }
+
+        /// Ends the set of startup evaluations once the boot evaluated every
+        /// route, at once for a worker without routes (`zygote/child_boot.zig`).
+        /// Clears the runtime's copy of the boot token, so a later evaluation
+        /// gets none while the startup evaluations still open keep theirs, and
+        /// sets the startup-end flag when none is open.
+        pub fn sealStartupEvaluations(self: *Runtime) void {
+            self.evaluations.startup_sealed = true;
+            self.evaluations.boot_egress_token = ipc.egress_token.none;
+            publishStartupEnd(self);
+        }
+
+        fn publishStartupEnd(self: *Runtime) void {
+            if (!self.evaluations.startup_sealed or
+                self.evaluations.startup_owners.count() != 0)
+                return;
+            self.observability.metrics_view.publishStartupEvaluationsEnded();
         }
 
         /// The handler and `env` of the route `request_ctx` dispatches to
@@ -190,7 +220,9 @@ pub fn Methods(comptime Runtime: type) type {
         ///     anything;
         ///  4. destroys the context, which releases its exec context in the
         ///     bridge and with it the turnless install, so a reaction it
-        ///     registered that runs later runs under the worker owner.
+        ///     registered that runs later runs under the worker owner;
+        ///  5. takes it out of the startup evaluations, and sets the
+        ///     startup-end flag when that set is sealed and empty.
         ///
         /// After it, a native completion still in flight for the id finds no
         /// owner and is dropped, like one for a finished request: a fetch
@@ -217,6 +249,8 @@ pub fn Methods(comptime Runtime: type) type {
                 });
             response_flow.releasePendingIngressResponse(self, evaluation);
             self.destroyRequestContext(evaluation);
+            self.evaluations.startup_owners.unset(@intCast(evaluation_id - request_context.evaluation_id_first));
+            publishStartupEnd(self);
         }
 
         /// Makes `exec_ctx` the bridge's turnless context and opens its
@@ -325,6 +359,8 @@ pub fn Methods(comptime Runtime: type) type {
             evaluation_id: u64,
             route_index: u16,
         ) !*request_context.RequestContext {
+            // After `sealStartupEvaluations` the runtime's copy is `none`, so a
+            // later evaluation copies no token.
             var dispatch_work = try ipc.DispatchWork.initBoot(
                 self.core.allocator,
                 evaluation_id,
@@ -344,6 +380,8 @@ pub fn Methods(comptime Runtime: type) type {
             dispatch_moved = true;
             errdefer context.deinit();
             try self.requests.active.putNoClobber(self.core.allocator, evaluation_id, context);
+            if (!self.evaluations.startup_sealed)
+                self.evaluations.startup_owners.set(@intCast(evaluation_id - request_context.evaluation_id_first));
             return context;
         }
     };

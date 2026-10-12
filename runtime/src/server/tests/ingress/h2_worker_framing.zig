@@ -244,25 +244,14 @@ test "the lane records a response head as gone out from its mark until the strea
     defer connection.deinit();
     const runtime = &connection.runtime;
 
-    const paired_stream_id = stream_id + 2;
-    const paired_request_key = RequestKey{ .lane_id = 2, .slot = 10, .generation = 1 };
     try runtime.h2ReserveStream(stream_id);
     try runtime.h2ActivateStream(stream_id, request_key, request_id);
-    try runtime.h2ReserveStream(paired_stream_id);
-    try runtime.h2ActivateStream(paired_stream_id, paired_request_key, request_id + 1);
     try std.testing.expect(!runtime.responseHeadQueued(stream_id));
-    try std.testing.expect(!runtime.responseHeadQueued(paired_stream_id));
-
-    // A head marked alone, and a head that shares its packet with the first
-    // chunk, both count; the body that follows changes nothing.
     try runtime.h2MarkWorkerResponseHeadQueued(stream_id, false);
-    try runtime.h2MarkWorkerResponseHeadChunkPairQueued(paired_stream_id, false);
     try std.testing.expect(runtime.responseHeadQueued(stream_id));
-    try std.testing.expect(runtime.responseHeadQueued(paired_stream_id));
     try runtime.h2MarkWorkerResponseBodyQueued(stream_id, true);
     try std.testing.expect(runtime.responseHeadQueued(stream_id));
 
     _ = runtime.h2MarkStreamReset(allocator, stream_id);
     try std.testing.expect(!runtime.responseHeadQueued(stream_id));
-    try std.testing.expect(runtime.responseHeadQueued(paired_stream_id));
 }

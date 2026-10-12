@@ -3,8 +3,10 @@
 //! workers to take out of service, then each lane's access records, then a
 //! flush of the record files. Runs on the service's metrics thread, and once
 //! more on the exiting thread after every producer has joined
-//! (`drainFinal`). Console lines reach stderr from the service's console
-//! thread (`Sink.flushConsole`), so a stalled stderr never holds this drain.
+//! (`drainFinal`). Each pass also ends the boot token of a worker whose
+//! startup evaluations ended (`Supervisor.progressBootEgress`). Console lines
+//! reach stderr from the service's console thread (`Sink.flushConsole`), so
+//! a stalled stderr never holds this drain.
 //!
 //! Invariants:
 //! - A worker's console ring is read only under its record's
@@ -141,8 +143,10 @@ pub fn drainAt(
         // (`usage_drain.zig`), so nothing here is fatal.
         supervision.usage_drain.drainAll(service.supervisor.usageDrain(), records);
         const grace_ns = ownerOverrunGraceNs(service.supervisor.hard_timeout_grace_ns);
-        for (records) |*worker|
+        for (records) |*worker| {
+            service.supervisor.progressBootEgress(worker, clock.mono_now_ns);
             checkWorker(service, worker, clock.mono_now_ns, grace_ns, on_fault);
+        }
     }
     service.analytics_drain.ticks +%= 1;
     for (service.lanes) |*lane|

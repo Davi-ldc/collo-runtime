@@ -32,6 +32,10 @@ const FetchBodyResponseStreamDrain = egress_body.ResponseStreamDrain;
 
 pub const Egress = struct {
     state: egress_state.State,
+    /// Set while a gateway disconnect runs
+    /// (`egress/gateway_runtime.zig:disconnectWithReason`); a release
+    /// callback that would disconnect again returns at once.
+    detach_in_progress: bool = false,
     /// Written after each completion record the worker publishes on its
     /// shared page (`serve/response_finish.zig`); `Runtime.init` says why
     /// this channel is required. Owned here, and closed by
@@ -292,6 +296,7 @@ pub fn Methods(comptime Runtime: type) type {
                 .egress_state = &self.egress.state,
                 .requests = &self.requests.active,
                 .boot_fetches_started = &self.evaluations.boot_fetches_started,
+                .boot_egress_token = &self.evaluations.boot_egress_token,
                 .ready_queue = &self.scheduler.ready_queue,
                 .ready_backlog = &self.scheduler.ready_backlog,
                 .dispatch_recv_scratch = self.core.dispatch_recv_scratch,
@@ -299,8 +304,11 @@ pub fn Methods(comptime Runtime: type) type {
                 .wakeup_fd = self.scheduler.wakeup_fd,
                 .trace_fd = self.observability.trace_fd,
                 .running = &self.core.running,
+                .detach_in_progress = &self.egress.detach_in_progress,
                 .disconnect_context = context,
                 .disconnect_fn = disconnectEgressGatewayCallback,
+                .response_holds_context = context,
+                .release_response_holds_before_detach_fn = releaseResponseHoldsBeforeDetachCallback,
                 .request_failure_context = context,
                 .request_failure_fn = requestFailureCallback,
                 .denial_log_context = context,
@@ -354,6 +362,11 @@ pub fn Methods(comptime Runtime: type) type {
             const runtime: *Runtime = @ptrCast(@alignCast(context orelse return));
             var egress_ctx = runtime.egressContext();
             egress_gateway_control.releaseBodyCredit(&egress_ctx, credit);
+        }
+
+        fn releaseResponseHoldsBeforeDetachCallback(context: ?*anyopaque) void {
+            const runtime: *Runtime = @ptrCast(@alignCast(context orelse return));
+            response_flow.releaseFetchResponseHoldsBeforeDetach(runtime);
         }
 
         fn disconnectEgressGatewayCallback(context: ?*anyopaque, reason: []const u8) void {

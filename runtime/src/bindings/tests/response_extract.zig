@@ -169,7 +169,7 @@ test "a closed ReadableStream body extracts as an empty body, and an errored one
     }
 }
 
-test "a body stream lends a buffer chunk's bytes in place, encodes a string chunk and refuses anything else" {
+test "a body stream lends a buffer chunk's bytes in place and refuses anything else, a string included" {
     var vm = try support.createVm();
     defer vm.deinit();
 
@@ -199,40 +199,34 @@ test "a body stream lends a buffer chunk's bytes in place, encodes a string chun
     var body_stream = extracted.body.takeBodyStream() orelse return error.MissingBodyStream;
     defer body_stream.deinit();
 
-    const cases = [_]struct { name: []const u8, bytes: []const u8, owned: bool }{
-        .{ .name = "view", .bytes = "hi", .owned = false },
-        .{ .name = "buffer", .bytes = "ok", .owned = false },
-        .{ .name = "text", .bytes = "h\xc3\xa9", .owned = true },
+    const lent = [_]struct { name: []const u8, bytes: []const u8 }{
+        .{ .name = "view", .bytes = "hi" },
+        .{ .name = "buffer", .bytes = "ok" },
     };
-    for (cases) |case| {
+    for (lent) |case| {
         var chunk_value = try exportResult(&vm, 5170, case.name);
         defer chunk_value.deinit();
-        var chunk = switch (try body_stream.chunk(&chunk_value)) {
-            .success => |lent| lent,
+        switch (try body_stream.chunk(&chunk_value)) {
+            .success => |bytes| try std.testing.expectEqualSlices(u8, case.bytes, bytes),
             .exception => |exception| {
                 var owned = exception;
                 owned.deinit();
                 return error.UnexpectedChunkException;
             },
-        };
-        defer chunk.deinit();
-        try std.testing.expectEqualSlices(u8, case.bytes, chunk.slice());
-        try std.testing.expectEqual(case.owned, chunk.owner != null);
+        }
     }
 
-    var number = try exportResult(&vm, 5170, "number");
-    defer number.deinit();
-    switch (try body_stream.chunk(&number)) {
-        .success => |lent| {
-            var owned = lent;
-            owned.deinit();
-            return error.ExpectedChunkTypeError;
-        },
-        .exception => |exception| {
-            var owned = exception;
-            defer owned.deinit();
-            try support.expectExceptionContains(&vm, &owned, "chunks must be");
-        },
+    for ([_][]const u8{ "text", "number" }) |name| {
+        var chunk_value = try exportResult(&vm, 5170, name);
+        defer chunk_value.deinit();
+        switch (try body_stream.chunk(&chunk_value)) {
+            .success => return error.ExpectedChunkTypeError,
+            .exception => |exception| {
+                var owned = exception;
+                defer owned.deinit();
+                try support.expectExceptionContains(&vm, &owned, "chunks must be an ArrayBuffer or an ArrayBufferView");
+            },
+        }
     }
 }
 

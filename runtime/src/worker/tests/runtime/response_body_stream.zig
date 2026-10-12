@@ -3,14 +3,14 @@
 //! the stream is still open, and the request finishes, with a usage record
 //! for every byte, only when the stream closes. A TransformStream's readable
 //! streams what the handler writes after it returned. A stream that errors,
-//! or yields a chunk that is not bytes, resets the client's stream instead of
-//! ending it, and a client's reset cancels the stream with the reset as its
-//! reason. The tests play the server on the control socket and move the
-//! runtime's fake clock, so a source that waits on a timer yields exactly
-//! when the test says. Runs in `worker-test`; the bridge's half (extraction,
-//! reads, chunks, cancel) is covered in `bindings-test`
-//! (`bindings/tests/response_extract.zig`), and a real client over the
-//! server in `local-e2e`.
+//! or yields a chunk that is not bytes, a string included, resets the
+//! client's stream instead of ending it, and a client's reset cancels the
+//! stream with the reset as its reason. The tests play the server on the
+//! control socket and move the runtime's fake clock, so a source that waits
+//! on a timer yields exactly when the test says. Runs in `worker-test`; the
+//! bridge's half (extraction, reads, chunks, cancel) is covered in
+//! `bindings-test` (`bindings/tests/response_extract.zig`), and a real
+//! client over the server in `local-e2e`.
 
 const std = @import("std");
 const support = @import("bindings_support");
@@ -169,14 +169,17 @@ test "a stream that errors after the head resets the client's stream instead of 
     try std.testing.expectEqual(@as(u16, 200), done.http_status);
 }
 
-test "a chunk that is not bytes resets the client's stream and cancels the stream with a TypeError" {
+// The Fetch Standard reads a response body's stream as bytes only, so a
+// string fails like any other value that is not an ArrayBuffer or an
+// ArrayBufferView.
+test "a string chunk resets the client's stream after the head and cancels the stream with a TypeError" {
     const source =
         \\export default function handler(request) {
         \\    if (new URL(request.url).pathname === "/reason")
         \\        return new Response(String(globalThis.cancelReason));
         \\    return new Response(new ReadableStream({
         \\        start(controller) {
-        \\            controller.enqueue(42);
+        \\            controller.enqueue("text");
         \\        },
         \\        cancel(reason) {
         \\            globalThis.cancelReason = `${reason.name}: ${reason.message}`;
@@ -200,7 +203,7 @@ test "a chunk that is not bytes resets the client's stream and cancels the strea
     const done = try rt.readWorkerCompletion(&fixture.runtime, fixture.control_pair[1], 904);
     try std.testing.expectEqual(@intFromEnum(ipc.RequestDoneStatus.js_exception), done.status);
 
-    try fixture.expectReason(route_index, 905, "TypeError: Response body stream chunks must be an ArrayBuffer, an ArrayBufferView or a string");
+    try fixture.expectReason(route_index, 905, "TypeError: Response body stream chunks must be an ArrayBuffer or an ArrayBufferView");
 }
 
 test "a client's reset cancels the response stream with the reset as its reason" {

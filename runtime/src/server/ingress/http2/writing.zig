@@ -24,10 +24,12 @@ const std = @import("std");
 
 const connection = @import("connection.zig");
 const connection_slot = @import("../runner/connection_slot.zig");
+const event_sources = @import("../runner/event_sources.zig");
 const fault = @import("../fault.zig");
 const response = @import("response.zig");
 const server_responses = @import("../server_responses.zig");
 const stream_table = @import("../runner/stream_table.zig");
+const write_queue = @import("../runner/write_queue.zig");
 const process = @import("collo_os").process;
 const h2 = @import("collo_http").http2;
 const ipc = @import("collo_ipc");
@@ -278,7 +280,7 @@ pub fn queueResponseChunk(
         return flushPendingResponseData(Worker, worker, runtime, stream_id);
     }
 
-    const sent = try queueResponseDataAvailableWindow(Worker, worker, runtime, stream_id, payload, end_stream);
+    const sent = try queueResponseDataAvailableWindow(Worker, worker, runtime, stream_id, payload, end_stream, null);
     if (sent == payload.len)
         return sent != 0 or end_stream;
     if (!runtime.isOpen())
@@ -287,140 +289,21 @@ pub fn queueResponseChunk(
     return true;
 }
 
-/// `queueResponseHead` and `queueResponseChunk` in one write: the head and
-/// as much of `payload` as the send windows allow, with the rest left
-/// waiting on the stream.
-pub fn queueResponseHeadAndChunk(
-    comptime Worker: type,
-    worker: *Worker,
-    runtime: *Slot,
-    stream_id: u32,
-    status: u16,
-    headers: []const ipc.ingress_channel.ResponseHeader,
-    payload: []const u8,
-    end_stream: bool,
-) !bool {
-    if (!runtime.isOpen())
-        return false;
-    if (status < 100 or status > 999)
-        return error.InvalidHttp2ResponseStatus;
-
-    var status_buf: [3]u8 = undefined;
-    const status_value = try std.fmt.bufPrint(&status_buf, "{d}", .{status});
-    const encoded_headers = try response.encodeResponseHeadersScratch(
-        worker.service.allocator,
-        &runtime.h2_hpack_encoder,
-        worker.h2_lane.encode_scratch,
-        status_value,
-        headers,
-    );
-
-    const send_len = if (payload.len == 0) 0 else try runtime.h2AvailableOutboundWindow(stream_id, payload.len);
-    const final = end_stream and send_len == payload.len;
-    const headers_end_stream = payload.len == 0 and end_stream;
-
-    const combined = try h2.encodeHeadersAndDataFrames(
-        worker.service.allocator,
-        runtime.h2_peer_settings.max_frame_size,
-        stream_id,
-        encoded_headers,
-        headers_end_stream,
-        payload[0..send_len],
-        final,
-    );
-    const queued = try queueOwnedWrite(Worker, worker, runtime, combined);
-    if (send_len != 0)
-        try runtime.h2ConsumeOutboundWindow(stream_id, send_len);
-    if (final)
-        runtime.h2NoteResponseEndQueued(stream_id);
-    if (send_len < payload.len)
-        try runtime.h2AppendPendingResponse(worker.service.allocator, stream_id, payload[send_len..], end_stream);
-    return queued or send_len != 0 or headers_end_stream;
-}
-
-/// How many of a worker's descriptors a queue call consumed, and the body
-/// bytes they carried.
-pub const QueuedWorkerResponse = struct {
-    consumed_descriptors: usize = 1,
-    body_bytes: usize = 0,
-};
-
-/// Queues a worker's response head and first body chunk as one write when
-/// `items` starts with an inline head without END_STREAM followed by an
-/// inline chunk of the same request. Returns null, consuming nothing, when
-/// it does not, leaving both to `queueWorkerResponseDescriptor`. The caller
-/// sorts an error with `fault.classifyResponseQueueError`. On a closing
-/// connection both descriptors are consumed and dropped.
-pub fn tryQueueWorkerResponseHeadChunkPair(
-    comptime Worker: type,
-    worker: *Worker,
-    runtime: *Slot,
-    items: []ipc.ingress_channel.Received,
-) !?QueuedWorkerResponse {
-    if (items.len < 2)
-        return null;
-    const head_received = &items[0];
-    const chunk_received = &items[1];
-    const head_descriptor = head_received.descriptor;
-    const chunk_descriptor = chunk_received.descriptor;
-    if (head_descriptor.op != @intFromEnum(ipc.ingress_channel.Op.response_head) or
-        chunk_descriptor.op != @intFromEnum(ipc.ingress_channel.Op.response_chunk))
-    {
-        return null;
-    }
-    if (!head_descriptor.hasFlag(ipc.ingress_channel.flags.inline_bytes) or
-        !chunk_descriptor.hasFlag(ipc.ingress_channel.flags.inline_bytes) or
-        head_descriptor.hasFlag(ipc.ingress_channel.flags.end_stream) or
-        !sameWorkerResponseIdentity(head_descriptor, chunk_descriptor))
-    {
-        return null;
-    }
-    if (!runtime.isOpen())
-        return .{ .consumed_descriptors = 2 };
-    try runtime.h2ValidateWorkerResponseHeadDescriptor(head_descriptor);
-    try runtime.h2ValidateWorkerResponseDescriptor(chunk_descriptor);
-
-    var head = try ipc.ingress_channel.decodeResponseHeadBounded(
-        worker.service.allocator,
-        head_received.payload,
-        max_worker_response_header_count,
-        max_worker_response_header_bytes,
-    );
-    defer head.deinit();
-    const end_stream = chunk_descriptor.hasFlag(ipc.ingress_channel.flags.end_stream);
-    _ = try queueResponseHeadAndChunk(
-        Worker,
-        worker,
-        runtime,
-        head_descriptor.stream_id,
-        head.status,
-        head.headers,
-        chunk_received.payload,
-        end_stream,
-    );
-    try runtime.h2MarkWorkerResponseHeadChunkPairQueued(head_descriptor.stream_id, end_stream);
-    _ = runtime.h2CloseStreamIfDone(worker.service.allocator, head_descriptor.stream_id);
-    return .{
-        .consumed_descriptors = 2,
-        .body_bytes = chunk_received.payload.len,
-    };
-}
-
-/// Queues one worker response descriptor on its stream. The caller has
-/// already matched the descriptor to an active request of the sending worker
-/// (`resolveDescriptor` in `runner/h2_worker_ipc.zig`). A
-/// descriptor the stream's response state does not admit, an unknown op or a
-/// malformed payload fails, and the caller sorts the error with
-/// `fault.classifyResponseQueueError`. On a closing connection the
-/// descriptor is dropped.
+/// Queues one worker response descriptor on its stream and returns the body
+/// bytes it queued. The caller has already matched the descriptor to an
+/// active request of the sending worker (`resolveDescriptor` in
+/// `runner/h2_worker_ipc.zig`). A descriptor the stream's response state
+/// does not admit, an unknown op or a malformed payload fails, and the
+/// caller sorts the error with `fault.classifyResponseQueueError`. On a
+/// closing connection the descriptor is dropped.
 pub fn queueWorkerResponseDescriptor(
     comptime Worker: type,
     worker: *Worker,
     runtime: *Slot,
     received: *ipc.ingress_channel.Received,
-) !QueuedWorkerResponse {
+) !usize {
     if (!runtime.isOpen())
-        return .{};
+        return 0;
     const descriptor = received.descriptor;
     const end_stream = descriptor.hasFlag(ipc.ingress_channel.flags.end_stream);
     switch (descriptor.op) {
@@ -446,28 +329,24 @@ pub fn queueWorkerResponseDescriptor(
             );
             try runtime.h2MarkWorkerResponseHeadQueued(descriptor.stream_id, end_stream);
             _ = runtime.h2CloseStreamIfDone(worker.service.allocator, descriptor.stream_id);
-            return .{};
+            return 0;
         },
         @intFromEnum(ipc.ingress_channel.Op.response_chunk) => {
             try runtime.h2ValidateWorkerResponseBodyDescriptor(descriptor);
             if (!descriptor.hasFlag(ipc.ingress_channel.flags.inline_bytes))
                 return error.IngressSharedPayloadUnavailable;
-            _ = try queueResponseChunk(
-                Worker,
-                worker,
-                runtime,
-                descriptor.stream_id,
-                received.payload,
-                end_stream,
-            );
+            const body_bytes = received.payload.len;
+            try runtime.h2AppendResponseChunk(worker.service.allocator, received);
             try runtime.h2MarkWorkerResponseBodyQueued(descriptor.stream_id, end_stream);
+            _ = try flushPendingResponseData(Worker, worker, runtime, descriptor.stream_id);
             _ = runtime.h2CloseStreamIfDone(worker.service.allocator, descriptor.stream_id);
-            return .{ .body_bytes = received.payload.len };
+            return body_bytes;
         },
         @intFromEnum(ipc.ingress_channel.Op.response_end) => {
             try runtime.h2ValidateWorkerResponseBodyDescriptor(descriptor);
             if (received.payload.len != 0)
                 return error.InvalidPacket;
+            try runtime.h2MarkWorkerResponseBodyQueued(descriptor.stream_id, true);
             _ = try queueResponseChunk(
                 Worker,
                 worker,
@@ -476,9 +355,8 @@ pub fn queueWorkerResponseDescriptor(
                 "",
                 true,
             );
-            try runtime.h2MarkWorkerResponseBodyQueued(descriptor.stream_id, true);
             _ = runtime.h2CloseStreamIfDone(worker.service.allocator, descriptor.stream_id);
-            return .{};
+            return 0;
         },
         @intFromEnum(ipc.ingress_channel.Op.response_reset) => {
             try runtime.h2ValidateWorkerResponseBodyDescriptor(descriptor);
@@ -489,7 +367,7 @@ pub fn queueWorkerResponseDescriptor(
             // The worker ended its own response, so its request needs no
             // reset toward it.
             _ = try resetStream(Worker, worker, runtime, descriptor.stream_id, reset_code);
-            return .{};
+            return 0;
         },
         else => return error.InvalidH2WorkerOutboundDescriptor,
     }
@@ -517,16 +395,6 @@ fn decodeWorkerResponseResetCode(raw: u32) ?h2.ErrorCode {
     };
 }
 
-/// True when two descriptors name the same request: lane, slot, generation,
-/// stream and request id.
-pub fn sameWorkerResponseIdentity(a: ipc.ingress_channel.Descriptor, b: ipc.ingress_channel.Descriptor) bool {
-    return a.request_lane_id == b.request_lane_id and
-        a.request_slot == b.request_slot and
-        a.stream_id == b.stream_id and
-        a.request_id == b.request_id and
-        a.request_generation == b.request_generation;
-}
-
 /// Writes queued bytes until the queue drains or the socket would block, and
 /// returns whether anything happened. A socket that would block arms the
 /// connection's write poll, and one that failed asks the lane to close the
@@ -549,6 +417,7 @@ pub fn flushPendingWrite(comptime Worker: type, worker: *Worker, runtime: *Slot)
             return true;
         }
         runtime.h2ConsumeQueuedWrite(worker.service.allocator, written);
+        try retireResponseChunks(Worker, worker, runtime);
         runtime.noteProgress(process.monotonicNowNsOrZero());
         did_work = true;
     }
@@ -726,33 +595,48 @@ fn flushPendingResponseStream(
     stream_id: u32,
 ) !bool {
     const allocator = worker.service.allocator;
-    const pending = runtime.h2PendingResponseSlice(stream_id) orelse return false;
-    const end_stream = runtime.h2PendingResponseEndsStream(stream_id);
-    if (pending.len == 0) {
-        if (!end_stream)
-            return false;
-        const queued = try queueDataFramesNoWindowAccounting(Worker, worker, runtime, stream_id, "", true);
-        try runtime.h2ClearPendingResponseEnd(stream_id);
+    var did_work = false;
+    // Nothing appends to the stream during the flush. A pass sends a whole
+    // chunk, of which a worker's stream holds at most its credit window, or
+    // the END_STREAM. After a pass that sends less, the next one queues the
+    // frame the socket refused, or stops. The bound covers those passes with
+    // one to spare.
+    for (0..limits.http_body.INGRESS_RESPONSE_CHUNKS_IN_FLIGHT_MAX + 3) |_| {
+        if (!runtime.isOpen() or runtime.h2WritesPending())
+            break;
+        const pending = runtime.h2PendingResponseSlice(stream_id) orelse break;
+        const end_stream = runtime.h2PendingResponseEndsStream(stream_id);
+        if (pending.len == 0) {
+            if (!end_stream)
+                break;
+            const queued = try queueDataFramesNoWindowAccounting(Worker, worker, runtime, stream_id, "", true);
+            try runtime.h2ClearPendingResponseEnd(stream_id);
+            _ = runtime.h2MaybeRemoveDrainedResponseStream(allocator, stream_id);
+            _ = runtime.h2CloseStreamIfDone(allocator, stream_id);
+            return queued or did_work;
+        }
+
+        const sent = try queueResponseDataAvailableWindow(Worker, worker, runtime, stream_id, pending, end_stream, runtime.h2PendingResponseChunk(stream_id));
+        if (sent == 0)
+            break;
+        try runtime.h2DropPendingResponsePrefix(allocator, stream_id, sent);
+        try retireResponseChunks(Worker, worker, runtime);
         _ = runtime.h2MaybeRemoveDrainedResponseStream(allocator, stream_id);
         _ = runtime.h2CloseStreamIfDone(allocator, stream_id);
-        return queued;
+        did_work = true;
     }
-
-    const sent = try queueResponseDataAvailableWindow(Worker, worker, runtime, stream_id, pending, end_stream);
-    if (sent == 0)
-        return false;
-    try runtime.h2DropPendingResponsePrefix(allocator, stream_id, sent);
-    _ = runtime.h2MaybeRemoveDrainedResponseStream(allocator, stream_id);
-    _ = runtime.h2CloseStreamIfDone(allocator, stream_id);
-    return true;
+    return did_work;
 }
 
 /// Sends as much of `payload` as the send windows allow and returns how much
-/// it took; the caller keeps the rest waiting. With nothing queued, frames go
-/// to the socket straight from `payload`, and a frame the socket took in part
-/// has its tail queued. When writes are already queued, or the socket would
-/// block before taking a byte, the admitted bytes are copied into the queue
-/// as frames. The stream records END_STREAM once its frame is queued.
+/// it took; the caller keeps the rest waiting. `chunk` is the worker's chunk
+/// that holds `payload`, or null for a server response. With nothing queued,
+/// frames go to the socket straight from `payload`, and a frame the socket
+/// took in part has its tail queued. When writes are already queued, or the
+/// socket would block before taking a byte, a server response's admitted
+/// bytes are copied into the queue as frames, and a worker's chunk queues one
+/// frame that points into it. The stream records END_STREAM once its frame
+/// is queued.
 fn queueResponseDataAvailableWindow(
     comptime Worker: type,
     worker: *Worker,
@@ -760,6 +644,7 @@ fn queueResponseDataAvailableWindow(
     stream_id: u32,
     payload: []const u8,
     end_stream: bool,
+    chunk: ?*write_queue.ResponseChunk,
 ) !usize {
     if (payload.len == 0) {
         if (end_stream)
@@ -773,7 +658,7 @@ fn queueResponseDataAvailableWindow(
     const final = end_stream and send_len == payload.len;
 
     if (!runtime.h2WritesPending()) {
-        const direct = try writeDataFramesDirectNoWindowAccounting(Worker, worker, runtime, stream_id, payload[0..send_len], final);
+        const direct = try writeDataFramesDirectNoWindowAccounting(Worker, worker, runtime, stream_id, payload[0..send_len], final, chunk);
         if (direct.committed_payload_len != 0) {
             try runtime.h2ConsumeOutboundWindow(stream_id, direct.committed_payload_len);
             if (final and direct.committed_payload_len == send_len)
@@ -784,6 +669,17 @@ fn queueResponseDataAvailableWindow(
             return 0;
     }
 
+    if (chunk) |worker_chunk| {
+        const frame_len = @min(send_len, runtime.h2_peer_settings.max_frame_size);
+        const frame_final = final and frame_len == send_len;
+        var header: [h2.frame_header_len]u8 = undefined;
+        try encodeFrameHeader(&header, frame_len, .data, if (frame_final) 0x1 else 0, stream_id);
+        try queueChunkFrameTail(Worker, worker, runtime, &header, @constCast(payload[0..frame_len]), 0, worker_chunk);
+        try runtime.h2ConsumeOutboundWindow(stream_id, frame_len);
+        if (frame_final)
+            runtime.h2NoteResponseEndQueued(stream_id);
+        return frame_len;
+    }
     _ = try queueDataFramesNoWindowAccounting(Worker, worker, runtime, stream_id, payload[0..send_len], final);
     try runtime.h2ConsumeOutboundWindow(stream_id, send_len);
     return send_len;
@@ -796,8 +692,9 @@ const DirectDataWriteResult = struct {
 
 /// Writes DATA frames for `payload` straight from it until the socket would
 /// block. A frame the socket took in part has its tail queued and counts as
-/// committed, since the client will receive it whole. The caller charges the
-/// send windows for `committed_payload_len`.
+/// committed, since the client will receive it whole: as a copy, or, when
+/// `payload` lies in a worker's `chunk`, as a segment that points into it.
+/// The caller charges the send windows for `committed_payload_len`.
 fn writeDataFramesDirectNoWindowAccounting(
     comptime Worker: type,
     worker: *Worker,
@@ -805,6 +702,7 @@ fn writeDataFramesDirectNoWindowAccounting(
     stream_id: u32,
     payload: []const u8,
     end_stream: bool,
+    chunk: ?*write_queue.ResponseChunk,
 ) !DirectDataWriteResult {
     const budget: usize = @intCast(runtime.h2_peer_settings.max_frame_size);
     if (budget == 0)
@@ -814,13 +712,13 @@ fn writeDataFramesDirectNoWindowAccounting(
     var offset: usize = 0;
     while (offset < payload.len) {
         const remaining = payload.len - offset;
-        const chunk_len = @min(remaining, budget);
-        const chunk = payload[offset..][0..chunk_len];
-        const is_last = offset + chunk_len == payload.len;
+        const frame_len = @min(remaining, budget);
+        const frame_payload = payload[offset..][0..frame_len];
+        const is_last = offset + frame_len == payload.len;
         var header: [h2.frame_header_len]u8 = undefined;
-        try encodeFrameHeader(&header, chunk_len, .data, if (is_last and end_stream) 0x1 else 0, stream_id);
+        try encodeFrameHeader(&header, frame_len, .data, if (is_last and end_stream) 0x1 else 0, stream_id);
 
-        const written = writeDataFrameVectored(runtime.fd, &header, chunk) catch |err| {
+        const written = writeDataFrameVectored(runtime.fd, &header, frame_payload) catch |err| {
             if (try connection.actOnClientIo(Worker, worker, runtime, .write, err))
                 result.did_work = true;
             return result;
@@ -833,19 +731,60 @@ fn writeDataFramesDirectNoWindowAccounting(
         result.did_work = true;
         runtime.noteProgress(process.monotonicNowNsOrZero());
 
-        const total_len = h2.frame_header_len + chunk.len;
+        const total_len = h2.frame_header_len + frame_payload.len;
         if (written < total_len) {
-            const remaining_wire = try copyRemainingDataFrameWire(worker.service.allocator, &header, chunk, written);
-            _ = try queueOwnedWrite(Worker, worker, runtime, remaining_wire);
-            result.committed_payload_len += chunk.len;
+            if (chunk) |worker_chunk| {
+                try queueChunkFrameTail(Worker, worker, runtime, &header, @constCast(frame_payload), written, worker_chunk);
+            } else {
+                // No other frame may follow a DATA frame whose tail was lost.
+                errdefer worker.closeRuntimeConnection(runtime, .{ .reason = .allocation_failed, .goaway = null });
+                const remaining_wire = try copyRemainingDataFrameWire(worker.service.allocator, &header, frame_payload, written);
+                _ = try queueOwnedWrite(Worker, worker, runtime, remaining_wire);
+            }
+            result.committed_payload_len += frame_payload.len;
             return result;
         }
 
-        result.committed_payload_len += chunk.len;
-        offset += chunk.len;
+        result.committed_payload_len += frame_payload.len;
+        offset += frame_payload.len;
     }
 
     return result;
+}
+
+/// Queues the unsent part of a DATA frame whose payload lies in `chunk`: a
+/// copy of the header's unsent bytes, then a segment that points into the
+/// chunk. The queue was empty, so only the second append can fail, and the
+/// connection then closes without GOAWAY.
+fn queueChunkFrameTail(
+    comptime Worker: type,
+    worker: *Worker,
+    runtime: *Slot,
+    header: *const [h2.frame_header_len]u8,
+    payload: []u8,
+    written: usize,
+    chunk: *write_queue.ResponseChunk,
+) !void {
+    const allocator = worker.service.allocator;
+    // A header without its payload cannot be followed by another frame.
+    errdefer worker.closeRuntimeConnection(runtime, .{ .reason = .allocation_failed, .goaway = null });
+    if (written < header.len)
+        try runtime.h2AppendWriteCopy(allocator, header[written..]);
+    const payload_offset = written -| header.len;
+    try runtime.h2AppendChunkWrite(allocator, payload[payload_offset..], chunk);
+    runtime.wait_events = event_sources.write_events;
+    try worker.updateConnectionInterest(runtime);
+}
+
+/// Destroys each chunk whose last byte the client socket took
+/// (`write_queue.zig:ResponseChunk`) and returns its credit to the request
+/// that owned it.
+fn retireResponseChunks(comptime Worker: type, worker: *Worker, runtime: *Slot) LaneFault!void {
+    while (runtime.h2TakeRetiredResponseChunk()) |chunk| {
+        const owner = chunk.owner;
+        worker.service.allocator.destroy(chunk);
+        try worker.responseChunkRetired(owner);
+    }
 }
 
 fn writeDataFrameVectored(fd: std.posix.fd_t, header: *const [h2.frame_header_len]u8, payload: []const u8) !usize {

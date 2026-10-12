@@ -18,16 +18,17 @@
 //! (`egress_gateway_generation` and `egress_gateway_session_id`) changes on
 //! the launcher thread and is read on the lanes, both under the mutex of the
 //! record's pool (`Pool.visitWorker` in `pool.zig`). `metrics_mutex` guards
-//! `page_mapped`, `log_drops_reported`, both ring marks (`log_ring_failed`
-//! and `usage_ring_failed`) and the usage and console cursors of the page
-//! view (`page.HostCursors`), and spans every drain of the worker's usage
-//! and console rings: the metrics thread's, a lane's settle, the reaper's
-//! final drain and the exiting thread's. The view's completion cursor
-//! belongs to the worker's reader lane. The forwarding window
-//! (`forwarded_in_queues`, `window_waiter`) and the body waiters are atomics
-//! any lane reads and writes without a lock. Lock order: `metrics_mutex`
-//! before the request table's own lock (`request_table.zig`); `send_mutex`
-//! never nests with either.
+//! `page_mapped`, `boot_egress`, `boot_end_pending`, `log_drops_reported`,
+//! both ring marks (`log_ring_failed` and `usage_ring_failed`) and the usage
+//! and console cursors of the page view (`page.HostCursors`), and spans every
+//! drain of the worker's usage and console rings: the metrics thread's, a
+//! lane's settle, the reaper's final drain and the exiting thread's. The
+//! view's completion cursor belongs to the worker's reader lane. The
+//! forwarding window (`forwarded_in_queues`, `window_waiter`) and the body
+//! waiters are atomics any lane reads and writes without a lock. Lock order:
+//! `metrics_mutex` before the request table's own lock (`request_table.zig`),
+//! and never held across the boot token's end (`Supervisor.progressBootEgress`);
+//! `send_mutex` never nests with either.
 
 const std = @import("std");
 const ipc = @import("collo_ipc");
@@ -39,6 +40,21 @@ const config = @import("collo_server_config");
 
 const host = @import("collo_host");
 const request_table = @import("request_table.zig");
+const page = @import("collo_worker_state").page;
+
+/// The boot token's gateway, session and deadline, fixed at launch; a
+/// reattach does not change them.
+pub const BootToken = struct {
+    gateway_generation: u64,
+    session_id: u64,
+    deadline_mono_ns: u64,
+};
+
+/// A boot token whose end is owed, and the worker it belongs to.
+pub const BootEndAttempt = struct {
+    worker_key: server_lifecycle.WorkerKey,
+    token: BootToken,
+};
 
 pub const Record = struct {
     /// With `generation`, the worker's `WorkerKey`, assigned when the record
@@ -75,6 +91,15 @@ pub const Record = struct {
     /// unmaps it, both under `metrics_mutex`; every drain checks it under the
     /// lock and skips a record without it.
     page_mapped: bool = false,
+    /// The worker's boot token until its end went out to its gateway or its
+    /// deadline passed; null for a worker launched without one. Guarded by
+    /// `metrics_mutex`.
+    boot_egress: ?BootToken = null,
+    /// Set the first time the worker's startup-end flag reads 1, and kept
+    /// until the end goes out. A worker that set the flag honestly and was
+    /// compromised before a failed send got retried could otherwise clear it
+    /// and keep the token until its deadline. Guarded by `metrics_mutex`.
+    boot_end_pending: bool = false,
     /// Serializes the server-to-worker send channel. The per-worker
     /// `dispatch_send_scratch` and the shared payload ring writer are
     /// single-producer by construction (the ring is load, copy, store with no
@@ -145,6 +170,7 @@ pub const Record = struct {
         egress_wake_set: ipc.egress_shared.WakeSet,
         created_mono_ns: u64,
         boot_work_ns: u64 = 0,
+        boot_egress: ?BootToken = null,
     };
 
     /// A pool entry's storage before its first worker: vacant, with the
@@ -195,7 +221,49 @@ pub const Record = struct {
 
         self.metrics_mutex.lock();
         defer self.metrics_mutex.unlock();
+        self.boot_egress = occupant.boot_egress;
+        self.boot_end_pending = false;
         self.page_mapped = self.handle.metrics != null;
+    }
+
+    /// The boot token to end now: the worker's, once its startup-end flag
+    /// read 1 (`boot_end_pending`). Null while the end is not owed, and for a
+    /// token past its deadline, which the record then forgets. The caller
+    /// sends the end without this lock and reports success to
+    /// `completeBootEnd`.
+    pub fn bootEndAttempt(self: *Record, now_ns: u64) ?BootEndAttempt {
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
+        if (!self.page_mapped)
+            return null;
+        const token = self.boot_egress orelse return null;
+        if (now_ns >= token.deadline_mono_ns) {
+            self.boot_egress = null;
+            self.boot_end_pending = false;
+            return null;
+        }
+        if (!self.boot_end_pending) {
+            const view = if (self.handle.metrics) |*mapped| mapped else return null;
+            const snapshot = page.LifecycleSnapshot.load(view.header);
+            self.boot_end_pending = snapshot.startupEnded();
+        }
+        if (!self.boot_end_pending)
+            return null;
+        return .{ .worker_key = self.key(), .token = token };
+    }
+
+    /// Forgets the boot token whose end `attempt` sent, unless the record
+    /// holds another worker by now: the send ran without this lock.
+    pub fn completeBootEnd(self: *Record, attempt: BootEndAttempt) void {
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
+        // `occupy` and `vacate` change the key only while the page is unmapped.
+        if (!self.page_mapped)
+            return;
+        if (!self.key().eql(attempt.worker_key))
+            return;
+        self.boot_egress = null;
+        self.boot_end_pending = false;
     }
 
     /// Sends SIGKILL to the worker through its pidfd. A worker that already

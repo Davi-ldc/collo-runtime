@@ -36,11 +36,21 @@ pub fn disconnect(runtime: *egress_context.Context) void {
 /// the trace. It fails every active fetch, every open body and every complete
 /// body that still has chunks queued, drops those chunks, returns each extent
 /// the worker holds to the pool while the endpoint is still mapped, and
-/// unmaps it. The event loop keeps running. Does nothing when the worker is
-/// detached.
+/// unmaps it. The event loop keeps running. It first clears every copy of the
+/// boot token (`Context.revokeBootEgress`), which is all it does for a worker
+/// already detached.
 pub fn disconnectWithReason(runtime: *egress_context.Context, reason: []const u8) void {
+    if (runtime.detach_in_progress.*)
+        return;
+    runtime.revokeBootEgress();
     if (runtime.egress_state.shared == null)
         return;
+    runtime.detach_in_progress.* = true;
+    defer runtime.detach_in_progress.* = false;
+    // Response outboxes can retain a borrowed extent after it left the
+    // body's queue. Return those leases before failing bodies or unmapping
+    // their endpoint; no request is finished inside this native hook.
+    runtime.releaseResponseHoldsBeforeDetach();
     runtime.traceRuntimeEvent("worker.egress_gateway.disconnect={s}", .{reason});
     failActiveFetches(runtime, detached_message);
     // Parked uploads name tasks that `failActiveFetches` just settled.

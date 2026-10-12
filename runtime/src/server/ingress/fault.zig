@@ -1033,9 +1033,8 @@ pub const ResponseQueueOutcome = union(enum) {
 };
 
 /// `http2/writing.zig` queueing a worker's response descriptor onto its
-/// stream (`queueWorkerResponseDescriptor`,
-/// `tryQueueWorkerResponseHeadChunkPair`), with the decode and HPACK
-/// encoding of the response head inside them.
+/// stream (`queueWorkerResponseDescriptor`), with the decode and HPACK
+/// encoding of the response head inside it.
 pub const ResponseQueueError = error{
     InvalidH2StreamIdentity,
     InvalidH2WorkerOutboundDescriptor,

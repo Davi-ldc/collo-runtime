@@ -192,6 +192,7 @@ test "a top-level turn that never yields is stopped by its own evaluation's budg
     _ = try rt.addRoute(runtime, ok_entry);
     _ = try rt.addRoute(runtime, hung_entry);
     try runtime.evaluateBootRoutes(pack_fd, 0, null);
+    runtime.sealStartupEvaluations();
     const hung_evaluation_id = request_context.evaluationId(1);
     const evaluation = runtime.requests.active.get(hung_evaluation_id) orelse
         return error.MissingEvaluation;

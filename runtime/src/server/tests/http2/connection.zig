@@ -53,9 +53,8 @@ const DataFrameHandling = http2_connection.DataFrameHandling;
 const Slot = connection_slot.Slot;
 const drive = http2_connection.drive;
 const queueResponseChunk = http2_writing.queueResponseChunk;
-const queueResponseHeadAndChunk = http2_writing.queueResponseHeadAndChunk;
+const queueResponseHead = http2_writing.queueResponseHead;
 const queueWorkerResponseDescriptor = http2_writing.queueWorkerResponseDescriptor;
-const tryQueueWorkerResponseHeadChunkPair = http2_writing.tryQueueWorkerResponseHeadChunkPair;
 const flushPendingResponseData = http2_writing.flushPendingResponseData;
 const encodeHeadersFrames = h2.encodeHeadersFrames;
 const encodeDataFrames = h2.encodeDataFrames;
@@ -692,6 +691,8 @@ const TestWorker = struct {
         _ = runtime;
     }
 
+    pub fn responseChunkRetired(_: *TestWorker, _: RequestKey) fault.LaneFault!void {}
+
     pub fn closeRuntimeConnection(self: *TestWorker, runtime: *Slot, close: fault.ConnectionClose) void {
         if (self.close == null)
             self.close = close;
@@ -822,20 +823,19 @@ const TestWorker = struct {
         return true;
     }
 
-    /// Answers `stream_id` from inside a stream handler the way a worker's
-    /// head and last chunk do: one queued write with END_STREAM, recorded as
-    /// the worker's head. The stream stays in the table; the driver closes
-    /// it once the handler returns and both ends are done.
+    /// Answers `stream_id` from inside a stream handler and records the head
+    /// and END_STREAM. The driver closes it once both ends are done.
     fn sendResponse(self: *TestWorker, runtime: *Slot, stream_id: u32, body: []const u8) StreamHandlerError!bool {
         const headers = [_]ipc.ingress_channel.ResponseHeader{
             .{ .name = self.response_header_name, .value = self.response_header_value },
         };
         self.response_count += 1;
-        const queued = try queueResponseHeadAndChunk(TestWorker, self, runtime, stream_id, self.response_status, &headers, body, true);
+        _ = try queueResponseHead(TestWorker, self, runtime, stream_id, self.response_status, &headers, false);
+        const queued = try queueResponseChunk(TestWorker, self, runtime, stream_id, body, true);
         // The record refuses only a stream with no active request or one
         // that has a head already, and the stub answers each stream it
         // started once, so a refusal is the stub's own state gone wrong.
-        runtime.h2MarkWorkerResponseHeadChunkPairQueued(stream_id, true) catch
+        runtime.h2MarkWorkerResponseHeadQueued(stream_id, true) catch
             return error.Http2StreamStateMismatch;
         return queued;
     }
@@ -865,6 +865,8 @@ const BackpressuredTestWorker = struct {
         _ = self;
         _ = runtime;
     }
+
+    pub fn responseChunkRetired(_: *BackpressuredTestWorker, _: RequestKey) fault.LaneFault!void {}
 
     pub fn closeRuntimeConnection(self: *BackpressuredTestWorker, runtime: *Slot, close: fault.ConnectionClose) void {
         if (self.close == null)
@@ -1363,7 +1365,7 @@ fn driveUntilIdle(comptime Worker: type, worker: *Worker, runtime: *Slot) !void 
 
 /// Queues a whole worker response on `stream_id`, a head and a last chunk of
 /// `body`, through the lane's path for a worker's descriptors
-/// (`tryQueueWorkerResponseHeadChunkPair`). The identity is the one
+/// (`queueWorkerResponseDescriptor`). The identity is the one
 /// `TestWorker.startDynamicH2` gave the stream's request.
 fn queueWorkerAnswer(worker: *TestWorker, runtime: *Slot, stream_id: u32, body: []const u8) !void {
     const key = runtime.h2ActiveRequestKey(stream_id) orelse return error.StreamHasNoActiveRequest;
@@ -1398,8 +1400,8 @@ fn queueWorkerAnswer(worker: *TestWorker, runtime: *Slot, stream_id: u32, body: 
             .payload_owned = false,
         },
     };
-    _ = (try tryQueueWorkerResponseHeadChunkPair(TestWorker, worker, runtime, &items)) orelse
-        return error.WorkerResponsePairNotRecognized;
+    for (&items) |*item|
+        _ = try queueWorkerResponseDescriptor(TestWorker, worker, runtime, item);
 }
 
 fn expectResponseHeader(
@@ -2955,7 +2957,8 @@ test "http2 DATA on a stream that drains its response is dropped with its connec
     var out: [1024]u8 = undefined;
     _ = try readAvailableFd(setup.pair[1], &out);
 
-    _ = try queueResponseHeadAndChunk(TestWorker, &worker, &setup.runtime, 1, 200, &.{}, "late", true);
+    _ = try queueResponseHead(TestWorker, &worker, &setup.runtime, 1, 200, &.{}, false);
+    _ = try queueResponseChunk(TestWorker, &worker, &setup.runtime, 1, "late", true);
     const request_key = setup.runtime.h2ActiveRequestKey(1) orelse return error.StreamHasNoActiveRequest;
     try std.testing.expectEqual(stream_table.StreamRelease.draining, setup.runtime.h2RemoveRequest(allocator, request_key));
 
@@ -3376,11 +3379,11 @@ test "http2 driver closes a connection whose client-sized allocation fails, with
     try std.testing.expectEqual(@intFromEnum(h2.ErrorCode.internal_error), readU32(goaway.payload[4..8]));
 }
 
-test "http2 driver closes a client that stops reading while it widens its windows, without GOAWAY (#34)" {
-    // The client's credit releases a response the server buffered while the
-    // client reads nothing, so the write queue passes its bound. The full
-    // queue is where a GOAWAY would wait, so the connection closes without
-    // one, and `drive` returns.
+test "http2 driver keeps a client that stops reading while it widens its windows, its write queue within its bound" {
+    // Each stream buffers the most a stream may hold, together more than the
+    // write queue's bound. A flush adds to the queue only while it is empty,
+    // so the client's credit moves one stream's response into the queue and
+    // the others keep waiting on their streams.
     const allocator = std.testing.allocator;
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
@@ -3393,32 +3396,35 @@ test "http2 driver closes a client that stops reading while it widens its window
     var settings_out: [256]u8 = undefined;
     _ = try readAvailableFd(setup.pair[1], &settings_out);
 
-    // A response twice the write queue's bound waits on a stream the client
-    // has given no send window.
     setup.runtime.h2_peer_settings.initial_window_size = 0;
-    const request_key = RequestKey{ .lane_id = 0, .slot = 1, .generation = 1 };
-    try setup.runtime.h2ReserveStream(1);
-    try setup.runtime.h2ActivateStream(1, request_key, 1);
-    const body = try allocator.alloc(u8, 2 * write_queue.max_queued_write_bytes);
+    const body = try allocator.alloc(u8, write_queue.max_h2_pending_response_bytes_per_stream);
     defer allocator.free(body);
     @memset(body, 'r');
-    _ = try queueResponseChunk(TestWorker, &worker, &setup.runtime, 1, body, true);
-    try std.testing.expect(setup.runtime.h2HasPendingResponse(1));
+    const stream_count = write_queue.max_queued_write_bytes / body.len + 1;
+    for (0..stream_count) |index| {
+        const stream_id: u32 = @intCast(2 * index + 1);
+        try setup.runtime.h2ReserveStream(stream_id);
+        try setup.runtime.h2ActivateStream(stream_id, .{ .lane_id = 0, .slot = @intCast(index), .generation = 1 }, stream_id);
+        _ = try queueResponseChunk(TestWorker, &worker, &setup.runtime, stream_id, body, true);
+    }
 
-    // The client stops reading, then opens the connection's and the stream's
-    // windows to the whole body.
+    // The client stops reading, then opens the connection's window and
+    // every stream's to the whole of what waits.
     try saturateFd(setup.pair[0]);
     var increment: [4]u8 = undefined;
-    writeU32(&increment, @intCast(body.len));
+    writeU32(&increment, @intCast(stream_count * body.len));
     try writeFrameFd(setup.pair[1], .window_update, 0, 0, &increment);
-    try writeFrameFd(setup.pair[1], .window_update, 0, 1, &increment);
+    writeU32(&increment, @intCast(body.len));
+    for (0..stream_count) |index|
+        try writeFrameFd(setup.pair[1], .window_update, 0, @intCast(2 * index + 1), &increment);
 
     _ = try drive(TestWorker, &worker, &setup.runtime);
 
-    try std.testing.expect(!setup.runtime.isOpen());
-    const close = worker.close orelse return error.MissingClose;
-    try std.testing.expectEqual(fault.ConnectionCloseReason.write_backpressure, close.reason);
-    try std.testing.expect(close.goaway == null);
+    try std.testing.expect(setup.runtime.isOpen());
+    try std.testing.expect(worker.close == null);
+    try std.testing.expect(setup.runtime.h2WritesPending());
+    try std.testing.expect(setup.runtime.h2_write_len - setup.runtime.h2_write_offset < write_queue.max_queued_write_bytes);
+    try std.testing.expect(setup.runtime.h2HasPendingResponse(@intCast(2 * stream_count - 1)));
 }
 
 test "http2 driver returns a client descriptor that is not open as the lane's own fault" {
@@ -3788,7 +3794,8 @@ test "http2 worker-death synthetic error drains failed stream while peer stream 
     const error_headers = [_]ipc.ingress_channel.ResponseHeader{
         .{ .name = "content-type", .value = "text/plain" },
     };
-    _ = try queueResponseHeadAndChunk(TestWorker, &worker, &setup.runtime, 1, 502, &error_headers, "bad gateway", true);
+    _ = try queueResponseHead(TestWorker, &worker, &setup.runtime, 1, 502, &error_headers, false);
+    _ = try queueResponseChunk(TestWorker, &worker, &setup.runtime, 1, "bad gateway", true);
     try std.testing.expectEqual(stream_table.StreamRelease.draining, setup.runtime.h2RemoveRequest(allocator, failed_key));
     try std.testing.expectEqual(@as(?stream_table.H2StreamState, .draining_response), setup.runtime.h2StreamState(1));
     try std.testing.expectEqualStrings("bad gateway", setup.runtime.h2PendingResponseSlice(1).?);
@@ -3798,7 +3805,8 @@ test "http2 worker-death synthetic error drains failed stream while peer stream 
     const peer_headers = [_]ipc.ingress_channel.ResponseHeader{
         .{ .name = "x-peer", .value = "survived" },
     };
-    _ = try queueResponseHeadAndChunk(TestWorker, &worker, &setup.runtime, 3, 200, &peer_headers, "ok", true);
+    _ = try queueResponseHead(TestWorker, &worker, &setup.runtime, 3, 200, &peer_headers, false);
+    _ = try queueResponseChunk(TestWorker, &worker, &setup.runtime, 3, "ok", true);
 
     var out: [2048]u8 = undefined;
     const received = try readAvailableFd(setup.pair[1], &out);
@@ -3911,7 +3919,7 @@ test "http2 a request that leaves its stream closes it, drains a tail that carri
     try std.testing.expectEqual(@as(usize, 1), runtime.ingress_channel_count);
 }
 
-test "http2 combined response head and chunk frames in one queued write" {
+test "http2 response heads precede their body frames" {
     const allocator = std.testing.allocator;
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
@@ -3926,7 +3934,8 @@ test "http2 combined response head and chunk frames in one queued write" {
     const headers = [_]ipc.ingress_channel.ResponseHeader{
         .{ .name = "content-type", .value = "text/plain" },
     };
-    _ = try queueResponseHeadAndChunk(TestWorker, &worker, &setup.runtime, 5, 200, &headers, "ok", true);
+    _ = try queueResponseHead(TestWorker, &worker, &setup.runtime, 5, 200, &headers, false);
+    _ = try queueResponseChunk(TestWorker, &worker, &setup.runtime, 5, "ok", true);
 
     var out: [256]u8 = undefined;
     const received = try readAvailableFd(setup.pair[1], &out);
@@ -4033,7 +4042,7 @@ test "http2 a response head the encoder fails midway poisons it, and the connect
     try std.testing.expectEqual(@intFromEnum(h2.ErrorCode.compression_error), readU32(goaway.payload[4..8]));
 }
 
-test "http2 worker response descriptor pair queues fused headers and data frames" {
+test "http2 worker response descriptors queue a head and body in order" {
     const allocator = std.testing.allocator;
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
@@ -4079,9 +4088,9 @@ test "http2 worker response descriptor pair queues fused headers and data frames
     };
 
     try std.testing.expect(!setup.runtime.responseHeadQueued(13));
-    const queued = (try tryQueueWorkerResponseHeadChunkPair(TestWorker, &worker, &setup.runtime, &items)) orelse return error.WorkerResponsePairNotRecognized;
-    try std.testing.expectEqual(@as(usize, 2), queued.consumed_descriptors);
-    try std.testing.expectEqual(@as(usize, body_payload.len), queued.body_bytes);
+    _ = try queueWorkerResponseDescriptor(TestWorker, &worker, &setup.runtime, &items[0]);
+    const body_bytes = try queueWorkerResponseDescriptor(TestWorker, &worker, &setup.runtime, &items[1]);
+    try std.testing.expectEqual(@as(usize, body_payload.len), body_bytes);
     try std.testing.expect(setup.runtime.responseHeadQueued(13));
 
     var out: [512]u8 = undefined;
@@ -4361,10 +4370,10 @@ test "http2 worker response descriptors queue split head chunk and explicit end"
     };
 
     _ = try queueWorkerResponseDescriptor(TestWorker, &worker, &setup.runtime, &head_received);
-    const chunk_result = try queueWorkerResponseDescriptor(TestWorker, &worker, &setup.runtime, &chunk_received);
-    const end_result = try queueWorkerResponseDescriptor(TestWorker, &worker, &setup.runtime, &end_received);
-    try std.testing.expectEqual(@as(usize, body_payload.len), chunk_result.body_bytes);
-    try std.testing.expectEqual(@as(usize, 0), end_result.body_bytes);
+    const chunk_body_bytes = try queueWorkerResponseDescriptor(TestWorker, &worker, &setup.runtime, &chunk_received);
+    const end_body_bytes = try queueWorkerResponseDescriptor(TestWorker, &worker, &setup.runtime, &end_received);
+    try std.testing.expectEqual(@as(usize, body_payload.len), chunk_body_bytes);
+    try std.testing.expectEqual(@as(usize, 0), end_body_bytes);
 
     var out: [512]u8 = undefined;
     const received = try readAvailableFd(setup.pair[1], &out);
@@ -4522,7 +4531,8 @@ test "http2 local server response drains when peer stream window is closed" {
     const headers = [_]ipc.ingress_channel.ResponseHeader{
         .{ .name = "content-type", .value = "text/plain" },
     };
-    _ = try queueResponseHeadAndChunk(TestWorker, &worker, &runtime, 9, 503, &headers, "busy", true);
+    _ = try queueResponseHead(TestWorker, &worker, &runtime, 9, 503, &headers, false);
+    _ = try queueResponseChunk(TestWorker, &worker, &runtime, 9, "busy", true);
 
     try std.testing.expectEqual(@as(?stream_table.H2StreamState, .preparing), runtime.h2StreamState(9));
     try std.testing.expectEqualStrings("busy", runtime.h2PendingResponseSlice(9).?);

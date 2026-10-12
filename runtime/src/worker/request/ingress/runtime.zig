@@ -37,6 +37,26 @@ pub fn enqueueDescriptor(runtime: anytype, received: ipc.ingress_channel.Receive
     }
 }
 
+/// Applies a cumulative body grant to the request it names and queues the
+/// request's response advance when the grant ends its wait for credit. A
+/// grant for a request no longer active is dropped, and one whose identity
+/// differs from its request's fails with `error.InvalidH2StreamIdentity`.
+pub fn enqueueResponseCredit(runtime: anytype, credit: ipc.messages.ResponseCredit) !void {
+    if (request_context.isReservedId(credit.request_id))
+        return;
+    const request_ctx = runtime.requests.active.get(credit.request_id) orelse return;
+    if (request_ctx.ingress_channel_id != credit.stream_id or
+        request_ctx.dispatch_work.request_generation != credit.request_generation or
+        request_ctx.dispatch_work.request_lane_id != credit.request_lane_id or
+        request_ctx.dispatch_work.request_slot != credit.request_slot)
+        return error.InvalidH2StreamIdentity;
+    try request_ctx.response_credit.grant(credit.grant_chunks_total);
+    if (request_ctx.response_advance.wait == .credit and request_ctx.response_credit.available() != 0) {
+        request_ctx.response_advance.wait = .none;
+        _ = response_stream.queueAdvance(runtime, request_ctx);
+    }
+}
+
 fn enqueueRequestBegin(runtime: anytype, received: *ipc.ingress_channel.Received) !void {
     var dispatch_work = try ipc.ingress_channel.decodeDispatchPayload(runtime.core.allocator, received);
     var dispatch_moved = false;
@@ -137,8 +157,8 @@ fn enqueueReset(runtime: anytype, received: *ipc.ingress_channel.Received) !void
 
 /// After a full ready queue asked for a rescan, queues what each active
 /// request still waits for: the cancel of a reset request, a dispatch that
-/// has not started, a body read that can settle, or a response body stream
-/// with a result to send or a read to start. It stops at the first item that
+/// has not started, a body read that can settle, or a stamped response
+/// advance of any source. It stops at the first item that
 /// still finds no room, which asks for the rescan again.
 pub fn collectReadyRequests(runtime: anytype) void {
     if (!runtime.scheduler.ingress_rescan_needed)
@@ -163,8 +183,8 @@ pub fn collectReadyRequests(runtime: anytype) void {
             if (!queueBodyReady(runtime, request_ctx))
                 return;
         }
-        if (response_stream.wantsAdvance(&request_ctx.response_stream)) {
-            if (!response_stream.queueAdvance(runtime, request_ctx.exec.request_id, &request_ctx.response_stream))
+        if (request_ctx.response_advance.state == .unqueued) {
+            if (!response_stream.queueAdvance(runtime, request_ctx))
                 return;
         }
     }

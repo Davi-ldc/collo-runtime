@@ -12,10 +12,12 @@
 const std = @import("std");
 
 /// An origin that answers every request with a precomputed gzip body and
-/// `content-encoding: gzip`, except two paths: `hold_path`, which it reads
+/// `content-encoding: gzip`, except three paths: `hold_path`, which it reads
 /// and then holds open without an answer until it stops, so a fetch of that
-/// path stays in flight, and `redirect_path`, which it answers with a 302 to
-/// another origin's `/gzip`.
+/// path stays in flight; `barrier_path`, which it answers only once the test
+/// calls `releaseBarrier` or the origin stops, serving nothing else
+/// meanwhile; and `redirect_path`, which it answers with a 302 to another
+/// origin's `/gzip`.
 pub const GzipOrigin = struct {
     server: std.net.Server,
     host_buffer: [64]u8,
@@ -33,8 +35,11 @@ pub const GzipOrigin = struct {
     held: std.atomic.Value(usize),
     held_streams: [held_streams_max]std.net.Stream,
     stopping: std.atomic.Value(bool),
+    /// Set by `releaseBarrier` or `stop`.
+    barrier_released: std.Thread.ResetEvent,
 
     pub const hold_path = "/hold";
+    pub const barrier_path = "/barrier";
     /// `/redirect?to=<host:port>` answers 302 with
     /// `location: http://<host:port>/gzip`.
     pub const redirect_path = "/redirect";
@@ -90,6 +95,7 @@ pub const GzipOrigin = struct {
             .held = std.atomic.Value(usize).init(0),
             .held_streams = undefined,
             .stopping = std.atomic.Value(bool).init(false),
+            .barrier_released = .{},
         };
         origin.thread = try std.Thread.spawn(.{}, GzipOrigin.serve, .{origin});
         return origin;
@@ -107,6 +113,7 @@ pub const GzipOrigin = struct {
 
     pub fn stop(self: *GzipOrigin, allocator: std.mem.Allocator) void {
         self.stopping.store(true, .release);
+        self.barrier_released.set();
         const address = std.net.Address.parseIp4("127.0.0.1", self.port) catch null;
         if (address) |addr| {
             if (std.net.tcpConnectToAddress(addr)) |stream| {
@@ -131,6 +138,12 @@ pub const GzipOrigin = struct {
         return error.OriginHeldRequestNotObserved;
     }
 
+    /// Lets the origin answer the request it holds at `barrier_path`, and
+    /// every later one at once.
+    pub fn releaseBarrier(self: *GzipOrigin) void {
+        self.barrier_released.set();
+    }
+
     fn serve(self: *GzipOrigin) void {
         while (!self.stopping.load(.acquire)) {
             const connection = self.server.accept() catch return;
@@ -143,6 +156,10 @@ pub const GzipOrigin = struct {
             _ = self.accepted.fetchAdd(1, .acq_rel);
             if (std.mem.startsWith(u8, head, "GET " ++ hold_path ++ " ")) {
                 self.hold(connection.stream);
+            } else if (std.mem.startsWith(u8, head, "GET " ++ barrier_path ++ " ")) {
+                self.barrier_released.wait();
+                answer(connection.stream);
+                connection.stream.close();
             } else if (std.mem.startsWith(u8, head, "GET " ++ redirect_path ++ "?to=")) {
                 redirect(connection.stream, head["GET ".len + redirect_path.len + "?to=".len ..]);
                 connection.stream.close();

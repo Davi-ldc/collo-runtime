@@ -206,7 +206,6 @@ pub const Service = struct {
                 .zygoteExited = Deps.launchZygoteExited,
                 .egressCurrentGeneration = Deps.launchEgressCurrentGeneration,
                 .egressPrewarm = Deps.launchEgressPrewarm,
-                .egressBootEnded = Deps.launchEgressBootEnded,
                 .nextStaleEgressWorker = Deps.launchNextStaleEgressWorker,
                 .setWorkerEgress = Deps.launchSetWorkerEgress,
                 .retireForEgress = Deps.launchRetireForEgress,

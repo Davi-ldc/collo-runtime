@@ -15,6 +15,7 @@ const ipc = @import("collo_ipc");
 const fd_mod = @import("collo_os").fd;
 const process = @import("collo_os").process;
 const os_linux = @import("collo_os").linux;
+const process_limits = @import("collo_limits").process;
 const host = @import("collo_host");
 const zygote = @import("collo_zygote");
 const worker_shared_page = @import("collo_worker_state").page;
@@ -256,7 +257,7 @@ test "a launch without routes sends the empty table and leaves the serves-routes
     try std.testing.expect(received.module_pack_fd == null);
 }
 
-test "an attached launch sends the session's half beside a boot token that expires with the child window (#48)" {
+test "an attached launch sends the session's half beside a boot token whose deadline adds the evaluation budget to the child window" {
     var send: InitSend = undefined;
     try send.init(null, .attached);
     defer send.deinit();
@@ -282,9 +283,15 @@ test "an attached launch sends the session's half beside a boot token that expir
     try std.testing.expectEqual(boot_egress.budget, fields.budget);
     try std.testing.expectEqual(@as(u64, 0), fields.request_id);
     try std.testing.expectEqual(@as(u64, 0), fields.request_generation);
-    try std.testing.expect(send.machine.child_init_deadline_abs_ns != 0);
-    try std.testing.expectEqual(send.machine.child_init_deadline_abs_ns, fields.deadline_monotonic_ns);
-    try std.testing.expectEqual(received.message.init_deadline_mono_ns, fields.deadline_monotonic_ns);
+    const deadline = received.message.init_deadline_mono_ns + process_limits.MODULE_EVAL_BUDGET_NS;
+    try std.testing.expectEqual(deadline, fields.deadline_monotonic_ns);
+    // The launcher reads the deadline here for the worker's record.
+    try std.testing.expectEqual(deadline, send.machine.boot_egress_deadline_abs_ns);
+}
+
+test "the boot token's deadline adds the evaluation budget to the init deadline, up to the owner's deadline" {
+    try std.testing.expectEqual(3 + process_limits.MODULE_EVAL_BUDGET_NS, launch.bootEgressDeadline(3, 0));
+    try std.testing.expectEqual(@as(u64, 4), launch.bootEgressDeadline(3, 4));
 }
 
 test "a launch for a definition without a network grant sends no egress descriptor and leaves flag_egress clear" {

@@ -1,8 +1,8 @@
 // Collo::GlobalObject, the JSC global object of each realm of a Collo VM, and VmClientData, through which a global
-// finds its ColloVm and stack frames get their public source URLs. Runs on the VM thread. VM creation installs
-// VmClientData before it creates the first global, and the JSC VM deletes it only in its own destructor, so every
-// live global reaches its ColloVm; owner() aborts when it cannot. A global knows its realm from its creation on, and
-// the realm, which the VM owns, outlives it.
+// finds its ColloVm, stack frames get their public source URLs, and globals get the subspace their size needs. Runs
+// on the VM thread. VM creation installs VmClientData before it creates the first global, and the JSC VM deletes it
+// only in its own destructor, so every live global reaches its ColloVm; owner() aborts when it cannot. A global knows
+// its realm from its creation on, and the realm, which the VM owns, outlives it.
 
 #include "jsc/runtime/state.h"
 

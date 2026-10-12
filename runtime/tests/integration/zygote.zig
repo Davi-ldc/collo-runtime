@@ -3046,7 +3046,8 @@ fn expectBootDiesAtInitDeadline(route_count: usize, fork_job_id: u64) !void {
     message.enableEgressGatewaySandbox();
     // The host's window: now plus WORKER_INIT_TIMEOUT_MS, fixed before the
     // send, the same absolute value both ends enforce. The boot token takes
-    // it as its deadline, as `host/launch.zig` mints it.
+    // it as its deadline too: this boot ends at the init deadline, so the
+    // budget `host/launch.zig:bootEgressDeadline` adds would change nothing.
     const init_deadline_mono_ns = (try process.monotonicNowNs()) +
         @as(u64, @intCast(zygote.host_client.worker_init_timeout_ms)) * std.time.ns_per_ms;
     message.init_deadline_mono_ns = init_deadline_mono_ns;

@@ -58,6 +58,9 @@ pub const MessageKind = enum(u32) {
     /// Worker to server on the worker's control socket, after WorkerReady: the
     /// worker asks to be retired (`WorkerRetiring`, `worker_retiring.zig`).
     worker_retiring = 27,
+    /// Server to worker on the worker's control socket: the cumulative body
+    /// chunk credit of one response (`ResponseCredit`, `response_credit.zig`).
+    response_credit = 28,
 };
 
 /// Why a worker asks to be retired. A worker never exits on its own for
@@ -322,9 +325,10 @@ pub const WorkerInit = extern struct {
     /// checks the limits it was actually given.
     cpu_max_cores: u32 = limits.worker.cpu_max_cores,
     _reserved0: u32 = 0,
-    /// The boot token (`egress_token.zig`, kind boot) that fetches made while the route's
-    /// modules evaluate present, minted when this message is sent with `init_deadline_mono_ns`
-    /// as its deadline. `egress_token.none` means no egress grant, and those fetches are denied.
+    /// The boot token (`egress_token.zig`, kind boot) that fetches made while
+    /// route modules evaluate present, with the deadline
+    /// `host/launch.zig:bootEgressDeadline` gives it. `egress_token.none`
+    /// means no egress grant, and those fetches are denied.
     boot_egress_token: egress_token.Bytes = egress_token.none,
     /// Absolute CLOCK_MONOTONIC deadline of the whole init window. Host and
     /// child read the same clock, so the raw value crosses the socket: the
@@ -507,6 +511,21 @@ pub const WorkerRetiring = extern struct {
             .reason = @intFromEnum(reason),
         };
     }
+};
+
+/// Server to worker, on its control socket: the cumulative number of body
+/// chunks the request's response may have published
+/// (`response_credit.zig:Window.granted`). The socket identifies the worker;
+/// every request identity field must match before the worker uses the grant.
+pub const ResponseCredit = extern struct {
+    kind: u32 = @intFromEnum(MessageKind.response_credit),
+    request_lane_id: u16,
+    reserved0: u16 = 0,
+    request_slot: u32,
+    stream_id: u32,
+    request_id: u64,
+    request_generation: u64,
+    grant_chunks_total: u64,
 };
 
 /// Fixed head of a DispatchWork packet. `dispatch.zig` owns the variable
@@ -813,6 +832,7 @@ pub fn decodeMessageKind(raw: u32) !MessageKind {
         25 => .fs_fault_response,
         26 => .egress_attach,
         27 => .worker_retiring,
+        28 => .response_credit,
         else => error.InvalidMessageKind,
     };
 }
@@ -882,6 +902,21 @@ comptime {
         @compileError("ipc.WorkerInit default unowned limit must pass validate");
     if (@sizeOf(WorkerRetiring) != 8)
         @compileError("ipc.WorkerRetiring size mismatch");
+    if (@sizeOf(ResponseCredit) != 40 or @alignOf(ResponseCredit) != 8)
+        @compileError("ipc.ResponseCredit layout mismatch");
+    for (.{
+        .{ "kind", 0 },
+        .{ "request_lane_id", 4 },
+        .{ "reserved0", 6 },
+        .{ "request_slot", 8 },
+        .{ "stream_id", 12 },
+        .{ "request_id", 16 },
+        .{ "request_generation", 24 },
+        .{ "grant_chunks_total", 32 },
+    }) |field| {
+        if (@offsetOf(ResponseCredit, field[0]) != field[1])
+            @compileError("ipc.ResponseCredit field offset mismatch");
+    }
     if (@sizeOf(DispatchPacketHeader) != 152)
         @compileError("ipc.DispatchPacketHeader size mismatch");
     if (@sizeOf(EgressAttach) != 4)

@@ -12,13 +12,14 @@
 //!   exactly: the request key of a live request dispatched to the sending
 //!   worker, on that request's own stream, and the HTTP/2 layer checks the
 //!   request id against the stream's record. A descriptor whose request ended
-//!   or whose stream went away is a race and drops. Every other mismatch, and
-//!   every descriptor the stream cannot admit, is a worker fault returned to
-//!   the caller as `fault.WorkerOutcome`; the caller runs the death path, and
-//!   nothing here marks a worker dead. Before it forwards one, the reader
-//!   checks it against the worker's request table (`RequestTable.forwardCheck`):
-//!   a request the table no longer holds drops the descriptor, and one the
-//!   table holds under another key is a fault.
+//!   or whose stream went away is a race and drops. Every other mismatch,
+//!   every descriptor the stream cannot admit, and a body chunk past the
+//!   request's credit window (`RequestSlot.response_credit`) are worker
+//!   faults returned to the caller as `fault.WorkerOutcome`; the caller runs
+//!   the death path, and nothing here marks a worker dead. Before it
+//!   forwards one, the reader checks it against the worker's request table
+//!   (`RequestTable.forwardCheck`): a request the table no longer holds drops
+//!   the descriptor, and one the table holds under another key is a fault.
 //! - The forwarding window bounds the commands one worker's output holds in
 //!   all lanes' queues to `limits.ingress.forwarded_commands_per_worker_max`
 //!   (`Record.forwarded_in_queues`). Each forwarded descriptor takes a unit
@@ -191,9 +192,8 @@ pub fn Methods(comptime Self: type) type {
             return handleReceived(self, registration, received);
         }
 
-        /// Handles the descriptors of one batch packet in order, queueing a
-        /// response head and its first chunk as one write when both are this
-        /// lane's. Stops at the first worker fault.
+        /// Handles the descriptors of one batch packet in order, stopping at
+        /// the first worker fault.
         pub fn handleWorkerBatch(
             self: *Self,
             registration: *completions.Registration,
@@ -202,16 +202,8 @@ pub fn Methods(comptime Self: type) type {
             self.lane.counters.h2_worker_descriptor_batches += 1;
             self.lane.counters.h2_worker_descriptors += @intCast(batch.items.len);
             var yield = false;
-            var index: usize = 0;
-            while (index < batch.items.len) {
-                var handled: Handled = undefined;
-                if (try tryHandleHeadChunkPair(self, registration, batch.items[index..])) |pair| {
-                    handled = pair;
-                    index += 2;
-                } else {
-                    handled = try handleReceived(self, registration, &batch.items[index]);
-                    index += 1;
-                }
+            for (batch.items) |*received| {
+                const handled = try handleReceived(self, registration, received);
                 switch (handled.outcome) {
                     .ok => {},
                     .would_block, .fault => return handled,
@@ -246,20 +238,27 @@ pub fn Methods(comptime Self: type) type {
                     return .{ .fault = reason };
                 },
             };
-            const payload: []u8 = switch (forwarded.payload) {
-                .none => &.{},
-                .inline_bytes => |bytes| bytes.bytes,
-                .ring => |ring| heldRingPayload(target.active, ring) orelse {
-                    try endForwardedUnit(self, forwarded);
-                    return .{ .fault = .payload_ring_invalid };
-                },
-            };
+            // An inline payload moves into `received` with the allocator that
+            // holds it; a ring payload stays borrowed from the ring.
             var received: Received = .{
                 .allocator = self.service.allocator,
                 .descriptor = forwarded.descriptor,
-                .payload = payload,
                 .payload_owned = false,
             };
+            switch (forwarded.payload) {
+                .none => {},
+                .inline_bytes => |bytes| {
+                    received.allocator = bytes.allocator;
+                    received.payload = bytes.bytes;
+                    received.payload_owned = true;
+                    forwarded.payload = .none;
+                },
+                .ring => |ring| received.payload = heldRingPayload(target.active, ring) orelse {
+                    try endForwardedUnit(self, forwarded);
+                    return .{ .fault = .payload_ring_invalid };
+                },
+            }
+            defer received.deinit();
             // A drive can end the request, and its slot may go back to the
             // pool only after the reader has the answer.
             const outcome = try queueDescriptor(self, target, &received);
@@ -464,60 +463,8 @@ pub fn Methods(comptime Self: type) type {
             }
         }
 
-        /// Queues a response head and the chunk right after it as one write
-        /// when both are inline, of one request of this lane, and the head
-        /// does not end the stream. Null, having done nothing, when they are
-        /// not such a pair or the HTTP/2 layer declines it; the two are then
-        /// handled one by one.
-        fn tryHandleHeadChunkPair(
-            self: *Self,
-            registration: *completions.Registration,
-            items: []Received,
-        ) LaneFault!?Handled {
-            if (items.len < 2)
-                return null;
-            const head = &items[0];
-            const chunk = &items[1];
-            if (head.descriptor.op != @intFromEnum(Op.response_head) or
-                chunk.descriptor.op != @intFromEnum(Op.response_chunk))
-            {
-                return null;
-            }
-            if (!head.descriptor.hasFlag(ipc.ingress_channel.flags.inline_bytes) or
-                !chunk.descriptor.hasFlag(ipc.ingress_channel.flags.inline_bytes) or
-                head.descriptor.hasFlag(ipc.ingress_channel.flags.end_stream) or
-                !http2_writing.sameWorkerResponseIdentity(head.descriptor, chunk.descriptor))
-            {
-                return null;
-            }
-            if (head.descriptor.stream_id == 0 or head.descriptor.request_lane_id != self.lane.lane_id)
-                return null;
-            const target = switch (try resolveAfterBacklog(self, registration.worker_key, head.descriptor)) {
-                .local => |target| target,
-                .stale, .fault => return null,
-            };
-            const queued = http2_writing.tryQueueWorkerResponseHeadChunkPair(
-                Self,
-                self,
-                target.runtime,
-                items[0..2],
-            ) catch |err| {
-                const outcome = try actOnQueueError(self, target, head.descriptor, err);
-                passRingPayload(registration, head.ring_span);
-                passRingPayload(registration, chunk.ring_span);
-                return .{ .outcome = outcome };
-            } orelse return null;
-            self.lane.counters.ingress_response_body_bytes += @intCast(queued.body_bytes);
-            stampFirstByte(target.active);
-            try driveBacklog(self, target.runtime);
-            passRingPayload(registration, head.ring_span);
-            passRingPayload(registration, chunk.ring_span);
-            try finishParkedCompletionIfResponseOver(self, target.active);
-            return .{ .yield = yieldForBacklog(self, target.runtime) };
-        }
-
         /// Sends a descriptor of another lane's request to that lane, under a
-        /// unit of the worker's window. An inline payload is copied into the
+        /// unit of the worker's window. An inline payload moves into the
         /// command; a ring payload stays in the ring, held until the owner
         /// answers. A descriptor whose request the worker's table no longer
         /// holds drops, and one the table holds under another key is a
@@ -567,13 +514,9 @@ pub fn Methods(comptime Self: type) type {
                 }
                 payload = .{ .ring = .{ .offset = span.offset, .len = span.len } };
             } else if (received.payload.len != 0) {
-                const bytes = self.service.allocator.dupe(u8, received.payload) catch |err| switch (err) {
-                    error.OutOfMemory => {
-                        try releaseForwardUnit(self, worker);
-                        return .{ .fault = .allocation_failed };
-                    },
-                };
-                payload = .{ .inline_bytes = .{ .bytes = bytes, .allocator = self.service.allocator } };
+                std.debug.assert(received.payload_owned);
+                payload = .{ .inline_bytes = .{ .bytes = received.payload, .allocator = received.allocator } };
+                received.payload_owned = false;
             }
             // The post consumes the command on every path, so a refused one
             // has already freed its inline copy.
@@ -652,18 +595,28 @@ pub fn Methods(comptime Self: type) type {
             return .{ .local = .{ .runtime = runtime, .active = active } };
         }
 
-        /// Queues one worker descriptor onto its request's stream, which copies
-        /// its payload, and acts on what the HTTP/2 layer decided
-        /// (`fault.classifyResponseQueueError`). It drives nothing and finishes
-        /// no request, so the caller decides what may run before what.
+        /// Charges a body chunk to its request's credit window, queues one
+        /// worker descriptor onto the request's stream, which takes an owned
+        /// payload or copies borrowed ring bytes, and acts on what the HTTP/2
+        /// layer decided (`fault.classifyResponseQueueError`). It drives
+        /// nothing and finishes no request, so the caller decides what may
+        /// run before what.
         fn queueDescriptor(self: *Self, target: Target, received: *Received) LaneFault!WorkerOutcome {
-            const queued = http2_writing.queueWorkerResponseDescriptor(
+            if (received.descriptor.op == @intFromEnum(Op.response_chunk)) {
+                // The writer may retire the chunk before it returns. A failed
+                // append ends the response, so this charge needs no rollback.
+                if (!target.active.response_credit.trySpend())
+                    return .{ .fault = .response_descriptor_invalid };
+            }
+            if (endsResponse(received.descriptor))
+                target.active.response_credit_unsent = false;
+            const body_bytes = http2_writing.queueWorkerResponseDescriptor(
                 Self,
                 self,
                 target.runtime,
                 received,
             ) catch |err| return actOnQueueError(self, target, received.descriptor, err);
-            self.lane.counters.ingress_response_body_bytes += @intCast(queued.body_bytes);
+            self.lane.counters.ingress_response_body_bytes += @intCast(body_bytes);
             if (received.descriptor.op == @intFromEnum(Op.response_head))
                 stampFirstByte(target.active);
             return .ok;

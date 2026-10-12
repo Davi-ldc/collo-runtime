@@ -414,8 +414,8 @@ fn workerChildMainImpl(zygote: *state.Zygote, child_init_fd: std.posix.fd_t, rep
         // above runs after the runtime's deferred teardown below.
         .route_table = mapped_route_table,
         .isolate_realm = received.message.isolatesRealms(),
-        // Every evaluation of a route module copies it, so top-level code
-        // fetches under it (`worker/runtime/evaluations.zig`).
+        // The evaluations the boot opens copy it, so top-level code fetches
+        // under it (`worker/runtime/evaluations.zig`).
         .boot_egress_token = received.message.boot_egress_token,
     });
     traceEvent(trace_fd, "child.runtime_options.resolved");
@@ -563,6 +563,9 @@ fn workerChildMainImpl(zygote: *state.Zygote, child_init_fd: std.posix.fd_t, rep
     }
     if (received.takeModulePackFd()) |fd|
         std.posix.close(fd);
+    // Outside the block above, so a worker without routes ends its startup
+    // evaluations at once.
+    runtime.sealStartupEvaluations();
 
     worker_state.metrics.?.setState(.ready, .none);
     worker_state.lifecycle_state = .ready;

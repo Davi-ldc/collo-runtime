@@ -10,19 +10,12 @@
 //!
 //! The VM forbids execution after a termination (`forbidExecutionOnTermination` in
 //! `jsc/runtime/vm.cpp`), JSC's mode for a VM that never recovers from a termination exception.
-//! A worker stops serving after a termination and its process exits without destroying the VM,
-//! but a test has to destroy it, and no ABI function clears a termination request first.
-//! Tearing down a terminated VM trips a JSC debug-build assertion that a Release engine compiles
-//! out, so the test runs only when `COLLO_VM_TERMINATION_RELEASE_LANE` is set, which
-//! `enableReleaseOnlyTests` in `runtime/build/tests.zig` does for runs against a Release engine,
-//! and skips otherwise. Against a debug engine the assertion fires at teardown, after the
-//! interrupt has happened.
+//! A worker stops serving after a termination and its process exits without destroying the VM;
+//! the test destroys it, which both engine profiles allow.
 
 const std = @import("std");
 const support = @import("bindings_support");
 const bindings = support.bindings;
-
-const release_lane_env = "COLLO_VM_TERMINATION_RELEASE_LANE";
 
 /// How long the watchdog waits, once the test thread signals the invoke, before it requests
 /// termination, so the VM thread is inside the loop rather than still entering it.
@@ -47,11 +40,6 @@ const Watchdog = struct {
 };
 
 test "requestTermination interrupts a spinning turn instead of hanging" {
-    // Compiled in every lane and run only against a Release engine, for the reason the file
-    // header gives.
-    if (std.posix.getenv(release_lane_env) == null)
-        return error.SkipZigTest;
-
     var vm = try support.createVm();
     defer vm.deinit();
 

@@ -278,15 +278,6 @@ pub fn h2MarkWorkerResponseBodyQueued(self: *Slot, stream_id: u32, end_stream: b
         entry.worker_response_ended = true;
 }
 
-pub fn h2MarkWorkerResponseHeadChunkPairQueued(self: *Slot, stream_id: u32, end_stream: bool) !void {
-    const entry = h2StreamEntry(self, stream_id) orelse return error.Http2UnknownStream;
-    if (entry.state != .active or entry.worker_response_head_sent or entry.worker_response_ended)
-        return error.InvalidH2WorkerOutboundDescriptor;
-    entry.worker_response_head_sent = true;
-    if (end_stream)
-        entry.worker_response_ended = true;
-}
-
 pub fn h2WorkerResponseEnded(self: *const Slot, stream_id: u32) bool {
     const entry = h2StreamEntryConst(self, stream_id) orelse return false;
     return entry.worker_response_ended;
@@ -533,6 +524,7 @@ pub const H2StreamEntry = struct {
     pending_response: []u8 = &.{},
     pending_response_start: usize = 0,
     pending_response_end_stream: bool = false,
+    response_chunks: write_queue.ResponseChunks = .{},
     /// The response's END_STREAM is in the connection's write queue.
     response_end_queued: bool = false,
     worker_response_head_sent: bool = false,
@@ -540,6 +532,7 @@ pub const H2StreamEntry = struct {
 
     /// Frees the stream's buffered body and response.
     pub fn deinitBuffers(self: *H2StreamEntry, allocator: std.mem.Allocator) void {
+        self.response_chunks.deinit(allocator);
         if (self.pending_body.len != 0)
             allocator.free(self.pending_body);
         if (self.pending_response.len != 0)

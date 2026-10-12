@@ -85,8 +85,8 @@ pub const Runtime = struct {
     /// Whom the VM thread works for, with the worker owner's exec context and
     /// CPU (`owner.zig`).
     owners: runtime_owner.Owners,
-    /// What every evaluation of a route module copies (`evaluations.zig`);
-    /// the evaluations themselves live in the active map.
+    /// What the startup evaluations copy and count (`evaluations.zig`); the
+    /// evaluations themselves live in the active map.
     evaluations: runtime_evaluations.Evaluations,
     /// The VM can run no JavaScript again: the sentinel fired, and its
     /// termination cannot be cleared (`forbidExecutionOnTermination` has no
@@ -278,6 +278,7 @@ pub const Runtime = struct {
     }
 
     pub const evaluateBootRoutes = EvaluationsMethods.evaluateBootRoutes;
+    pub const sealStartupEvaluations = EvaluationsMethods.sealStartupEvaluations;
     pub const ensureRouteHandler = EvaluationsMethods.ensureRouteHandler;
     pub const armEvaluationBudget = EvaluationsMethods.armEvaluationBudget;
     pub const closeEvaluationOnceSettled = EvaluationsMethods.closeEvaluationOnceSettled;
@@ -318,7 +319,6 @@ pub const Runtime = struct {
     pub const scheduleRequestTaskCompletion = RequestsMethods.scheduleRequestTaskCompletion;
     pub const collectReadyRequestCompletions = RequestsMethods.collectReadyRequestCompletions;
     pub const destroyRequestContext = RequestsMethods.destroyRequestContext;
-    pub const flushPendingIngressResponses = RequestsMethods.flushPendingIngressResponses;
 
     pub const scheduleFetch = EgressMethods.scheduleFetch;
     pub const disconnectEgressGateway = EgressMethods.disconnectEgressGateway;

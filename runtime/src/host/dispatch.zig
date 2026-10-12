@@ -9,10 +9,14 @@
 //! Response frames (head, chunks, end) arrive as ingress-channel packets on
 //! the control fd; the completion record is published on the shared metrics
 //! page and signaled through the completion eventfd. Every host reads the
-//! same two channels, in-process harnesses and forked workers alike.
+//! same two channels, in-process harnesses and forked workers alike. The
+//! reader grants the worker response credit for each chunk it takes, as the
+//! server does (`ResponseReadCredit`), so a worker's response may run past
+//! its first `common/ipc/response_credit.zig:window` chunks.
 
 const std = @import("std");
 const ipc = @import("collo_ipc");
+const body_limits = @import("collo_limits").http_body;
 const fd_mod = @import("collo_os").fd;
 const worker_shared_page = @import("collo_worker_state").page;
 
@@ -211,6 +215,11 @@ pub const ReadBudget = struct {
     /// `name: value\r\n` form kept in `headers_wire` spends 4 separator
     /// bytes per header, so it never exceeds this cap either.
     max_headers_bytes: usize,
+    /// For a host that runs the worker on its own thread: one bounded pass
+    /// of the worker, called before each read. With it, a poll that finds
+    /// nothing waits at most a millisecond before the next pass.
+    progress_context: ?*anyopaque = null,
+    progress_fn: ?*const fn (?*anyopaque) anyerror!void = null,
 };
 
 /// Bounded read of one request's response. Frames are drained from the
@@ -236,9 +245,17 @@ pub fn readResponse(
     };
 
     var control_fd = channels.control_fd;
+    var credit = ResponseReadCredit{ .request_id = request_id };
     var timer = try std.time.Timer.start();
     const budget_ns = @as(u64, budget.wall_ms) * std.time.ns_per_ms;
     while (true) {
+        if (budget.progress_fn) |progress|
+            try progress(budget.progress_context);
+        if (control_fd != -1)
+            credit.flush(control_fd) catch |err| switch (err) {
+                error.PeerClosed => credit.pending = false,
+                else => return err,
+            };
         // Ring first: the completion may already be published.
         var records: [1]worker_shared_page.WorkerCompletionRecord = undefined;
         const drained = try channels.metrics.drainWorkerCompletions(&records);
@@ -268,7 +285,7 @@ pub fn readResponse(
                     return error.ControlChannelBroken;
                 if ((control_poll[0].revents & std.posix.POLL.IN) == 0)
                     break;
-                drainResponseControlPacket(allocator, channels, budget, &response, &body) catch |err| switch (err) {
+                drainResponseControlPacket(allocator, channels, budget, &response, &body, &credit) catch |err| switch (err) {
                     error.ControlPeerClosed, error.WouldBlock => break,
                     else => return err,
                 };
@@ -285,7 +302,8 @@ pub fn readResponse(
         var pollfds = [2]std.posix.pollfd{
             .{
                 .fd = control_fd,
-                .events = std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR,
+                .events = std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR |
+                    (if (credit.pending) @as(i16, std.posix.POLL.OUT) else 0),
                 .revents = 0,
             },
             .{
@@ -294,9 +312,13 @@ pub fn readResponse(
                 .revents = 0,
             },
         };
-        const ready = std.posix.poll(&pollfds, remaining_ms) catch return error.ResponseChannelClosed;
-        if (ready == 0)
+        const wait_ms = if (budget.progress_fn != null) @min(remaining_ms, 1) else remaining_ms;
+        const ready = std.posix.poll(&pollfds, wait_ms) catch return error.ResponseChannelClosed;
+        if (ready == 0) {
+            if (budget.progress_fn != null)
+                continue;
             return error.ResponseNotFinalized;
+        }
 
         if ((pollfds[0].revents & (std.posix.POLL.ERR | std.posix.POLL.NVAL)) != 0 or
             (pollfds[1].revents & (std.posix.POLL.ERR | std.posix.POLL.NVAL)) != 0)
@@ -307,7 +329,7 @@ pub fn readResponse(
         {
             // Drain the control packet first so response bytes sent before
             // the completion was published are never lost to an early return.
-            drainResponseControlPacket(allocator, channels, budget, &response, &body) catch |err| switch (err) {
+            drainResponseControlPacket(allocator, channels, budget, &response, &body, &credit) catch |err| switch (err) {
                 error.ControlPeerClosed => {
                     // The worker may close after publishing; keep waiting on
                     // the metrics channel for the completion.
@@ -331,12 +353,85 @@ pub fn readResponse(
     }
 }
 
+/// The response credit of one response a host reads. The response's
+/// identity is pinned by its head, which must come first, and every later
+/// descriptor must carry it. Each chunk is charged as it is decoded and
+/// retired once its packet was read whole, which sends the worker a new
+/// cumulative grant.
+pub const ResponseReadCredit = struct {
+    request_id: u64,
+    /// The grant to send, which carries the pinned identity.
+    identity: ?ipc.ResponseCredit = null,
+    window: ipc.response_credit.Window = .{},
+    /// A grant waits for room in the control socket.
+    pending: bool = false,
+    ended: bool = false,
+
+    /// Checks `descriptor` against the response and charges a chunk. A chunk
+    /// past the window fails with `error.ResponseCreditExceeded`.
+    pub fn admit(self: *ResponseReadCredit, descriptor: ipc.ingress_channel.Descriptor) !void {
+        if (descriptor.request_id != self.request_id or self.ended)
+            return error.InvalidH2StreamIdentity;
+        if (self.identity) |identity| {
+            if (identity.request_lane_id != descriptor.request_lane_id or
+                identity.request_slot != descriptor.request_slot or
+                identity.request_generation != descriptor.request_generation or
+                identity.stream_id != descriptor.stream_id)
+                return error.InvalidH2StreamIdentity;
+            if (descriptor.op == @intFromEnum(ipc.ingress_channel.Op.response_head))
+                return error.InvalidH2WorkerInboundDescriptor;
+        } else {
+            if (descriptor.op != @intFromEnum(ipc.ingress_channel.Op.response_head))
+                return error.InvalidH2WorkerInboundDescriptor;
+            self.identity = .{
+                .request_lane_id = descriptor.request_lane_id,
+                .request_slot = descriptor.request_slot,
+                .stream_id = descriptor.stream_id,
+                .request_id = descriptor.request_id,
+                .request_generation = descriptor.request_generation,
+                .grant_chunks_total = self.window.granted,
+            };
+        }
+        if (descriptor.op == @intFromEnum(ipc.ingress_channel.Op.response_chunk)) {
+            if (descriptor.byte_len == 0 or descriptor.byte_len > body_limits.INGRESS_RESPONSE_CHUNK_BYTES)
+                return error.InvalidH2WorkerInboundDescriptor;
+            if (!self.window.trySpend())
+                return error.ResponseCreditExceeded;
+        }
+        if (descriptor.hasFlag(ipc.ingress_channel.flags.end_stream) or
+            descriptor.op == @intFromEnum(ipc.ingress_channel.Op.response_end) or
+            descriptor.op == @intFromEnum(ipc.ingress_channel.Op.response_reset))
+            self.ended = true;
+    }
+
+    /// Retires `count` admitted chunks; the grant is sent while the response
+    /// has not ended.
+    pub fn retire(self: *ResponseReadCredit, count: u64) void {
+        for (0..count) |_|
+            self.identity.?.grant_chunks_total = self.window.retire();
+        if (count != 0)
+            self.pending = !self.ended;
+    }
+
+    /// Sends a pending grant; a full socket keeps it pending.
+    pub fn flush(self: *ResponseReadCredit, control_fd: std.posix.fd_t) !void {
+        if (!self.pending)
+            return;
+        ipc.response_credit.send(control_fd, self.identity.?) catch |err| switch (err) {
+            error.WouldBlock => return,
+            else => return err,
+        };
+        self.pending = false;
+    }
+};
+
 fn drainResponseControlPacket(
     allocator: std.mem.Allocator,
     channels: CompletionChannels,
     budget: ReadBudget,
     response: *Response,
     body: *std.ArrayList(u8),
+    credit: *ResponseReadCredit,
 ) !void {
     var scratch: [ipc.max_message_bytes]u8 = undefined;
     var packet = ipc.recvPacketWithFdsScratch(allocator, channels.control_fd, &scratch) catch |err| switch (err) {
@@ -352,6 +447,7 @@ fn drainResponseControlPacket(
     const kind = try ipc.decodeMessageKind(ipc.packet.readStruct(u32, packet.bytes[0..@sizeOf(u32)]));
     switch (kind) {
         .ingress_channel => {
+            const spent_before = credit.window.spent;
             packet_alive = false;
             if (ipc.ingress_channel.isDescriptorBatchPacket(packet.bytes)) {
                 var batch = if (channels.ingress_payload) |ingress_payload|
@@ -363,8 +459,10 @@ fn drainResponseControlPacket(
                 else
                     try ipc.ingress_channel.decodeReceivedBatchPacket(allocator, &packet);
                 defer batch.deinit();
-                for (batch.items) |item|
+                for (batch.items) |item| {
+                    try credit.admit(item.descriptor);
                     try appendResponsePayload(allocator, budget, response, body, item.descriptor, item.payload);
+                }
             } else {
                 var received = if (channels.ingress_payload) |ingress_payload|
                     try ipc.ingress_channel.decodeReceivedPacketWithSharedPayload(
@@ -375,8 +473,12 @@ fn drainResponseControlPacket(
                 else
                     try ipc.ingress_channel.decodeReceivedPacket(allocator, &packet);
                 defer received.deinit();
+                try credit.admit(received.descriptor);
                 try appendResponsePayload(allocator, budget, response, body, received.descriptor, received.payload);
             }
+            // The decoder's payloads and ring releases ended with the branch
+            // above. The accumulated result is bounded separately by budget.
+            credit.retire(credit.window.spent - spent_before);
         },
         .worker_retiring => {
             // A worker sends one notice; a second is a broken contract.

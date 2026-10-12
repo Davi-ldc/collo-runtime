@@ -22,7 +22,7 @@ pub const Body = union(enum) {
     /// Borrowed; the producer keeps the bytes alive until the response is
     /// written.
     bytes: []const u8,
-    /// Allocated by the allocator later passed to `takeOwnedBytes` or
+    /// Allocated by the allocator later passed to `takeRetained` or
     /// `deinitOwned`.
     owned: []u8,
     /// A body the bridge extracted, whole or in segments.
@@ -94,34 +94,18 @@ pub const Body = union(enum) {
         }
     }
 
-    /// Moves the body out as bytes that `allocator` owns, copying unless it
-    /// is already `owned`, and leaves `.empty` behind. A stream of either
-    /// kind has no bytes and fails with `error.InvalidResponseBody`, as does an extracted
-    /// body whose segments do not add up to its length; a failure leaves the
-    /// body as it was.
-    pub fn takeOwnedBytes(self: *Body, allocator: std.mem.Allocator) ![]u8 {
-        switch (self.*) {
-            .owned => |bytes| {
-                self.* = .empty;
-                return bytes;
-            },
-            .bytes => |bytes| {
-                const owned = try allocator.dupe(u8, bytes);
-                self.* = .empty;
-                return owned;
-            },
-            .abi => |*body| {
-                const copied = try copyAbiBody(allocator, body.*);
-                body.deinit();
-                self.* = .empty;
-                return copied;
-            },
-            .empty => {
-                self.* = .empty;
-                return try allocator.dupe(u8, "");
-            },
+    /// Moves the body out with the owner and segments it has and leaves
+    /// `.empty` behind; only borrowed bytes are copied, into memory from
+    /// `allocator`. A stream of either kind fails with
+    /// `error.InvalidResponseBody` and stays where it was.
+    pub fn takeRetained(self: *Body, allocator: std.mem.Allocator) !Body {
+        const retained: Body = switch (self.*) {
+            .bytes => |bytes| .{ .owned = try allocator.dupe(u8, bytes) },
+            .empty, .owned, .abi => self.*,
             .fetch_stream, .body_stream => return error.InvalidResponseBody,
-        }
+        };
+        self.* = .empty;
+        return retained;
     }
 
     pub fn deinitOwned(self: *Body, allocator: std.mem.Allocator) void {
@@ -211,26 +195,4 @@ fn serverControlsResponseHeader(name: []const u8) bool {
     return std.ascii.eqlIgnoreCase(name, "content-length") or
         std.ascii.eqlIgnoreCase(name, "connection") or
         std.ascii.eqlIgnoreCase(name, "transfer-encoding");
-}
-
-fn copyAbiBody(
-    allocator: std.mem.Allocator,
-    body: bindings.ExtractedResponseBody,
-) ![]u8 {
-    const segments = body.segmentsSlice();
-    const copied = try allocator.alloc(u8, body.total_len);
-    errdefer allocator.free(copied);
-
-    var offset: usize = 0;
-    for (segments) |segment| {
-        const bytes = segment.slice();
-        if (bytes.len > copied.len - offset)
-            return error.InvalidResponseBody;
-        @memcpy(copied[offset..][0..bytes.len], bytes);
-        offset += bytes.len;
-    }
-    if (offset != copied.len)
-        return error.InvalidResponseBody;
-
-    return copied;
 }

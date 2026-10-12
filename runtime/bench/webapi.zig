@@ -159,9 +159,17 @@ fn runColloBench(allocator: std.mem.Allocator, spec: BenchSpec, run_count: u32) 
     var vm = try bindings_support.createVm();
     defer vm.deinit();
 
+    // The worker's transport is a real worker's: its end of the control
+    // socket does not block (`zygote/child_boot.zig`), and bodies above the
+    // inline threshold go through a payload ring.
     const control_pair = try fd_mod.socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
     defer std.posix.close(control_pair[0]);
     defer std.posix.close(control_pair[1]);
+    try fd_mod.setNonblocking(control_pair[0], true);
+    const ingress_payload_fd = try ipc.ingress_channel.createSharedPayloadMemfd();
+    defer std.posix.close(ingress_payload_fd);
+    var server_payload = try ipc.ingress_channel.mapSharedPayloadReadWrite(ingress_payload_fd, .server);
+    defer server_payload.deinit();
 
     const metrics_fd = try worker_shared_page.createMemfd("collo-bench-webapi-metrics");
     defer std.posix.close(metrics_fd);
@@ -171,9 +179,9 @@ fn runColloBench(allocator: std.mem.Allocator, spec: BenchSpec, run_count: u32) 
     const completion_eventfd = try std.posix.eventfd(0, std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK);
 
     var now_mono_ns: u64 = 0;
-    var runtime = try worker.Runtime.init(allocator, &vm, control_pair[0], &metrics_view, completion_eventfd, .{
-        .ctx = &now_mono_ns,
-        .now_fn = fakeNow,
+    var runtime = try worker.Runtime.init(allocator, &vm, control_pair[0], &metrics_view, completion_eventfd, worker.RuntimeOptions{
+        .clock = .{ .ctx = &now_mono_ns, .now_fn = fakeNow },
+        .ingress_payload_fd = ingress_payload_fd,
     });
     defer runtime.deinit();
     try runtime.attachHostRuntime();
@@ -194,7 +202,7 @@ fn runColloBench(allocator: std.mem.Allocator, spec: BenchSpec, run_count: u32) 
     return runRouteAndReadBody(
         allocator,
         &runtime,
-        control_pair[1],
+        .{ .control_fd = control_pair[1], .ingress_payload = &server_payload },
         source,
         requestIdForSpecifier(spec.specifier),
         spec.specifier,
@@ -331,7 +339,7 @@ fn numberValue(value: std.json.Value) f64 {
 fn runRouteAndReadBody(
     allocator: std.mem.Allocator,
     runtime: *worker.Runtime,
-    server_control_fd: std.posix.fd_t,
+    host_ends: worker_ingress.HostEnds,
     source: []const u8,
     request_id: u64,
     specifier: []const u8,
@@ -354,6 +362,7 @@ fn runRouteAndReadBody(
     // this runtime's table is the one route.
     const route_index = try runtime.modules.state.addRoute(allocator, route_specifier, &ipc.route_bindings.empty_blob);
     try runtime.evaluateBootRoutes(route_fd, 0, null);
+    runtime.sealStartupEvaluations();
 
     var dispatch = try ipc.DispatchWork.initOwned(allocator, .{
         .request_id = request_id,
@@ -376,34 +385,16 @@ fn runRouteAndReadBody(
     defer dispatch.deinit();
 
     try worker_ingress.enqueueRoute(allocator, runtime, &dispatch, 1);
-    const request_item = runtime.scheduler.ready_queue.pop() orelse return error.MissingRequestWork;
-    try worker.executeWorkItem(runtime, request_item);
-    try executeUntilRequestDone(runtime, request_id);
-
-    var response = try worker_ingress.readResponse(allocator, server_control_fd, request_id, .{
-        .completion_eventfd = runtime.egress.completion_eventfd,
-        .metrics = runtime.observability.metrics_view,
-    });
-    defer response.deinit(allocator);
-    return allocator.dupe(u8, response.body);
+    var response = try worker_ingress.readResponse(allocator, runtime, host_ends, request_id, response_wall_ms);
+    defer response.deinit();
+    return response.takeBody();
 }
 
-fn executeUntilRequestDone(runtime: *worker.Runtime, request_id: u64) !void {
-    var attempts: usize = 0;
-    while (runtime.requests.active.contains(request_id)) : (attempts += 1) {
-        if (attempts > 10000)
-            return error.RequestDidNotComplete;
-        try runtime.collectCompletedCryptoJobs();
-        try runtime.collectCompletedFetches();
-        try runtime.collectReadyFetchBodies();
-        try runtime.collectDueTimers();
-        if (runtime.scheduler.ready_queue.pop()) |item| {
-            try worker.executeWorkItem(runtime, item);
-            continue;
-        }
-        std.Thread.sleep(std.time.ns_per_ms);
-    }
-}
+/// How long the request may take, read included. The read runs the handler,
+/// which runs every case of one bench file `COLLO_WEBAPI_BENCH_RUNS` times,
+/// and the request's own deadline lies on a clock that never moves
+/// (`fakeNow`), so this is the only bound.
+const response_wall_ms: u32 = 10 * 60 * 1000;
 
 fn scopedRouteSpecifier(allocator: std.mem.Allocator, specifier: []const u8) ![]u8 {
     if (ipc.module_pack.deployHashFromSpecifier(specifier) != null)

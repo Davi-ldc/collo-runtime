@@ -25,7 +25,7 @@ pub const Retirement = struct {
     reason: ?ipc.WorkerRetiringReason = null,
     /// The notice found the control socket full. While it holds, the loop
     /// polls the socket for room (`scheduler/uring_backend.zig`) and sends
-    /// the notice after the parked responses (`flushParkedResponses` in
+    /// the notice once the socket turns writable (`handleControlWritable` in
     /// `scheduler/loop.zig`).
     notice_pending: bool = false,
 };
@@ -76,7 +76,7 @@ pub fn Methods(comptime Runtime: type) type {
         /// Sends the pending notice; does nothing when none is pending. A
         /// runtime without a control socket, as in-process tests build, has
         /// nobody to tell and drops it. The socket does not block: a full one
-        /// leaves the notice pending for the next flush. Fails with
+        /// leaves the notice pending until the socket has room. Fails with
         /// `error.ControlPeerClosed` once the server hung up, or with the
         /// send's error.
         pub fn sendRetirementNotice(self: *Runtime) !void {
