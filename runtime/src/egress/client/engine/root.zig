@@ -36,6 +36,7 @@ const readiness = @import("collo_egress_readiness");
 const transport = @import("collo_egress_transport");
 const task_model = @import("../task.zig");
 const result_mod = @import("result.zig");
+pub const result = result_mod;
 const body_credit = core.body_credit;
 const h2_types_mod = @import("h2_types.zig").Types(Command);
 const origin_mod = @import("origin.zig");
@@ -121,6 +122,11 @@ pub const ThreadConfig = struct {
     /// concurrent at three engine threads per shard, owner included.
     connector_count: usize = 2,
 };
+
+/// The stack each owner and connector thread reserves: Zig's default, named so the gateway's
+/// sizing plan counts it in the address space it derives (`egress/gateway/sizing.zig`). Only the
+/// pages a thread touches cost memory.
+pub const thread_stack_bytes: usize = std.Thread.SpawnConfig.default_stack_size;
 
 /// Freelist cap for the shared HTTP/1 pool's body read buffers, each
 /// `continuation_read_buffer_bytes` long. Every in-flight h1 body
@@ -755,9 +761,13 @@ pub const Engine = struct {
         }
         try self.initH2Drivers();
         try self.dns_cache.prestartWorkers();
-        self.h2_worker = try std.Thread.spawn(.{}, ownerMain, .{self});
+        self.h2_worker = try std.Thread.spawn(.{ .stack_size = thread_stack_bytes }, ownerMain, .{self});
         while (self.started_h2_connectors < self.h2_connectors.len) : (self.started_h2_connectors += 1)
-            self.h2_connectors[self.started_h2_connectors] = try std.Thread.spawn(.{}, connectorMain, .{ self, self.started_h2_connectors });
+            self.h2_connectors[self.started_h2_connectors] = try std.Thread.spawn(
+                .{ .stack_size = thread_stack_bytes },
+                connectorMain,
+                .{ self, self.started_h2_connectors },
+            );
     }
 
     /// A ring that died delivers no completions, and none can be created

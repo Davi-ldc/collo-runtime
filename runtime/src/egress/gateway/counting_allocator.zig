@@ -1,9 +1,11 @@
-//! The allocator of one shard's engine: a `std.mem.Allocator` that forwards to its child and
-//! keeps an atomic count of live bytes. With a budget it also refuses any growth past it, so a
-//! runaway shard fails its own allocations with `error.OutOfMemory` instead of leaving the kernel
-//! to pick an out-of-memory victim. The engine handles that error like any other: the fetch whose
-//! publication allocated is demoted, and any other failure restarts the shard (`engine.zig`,
-//! `runtime/shard_flow.zig`). The budget is `supervisor_limits.shard_memory`.
+//! A budgeted allocator: a `std.mem.Allocator` that forwards to its child and keeps an atomic
+//! count of live bytes. With a budget it also refuses any growth past it, so a runaway consumer
+//! fails its own allocations with `error.OutOfMemory` instead of leaving the kernel to pick an
+//! out-of-memory victim. Each shard's engine allocates through one, budgeted at
+//! `supervisor_limits.shard_memory`: the fetch whose publication allocated is demoted, and any
+//! other failure restarts the shard (`engine.zig`, `runtime/shard_flow.zig`). The gateway's
+//! pooled upload buffers come from another, budgeted at `supervisor_limits.upload_memory`, where
+//! a refusal fails one fetch start (`runtime/upload_flow.zig`).
 //!
 //! The shard's engine threads and the gateway's loop thread allocate through it concurrently, so
 //! the count and the budget are atomics and no lock is taken. The cost is one or two atomic

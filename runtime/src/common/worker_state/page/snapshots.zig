@@ -1,6 +1,6 @@
 //! The host's reads of three sections a worker writes on its page: the
-//! lifecycle header, the live slots and the usage record ring. Every host
-//! reader of those sections goes through this file.
+//! lifecycle header with its owner section, the live slots and the usage
+//! record ring. Every host reader of those sections goes through this file.
 //!
 //! The worker can rewrite any byte of its page at any moment, so two loads
 //! of one field can disagree, and a check made on the first says nothing
@@ -18,9 +18,10 @@
 //!
 //! A copy that passes its checks is still the worker's claim. A live slot
 //! that matches an identity names a request the host sent to that worker,
-//! and the start time and CPU it reports reach only that worker's records.
-//! A `RecordCursor` has one user at a time; the server's drains hold the
-//! worker record's `metrics_mutex` (`server/supervisor/worker_table.zig`).
+//! and the CPU it reports reaches only that worker's records; the same holds
+//! for the owner section's deadline and CPU. A `RecordCursor` has one user
+//! at a time; the server's drains hold the worker record's `metrics_mutex`
+//! (`server/supervisor/worker_table.zig`).
 
 const std = @import("std");
 
@@ -60,6 +61,50 @@ pub const LifecycleSnapshot = struct {
     }
 };
 
+/// The owner the worker's VM thread works for, as it last published it
+/// (`WorkerWriterView.publishOwner`), each field loaded once. The two are
+/// stored one after the other, so a load during an owner change may pair one
+/// owner's id with the other's deadline: the deadline is the value to act
+/// on, and the id only names an owner in the host's log.
+pub const OwnerSnapshot = struct {
+    owner_id: u64,
+    /// CLOCK_MONOTONIC; 0 while the VM thread works for no owner.
+    deadline_mono_ns: u64,
+
+    pub fn load(header: *const Header) OwnerSnapshot {
+        const owner_id = @atomicLoad(u64, &header.owner_id, .acquire);
+        const deadline_mono_ns = @atomicLoad(u64, &header.owner_deadline_mono_ns, .acquire);
+        return .{ .owner_id = owner_id, .deadline_mono_ns = deadline_mono_ns };
+    }
+};
+
+/// The CPU of the owner the worker's sentinel watches, as the sentinel last
+/// read it (`WorkerWriterView.publishRunningOwnerCpu`), both values from one
+/// store of the pair.
+pub const RunningOwnerSnapshot = struct {
+    owner_id: u64,
+    cpu_ns: u64,
+
+    /// The pair, or null when the sentinel was storing it during the load,
+    /// when the sequence moved between the loads or when no owner was ever
+    /// stored. One attempt, no retry: a worker that keeps its sequence moving
+    /// only loses its own CPU from a record.
+    pub fn load(header: *const Header) ?RunningOwnerSnapshot {
+        const before = @atomicLoad(u32, &header.running_owner_sequence, .acquire);
+        if (before & 1 != 0)
+            return null;
+        // Acquire keeps the second load of the sequence after both values.
+        const owner_id = @atomicLoad(u64, &header.running_owner_id, .acquire);
+        const cpu_ns = @atomicLoad(u64, &header.running_owner_cpu_ns, .acquire);
+        const after = @atomicLoad(u32, &header.running_owner_sequence, .monotonic);
+        if (after != before)
+            return null;
+        if (owner_id == 0)
+            return null;
+        return .{ .owner_id = owner_id, .cpu_ns = cpu_ns };
+    }
+};
+
 /// One live slot with each field loaded once. `state` stays the raw value
 /// the page holds, so a value outside `LiveSlotState` reads as inactive.
 pub const LiveSlotSnapshot = struct {
@@ -71,8 +116,7 @@ pub const LiveSlotSnapshot = struct {
     worker_generation: u64,
     request_slot: u32,
     request_lane_id: u16,
-    started_mono_ns: u64,
-    cpu_time_ns: u64,
+    cpu_ns: u64,
 
     /// Loads `state` first, with acquire ordering, then every other field
     /// once. The worker stores `state` last when it claims a slot
@@ -90,8 +134,7 @@ pub const LiveSlotSnapshot = struct {
             .worker_generation = @atomicLoad(u64, &slot.worker_generation, .monotonic),
             .request_slot = @atomicLoad(u32, &slot.request_slot, .monotonic),
             .request_lane_id = @atomicLoad(u16, &slot.request_lane_id, .monotonic),
-            .started_mono_ns = @atomicLoad(u64, &slot.started_mono_ns, .monotonic),
-            .cpu_time_ns = @atomicLoad(u64, &slot.cpu_time_ns, .monotonic),
+            .cpu_ns = @atomicLoad(u64, &slot.cpu_ns, .monotonic),
         };
     }
 
@@ -100,7 +143,7 @@ pub const LiveSlotSnapshot = struct {
     }
 
     /// Whether the copy is an active slot that holds the request `identity`
-    /// names. Every identity field takes part except `billing_sequence`.
+    /// names, every identity field compared.
     pub fn matches(self: *const LiveSlotSnapshot, identity: LifecycleIdentity) bool {
         if (!self.isActive())
             return false;
@@ -207,25 +250,18 @@ fn loadCompletedRecord(src: *const CompletedRecord) CompletedRecord {
     return .{
         .request_id = @atomicLoad(u64, &src.request_id, .monotonic),
         .request_generation = @atomicLoad(u64, &src.request_generation, .monotonic),
-        .worker_id = @atomicLoad(u64, &src.worker_id, .monotonic),
-        .worker_generation = @atomicLoad(u64, &src.worker_generation, .monotonic),
-        .started_mono_ns = @atomicLoad(u64, &src.started_mono_ns, .monotonic),
-        .finished_mono_ns = @atomicLoad(u64, &src.finished_mono_ns, .monotonic),
-        .cpu_time_ns = @atomicLoad(u64, &src.cpu_time_ns, .monotonic),
-        .io_time_ns = @atomicLoad(u64, &src.io_time_ns, .monotonic),
+        .exec_ns = @atomicLoad(u64, &src.exec_ns, .monotonic),
         .waiting_ns = @atomicLoad(u64, &src.waiting_ns, .monotonic),
-        .queued_ns = @atomicLoad(u64, &src.queued_ns, .monotonic),
-        .max_turn_ns = @atomicLoad(u64, &src.max_turn_ns, .monotonic),
-        .turn_cpu_ns = @atomicLoad(u64, &src.turn_cpu_ns, .monotonic),
+        .io_ns = @atomicLoad(u64, &src.io_ns, .monotonic),
+        .cpu_ns = @atomicLoad(u64, &src.cpu_ns, .monotonic),
         .client_served_bytes = @atomicLoad(u64, &src.client_served_bytes, .monotonic),
-        .fetch_billed_sent_bytes = @atomicLoad(u64, &src.fetch_billed_sent_bytes, .monotonic),
-        .fetch_billed_received_bytes = @atomicLoad(u64, &src.fetch_billed_received_bytes, .monotonic),
-        .fetch_cost_bytes = @atomicLoad(u64, &src.fetch_cost_bytes, .monotonic),
-        .billing_sequence = @atomicLoad(u64, &src.billing_sequence, .monotonic),
+        .fetch_sent_bytes = @atomicLoad(u64, &src.fetch_sent_bytes, .monotonic),
+        .fetch_received_bytes = @atomicLoad(u64, &src.fetch_received_bytes, .monotonic),
+        .fetch_wire_bytes = @atomicLoad(u64, &src.fetch_wire_bytes, .monotonic),
         .request_slot = @atomicLoad(u32, &src.request_slot, .monotonic),
         .request_lane_id = @atomicLoad(u16, &src.request_lane_id, .monotonic),
         ._reserved1 = @atomicLoad(u16, &src._reserved1, .monotonic),
         .status = @atomicLoad(u32, &src.status, .monotonic),
-        .flags = @atomicLoad(u32, &src.flags, .monotonic),
+        ._reserved2 = @atomicLoad(u32, &src._reserved2, .monotonic),
     };
 }

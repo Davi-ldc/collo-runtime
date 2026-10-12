@@ -2,7 +2,7 @@
 //! refusing malformed ones, resolving and evaluating in-memory ES modules, `import()` of a
 //! registered module and the module-not-found rejection of any other, the specifiers it
 //! rejects, eviction by lifetime, the public `/var/task` spelling of route keys, and what
-//! `Vm.promiseAwaitSync` refuses. Packs loaded from sealed memfds in a worker, a handler's
+//! `Realm.promiseAwaitSync` refuses. Packs loaded from sealed memfds in a worker, a handler's
 //! `import()` and top-level await settlement are covered in `worker-test`
 //! (`worker/tests/runtime/modules.zig` and `boot_eval.zig`).
 
@@ -336,7 +336,7 @@ test "permanent modules survive evictable cache sweeps" {
     const pack = try module_pack.buildSingleAlloc(std.testing.allocator, "/permanent.js", "export default 'kept';");
     defer std.testing.allocator.free(pack);
 
-    try vm.registerModulePackWithOptions(pack, .{ .lifetime = @intFromEnum(support.bindings.ModuleLifetime.permanent) });
+    try vm.registerModulePackWithLifetime(pack, .permanent);
 
     const stats = try vm.evictModulesByLifetime(.evictable);
     try std.testing.expectEqual(@as(usize, 0), stats.sources_removed);
@@ -359,7 +359,7 @@ test "duplicate source registration can upgrade module lifetime" {
     defer std.testing.allocator.free(duplicate_pack);
 
     try vm.registerModulePack(pack);
-    try vm.registerModulePackWithOptions(duplicate_pack, .{ .lifetime = @intFromEnum(support.bindings.ModuleLifetime.permanent) });
+    try vm.registerModulePackWithLifetime(duplicate_pack, .permanent);
 
     const stats = try vm.evictModulesByLifetime(.evictable);
     try std.testing.expectEqual(@as(usize, 0), stats.sources_removed);
@@ -393,17 +393,6 @@ test "duplicate source registration can upgrade bytecode metadata" {
     var entry = try support.getExportOk(&vm, "/bytecode-upgrade.js", "default");
     defer entry.deinit();
     try support.expectValueString(&vm, &entry, "bytecode-upgrade");
-}
-
-test "module registration options reject unknown tags" {
-    var vm = try support.createVm();
-    defer vm.deinit();
-
-    const pack = try module_pack.buildSingleAlloc(std.testing.allocator, "/bad-options.js", "export default 1;");
-    defer std.testing.allocator.free(pack);
-
-    try std.testing.expectError(error.InvalidArgument, vm.registerModulePackWithOptions(pack, .{ .lifetime = 99 }));
-    try std.testing.expectError(error.InvalidArgument, vm.registerModulePackWithOptions(pack, .{ .module_type = 99 }));
 }
 
 test "module pack registration rejects corrupted record hash" {
@@ -599,7 +588,7 @@ test "promise await sync inside a turn returns invalid argument" {
     var promise = try support.invokeOk(&vm, &exec_ctx, &make_promise, &.{});
     defer promise.deinit();
 
-    try std.testing.expectError(error.InvalidArgument, vm.promiseAwaitSync(&promise));
+    try std.testing.expectError(error.InvalidArgument, vm.mainRealm().promiseAwaitSync(&promise));
 }
 
 test "promise await sync rejects pending external promises" {
@@ -616,7 +605,7 @@ test "promise await sync rejects pending external promises" {
     var pending = try support.getExportOk(&vm, "/pending-promise.js", "pending");
     defer pending.deinit();
 
-    var unsupported = switch (try vm.promiseAwaitSync(&pending)) {
+    var unsupported = switch (try vm.mainRealm().promiseAwaitSync(&pending)) {
         .unsupported => |value| value,
         .success => |value| {
             var owned_value = value;

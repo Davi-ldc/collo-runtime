@@ -1,16 +1,48 @@
 //! The fs index without a worker: lexical path normalization, namespace
-//! classification, listings from the index, the `collo_worker_fs_*` C ABI
-//! the binding calls, and the seal and parse checks of `initWorkerForTest`.
-//! The namespace setup `initWorker` does inside a worker's chroot, the
-//! binding's EROFS and ENOENT answers and faulted reads are covered by the
-//! zygote-integration lane (`runtime/tests/integration/zygote.zig`).
+//! classification, listings from the index, the route, listing and
+//! copy-path exports the binding calls through abi.h, and the seal and parse
+//! checks of `initWorkerForTest`. The namespace setup `initWorker` does
+//! inside a worker's chroot, the binding's EROFS and ENOENT answers and
+//! faulted reads are covered by the zygote-integration lane
+//! (`runtime/tests/integration/zygote.zig`).
 
 const std = @import("std");
+const bindings = @import("collo_bindings");
 const worker = @import("collo_worker");
 const fd_mod = @import("collo_os").fd;
 
 const fs = worker.fs;
 const fs_index = fs.fs_index;
+
+fn abiString(bytes: []const u8) bindings.RawString {
+    return .{ .ptr = bytes.ptr, .len = bytes.len };
+}
+
+/// Routes `path` through `collo_runtime_fs_route` and expects OK with the
+/// route class `expected`.
+fn expectRouteClass(
+    expected: bindings.FsRouteClass,
+    path: []const u8,
+    out_path: []u8,
+    route: *bindings.FsRoute,
+) !void {
+    try std.testing.expectEqual(
+        bindings.status_ok,
+        fs.collo_runtime_fs_route(abiString(path), out_path.ptr, out_path.len, route),
+    );
+    try std.testing.expectEqual(@intFromEnum(expected), route.route_class);
+}
+
+/// Lists one entry of `dir` through `collo_runtime_fs_readdir_next`.
+fn readdirNext(
+    dir: []const u8,
+    cursor: *u64,
+    name: []u8,
+    name_len: *u32,
+    is_dir: *u8,
+) bindings.RawStatus {
+    return fs.collo_runtime_fs_readdir_next(abiString(dir), cursor, name.ptr, name.len, name_len, is_dir);
+}
 
 // Canonical fixture: byte-ascending paths, one root file, one nested tree,
 // one deep chain proving immediate-children dedup.
@@ -146,43 +178,22 @@ test "deploy tmp/ entry is not shadowed by the /tmp scratch (FW1 finding 3 regre
     defer fs.uninstallForTest();
 
     var out_path: [fs.max_normalized_bytes]u8 = undefined;
-    var info: fs.RouteInfo = undefined;
+    var route: bindings.FsRoute = undefined;
 
     // The relative path is the file of the tree. The binding answers EROFS
     // to a mutation of any class other than tmp.
-    try std.testing.expectEqual(
-        fs.route_class_deploy_file,
-        fs.collo_worker_fs_route(
-            "./tmp/config.json",
-            "./tmp/config.json".len,
-            &out_path,
-            out_path.len,
-            &info,
-        ),
-    );
-    try std.testing.expectEqualStrings("/var/task/tmp/config.json", out_path[0..info.normalized_len]);
-    try std.testing.expectEqual(@as(u64, 9), info.size);
+    try expectRouteClass(.deploy_file, "./tmp/config.json", &out_path, &route);
+    try std.testing.expectEqualStrings("/var/task/tmp/config.json", out_path[0..route.normalized_len]);
+    try std.testing.expectEqual(@as(u64, 9), route.size);
 
     // The tree's `tmp` directory is a directory of the tree, not the scratch.
-    try std.testing.expectEqual(
-        fs.route_class_deploy_dir,
-        fs.collo_worker_fs_route("tmp", "tmp".len, &out_path, out_path.len, &info),
-    );
-    try std.testing.expectEqualStrings("/var/task/tmp", out_path[0..info.normalized_len]);
+    try expectRouteClass(.deploy_dir, "tmp", &out_path, &route);
+    try std.testing.expectEqualStrings("/var/task/tmp", out_path[0..route.normalized_len]);
 
     // The absolute path is scratch, whatever the index holds under the same
     // name.
-    try std.testing.expectEqual(
-        fs.route_class_tmp,
-        fs.collo_worker_fs_route(
-            "/tmp/config.json",
-            "/tmp/config.json".len,
-            &out_path,
-            out_path.len,
-            &info,
-        ),
-    );
-    try std.testing.expectEqualStrings("/tmp/config.json", out_path[0..info.normalized_len]);
+    try expectRouteClass(.tmp, "/tmp/config.json", &out_path, &route);
+    try std.testing.expectEqualStrings("/tmp/config.json", out_path[0..route.normalized_len]);
 }
 
 test "DirIter lists immediate children with dedup, in index order" {
@@ -215,98 +226,78 @@ test "DirIter lists immediate children with dedup, in index order" {
     try std.testing.expectEqual(@as(?fs.DirEntry, null), data_iter.next());
 }
 
-test "collo_worker_fs_route classifies and synthesizes deploy metadata" {
+test "collo_runtime_fs_route classifies and synthesizes deploy metadata" {
     const bytes = try buildFixtureIndexBytes(std.testing.allocator);
     defer std.testing.allocator.free(bytes);
     try fs.installForTest(bytes, fs.deploy_root);
     defer fs.uninstallForTest();
 
     var out_path: [fs.max_normalized_bytes]u8 = undefined;
-    var info: fs.RouteInfo = undefined;
+    var route: bindings.FsRoute = undefined;
 
     // A relative path of a file in the tree reports its size, with the
     // index's `mtime_ms`.
-    try std.testing.expectEqual(
-        fs.route_class_deploy_file,
-        fs.collo_worker_fs_route("data/config.json", "data/config.json".len, &out_path, out_path.len, &info),
-    );
-    try std.testing.expectEqual(@as(u64, 42), info.size);
-    try std.testing.expectEqual(fixture_mtime_ms, info.mtime_ms);
-    try std.testing.expectEqualStrings("/var/task/data/config.json", out_path[0..info.normalized_len]);
-    try std.testing.expectEqual(@as(u8, 0), out_path[info.normalized_len]);
+    try expectRouteClass(.deploy_file, "data/config.json", &out_path, &route);
+    try std.testing.expectEqual(@as(u64, 42), route.size);
+    try std.testing.expectEqual(fixture_mtime_ms, route.mtime_ms);
+    try std.testing.expectEqualStrings("/var/task/data/config.json", out_path[0..route.normalized_len]);
+    try std.testing.expectEqual(@as(u8, 0), out_path[route.normalized_len]);
 
     // A directory derived from the entries' prefixes.
-    try std.testing.expectEqual(
-        fs.route_class_deploy_dir,
-        fs.collo_worker_fs_route("data", "data".len, &out_path, out_path.len, &info),
-    );
-    try std.testing.expectEqual(fixture_mtime_ms, info.mtime_ms);
+    try expectRouteClass(.deploy_dir, "data", &out_path, &route);
+    try std.testing.expectEqual(fixture_mtime_ms, route.mtime_ms);
 
     // An absolute path under `deploy_root`.
-    try std.testing.expectEqual(
-        fs.route_class_deploy_file,
-        fs.collo_worker_fs_route(
-            "/var/task/index.js",
-            "/var/task/index.js".len,
-            &out_path,
-            out_path.len,
-            &info,
-        ),
-    );
-    try std.testing.expectEqual(@as(u64, 100), info.size);
+    try expectRouteClass(.deploy_file, "/var/task/index.js", &out_path, &route);
+    try std.testing.expectEqual(@as(u64, 100), route.size);
 
     // /tmp passthrough with a normalized escape attempt folded inside it.
-    try std.testing.expectEqual(
-        fs.route_class_tmp,
-        fs.collo_worker_fs_route("/tmp/a/../b", "/tmp/a/../b".len, &out_path, out_path.len, &info),
-    );
-    try std.testing.expectEqualStrings("/tmp/b", out_path[0..info.normalized_len]);
+    try expectRouteClass(.tmp, "/tmp/a/../b", &out_path, &route);
+    try std.testing.expectEqualStrings("/tmp/b", out_path[0..route.normalized_len]);
 
     // Climbing above the root stops at "/", and the result lies outside
     // every namespace.
-    try std.testing.expectEqual(
-        fs.route_class_none,
-        fs.collo_worker_fs_route("../../../etc/passwd", "../../../etc/passwd".len, &out_path, out_path.len, &info),
-    );
-    try std.testing.expectEqualStrings("/etc/passwd", out_path[0..info.normalized_len]);
+    try expectRouteClass(.none, "../../../etc/passwd", &out_path, &route);
+    try std.testing.expectEqualStrings("/etc/passwd", out_path[0..route.normalized_len]);
 
     // The cwd ancestor chain stats as virtual read-only dirs.
-    try std.testing.expectEqual(
-        fs.route_class_deploy_dir,
-        fs.collo_worker_fs_route("..", "..".len, &out_path, out_path.len, &info),
-    );
-    try std.testing.expectEqualStrings("/var", out_path[0..info.normalized_len]);
-    try std.testing.expectEqual(
-        fs.route_class_deploy_dir,
-        fs.collo_worker_fs_route("/", "/".len, &out_path, out_path.len, &info),
-    );
+    try expectRouteClass(.deploy_dir, "..", &out_path, &route);
+    try std.testing.expectEqualStrings("/var", out_path[0..route.normalized_len]);
+    try expectRouteClass(.deploy_dir, "/", &out_path, &route);
 
     // A path of `max_normalized_bytes` bytes is too long.
     const long_input = "x" ** fs.max_normalized_bytes;
     try std.testing.expectEqual(
-        fs.route_error_too_long,
-        fs.collo_worker_fs_route(long_input, long_input.len, &out_path, out_path.len, &info),
+        bindings.status_invalid_argument,
+        fs.collo_runtime_fs_route(abiString(long_input), &out_path, out_path.len, &route),
     );
 }
 
-test "collo_worker_fs_route fails internal without an installed index" {
+test "collo_runtime_fs_route fails and clears its route without an installed index" {
     var out_path: [fs.max_normalized_bytes]u8 = undefined;
-    var info: fs.RouteInfo = undefined;
+    // A stale route from an earlier call, which the failing call clears.
+    var route: bindings.FsRoute = .{
+        .size = 1,
+        .mtime_ms = 1,
+        .normalized_len = 1,
+        .route_class = @intFromEnum(bindings.FsRouteClass.tmp),
+    };
     try std.testing.expect(!fs.isInitialized());
     try std.testing.expectEqual(
-        fs.route_error_internal,
-        fs.collo_worker_fs_route("x", 1, &out_path, out_path.len, &info),
+        bindings.status_error,
+        fs.collo_runtime_fs_route(abiString("x"), &out_path, out_path.len, &route),
     );
+    try std.testing.expectEqual(bindings.FsRoute{}, route);
 }
 
-test "collo_worker_fs_readdir_next walks a deploy dir statelessly" {
+test "collo_runtime_fs_readdir_next walks a deploy dir statelessly" {
     const bytes = try buildFixtureIndexBytes(std.testing.allocator);
     defer std.testing.allocator.free(bytes);
     try fs.installForTest(bytes, fs.deploy_root);
     defer fs.uninstallForTest();
 
-    var cursor: u64 = fs.readdir_cursor_start;
-    var name: [fs_index.path_bytes_max + 1]u8 = undefined;
+    var cursor: u64 = bindings.fs_readdir_cursor_start;
+    var name: [bindings.fs_name_bytes_max]u8 = undefined;
     var name_len: u32 = 0;
     var is_dir: u8 = 0;
 
@@ -319,19 +310,19 @@ test "collo_worker_fs_readdir_next walks a deploy dir statelessly" {
     const data_dir = "/var/task/data";
     for (expected) |entry| {
         try std.testing.expectEqual(
-            @as(i32, 1),
-            fs.collo_worker_fs_readdir_next(data_dir, data_dir.len, &cursor, &name, name.len, &name_len, &is_dir),
+            bindings.status_ok,
+            readdirNext(data_dir, &cursor, &name, &name_len, &is_dir),
         );
         try std.testing.expectEqualStrings(entry.name, name[0..name_len]);
         try std.testing.expectEqual(@intFromBool(entry.is_dir), is_dir);
     }
     try std.testing.expectEqual(
-        @as(i32, 0),
-        fs.collo_worker_fs_readdir_next(data_dir, data_dir.len, &cursor, &name, name.len, &name_len, &is_dir),
+        bindings.status_not_found,
+        readdirNext(data_dir, &cursor, &name, &name_len, &is_dir),
     );
 
     // `deploy_root` lists the top level of the index.
-    cursor = fs.readdir_cursor_start;
+    cursor = bindings.fs_readdir_cursor_start;
     const anchor = fs.deploy_root;
     const anchor_expected = [_]Expected{
         .{ .name = "assets", .is_dir = true },
@@ -340,53 +331,95 @@ test "collo_worker_fs_readdir_next walks a deploy dir statelessly" {
     };
     for (anchor_expected) |entry| {
         try std.testing.expectEqual(
-            @as(i32, 1),
-            fs.collo_worker_fs_readdir_next(anchor, anchor.len, &cursor, &name, name.len, &name_len, &is_dir),
+            bindings.status_ok,
+            readdirNext(anchor, &cursor, &name, &name_len, &is_dir),
         );
         try std.testing.expectEqualStrings(entry.name, name[0..name_len]);
         try std.testing.expectEqual(@intFromBool(entry.is_dir), is_dir);
     }
     try std.testing.expectEqual(
-        @as(i32, 0),
-        fs.collo_worker_fs_readdir_next(anchor, anchor.len, &cursor, &name, name.len, &name_len, &is_dir),
+        bindings.status_not_found,
+        readdirNext(anchor, &cursor, &name, &name_len, &is_dir),
     );
 
     // "/" is a virtual directory listing the namespace roots, not the index,
     // and "/var" lists only "task".
-    cursor = fs.readdir_cursor_start;
+    cursor = bindings.fs_readdir_cursor_start;
     const root_expected = [_][]const u8{ "tmp", "var" };
     for (root_expected) |entry_name| {
         try std.testing.expectEqual(
-            @as(i32, 1),
-            fs.collo_worker_fs_readdir_next("/", "/".len, &cursor, &name, name.len, &name_len, &is_dir),
+            bindings.status_ok,
+            readdirNext("/", &cursor, &name, &name_len, &is_dir),
         );
         try std.testing.expectEqualStrings(entry_name, name[0..name_len]);
         try std.testing.expectEqual(@as(u8, 1), is_dir);
     }
     try std.testing.expectEqual(
-        @as(i32, 0),
-        fs.collo_worker_fs_readdir_next("/", "/".len, &cursor, &name, name.len, &name_len, &is_dir),
+        bindings.status_not_found,
+        readdirNext("/", &cursor, &name, &name_len, &is_dir),
     );
 
-    cursor = fs.readdir_cursor_start;
+    cursor = bindings.fs_readdir_cursor_start;
     try std.testing.expectEqual(
-        @as(i32, 1),
-        fs.collo_worker_fs_readdir_next("/var", "/var".len, &cursor, &name, name.len, &name_len, &is_dir),
+        bindings.status_ok,
+        readdirNext("/var", &cursor, &name, &name_len, &is_dir),
     );
     try std.testing.expectEqualStrings("task", name[0..name_len]);
     try std.testing.expectEqual(@as(u8, 1), is_dir);
     try std.testing.expectEqual(
-        @as(i32, 0),
-        fs.collo_worker_fs_readdir_next("/var", "/var".len, &cursor, &name, name.len, &name_len, &is_dir),
+        bindings.status_not_found,
+        readdirNext("/var", &cursor, &name, &name_len, &is_dir),
     );
 
-    // A directory outside every namespace never classifies as deploy_dir,
-    // so the iterator treats it as a misuse of the ABI.
-    cursor = fs.readdir_cursor_start;
+    // Neither a directory outside every namespace nor a file of the tree
+    // classifies as deploy_dir, so listing either is a misuse of the ABI.
+    cursor = bindings.fs_readdir_cursor_start;
     try std.testing.expectEqual(
-        fs.route_error_internal,
-        fs.collo_worker_fs_readdir_next("/data", "/data".len, &cursor, &name, name.len, &name_len, &is_dir),
+        bindings.status_error,
+        readdirNext("/data", &cursor, &name, &name_len, &is_dir),
     );
+    cursor = bindings.fs_readdir_cursor_start;
+    try std.testing.expectEqual(
+        bindings.status_error,
+        readdirNext("/var/task/index.js", &cursor, &name, &name_len, &is_dir),
+    );
+}
+
+test "collo_runtime_fs_materialized_path joins the materialize root with the index key" {
+    const bytes = try buildFixtureIndexBytes(std.testing.allocator);
+    defer std.testing.allocator.free(bytes);
+    try fs.installForTest(bytes, fs.deploy_root);
+    defer fs.uninstallForTest();
+
+    var out_path: [fs.max_normalized_bytes]u8 = undefined;
+    var out_len: usize = 0;
+
+    // `installForTest` copies under `deploy_root`, as a worker does, so the
+    // copy's path is the normalized path itself.
+    const config = "/var/task/data/config.json";
+    try std.testing.expectEqual(
+        bindings.status_ok,
+        fs.collo_runtime_fs_materialized_path(abiString(config), &out_path, out_path.len, &out_len),
+    );
+    try std.testing.expectEqualStrings(config, out_path[0..out_len]);
+    try std.testing.expectEqual(@as(u8, 0), out_path[out_len]);
+
+    // The root of the tree and paths outside it have no copy, and a buffer
+    // without room for the NUL fails with the length cleared.
+    try std.testing.expectEqual(
+        bindings.status_error,
+        fs.collo_runtime_fs_materialized_path(abiString(fs.deploy_root), &out_path, out_path.len, &out_len),
+    );
+    try std.testing.expectEqual(
+        bindings.status_error,
+        fs.collo_runtime_fs_materialized_path(abiString("/tmp/x"), &out_path, out_path.len, &out_len),
+    );
+    out_len = config.len;
+    try std.testing.expectEqual(
+        bindings.status_error,
+        fs.collo_runtime_fs_materialized_path(abiString(config), &out_path, config.len, &out_len),
+    );
+    try std.testing.expectEqual(@as(usize, 0), out_len);
 }
 
 test "placeholder index: anchor exists, everything else is none, tmp still routes" {
@@ -394,39 +427,30 @@ test "placeholder index: anchor exists, everything else is none, tmp still route
     defer fs.uninstallForTest();
 
     var out_path: [fs.max_normalized_bytes]u8 = undefined;
-    var info: fs.RouteInfo = undefined;
+    var route: bindings.FsRoute = undefined;
 
     // process.cwd(), which is `deploy_root`, must stat even with an empty
     // index.
-    try std.testing.expectEqual(
-        fs.route_class_deploy_dir,
-        fs.collo_worker_fs_route(".", ".".len, &out_path, out_path.len, &info),
-    );
-    try std.testing.expectEqualStrings("/var/task", out_path[0..info.normalized_len]);
-    try std.testing.expectEqual(
-        fs.route_class_none,
-        fs.collo_worker_fs_route("anything.txt", "anything.txt".len, &out_path, out_path.len, &info),
-    );
-    try std.testing.expectEqual(
-        fs.route_class_tmp,
-        fs.collo_worker_fs_route("/tmp/scratch", "/tmp/scratch".len, &out_path, out_path.len, &info),
-    );
+    try expectRouteClass(.deploy_dir, ".", &out_path, &route);
+    try std.testing.expectEqualStrings("/var/task", out_path[0..route.normalized_len]);
+    try expectRouteClass(.none, "anything.txt", &out_path, &route);
+    try expectRouteClass(.tmp, "/tmp/scratch", &out_path, &route);
 
     // Listing `deploy_root` of an empty index ends at once.
-    var cursor: u64 = fs.readdir_cursor_start;
-    var name: [fs_index.path_bytes_max + 1]u8 = undefined;
+    var cursor: u64 = bindings.fs_readdir_cursor_start;
+    var name: [bindings.fs_name_bytes_max]u8 = undefined;
     var name_len: u32 = 0;
     var is_dir: u8 = 0;
     try std.testing.expectEqual(
-        @as(i32, 0),
-        fs.collo_worker_fs_readdir_next(fs.deploy_root, fs.deploy_root.len, &cursor, &name, name.len, &name_len, &is_dir),
+        bindings.status_not_found,
+        readdirNext(fs.deploy_root, &cursor, &name, &name_len, &is_dir),
     );
 
     // The virtual root still lists the namespace roots.
-    cursor = fs.readdir_cursor_start;
+    cursor = bindings.fs_readdir_cursor_start;
     try std.testing.expectEqual(
-        @as(i32, 1),
-        fs.collo_worker_fs_readdir_next("/", "/".len, &cursor, &name, name.len, &name_len, &is_dir),
+        bindings.status_ok,
+        readdirNext("/", &cursor, &name, &name_len, &is_dir),
     );
     try std.testing.expectEqualStrings("tmp", name[0..name_len]);
 }
@@ -472,11 +496,8 @@ test "initWorker maps a sealed valid index and fails closed on garbage" {
     try std.testing.expectEqual(@as(?u64, fixture_mtime_ms), fs.mtimeMs());
 
     var out_path: [fs.max_normalized_bytes]u8 = undefined;
-    var info: fs.RouteInfo = undefined;
-    try std.testing.expectEqual(
-        fs.route_class_deploy_file,
-        fs.collo_worker_fs_route("index.js", "index.js".len, &out_path, out_path.len, &info),
-    );
-    try std.testing.expectEqualStrings("/var/task/index.js", out_path[0..info.normalized_len]);
-    try std.testing.expectEqual(@as(u64, 100), info.size);
+    var route: bindings.FsRoute = undefined;
+    try expectRouteClass(.deploy_file, "index.js", &out_path, &route);
+    try std.testing.expectEqualStrings("/var/task/index.js", out_path[0..route.normalized_len]);
+    try std.testing.expectEqual(@as(u64, 100), route.size);
 }

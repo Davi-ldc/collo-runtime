@@ -60,15 +60,20 @@ pub fn cgroupRoot(allocator: std.mem.Allocator) !host.WorkerCgroupRoot {
 pub const LaunchedWorker = struct {
     allocator: std.mem.Allocator,
     root: host.WorkerCgroupRoot,
-    /// The wake set of a worker the caller launched without egress, which
-    /// booted detached; empty when the caller brought the worker's egress
-    /// and keeps its own wake set.
+    /// The wake set a worker launched with a null `egress` booted detached
+    /// on; empty when the caller chose the worker's egress (`none`,
+    /// `detached` or `attached`) and keeps any wake set it needs.
     wake_set: ipc.egress_shared.WakeSet,
+    /// The mount point of a worker launched without one, held until
+    /// `deinit`, which removes it after stopping the worker; null when the
+    /// caller brought its own, as a test of workers sharing one does.
+    tmp_mount_point: ?host.TmpMountPoint,
     handle: host.WorkerHandle,
     handle_alive: bool = true,
 
     /// Tears the worker down ahead of `deinit`, for tests that observe the
-    /// teardown (tmp root gone, leaf removed) while the root still exists.
+    /// teardown (leaf removed, mount point left empty) while the root still
+    /// exists.
     pub fn stopWorker(self: *LaunchedWorker) void {
         if (!self.handle_alive)
             return;
@@ -78,17 +83,21 @@ pub const LaunchedWorker = struct {
 
     pub fn deinit(self: *LaunchedWorker) void {
         self.stopWorker();
+        if (self.tmp_mount_point) |*tmp_mount_point|
+            tmp_mount_point.deinit();
         self.wake_set.deinit();
         self.root.deinit(self.allocator);
         self.* = undefined;
     }
 };
 
-/// `host.LaunchOptions` with `egress` optional: null launches the worker
-/// detached on a wake set the launched worker keeps
-/// (`LaunchedWorker.wake_set`), so a test that makes no fetch states nothing
-/// about egress. Every other field is the host's, default included, since the
-/// type is built from the host's.
+/// `host.LaunchOptions` with `egress` and `tmp_mount_point_fd` optional. A
+/// null `egress` launches the worker detached on a wake set the launched
+/// worker keeps (`LaunchedWorker.wake_set`), so a test that makes no fetch
+/// states nothing about egress; a null `tmp_mount_point_fd` gives the worker
+/// a mount point of its own (`LaunchedWorker.tmp_mount_point`), as a host
+/// with one worker has. Every other field is the host's, default included,
+/// since the type is built from the host's.
 pub const LaunchOptions = blk: {
     const info = @typeInfo(host.LaunchOptions).@"struct";
     var fields = info.fields[0..info.fields.len].*;
@@ -98,6 +107,11 @@ pub const LaunchOptions = blk: {
             field.type = ?host.launch.LaunchEgress;
             field.default_value_ptr = &no_egress;
             field.alignment = @alignOf(?host.launch.LaunchEgress);
+        } else if (std.mem.eql(u8, field.name, "tmp_mount_point_fd")) {
+            const no_mount_point: ?std.posix.fd_t = null;
+            field.type = ?std.posix.fd_t;
+            field.default_value_ptr = &no_mount_point;
+            field.alignment = @alignOf(?std.posix.fd_t);
         }
     }
     break :blk @Type(.{ .@"struct" = .{
@@ -108,12 +122,19 @@ pub const LaunchOptions = blk: {
     } });
 };
 
-/// The host's options for `options` with `egress` as the launch's egress.
-fn hostLaunchOptions(options: LaunchOptions, egress: host.launch.LaunchEgress) host.LaunchOptions {
+/// The host's options for `options`, with `egress` as the launch's egress
+/// and `tmp_mount_point_fd` as its mount point.
+fn hostLaunchOptions(
+    options: LaunchOptions,
+    egress: host.launch.LaunchEgress,
+    tmp_mount_point_fd: std.posix.fd_t,
+) host.LaunchOptions {
     var launch_options: host.LaunchOptions = undefined;
     inline for (@typeInfo(host.LaunchOptions).@"struct".fields) |field| {
         if (comptime std.mem.eql(u8, field.name, "egress")) {
             launch_options.egress = egress;
+        } else if (comptime std.mem.eql(u8, field.name, "tmp_mount_point_fd")) {
+            launch_options.tmp_mount_point_fd = tmp_mount_point_fd;
         } else {
             @field(launch_options, field.name) = @field(options, field.name);
         }
@@ -121,12 +142,32 @@ fn hostLaunchOptions(options: LaunchOptions, egress: host.launch.LaunchEgress) h
     return launch_options;
 }
 
+/// Fails unless the directory `dir_fd` names holds no entry, as a host's
+/// mount point does whatever its workers mounted over it in their own mount
+/// namespaces.
+pub fn expectDirEmpty(dir_fd: std.posix.fd_t) !void {
+    const reopened = try std.posix.openat(dir_fd, ".", .{
+        .ACCMODE = .RDONLY,
+        .DIRECTORY = true,
+        .CLOEXEC = true,
+    }, 0);
+    var dir: std.fs.Dir = .{ .fd = reopened };
+    defer dir.close();
+    var entries = dir.iterate();
+    if (try entries.next()) |entry| {
+        std.debug.print("expected an empty directory, found {s}\n", .{entry.name});
+        return error.DirectoryNotEmpty;
+    }
+}
+
 /// Creates the leaf `worker-<fork_job_id>` with `memory_limit_bytes`, forks
 /// into it and runs the launch to ready; the caller owns the result. When
 /// `options` brings no egress, the worker boots detached on a wake set the
-/// result owns. On any failure the forked child is terminated and every
-/// resource released; `error.WorkerCgroupDelegationUnavailable` means this
-/// environment cannot place workers at all.
+/// result owns, and when it brings no mount point, the worker mounts its
+/// tmpfs over one the result owns. On any failure the forked child is
+/// terminated and every resource released;
+/// `error.WorkerCgroupDelegationUnavailable` means this environment cannot
+/// place workers at all.
 pub fn launchWorker(
     allocator: std.mem.Allocator,
     spawned: *zygote.host_client.SpawnedZygote,
@@ -143,7 +184,15 @@ pub fn launchWorker(
         wake_set = try ipc.egress_shared.WakeSet.create();
         break :blk .{ .detached = &wake_set };
     };
-    const launch_options = hostLaunchOptions(options, egress);
+    var tmp_mount_point: ?host.TmpMountPoint = null;
+    errdefer if (tmp_mount_point) |*owned| owned.deinit();
+    if (options.tmp_mount_point_fd == null) {
+        var claimed: host.TmpMountPoint = undefined;
+        try claimed.init(host.tmp_mount.default_parent_dir);
+        tmp_mount_point = claimed;
+    }
+    const tmp_mount_point_fd = options.tmp_mount_point_fd orelse tmp_mount_point.?.fd();
+    const launch_options = hostLaunchOptions(options, egress, tmp_mount_point_fd);
 
     const prepared_fd = try root.createWorkerDir(fork_job_id, .{
         .memory_limit_bytes = memory_limit_bytes,
@@ -168,6 +217,7 @@ pub fn launchWorker(
         .allocator = allocator,
         .root = root,
         .wake_set = wake_set,
+        .tmp_mount_point = tmp_mount_point,
         .handle = handle,
     };
 }

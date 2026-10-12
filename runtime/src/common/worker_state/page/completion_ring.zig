@@ -31,9 +31,11 @@ const completion_ring_slack: usize = 8;
 /// the worker publishes as a completion's status; the drain refuses a larger
 /// one. This module does not import the IPC module, so
 /// `runtime/tests/contracts/limits.zig` asserts that the two agree.
-pub const worker_completion_status_max: u32 = 6;
+pub const worker_completion_status_max: u32 = 9;
 
 /// One finished request as the worker publishes it and the host drains it.
+/// It holds what the lane needs to end the request; what the request used
+/// rides the usage record ring alone (`usage_records.zig`).
 pub const WorkerCompletionRecord = extern struct {
     /// One more than the record's ring position.
     sequence: u64,
@@ -46,20 +48,6 @@ pub const WorkerCompletionRecord = extern struct {
     http_status: u16,
     status: u32,
     _reserved0: u32 = 0,
-    /// The request's timeline, sealed by the worker when the request
-    /// finishes. It rides this ring as well as the usage ring because the
-    /// host writes the access record where it reads completions, on the side
-    /// that knows the route. Zero on a completion that measured nothing.
-    ///
-    /// `cpu_time_ns` here is the turn clock (`CompletedRecord.turn_cpu_ns`),
-    /// not the process delta that shares its name on the usage record. The
-    /// process delta folds a worker's module evaluation into its first record
-    /// and charges a co-scheduled request's work so far to whichever request
-    /// finishes first, which is right for a worker's total and wrong for one
-    /// request.
-    cpu_time_ns: u64 = 0,
-    io_time_ns: u64 = 0,
-    waiting_ns: u64 = 0,
 };
 
 /// What the worker passes to `WorkerWriterView.publishWorkerCompletion`.
@@ -72,24 +60,21 @@ pub const WorkerCompletionPublish = struct {
     worker_generation: u64,
     status: u32,
     http_status: u16,
-    cpu_time_ns: u64 = 0,
-    io_time_ns: u64 = 0,
-    waiting_ns: u64 = 0,
 };
 
 /// The completion ring's cursors: the worker moves `head` past each record
 /// it publishes, and `tail` is the copy of the host's tail that the host
 /// stores after each drain and never reads back. The worker sets `fatal` when
-/// the ring overflows, counting the overflow, and the host sets it when a
-/// drain finds a bad record; a fatal ring fails every later drain with
-/// `error.WorkerCompletionRingFatal`.
+/// the ring overflows, and the host sets it when a drain finds a bad record;
+/// a fatal ring fails every later drain with
+/// `error.WorkerCompletionRingFatal`. `_reserved1` pads the header to 64
+/// bytes.
 pub const WorkerCompletionRingHeader = extern struct {
     head: u64,
     tail: u64,
-    overflow_count: u64,
     fatal: u32,
     _reserved0: u32,
-    _reserved1: [4]u64,
+    _reserved1: [5]u64,
 };
 
 /// How a drain fails. The lane counts each as a worker fault
@@ -162,9 +147,6 @@ pub fn recordForPublish(head: u64, completion: WorkerCompletionPublish) error{
         .request_lane_id = completion.request_lane_id,
         .http_status = completion.http_status,
         .status = completion.status,
-        .cpu_time_ns = completion.cpu_time_ns,
-        .io_time_ns = completion.io_time_ns,
-        .waiting_ns = completion.waiting_ns,
     };
     try validateWorkerCompletionRecord(&record);
     return record;
@@ -197,9 +179,6 @@ fn loadWorkerCompletionRecord(src: *const WorkerCompletionRecord) WorkerCompleti
         .http_status = @atomicLoad(u16, &src.http_status, .monotonic),
         .status = @atomicLoad(u32, &src.status, .monotonic),
         ._reserved0 = @atomicLoad(u32, &src._reserved0, .monotonic),
-        .cpu_time_ns = @atomicLoad(u64, &src.cpu_time_ns, .monotonic),
-        .io_time_ns = @atomicLoad(u64, &src.io_time_ns, .monotonic),
-        .waiting_ns = @atomicLoad(u64, &src.waiting_ns, .monotonic),
     };
 }
 
@@ -213,28 +192,23 @@ fn validateWorkerCompletionRecord(record: *const WorkerCompletionRecord) error{
         return error.InvalidWorkerCompletionStatus;
     if (record._reserved0 != 0)
         return error.InvalidWorkerCompletionRecord;
-    // The timeline fields are not validated: only the worker can measure
-    // them, and the usage ring carries the same worker-written numbers. A
-    // forged value distorts that worker's own records and breaks no
-    // structural invariant. The access record's wall duration comes from the
-    // lane's clock. Its status is `http_status`, which the lane replaces with
-    // a 502 only when the worker completed without a response head on a
+    // The access record's status is `http_status`, which the lane replaces
+    // with a 502 only when the worker completed without a response head on a
     // stream still open and not reset (`completionLeftNoAnswer` in
-    // `server/ingress/runner/request_finish.zig`).
+    // `server/ingress/runner/request_finish.zig`), and its wall duration
+    // comes from the lane's clock.
 }
 
 comptime {
-    if (@sizeOf(WorkerCompletionRecord) != 80)
+    if (@sizeOf(WorkerCompletionRecord) != 56)
         @compileError("worker_state.page.WorkerCompletionRecord size mismatch");
     if (@offsetOf(WorkerCompletionRecord, "request_slot") != 40)
         @compileError("worker_state.page.WorkerCompletionRecord request_slot offset mismatch");
     if (@offsetOf(WorkerCompletionRecord, "status") != 48)
         @compileError("worker_state.page.WorkerCompletionRecord status offset mismatch");
-    if (@offsetOf(WorkerCompletionRecord, "cpu_time_ns") != 56)
-        @compileError("worker_state.page.WorkerCompletionRecord cpu_time_ns offset mismatch");
     if (@sizeOf(WorkerCompletionRingHeader) != 64)
         @compileError("worker_state.page.WorkerCompletionRingHeader size mismatch");
-    if (COMPLETION_RING_COUNT != 16)
+    if (COMPLETION_RING_COUNT != 64)
         @compileError("worker_state.page completion ring count mismatch");
     if (!std.math.isPowerOfTwo(COMPLETION_RING_COUNT))
         @compileError("worker_state.page completion ring count must be a power of two");

@@ -1,145 +1,163 @@
-//! Egress target policy: parses a fetch URL into a request target and checks
-//! resolved addresses, so a fetch reaches only public addresses, plus private
-//! ranges when the configuration allows them. Plain http URLs are refused
-//! unless `allow_plain_http` is set.
+//! Egress target policy: a hop's URL becomes a request target only when the
+//! fetch's network policy admits the hop's scheme, host and effective port
+//! (`collo_network.admit`), and the addresses DNS returns for that host are
+//! then checked against the admission (`collo_network.admitAddress`). Every
+//! hop of every fetch, redirects included, passes through `parseTarget`
+//! (`request/plan.zig:prepareRequest`), and every connector resolves through
+//! `resolveRequestTargetUntil`, so the rule a configuration error states is
+//! the rule each hop meets.
 //!
-//! The address check runs on what DNS returned, not on the host name, and a
-//! resolution with any denied address is refused whole, so a name that mixes
-//! public and internal addresses cannot reach the internal one. Before
-//! resolution, `localhost` names, hosts holding a space, a control or
+//! Before the policy sees a host, hosts holding a space, a control or
 //! non-ASCII byte or any of `%`, `/`, `\`, `@`, and numeric hosts other than
-//! canonical dotted-quad IPv4 are refused.
+//! canonical dotted-quad IPv4 are refused as invalid URLs. The address check
+//! runs on what DNS returned, not on the host name, and a resolution with any
+//! denied address is refused whole, so a name that mixes public and internal
+//! addresses cannot reach the internal one.
+//!
+//! A refusal by the policy is one of the `DenialError`s, one per
+//! `collo_network.Denial`, so the gateway can tell the worker why
+//! (`denialOf`) without a gateway log line: a denial is the tenant's event.
 
 const std = @import("std");
 
 const config_mod = @import("../config.zig");
 const dns_cache = @import("collo_egress_dns_cache");
+const network = @import("collo_network");
 
 pub const DnsCache = dns_cache.Cache;
 pub const DnsCacheConfig = dns_cache.Config;
 const Protocol = config_mod.Protocol;
 
-pub const EgressPolicy = struct {
-    allow_plain_http: bool = false,
-    allow_private_networks: bool = false,
-
-    pub fn validateUrl(self: EgressPolicy, url: []const u8) !void {
-        _ = try self.parseTarget(url);
-    }
-
-    pub fn validateResolvedAddress(self: EgressPolicy, address: std.net.Address) !void {
-        const classification = classifyEgressAddress(address);
-        if (self.permitsAddressClass(classification))
-            return;
-        return error.EgressDenied;
-    }
-
-    pub fn parseTarget(self: EgressPolicy, url: []const u8) !RequestTarget {
-        try validateProtocol(url, self.allow_plain_http);
-
-        const uri = try std.Uri.parse(url);
-        const host_component = uri.host orelse return error.InvalidFetchUrl;
-        const authority_host = host_component.percent_encoded;
-        if (authority_host.len == 0)
-            return error.InvalidFetchUrl;
-        const lookup_host = uriHostForLookup(authority_host) orelse return error.InvalidFetchUrl;
-        const security_host = normalizeHostForEgressPolicy(lookup_host) orelse return error.InvalidFetchUrl;
-        if (std.ascii.eqlIgnoreCase(security_host, "localhost") or
-            std.ascii.endsWithIgnoreCase(security_host, ".localhost"))
-        {
-            return error.EgressDenied;
-        }
-
-        const protocol = Protocol.fromScheme(uri.scheme) orelse return error.UnsupportedFetchProtocol;
-        return .{
-            .uri = uri,
-            .authority_host = authority_host,
-            .tls_server_name = security_host,
-            .port = uri.port orelse defaultPort(protocol),
-            .protocol = protocol,
-        };
-    }
-
-    pub fn resolveRequestTarget(
-        self: EgressPolicy,
-        allocator: std.mem.Allocator,
-        cache: *DnsCache,
-        target: RequestTarget,
-    ) !ResolvedTarget {
-        return self.resolveRequestTargetUntil(allocator, cache, target, 0);
-    }
-
-    pub fn resolveRequestTargetUntil(
-        self: EgressPolicy,
-        allocator: std.mem.Allocator,
-        cache: *DnsCache,
-        target: RequestTarget,
-        request_deadline_mono_ns: u64,
-    ) !ResolvedTarget {
-        const addresses = try cache.resolveUntil(
-            allocator,
-            target.tls_server_name,
-            target.port,
-            request_deadline_mono_ns,
-        );
-        errdefer allocator.free(addresses);
-        return try self.resolvedTargetFromAddresses(allocator, target, addresses);
-    }
-
-    fn resolvedTargetFromAddresses(self: EgressPolicy, allocator: std.mem.Allocator, target: RequestTarget, addresses: []std.net.Address) !ResolvedTarget {
-        const selected_address = try self.selectResolvedAddress(addresses);
-
-        return .{
-            .uri = target.uri,
-            .authority_host = target.authority_host,
-            .tls_server_name = target.tls_server_name,
-            .connect_host = try addressHostAlloc(allocator, selected_address),
-            .connect_addresses = addresses,
-            .port = target.port,
-            .protocol = target.protocol,
-        };
-    }
-
-    pub fn selectResolvedAddress(self: EgressPolicy, addresses: []const std.net.Address) !std.net.Address {
-        if (addresses.len == 0)
-            return error.HostLacksNetworkAddresses;
-
-        var selected: ?std.net.Address = null;
-        for (addresses) |address| {
-            if (!self.permitsAddressClass(classifyEgressAddress(address)))
-                return error.EgressDenied;
-            if (selected == null)
-                selected = address;
-        }
-        return selected.?;
-    }
-
-    fn permitsAddressClass(self: EgressPolicy, classification: AddressClass) bool {
-        return switch (classification) {
-            .public => true,
-            .private_routable => self.allow_private_networks,
-            .loopback,
-            .unspecified,
-            .link_local,
-            .metadata,
-            .shared_carrier,
-            .benchmark,
-            .documentation,
-            .multicast,
-            .broadcast,
-            .reserved,
-            .unknown,
-            => false,
-        };
-    }
+/// The errors a hop the network policy refuses fails with, one per
+/// `network.Denial` (`denialError`, `denialOf`).
+pub const DenialError = error{
+    EgressNotGranted,
+    EgressHostDenied,
+    EgressPortDenied,
+    EgressSchemeDenied,
+    EgressPrivateAddressDenied,
+    EgressReservedAddressDenied,
 };
+
+pub fn denialError(denial: network.Denial) DenialError {
+    return switch (denial) {
+        .no_grant => error.EgressNotGranted,
+        .host_not_allowed => error.EgressHostDenied,
+        .port_not_allowed => error.EgressPortDenied,
+        .http_not_allowed => error.EgressSchemeDenied,
+        .private_address => error.EgressPrivateAddressDenied,
+        .reserved_address => error.EgressReservedAddressDenied,
+    };
+}
+
+/// The denial `err` reports, or null for an error that is no denial.
+pub fn denialOf(err: anyerror) ?network.Denial {
+    return switch (err) {
+        error.EgressNotGranted => .no_grant,
+        error.EgressHostDenied => .host_not_allowed,
+        error.EgressPortDenied => .port_not_allowed,
+        error.EgressSchemeDenied => .http_not_allowed,
+        error.EgressPrivateAddressDenied => .private_address,
+        error.EgressReservedAddressDenied => .reserved_address,
+        else => null,
+    };
+}
+
+comptime {
+    // Every denial has its own error, and the error maps back to it.
+    for (std.enums.values(network.Denial)) |denial|
+        std.debug.assert(denialOf(denialError(denial)).? == denial);
+}
+
+/// Parses `url` into the target of one hop and decides it under `policy`
+/// before any DNS query. Fails with `error.UnsupportedFetchProtocol` for a
+/// scheme other than `http` and `https`, `error.InvalidFetchUrl` for a URL
+/// or host the transport refuses on its own, and a `DenialError` when the
+/// policy refuses the hop; a host no allow entry could name is
+/// `error.EgressHostDenied`.
+pub fn parseTarget(policy: network.Policy, url: []const u8) !RequestTarget {
+    const uri = try std.Uri.parse(url);
+    const protocol = Protocol.fromScheme(uri.scheme) orelse return error.UnsupportedFetchProtocol;
+    const host_component = uri.host orelse return error.InvalidFetchUrl;
+    const authority_host = host_component.percent_encoded;
+    if (authority_host.len == 0)
+        return error.InvalidFetchUrl;
+    const lookup_host = uriHostForLookup(authority_host) orelse return error.InvalidFetchUrl;
+    const security_host = normalizeHostForEgressPolicy(lookup_host) orelse return error.InvalidFetchUrl;
+
+    var name_buffer: [network.pattern.name_bytes_max]u8 = undefined;
+    const target = network.Target.init(
+        schemeOf(protocol),
+        authority_host,
+        uri.port,
+        &name_buffer,
+    ) orelse return error.EgressHostDenied;
+    const admission = switch (network.admit(policy, target)) {
+        .admitted => |admitted| admitted,
+        .denied => |denial| return denialError(denial),
+    };
+    return .{
+        .uri = uri,
+        .authority_host = authority_host,
+        .tls_server_name = security_host,
+        .port = target.port,
+        .protocol = protocol,
+        .admission = admission,
+    };
+}
+
+/// Resolves an admitted target and checks every address DNS returned
+/// against its admission (`selectResolvedAddress`).
+pub fn resolveRequestTargetUntil(
+    allocator: std.mem.Allocator,
+    cache: *DnsCache,
+    target: RequestTarget,
+    request_deadline_mono_ns: u64,
+) !ResolvedTarget {
+    const addresses = try cache.resolveUntil(
+        allocator,
+        target.tls_server_name,
+        target.port,
+        request_deadline_mono_ns,
+    );
+    errdefer allocator.free(addresses);
+    const selected_address = try selectResolvedAddress(target.admission, addresses);
+    return .{
+        .uri = target.uri,
+        .authority_host = target.authority_host,
+        .tls_server_name = target.tls_server_name,
+        .connect_host = try addressHostAlloc(allocator, selected_address),
+        .connect_addresses = addresses,
+        .port = target.port,
+        .protocol = target.protocol,
+    };
+}
+
+/// The first of `addresses`, once every one of them passes `admission`.
+/// Fails with `error.HostLacksNetworkAddresses` for an empty answer and
+/// with `error.EgressPrivateAddressDenied` or
+/// `error.EgressReservedAddressDenied` when any address is refused, so the
+/// resolution is refused whole.
+pub fn selectResolvedAddress(admission: network.Admission, addresses: []const std.net.Address) !std.net.Address {
+    if (addresses.len == 0)
+        return error.HostLacksNetworkAddresses;
+    for (addresses) |address| {
+        if (network.admitAddress(admission, address)) |denial|
+            return denialError(denial);
+    }
+    return addresses[0];
+}
 
 pub const RequestTarget = struct {
     uri: std.Uri,
     authority_host: []const u8,
     tls_server_name: []const u8,
+    /// The port the hop connects to: the URL's, or the scheme's default.
     port: u16,
     protocol: Protocol,
+    /// What the policy granted this hop, which every resolved address must
+    /// pass.
+    admission: network.Admission,
 };
 
 pub const ResolvedTarget = struct {
@@ -158,137 +176,16 @@ pub const ResolvedTarget = struct {
     }
 };
 
-pub fn validateProtocol(url: []const u8, allow_plain_http: bool) !void {
-    const uri = std.Uri.parse(url) catch return error.UnsupportedFetchProtocol;
-    const protocol = Protocol.fromScheme(uri.scheme) orelse return error.UnsupportedFetchProtocol;
-    if (protocol == .plain and !allow_plain_http)
-        return error.PlainHttpFetchDisabled;
-}
-
-const AddressClass = enum {
-    public,
-    private_routable,
-    loopback,
-    unspecified,
-    link_local,
-    metadata,
-    shared_carrier,
-    benchmark,
-    documentation,
-    multicast,
-    broadcast,
-    reserved,
-    unknown,
-};
-
-fn classifyEgressAddress(address: std.net.Address) AddressClass {
-    return switch (address.any.family) {
-        std.posix.AF.INET => blk: {
-            const bytes = ipv4Bytes(address);
-            break :blk classifyIpv4Bytes(bytes);
-        },
-        std.posix.AF.INET6 => classifyIp6(address.in6.sa.addr),
-        else => .unknown,
-    };
-}
-
-pub fn ipv4Bytes(address: std.net.Address) [4]u8 {
-    var bytes: [4]u8 = undefined;
-    @memcpy(&bytes, std.mem.asBytes(&address.in.sa.addr));
-    return bytes;
-}
-
-fn classifyIpv4Bytes(bytes: [4]u8) AddressClass {
-    const b0 = bytes[0];
-    const b1 = bytes[1];
-    const b2 = bytes[2];
-    if (b0 == 0)
-        return .unspecified;
-    if (b0 == 10)
-        return .private_routable;
-    if (b0 == 100 and (b1 & 0xc0) == 0x40)
-        return .shared_carrier;
-    if (b0 == 127)
-        return .loopback;
-    if (b0 == 169 and b1 == 254)
-        return .metadata;
-    if (b0 == 172 and b1 >= 16 and b1 <= 31)
-        return .private_routable;
-    if (b0 == 192 and b1 == 0 and b2 == 2)
-        return .documentation;
-    if (b0 == 192 and b1 == 0)
-        return .reserved;
-    if (b0 == 192 and b1 == 88 and b2 == 99)
-        return .reserved;
-    if (b0 == 192 and b1 == 168)
-        return .private_routable;
-    if (b0 == 198 and (b1 == 18 or b1 == 19))
-        return .benchmark;
-    if (b0 == 198 and b1 == 51 and b2 == 100)
-        return .documentation;
-    if (b0 == 203 and b1 == 0 and b2 == 113)
-        return .documentation;
-    if ((b0 & 0xf0) == 0xe0)
-        return .multicast;
-    if (std.mem.eql(u8, &bytes, &[_]u8{ 255, 255, 255, 255 }))
-        return .broadcast;
-    if ((b0 & 0xf0) == 0xf0)
-        return .reserved;
-    return .public;
-}
-
-fn classifyIp6(bytes: [16]u8) AddressClass {
-    const all_zero = std.mem.eql(u8, &bytes, &([1]u8{0} ** 16));
-    if (all_zero)
-        return .unspecified;
-    if (bytes[0] == 0xff)
-        return .multicast;
-    if (std.mem.eql(u8, bytes[0..15], &([1]u8{0} ** 15)) and bytes[15] == 1)
-        return .loopback;
-    if (isCloudMetadataIpv6(bytes))
-        return .metadata;
-    if ((bytes[0] & 0xfe) == 0xfc)
-        return .private_routable;
-    if (bytes[0] == 0xfe and (bytes[1] & 0xc0) == 0x80)
-        return .link_local;
-    if (std.mem.eql(u8, bytes[0..12], &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff })) {
-        const mapped = std.net.Address.initIp4(bytes[12..16].*, 0);
-        return classifyEgressAddress(mapped);
-    }
-    if (isWellKnownNat64Address(bytes))
-        return .reserved;
-    if (bytes[0] == 0x01 and bytes[1] == 0x00 and std.mem.eql(u8, bytes[2..8], &([1]u8{0} ** 6)))
-        return .reserved;
-    if (bytes[0] == 0x20 and bytes[1] == 0x01 and bytes[2] == 0x00 and bytes[3] == 0x02)
-        return .benchmark;
-    if (bytes[0] == 0x20 and bytes[1] == 0x01 and bytes[2] == 0x00 and bytes[3] <= 0x02)
-        return .reserved;
-    if (bytes[0] == 0x20 and bytes[1] == 0x01 and bytes[2] == 0x0d and bytes[3] == 0xb8)
-        return .documentation;
-    if (bytes[0] == 0x20 and bytes[1] == 0x02)
-        return .reserved;
-    return .public;
-}
-
-fn isWellKnownNat64Address(bytes: [16]u8) bool {
-    if (std.mem.eql(u8, bytes[0..12], &[_]u8{ 0x00, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0 }))
-        return true;
-    return std.mem.eql(u8, bytes[0..6], &[_]u8{ 0x00, 0x64, 0xff, 0x9b, 0, 0x01 });
-}
-
-/// The AWS instance metadata endpoint over IPv6, fd00:ec2::254.
-fn isCloudMetadataIpv6(bytes: [16]u8) bool {
-    return std.mem.eql(
-        u8,
-        &bytes,
-        &[_]u8{ 0xfd, 0x00, 0x0e, 0xc2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02, 0x54 },
-    );
-}
+pub const ipv4Bytes = network.address.ipv4Bytes;
 
 pub fn defaultPort(protocol: Protocol) u16 {
+    return schemeOf(protocol).defaultPort();
+}
+
+fn schemeOf(protocol: Protocol) network.Scheme {
     return switch (protocol) {
-        .plain => 80,
-        .tls => 443,
+        .plain => .http,
+        .tls => .https,
     };
 }
 

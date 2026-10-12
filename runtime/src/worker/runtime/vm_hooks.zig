@@ -14,23 +14,27 @@
 //! `exception_log` calls its sink on the same thread. The worker's boot
 //! attaches the runtime before it starts the sentinel and installs seccomp
 //! (`zygote/child_boot.zig`), and nothing here starts a thread.
+//!
+//! Both log sinks publish a line under the request id
+//! `observability.ringRequestId` gives its owner.
 
 const std = @import("std");
 const bindings = @import("collo_bindings");
 const worker_shared_page = @import("collo_worker_state").page;
 const log_limits = @import("collo_limits").runtime_logs;
 const exception_log = @import("collo_worker_js").exception_log;
-const scheduler_resources = @import("../scheduler/resources.zig");
+const runtime_observability = @import("observability.zig");
+const runtime_owner = @import("owner.zig");
+
+const ringRequestId = runtime_observability.ringRequestId;
 
 pub fn Methods(comptime Runtime: type) type {
     return struct {
         pub fn attachHostRuntime(self: *Runtime) !void {
             self.installEgressCallbacks();
             try self.core.vm.setHostRuntime(self);
-            // A restored promise continuation is a turn of its own request, not of
-            // the one draining the queue. The engine moves the CPU slice itself;
-            // the hook moves the two things that live out here, the deadline
-            // arbiter's owner and the request timeline.
+            // A restored promise continuation runs in a window of its own
+            // owner, not of the one draining the queue (`owner.zig`).
             try self.core.vm.setOwnerTransitionHook(ownerTransitionCallback, @ptrCast(self));
             // Console and uncaught-exception lines go to the shared page's log
             // ring. The sink is registered here, not in `init`, because `self`
@@ -50,38 +54,31 @@ pub fn Methods(comptime Runtime: type) type {
             exception_log.setRegistration(&self.exception_sink_registration);
         }
 
-        /// Called by the engine, in pairs, when a microtask drain hands execution
-        /// from one request to another and back
-        /// (`collo_vm_set_owner_transition_hook` in `abi.h`). It draws the
-        /// borders the fs fault and crypto settlements draw around their
-        /// sub-turns: the sentinel needs the new owner published, or a hang
-        /// inside the continuation would escape its owner gate, and the timeline
-        /// needs the turn closed and reopened, or the entering request would
-        /// count its own execution as I/O.
+        /// Called by the engine, in pairs, around each restored promise
+        /// continuation whose owner differs from the owner it interrupts:
+        /// `(interrupted, restored)` before it, `(restored, interrupted)` after
+        /// it (`collo_vm_set_owner_transition_hook` in `abi.h`). Each call
+        /// moves the VM thread to the `entering` side's owner, as the fs fault
+        /// and crypto settlements do around their sub-turns: its CPU is the
+        /// entering owner's from here, the sentinel can stop a hang inside the
+        /// continuation only once that owner is published, and a request's
+        /// timeline needs its turn closed and reopened, or the entering request
+        /// would count its own execution as I/O. No ready item is consumed: a
+        /// microtask never went through the ready queue that counts them.
         ///
-        /// A null side is turnless execution: module evaluation, or an owner whose
-        /// request already ended. It publishes 0, so no other request is charged
-        /// with, or stopped for, work nobody owns.
+        /// A null side is JavaScript no exec context claims, a released
+        /// registrant or a closed evaluation, which the worker owner owns
+        /// (`owner.ownerOf`), so no request is charged with, or stopped for,
+        /// work it does not own. The `leaving` side is the owner the previous
+        /// call entered, so this call needs only the other one.
         fn ownerTransitionCallback(
             ctx: ?*anyopaque,
             leaving: ?*bindings.ExecCtx,
             entering: ?*bindings.ExecCtx,
         ) callconv(.c) void {
+            _ = leaving;
             const self: *Runtime = @ptrCast(@alignCast(ctx orelse return));
-            const now = self.nowMonoNs();
-            if (leaving) |exec_ctx| {
-                if (self.requests.active.get(exec_ctx.request_id)) |request|
-                    request.noteTurnEnd(now);
-            }
-            // Published before the timeline opens, so the arbiter never sees a
-            // window with no owner while JS is running.
-            scheduler_resources.publishTurnOwner(self, if (entering) |exec_ctx| exec_ctx.request_id else 0);
-            if (entering) |exec_ctx| {
-                if (self.requests.active.get(exec_ctx.request_id)) |request|
-                    // No ready item to consume: a microtask never went through the
-                    // ready queue that counts them.
-                    request.noteTurnBegin(now, false);
-            }
+            _ = runtime_owner.enter(self, runtime_owner.ownerOf(entering), .{});
         }
 
         fn consoleSinkCallback(
@@ -105,7 +102,7 @@ pub fn Methods(comptime Runtime: type) type {
             }
             const payload: []const u8 = if (bytes) |b| b[0..len] else &.{};
             const log_level = std.meta.intToEnum(worker_shared_page.LogLevel, level) catch .info;
-            view.publishLogLine(log_level, flags, request_id, self.nowMonoNs(), payload);
+            view.publishLogLine(log_level, flags, ringRequestId(request_id), self.nowMonoNs(), payload);
         }
 
         fn exceptionLogSinkCallback(ctx: ?*anyopaque, request_id: u64, message: []const u8) void {
@@ -114,7 +111,7 @@ pub fn Methods(comptime Runtime: type) type {
             view.publishLogLine(
                 .err,
                 worker_shared_page.LogLineFlags.js_exception,
-                request_id,
+                ringRequestId(request_id),
                 self.nowMonoNs(),
                 message,
             );

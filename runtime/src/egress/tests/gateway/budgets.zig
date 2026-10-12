@@ -280,7 +280,7 @@ test "a session holds a budget for every request in flight and its boot token, f
         budgets.per_session_max,
     );
     try std.testing.expectEqual(
-        gateway.sizing.workers_max * budgets.per_session_max,
+        gateway.sizing.sessions_max * budgets.per_session_max,
         budgets.per_gateway_max,
     );
 }

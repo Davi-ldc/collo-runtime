@@ -122,7 +122,7 @@ pub const LaneRuntimeState = event_sources.LaneRuntimeState;
 /// Registrations one lane can hold: every worker the node can have, so a
 /// lane never runs out while each worker holds one registration per lane.
 pub const max_completion_registrations: u32 =
-    @intCast(limits.server.worker_definitions_max * supervision.scheduler_limits.capacity.pool_workers_max);
+    @intCast(limits.server.worker_definitions_max * limits.pool.pool_workers_max);
 
 /// The capacities of a lane's tables. A serving lane keeps the limits; a
 /// test shrinks them to reach a full table.
@@ -130,6 +130,20 @@ pub const TableCapacities = struct {
     connections: u32 = limits.ingress.connections_per_lane_max,
     requests: u32 = limits.ingress.requests_per_lane_max,
     streams: u32 = limits.ingress.streams_per_lane_max,
+};
+
+/// Where a lane reads CLOCK_MONOTONIC through `LaneWorker.monotonicNowNs`: the
+/// kernel's clock, unless `read` is set, which then answers every reading
+/// with `context`. A serving lane keeps the kernel's; a test sets its own to
+/// tell one reading from another.
+pub const LaneClock = struct {
+    context: ?*anyopaque = null,
+    read: ?*const fn (context: ?*anyopaque) u64 = null,
+
+    pub fn nowNs(self: LaneClock) u64 {
+        const read = self.read orelse return process.monotonicNowNsOrZero();
+        return read(self.context);
+    }
 };
 
 /// The bits other threads raise on a lane (`LaneWorker.raiseWake`), each
@@ -145,8 +159,9 @@ pub const wake = struct {
 
 /// A lane's resident memory with every table full and every buffer used,
 /// term by term, for a configuration of `definition_count` worker
-/// definitions (`laneMemoryTerms`). The tables fault in, so a lane holds
-/// this only at its busiest; at start it holds almost none of it.
+/// definitions whose `concurrency` adds up to `slots_per_worker_total`
+/// (`laneMemoryTerms`). The tables fault in, so a lane holds this only at its
+/// busiest; at start it holds almost none of it.
 pub const LaneMemoryTerms = struct {
     /// The connection slab and the connection deadline heap.
     connections: usize,
@@ -172,9 +187,10 @@ pub const LaneMemoryTerms = struct {
     }
 };
 
-pub fn laneMemoryTerms(definition_count: usize) LaneMemoryTerms {
-    const registrations = definition_count * supervision.scheduler_limits.capacity.pool_workers_max;
-    const command_places = limits.ingress.commands_per_lane_max + lane_mod.obligationReserve(definition_count);
+pub fn laneMemoryTerms(definition_count: usize, slots_per_worker_total: usize) LaneMemoryTerms {
+    const registrations = definition_count * limits.pool.pool_workers_max;
+    const command_places = limits.ingress.commands_per_lane_max +
+        lane_mod.obligationReserve(definition_count, slots_per_worker_total);
     return .{
         .connections = limits.ingress.connections_per_lane_max * (@sizeOf(ConnectionSlot) + @sizeOf(*ConnectionSlot)),
         .requests = limits.ingress.requests_per_lane_max * (@sizeOf(RequestSlot) + timer_wheel.entrySizeBytes()),
@@ -189,8 +205,8 @@ pub fn laneMemoryTerms(definition_count: usize) LaneMemoryTerms {
 
 /// The cost the lane plan's memory cap charges per lane: the sum of
 /// `laneMemoryTerms`.
-pub fn laneMemoryShape(definition_count: usize) lane_plan.MemoryShape {
-    return .{ .resident_cap_bytes = laneMemoryTerms(definition_count).total() };
+pub fn laneMemoryShape(definition_count: usize, slots_per_worker_total: usize) lane_plan.MemoryShape {
+    return .{ .resident_cap_bytes = laneMemoryTerms(definition_count, slots_per_worker_total).total() };
 }
 
 const ConnectionSlot = connection_slot.Slot;
@@ -239,6 +255,9 @@ pub fn LaneWorker(comptime Service: type) type {
         /// The pre-request, idle and stall timeouts. Tests shorten them;
         /// nothing else changes them.
         connection_timeouts: deadline_driver.ConnectionTimeouts = .{},
+        /// The clock `monotonicNowNs` reads. Tests set it; nothing else
+        /// changes it.
+        clock: LaneClock = .{},
         /// The capacities `ring_driver.initRuntime` gives the tables.
         table_capacities: TableCapacities = .{},
         requests: request_slot.RequestSlab = .{},
@@ -357,8 +376,7 @@ pub fn LaneWorker(comptime Service: type) type {
         }
 
         pub fn monotonicNowNs(self: *const Self) u64 {
-            _ = self;
-            return process.monotonicNowNsOrZero();
+            return self.clock.nowNs();
         }
 
         /// Posts `command` to this lane's queue from any thread, consuming it
@@ -414,8 +432,10 @@ pub fn LaneWorker(comptime Service: type) type {
             return deadline_driver.handleDeadlineTimer(Self, self);
         }
 
-        // What the HTTP/2 driver calls on its `Worker` (`http2/connection.zig`).
+        // What the HTTP/2 driver calls on its `Worker` (`http2/connection.zig`),
+        // with `monotonicNowNs` above.
         pub const startDynamicH2 = admission.Methods(Self).startDynamicH2;
+        pub const refuseH2Stream = admission.Methods(Self).refuseH2Stream;
         pub const handleH2DataFrame = request_body.Methods(Self).handleH2DataFrame;
         pub const handleH2DataFrameBatch = request_body.Methods(Self).handleH2DataFrameBatch;
         pub const handleH2ResetFrame = request_body.Methods(Self).handleH2ResetFrame;

@@ -1,16 +1,17 @@
 //! Compares identity, zstd and Brotli at several levels on three kinds of
 //! input: JavaScript and other source text, configuration JSON and random
-//! bytes. It
-//! prints the encoded size and the mean encode and decode time per corpus
-//! case and codec, so the tradeoff is measured before any runtime code picks
-//! a codec. The bench imports no runtime module. It loads libzstd and the
-//! Brotli libraries with dlopen and fails when any is missing. It reads
-//! repository fixtures by relative path, so it runs from the repository
-//! root, where the build step sets its working directory. Every case must
-//! survive a round trip byte for byte before it is timed. Runs on its main
-//! thread and builds ReleaseFast.
+//! bytes. It prints the encoded size and the mean encode and decode time per
+//! corpus case and codec, so the tradeoff is measured before any runtime code
+//! picks a codec. The bench imports no runtime module, only the codec
+//! bindings (`collo_zstd`, `collo_brotli`), so it measures the pinned
+//! libraries the binary links. It reads repository fixtures by relative
+//! path, so it runs from the repository root, where the build step sets its
+//! working directory. Every case must survive a round trip byte for byte
+//! before it is timed. Runs on its main thread and builds ReleaseFast.
 
 const std = @import("std");
+const brotli = @import("collo_brotli");
+const zstd = @import("collo_zstd");
 const bench_metadata = @import("metadata.zig");
 
 const workload_array_ops_js = @embedFile("workload_array_ops_js");
@@ -82,211 +83,46 @@ const CorpusCase = struct {
     }
 };
 
-const DynamicLib = struct {
-    handle: *anyopaque,
+/// The encoder hint every Brotli case uses: the corpus is mostly source text.
+const brotli_mode: brotli.EncoderMode = .text;
 
-    fn openAny(names: []const [:0]const u8) !DynamicLib {
-        for (names) |name| {
-            if (std.c.dlopen(name.ptr, .{ .LAZY = true })) |handle| {
-                return .{ .handle = handle };
-            }
-        }
-        return error.FileNotFound;
+comptime {
+    for (codecs) |spec| {
+        if (spec.codec == .br)
+            std.debug.assert(spec.level <= brotli.quality_max);
     }
+}
 
-    fn close(self: *DynamicLib) void {
-        _ = std.c.dlclose(self.handle);
-        self.* = undefined;
+fn maxCompressedSize(codec: Codec, raw_len: usize) usize {
+    return switch (codec) {
+        .identity => raw_len,
+        .zstd => zstd.compressBound(raw_len),
+        .br => brotli.maxCompressedSize(raw_len),
+    };
+}
+
+fn compressInto(spec: CodecSpec, input: []const u8, output: []u8) !usize {
+    std.debug.assert(input.len >= min_case_bytes);
+    switch (spec.codec) {
+        .identity => {
+            @memcpy(output[0..input.len], input);
+            return input.len;
+        },
+        .zstd => return zstd.compress(output, input, spec.level),
+        .br => return brotli.compress(spec.level, brotli.default_window_bits, brotli_mode, input, output),
     }
+}
 
-    fn lookup(self: *DynamicLib, comptime T: type, name: [:0]const u8) !T {
-        const symbol = @call(.never_tail, std.c.dlsym, .{ self.handle, name.ptr }) orelse {
-            return error.MissingSymbol;
-        };
-        return @as(T, @ptrCast(@alignCast(symbol)));
+fn decompressInto(spec: CodecSpec, compressed: []const u8, output: []u8) !usize {
+    switch (spec.codec) {
+        .identity => {
+            @memcpy(output[0..compressed.len], compressed);
+            return compressed.len;
+        },
+        .zstd => return zstd.decompress(output, compressed),
+        .br => return brotli.decompress(compressed, output),
     }
-};
-
-const BrotliEncoderMaxCompressedSizeFn = *const fn (usize) callconv(.c) usize;
-const BrotliEncoderCompressFn = *const fn (
-    c_int,
-    c_int,
-    c_int,
-    usize,
-    [*]const u8,
-    *usize,
-    [*]u8,
-) callconv(.c) c_int;
-const BrotliDecoderDecompressFn = *const fn (
-    usize,
-    [*]const u8,
-    *usize,
-    [*]u8,
-) callconv(.c) c_int;
-const ZstdCompressBoundFn = *const fn (usize) callconv(.c) usize;
-const ZstdCompressFn = *const fn (
-    [*]u8,
-    usize,
-    [*]const u8,
-    usize,
-    c_int,
-) callconv(.c) usize;
-const ZstdDecompressFn = *const fn (
-    [*]u8,
-    usize,
-    [*]const u8,
-    usize,
-) callconv(.c) usize;
-const ZstdIsErrorFn = *const fn (usize) callconv(.c) c_uint;
-const ZstdGetErrorNameFn = *const fn (usize) callconv(.c) [*:0]const u8;
-
-const CodecLibs = struct {
-    brotli_encoder: DynamicLib,
-    brotli_decoder: DynamicLib,
-    zstd: DynamicLib,
-    brotli_max_compressed_size: BrotliEncoderMaxCompressedSizeFn,
-    brotli_compress: BrotliEncoderCompressFn,
-    brotli_decompress: BrotliDecoderDecompressFn,
-    zstd_compress_bound: ZstdCompressBoundFn,
-    zstd_compress: ZstdCompressFn,
-    zstd_decompress: ZstdDecompressFn,
-    zstd_is_error: ZstdIsErrorFn,
-    zstd_get_error_name: ZstdGetErrorNameFn,
-
-    fn init() !CodecLibs {
-        var brotli_encoder = try DynamicLib.openAny(&.{ "libbrotlienc.so.1", "libbrotlienc.so" });
-        errdefer brotli_encoder.close();
-        var brotli_decoder = try DynamicLib.openAny(&.{ "libbrotlidec.so.1", "libbrotlidec.so" });
-        errdefer brotli_decoder.close();
-        var zstd = try DynamicLib.openAny(&.{ "libzstd.so.1", "libzstd.so" });
-        errdefer zstd.close();
-
-        return .{
-            .brotli_encoder = brotli_encoder,
-            .brotli_decoder = brotli_decoder,
-            .zstd = zstd,
-            .brotli_max_compressed_size = try brotli_encoder.lookup(
-                BrotliEncoderMaxCompressedSizeFn,
-                "BrotliEncoderMaxCompressedSize",
-            ),
-            .brotli_compress = try brotli_encoder.lookup(
-                BrotliEncoderCompressFn,
-                "BrotliEncoderCompress",
-            ),
-            .brotli_decompress = try brotli_decoder.lookup(
-                BrotliDecoderDecompressFn,
-                "BrotliDecoderDecompress",
-            ),
-            .zstd_compress_bound = try zstd.lookup(ZstdCompressBoundFn, "ZSTD_compressBound"),
-            .zstd_compress = try zstd.lookup(ZstdCompressFn, "ZSTD_compress"),
-            .zstd_decompress = try zstd.lookup(ZstdDecompressFn, "ZSTD_decompress"),
-            .zstd_is_error = try zstd.lookup(ZstdIsErrorFn, "ZSTD_isError"),
-            .zstd_get_error_name = try zstd.lookup(ZstdGetErrorNameFn, "ZSTD_getErrorName"),
-        };
-    }
-
-    fn deinit(self: *CodecLibs) void {
-        self.zstd.close();
-        self.brotli_decoder.close();
-        self.brotli_encoder.close();
-        self.* = undefined;
-    }
-
-    fn maxCompressedSize(self: *const CodecLibs, codec: Codec, raw_len: usize) usize {
-        return switch (codec) {
-            .identity => raw_len,
-            .zstd => self.zstd_compress_bound(raw_len),
-            .br => self.brotli_max_compressed_size(raw_len),
-        };
-    }
-
-    fn compressInto(
-        self: *const CodecLibs,
-        spec: CodecSpec,
-        input: []const u8,
-        output: []u8,
-    ) !usize {
-        std.debug.assert(input.len >= min_case_bytes);
-        switch (spec.codec) {
-            .identity => {
-                @memcpy(output[0..input.len], input);
-                return input.len;
-            },
-            .zstd => {
-                const written = self.zstd_compress(
-                    output.ptr,
-                    output.len,
-                    input.ptr,
-                    input.len,
-                    spec.level,
-                );
-                try self.checkZstd(written);
-                return written;
-            },
-            .br => {
-                var out_len = output.len;
-                const ok = self.brotli_compress(
-                    spec.level,
-                    22,
-                    1,
-                    input.len,
-                    input.ptr,
-                    &out_len,
-                    output.ptr,
-                );
-                if (ok == 0) {
-                    return error.BrotliCompressFailed;
-                }
-                return out_len;
-            },
-        }
-    }
-
-    fn decompressInto(
-        self: *const CodecLibs,
-        spec: CodecSpec,
-        compressed: []const u8,
-        output: []u8,
-    ) !usize {
-        switch (spec.codec) {
-            .identity => {
-                @memcpy(output[0..compressed.len], compressed);
-                return compressed.len;
-            },
-            .zstd => {
-                const written = self.zstd_decompress(
-                    output.ptr,
-                    output.len,
-                    compressed.ptr,
-                    compressed.len,
-                );
-                try self.checkZstd(written);
-                return written;
-            },
-            .br => {
-                var out_len = output.len;
-                const result = self.brotli_decompress(
-                    compressed.len,
-                    compressed.ptr,
-                    &out_len,
-                    output.ptr,
-                );
-                if (result != 1) {
-                    return error.BrotliDecompressFailed;
-                }
-                return out_len;
-            },
-        }
-    }
-
-    fn checkZstd(self: *const CodecLibs, result: usize) !void {
-        if (self.zstd_is_error(result) == 0) {
-            return;
-        }
-        std.log.err("zstd failure: {s}", .{self.zstd_get_error_name(result)});
-        return error.ZstdFailed;
-    }
-};
+}
 
 const Measurement = struct {
     encoded_bytes: usize,
@@ -301,12 +137,6 @@ pub fn main() !void {
 
     try bench_metadata.print(allocator, "compression_codecs");
 
-    var libs = CodecLibs.init() catch |err| {
-        std.log.err("compression codec libraries are required for this benchmark: {s}", .{@errorName(err)});
-        return err;
-    };
-    defer libs.deinit();
-
     const rounds = try envUsize(allocator, "COLLO_BENCH_COMPRESSION_ROUNDS", default_rounds);
     var corpus = std.array_list.Aligned(CorpusCase, null).empty;
     defer {
@@ -319,7 +149,7 @@ pub fn main() !void {
 
     for (corpus.items) |entry| {
         for (codecs) |codec| {
-            const measurement = try measureCodec(allocator, &libs, entry.bytes, codec, rounds);
+            const measurement = try measureCodec(allocator, entry.bytes, codec, rounds);
             printMeasurement(entry, codec, measurement, rounds);
         }
     }
@@ -497,21 +327,20 @@ fn appendRepoConcat(
 
 fn measureCodec(
     allocator: std.mem.Allocator,
-    libs: *const CodecLibs,
     input: []const u8,
     spec: CodecSpec,
     rounds: usize,
 ) !Measurement {
     std.debug.assert(rounds > 0);
 
-    const compressed_capacity = libs.maxCompressedSize(spec.codec, input.len);
+    const compressed_capacity = maxCompressedSize(spec.codec, input.len);
     const compressed = try allocator.alloc(u8, compressed_capacity);
     defer allocator.free(compressed);
     const restored = try allocator.alloc(u8, input.len);
     defer allocator.free(restored);
 
-    const encoded_bytes = try libs.compressInto(spec, input, compressed);
-    const decoded_bytes = try libs.decompressInto(spec, compressed[0..encoded_bytes], restored);
+    const encoded_bytes = try compressInto(spec, input, compressed);
+    const decoded_bytes = try decompressInto(spec, compressed[0..encoded_bytes], restored);
     if (decoded_bytes != input.len) {
         return error.CodecRoundTripMismatch;
     }
@@ -536,7 +365,7 @@ fn measureCodec(
         const encode_start = try monotonicNowNs();
         var iteration: usize = 0;
         while (iteration < iterations) : (iteration += 1) {
-            const written = try libs.compressInto(spec, input, compressed);
+            const written = try compressInto(spec, input, compressed);
             std.debug.assert(written == encoded_bytes);
         }
         encode_total_ns += try elapsedSince(encode_start);
@@ -544,7 +373,7 @@ fn measureCodec(
         const decode_start = try monotonicNowNs();
         iteration = 0;
         while (iteration < iterations) : (iteration += 1) {
-            const written = try libs.decompressInto(spec, compressed[0..encoded_bytes], restored);
+            const written = try decompressInto(spec, compressed[0..encoded_bytes], restored);
             std.debug.assert(written == input.len);
         }
         decode_total_ns += try elapsedSince(decode_start);

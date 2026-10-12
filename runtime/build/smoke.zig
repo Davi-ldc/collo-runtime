@@ -1,9 +1,9 @@
 //! `zig build smoke`, the check a handoff requires. In order, it runs the
-//! `test` aggregate, `zygote-integration` and `local-e2e` with
-//! COLLO_TEST_STRICT_SKIPS=1, so any skip runtime/tests/support/skip_allowlist.zon
-//! does not grant fails it, then serves one request through the installed
-//! `collo serve` with the driver in runtime/tests/support/serve_smoke.zig,
-//! which owns what that check expects.
+//! `test` aggregate, the forced and concurrent `bindings-gc-stress` profiles,
+//! `zygote-integration` and `local-e2e` with COLLO_TEST_STRICT_SKIPS=1, so any
+//! skip runtime/tests/support/skip_allowlist.zon does not grant fails it, then
+//! serves one request through the installed `collo serve` with the driver in
+//! runtime/tests/support/serve_smoke.zig, which owns what that check expects.
 //!
 //! Every run needs the delegated cgroup v2 subtree that `wsl-config run`
 //! enters (dev/wsl/cgroup_env.zig), so each one waits on a preflight that
@@ -47,7 +47,8 @@ pub const Inputs = struct {
 
 pub fn addStep(b: *std.Build, ctx: *const context_mod.Context, inputs: Inputs) void {
     const lanes = inputs.lanes;
-    lanes.strict_zygote_integration.step.dependOn(lanes.aggregate.strict);
+    lanes.strict_gc_stress.start.dependOn(lanes.aggregate.strict);
+    lanes.strict_zygote_integration.step.dependOn(lanes.strict_gc_stress.done);
     lanes.strict_local_e2e.step.dependOn(&lanes.strict_zygote_integration.step);
 
     const serve = addServeCheck(b, ctx);
@@ -56,7 +57,7 @@ pub fn addStep(b: *std.Build, ctx: *const context_mod.Context, inputs: Inputs) v
 
     const smoke = b.step(
         "smoke",
-        "Required before handoff: test, zygote-integration and local-e2e with strict skips, then one collo serve request (needs the delegated cgroup)",
+        "Required before handoff: test, bindings-gc-stress, zygote-integration and local-e2e with strict skips, then one collo serve request (needs the delegated cgroup)",
     );
     smoke.dependOn(&serve.step);
     smoke.dependOn(inputs.install_wsl_config);
@@ -81,9 +82,9 @@ fn addServeCheck(b: *std.Build, ctx: *const context_mod.Context) *std.Build.Step
     // the test shim's handshake checks call, which the driver never runs but
     // the linker resolves. Neither takes the build's sanitizer, since the
     // smoke tests the installed binary and not the driver.
-    shims.configureBoringSslShim(b, driver, ctx.toolchain, .{});
+    shims.configureBoringSslShim(b, driver, ctx.toolchain, ctx.boringssl.headers(), .{});
     shims.configureBoringSslTestShim(b, driver, ctx.toolchain, .{});
-    shims.linkBoringSslArchives(b, driver, ctx.opts.boringssl_build_dir);
+    ctx.boringssl.linkArchives(b, driver);
 
     const run = b.addRunArtifact(driver);
     run.setName("collo serve the hello fixture");

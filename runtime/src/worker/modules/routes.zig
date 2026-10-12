@@ -30,6 +30,12 @@
 //! own route failed, and the route's requests get the same 500 in all three
 //! cases while the other routes keep serving. The worker gives way to a fresh
 //! one only once no route can serve (`pinFailed` owns the rule).
+//!
+//! A route's entry runs under the evaluation of its module instance, which
+//! the caller holds open and passes by id (`worker/runtime/evaluations.zig`
+//! opens and closes it); the route's `evaluating` record keeps that id, and
+//! routes that share an instance share it. This file decides which routes
+//! evaluate under an evaluation and nothing about its context.
 
 const std = @import("std");
 const bindings = @import("collo_bindings");
@@ -74,20 +80,30 @@ pub const RouteHandlerResult = union(enum) {
 /// and the requests parked on it get their 500.
 pub const module_eval_budget_ns: u64 = 10 * std.time.ns_per_s;
 
-/// The handler and `env` of the route `request_ctx` dispatches to. A route
-/// still `idle` has its entry evaluated from the packs the worker
-/// registered. Returns `.pending` after parking the request on an evaluation
-/// in flight, and `.exception` when the evaluation or the export read threw,
-/// after pinning the route failed. Fails with `error.UnknownRoute` for an
-/// index past the route table, `error.RouteModuleEvaluationFailed` for a
-/// route already failed, `error.RoutePackNotRegistered` when no registered
-/// pack holds the route's entry, and otherwise with the error of the step
-/// that failed: creating the route's realm, reading the handler or building
-/// `env`.
-pub fn ensureRouteHandler(
+/// What a route offers a request before its entry is evaluated
+/// (`lookupRouteHandler`).
+pub const RouteLookup = union(enum) {
+    ready: ReadyRoute,
+    /// The entry's top-level await is in flight: the request joined the
+    /// route's waiter list and runs again when the settlement queues it.
+    pending,
+    /// The entry has not been evaluated in the route's realm, and a
+    /// registered pack holds it: the caller evaluates it under its module
+    /// instance's evaluation (`evaluateRequestedRoute`).
+    idle,
+};
+
+/// The handler and `env` of the route `request_ctx` dispatches to, as far as
+/// they exist without evaluating its entry. Returns `.pending` after parking
+/// the request on the evaluation in flight. Fails with `error.UnknownRoute`
+/// for an index past the route table, `error.RouteModuleEvaluationFailed`
+/// for a route already failed, `error.RoutePackNotRegistered` when no
+/// registered pack holds the route's entry, and with OutOfMemory when the
+/// request cannot be parked.
+pub fn lookupRouteHandler(
     ctx: *module_context.Context,
     request_ctx: *request_context.RequestContext,
-) !RouteHandlerResult {
+) !RouteLookup {
     const index = request_ctx.dispatch_work.route_index;
     if (index >= ctx.modules.routes.items.len)
         return error.UnknownRoute;
@@ -101,11 +117,25 @@ pub fn ensureRouteHandler(
         },
         .failed => return error.RouteModuleEvaluationFailed,
     }
-
     if (!sourceLoaded(ctx, route.entry_specifier))
         return error.RoutePackNotRegistered;
+    return .idle;
+}
 
-    switch (try evaluateRoute(ctx, index, request_ctx.exec.request_id)) {
+/// Evaluates the entry of the route `request_ctx` dispatches to, which
+/// `lookupRouteHandler` found `idle`, under evaluation `evaluation_id`
+/// (`evaluateRoute` says which id that must be). Returns the ready route;
+/// `.pending` after parking the request on the evaluation; or `.exception`
+/// when the evaluation or the export read threw, after pinning the route
+/// failed. Fails with the error of the step that failed: creating the
+/// route's realm, reading the handler or building `env`.
+pub fn evaluateRequestedRoute(
+    ctx: *module_context.Context,
+    request_ctx: *request_context.RequestContext,
+    evaluation_id: u64,
+) !RouteHandlerResult {
+    const index = request_ctx.dispatch_work.route_index;
+    switch (try evaluateRoute(ctx, index, evaluation_id, request_ctx.exec.request_id)) {
         .ready => {},
         .pending => return .pending,
         .exception => |exception| {
@@ -132,13 +162,17 @@ const EvaluateOutcome = union(enum) {
 /// The one place a route's entry is evaluated, in the route's realm. A
 /// synchronous success reads the handler at once through `finishReadyRoute`;
 /// a top-level await moves the route to `evaluating`, which
-/// `settleEvaluation` finishes later. `waiter_request_id` is the request to
-/// park on that record, null on the boot path, which has no request. Fails
-/// with `error.HandlerNotCallable` when the default export is not a function,
-/// leaving the route `idle`.
+/// `settleEvaluation` finishes later. `evaluation_id` is the evaluation the
+/// caller holds open and installed for the entry's code: the one in flight
+/// for the route's module instance when there is one
+/// (`evaluationInFlight`), else a new one. `waiter_request_id` is the request
+/// to park on that record, null on the boot path, which has no request.
+/// Fails with `error.HandlerNotCallable` when the default export is not a
+/// function, leaving the route `idle`.
 fn evaluateRoute(
     ctx: *module_context.Context,
     index: usize,
+    evaluation_id: u64,
     waiter_request_id: ?u64,
 ) !EvaluateOutcome {
     const realm = try routeRealm(ctx, index);
@@ -150,9 +184,18 @@ fn evaluateRoute(
             .exception => |exception| return .{ .exception = exception },
         },
         .pending => {
+            // Routes that share an instance get one outcome from its one
+            // evaluation, so they also share its deadline and its owner
+            // instead of each counting from its own start.
+            const shared = instanceEvaluating(ctx, realm.index(), route.entry_specifier);
+            if (shared) |instance|
+                std.debug.assert(instance.evaluation_id == evaluation_id);
             var evaluating = modules_state.RouteModuleState.Evaluating{
-                .deadline_mono_ns = instanceDeadline(ctx, realm, route.entry_specifier) orelse
+                .deadline_mono_ns = if (shared) |instance|
+                    instance.deadline_mono_ns
+                else
                     ctx.nowMonoNs() +| module_eval_budget_ns,
+                .evaluation_id = evaluation_id,
             };
             errdefer evaluating.waiters.deinit(ctx.allocator);
             if (waiter_request_id) |request_id|
@@ -165,17 +208,64 @@ fn evaluateRoute(
     }
 }
 
-/// The deadline of the evaluation in flight for the module instance that
-/// `specifier` names in `realm`, when another route already waits on it.
-/// Routes that share an instance get one outcome from its one evaluation, so
-/// they also share its deadline instead of each counting from its own start.
-fn instanceDeadline(ctx: *module_context.Context, realm: bindings.Realm, specifier: []const u8) ?u64 {
+/// The `evaluating` record of a route that evaluates the module instance
+/// `specifier` names in the realm with index `realm_index`; every route of
+/// the instance holds the same deadline and evaluation. Null once none does.
+fn instanceEvaluating(
+    ctx: *module_context.Context,
+    realm_index: u32,
+    specifier: []const u8,
+) ?*const modules_state.RouteModuleState.Evaluating {
     for (ctx.modules.routes.items) |*candidate| {
         const evaluating = switch (candidate.module) {
             .evaluating => |*evaluating| evaluating,
             .idle, .ready, .failed => continue,
         };
-        if (sameInstance(candidate, realm.index(), specifier))
+        if (sameInstance(candidate, realm_index, specifier))
+            return evaluating;
+    }
+    return null;
+}
+
+/// The evaluation of the module instance `specifier` names in the realm with
+/// index `realm_index`, while a route still evaluates it; null once none
+/// does, as for a settlement that came late or twice.
+pub fn instanceEvaluation(ctx: *module_context.Context, realm_index: u32, specifier: []const u8) ?u64 {
+    const evaluating = instanceEvaluating(ctx, realm_index, specifier) orelse return null;
+    return evaluating.evaluation_id;
+}
+
+/// The evaluation in flight for the module instance the `idle` route at
+/// `index` would evaluate, which the route then joins; null when its
+/// evaluation would start the instance. A route without a realm yet would
+/// run in the main realm, index 0, unless the worker isolates realms and it
+/// is not route 0, in which case its realm, and so its instance, will be new.
+pub fn evaluationInFlight(ctx: *module_context.Context, index: usize) ?u64 {
+    const route = &ctx.modules.routes.items[index];
+    const realm_index: u32 = if (route.realm) |realm|
+        realm.index()
+    else if (ctx.modules.isolate_realm and index != 0)
+        return null
+    else
+        0;
+    return instanceEvaluation(ctx, realm_index, route.entry_specifier);
+}
+
+/// Whether any route still evaluates under evaluation `evaluation_id`.
+pub fn evaluationOpen(ctx: *module_context.Context, evaluation_id: u64) bool {
+    return evaluationDeadline(ctx, evaluation_id) != null;
+}
+
+/// The deadline of the routes that evaluate under evaluation
+/// `evaluation_id`, the budget of the instance they share; null once none
+/// does.
+pub fn evaluationDeadline(ctx: *module_context.Context, evaluation_id: u64) ?u64 {
+    for (ctx.modules.routes.items) |*route| {
+        const evaluating = switch (route.module) {
+            .evaluating => |*evaluating| evaluating,
+            .idle, .ready, .failed => continue,
+        };
+        if (evaluating.evaluation_id == evaluation_id)
             return evaluating.deadline_mono_ns;
     }
     return null;
@@ -238,6 +328,9 @@ fn finishReadyRoute(ctx: *module_context.Context, index: usize) !ReadyOutcome {
 pub const Settlement = struct {
     /// Owned by the caller.
     waiters: std.ArrayListUnmanaged(u64),
+    /// The evaluation the route evaluated under, which the caller closes
+    /// once no other route still evaluates under it.
+    evaluation_id: u64,
 };
 
 /// Finishes the evaluation of the next route whose entry is `specifier` and
@@ -262,12 +355,13 @@ pub fn settleEvaluation(
         if (sameInstance(candidate, realm_index, specifier))
             break candidate_index;
     } else return null;
+    const evaluation_id = ctx.modules.routes.items[index].module.evaluating.evaluation_id;
     if (!resolved) {
         std.log.warn("route module evaluation rejected; route pinned failed route={d} specifier={s}", .{
             index,
             specifier,
         });
-        return .{ .waiters = pinFailed(ctx, index, .rejected) };
+        return .{ .waiters = pinFailed(ctx, index, .rejected), .evaluation_id = evaluation_id };
     }
     const route = &ctx.modules.routes.items[index];
     const waiters = route.module.evaluating.waiters;
@@ -293,7 +387,7 @@ pub fn settleEvaluation(
     };
     // The waiters run even when reading the handler failed: the route is
     // then `idle` again, and each evaluates the entry on its own.
-    return .{ .waiters = waiters };
+    return .{ .waiters = waiters, .evaluation_id = evaluation_id };
 }
 
 /// Pins failed the next route whose top-level await is still pending past
@@ -317,18 +411,8 @@ pub fn expireEvaluation(ctx: *module_context.Context) ?Settlement {
         index,
         ctx.modules.routes.items[index].entry_specifier,
     });
-    return .{ .waiters = pinFailed(ctx, index, .exceeded_budget) };
-}
-
-/// Whether any route's top-level await is still in flight. The boot context
-/// closes once none is, after a settlement or an expiry
-/// (`worker/runtime/modules.zig`).
-pub fn anyEvaluating(ctx: *module_context.Context) bool {
-    for (ctx.modules.routes.items) |route| {
-        if (route.module == .evaluating)
-            return true;
-    }
-    return false;
+    const evaluation_id = ctx.modules.routes.items[index].module.evaluating.evaluation_id;
+    return .{ .waiters = pinFailed(ctx, index, .exceeded_budget), .evaluation_id = evaluation_id };
 }
 
 /// Monotonic stamps of the steps of the boot's pack registration
@@ -362,13 +446,15 @@ pub const BootRouteOutcome = enum {
     /// Nothing of the route is in flight: it is ready, failed or `idle`.
     settled,
     /// Its top-level await is in flight with the route `evaluating`; the
-    /// caller arms `module_eval_budget_ns` on the boot context.
+    /// caller arms the route's evaluation at its budget.
     pending,
 };
 
-/// Evaluates the entry of the route at `index` in the route's realm, after
-/// `bootRegisterPack`, so a cold-started worker serves its first request
-/// without module work. The caller evaluates every route in route order.
+/// Evaluates the entry of the route at `index` in the route's realm, under
+/// evaluation `evaluation_id` (`evaluateRoute` says which id that must be),
+/// after `bootRegisterPack`, so a cold-started worker serves its first
+/// request without module work. The caller evaluates every route in route
+/// order.
 ///
 /// A failure to create the route's realm fails the init. A synchronous throw
 /// pins the route failed, as a rejected top-level await does, and the worker
@@ -377,10 +463,10 @@ pub const BootRouteOutcome = enum {
 /// uncached, so each request for the route evaluates the entry again and
 /// fails on its own. A route the boot already moved out of `idle` is left as
 /// it is.
-pub fn bootEvaluateRoute(ctx: *module_context.Context, index: usize) !BootRouteOutcome {
+pub fn bootEvaluateRoute(ctx: *module_context.Context, index: usize, evaluation_id: u64) !BootRouteOutcome {
     if (ctx.modules.routes.items[index].module != .idle)
         return .settled;
-    switch (evaluateRoute(ctx, index, null) catch |err| switch (err) {
+    switch (evaluateRoute(ctx, index, evaluation_id, null) catch |err| switch (err) {
         // An uncallable default export is the tenant's mistake and is left
         // to each request; every other error fails the init.
         error.HandlerNotCallable => {
@@ -459,9 +545,7 @@ fn registerPack(
     var staged = try stageLoadedSources(ctx, parsed_pack);
     defer staged.deinit(ctx.allocator);
     // Registration consumes the mapping that parsed_pack points into.
-    try ctx.vm.registerModulePackMapping(pack.take(), .{
-        .lifetime = @intFromEnum(bindings.ModuleLifetime.permanent),
-    });
+    try ctx.vm.registerModulePackMapping(pack.take(), .permanent);
     staged.commit(ctx);
     if (marks) |m| m.pack_registered_ns = process.monotonicNowNsOrZero();
 }
@@ -481,12 +565,12 @@ fn markRouteThrew(ctx: *module_context.Context, index: usize) void {
 /// queues again so each gets its 500, empty for an `idle` route. Changes the
 /// tag in place and allocates nothing.
 ///
-/// It also owns the rule that sets `State.recycle_after_drain`: the worker
-/// gives way to a fresh one only once none of its routes can serve, and only
-/// when one failed on an await (`RouteModuleState.Failure`), which a fresh
-/// evaluation may get past. While any route is ready, still evaluating or
-/// `idle`, the worker keeps serving, so one broken route never takes the
-/// healthy ones down with it, and a worker whose routes all threw
+/// It also owns the rule that sets `State.fresh_worker_may_serve`: the
+/// worker gives way to a fresh one only once none of its routes can serve,
+/// and only when one failed on an await (`RouteModuleState.Failure`), which
+/// a fresh evaluation may get past. While any route is ready, still
+/// evaluating or `idle`, the worker keeps serving, so one broken route never
+/// takes the healthy ones down with it, and a worker whose routes all threw
 /// synchronously keeps answering 500s instead of booting replacements that
 /// would throw again.
 fn pinFailed(
@@ -504,7 +588,7 @@ fn pinFailed(
     };
     route.module = .{ .failed = failure };
     if (freshWorkerMayServe(ctx.modules.routes.items))
-        ctx.modules.recycle_after_drain = true;
+        ctx.modules.fresh_worker_may_serve = true;
     return waiters;
 }
 

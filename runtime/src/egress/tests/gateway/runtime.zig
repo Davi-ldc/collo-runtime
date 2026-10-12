@@ -1,13 +1,16 @@
 //! The gateway loop's own state, apart from any engine: the shard a fetch hashes to, the router's
 //! session-scoped route keys, what a route keeps and per-worker removal, the drop queue's
 //! deduplication and overflow, the invalid-command window, a worker attach under allocation
-//! failure, the readiness ring's size, and the hysteresis of the backpressure levels. The loop's
-//! dispatch over a real endpoint is covered in `worker_flow.zig`, and its control socket in
-//! `control_flow.zig`. Lane: egress-gateway-test.
+//! failure, the gateway's boot under allocation failure, the readiness ring's size up to the
+//! largest plan, and the hysteresis of the backpressure levels. The loop's dispatch over a real
+//! endpoint is covered in `worker_flow.zig`, and its control socket in `control_flow.zig`. Lane:
+//! egress-gateway-test.
 
 const std = @import("std");
 const gateway = @import("collo_egress_gateway");
 const ipc = @import("collo_ipc");
+
+const loop_support = @import("support/loop.zig");
 
 test "egress gateway shard hashing is deterministic and bounded" {
     const isolation: gateway.policy.PoolIsolation = .{
@@ -76,8 +79,8 @@ test "egress gateway body route lookup validates fetch id and keeps what admissi
     const route = router.routeForBody(1, 7, 9) orelse return error.MissingRoute;
     try std.testing.expect(router.routeForBody(1, 8, 9) == null);
     try std.testing.expect(router.routeForBody(2, 7, 9) == null);
-    // A fetch resubmitted after its shard restarts runs under the cell and the policy entry
-    // its token named at admission, which the route keeps.
+    // A fetch resubmitted after its shard restarts runs under the cell and the policy its token
+    // named at admission, which the route keeps.
     try std.testing.expectEqual(@as(usize, 2), route.record.shard_index);
     try std.testing.expectEqualSlices(u8, &([_]u8{3} ** 16), &route.record.security_cell_id);
     try std.testing.expectEqual(@as(u16, 5), route.record.policy_id);
@@ -254,10 +257,10 @@ test "egress gateway worker attach registry is transactional under allocation fa
         );
         defer registry.deinit(failing.allocator());
 
-        var session_fds = try createSession();
+        var session_fds = try loop_support.createSession();
         defer session_fds.deinit();
 
-        var gateway_raw = try dupEgressRawFds(session_fds.rawForGateway());
+        var gateway_raw = try loop_support.dupEgressRawFds(session_fds.rawForGateway());
         var endpoint = try ipc.egress_shared.mapEndpointTakeForGateway(&gateway_raw);
         var endpoint_owned = true;
         defer {
@@ -286,49 +289,52 @@ test "egress gateway worker attach registry is transactional under allocation fa
     }
 }
 
-test "egress gateway readiness ring accounts for all worker polls" {
+test "a gateway whose boot allocation fails frees what it took and closes its control socket" {
+    // The engines are never built: each failure comes before the shards.
+    const plan = gateway.sizing.Plan{
+        .shard_count = 1,
+        .engine_threads = .{ .h2_connectors = 1, .resolvers = 0 },
+        .sessions_max = 1,
+        .open_files = 1024,
+        .address_space_bytes = 1024 * 1024 * 1024,
+    };
+    // The scratch, the decode scratch and the upload allocator's cell: the gateway owns none of
+    // them until all three exist, so `init` itself frees those a later failure leaves.
+    for (0..3) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        // The gateway owns the descriptor from the call on, whatever the call returns.
+        const control_fd = try std.posix.eventfd(0, std.os.linux.EFD.CLOEXEC);
+        try std.testing.expectError(
+            error.OutOfMemory,
+            gateway.runtime.Gateway.init(failing.allocator(), control_fd, plan),
+        );
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        const linux = std.os.linux;
+        try std.testing.expectEqual(linux.E.BADF, linux.E.init(linux.fcntl(control_fd, linux.F.GETFD, 0)));
+    }
+}
+
+test "the readiness ring holds every poll a pass arms for its sessions" {
     const shard_count: usize = 8;
-    const max_workers: usize = 256;
-    const entries = gateway.readiness.recommendedEntryCount(shard_count, max_workers);
+    const max_sessions: usize = 256;
+    const entries = gateway.readiness.recommendedEntryCount(shard_count, max_sessions);
 
-    // The control poll, a poll per shard and two per worker, plus the removal
-    // headroom and the floor that `recommendedEntryCount` keeps.
-    try std.testing.expect(entries >= 1 + shard_count + max_workers * 2 + 32);
+    // The control poll, a poll per shard, two per session and the tick timeout, plus the removal
+    // headroom; io_uring takes a power of two, and the count keeps a floor of 256.
+    try std.testing.expect(entries >= 1 + shard_count + max_sessions * 2 + 1 + 32);
     try std.testing.expect(entries >= 256);
+    try std.testing.expect(std.math.isPowerOfTwo(entries));
 }
 
-/// A session on a wake set of its own. The session holds its own copy of
-/// every wake descriptor, so the set closes once the session is built.
-fn createSession() !ipc.egress_shared.SessionFds {
-    var wake_set = try ipc.egress_shared.WakeSet.create();
-    defer wake_set.deinit();
-    return ipc.egress_shared.createSessionForWorker(&wake_set);
-}
+test "the readiness ring of the largest plan is a power of two within the kernel's limit" {
+    const shard_count = gateway.shard.default_max_shards;
+    const max_sessions = gateway.sizing.sessions_max;
+    const entries = gateway.readiness.recommendedEntryCount(shard_count, max_sessions);
 
-fn dupEgressRawFds(fds: ipc.egress_shared.RawFds) !ipc.egress_shared.RawFds {
-    var out = ipc.egress_shared.RawFds{};
-    errdefer out.close();
-    out.command_control_fd = try std.posix.dup(fds.command_control_fd);
-    out.command_producer_fd = try std.posix.dup(fds.command_producer_fd);
-    out.command_consumer_fd = try std.posix.dup(fds.command_consumer_fd);
-    out.command_data_fd = try std.posix.dup(fds.command_data_fd);
-    out.completion_control_fd = try std.posix.dup(fds.completion_control_fd);
-    out.completion_producer_fd = try std.posix.dup(fds.completion_producer_fd);
-    out.completion_consumer_fd = try std.posix.dup(fds.completion_consumer_fd);
-    out.completion_data_fd = try std.posix.dup(fds.completion_data_fd);
-    out.body_pool_control_fd = try std.posix.dup(fds.body_pool_control_fd);
-    out.body_pool_producer_fd = try std.posix.dup(fds.body_pool_producer_fd);
-    out.body_pool_consumer_fd = try std.posix.dup(fds.body_pool_consumer_fd);
-    out.body_pool_data_fd = try std.posix.dup(fds.body_pool_data_fd);
-    out.upload_pool_control_fd = try std.posix.dup(fds.upload_pool_control_fd);
-    out.upload_pool_producer_fd = try std.posix.dup(fds.upload_pool_producer_fd);
-    out.upload_pool_consumer_fd = try std.posix.dup(fds.upload_pool_consumer_fd);
-    out.upload_pool_data_fd = try std.posix.dup(fds.upload_pool_data_fd);
-    out.command_eventfd = try std.posix.dup(fds.command_eventfd);
-    out.completion_eventfd = try std.posix.dup(fds.completion_eventfd);
-    out.liveness_fd = try std.posix.dup(fds.liveness_fd);
-    out.peer_liveness_fd = try std.posix.dup(fds.peer_liveness_fd);
-    return out;
+    try std.testing.expect(std.math.isPowerOfTwo(entries));
+    try std.testing.expect(entries <= gateway.readiness.ring_entries_max);
+    // One pass arms the control poll, a poll per shard, two per session and the tick timeout.
+    try std.testing.expect(entries >= 1 + shard_count + 2 * max_sessions + 1);
 }
 
 test "egress gateway worker backpressure uses hysteresis" {

@@ -10,10 +10,11 @@
 //! eventfd over the ring fd, and transient flush failures are injected
 //! through `test_flush_failures`. A NOBUFS suspension is read from
 //! `provided_multishot_suspensions`, because the drain that ingests it can
-//! lift it before the wait returns. When the kernel refuses to create a ring,
-//! a test returns without checking anything; tests that need provided-buffer
-//! rings skip when the kernel lacks them. How the engine's owner loop uses
-//! the driver is tested in all.zig.
+//! lift it before the wait returns. Every test skips when the kernel or its
+//! policy offers no io_uring (`initDriver`), and tests that need
+//! provided-buffer rings skip when the kernel lacks them; any other setup
+//! failure fails the test. How the engine's owner loop uses the driver is
+//! tested in all.zig.
 
 const std = @import("std");
 const data_io = @import("collo_egress_client").data_io;
@@ -33,6 +34,27 @@ fn socketPair() ![2]std.posix.fd_t {
     }
 }
 
+/// A driver, or a skip when this kernel or its policy offers no usable
+/// io_uring (`Driver.initWithConfig`'s `UnsupportedKernel` and
+/// `PermissionDenied`); any other failure fails the test.
+fn initDriver(config: data_io.Config) !data_io.Driver {
+    return data_io.Driver.initWithConfig(std.testing.allocator, config) catch |err| switch (err) {
+        error.UnsupportedKernel, error.PermissionDenied => return error.SkipZigTest,
+        else => |other| return other,
+    };
+}
+
+/// Switches the driver to provided-buffer multishot recv, or skips when the
+/// kernel has no buffer rings (`IORING_REGISTER_PBUF_RING` answers EINVAL
+/// before Linux 5.19); any other failure fails the test.
+fn requireProvidedMultishot(driver: *data_io.Driver) !void {
+    const provided = driver.ensureProvidedMultishot() catch |err| switch (err) {
+        error.ArgumentsInvalid => return error.SkipZigTest,
+        else => |other| return other,
+    };
+    if (!provided) return error.SkipZigTest;
+}
+
 /// Teardown for a transport the driver has seen. A confirmed cancel leaves
 /// the transport with the caller, which deinits it. An unconfirmed cancel
 /// quarantines the registration and hands the transport to the driver,
@@ -44,7 +66,7 @@ fn cancelAndDeinit(driver: *data_io.Driver, bio: *transport.TlsBioTransport) voi
 }
 
 test "egress data io wakes from eventfd without sources" {
-    var driver = data_io.Driver.init(std.testing.allocator) catch return;
+    var driver = try initDriver(.{});
     defer driver.deinit();
     const wake_fd = try std.posix.eventfd(0, std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK);
     defer std.posix.close(wake_fd);
@@ -55,7 +77,7 @@ test "egress data io wakes from eventfd without sources" {
 }
 
 test "egress data io can force one-shot recv fallback" {
-    var driver = data_io.Driver.initWithConfig(std.testing.allocator, .{ .recv_strategy = .one_shot }) catch return;
+    var driver = try initDriver(.{ .recv_strategy = .one_shot });
     defer driver.deinit();
 
     try std.testing.expect(!driver.usingProvidedMultishot());
@@ -68,11 +90,11 @@ test "egress data io can force one-shot recv fallback" {
 }
 
 test "egress data io exposes provided multishot when kernel supports buffer rings" {
-    var driver = data_io.Driver.initWithConfig(std.testing.allocator, .{
+    var driver = try initDriver(.{
         .recv_strategy = .provided_multishot,
         .provided_buffer_count = 2,
         .provided_buffer_size = 1024,
-    }) catch return error.SkipZigTest;
+    });
     defer driver.deinit();
 
     try std.testing.expect(try driver.ensureProvidedMultishot());
@@ -80,7 +102,7 @@ test "egress data io exposes provided multishot when kernel supports buffer ring
 }
 
 test "egress data io sends BIO handshake ciphertext" {
-    var driver = data_io.Driver.init(std.testing.allocator) catch return;
+    var driver = try initDriver(.{});
     defer driver.deinit();
 
     const fds = try socketPair();
@@ -126,7 +148,7 @@ test "egress data io sends BIO handshake ciphertext" {
 }
 
 test "egress data io preserves ciphertext after a partial socket send" {
-    var driver = data_io.Driver.init(std.testing.allocator) catch return;
+    var driver = try initDriver(.{});
     defer driver.deinit();
 
     const fds = try socketPair();
@@ -178,7 +200,7 @@ test "egress data io preserves ciphertext after a partial socket send" {
 }
 
 test "egress data io keeps one recv and one send in flight per BIO connection" {
-    var driver = data_io.Driver.init(std.testing.allocator) catch return;
+    var driver = try initDriver(.{});
     defer driver.deinit();
 
     const fds = try socketPair();
@@ -214,7 +236,7 @@ test "egress data io keeps one recv and one send in flight per BIO connection" {
 }
 
 test "egress data io expires BIO read deadlines" {
-    var driver = data_io.Driver.init(std.testing.allocator) catch return;
+    var driver = try initDriver(.{});
     defer driver.deinit();
 
     const fds = try socketPair();
@@ -245,7 +267,7 @@ test "egress data io expires BIO read deadlines" {
 }
 
 test "egress data io expires deadline-only sources without arming io" {
-    var driver = data_io.Driver.init(std.testing.allocator) catch return;
+    var driver = try initDriver(.{});
     defer driver.deinit();
 
     var context: u8 = 0;
@@ -259,7 +281,7 @@ test "egress data io expires deadline-only sources without arming io" {
 }
 
 test "egress data io coalesces fd readiness and serves one result per wait" {
-    var driver = data_io.Driver.init(std.testing.allocator) catch return;
+    var driver = try initDriver(.{});
     defer driver.deinit();
 
     const pair_a = try socketPair();
@@ -315,7 +337,7 @@ test "egress data io coalesces fd readiness and serves one result per wait" {
 }
 
 test "egress data io re-arms persistent polls across interest mask changes" {
-    var driver = data_io.Driver.init(std.testing.allocator) catch return;
+    var driver = try initDriver(.{});
     defer driver.deinit();
 
     const pair = try socketPair();
@@ -360,7 +382,7 @@ test "egress data io re-arms persistent polls across interest mask changes" {
 }
 
 test "egress data io drops readiness that races a departed watch" {
-    var driver = data_io.Driver.init(std.testing.allocator) catch return;
+    var driver = try initDriver(.{});
     defer driver.deinit();
 
     const pair = try socketPair();
@@ -414,7 +436,7 @@ test "egress data io drops readiness that races a departed watch" {
 }
 
 test "egress data io drops stale fd poll completions after fd reuse" {
-    var driver = data_io.Driver.init(std.testing.allocator) catch return;
+    var driver = try initDriver(.{});
     defer driver.deinit();
 
     const pair_first = try socketPair();
@@ -457,7 +479,7 @@ test "egress data io drops stale fd poll completions after fd reuse" {
 }
 
 test "egress data io accepts more than 127 mixed sources and chunks SQ submission" {
-    var driver = data_io.Driver.init(std.testing.allocator) catch return;
+    var driver = try initDriver(.{});
     defer driver.deinit();
 
     const pair = try socketPair();
@@ -523,7 +545,7 @@ test "egress data io accepts more than 127 mixed sources and chunks SQ submissio
 // progress round after round, since the parked herd adds no SQE churn, and
 // once the herd's stall deadlines pass every one of them must fire.
 test "egress data io serves BIO progress under 128 silent armed fd watches" {
-    var driver = data_io.Driver.init(std.testing.allocator) catch return;
+    var driver = try initDriver(.{});
     defer driver.deinit();
 
     const silent_pair = try socketPair();
@@ -627,14 +649,13 @@ test "egress data io serves BIO progress under 128 silent armed fd watches" {
 // and a fresh recv delivers the same bytes. So every pass is checked as it
 // returns.
 test "egress data io releases provided h2 buffers while serving an h1 ready backlog" {
-    var driver = data_io.Driver.initWithConfig(std.testing.allocator, .{
+    var driver = try initDriver(.{
         .recv_strategy = .provided_multishot,
         .provided_buffer_count = 2,
         .provided_buffer_size = 1024,
-    }) catch return error.SkipZigTest;
+    });
     defer driver.deinit();
-    const provided = driver.ensureProvidedMultishot() catch return error.SkipZigTest;
-    if (!provided) return error.SkipZigTest;
+    try requireProvidedMultishot(&driver);
 
     // Four watches on one readable fd keep a coalesced ready backlog alive
     // across every round: each serve re-arms, and each re-arm completes
@@ -729,7 +750,7 @@ test "egress data io releases provided h2 buffers while serving an h1 ready back
 // already armed stay serviceable. An error from syncSources would instead
 // make the owner fail every fetch on the shard.
 test "egress data io contains watch admission past the cap to the offending source" {
-    var driver = data_io.Driver.init(std.testing.allocator) catch return;
+    var driver = try initDriver(.{});
     defer driver.deinit();
 
     const pair = try socketPair();
@@ -785,7 +806,7 @@ test "egress data io contains watch admission past the cap to the offending sour
 // admission, or cancel/re-arm churn inflates the count into spurious
 // failures at the cap.
 test "egress data io reaps completed arms before rejecting admission at the cap" {
-    var driver = data_io.Driver.init(std.testing.allocator) catch return;
+    var driver = try initDriver(.{});
     defer driver.deinit();
 
     const pair_old = try socketPair();
@@ -851,7 +872,7 @@ test "egress data io reaps completed arms before rejecting admission at the cap"
 // Each cancel must abandon the registration instead of blocking forever on a
 // CQE that will never come, or panicking when the drain's enter fails.
 test "egress data io abandons teardown drains on a dead ring" {
-    var driver = data_io.Driver.init(std.testing.allocator) catch return;
+    var driver = try initDriver(.{});
     defer driver.deinit();
 
     const fds = try socketPair();
@@ -922,7 +943,7 @@ test "egress data io abandons teardown drains on a dead ring" {
 // the unread CQEs stay in the CQ for the passes that follow, where they
 // coalesce per slot.
 test "egress data io serves an expired deadline before draining a completion backlog" {
-    var driver = data_io.Driver.init(std.testing.allocator) catch return;
+    var driver = try initDriver(.{});
     defer driver.deinit();
 
     const pair = try socketPair();
@@ -998,14 +1019,13 @@ fn floodWriter(fd: std.posix.fd_t, stop: *std.atomic.Value(bool)) void {
 // that ran until the CQ was empty could be captured indefinitely. The
 // bounded drain must still let the deadline-only source fire on time.
 test "egress data io fires deadlines under a continuous provided-multishot flood" {
-    var driver = data_io.Driver.initWithConfig(std.testing.allocator, .{
+    var driver = try initDriver(.{
         .recv_strategy = .provided_multishot,
         .provided_buffer_count = 4,
         .provided_buffer_size = 1024,
-    }) catch return error.SkipZigTest;
+    });
     defer driver.deinit();
-    const provided = driver.ensureProvidedMultishot() catch return error.SkipZigTest;
-    if (!provided) return error.SkipZigTest;
+    try requireProvidedMultishot(&driver);
 
     const bio_pair = try socketPair();
     defer std.posix.close(bio_pair[1]);
@@ -1081,7 +1101,7 @@ test "egress data io fires deadlines under a continuous provided-multishot flood
 // owns the cancel; waiting on a cancel the kernel never received would park
 // it forever against the silent peer.
 test "egress data io cancels a parked connection through a full SQ without hanging" {
-    var driver = data_io.Driver.init(std.testing.allocator) catch return;
+    var driver = try initDriver(.{});
     defer driver.deinit();
 
     const fds = try socketPair();
@@ -1158,7 +1178,7 @@ test "egress data io cancels a parked connection through a full SQ without hangi
 // return). A real oversubscription must be rejected without allocating a
 // slot or map entry for the rejected source.
 test "egress data io retires a departing herd before admitting its replacement at the cap" {
-    var driver = data_io.Driver.init(std.testing.allocator) catch return;
+    var driver = try initDriver(.{});
     defer driver.deinit();
 
     const pair_old = try socketPair();
@@ -1243,7 +1263,7 @@ test "egress data io retires a departing herd before admitting its replacement a
 // does not hold, and the count must stay right across repeated failed
 // reconciles.
 test "egress data io rolls back arms a failed flush never handed the kernel" {
-    var driver = data_io.Driver.init(std.testing.allocator) catch return;
+    var driver = try initDriver(.{});
     defer driver.deinit();
 
     const pair = try socketPair();
@@ -1289,7 +1309,7 @@ test "egress data io rolls back arms a failed flush never handed the kernel" {
 // wrap, where epoch 0 is a valid arm token, and still delivers readiness
 // under the wrapped token.
 test "egress data io delivers readiness across a per-slot epoch wrap" {
-    var driver = data_io.Driver.init(std.testing.allocator) catch return;
+    var driver = try initDriver(.{});
     defer driver.deinit();
 
     const pair = try socketPair();
@@ -1363,7 +1383,7 @@ test "egress data io delivers readiness across a per-slot epoch wrap" {
 // longer touches the buffers, are the registration released and the
 // transport deinited.
 test "egress data io quarantines an unconfirmed cancel on a live ring until terminals arrive" {
-    var driver = data_io.Driver.init(std.testing.allocator) catch return;
+    var driver = try initDriver(.{});
     defer driver.deinit();
 
     const fds = try socketPair();
@@ -1451,14 +1471,13 @@ test "egress data io quarantines an unconfirmed cancel on a live ring until term
 // empty, it is restored instead of the shard paying for one-shot recv
 // forever.
 test "egress data io recovers provided multishot after a NOBUFS under a readiness-heavy flood" {
-    var driver = data_io.Driver.initWithConfig(std.testing.allocator, .{
+    var driver = try initDriver(.{
         .recv_strategy = .provided_multishot,
         .provided_buffer_count = 2,
         .provided_buffer_size = 1024,
-    }) catch return error.SkipZigTest;
+    });
     defer driver.deinit();
-    const provided = driver.ensureProvidedMultishot() catch return error.SkipZigTest;
-    if (!provided) return error.SkipZigTest;
+    try requireProvidedMultishot(&driver);
 
     // 600 armed one-shot polls on a level-ready fd all complete at once,
     // parking 600 CQEs ahead of anything the transport posts, more than one
@@ -1557,7 +1576,7 @@ test "egress data io recovers provided multishot after a NOBUFS under a readines
 }
 
 test "egress data io reports socket EOF to BIO transport" {
-    var driver = data_io.Driver.init(std.testing.allocator) catch return;
+    var driver = try initDriver(.{});
     defer driver.deinit();
 
     const fds = try socketPair();

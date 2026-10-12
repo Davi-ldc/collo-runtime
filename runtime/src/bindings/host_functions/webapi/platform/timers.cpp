@@ -12,41 +12,35 @@
 
 #include <JavaScriptCore/Error.h>
 #include <JavaScriptCore/JSCInlines.h>
-#include <cmath>
-#include <limits>
 #include <optional>
 
 namespace {
 
-// The largest WebIDL `long`, the type HTML gives the timeout argument.
-constexpr double maxTimerDelayMs = 2147483647.0;
-
-// Truncates the delay toward zero. NaN and non-positive delays become 0, and a delay above maxTimerDelayMs saturates
-// there, where WebIDL's `long` conversion would wrap a finite delay modulo 2^32 and turn an infinite one into 0. The
-// conversion can run script.
+// HTML's timeout is a WebIDL `long`: ToInt32 wraps a finite delay modulo 2^32 and maps NaN and the infinities to 0,
+// then HTML clamps a negative timeout to 0. The conversion can run script.
 uint32_t timerDelayMs(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSC::JSValue value)
 {
-    double raw_delay = value.toNumber(global_object);
+    const int32_t delay = value.toInt32(global_object);
     RETURN_IF_EXCEPTION(scope, 0);
-    if (!(raw_delay > 0))
-        return 0;
-    if (raw_delay > maxTimerDelayMs)
-        return static_cast<uint32_t>(maxTimerDelayMs);
-    return static_cast<uint32_t>(raw_delay);
+    return delay > 0 ? static_cast<uint32_t>(delay) : 0;
+}
+
+// The id a number names, or nullopt for a number no timer can have: not positive, NaN, or at least 2^64.
+// double(UINT64_MAX) rounds up to 2^64, so the bound is the exact 0x1p64.
+std::optional<uint64_t> timerIdFromNumber(double raw_timer_id)
+{
+    if (!(raw_timer_id > 0) || !(raw_timer_id < 0x1p64))
+        return std::nullopt;
+    return static_cast<uint64_t>(raw_timer_id);
 }
 
 // The timer id `value` names after a number conversion, which can run script, or nullopt for a value no timer can
-// have: not positive, not finite, or beyond uint64_t.
-// FIXME: the bound compares against double(UINT64_MAX), which rounds up to 2^64, so 2^64 itself passes and its cast to
-// uint64_t is undefined behavior. immediateIdFromArgument has the same bound.
+// have.
 std::optional<uint64_t> timerIdFromValue(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSC::JSValue value)
 {
     double raw_timer_id = value.toNumber(global_object);
     RETURN_IF_EXCEPTION(scope, std::nullopt);
-    if (!(raw_timer_id > 0) || !std::isfinite(raw_timer_id)
-        || raw_timer_id > static_cast<double>(std::numeric_limits<uint64_t>::max()))
-        return std::nullopt;
-    return static_cast<uint64_t>(raw_timer_id);
+    return timerIdFromNumber(raw_timer_id);
 }
 
 JSC::EncodedJSValue setTimer(JSC::JSGlobalObject* global_object, JSC::CallFrame* call_frame, bool repeats)
@@ -72,7 +66,9 @@ JSC::EncodedJSValue setTimer(JSC::JSGlobalObject* global_object, JSC::CallFrame*
 
     ColloExecCtx* exec_ctx = Collo::HostFunctions::Runtime::activeExecContext(*owner_result.owner);
     if (!exec_ctx)
-        return JSC::throwVMTypeError(global_object, scope, "setTimeout requires an active request turn."_s);
+        return JSC::throwVMTypeError(global_object, scope,
+            repeats ? "setInterval requires an active request turn."_s
+                    : "setTimeout requires an active request turn."_s);
 
     const uint32_t delay_ms = timerDelayMs(global_object, scope, call_frame->argument(1));
     RETURN_IF_EXCEPTION(scope, {});
@@ -128,12 +124,7 @@ std::optional<uint64_t> immediateIdFromArgument(JSC::JSValue value)
         return std::nullopt;
     if (!value.isNumber())
         return std::nullopt;
-
-    double raw_timer_id = value.asNumber();
-    if (!(raw_timer_id > 0) || !std::isfinite(raw_timer_id)
-        || raw_timer_id > static_cast<double>(std::numeric_limits<uint64_t>::max()))
-        return std::nullopt;
-    return static_cast<uint64_t>(raw_timer_id);
+    return timerIdFromNumber(value.asNumber());
 }
 
 } // namespace

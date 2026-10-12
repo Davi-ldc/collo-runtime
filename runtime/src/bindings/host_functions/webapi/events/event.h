@@ -36,7 +36,8 @@ JSC::JSObject* createWebApiErrorEvent(JSC::JSGlobalObject*, WTF::String message,
 // dispatchEvent() returns: false when a listener canceled the event. Throws a TypeError for a value that is not an
 // Event and an InvalidStateError DOMException for an event already being dispatched. A listener's exception is
 // cleared and does not reach the caller, except one from the global object's onerror or onmessage handler, which
-// propagates. A termination stays pending.
+// propagates. A termination stays pending and ends the dispatch; one already pending when the call begins makes it
+// return an empty value without running any listener.
 JSC::EncodedJSValue dispatchWebApiEvent(
     JSC::JSGlobalObject*, JSC::ThrowScope&, WebApiEventTargetHandle, JSC::JSValue event_value);
 // dispatchWebApiEvent with an explicit attribute handler in place of the handle's. `attribute_handler` runs at

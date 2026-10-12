@@ -2,11 +2,12 @@
 // key's algorithm, extractable flag and usages when unwrapKey is called, so the job carries only native data, and the
 // import runs on the VM thread when the job settles. The decrypted bytes never become JavaScript values: a JWK is
 // parsed natively where the spec's "parse a JWK" step would run JSON.parse, and every buffer that holds decrypted
-// bytes is zeroed before it is freed, except the gaps marked FIXME below. The JWK checks follow jwk.cpp's importKey
-// path member for member, but the native parser fails some input that JSON.parse and the JsonWebKey conversion
-// accept: a lone surrogate, a non-string value in any string member it knows (even one the algorithm ignores), a
-// string over maxNativeJwkStringBytes, and nesting deeper than skipValue allows. A non-string key_ops element is a
-// TypeError here where importKey reports a DataError, and parseExt notes where "ext" departs from ToBoolean.
+// bytes is a `SecretBytes`, allocated once at its exact size and zeroed before it is freed. The JWK checks follow
+// jwk.cpp's importKey path member for member, but the native parser fails some input that JSON.parse and the
+// JsonWebKey conversion accept: a lone surrogate, a non-string value in any string member it knows (even one the
+// algorithm ignores), a string over maxNativeJwkStringBytes, and nesting deeper than skipValue allows. A non-string
+// key_ops element is a TypeError here where importKey reports a DataError, and parseExt notes where "ext" departs from
+// ToBoolean.
 
 #include "jsc/runtime/state.h"
 
@@ -173,13 +174,11 @@ static bool equalAscii(std::span<const uint8_t> bytes, WTF::ASCIILiteral text)
 }
 
 struct NativeJwkString {
-    ~NativeJwkString() { secureZeroVector(bytes); }
-
     bool equals(WTF::ASCIILiteral text) const { return present && equalAscii(bytes.span(), text); }
 
     bool isEmpty() const { return bytes.isEmpty(); }
 
-    WTF::Vector<uint8_t> bytes;
+    SecretBytes bytes;
     bool present { false };
 };
 
@@ -251,8 +250,7 @@ public:
         }
 
         for (;;) {
-            WTF::Vector<uint8_t> name;
-            SecureVectorGuard name_guard(name);
+            SecretBytes name;
             if (!parseString(&name, error))
                 return false;
             skipWhitespace();
@@ -330,17 +328,12 @@ private:
         return std::nullopt;
     }
 
-    // FIXME: each tryAppend that grows *out frees the previous buffer without zeroing it, and that buffer holds a
-    // prefix of a decrypted member such as "d" or "k".
-    bool appendByte(WTF::Vector<uint8_t>* out, uint8_t byte, NativeJwkParseError& error)
+    // Counts one byte of a string's value in `length` and, given `out`, appends it there. `parseString` reserves the
+    // whole value in `out` first, so the append never reallocates.
+    bool appendByte(SecretBytes* out, size_t& length, uint8_t byte, NativeJwkParseError& error)
     {
-        if (!out)
-            return true;
-        if (out->size() >= maxNativeJwkStringBytes) {
-            error = NativeJwkParseError::Json;
-            return false;
-        }
-        if (!out->tryAppend(std::span<const uint8_t> { &byte, 1 })) {
+        ++length;
+        if (out && !out->tryAppend(std::span<const uint8_t> { &byte, 1 })) {
             error = NativeJwkParseError::OutOfMemory;
             return false;
         }
@@ -369,26 +362,53 @@ private:
 
     // Appends a Unicode scalar value as UTF-8, so a string holds the text JSON.parse would produce, encoded as UTF-8
     // like the unescaped bytes around it.
-    bool appendCodepointUtf8(WTF::Vector<uint8_t>* out, unsigned codepoint, NativeJwkParseError& error)
+    bool appendCodepointUtf8(SecretBytes* out, size_t& length, unsigned codepoint, NativeJwkParseError& error)
     {
         if (codepoint <= 0x7f)
-            return appendByte(out, static_cast<uint8_t>(codepoint), error);
+            return appendByte(out, length, static_cast<uint8_t>(codepoint), error);
         if (codepoint <= 0x7ff) {
-            return appendByte(out, static_cast<uint8_t>(0xc0 | (codepoint >> 6)), error)
-                && appendByte(out, static_cast<uint8_t>(0x80 | (codepoint & 0x3f)), error);
+            return appendByte(out, length, static_cast<uint8_t>(0xc0 | (codepoint >> 6)), error)
+                && appendByte(out, length, static_cast<uint8_t>(0x80 | (codepoint & 0x3f)), error);
         }
         if (codepoint <= 0xffff) {
-            return appendByte(out, static_cast<uint8_t>(0xe0 | (codepoint >> 12)), error)
-                && appendByte(out, static_cast<uint8_t>(0x80 | ((codepoint >> 6) & 0x3f)), error)
-                && appendByte(out, static_cast<uint8_t>(0x80 | (codepoint & 0x3f)), error);
+            return appendByte(out, length, static_cast<uint8_t>(0xe0 | (codepoint >> 12)), error)
+                && appendByte(out, length, static_cast<uint8_t>(0x80 | ((codepoint >> 6) & 0x3f)), error)
+                && appendByte(out, length, static_cast<uint8_t>(0x80 | (codepoint & 0x3f)), error);
         }
-        return appendByte(out, static_cast<uint8_t>(0xf0 | (codepoint >> 18)), error)
-            && appendByte(out, static_cast<uint8_t>(0x80 | ((codepoint >> 12) & 0x3f)), error)
-            && appendByte(out, static_cast<uint8_t>(0x80 | ((codepoint >> 6) & 0x3f)), error)
-            && appendByte(out, static_cast<uint8_t>(0x80 | (codepoint & 0x3f)), error);
+        return appendByte(out, length, static_cast<uint8_t>(0xf0 | (codepoint >> 18)), error)
+            && appendByte(out, length, static_cast<uint8_t>(0x80 | ((codepoint >> 12) & 0x3f)), error)
+            && appendByte(out, length, static_cast<uint8_t>(0x80 | ((codepoint >> 6) & 0x3f)), error)
+            && appendByte(out, length, static_cast<uint8_t>(0x80 | (codepoint & 0x3f)), error);
     }
 
-    bool parseString(WTF::Vector<uint8_t>* out, NativeJwkParseError& error)
+    // Reads a string. Given `out`, which must be empty, a first scan measures the value and holds it to
+    // maxNativeJwkStringBytes, so `out` is allocated once at its exact size before a second scan copies the value into
+    // it. Without `out`, as for a skipped value, the string is only validated and has no bound of its own.
+    bool parseString(SecretBytes* out, NativeJwkParseError& error)
+    {
+        const size_t start = m_offset;
+        size_t length = 0;
+        if (!scanString(nullptr, length, error))
+            return false;
+        if (!out)
+            return true;
+        if (length > maxNativeJwkStringBytes) {
+            error = NativeJwkParseError::Json;
+            return false;
+        }
+        if (!out->tryReserveCapacity(length)) {
+            error = NativeJwkParseError::OutOfMemory;
+            return false;
+        }
+        m_offset = start;
+        size_t copied_length = 0;
+        if (!scanString(out, copied_length, error))
+            return false;
+        ASSERT(copied_length == length);
+        return true;
+    }
+
+    bool scanString(SecretBytes* out, size_t& length, NativeJwkParseError& error)
     {
         skipWhitespace();
         if (m_offset >= m_input.size() || m_input[m_offset++] != '"') {
@@ -405,7 +425,7 @@ private:
                 return false;
             }
             if (byte != '\\') {
-                if (!appendByte(out, byte, error))
+                if (!appendByte(out, length, byte, error))
                     return false;
                 continue;
             }
@@ -419,27 +439,27 @@ private:
             case '"':
             case '\\':
             case '/':
-                if (!appendByte(out, escaped, error))
+                if (!appendByte(out, length, escaped, error))
                     return false;
                 break;
             case 'b':
-                if (!appendByte(out, '\b', error))
+                if (!appendByte(out, length, '\b', error))
                     return false;
                 break;
             case 'f':
-                if (!appendByte(out, '\f', error))
+                if (!appendByte(out, length, '\f', error))
                     return false;
                 break;
             case 'n':
-                if (!appendByte(out, '\n', error))
+                if (!appendByte(out, length, '\n', error))
                     return false;
                 break;
             case 'r':
-                if (!appendByte(out, '\r', error))
+                if (!appendByte(out, length, '\r', error))
                     return false;
                 break;
             case 't':
-                if (!appendByte(out, '\t', error))
+                if (!appendByte(out, length, '\t', error))
                     return false;
                 break;
             case 'u': {
@@ -468,7 +488,7 @@ private:
                     error = NativeJwkParseError::Json;
                     return false;
                 }
-                if (!appendCodepointUtf8(out, codepoint, error))
+                if (!appendCodepointUtf8(out, length, codepoint, error))
                     return false;
                 break;
             }
@@ -485,7 +505,6 @@ private:
     // A repeated member replaces the earlier one, as in JSON.parse, which keeps the last.
     bool parseStringField(NativeJwkString& field, NativeJwkParseError& error)
     {
-        secureZeroVector(field.bytes);
         field.bytes.clear();
         field.present = true;
         return parseString(&field.bytes, error);
@@ -509,8 +528,7 @@ private:
         }
 
         for (;;) {
-            WTF::Vector<uint8_t> usage;
-            SecureVectorGuard usage_guard(usage);
+            SecretBytes usage;
             if (!parseString(&usage, error)) {
                 if (error == NativeJwkParseError::Json)
                     error = NativeJwkParseError::Type;
@@ -677,8 +695,7 @@ private:
             return true;
         }
         if (m_offset < m_input.size() && m_input[m_offset] == '"') {
-            WTF::Vector<uint8_t> value;
-            SecureVectorGuard value_guard(value);
+            SecretBytes value;
             if (!parseString(&value, error))
                 return false;
             out.ext = !value.isEmpty();
@@ -755,35 +772,27 @@ static void setNativeJwkParseError(
     out_error = domExceptionValue(global_object, DOMExceptionCode::DataError);
 }
 
-static bool decodeNativeBase64Url(JSC::JSGlobalObject* global_object, const NativeJwkString& field,
-    WTF::Vector<uint8_t>& out, JSC::JSValue& out_error)
+// Decodes a member into `out`, which must be empty. jwk.cpp's importKey decodes with the same decodeSecretBase64Url,
+// so both front ends accept the same alphabet and padding and both reject whitespace.
+static bool decodeNativeBase64Url(
+    JSC::JSGlobalObject* global_object, const NativeJwkString& field, SecretBytes& out, JSC::JSValue& out_error)
 {
     if (!field.present || field.bytes.size() > maxNativeJwkStringBytes) {
         out_error = domExceptionValue(global_object, DOMExceptionCode::DataError);
         return false;
     }
-    // jwk.cpp decodes with the same WTF::base64URLDecode and the same options, so both front ends accept the same
-    // alphabet and padding and both reject whitespace.
-    auto decoded = WTF::base64URLDecode(field.bytes.span());
-    if (!decoded) {
-        out_error = domExceptionValue(global_object, DOMExceptionCode::DataError);
-        return false;
-    }
-    // The decoded bytes can be private key material, so they are copied into the caller's guarded output and zeroed
-    // here before the buffer is freed.
-    // FIXME: base64URLDecode decodes into a buffer as long as its input and shrinks it to the decoded length, so the
-    // capacity past size() still holds the last quarter of the decoded sextets, which secureZeroVector does not reach.
-    bool ok = out.tryAppend(decoded->span());
-    secureZeroVector(*decoded);
-    if (!ok) {
+    bool allocation_failed = false;
+    if (decodeSecretBase64Url(field.bytes.span(), out, allocation_failed))
+        return true;
+    if (allocation_failed)
         out_error = JSC::createOutOfMemoryError(global_object);
-        return false;
-    }
-    return true;
+    else
+        out_error = domExceptionValue(global_object, DOMExceptionCode::DataError);
+    return false;
 }
 
-static bool getNativeJwkBytes(JSC::JSGlobalObject* global_object, const NativeJwkString& field,
-    WTF::Vector<uint8_t>& out, JSC::JSValue& out_error)
+static bool getNativeJwkBytes(
+    JSC::JSGlobalObject* global_object, const NativeJwkString& field, SecretBytes& out, JSC::JSValue& out_error)
 {
     if (!decodeNativeBase64Url(global_object, field, out, out_error))
         return false;
@@ -794,13 +803,15 @@ static bool getNativeJwkBytes(JSC::JSGlobalObject* global_object, const NativeJw
     return true;
 }
 
-static bool getNativeRsaInteger(JSC::JSGlobalObject* global_object, const NativeJwkString& field,
-    WTF::Vector<uint8_t>& out, bool trim_leading_zero, JSC::JSValue& out_error)
+static bool getNativeRsaInteger(JSC::JSGlobalObject* global_object, const NativeJwkString& field, SecretBytes& out,
+    bool trim_leading_zero, JSC::JSValue& out_error)
 {
     if (!getNativeJwkBytes(global_object, field, out, out_error))
         return false;
-    if (trim_leading_zero && out.size() > 1 && out[0] == 0)
-        out.removeAt(0);
+    if (trim_leading_zero && out.size() > 1 && !out.data()[0]) {
+        std::memmove(out.data(), out.data() + 1, out.size() - 1);
+        out.shrink(out.size() - 1);
+    }
     return true;
 }
 
@@ -860,8 +871,7 @@ static bool importNativeHmacJwkWithSpec(JSC::JSGlobalObject* global_object, JSC:
         || !validateNativeJwkKeyOps(global_object, jwk, spec.usages, out_error))
         return false;
 
-    WTF::Vector<uint8_t> material;
-    SecureVectorGuard material_guard(material);
+    SecretBytes material;
     if (!getNativeJwkBytes(global_object, jwk.k, material, out_error))
         return false;
     // Web Crypto HMAC import requires a declared length to satisfy data_bits - 8 < length <= data_bits.
@@ -873,8 +883,6 @@ static bool importNativeHmacJwkWithSpec(JSC::JSGlobalObject* global_object, JSC:
 
     out_key = createHmacKey(global_object, spec.hash, WTF::move(material), spec.extractable, spec.usages,
         spec.has_length_bits ? spec.length_bits : 0);
-    if (out_key)
-        material_guard.dismiss();
     return !takePendingException(scope, out_error);
 }
 
@@ -889,8 +897,7 @@ static bool importNativeAesJwkWithSpec(JSC::JSGlobalObject* global_object, JSC::
         return false;
     }
 
-    WTF::Vector<uint8_t> material;
-    SecureVectorGuard material_guard(material);
+    SecretBytes material;
     if (!getNativeJwkBytes(global_object, jwk.k, material, out_error))
         return false;
     if (!isValidAesKeyLength(material.size())) {
@@ -904,8 +911,6 @@ static bool importNativeAesJwkWithSpec(JSC::JSGlobalObject* global_object, JSC::
         return false;
 
     out_key = createAesKey(global_object, spec.algorithm, WTF::move(material), spec.extractable, spec.usages);
-    if (out_key)
-        material_guard.dismiss();
     return !takePendingException(scope, out_error);
 }
 
@@ -932,8 +937,8 @@ static bool importNativeRsaJwkWithSpec(JSC::JSGlobalObject* global_object, JSC::
         return false;
     }
 
-    WTF::Vector<uint8_t> n;
-    WTF::Vector<uint8_t> e;
+    SecretBytes n;
+    SecretBytes e;
     if (!getNativeRsaInteger(global_object, jwk.n, n, true, out_error)
         || !getNativeRsaInteger(global_object, jwk.e, e, false, out_error))
         return false;
@@ -953,18 +958,12 @@ static bool importNativeRsaJwkWithSpec(JSC::JSGlobalObject* global_object, JSC::
     if (type == CryptoKeyType::Public)
         rsa.reset(RSA_new_public_key_large_e(bn_n.get(), bn_e.get()));
     else {
-        WTF::Vector<uint8_t> d;
-        WTF::Vector<uint8_t> p;
-        WTF::Vector<uint8_t> q;
-        WTF::Vector<uint8_t> dp;
-        WTF::Vector<uint8_t> dq;
-        WTF::Vector<uint8_t> qi;
-        SecureVectorGuard d_guard(d);
-        SecureVectorGuard p_guard(p);
-        SecureVectorGuard q_guard(q);
-        SecureVectorGuard dp_guard(dp);
-        SecureVectorGuard dq_guard(dq);
-        SecureVectorGuard qi_guard(qi);
+        SecretBytes d;
+        SecretBytes p;
+        SecretBytes q;
+        SecretBytes dp;
+        SecretBytes dq;
+        SecretBytes qi;
         if (!getNativeRsaInteger(global_object, jwk.d, d, false, out_error)
             || !getNativeRsaInteger(global_object, jwk.p, p, false, out_error)
             || !getNativeRsaInteger(global_object, jwk.q, q, false, out_error)
@@ -1032,8 +1031,8 @@ static bool importNativeEcJwkWithSpec(JSC::JSGlobalObject* global_object, JSC::T
     }
 
     auto coordinate_bytes = coordinateBytesForNamedCurve(spec.curve);
-    WTF::Vector<uint8_t> x;
-    WTF::Vector<uint8_t> y;
+    SecretBytes x;
+    SecretBytes y;
     if (!getNativeJwkBytes(global_object, jwk.x, x, out_error)
         || !getNativeJwkBytes(global_object, jwk.y, y, out_error))
         return false;
@@ -1050,8 +1049,7 @@ static bool importNativeEcJwkWithSpec(JSC::JSGlobalObject* global_object, JSC::T
         return false;
     }
     if (type == CryptoKeyType::Private) {
-        WTF::Vector<uint8_t> d;
-        SecureVectorGuard d_guard(d);
+        SecretBytes d;
         if (!getNativeJwkBytes(global_object, jwk.d, d, out_error))
             return false;
         if (d.size() != coordinate_bytes) {
@@ -1109,9 +1107,8 @@ static bool importNativeOkpJwkWithSpec(JSC::JSGlobalObject* global_object, JSC::
         return false;
     }
 
-    WTF::Vector<uint8_t> material;
-    SecureVectorGuard material_guard(material);
-    WTF::Vector<uint8_t> declared_public;
+    SecretBytes material;
+    SecretBytes declared_public;
     if (!getNativeJwkBytes(global_object, type == CryptoKeyType::Private ? jwk.d : jwk.x, material, out_error))
         return false;
     if (material.size() != 32) {
@@ -1191,11 +1188,8 @@ static bool importUnwrappedJwkWithSpec(JSC::JSGlobalObject* global_object, JSC::
 }
 
 static bool importUnwrappedRawWithSpec(JSC::JSGlobalObject* global_object, JSC::TopExceptionScope& scope,
-    WTF::Vector<uint8_t>&& material, const UnwrappedKeyImportSpec& spec, JSColloCryptoKey*& out_key,
-    JSC::JSValue& out_error)
+    SecretBytes&& material, const UnwrappedKeyImportSpec& spec, JSColloCryptoKey*& out_key, JSC::JSValue& out_error)
 {
-    SecureVectorGuard material_guard(material);
-
     if (spec.algorithm == CryptoKeyAlgorithm::Hmac) {
         if (!validateRequestedUsages(spec.usages, CryptoKeyUsageSign | CryptoKeyUsageVerify, out_error, global_object)
             || !validateRequiredUsages(spec.usages, out_error, global_object))
@@ -1212,8 +1206,6 @@ static bool importUnwrappedRawWithSpec(JSC::JSGlobalObject* global_object, JSC::
         }
         out_key = createHmacKey(global_object, spec.hash, WTF::move(material), spec.extractable, spec.usages,
             spec.has_length_bits ? spec.length_bits : 0);
-        if (out_key)
-            material_guard.dismiss();
         return !takePendingException(scope, out_error);
     }
 
@@ -1226,8 +1218,6 @@ static bool importUnwrappedRawWithSpec(JSC::JSGlobalObject* global_object, JSC::
             return false;
         }
         out_key = createAesKey(global_object, spec.algorithm, WTF::move(material), spec.extractable, spec.usages);
-        if (out_key)
-            material_guard.dismiss();
         return !takePendingException(scope, out_error);
     }
 
@@ -1242,8 +1232,6 @@ static bool importUnwrappedRawWithSpec(JSC::JSGlobalObject* global_object, JSC::
             return false;
         }
         out_key = createRawDeriveKey(global_object, spec.algorithm, WTF::move(material), spec.usages);
-        if (out_key)
-            material_guard.dismiss();
         return !takePendingException(scope, out_error);
     }
 
@@ -1434,10 +1422,9 @@ static bool importUnwrappedAsymmetricDerWithSpec(JSC::JSGlobalObject* global_obj
 }
 
 bool importUnwrappedKeyBytesWithSpec(JSC::JSGlobalObject* global_object, JSC::TopExceptionScope& scope,
-    const String& format, WTF::Vector<uint8_t>&& bytes, const UnwrappedKeyImportSpec& spec, JSColloCryptoKey*& out_key,
+    const String& format, SecretBytes&& bytes, const UnwrappedKeyImportSpec& spec, JSColloCryptoKey*& out_key,
     JSC::JSValue& out_error)
 {
-    SecureVectorGuard bytes_guard(bytes);
     if (format == "raw"_s)
         return importUnwrappedRawWithSpec(global_object, scope, WTF::move(bytes), spec, out_key, out_error);
     if (format == "spki"_s || format == "pkcs8"_s)

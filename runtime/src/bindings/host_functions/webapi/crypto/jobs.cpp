@@ -32,7 +32,9 @@ CryptoAsyncContextResult createCryptoAsyncContext(JSC::JSGlobalObject* global_ob
         if (deferred)
             collo_promise_deferred_release(deferred);
         JSC::JSValue exception = scope.exception()->value();
-        scope.clearExceptionExceptTermination();
+        // A termination stays pending, and the empty value lets the method return with it so the VM keeps unwinding.
+        if (!scope.clearExceptionExceptTermination())
+            return { {}, {}, false };
         return { {}, rejectedPromise(global_object, exception), false };
     }
     if (status != COLLO_STATUS_OK || !deferred) {
@@ -89,47 +91,50 @@ static bool activeCryptoRequestTurn(
     const CryptoAsyncContext& context, ColloExecCtx*& out_exec_ctx, void*& out_host_runtime)
 {
     // Reads the context through `Runtime::activeExecContext`, not `current_exec_ctx`, so module top-level code, which
-    // runs outside any turn, uses the boot context when the worker installed one (`installBootContext` in
-    // `worker/runtime/boot_context.zig`).
+    // runs outside any turn, uses the evaluation the worker installed as the turnless context
+    // (collo_vm_set_turnless_exec_ctx).
     out_exec_ctx = context.owner ? Runtime::activeExecContext(*context.owner) : nullptr;
     out_host_runtime = context.owner ? context.owner->host_runtime.load(std::memory_order_acquire) : nullptr;
     return out_exec_ctx && out_exec_ctx->request_id != 0 && out_host_runtime;
 }
 
-static JSC::EncodedJSValue rejectedOutsideActiveRequestTurn(JSC::JSGlobalObject* global_object)
+static JSC::EncodedJSValue rejectedWithOperationError(JSC::JSGlobalObject* global_object, WTF::ASCIILiteral message)
 {
-    return rejectedPromise(global_object,
-        domExceptionValue(
-            global_object, DOMExceptionCode::OperationError, "WebCrypto operation requires an active request turn."_s));
+    return rejectedPromise(
+        global_object, Collo::JscSupport::domExceptionValue(global_object, DOMExceptionCode::OperationError, message));
 }
 
-JSC::EncodedJSValue enqueueCryptoJobPromise(JSC::JSGlobalObject* global_object, JSC::TopExceptionScope& scope,
-    const CryptoAsyncContext& context, std::unique_ptr<CryptoJob> job)
+JSC::EncodedJSValue enqueueCryptoJobPromise(
+    JSC::JSGlobalObject* global_object, const CryptoAsyncContext& context, std::unique_ptr<CryptoJob> job)
 {
-    UNUSED_PARAM(scope);
     if (!job)
         return runCryptoJobPromiseInline(global_object, context, nullptr);
 
     ColloExecCtx* exec_ctx = nullptr;
     void* host_runtime = nullptr;
     if (!activeCryptoRequestTurn(context, exec_ctx, host_runtime))
-        return rejectedOutsideActiveRequestTurn(global_object);
+        return rejectedWithOperationError(global_object, "WebCrypto operation requires an active request turn."_s);
 
     if (job->cost() == CryptoJobCost::InlinePreferred)
         return runCryptoJobPromiseInline(global_object, context, WTF::move(job));
 
     auto* raw_job = reinterpret_cast<ColloCryptoJob*>(job.get());
     ColloStatus status = collo_runtime_crypto_job_enqueue(host_runtime, exec_ctx->request_id, raw_job);
-    if (status == COLLO_STATUS_OK) {
+    // The statuses follow `collo_runtime_crypto_job_enqueue` in `worker/host/crypto.zig`: a call outside an active
+    // request, an in-flight bound reached, or a pool that is disabled or shutting down.
+    switch (status) {
+    case COLLO_STATUS_OK:
         job.release();
         return JSC::JSValue::encode(context.promise);
+    case COLLO_STATUS_INVALID_ARGUMENT:
+        return rejectedWithOperationError(global_object, "WebCrypto operation requires an active request turn."_s);
+    case COLLO_STATUS_ERROR:
+        return rejectedWithOperationError(global_object, "Too many WebCrypto operations are in flight."_s);
+    case COLLO_STATUS_UNSUPPORTED:
+        return rejectedWithOperationError(global_object, "The WebCrypto job pool is not running."_s);
+    default:
+        return rejectedWithOperationError(global_object, "The WebCrypto job pool refused the operation."_s);
     }
-
-    if (status == COLLO_STATUS_INVALID_ARGUMENT)
-        return rejectedOutsideActiveRequestTurn(global_object);
-
-    return rejectedPromise(global_object,
-        domExceptionValue(global_object, DOMExceptionCode::OperationError, "Crypto job queue is full."_s));
 }
 
 JSC::JSObject* createCryptoKeyPairObject(

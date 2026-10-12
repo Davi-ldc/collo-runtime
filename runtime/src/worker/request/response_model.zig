@@ -29,15 +29,18 @@ pub const Body = union(enum) {
     abi: bindings.ExtractedResponseBody,
     /// A fetch response body the response streams; no bytes are held here.
     fetch_stream: bindings.FetchBodyIdentity,
+    /// A ReadableStream the bridge locked at extraction, owned; the response
+    /// streams it (`serve/response_body_stream.zig`).
+    body_stream: bindings.ResponseBodyStream,
 
-    /// The body's length in bytes; 0 for a fetch stream.
+    /// The body's length in bytes; 0 for a stream of either kind.
     pub fn len(self: Body) usize {
         return switch (self) {
             .empty => 0,
             .bytes => |bytes| bytes.len,
             .owned => |bytes| bytes.len,
             .abi => |body| body.total_len,
-            .fetch_stream => 0,
+            .fetch_stream, .body_stream => 0,
         };
     }
 
@@ -49,7 +52,7 @@ pub const Body = union(enum) {
             .bytes => |bytes| bytes,
             .owned => |bytes| bytes,
             .abi => |body| body.firstContiguousSlice(),
-            .fetch_stream => "",
+            .fetch_stream, .body_stream => "",
         };
     }
 
@@ -81,9 +84,19 @@ pub const Body = union(enum) {
         }
     }
 
+    pub fn takeBodyStream(self: *Body) ?bindings.ResponseBodyStream {
+        switch (self.*) {
+            .body_stream => |stream| {
+                self.* = .empty;
+                return stream;
+            },
+            else => return null,
+        }
+    }
+
     /// Moves the body out as bytes that `allocator` owns, copying unless it
-    /// is already `owned`, and leaves `.empty` behind. A fetch stream has no
-    /// bytes and fails with `error.InvalidResponseBody`, as does an extracted
+    /// is already `owned`, and leaves `.empty` behind. A stream of either
+    /// kind has no bytes and fails with `error.InvalidResponseBody`, as does an extracted
     /// body whose segments do not add up to its length; a failure leaves the
     /// body as it was.
     pub fn takeOwnedBytes(self: *Body, allocator: std.mem.Allocator) ![]u8 {
@@ -107,7 +120,7 @@ pub const Body = union(enum) {
                 self.* = .empty;
                 return try allocator.dupe(u8, "");
             },
-            .fetch_stream => return error.InvalidResponseBody,
+            .fetch_stream, .body_stream => return error.InvalidResponseBody,
         }
     }
 
@@ -119,6 +132,7 @@ pub const Body = union(enum) {
             => {},
             .owned => |bytes| allocator.free(bytes),
             .abi => |*body| body.deinit(),
+            .body_stream => |*stream| stream.deinit(),
         }
         self.* = .empty;
     }

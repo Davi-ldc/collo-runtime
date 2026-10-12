@@ -1,6 +1,7 @@
 // The job model behind every asynchronous SubtleCrypto method. A method validates its arguments on the VM thread,
-// copies what the operation needs into native storage (secret bytes, `EVP_PKEY` references from `retainSharedPkey`,
-// parameters), and wraps that work in a `CryptoJob` that owns the promise's deferred. `enqueueCryptoJobPromise` runs
+// copies what the operation needs into native storage (secret bytes in `SecretBytes`, `EVP_PKEY` references from
+// `retainSharedPkey`, parameters), and wraps that work in a `CryptoJob` that owns the promise's deferred. Every byte a
+// job produces lands in a `SecretBytes` too, so the job zeroes it when destroyed. `enqueueCryptoJobPromise` runs
 // the job inline or hands it to the worker's crypto pool (`worker/js/crypto/jobs.zig`). `CryptoJob::run` is the only
 // member that may execute on a pool thread, so the work it calls never touches a JSC object; the job builds JavaScript
 // values only in `settle`, back on the VM thread. The job is destroyed on the VM thread too, because the deferred it
@@ -25,8 +26,6 @@
 #include <new>
 
 namespace Collo::HostFunctions::WebCrypto {
-
-using namespace Collo::JscSupport;
 
 // Returns a plain `{ publicKey, privateKey }` object, the CryptoKeyPair dictionary generateKey resolves with.
 JSC::JSObject* createCryptoKeyPairObject(JSC::JSGlobalObject*, JSC::VM&, JSColloCryptoKey*, JSColloCryptoKey*);
@@ -57,8 +56,10 @@ public:
     // Settles the promise on the VM thread, building its value in the promise's realm, and releases the deferred; a
     // second call returns `COLLO_STATUS_INVALID_ARGUMENT`. The promise resolves with `resolveValue`'s result. It
     // rejects with, in order of precedence, a value passed to `rejectWithValue`, an exception thrown while building the
-    // result, or a DOMException from `fail`'s code and message, which default to OperationError with no message. A
-    // non-OK status comes from settling the promise itself, with any exception in `*out_exception`.
+    // result, or an OperationError when the run failed. A non-OK status comes from settling the promise itself, with
+    // any exception in `*out_exception`. A termination pending before or during the settle must keep unwinding and
+    // nothing may enter JavaScript until it has, so the deferred is released unsettled and the call returns the
+    // termination as its exception.
     ColloStatus settle(ColloValue** out_exception)
     {
         if (!m_deferred)
@@ -68,10 +69,16 @@ public:
         auto& vm = global_object->vm();
         JSC::JSLockHolder locker(vm);
         auto scope = DECLARE_TOP_EXCEPTION_SCOPE(vm);
-        JSC::JSValue value = m_ok ? resolveValue(global_object, scope) : JSC::JSValue();
+        JSC::JSValue value;
+        if (m_ok && !scope.exception())
+            value = resolveValue(global_object, scope);
         if (scope.exception()) {
-            value = scope.exception()->value();
-            scope.clearExceptionExceptTermination();
+            JSC::JSValue thrown = scope.exception()->value();
+            if (!scope.clearExceptionExceptTermination()) {
+                releaseDeferred();
+                return Collo::caughtExceptionStatus(m_vm, scope, out_exception);
+            }
+            value = thrown;
             m_ok = false;
         }
         if (m_rejection_value) {
@@ -79,27 +86,16 @@ public:
             m_ok = false;
         }
         if (!value) {
-            value = domExceptionValue(global_object, m_error_code, m_error_message);
+            value = Collo::JscSupport::domExceptionValue(global_object, DOMExceptionCode::OperationError);
             m_ok = false;
         }
 
         ColloStatus status = Collo::settlePromiseDeferred(m_vm, m_deferred, value, !m_ok, out_exception);
-        collo_promise_deferred_release(m_deferred);
-        m_deferred = nullptr;
+        releaseDeferred();
         return status;
     }
 
 protected:
-    // Sets the DOMException a failed run rejects with. May run on a crypto pool thread inside `runImpl`, while the VM
-    // thread later reads and destroys the message, so it is stored as an isolated copy: empty, or the sole reference
-    // to a string that is not an atom. A shared reference would race on its refcount, and an atom string's destructor
-    // removes it from the AtomStringTable of whichever thread frees it.
-    void fail(DOMExceptionCode code = DOMExceptionCode::OperationError, WTF::String message = {})
-    {
-        m_error_code = code;
-        m_error_message = WTF::move(message).isolatedCopy();
-    }
-
     // Called only from `resolveValue`, on the VM thread. The value sits in heap memory the collector does not scan;
     // it stays alive because `settle` reads it back into a local before anything can allocate.
     void rejectWithValue(JSC::JSValue value) { m_rejection_value = value; }
@@ -108,6 +104,12 @@ private:
     virtual bool runImpl() = 0;
     virtual JSC::JSValue resolveValue(JSC::JSGlobalObject*, JSC::TopExceptionScope&) = 0;
 
+    void releaseDeferred()
+    {
+        collo_promise_deferred_release(m_deferred);
+        m_deferred = nullptr;
+    }
+
     ColloVm* m_vm;
     // Holds the promise's resolving functions through `JSC::Strong` handles. No cell owns the job, so nothing these
     // roots keep alive can keep the job alive in turn. The job is destroyed on the VM thread once it settles, or when
@@ -115,14 +117,12 @@ private:
     ColloPromiseDeferred* m_deferred;
     CryptoJobCost m_cost { CryptoJobCost::Heavy };
     bool m_ok { false };
-    DOMExceptionCode m_error_code { DOMExceptionCode::OperationError };
-    WTF::String m_error_message;
     JSC::JSValue m_rejection_value;
 };
 
-// Runs `work(out)`, a callable `bool(WTF::Vector<uint8_t>&)` that fills `out` and returns false on failure, and
-// resolves with a new ArrayBuffer holding a copy of the bytes. The bytes may be plaintext or key material, so the job
-// zeroes them when it is destroyed.
+// Runs `work(out)`, a callable `bool(SecretBytes&)` that fills `out` and returns false on failure, and resolves with a
+// new ArrayBuffer holding a copy of the bytes. The bytes may be plaintext or key material, and `SecretBytes` zeroes
+// them when the job is destroyed.
 template <typename Work> class BytesCryptoJob final : public CryptoJob {
 public:
     BytesCryptoJob(ColloVm* vm, ColloPromiseDeferred* deferred, Work work, CryptoJobCost cost = CryptoJobCost::Heavy)
@@ -131,19 +131,13 @@ public:
     {
     }
 
-    ~BytesCryptoJob() override
-    {
-        if (!m_bytes.isEmpty())
-            WTF::secureZeroSpan(m_bytes.mutableSpan());
-    }
-
 private:
     bool runImpl() override { return m_work(m_bytes); }
 
     JSC::JSValue resolveValue(JSC::JSGlobalObject* global_object, JSC::TopExceptionScope& scope) override
     {
         JSC::JSValue error;
-        auto result = createArrayBufferCopy(global_object, scope, m_bytes.span(), error);
+        auto result = Collo::JscSupport::createArrayBufferCopy(global_object, scope, m_bytes.span(), error);
         if (error) {
             rejectWithValue(error);
             return {};
@@ -152,7 +146,7 @@ private:
     }
 
     Work m_work;
-    WTF::Vector<uint8_t> m_bytes;
+    SecretBytes m_bytes;
 };
 
 template <typename Work> BytesCryptoJob(ColloVm*, ColloPromiseDeferred*, Work, CryptoJobCost) -> BytesCryptoJob<Work>;
@@ -188,7 +182,7 @@ struct SecretKeyResult {
     WebCryptoHash hash { WebCryptoHash::SHA256 };
     bool extractable { false };
     uint8_t usages { 0 };
-    SecureBytes material;
+    SecretBytes material;
 };
 
 // Runs `work(result)` and resolves with a new AES or HMAC CryptoKey built from it. Any other algorithm resolves to
@@ -209,10 +203,10 @@ private:
     {
         if (isAesAlgorithm(m_result.algorithm))
             return createAesKey(
-                global_object, m_result.algorithm, m_result.material.release(), m_result.extractable, m_result.usages);
+                global_object, m_result.algorithm, WTF::move(m_result.material), m_result.extractable, m_result.usages);
         if (m_result.algorithm == CryptoKeyAlgorithm::Hmac)
             return createHmacKey(
-                global_object, m_result.hash, m_result.material.release(), m_result.extractable, m_result.usages);
+                global_object, m_result.hash, WTF::move(m_result.material), m_result.extractable, m_result.usages);
         return {};
     }
 
@@ -292,7 +286,8 @@ template <typename Work> KeyPairCryptoJob(ColloVm*, ColloPromiseDeferred*, Work)
 
 // Runs `work(decrypted)`, which decrypts the wrapped key on the pool, and imports the plaintext when the job settles
 // on the VM thread: as `format`, with the attributes in `import_spec`, which the method normalized before queueing
-// the job. An import failure rejects with its error. The decrypted bytes are zeroed when the job is destroyed.
+// the job. An import failure rejects with its error. The decrypted bytes either move into the new key or are zeroed
+// when the job is destroyed.
 template <typename Work> class UnwrapKeyCryptoJob final : public CryptoJob {
 public:
     UnwrapKeyCryptoJob(ColloVm* owner, ColloPromiseDeferred* deferred, WTF::String format,
@@ -305,12 +300,6 @@ public:
         , m_import_spec(import_spec)
         , m_work(WTF::move(work))
     {
-    }
-
-    ~UnwrapKeyCryptoJob() override
-    {
-        if (!m_decrypted.isEmpty())
-            WTF::secureZeroSpan(m_decrypted.mutableSpan());
     }
 
 private:
@@ -332,7 +321,7 @@ private:
     WTF::String m_format;
     UnwrappedKeyImportSpec m_import_spec;
     Work m_work;
-    WTF::Vector<uint8_t> m_decrypted;
+    SecretBytes m_decrypted;
 };
 
 template <typename Work>
@@ -358,16 +347,16 @@ struct CryptoAsyncContextResult {
 
 // Creates the method's promise. On success the caller owns `value.deferred` and hands it to the CryptoJob it builds.
 // On failure `ok` is false and `error` is a rejected promise to return; an exception pending in `scope` becomes its
-// reason and is cleared.
+// reason and is cleared, except a termination, which stays pending with `error` empty.
 CryptoAsyncContextResult createCryptoAsyncContext(JSC::JSGlobalObject*, JSC::TopExceptionScope&);
 
 // Consumes `job`, which owns `context.deferred`, and returns `context.promise` once the job has run inline and settled
 // it or the crypto pool has accepted the job. Otherwise the job is destroyed, the context's promise is abandoned, and
 // the call returns a new rejected promise: when `job` is null because its allocation failed, when no request turn is
 // active, when the pool refuses the job, or when a job run inline fails to settle the promise. The worker accepts a
-// job only for an active request or the boot context, since it discards a request's queued jobs when the request ends
-// (`cancelForRequest` in `worker/js/crypto/jobs.zig`).
+// job only for an active request or an open module evaluation, since it discards an owner's queued jobs when the
+// owner ends (`cancelForRequest` in `worker/js/crypto/jobs.zig`).
 JSC::EncodedJSValue enqueueCryptoJobPromise(
-    JSC::JSGlobalObject*, JSC::TopExceptionScope&, const CryptoAsyncContext&, std::unique_ptr<CryptoJob>);
+    JSC::JSGlobalObject*, const CryptoAsyncContext&, std::unique_ptr<CryptoJob>);
 
 } // namespace Collo::HostFunctions::WebCrypto

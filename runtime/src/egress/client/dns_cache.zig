@@ -17,6 +17,11 @@ const readiness = @import("collo_egress_readiness");
 
 pub const Resolver = *const fn (std.mem.Allocator, []const u8, u16) LookupResult;
 
+/// The stack each resolver thread reserves: Zig's default, named so the gateway's sizing plan
+/// counts it in the address space it derives (`egress/gateway/sizing.zig`); glibc's resolver runs
+/// on it. Only the pages a thread touches cost memory.
+pub const resolver_thread_stack_bytes: usize = std.Thread.SpawnConfig.default_stack_size;
+
 pub const Config = struct {
     max_entries: usize = 256,
     ttl_ns: u64 = 30 * std.time.ns_per_s,
@@ -266,7 +271,11 @@ pub const Cache = struct {
         if (self.workers.len == 0)
             self.workers = try self.allocator.alloc(std.Thread, count);
         while (self.started_workers < self.workers.len) : (self.started_workers += 1)
-            self.workers[self.started_workers] = try std.Thread.spawn(.{}, resolverMain, .{self});
+            self.workers[self.started_workers] = try std.Thread.spawn(
+                .{ .stack_size = resolver_thread_stack_bytes },
+                resolverMain,
+                .{self},
+            );
     }
 
     fn resolverMain(self: *Cache) void {

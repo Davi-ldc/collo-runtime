@@ -1,6 +1,7 @@
 //! Recognizes a handler's returned thenable and arranges for the request's
 //! task to complete when it settles, both in a turn on the request's
-//! `ExecCtx` (`worker/js/jsc/turn.zig`). Runs in the worker on the VM thread.
+//! `ExecCtx` (`worker/js/jsc/turn.zig`), in the realm of the request's route.
+//! Runs in the worker on the VM thread.
 //!
 //! The settlement returns with the completion token built here: the task's
 //! slot and generation, which key the request task table, and the request's
@@ -21,7 +22,8 @@ pub fn isThenableValue(
     request: *request_context.RequestContext,
     value: *const bindings.Value,
 ) !bool {
-    return turn.isThenable(runtime.core.vm, &request.exec, value);
+    const realm = runtime.realmOfRoute(request.dispatch_work.route_index);
+    return turn.isThenable(runtime.core.vm, realm, &request.exec, value);
 }
 
 /// Completes the task `token` names when `value`, borrowed, settles. Fails
@@ -32,7 +34,8 @@ pub fn settleRequestThenable(
     token: request_task.TaskToken,
     value: *const bindings.Value,
 ) !void {
-    try turn.settleRequestThenable(runtime.core.vm, &request.exec, completionToken(request, token), value);
+    const realm = runtime.realmOfRoute(request.dispatch_work.route_index);
+    try turn.settleRequestThenable(runtime.core.vm, realm, &request.exec, completionToken(request, token), value);
 }
 
 fn completionToken(

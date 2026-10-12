@@ -5,8 +5,8 @@
 //! worker calls them on the runtime. Everything here belongs to the worker's
 //! VM thread. The crypto pool runs jobs on threads of its own and hands each
 //! back to that thread. The sentinel's thread requests termination and
-//! records which deadline fired, which the VM thread reads, and ends the
-//! process on memory pressure (`sentinel.zig`).
+//! records which owner it stopped, which the VM thread reads, and ends the
+//! process on memory pressure or its own failure (`sentinel.zig`).
 //!
 //! The runtime starts no threads but these, the crypto pool's in `init` and
 //! the sentinel's in `startSentinel`, and the worker's boot calls both
@@ -14,33 +14,38 @@
 //! (`zygote/child_boot.zig`). Nothing in the runtime may start a thread
 //! after that, on first use or otherwise.
 //!
-//! The boot context is the identity of module top-level code. It is open
-//! from before the routes' entries are evaluated until every one of those
-//! evaluations settles, and once closed it is gone for the life of the
-//! process: no work may be scheduled under its id again
-//! (`bootIdentityClosed`).
+//! Whom the VM thread works for at every moment is decided in one place,
+//! `owner.zig`: a dispatched request, the evaluation of a route module's
+//! top-level code, or the worker owner, and the CPU, the sentinel's view and
+//! a request's timeline all follow that owner.
 //!
-//! Which file holds what. Every file below but `core.zig`, `types.zig` and
-//! `sentinel.zig` has a `Methods(Runtime)` mixin whose functions `Runtime`
-//! declares as its own, and a domain file holds its state beside it.
+//! Which file holds what. Every file below but `core.zig`, `types.zig`,
+//! `owner.zig` and `sentinel.zig` has a `Methods(Runtime)` mixin whose
+//! functions `Runtime` declares as its own, and a domain file holds its
+//! state beside it.
 //! - This file: `Runtime` with its fields, its construction and teardown,
 //!   its clock and the sentinel's start.
-//! - `boot_context.zig`: the boot context, from its install through the
-//!   evaluation of every route's entry to its close.
+//! - `owner.zig`: the owner of the VM thread and its windows, as functions
+//!   over the runtime that every domain calls.
+//! - `evaluations.zig`: the owners of route modules' top-level code, from
+//!   the boot's evaluation of every route's entry to each one's close.
 //! - `vm_hooks.zig`: what `attachHostRuntime` registers on the VM, with the
 //!   owner-transition hook and the console and exception-log sinks.
 //! - `scheduler.zig`: the ready queue, timers and immediates, request
 //!   deadlines, the worker ring and the loop's eventfds.
 //! - `requests.zig`: request contexts, ingress work and request completions.
 //! - `egress.zig`: fetches and their bodies through the egress gateway.
-//! - `modules.zig`: route module evaluation settlements and expiries, and
-//!   the worker's stop when no route can serve or after a deadline fire.
+//! - `modules.zig`: route module evaluation settlements and expiries.
+//! - `retirement.zig`: the worker's decision to give way to a fresh one, when
+//!   its VM can run no JavaScript again or no route can serve, and the notice
+//!   that tells the server.
 //! - `crypto.zig`: WebCrypto jobs.
 //! - `fs_fault.zig`: the entry points into the fault plane
 //!   (`worker/fs/fault.zig`).
-//! - `observability.zig`: the shared page, the sentinel and trace events.
+//! - `observability.zig`: the shared page, the sentinel, trace events and
+//!   the request id a line of the tenant's log carries.
 //! - `core.zig`: the handles every domain reads; `types.zig`: the options,
-//!   limits and clock the runtime is built from; `sentinel.zig`: the
+//!   limits and clocks the runtime is built from; `sentinel.zig`: the
 //!   sentinel's thread.
 
 const std = @import("std");
@@ -51,16 +56,19 @@ const egress_body = @import("../egress/body/root.zig");
 const exception_log = @import("collo_worker_js").exception_log;
 const response_flow = @import("../serve/response.zig");
 const fs_fault = @import("../fs/fault.zig");
-const runtime_boot_context = @import("boot_context.zig");
 const runtime_core = @import("core.zig");
 const runtime_crypto = @import("crypto.zig");
 const runtime_egress = @import("egress.zig");
+const runtime_evaluations = @import("evaluations.zig");
 const runtime_fs_fault = @import("fs_fault.zig");
 const runtime_modules = @import("modules.zig");
 const runtime_observability = @import("observability.zig");
+const runtime_owner = @import("owner.zig");
 const runtime_requests = @import("requests.zig");
+const runtime_retirement = @import("retirement.zig");
 const runtime_scheduler = @import("scheduler.zig");
 const runtime_vm_hooks = @import("vm_hooks.zig");
+const termination = @import("../serve/termination.zig");
 
 const coerceRuntimeOptions = runtime_types.coerceRuntimeOptions;
 
@@ -74,30 +82,28 @@ pub const Runtime = struct {
     /// In-flight fs faults, one task per path however many requests wait on
     /// it (`worker/fs/fault.zig` owns the behavior).
     fs_fault: fs_fault.State,
-    /// The boot context's state, independent of the worker's lifecycle:
-    /// `.open` from init until every route's evaluation settles, then
-    /// `.closing` and `.closed` through `closeBootContext`. A top-level await
-    /// may settle after the worker reported ready, so requests can run while
-    /// the boot context is still open. `.closed` is final.
-    boot_ctx: BootCtxState,
-    /// Set once the request whose deadline made the sentinel fire has its
-    /// response written; `serve/dispatch.zig` reads the fired bit on every
-    /// response path a fire can reach, and `disarmRequestDeadline`
-    /// (`scheduler/resources.zig`) on any other way a request ends. The
-    /// fire's termination request cannot be cleared from the VM
-    /// (`forbidExecutionOnTermination` has no reset), so after the drain the
-    /// worker stops instead of answering every later request with a 500.
-    /// `maybeRecycleAfterFailedEvaluation` acts on it.
-    stop_after_deadline_fire: bool,
+    /// Whom the VM thread works for, with the worker owner's exec context and
+    /// CPU (`owner.zig`).
+    owners: runtime_owner.Owners,
+    /// What every evaluation of a route module copies (`evaluations.zig`);
+    /// the evaluations themselves live in the active map.
+    evaluations: runtime_evaluations.Evaluations,
+    /// The VM can run no JavaScript again: the sentinel fired, and its
+    /// termination cannot be cleared (`forbidExecutionOnTermination` has no
+    /// reset). Set in one place, the loop's check of the fire
+    /// (`checkRetirement` in `retirement.zig`), which also retires the
+    /// worker.
+    vm_terminated: bool,
+    /// Whether, and why, the worker asked the server to retire it
+    /// (`retirement.zig`).
+    retirement: runtime_retirement.Retirement,
     observability: runtime_observability.Observability,
     // Filled in `attachHostRuntime`, because `self` has a stable address only
     // from then on; `exception_log` holds a pointer to this field while it is
     // attached.
     exception_sink_registration: exception_log.Registration,
 
-    pub const BootCtxState = enum { open, closing, closed };
-
-    const BootContextMethods = runtime_boot_context.Methods(Runtime);
+    const EvaluationsMethods = runtime_evaluations.Methods(Runtime);
     const VmHooksMethods = runtime_vm_hooks.Methods(Runtime);
     const SchedulerMethods = runtime_scheduler.Methods(Runtime);
     const RequestsMethods = runtime_requests.Methods(Runtime);
@@ -106,6 +112,7 @@ pub const Runtime = struct {
     const CryptoMethods = runtime_crypto.Methods(Runtime);
     const FsFaultMethods = runtime_fs_fault.Methods(Runtime);
     const ObservabilityMethods = runtime_observability.Methods(Runtime);
+    const RetirementMethods = runtime_retirement.Methods(Runtime);
 
     /// The writer view of the shared page and the completion eventfd are the
     /// only completion channel a request has (a completion record, then a
@@ -190,8 +197,13 @@ pub const Runtime = struct {
             .modules = modules,
             .crypto = crypto,
             .fs_fault = .{},
-            .boot_ctx = .open,
-            .stop_after_deadline_fire = false,
+            .owners = runtime_owner.Owners.init(runtime_options),
+            .evaluations = .{
+                .boot_egress_token = runtime_options.boot_egress_token,
+                .boot_fetches_started = 0,
+            },
+            .vm_terminated = false,
+            .retirement = .{},
             .observability = observability,
             .exception_sink_registration = undefined,
         };
@@ -222,6 +234,10 @@ pub const Runtime = struct {
             self.destroyRequestContext(entry.value_ptr.*);
         }
         self.requests.deinitActiveMap(self.core.allocator);
+        // The bridge keys owner tokens by this exec context's address, which
+        // dies with the runtime (`owner.zig`).
+        self.core.vm.releaseExecCtx(&self.owners.worker_exec) catch |err|
+            std.log.warn("failed to release the worker owner's exec ctx: {s}", .{@errorName(err)});
         self.requests.deinitIngress();
 
         self.scheduler.deinitWorkerRing();
@@ -254,11 +270,20 @@ pub const Runtime = struct {
         try self.observability.sentinel.start();
     }
 
-    pub const installBootContext = BootContextMethods.installBootContext;
-    pub const bootContext = BootContextMethods.bootContext;
-    pub const evaluateBootRoutes = BootContextMethods.evaluateBootRoutes;
-    pub const closeBootContext = BootContextMethods.closeBootContext;
-    pub const bootIdentityClosed = BootContextMethods.bootIdentityClosed;
+    /// Answers every request a charge took past its CPU budget
+    /// (`termination.endSpentBudgets`); the loop calls it outside every owner
+    /// window.
+    pub fn endSpentBudgets(self: *Runtime) void {
+        termination.endSpentBudgets(self);
+    }
+
+    pub const evaluateBootRoutes = EvaluationsMethods.evaluateBootRoutes;
+    pub const ensureRouteHandler = EvaluationsMethods.ensureRouteHandler;
+    pub const armEvaluationBudget = EvaluationsMethods.armEvaluationBudget;
+    pub const closeEvaluationOnceSettled = EvaluationsMethods.closeEvaluationOnceSettled;
+    pub const closeEvaluation = EvaluationsMethods.closeEvaluation;
+    pub const enterTurnless = EvaluationsMethods.enterTurnless;
+    pub const leaveTurnless = EvaluationsMethods.leaveTurnless;
 
     pub const attachHostRuntime = VmHooksMethods.attachHostRuntime;
 
@@ -269,14 +294,13 @@ pub const Runtime = struct {
     pub const workerSchedulerMetricsSnapshot = SchedulerMethods.workerSchedulerMetricsSnapshot;
     pub const armRequestDeadline = SchedulerMethods.armRequestDeadline;
     pub const disarmRequestDeadline = SchedulerMethods.disarmRequestDeadline;
-    pub const requestDeadlineTerminationRequested = SchedulerMethods.requestDeadlineTerminationRequested;
-    pub const requestDeadlineSentinelFired = SchedulerMethods.requestDeadlineSentinelFired;
     pub const scheduleTimer = SchedulerMethods.scheduleTimer;
     pub const scheduleImmediate = SchedulerMethods.scheduleImmediate;
     pub const readyItemOwnerRequestId = SchedulerMethods.readyItemOwnerRequestId;
     pub const tryQueueReadyWork = SchedulerMethods.tryQueueReadyWork;
     pub const tryQueueReadyWorkReadySince = SchedulerMethods.tryQueueReadyWorkReadySince;
     pub const drainReadyBacklog = SchedulerMethods.drainReadyBacklog;
+    pub const withdrawReadyWork = SchedulerMethods.withdrawReadyWork;
     pub const collectDueTimers = SchedulerMethods.collectDueTimers;
     pub const collectReadyImmediates = SchedulerMethods.collectReadyImmediates;
     pub const collectDueRequestDeadlines = SchedulerMethods.collectDueRequestDeadlines;
@@ -333,8 +357,8 @@ pub const Runtime = struct {
     pub const collectModuleSettlements = ModulesMethods.collectModuleSettlements;
     pub const handleModuleEvaluationSettled = ModulesMethods.handleModuleEvaluationSettled;
     pub const expireRouteEvaluations = ModulesMethods.expireRouteEvaluations;
-    pub const maybeRecycleAfterFailedEvaluation = ModulesMethods.maybeRecycleAfterFailedEvaluation;
     pub const modulesContext = ModulesMethods.modulesContext;
+    pub const realmOfRoute = ModulesMethods.realmOfRoute;
 
     pub const scheduleCryptoJob = CryptoMethods.scheduleCryptoJob;
     pub const collectCompletedCryptoJobs = CryptoMethods.collectCompletedCryptoJobs;
@@ -348,5 +372,10 @@ pub const Runtime = struct {
     pub const handleFsFaultCompletionFailure = FsFaultMethods.handleFsFaultCompletionFailure;
 
     pub const traceRuntimeEvent = ObservabilityMethods.traceRuntimeEvent;
+    pub const logNetworkDenial = ObservabilityMethods.logNetworkDenial;
     pub const flushLiveRequestCpuBestEffort = ObservabilityMethods.flushLiveRequestCpuBestEffort;
+
+    pub const checkRetirement = RetirementMethods.checkRetirement;
+    pub const requestRetirement = RetirementMethods.requestRetirement;
+    pub const sendRetirementNotice = RetirementMethods.sendRetirementNotice;
 };

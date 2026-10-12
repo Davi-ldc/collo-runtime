@@ -14,10 +14,12 @@
 //! connection down, stays outside this suite.
 //!
 //! The tests cover request-body and flow-control accounting, header blocks,
-//! the bound on a request head's fields and the HPACK state both ends keep
-//! across a refused or dropped block, the interim 100 for
-//! `expect: 100-continue`, the per-read frame budget against floods, the
-//! concurrent-stream cap and the moment a stream leaves it, and the response
+//! the read a request head arrives with, the bound on a request head's
+//! fields, the malformed heads the lane answers 400 (`te` among them) and
+//! the HPACK state both ends keep across a refused or dropped block, the
+//! interim 100 for `expect: 100-continue`, the per-read frame budget against
+//! floods, the concurrent-stream cap and the moment a stream leaves it, and
+//! the response
 //! path: queueing behind flow control, worker response descriptors, the
 //! lane's record of a worker's head, how a stream ends when its request
 //! leaves it, framing and write buffers. A fault a client causes closes only
@@ -548,6 +550,9 @@ const captured_requests_max = 8;
 
 const CapturedRequest = struct {
     stream_id: u32 = 0,
+    /// `ParsedHead.received_ns`: the stub's clock at the read that completed
+    /// the head.
+    received_ns: u64 = 0,
     method: [16]u8 = undefined,
     method_len: usize = 0,
     path: [128]u8 = undefined,
@@ -598,6 +603,51 @@ const AutoResponseMode = enum {
     on_body_end_stream,
 };
 
+// The answers the lane writes alone, as `server/ingress/server_responses.zig`
+// holds them, which this suite's stand-ins for the lane write the same way.
+const bad_request_response: http2_writing.ServerResponse = .{
+    .status = 400,
+    .reason = "Bad Request",
+    .body = "bad request",
+};
+const payload_too_large_response: http2_writing.ServerResponse = .{
+    .status = 413,
+    .reason = "Payload Too Large",
+    .body = "payload too large",
+};
+const header_fields_too_large_response: http2_writing.ServerResponse = .{
+    .status = 431,
+    .reason = "Request Header Fields Too Large",
+    .body = "request header fields too large",
+};
+
+/// Answers a head the driver refused the way the lane does
+/// (`refuseH2Stream` in `server/ingress/runner/admission.zig`), with no
+/// access record: the stream enters the table, or is refused with
+/// REFUSED_STREAM past the cap, and gets 431 or 400 alone. Returns whether
+/// the stream was refused.
+fn answerRefusedHead(
+    comptime Worker: type,
+    worker: *Worker,
+    runtime: *Slot,
+    stream_id: u32,
+    refused: *const h2_request.RefusedHead,
+) StreamHandlerError!bool {
+    runtime.h2ReserveStream(stream_id) catch |err| switch (err) {
+        error.Http2TooManyConcurrentStreams => {
+            try http2_writing.queueRstStream(Worker, worker, runtime, stream_id, .refused_stream);
+            return true;
+        },
+        else => |other| return other,
+    };
+    const response = switch (refused.reason) {
+        .fields_too_large => header_fields_too_large_response,
+        .malformed => bad_request_response,
+    };
+    _ = try http2_writing.answerStreamAlone(Worker, worker, runtime, stream_id, response, refused.request_ended);
+    return false;
+}
+
 const TestWorker = struct {
     service: TestService,
     /// What the driver shares across a lane's connections; every slot of
@@ -623,6 +673,19 @@ const TestWorker = struct {
     response_count: usize = 0,
     /// The first close the driver asked for, null while it asked none.
     close: ?fault.ConnectionClose = null,
+    /// What the lane's clock reads (`monotonicNowNs`); a test moves it
+    /// between reads.
+    clock_ns: u64 = 1_000_000_000,
+    /// Heads the driver refused (`refuseH2Stream`) and the last one's reason.
+    refused_head_count: usize = 0,
+    last_refusal: ?h2_request.RefusedHead = null,
+    /// Heads answered 413 for a declared body over the bound, as the lane
+    /// answers them once it matched their route.
+    oversized_count: usize = 0,
+
+    pub fn monotonicNowNs(self: *const TestWorker) u64 {
+        return self.clock_ns;
+    }
 
     pub fn updateConnectionInterest(self: *TestWorker, runtime: *Slot) fault.LaneFault!void {
         _ = self;
@@ -633,6 +696,18 @@ const TestWorker = struct {
         if (self.close == null)
             self.close = close;
         closeAsLane(self.service.allocator, runtime, close);
+    }
+
+    pub fn refuseH2Stream(self: *TestWorker, runtime: *Slot, stream_id: u32, refused: *const h2_request.RefusedHead) StreamHandlerError!void {
+        self.refused_head_count += 1;
+        // The strings borrow the decoded block, which is gone after the call.
+        self.last_refusal = .{
+            .reason = refused.reason,
+            .request_ended = refused.request_ended,
+            .received_ns = refused.received_ns,
+        };
+        if (try answerRefusedHead(TestWorker, self, runtime, stream_id, refused))
+            self.refused_count += 1;
     }
 
     /// Request bodies never wait in the stub, so a drive finds none to
@@ -656,6 +731,14 @@ const TestWorker = struct {
             },
             else => |other| return other,
         };
+        // As the lane checks it once the route is known.
+        if (head.content_length) |length| {
+            if (length > limits.http_body.MATERIALIZED_BODY_BYTES_MAX) {
+                self.oversized_count += 1;
+                _ = try http2_writing.answerStreamAlone(TestWorker, self, runtime, stream_id, payload_too_large_response, head.end_stream);
+                return true;
+            }
+        }
         try runtime.h2SetRequestBodyExpectation(stream_id, head.body_framing, head.content_length, head.end_stream);
         const request_key = RequestKey{
             .lane_id = 0,
@@ -670,6 +753,7 @@ const TestWorker = struct {
         if (index < self.requests.len) {
             var captured = CapturedRequest{
                 .stream_id = stream_id,
+                .received_ns = head.received_ns,
                 .content_length = head.content_length,
                 .end_stream = head.end_stream,
                 .header_count = head.headers.len,
@@ -767,6 +851,15 @@ const BackpressuredTestWorker = struct {
     data_batch_count: usize = 0,
     /// The first close the driver asked for, null while it asked none.
     close: ?fault.ConnectionClose = null,
+
+    pub fn monotonicNowNs(self: *const BackpressuredTestWorker) u64 {
+        _ = self;
+        return 1_000_000_000;
+    }
+
+    pub fn refuseH2Stream(self: *BackpressuredTestWorker, runtime: *Slot, stream_id: u32, refused: *const h2_request.RefusedHead) StreamHandlerError!void {
+        _ = try answerRefusedHead(BackpressuredTestWorker, self, runtime, stream_id, refused);
+    }
 
     pub fn updateConnectionInterest(self: *BackpressuredTestWorker, runtime: *Slot) fault.LaneFault!void {
         _ = self;
@@ -1819,7 +1912,10 @@ test "http2 driver rejects settings ack as initial client settings" {
     try std.testing.expectEqual(@intFromEnum(h2.ErrorCode.protocol_error), readU32(goaway.payload[4..8]));
 }
 
-test "http2 driver resets stream when host conflicts with authority" {
+test "http2 a head whose host names another origin than its authority is malformed: the lane answers it 400 and the connection keeps serving" {
+    // The block decoded, so both ends' header tables are in step and the
+    // stream can carry an answer (RFC 9113 §8.1.1), which the lane gives
+    // through its `refuseH2Stream`.
     const allocator = std.testing.allocator;
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
@@ -1836,14 +1932,98 @@ test "http2 driver resets stream when host conflicts with authority" {
         .{ .name = "host", .value = "other.example.com" },
     }, true);
 
-    _ = try drive(TestWorker, &worker, &setup.runtime);
+    try driveUntilIdle(TestWorker, &worker, &setup.runtime);
 
     try std.testing.expect(setup.runtime.isOpen());
     try std.testing.expectEqual(@as(usize, 0), worker.request_count);
-    var out: [256]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), worker.refused_head_count);
+    const refusal = worker.last_refusal orelse return error.MissingRefusal;
+    try std.testing.expectEqual(h2_request.RefusedHead.Reason.malformed, refusal.reason);
+    var out: [512]u8 = undefined;
     const received = try readAvailableFd(setup.pair[1], &out);
-    const rst = findFrame(received, .rst_stream, 1) orelse return error.MissingResetFrame;
-    try std.testing.expectEqual(@intFromEnum(h2.ErrorCode.protocol_error), readU32(rst.payload[0..4]));
+    try expectAnsweredAndEnded(allocator, received, 1, "400");
+    // The head ended its stream, so no reset follows the answer.
+    try std.testing.expect(findFrame(received, .rst_stream, 1) == null);
+    try std.testing.expect(findFrame(received, .goaway, 0) == null);
+
+    try writeGetFd(allocator, setup.pair[1], 3, "/after");
+    try driveUntilIdle(TestWorker, &worker, &setup.runtime);
+    try std.testing.expectEqual(@as(usize, 1), worker.request_count);
+    try std.testing.expectEqualStrings("/after", worker.requests[0].pathSlice());
+}
+
+test "http2 a request with te other than trailers is malformed, answered 400 while its connection keeps serving, and te: trailers passes" {
+    const allocator = std.testing.allocator;
+    var setup = try newH2SocketPairRuntime();
+    defer std.posix.close(setup.pair[0]);
+    defer std.posix.close(setup.pair[1]);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
+    var worker = TestWorker{ .service = .{ .allocator = allocator } };
+    var encoder = try hpack.Encoder.init();
+    defer encoder.deinit();
+
+    try writeClientPrefaceAndSettings(setup.pair[1]);
+    try writeHeadersFrameWithFd(allocator, setup.pair[1], &encoder, 1, &.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "example.com" },
+        .{ .name = ":path", .value = "/te" },
+        .{ .name = "te", .value = "gzip" },
+    }, true);
+    try driveUntilIdle(TestWorker, &worker, &setup.runtime);
+
+    try std.testing.expect(setup.runtime.isOpen());
+    try std.testing.expectEqual(@as(usize, 0), worker.request_count);
+    var out: [512]u8 = undefined;
+    const received = try readAvailableFd(setup.pair[1], &out);
+    try expectAnsweredAndEnded(allocator, received, 1, "400");
+    try std.testing.expect(findFrame(received, .goaway, 0) == null);
+
+    // RFC 9113 §8.2.2 admits te in a request as trailers alone, in any case.
+    try writeHeadersFrameWithFd(allocator, setup.pair[1], &encoder, 3, &.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "example.com" },
+        .{ .name = ":path", .value = "/te" },
+        .{ .name = "te", .value = " Trailers" },
+    }, true);
+    try driveUntilIdle(TestWorker, &worker, &setup.runtime);
+    try std.testing.expectEqual(@as(usize, 1), worker.request_count);
+    try std.testing.expectEqualStrings("te", worker.requests[0].lastFieldName());
+}
+
+test "http2 the read that completes a request head is when it arrived, whatever the lane's clock reads after" {
+    const allocator = std.testing.allocator;
+    var setup = try newH2SocketPairRuntime();
+    defer std.posix.close(setup.pair[0]);
+    defer std.posix.close(setup.pair[1]);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
+    var worker = TestWorker{ .service = .{ .allocator = allocator } };
+    try writeClientPrefaceAndSettings(setup.pair[1]);
+    try driveUntilIdle(TestWorker, &worker, &setup.runtime);
+
+    // The head's block is split across two reads, made at two readings of
+    // the lane's clock; it arrives with the read that completes it.
+    var encoder = try hpack.Encoder.init();
+    defer encoder.deinit();
+    var block = try encoder.encodeHeaders(allocator, &.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "example.com" },
+        .{ .name = ":path", .value = "/split" },
+    }, 16 * 1024);
+    defer block.deinit(allocator);
+    const cut = block.bytes().len / 2;
+    try writeFrameFd(setup.pair[1], .headers, 0x1, 1, block.bytes()[0..cut]);
+    worker.clock_ns = 2_000_000_000;
+    try driveUntilIdle(TestWorker, &worker, &setup.runtime);
+    try std.testing.expectEqual(@as(usize, 0), worker.request_count);
+
+    try writeFrameFd(setup.pair[1], .continuation, 0x4, 1, block.bytes()[cut..]);
+    worker.clock_ns = 3_000_000_000;
+    try driveUntilIdle(TestWorker, &worker, &setup.runtime);
+    try std.testing.expectEqual(@as(usize, 1), worker.request_count);
+    try std.testing.expectEqual(@as(u64, 3_000_000_000), worker.requests[0].received_ns);
 }
 
 test "http2 request head over the decoded byte bound answers 431 and keeps its connection" {
@@ -1988,9 +2168,11 @@ test "http2 257 repeated request headers in about 300 bytes of HPACK answer 431,
 }
 
 test "http2 a request head declaring a body over the limit answers 413 and asks the client to stop sending" {
-    // The head leaves its stream open, so once the answer's END_STREAM is
-    // queued the client gets RST_STREAM NO_ERROR (RFC 9113 §8.1) instead
-    // of sending a body nobody reads.
+    // The lane answers it once it matched the route, as the stub does here,
+    // through the driver's `answerStreamAlone`. The head leaves its stream
+    // open, so once the answer's END_STREAM is queued the client gets
+    // RST_STREAM NO_ERROR (RFC 9113 §8.1) instead of sending a body nobody
+    // reads.
     const allocator = std.testing.allocator;
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
@@ -2017,6 +2199,7 @@ test "http2 a request head declaring a body over the limit answers 413 and asks 
 
     try std.testing.expect(setup.runtime.isOpen());
     try std.testing.expectEqual(@as(usize, 0), worker.request_count);
+    try std.testing.expectEqual(@as(usize, 1), worker.oversized_count);
     try std.testing.expectEqual(@as(usize, 0), setup.runtime.ingress_channel_count);
     var out: [1024]u8 = undefined;
     const received = try readAvailableFd(setup.pair[1], &out);
@@ -2027,10 +2210,10 @@ test "http2 a request head declaring a body over the limit answers 413 and asks 
 }
 
 test "http2 invalid headers still consume stream ordering, and a head on a lower id the client never opened closes the connection" {
-    // Stream 3's head lacks `:path` and is refused alone, yet it uses up
-    // every lower stream id. Stream 1 was never opened, so a HEADERS frame on
-    // it cannot be trailers that crossed a reset: a new stream's id must be
-    // above every id the client used (RFC 9113 §5.1.1).
+    // Stream 3's head lacks `:path` and is answered 400 alone, yet it uses
+    // up every lower stream id. Stream 1 was never opened, so a HEADERS
+    // frame on it cannot be trailers that crossed a reset: a new stream's id
+    // must be above every id the client used (RFC 9113 §5.1.1).
     const allocator = std.testing.allocator;
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
@@ -2057,10 +2240,11 @@ test "http2 invalid headers still consume stream ordering, and a head on a lower
 
     try std.testing.expect(!setup.runtime.isOpen());
     try std.testing.expectEqual(@as(usize, 0), worker.request_count);
-    var out: [512]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), worker.refused_head_count);
+    var out: [1024]u8 = undefined;
     const received = try readAvailableFd(setup.pair[1], &out);
-    const rst = findFrame(received, .rst_stream, 3) orelse return error.MissingResetFrame;
-    try std.testing.expectEqual(@intFromEnum(h2.ErrorCode.protocol_error), readU32(rst.payload[0..4]));
+    try expectAnsweredAndEnded(allocator, received, 3, "400");
+    try std.testing.expect(findFrame(received, .rst_stream, 3) == null);
     try std.testing.expect(findFrame(received, .rst_stream, 1) == null);
     const goaway = findFrame(received, .goaway, 0) orelse return error.MissingGoaway;
     try std.testing.expectEqual(@intFromEnum(h2.ErrorCode.protocol_error), readU32(goaway.payload[4..8]));
@@ -4274,6 +4458,8 @@ test "http2 response headers reject invalid names and values before framing" {
         &.{.{ .name = "X-Mode", .value = "h2" }},
         &.{.{ .name = ":path", .value = "/" }},
         &.{.{ .name = "transfer-encoding", .value = "chunked" }},
+        // Only a request may carry te (RFC 9113 §8.2.2).
+        &.{.{ .name = "te", .value = "trailers" }},
         &.{.{ .name = "x-test", .value = "ok\r\nbad" }},
         &.{.{ .name = "x-test", .value = "\x7f" }},
     };

@@ -1,5 +1,6 @@
 //! Request deadlines on an ingress lane. A request has one deadline, fixed
-//! at admission. A request that still waits for a worker slot then is
+//! at admission and counted from the socket read that brought its head. A
+//! request that still waits for a worker slot then is
 //! answered 503 and leaves its pool's waiters, and one whose begin still
 //! waits for room in its worker's socket is answered 504 with the worker left
 //! in service. Once the begin reached the worker, the request's wheel entry
@@ -324,6 +325,52 @@ test "trailers split across reads on a stream the lane answered at its request's
     try first.expectStatus(1, 200);
     try harness.expectLanesRunning();
     try harness.expectServing(stub);
+}
+
+/// A lane clock a test drives (`runner.LaneClock`): each reading returns the
+/// time and moves it on by `step_ns`, so no two readings agree and a stamp
+/// shows which reading it came from.
+const SteppingClock = struct {
+    now_ns: u64,
+    step_ns: u64,
+
+    fn read(context: ?*anyopaque) u64 {
+        const self: *SteppingClock = @ptrCast(@alignCast(context.?));
+        const now_ns = self.now_ns;
+        self.now_ns += self.step_ns;
+        return now_ns;
+    }
+};
+
+test "a request's deadline counts from the read that brought its head, not from the lane's later work on it" {
+    var scene: OneWorker = undefined;
+    try scene.init(.{});
+    defer scene.deinit();
+    const harness = &scene.harness;
+    const lane = harness.lane(0);
+    var clock = SteppingClock{
+        .now_ns = @import("collo_os").process.monotonicNowNsOrZero(),
+        .step_ns = std.time.ns_per_ms,
+    };
+    lane.clock = .{ .context = &clock, .read = SteppingClock.read };
+
+    try scene.client.get(1);
+    try scene.client.drive();
+    const request = try scene.stub.readRequestBegin();
+    const slot = harness.requestSlotOf(scene.client, 1) orelse return error.RequestNotAdmitted;
+    const connection = switch (lane.connections.lookup(scene.client.slot, scene.client.key.generation)) {
+        .live => |runtime| runtime,
+        .stale_generation, .vacant, .out_of_range => return error.ConnectionGone,
+    };
+    // The read that brought the head stamped the connection's progress and
+    // the head's arrival with one reading; admission and dispatch read the
+    // clock again after it, each a step later.
+    try std.testing.expectEqual(connection.last_progress_ns, slot.admitted_ns);
+    try std.testing.expect(clock.now_ns > slot.admitted_ns + std.time.ns_per_ms);
+    const timeout_ns = harness.supervisor.routes.definition(lane_harness.default_definition).settings.limits.timeoutNs();
+    try std.testing.expectEqual(slot.admitted_ns + timeout_ns, slot.deadline_ns);
+    try std.testing.expectEqual(slot.deadline_ns, request.deadline_monotonic_ns);
+    try std.testing.expectEqual(slot.admitted_ns, slot.access.started_mono_ns);
 }
 
 /// A HEADERS frame with END_HEADERS and the END_STREAM flag `end_stream`,

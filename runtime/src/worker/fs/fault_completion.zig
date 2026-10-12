@@ -4,16 +4,18 @@
 //! every waiter when the loop runs that item.
 //!
 //! A fault completes once, from its first response, and its waiters settle
-//! only from the work item, each in a sub-turn published under its own
-//! request (`resolveWaiters`). A completion that finds the ready queue and
-//! its backlog full sets `State.rescan_needed`, and `collectCompletions`
-//! queues it later, as egress does for fetch completions.
+//! only from the work item, each in a sub-turn in the window of its own
+//! owner (`resolveWaiters`, `runtime/owner.zig`). A completion that finds the
+//! ready queue and its backlog full sets `State.rescan_needed`, and
+//! `collectCompletions` queues it later, as egress does for fetch
+//! completions.
 
 const std = @import("std");
 const ipc = @import("collo_ipc");
 const worker_fs = @import("index.zig");
 const turn = @import("collo_worker_js").turn;
-const scheduler_resources = @import("../scheduler/resources.zig");
+const request_context = @import("collo_worker_request").context;
+const runtime_owner = @import("../runtime/owner.zig");
 const fault = @import("fault.zig");
 const copies = @import("copies.zig");
 
@@ -105,6 +107,10 @@ fn queueCompletion(runtime: anytype, task: *fault.Task) void {
 fn noteWaitersReady(runtime: anytype, task: *fault.Task) void {
     const now = runtime.nowMonoNs();
     for (task.waiters.items) |*waiter| {
+        // Only a dispatched request keeps a timeline; an evaluation's waiter
+        // counts nothing.
+        if (request_context.isReservedId(waiter.request_id))
+            continue;
         const request = runtime.requests.active.get(waiter.request_id) orelse continue;
         if (request.request_generation != waiter.request_generation)
             continue;
@@ -115,9 +121,10 @@ fn noteWaitersReady(runtime: anytype, task: *fault.Task) void {
 
 /// Releases the ready items still counted for waiters when a settle stopped
 /// before or during its waiter loop, for example because the VM could not
-/// build the settle value. Each is released through a zero-length turn, so
-/// the waiting since the fan-out is folded and the request's next slice
-/// derives from its remaining ready items instead of staying io.
+/// build the settle value. Each is withdrawn
+/// (`RequestContext.noteReadyWithdrawn`), so the waiting since the fan-out
+/// closes and the request's next slice derives from its remaining ready
+/// items instead of staying runnable.
 fn releaseUnconsumedWaiterCounts(runtime: anytype, task: *fault.Task) void {
     for (task.waiters.items) |*waiter| {
         if (!waiter.ready_counted)
@@ -126,9 +133,7 @@ fn releaseUnconsumedWaiterCounts(runtime: anytype, task: *fault.Task) void {
         const request = runtime.requests.active.get(waiter.request_id) orelse continue;
         if (request.request_generation != waiter.request_generation)
             continue;
-        const now = runtime.nowMonoNs();
-        request.noteTurnBegin(now, true);
-        request.noteTurnEnd(now);
+        request.noteReadyWithdrawn(runtime.nowMonoNs());
     }
 }
 
@@ -208,30 +213,21 @@ fn resolveWaiters(runtime: anytype, task: *fault.Task, first_error: *?anyerror) 
         const request = runtime.requests.active.get(waiter.request_id) orelse continue;
         if (request.request_generation != waiter.request_generation)
             continue;
-        // The shared settle spans several requests, so the work item
-        // publishes no turn owner. Each waiter's resolution is its own
-        // sub-turn, published under that waiter's request and cleared before
-        // the next, so the sentinel can stop a hang inside a reaction at
-        // that request's deadline.
-        scheduler_resources.publishTurnOwner(runtime, request.exec.request_id);
-        defer scheduler_resources.clearTurnOwner(runtime);
-        // The sub-turn runs this waiter's request and consumes the ready
-        // item counted for it, if one was. The request is looked up again
-        // after the JavaScript runs, because a reaction may finish and
-        // destroy it. The sub-turn's length counts toward the request's
-        // longest turn.
-        const sub_turn_start = runtime.nowMonoNs();
-        request.noteTurnBegin(sub_turn_start, waiter.ready_counted);
+        // The shared settle spans several owners, so the work item opens no
+        // window. Each waiter's resolution is a sub-turn in the window of
+        // its own owner, closed before the next, so its CPU is that owner's
+        // and the sentinel can stop a hang inside a reaction at that owner's
+        // deadline. The sub-turn consumes the ready item counted for the
+        // waiter, if one was.
+        const previous_owner_id = runtime_owner.enter(runtime, waiter.request_id, .{
+            .consumes_ready_item = waiter.ready_counted,
+        });
+        defer runtime_owner.leave(runtime, previous_owner_id);
         waiter.ready_counted = false;
         turn.resolvePromise(runtime.core.vm, &request.exec, &waiter.deferred, &value) catch |err| {
             if (first_error.* == null)
                 first_error.* = err;
         };
-        const sub_turn_end = runtime.nowMonoNs();
-        if (runtime.requests.active.get(waiter.request_id)) |still_alive| {
-            still_alive.noteTurnEnd(sub_turn_end);
-            still_alive.max_turn_ns = @max(still_alive.max_turn_ns, sub_turn_end - sub_turn_start);
-        }
     }
 }
 
@@ -245,22 +241,16 @@ fn rejectWaiters(runtime: anytype, task: *fault.Task, message: []const u8, first
         const request = runtime.requests.active.get(waiter.request_id) orelse continue;
         if (request.request_generation != waiter.request_generation)
             continue;
-        // Published per waiter, for the reason given in `resolveWaiters`.
-        scheduler_resources.publishTurnOwner(runtime, request.exec.request_id);
-        defer scheduler_resources.clearTurnOwner(runtime);
-        // The same sub-turn accounting as in `resolveWaiters`.
-        const sub_turn_start = runtime.nowMonoNs();
-        request.noteTurnBegin(sub_turn_start, waiter.ready_counted);
+        // A window per waiter, for the reasons given in `resolveWaiters`.
+        const previous_owner_id = runtime_owner.enter(runtime, waiter.request_id, .{
+            .consumes_ready_item = waiter.ready_counted,
+        });
+        defer runtime_owner.leave(runtime, previous_owner_id);
         waiter.ready_counted = false;
         turn.rejectPromise(runtime.core.vm, &request.exec, &waiter.deferred, &reason) catch |err| {
             if (first_error.* == null)
                 first_error.* = err;
         };
-        const sub_turn_end = runtime.nowMonoNs();
-        if (runtime.requests.active.get(waiter.request_id)) |still_alive| {
-            still_alive.noteTurnEnd(sub_turn_end);
-            still_alive.max_turn_ns = @max(still_alive.max_turn_ns, sub_turn_end - sub_turn_start);
-        }
     }
 }
 

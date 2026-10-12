@@ -1,9 +1,10 @@
 // TextEncoder, TextDecoder, TextEncoderStream and TextDecoderStream from the WHATWG Encoding Standard, run on the VM
-// thread. A TextDecoder cell owns the ICU converter of its encoding, when the encoding uses one. The constructor opens
-// it and closes it again if it throws before the cell exists; from then on the cell closes it in its destructor and
-// closes the old one when UTF-16 BOM sniffing switches converters. Between streaming calls a decoder keeps a carried
-// partial sequence of at most three bytes, its BOM flag and the converter's state; a decode that throws resets all
-// three, so the next call starts clean.
+// thread. UTF-8, x-user-defined and every single-byte encoding decode natively, the single-byte ones through the
+// Encoding Standard's index tables; ICU decodes only UTF-16 and the multi-byte encodings. A TextDecoder cell owns the
+// ICU converter of its encoding, when the encoding uses one. The constructor opens it and closes it again if it throws
+// before the cell exists; from then on the cell closes it in its destructor. Between streaming calls a decoder keeps a
+// carried partial UTF-8 sequence of at most three bytes, its BOM flag and the converter's state; a decode that throws
+// resets all three, so the next call starts clean.
 //
 // A stream cell reaches its transform stream, and a TextDecoderStream its decoder, through write barriers that
 // visitChildren traces. A stream's JavaScript callbacks reach their owner through a non-enumerable property of the
@@ -41,6 +42,7 @@
 #include <wtf/text/WTFString.h>
 
 #include <unicode/ucnv.h>
+#include <unicode/ucnv_cb.h>
 
 #include <algorithm>
 #include <array>
@@ -87,7 +89,6 @@ namespace {
         Windows1256,
         Windows1257,
         Windows1258,
-        Utf16,
         Utf16BE,
         Utf16LE,
         XUserDefined,
@@ -173,12 +174,6 @@ namespace {
 
         TextDecoderEncoding encoding() const { return m_encoding; }
         UConverter* converter() const { return m_converter; }
-        void replaceConverter(UConverter* converter)
-        {
-            if (m_converter)
-                ucnv_close(m_converter);
-            m_converter = converter;
-        }
         bool fatal() const { return m_fatal; }
         bool ignoreBOM() const { return m_ignore_bom; }
         bool bomSeen() const { return m_bom_seen; }
@@ -746,13 +741,15 @@ namespace {
         TextDecoderLabel { "x-cp1258"_s, TextDecoderEncoding::Windows1258 },
         TextDecoderLabel { "utf-16be"_s, TextDecoderEncoding::Utf16BE },
         TextDecoderLabel { "unicodefffe"_s, TextDecoderEncoding::Utf16BE },
+        // The Encoding Standard gives "utf-16" and its aliases to UTF-16LE, and TextDecoder sniffs no BOM, so a
+        // leading FE FF decodes as U+FFFE instead of switching the decoder to big-endian.
         TextDecoderLabel { "utf-16le"_s, TextDecoderEncoding::Utf16LE },
-        TextDecoderLabel { "utf-16"_s, TextDecoderEncoding::Utf16 },
-        TextDecoderLabel { "csunicode"_s, TextDecoderEncoding::Utf16 },
-        TextDecoderLabel { "iso-10646-ucs-2"_s, TextDecoderEncoding::Utf16 },
-        TextDecoderLabel { "ucs-2"_s, TextDecoderEncoding::Utf16 },
-        TextDecoderLabel { "unicode"_s, TextDecoderEncoding::Utf16 },
-        TextDecoderLabel { "unicodefeff"_s, TextDecoderEncoding::Utf16 },
+        TextDecoderLabel { "utf-16"_s, TextDecoderEncoding::Utf16LE },
+        TextDecoderLabel { "csunicode"_s, TextDecoderEncoding::Utf16LE },
+        TextDecoderLabel { "iso-10646-ucs-2"_s, TextDecoderEncoding::Utf16LE },
+        TextDecoderLabel { "ucs-2"_s, TextDecoderEncoding::Utf16LE },
+        TextDecoderLabel { "unicode"_s, TextDecoderEncoding::Utf16LE },
+        TextDecoderLabel { "unicodefeff"_s, TextDecoderEncoding::Utf16LE },
         TextDecoderLabel { "x-user-defined"_s, TextDecoderEncoding::XUserDefined },
         // Labels of the replacement encoding ("replacement", "csiso2022kr", "hz-gb-2312", "iso-2022-cn",
         // "iso-2022-cn-ext", "iso-2022-kr") are left out: the TextDecoder and TextDecoderStream constructors must
@@ -907,7 +904,6 @@ namespace {
             return "windows-1257"_s;
         case TextDecoderEncoding::Windows1258:
             return "windows-1258"_s;
-        case TextDecoderEncoding::Utf16:
         case TextDecoderEncoding::Utf16LE:
             return "utf-16le"_s;
         case TextDecoderEncoding::Utf16BE:
@@ -936,51 +932,13 @@ namespace {
         RELEASE_ASSERT_NOT_REACHED();
     }
 
+    // Single-byte encodings decode through singleByteIndex below and UTF-8 and x-user-defined have decoders of their
+    // own, so ICU serves only UTF-16 and the multi-byte encodings.
     static const char* icuConverterName(TextDecoderEncoding encoding)
     {
         switch (encoding) {
-        case TextDecoderEncoding::ISO88592:
-            return "ISO-8859-2";
-        case TextDecoderEncoding::ISO88593:
-            return "ISO-8859-3";
-        case TextDecoderEncoding::ISO88594:
-            return "ISO-8859-4";
-        case TextDecoderEncoding::ISO88595:
-            return "ISO-8859-5";
-        case TextDecoderEncoding::ISO88596:
-            return "ISO-8859-6";
-        case TextDecoderEncoding::ISO88597:
-            return "ISO-8859-7";
-        case TextDecoderEncoding::ISO88598:
-        case TextDecoderEncoding::ISO88598I:
-            return "ISO-8859-8";
-        case TextDecoderEncoding::ISO885910:
-            return "ISO-8859-10";
-        case TextDecoderEncoding::ISO885913:
-            return "ISO-8859-13";
-        case TextDecoderEncoding::ISO885914:
-            return "ISO-8859-14";
-        case TextDecoderEncoding::ISO885915:
-            return "ISO-8859-15";
-        case TextDecoderEncoding::KOI8R:
-            return "KOI8-R";
-        case TextDecoderEncoding::Windows1250:
-            return "windows-1250";
-        case TextDecoderEncoding::Windows1251:
-            return "windows-1251";
-        case TextDecoderEncoding::Windows1252:
-            return "windows-1252";
-        case TextDecoderEncoding::Windows1254:
-            return "windows-1254";
-        case TextDecoderEncoding::Windows1256:
-            return "windows-1256";
-        case TextDecoderEncoding::Windows1257:
-            return "windows-1257";
-        case TextDecoderEncoding::Windows1258:
-            return "windows-1258";
         case TextDecoderEncoding::Utf16BE:
             return "UTF-16BE";
-        case TextDecoderEncoding::Utf16:
         case TextDecoderEncoding::Utf16LE:
             return "UTF-16LE";
         case TextDecoderEncoding::Big5:
@@ -1000,18 +958,36 @@ namespace {
             return "GBK";
         case TextDecoderEncoding::GB18030:
             return "GB18030";
-        case TextDecoderEncoding::Macintosh:
-            return "macintosh";
-        case TextDecoderEncoding::XMacCyrillic:
-            return "x-mac-cyrillic";
         case TextDecoderEncoding::Utf8:
         case TextDecoderEncoding::IBM866:
+        case TextDecoderEncoding::ISO88592:
+        case TextDecoderEncoding::ISO88593:
+        case TextDecoderEncoding::ISO88594:
+        case TextDecoderEncoding::ISO88595:
+        case TextDecoderEncoding::ISO88596:
+        case TextDecoderEncoding::ISO88597:
+        case TextDecoderEncoding::ISO88598:
+        case TextDecoderEncoding::ISO88598I:
+        case TextDecoderEncoding::ISO885910:
+        case TextDecoderEncoding::ISO885913:
+        case TextDecoderEncoding::ISO885914:
+        case TextDecoderEncoding::ISO885915:
         case TextDecoderEncoding::ISO885916:
+        case TextDecoderEncoding::KOI8R:
         case TextDecoderEncoding::KOI8U:
         case TextDecoderEncoding::Windows874:
+        case TextDecoderEncoding::Windows1250:
+        case TextDecoderEncoding::Windows1251:
+        case TextDecoderEncoding::Windows1252:
         case TextDecoderEncoding::Windows1253:
+        case TextDecoderEncoding::Windows1254:
         case TextDecoderEncoding::Windows1255:
+        case TextDecoderEncoding::Windows1256:
+        case TextDecoderEncoding::Windows1257:
+        case TextDecoderEncoding::Windows1258:
         case TextDecoderEncoding::XUserDefined:
+        case TextDecoderEncoding::Macintosh:
+        case TextDecoderEncoding::XMacCyrillic:
             return nullptr;
         }
         RELEASE_ASSERT_NOT_REACHED();
@@ -1019,8 +995,22 @@ namespace {
 
     static bool usesBomHandling(TextDecoderEncoding encoding)
     {
-        return encoding == TextDecoderEncoding::Utf8 || encoding == TextDecoderEncoding::Utf16
-            || encoding == TextDecoderEncoding::Utf16LE || encoding == TextDecoderEncoding::Utf16BE;
+        return encoding == TextDecoderEncoding::Utf8 || encoding == TextDecoderEncoding::Utf16LE
+            || encoding == TextDecoderEncoding::Utf16BE;
+    }
+
+    // The Encoding Standard's decoders emit U+FFFD for every error. ICU's own SUBSTITUTE callback writes U+001A instead
+    // for a one-byte error in a converter whose table defines a one-byte substitution character, as the Shift_JIS and
+    // EUC-JP tables do, so a decoder that is not fatal substitutes through this callback.
+    static void substituteReplacementCharacter(const void*, UConverterToUnicodeArgs* args, const char*, int32_t,
+        UConverterCallbackReason reason, UErrorCode* status)
+    {
+        // A reset, close or clone is a notification, not an error.
+        if (reason > UCNV_IRREGULAR)
+            return;
+        *status = U_ZERO_ERROR;
+        static constexpr UChar replacement = 0xFFFD;
+        ucnv_cbToUWriteUChars(args, &replacement, 1, 0, status);
     }
 
     static UConverter* createIcuConverter(
@@ -1039,7 +1029,7 @@ namespace {
         }
 
         status = U_ZERO_ERROR;
-        ucnv_setToUCallBack(converter, fatal ? UCNV_TO_U_CALLBACK_STOP : UCNV_TO_U_CALLBACK_SUBSTITUTE, nullptr,
+        ucnv_setToUCallBack(converter, fatal ? UCNV_TO_U_CALLBACK_STOP : substituteReplacementCharacter, nullptr,
             nullptr, nullptr, &status);
         if (U_FAILURE(status)) {
             ucnv_close(converter);
@@ -1051,679 +1041,386 @@ namespace {
         return converter;
     }
 
-    static constexpr uint32_t invalidSingleByteCodePoint = 0xffffffffu;
+    // The Encoding Standard's index of each single-byte encoding: entry i holds the code point of byte 0x80 + i, and
+    // bytes below 0x80 decode as themselves. A byte the index leaves unmapped holds U+FFFD. No single-byte index maps
+    // a byte to U+FFFD, so the replacing decoder emits an entry as it is and the fatal decoder treats U+FFFD as the
+    // error. Every index maps into the Basic Multilingual Plane, so an entry is one UTF-16 code unit. The values are
+    // the published index files (https://encoding.spec.whatwg.org/#legacy-single-byte-encodings); a change
+    // regenerates a table from them instead of editing entries by hand.
+    using SingleByteIndex = std::array<char16_t, 128>;
+    static constexpr char16_t unmappedSingleByte = 0xfffd;
 
-    static constexpr uint32_t ibm866Index[128] = {
-        1040u,
-        1041u,
-        1042u,
-        1043u,
-        1044u,
-        1045u,
-        1046u,
-        1047u,
-        1048u,
-        1049u,
-        1050u,
-        1051u,
-        1052u,
-        1053u,
-        1054u,
-        1055u,
-        1056u,
-        1057u,
-        1058u,
-        1059u,
-        1060u,
-        1061u,
-        1062u,
-        1063u,
-        1064u,
-        1065u,
-        1066u,
-        1067u,
-        1068u,
-        1069u,
-        1070u,
-        1071u,
-        1072u,
-        1073u,
-        1074u,
-        1075u,
-        1076u,
-        1077u,
-        1078u,
-        1079u,
-        1080u,
-        1081u,
-        1082u,
-        1083u,
-        1084u,
-        1085u,
-        1086u,
-        1087u,
-        9617u,
-        9618u,
-        9619u,
-        9474u,
-        9508u,
-        9569u,
-        9570u,
-        9558u,
-        9557u,
-        9571u,
-        9553u,
-        9559u,
-        9565u,
-        9564u,
-        9563u,
-        9488u,
-        9492u,
-        9524u,
-        9516u,
-        9500u,
-        9472u,
-        9532u,
-        9566u,
-        9567u,
-        9562u,
-        9556u,
-        9577u,
-        9574u,
-        9568u,
-        9552u,
-        9580u,
-        9575u,
-        9576u,
-        9572u,
-        9573u,
-        9561u,
-        9560u,
-        9554u,
-        9555u,
-        9579u,
-        9578u,
-        9496u,
-        9484u,
-        9608u,
-        9604u,
-        9612u,
-        9616u,
-        9600u,
-        1088u,
-        1089u,
-        1090u,
-        1091u,
-        1092u,
-        1093u,
-        1094u,
-        1095u,
-        1096u,
-        1097u,
-        1098u,
-        1099u,
-        1100u,
-        1101u,
-        1102u,
-        1103u,
-        1025u,
-        1105u,
-        1028u,
-        1108u,
-        1031u,
-        1111u,
-        1038u,
-        1118u,
-        176u,
-        8729u,
-        183u,
-        8730u,
-        8470u,
-        164u,
-        9632u,
-        160u,
-    };
+    static constexpr SingleByteIndex ibm866Index { { 0x0410, 0x0411, 0x0412, 0x0413, 0x0414, 0x0415, 0x0416, 0x0417,
+        0x0418, 0x0419, 0x041a, 0x041b, 0x041c, 0x041d, 0x041e, 0x041f, 0x0420, 0x0421, 0x0422, 0x0423, 0x0424, 0x0425,
+        0x0426, 0x0427, 0x0428, 0x0429, 0x042a, 0x042b, 0x042c, 0x042d, 0x042e, 0x042f, 0x0430, 0x0431, 0x0432, 0x0433,
+        0x0434, 0x0435, 0x0436, 0x0437, 0x0438, 0x0439, 0x043a, 0x043b, 0x043c, 0x043d, 0x043e, 0x043f, 0x2591, 0x2592,
+        0x2593, 0x2502, 0x2524, 0x2561, 0x2562, 0x2556, 0x2555, 0x2563, 0x2551, 0x2557, 0x255d, 0x255c, 0x255b, 0x2510,
+        0x2514, 0x2534, 0x252c, 0x251c, 0x2500, 0x253c, 0x255e, 0x255f, 0x255a, 0x2554, 0x2569, 0x2566, 0x2560, 0x2550,
+        0x256c, 0x2567, 0x2568, 0x2564, 0x2565, 0x2559, 0x2558, 0x2552, 0x2553, 0x256b, 0x256a, 0x2518, 0x250c, 0x2588,
+        0x2584, 0x258c, 0x2590, 0x2580, 0x0440, 0x0441, 0x0442, 0x0443, 0x0444, 0x0445, 0x0446, 0x0447, 0x0448, 0x0449,
+        0x044a, 0x044b, 0x044c, 0x044d, 0x044e, 0x044f, 0x0401, 0x0451, 0x0404, 0x0454, 0x0407, 0x0457, 0x040e, 0x045e,
+        0x00b0, 0x2219, 0x00b7, 0x221a, 0x2116, 0x00a4, 0x25a0, 0x00a0 } };
 
-    static constexpr uint32_t koi8uIndex[128] = {
-        9472u,
-        9474u,
-        9484u,
-        9488u,
-        9492u,
-        9496u,
-        9500u,
-        9508u,
-        9516u,
-        9524u,
-        9532u,
-        9600u,
-        9604u,
-        9608u,
-        9612u,
-        9616u,
-        9617u,
-        9618u,
-        9619u,
-        8992u,
-        9632u,
-        8729u,
-        8730u,
-        8776u,
-        8804u,
-        8805u,
-        160u,
-        8993u,
-        176u,
-        178u,
-        183u,
-        247u,
-        9552u,
-        9553u,
-        9554u,
-        1105u,
-        1108u,
-        9556u,
-        1110u,
-        1111u,
-        9559u,
-        9560u,
-        9561u,
-        9562u,
-        9563u,
-        1169u,
-        1118u,
-        9566u,
-        9567u,
-        9568u,
-        9569u,
-        1025u,
-        1028u,
-        9571u,
-        1030u,
-        1031u,
-        9574u,
-        9575u,
-        9576u,
-        9577u,
-        9578u,
-        1168u,
-        1038u,
-        169u,
-        1102u,
-        1072u,
-        1073u,
-        1094u,
-        1076u,
-        1077u,
-        1092u,
-        1075u,
-        1093u,
-        1080u,
-        1081u,
-        1082u,
-        1083u,
-        1084u,
-        1085u,
-        1086u,
-        1087u,
-        1103u,
-        1088u,
-        1089u,
-        1090u,
-        1091u,
-        1078u,
-        1074u,
-        1100u,
-        1099u,
-        1079u,
-        1096u,
-        1101u,
-        1097u,
-        1095u,
-        1098u,
-        1070u,
-        1040u,
-        1041u,
-        1062u,
-        1044u,
-        1045u,
-        1060u,
-        1043u,
-        1061u,
-        1048u,
-        1049u,
-        1050u,
-        1051u,
-        1052u,
-        1053u,
-        1054u,
-        1055u,
-        1071u,
-        1056u,
-        1057u,
-        1058u,
-        1059u,
-        1046u,
-        1042u,
-        1068u,
-        1067u,
-        1047u,
-        1064u,
-        1069u,
-        1065u,
-        1063u,
-        1066u,
-    };
+    static constexpr SingleByteIndex iso88592Index { { 0x0080, 0x0081, 0x0082, 0x0083, 0x0084, 0x0085, 0x0086, 0x0087,
+        0x0088, 0x0089, 0x008a, 0x008b, 0x008c, 0x008d, 0x008e, 0x008f, 0x0090, 0x0091, 0x0092, 0x0093, 0x0094, 0x0095,
+        0x0096, 0x0097, 0x0098, 0x0099, 0x009a, 0x009b, 0x009c, 0x009d, 0x009e, 0x009f, 0x00a0, 0x0104, 0x02d8, 0x0141,
+        0x00a4, 0x013d, 0x015a, 0x00a7, 0x00a8, 0x0160, 0x015e, 0x0164, 0x0179, 0x00ad, 0x017d, 0x017b, 0x00b0, 0x0105,
+        0x02db, 0x0142, 0x00b4, 0x013e, 0x015b, 0x02c7, 0x00b8, 0x0161, 0x015f, 0x0165, 0x017a, 0x02dd, 0x017e, 0x017c,
+        0x0154, 0x00c1, 0x00c2, 0x0102, 0x00c4, 0x0139, 0x0106, 0x00c7, 0x010c, 0x00c9, 0x0118, 0x00cb, 0x011a, 0x00cd,
+        0x00ce, 0x010e, 0x0110, 0x0143, 0x0147, 0x00d3, 0x00d4, 0x0150, 0x00d6, 0x00d7, 0x0158, 0x016e, 0x00da, 0x0170,
+        0x00dc, 0x00dd, 0x0162, 0x00df, 0x0155, 0x00e1, 0x00e2, 0x0103, 0x00e4, 0x013a, 0x0107, 0x00e7, 0x010d, 0x00e9,
+        0x0119, 0x00eb, 0x011b, 0x00ed, 0x00ee, 0x010f, 0x0111, 0x0144, 0x0148, 0x00f3, 0x00f4, 0x0151, 0x00f6, 0x00f7,
+        0x0159, 0x016f, 0x00fa, 0x0171, 0x00fc, 0x00fd, 0x0163, 0x02d9 } };
 
-    static constexpr uint32_t windows874Index[128] = {
-        8364u,
-        129u,
-        130u,
-        131u,
-        132u,
-        8230u,
-        134u,
-        135u,
-        136u,
-        137u,
-        138u,
-        139u,
-        140u,
-        141u,
-        142u,
-        143u,
-        144u,
-        8216u,
-        8217u,
-        8220u,
-        8221u,
-        8226u,
-        8211u,
-        8212u,
-        152u,
-        153u,
-        154u,
-        155u,
-        156u,
-        157u,
-        158u,
-        159u,
-        160u,
-        3585u,
-        3586u,
-        3587u,
-        3588u,
-        3589u,
-        3590u,
-        3591u,
-        3592u,
-        3593u,
-        3594u,
-        3595u,
-        3596u,
-        3597u,
-        3598u,
-        3599u,
-        3600u,
-        3601u,
-        3602u,
-        3603u,
-        3604u,
-        3605u,
-        3606u,
-        3607u,
-        3608u,
-        3609u,
-        3610u,
-        3611u,
-        3612u,
-        3613u,
-        3614u,
-        3615u,
-        3616u,
-        3617u,
-        3618u,
-        3619u,
-        3620u,
-        3621u,
-        3622u,
-        3623u,
-        3624u,
-        3625u,
-        3626u,
-        3627u,
-        3628u,
-        3629u,
-        3630u,
-        3631u,
-        3632u,
-        3633u,
-        3634u,
-        3635u,
-        3636u,
-        3637u,
-        3638u,
-        3639u,
-        3640u,
-        3641u,
-        3642u,
-        invalidSingleByteCodePoint,
-        invalidSingleByteCodePoint,
-        invalidSingleByteCodePoint,
-        invalidSingleByteCodePoint,
-        3647u,
-        3648u,
-        3649u,
-        3650u,
-        3651u,
-        3652u,
-        3653u,
-        3654u,
-        3655u,
-        3656u,
-        3657u,
-        3658u,
-        3659u,
-        3660u,
-        3661u,
-        3662u,
-        3663u,
-        3664u,
-        3665u,
-        3666u,
-        3667u,
-        3668u,
-        3669u,
-        3670u,
-        3671u,
-        3672u,
-        3673u,
-        3674u,
-        3675u,
-        invalidSingleByteCodePoint,
-        invalidSingleByteCodePoint,
-        invalidSingleByteCodePoint,
-        invalidSingleByteCodePoint,
-    };
+    static constexpr SingleByteIndex iso88593Index { { 0x0080, 0x0081, 0x0082, 0x0083, 0x0084, 0x0085, 0x0086, 0x0087,
+        0x0088, 0x0089, 0x008a, 0x008b, 0x008c, 0x008d, 0x008e, 0x008f, 0x0090, 0x0091, 0x0092, 0x0093, 0x0094, 0x0095,
+        0x0096, 0x0097, 0x0098, 0x0099, 0x009a, 0x009b, 0x009c, 0x009d, 0x009e, 0x009f, 0x00a0, 0x0126, 0x02d8, 0x00a3,
+        0x00a4, 0xfffd, 0x0124, 0x00a7, 0x00a8, 0x0130, 0x015e, 0x011e, 0x0134, 0x00ad, 0xfffd, 0x017b, 0x00b0, 0x0127,
+        0x00b2, 0x00b3, 0x00b4, 0x00b5, 0x0125, 0x00b7, 0x00b8, 0x0131, 0x015f, 0x011f, 0x0135, 0x00bd, 0xfffd, 0x017c,
+        0x00c0, 0x00c1, 0x00c2, 0xfffd, 0x00c4, 0x010a, 0x0108, 0x00c7, 0x00c8, 0x00c9, 0x00ca, 0x00cb, 0x00cc, 0x00cd,
+        0x00ce, 0x00cf, 0xfffd, 0x00d1, 0x00d2, 0x00d3, 0x00d4, 0x0120, 0x00d6, 0x00d7, 0x011c, 0x00d9, 0x00da, 0x00db,
+        0x00dc, 0x016c, 0x015c, 0x00df, 0x00e0, 0x00e1, 0x00e2, 0xfffd, 0x00e4, 0x010b, 0x0109, 0x00e7, 0x00e8, 0x00e9,
+        0x00ea, 0x00eb, 0x00ec, 0x00ed, 0x00ee, 0x00ef, 0xfffd, 0x00f1, 0x00f2, 0x00f3, 0x00f4, 0x0121, 0x00f6, 0x00f7,
+        0x011d, 0x00f9, 0x00fa, 0x00fb, 0x00fc, 0x016d, 0x015d, 0x02d9 } };
 
-    static constexpr uint32_t windows1253Index[128] = {
-        8364u,
-        129u,
-        8218u,
-        402u,
-        8222u,
-        8230u,
-        8224u,
-        8225u,
-        136u,
-        8240u,
-        138u,
-        8249u,
-        140u,
-        141u,
-        142u,
-        143u,
-        144u,
-        8216u,
-        8217u,
-        8220u,
-        8221u,
-        8226u,
-        8211u,
-        8212u,
-        152u,
-        8482u,
-        154u,
-        8250u,
-        156u,
-        157u,
-        158u,
-        159u,
-        160u,
-        901u,
-        902u,
-        163u,
-        164u,
-        165u,
-        166u,
-        167u,
-        168u,
-        169u,
-        invalidSingleByteCodePoint,
-        171u,
-        172u,
-        173u,
-        174u,
-        8213u,
-        176u,
-        177u,
-        178u,
-        179u,
-        900u,
-        181u,
-        182u,
-        183u,
-        904u,
-        905u,
-        906u,
-        187u,
-        908u,
-        189u,
-        910u,
-        911u,
-        912u,
-        913u,
-        914u,
-        915u,
-        916u,
-        917u,
-        918u,
-        919u,
-        920u,
-        921u,
-        922u,
-        923u,
-        924u,
-        925u,
-        926u,
-        927u,
-        928u,
-        929u,
-        invalidSingleByteCodePoint,
-        931u,
-        932u,
-        933u,
-        934u,
-        935u,
-        936u,
-        937u,
-        938u,
-        939u,
-        940u,
-        941u,
-        942u,
-        943u,
-        944u,
-        945u,
-        946u,
-        947u,
-        948u,
-        949u,
-        950u,
-        951u,
-        952u,
-        953u,
-        954u,
-        955u,
-        956u,
-        957u,
-        958u,
-        959u,
-        960u,
-        961u,
-        962u,
-        963u,
-        964u,
-        965u,
-        966u,
-        967u,
-        968u,
-        969u,
-        970u,
-        971u,
-        972u,
-        973u,
-        974u,
-        invalidSingleByteCodePoint,
-    };
+    static constexpr SingleByteIndex iso88594Index { { 0x0080, 0x0081, 0x0082, 0x0083, 0x0084, 0x0085, 0x0086, 0x0087,
+        0x0088, 0x0089, 0x008a, 0x008b, 0x008c, 0x008d, 0x008e, 0x008f, 0x0090, 0x0091, 0x0092, 0x0093, 0x0094, 0x0095,
+        0x0096, 0x0097, 0x0098, 0x0099, 0x009a, 0x009b, 0x009c, 0x009d, 0x009e, 0x009f, 0x00a0, 0x0104, 0x0138, 0x0156,
+        0x00a4, 0x0128, 0x013b, 0x00a7, 0x00a8, 0x0160, 0x0112, 0x0122, 0x0166, 0x00ad, 0x017d, 0x00af, 0x00b0, 0x0105,
+        0x02db, 0x0157, 0x00b4, 0x0129, 0x013c, 0x02c7, 0x00b8, 0x0161, 0x0113, 0x0123, 0x0167, 0x014a, 0x017e, 0x014b,
+        0x0100, 0x00c1, 0x00c2, 0x00c3, 0x00c4, 0x00c5, 0x00c6, 0x012e, 0x010c, 0x00c9, 0x0118, 0x00cb, 0x0116, 0x00cd,
+        0x00ce, 0x012a, 0x0110, 0x0145, 0x014c, 0x0136, 0x00d4, 0x00d5, 0x00d6, 0x00d7, 0x00d8, 0x0172, 0x00da, 0x00db,
+        0x00dc, 0x0168, 0x016a, 0x00df, 0x0101, 0x00e1, 0x00e2, 0x00e3, 0x00e4, 0x00e5, 0x00e6, 0x012f, 0x010d, 0x00e9,
+        0x0119, 0x00eb, 0x0117, 0x00ed, 0x00ee, 0x012b, 0x0111, 0x0146, 0x014d, 0x0137, 0x00f4, 0x00f5, 0x00f6, 0x00f7,
+        0x00f8, 0x0173, 0x00fa, 0x00fb, 0x00fc, 0x0169, 0x016b, 0x02d9 } };
 
-    static constexpr uint32_t windows1255Index[128] = {
-        8364u,
-        129u,
-        8218u,
-        402u,
-        8222u,
-        8230u,
-        8224u,
-        8225u,
-        710u,
-        8240u,
-        138u,
-        8249u,
-        140u,
-        141u,
-        142u,
-        143u,
-        144u,
-        8216u,
-        8217u,
-        8220u,
-        8221u,
-        8226u,
-        8211u,
-        8212u,
-        732u,
-        8482u,
-        154u,
-        8250u,
-        156u,
-        157u,
-        158u,
-        159u,
-        160u,
-        161u,
-        162u,
-        163u,
-        8362u,
-        165u,
-        166u,
-        167u,
-        168u,
-        169u,
-        215u,
-        171u,
-        172u,
-        173u,
-        174u,
-        175u,
-        176u,
-        177u,
-        178u,
-        179u,
-        180u,
-        181u,
-        182u,
-        183u,
-        184u,
-        185u,
-        247u,
-        187u,
-        188u,
-        189u,
-        190u,
-        191u,
-        1456u,
-        1457u,
-        1458u,
-        1459u,
-        1460u,
-        1461u,
-        1462u,
-        1463u,
-        1464u,
-        1465u,
-        1466u,
-        1467u,
-        1468u,
-        1469u,
-        1470u,
-        1471u,
-        1472u,
-        1473u,
-        1474u,
-        1475u,
-        1520u,
-        1521u,
-        1522u,
-        1523u,
-        1524u,
-        invalidSingleByteCodePoint,
-        invalidSingleByteCodePoint,
-        invalidSingleByteCodePoint,
-        invalidSingleByteCodePoint,
-        invalidSingleByteCodePoint,
-        invalidSingleByteCodePoint,
-        invalidSingleByteCodePoint,
-        1488u,
-        1489u,
-        1490u,
-        1491u,
-        1492u,
-        1493u,
-        1494u,
-        1495u,
-        1496u,
-        1497u,
-        1498u,
-        1499u,
-        1500u,
-        1501u,
-        1502u,
-        1503u,
-        1504u,
-        1505u,
-        1506u,
-        1507u,
-        1508u,
-        1509u,
-        1510u,
-        1511u,
-        1512u,
-        1513u,
-        1514u,
-        invalidSingleByteCodePoint,
-        invalidSingleByteCodePoint,
-        8206u,
-        8207u,
-        invalidSingleByteCodePoint,
-    };
+    static constexpr SingleByteIndex iso88595Index { { 0x0080, 0x0081, 0x0082, 0x0083, 0x0084, 0x0085, 0x0086, 0x0087,
+        0x0088, 0x0089, 0x008a, 0x008b, 0x008c, 0x008d, 0x008e, 0x008f, 0x0090, 0x0091, 0x0092, 0x0093, 0x0094, 0x0095,
+        0x0096, 0x0097, 0x0098, 0x0099, 0x009a, 0x009b, 0x009c, 0x009d, 0x009e, 0x009f, 0x00a0, 0x0401, 0x0402, 0x0403,
+        0x0404, 0x0405, 0x0406, 0x0407, 0x0408, 0x0409, 0x040a, 0x040b, 0x040c, 0x00ad, 0x040e, 0x040f, 0x0410, 0x0411,
+        0x0412, 0x0413, 0x0414, 0x0415, 0x0416, 0x0417, 0x0418, 0x0419, 0x041a, 0x041b, 0x041c, 0x041d, 0x041e, 0x041f,
+        0x0420, 0x0421, 0x0422, 0x0423, 0x0424, 0x0425, 0x0426, 0x0427, 0x0428, 0x0429, 0x042a, 0x042b, 0x042c, 0x042d,
+        0x042e, 0x042f, 0x0430, 0x0431, 0x0432, 0x0433, 0x0434, 0x0435, 0x0436, 0x0437, 0x0438, 0x0439, 0x043a, 0x043b,
+        0x043c, 0x043d, 0x043e, 0x043f, 0x0440, 0x0441, 0x0442, 0x0443, 0x0444, 0x0445, 0x0446, 0x0447, 0x0448, 0x0449,
+        0x044a, 0x044b, 0x044c, 0x044d, 0x044e, 0x044f, 0x2116, 0x0451, 0x0452, 0x0453, 0x0454, 0x0455, 0x0456, 0x0457,
+        0x0458, 0x0459, 0x045a, 0x045b, 0x045c, 0x00a7, 0x045e, 0x045f } };
 
-    static const uint32_t* whatwgSingleByteIndex(TextDecoderEncoding encoding)
+    static constexpr SingleByteIndex iso88596Index { { 0x0080, 0x0081, 0x0082, 0x0083, 0x0084, 0x0085, 0x0086, 0x0087,
+        0x0088, 0x0089, 0x008a, 0x008b, 0x008c, 0x008d, 0x008e, 0x008f, 0x0090, 0x0091, 0x0092, 0x0093, 0x0094, 0x0095,
+        0x0096, 0x0097, 0x0098, 0x0099, 0x009a, 0x009b, 0x009c, 0x009d, 0x009e, 0x009f, 0x00a0, 0xfffd, 0xfffd, 0xfffd,
+        0x00a4, 0xfffd, 0xfffd, 0xfffd, 0xfffd, 0xfffd, 0xfffd, 0xfffd, 0x060c, 0x00ad, 0xfffd, 0xfffd, 0xfffd, 0xfffd,
+        0xfffd, 0xfffd, 0xfffd, 0xfffd, 0xfffd, 0xfffd, 0xfffd, 0xfffd, 0xfffd, 0x061b, 0xfffd, 0xfffd, 0xfffd, 0x061f,
+        0xfffd, 0x0621, 0x0622, 0x0623, 0x0624, 0x0625, 0x0626, 0x0627, 0x0628, 0x0629, 0x062a, 0x062b, 0x062c, 0x062d,
+        0x062e, 0x062f, 0x0630, 0x0631, 0x0632, 0x0633, 0x0634, 0x0635, 0x0636, 0x0637, 0x0638, 0x0639, 0x063a, 0xfffd,
+        0xfffd, 0xfffd, 0xfffd, 0xfffd, 0x0640, 0x0641, 0x0642, 0x0643, 0x0644, 0x0645, 0x0646, 0x0647, 0x0648, 0x0649,
+        0x064a, 0x064b, 0x064c, 0x064d, 0x064e, 0x064f, 0x0650, 0x0651, 0x0652, 0xfffd, 0xfffd, 0xfffd, 0xfffd, 0xfffd,
+        0xfffd, 0xfffd, 0xfffd, 0xfffd, 0xfffd, 0xfffd, 0xfffd, 0xfffd } };
+
+    static constexpr SingleByteIndex iso88597Index { { 0x0080, 0x0081, 0x0082, 0x0083, 0x0084, 0x0085, 0x0086, 0x0087,
+        0x0088, 0x0089, 0x008a, 0x008b, 0x008c, 0x008d, 0x008e, 0x008f, 0x0090, 0x0091, 0x0092, 0x0093, 0x0094, 0x0095,
+        0x0096, 0x0097, 0x0098, 0x0099, 0x009a, 0x009b, 0x009c, 0x009d, 0x009e, 0x009f, 0x00a0, 0x2018, 0x2019, 0x00a3,
+        0x20ac, 0x20af, 0x00a6, 0x00a7, 0x00a8, 0x00a9, 0x037a, 0x00ab, 0x00ac, 0x00ad, 0xfffd, 0x2015, 0x00b0, 0x00b1,
+        0x00b2, 0x00b3, 0x0384, 0x0385, 0x0386, 0x00b7, 0x0388, 0x0389, 0x038a, 0x00bb, 0x038c, 0x00bd, 0x038e, 0x038f,
+        0x0390, 0x0391, 0x0392, 0x0393, 0x0394, 0x0395, 0x0396, 0x0397, 0x0398, 0x0399, 0x039a, 0x039b, 0x039c, 0x039d,
+        0x039e, 0x039f, 0x03a0, 0x03a1, 0xfffd, 0x03a3, 0x03a4, 0x03a5, 0x03a6, 0x03a7, 0x03a8, 0x03a9, 0x03aa, 0x03ab,
+        0x03ac, 0x03ad, 0x03ae, 0x03af, 0x03b0, 0x03b1, 0x03b2, 0x03b3, 0x03b4, 0x03b5, 0x03b6, 0x03b7, 0x03b8, 0x03b9,
+        0x03ba, 0x03bb, 0x03bc, 0x03bd, 0x03be, 0x03bf, 0x03c0, 0x03c1, 0x03c2, 0x03c3, 0x03c4, 0x03c5, 0x03c6, 0x03c7,
+        0x03c8, 0x03c9, 0x03ca, 0x03cb, 0x03cc, 0x03cd, 0x03ce, 0xfffd } };
+
+    // ISO-8859-8-I decodes through this index too; it differs from ISO-8859-8 only in how text is laid out.
+    static constexpr SingleByteIndex iso88598Index { { 0x0080, 0x0081, 0x0082, 0x0083, 0x0084, 0x0085, 0x0086, 0x0087,
+        0x0088, 0x0089, 0x008a, 0x008b, 0x008c, 0x008d, 0x008e, 0x008f, 0x0090, 0x0091, 0x0092, 0x0093, 0x0094, 0x0095,
+        0x0096, 0x0097, 0x0098, 0x0099, 0x009a, 0x009b, 0x009c, 0x009d, 0x009e, 0x009f, 0x00a0, 0xfffd, 0x00a2, 0x00a3,
+        0x00a4, 0x00a5, 0x00a6, 0x00a7, 0x00a8, 0x00a9, 0x00d7, 0x00ab, 0x00ac, 0x00ad, 0x00ae, 0x00af, 0x00b0, 0x00b1,
+        0x00b2, 0x00b3, 0x00b4, 0x00b5, 0x00b6, 0x00b7, 0x00b8, 0x00b9, 0x00f7, 0x00bb, 0x00bc, 0x00bd, 0x00be, 0xfffd,
+        0xfffd, 0xfffd, 0xfffd, 0xfffd, 0xfffd, 0xfffd, 0xfffd, 0xfffd, 0xfffd, 0xfffd, 0xfffd, 0xfffd, 0xfffd, 0xfffd,
+        0xfffd, 0xfffd, 0xfffd, 0xfffd, 0xfffd, 0xfffd, 0xfffd, 0xfffd, 0xfffd, 0xfffd, 0xfffd, 0xfffd, 0xfffd, 0xfffd,
+        0xfffd, 0xfffd, 0xfffd, 0x2017, 0x05d0, 0x05d1, 0x05d2, 0x05d3, 0x05d4, 0x05d5, 0x05d6, 0x05d7, 0x05d8, 0x05d9,
+        0x05da, 0x05db, 0x05dc, 0x05dd, 0x05de, 0x05df, 0x05e0, 0x05e1, 0x05e2, 0x05e3, 0x05e4, 0x05e5, 0x05e6, 0x05e7,
+        0x05e8, 0x05e9, 0x05ea, 0xfffd, 0xfffd, 0x200e, 0x200f, 0xfffd } };
+
+    static constexpr SingleByteIndex iso885910Index { { 0x0080, 0x0081, 0x0082, 0x0083, 0x0084, 0x0085, 0x0086, 0x0087,
+        0x0088, 0x0089, 0x008a, 0x008b, 0x008c, 0x008d, 0x008e, 0x008f, 0x0090, 0x0091, 0x0092, 0x0093, 0x0094, 0x0095,
+        0x0096, 0x0097, 0x0098, 0x0099, 0x009a, 0x009b, 0x009c, 0x009d, 0x009e, 0x009f, 0x00a0, 0x0104, 0x0112, 0x0122,
+        0x012a, 0x0128, 0x0136, 0x00a7, 0x013b, 0x0110, 0x0160, 0x0166, 0x017d, 0x00ad, 0x016a, 0x014a, 0x00b0, 0x0105,
+        0x0113, 0x0123, 0x012b, 0x0129, 0x0137, 0x00b7, 0x013c, 0x0111, 0x0161, 0x0167, 0x017e, 0x2015, 0x016b, 0x014b,
+        0x0100, 0x00c1, 0x00c2, 0x00c3, 0x00c4, 0x00c5, 0x00c6, 0x012e, 0x010c, 0x00c9, 0x0118, 0x00cb, 0x0116, 0x00cd,
+        0x00ce, 0x00cf, 0x00d0, 0x0145, 0x014c, 0x00d3, 0x00d4, 0x00d5, 0x00d6, 0x0168, 0x00d8, 0x0172, 0x00da, 0x00db,
+        0x00dc, 0x00dd, 0x00de, 0x00df, 0x0101, 0x00e1, 0x00e2, 0x00e3, 0x00e4, 0x00e5, 0x00e6, 0x012f, 0x010d, 0x00e9,
+        0x0119, 0x00eb, 0x0117, 0x00ed, 0x00ee, 0x00ef, 0x00f0, 0x0146, 0x014d, 0x00f3, 0x00f4, 0x00f5, 0x00f6, 0x0169,
+        0x00f8, 0x0173, 0x00fa, 0x00fb, 0x00fc, 0x00fd, 0x00fe, 0x0138 } };
+
+    static constexpr SingleByteIndex iso885913Index { { 0x0080, 0x0081, 0x0082, 0x0083, 0x0084, 0x0085, 0x0086, 0x0087,
+        0x0088, 0x0089, 0x008a, 0x008b, 0x008c, 0x008d, 0x008e, 0x008f, 0x0090, 0x0091, 0x0092, 0x0093, 0x0094, 0x0095,
+        0x0096, 0x0097, 0x0098, 0x0099, 0x009a, 0x009b, 0x009c, 0x009d, 0x009e, 0x009f, 0x00a0, 0x201d, 0x00a2, 0x00a3,
+        0x00a4, 0x201e, 0x00a6, 0x00a7, 0x00d8, 0x00a9, 0x0156, 0x00ab, 0x00ac, 0x00ad, 0x00ae, 0x00c6, 0x00b0, 0x00b1,
+        0x00b2, 0x00b3, 0x201c, 0x00b5, 0x00b6, 0x00b7, 0x00f8, 0x00b9, 0x0157, 0x00bb, 0x00bc, 0x00bd, 0x00be, 0x00e6,
+        0x0104, 0x012e, 0x0100, 0x0106, 0x00c4, 0x00c5, 0x0118, 0x0112, 0x010c, 0x00c9, 0x0179, 0x0116, 0x0122, 0x0136,
+        0x012a, 0x013b, 0x0160, 0x0143, 0x0145, 0x00d3, 0x014c, 0x00d5, 0x00d6, 0x00d7, 0x0172, 0x0141, 0x015a, 0x016a,
+        0x00dc, 0x017b, 0x017d, 0x00df, 0x0105, 0x012f, 0x0101, 0x0107, 0x00e4, 0x00e5, 0x0119, 0x0113, 0x010d, 0x00e9,
+        0x017a, 0x0117, 0x0123, 0x0137, 0x012b, 0x013c, 0x0161, 0x0144, 0x0146, 0x00f3, 0x014d, 0x00f5, 0x00f6, 0x00f7,
+        0x0173, 0x0142, 0x015b, 0x016b, 0x00fc, 0x017c, 0x017e, 0x2019 } };
+
+    static constexpr SingleByteIndex iso885914Index { { 0x0080, 0x0081, 0x0082, 0x0083, 0x0084, 0x0085, 0x0086, 0x0087,
+        0x0088, 0x0089, 0x008a, 0x008b, 0x008c, 0x008d, 0x008e, 0x008f, 0x0090, 0x0091, 0x0092, 0x0093, 0x0094, 0x0095,
+        0x0096, 0x0097, 0x0098, 0x0099, 0x009a, 0x009b, 0x009c, 0x009d, 0x009e, 0x009f, 0x00a0, 0x1e02, 0x1e03, 0x00a3,
+        0x010a, 0x010b, 0x1e0a, 0x00a7, 0x1e80, 0x00a9, 0x1e82, 0x1e0b, 0x1ef2, 0x00ad, 0x00ae, 0x0178, 0x1e1e, 0x1e1f,
+        0x0120, 0x0121, 0x1e40, 0x1e41, 0x00b6, 0x1e56, 0x1e81, 0x1e57, 0x1e83, 0x1e60, 0x1ef3, 0x1e84, 0x1e85, 0x1e61,
+        0x00c0, 0x00c1, 0x00c2, 0x00c3, 0x00c4, 0x00c5, 0x00c6, 0x00c7, 0x00c8, 0x00c9, 0x00ca, 0x00cb, 0x00cc, 0x00cd,
+        0x00ce, 0x00cf, 0x0174, 0x00d1, 0x00d2, 0x00d3, 0x00d4, 0x00d5, 0x00d6, 0x1e6a, 0x00d8, 0x00d9, 0x00da, 0x00db,
+        0x00dc, 0x00dd, 0x0176, 0x00df, 0x00e0, 0x00e1, 0x00e2, 0x00e3, 0x00e4, 0x00e5, 0x00e6, 0x00e7, 0x00e8, 0x00e9,
+        0x00ea, 0x00eb, 0x00ec, 0x00ed, 0x00ee, 0x00ef, 0x0175, 0x00f1, 0x00f2, 0x00f3, 0x00f4, 0x00f5, 0x00f6, 0x1e6b,
+        0x00f8, 0x00f9, 0x00fa, 0x00fb, 0x00fc, 0x00fd, 0x0177, 0x00ff } };
+
+    static constexpr SingleByteIndex iso885915Index { { 0x0080, 0x0081, 0x0082, 0x0083, 0x0084, 0x0085, 0x0086, 0x0087,
+        0x0088, 0x0089, 0x008a, 0x008b, 0x008c, 0x008d, 0x008e, 0x008f, 0x0090, 0x0091, 0x0092, 0x0093, 0x0094, 0x0095,
+        0x0096, 0x0097, 0x0098, 0x0099, 0x009a, 0x009b, 0x009c, 0x009d, 0x009e, 0x009f, 0x00a0, 0x00a1, 0x00a2, 0x00a3,
+        0x20ac, 0x00a5, 0x0160, 0x00a7, 0x0161, 0x00a9, 0x00aa, 0x00ab, 0x00ac, 0x00ad, 0x00ae, 0x00af, 0x00b0, 0x00b1,
+        0x00b2, 0x00b3, 0x017d, 0x00b5, 0x00b6, 0x00b7, 0x017e, 0x00b9, 0x00ba, 0x00bb, 0x0152, 0x0153, 0x0178, 0x00bf,
+        0x00c0, 0x00c1, 0x00c2, 0x00c3, 0x00c4, 0x00c5, 0x00c6, 0x00c7, 0x00c8, 0x00c9, 0x00ca, 0x00cb, 0x00cc, 0x00cd,
+        0x00ce, 0x00cf, 0x00d0, 0x00d1, 0x00d2, 0x00d3, 0x00d4, 0x00d5, 0x00d6, 0x00d7, 0x00d8, 0x00d9, 0x00da, 0x00db,
+        0x00dc, 0x00dd, 0x00de, 0x00df, 0x00e0, 0x00e1, 0x00e2, 0x00e3, 0x00e4, 0x00e5, 0x00e6, 0x00e7, 0x00e8, 0x00e9,
+        0x00ea, 0x00eb, 0x00ec, 0x00ed, 0x00ee, 0x00ef, 0x00f0, 0x00f1, 0x00f2, 0x00f3, 0x00f4, 0x00f5, 0x00f6, 0x00f7,
+        0x00f8, 0x00f9, 0x00fa, 0x00fb, 0x00fc, 0x00fd, 0x00fe, 0x00ff } };
+
+    static constexpr SingleByteIndex iso885916Index { { 0x0080, 0x0081, 0x0082, 0x0083, 0x0084, 0x0085, 0x0086, 0x0087,
+        0x0088, 0x0089, 0x008a, 0x008b, 0x008c, 0x008d, 0x008e, 0x008f, 0x0090, 0x0091, 0x0092, 0x0093, 0x0094, 0x0095,
+        0x0096, 0x0097, 0x0098, 0x0099, 0x009a, 0x009b, 0x009c, 0x009d, 0x009e, 0x009f, 0x00a0, 0x0104, 0x0105, 0x0141,
+        0x20ac, 0x201e, 0x0160, 0x00a7, 0x0161, 0x00a9, 0x0218, 0x00ab, 0x0179, 0x00ad, 0x017a, 0x017b, 0x00b0, 0x00b1,
+        0x010c, 0x0142, 0x017d, 0x201d, 0x00b6, 0x00b7, 0x017e, 0x010d, 0x0219, 0x00bb, 0x0152, 0x0153, 0x0178, 0x017c,
+        0x00c0, 0x00c1, 0x00c2, 0x0102, 0x00c4, 0x0106, 0x00c6, 0x00c7, 0x00c8, 0x00c9, 0x00ca, 0x00cb, 0x00cc, 0x00cd,
+        0x00ce, 0x00cf, 0x0110, 0x0143, 0x00d2, 0x00d3, 0x00d4, 0x0150, 0x00d6, 0x015a, 0x0170, 0x00d9, 0x00da, 0x00db,
+        0x00dc, 0x0118, 0x021a, 0x00df, 0x00e0, 0x00e1, 0x00e2, 0x0103, 0x00e4, 0x0107, 0x00e6, 0x00e7, 0x00e8, 0x00e9,
+        0x00ea, 0x00eb, 0x00ec, 0x00ed, 0x00ee, 0x00ef, 0x0111, 0x0144, 0x00f2, 0x00f3, 0x00f4, 0x0151, 0x00f6, 0x015b,
+        0x0171, 0x00f9, 0x00fa, 0x00fb, 0x00fc, 0x0119, 0x021b, 0x00ff } };
+
+    static constexpr SingleByteIndex koi8rIndex { { 0x2500, 0x2502, 0x250c, 0x2510, 0x2514, 0x2518, 0x251c, 0x2524,
+        0x252c, 0x2534, 0x253c, 0x2580, 0x2584, 0x2588, 0x258c, 0x2590, 0x2591, 0x2592, 0x2593, 0x2320, 0x25a0, 0x2219,
+        0x221a, 0x2248, 0x2264, 0x2265, 0x00a0, 0x2321, 0x00b0, 0x00b2, 0x00b7, 0x00f7, 0x2550, 0x2551, 0x2552, 0x0451,
+        0x2553, 0x2554, 0x2555, 0x2556, 0x2557, 0x2558, 0x2559, 0x255a, 0x255b, 0x255c, 0x255d, 0x255e, 0x255f, 0x2560,
+        0x2561, 0x0401, 0x2562, 0x2563, 0x2564, 0x2565, 0x2566, 0x2567, 0x2568, 0x2569, 0x256a, 0x256b, 0x256c, 0x00a9,
+        0x044e, 0x0430, 0x0431, 0x0446, 0x0434, 0x0435, 0x0444, 0x0433, 0x0445, 0x0438, 0x0439, 0x043a, 0x043b, 0x043c,
+        0x043d, 0x043e, 0x043f, 0x044f, 0x0440, 0x0441, 0x0442, 0x0443, 0x0436, 0x0432, 0x044c, 0x044b, 0x0437, 0x0448,
+        0x044d, 0x0449, 0x0447, 0x044a, 0x042e, 0x0410, 0x0411, 0x0426, 0x0414, 0x0415, 0x0424, 0x0413, 0x0425, 0x0418,
+        0x0419, 0x041a, 0x041b, 0x041c, 0x041d, 0x041e, 0x041f, 0x042f, 0x0420, 0x0421, 0x0422, 0x0423, 0x0416, 0x0412,
+        0x042c, 0x042b, 0x0417, 0x0428, 0x042d, 0x0429, 0x0427, 0x042a } };
+
+    static constexpr SingleByteIndex koi8uIndex { { 0x2500, 0x2502, 0x250c, 0x2510, 0x2514, 0x2518, 0x251c, 0x2524,
+        0x252c, 0x2534, 0x253c, 0x2580, 0x2584, 0x2588, 0x258c, 0x2590, 0x2591, 0x2592, 0x2593, 0x2320, 0x25a0, 0x2219,
+        0x221a, 0x2248, 0x2264, 0x2265, 0x00a0, 0x2321, 0x00b0, 0x00b2, 0x00b7, 0x00f7, 0x2550, 0x2551, 0x2552, 0x0451,
+        0x0454, 0x2554, 0x0456, 0x0457, 0x2557, 0x2558, 0x2559, 0x255a, 0x255b, 0x0491, 0x045e, 0x255e, 0x255f, 0x2560,
+        0x2561, 0x0401, 0x0404, 0x2563, 0x0406, 0x0407, 0x2566, 0x2567, 0x2568, 0x2569, 0x256a, 0x0490, 0x040e, 0x00a9,
+        0x044e, 0x0430, 0x0431, 0x0446, 0x0434, 0x0435, 0x0444, 0x0433, 0x0445, 0x0438, 0x0439, 0x043a, 0x043b, 0x043c,
+        0x043d, 0x043e, 0x043f, 0x044f, 0x0440, 0x0441, 0x0442, 0x0443, 0x0436, 0x0432, 0x044c, 0x044b, 0x0437, 0x0448,
+        0x044d, 0x0449, 0x0447, 0x044a, 0x042e, 0x0410, 0x0411, 0x0426, 0x0414, 0x0415, 0x0424, 0x0413, 0x0425, 0x0418,
+        0x0419, 0x041a, 0x041b, 0x041c, 0x041d, 0x041e, 0x041f, 0x042f, 0x0420, 0x0421, 0x0422, 0x0423, 0x0416, 0x0412,
+        0x042c, 0x042b, 0x0417, 0x0428, 0x042d, 0x0429, 0x0427, 0x042a } };
+
+    static constexpr SingleByteIndex macintoshIndex { { 0x00c4, 0x00c5, 0x00c7, 0x00c9, 0x00d1, 0x00d6, 0x00dc, 0x00e1,
+        0x00e0, 0x00e2, 0x00e4, 0x00e3, 0x00e5, 0x00e7, 0x00e9, 0x00e8, 0x00ea, 0x00eb, 0x00ed, 0x00ec, 0x00ee, 0x00ef,
+        0x00f1, 0x00f3, 0x00f2, 0x00f4, 0x00f6, 0x00f5, 0x00fa, 0x00f9, 0x00fb, 0x00fc, 0x2020, 0x00b0, 0x00a2, 0x00a3,
+        0x00a7, 0x2022, 0x00b6, 0x00df, 0x00ae, 0x00a9, 0x2122, 0x00b4, 0x00a8, 0x2260, 0x00c6, 0x00d8, 0x221e, 0x00b1,
+        0x2264, 0x2265, 0x00a5, 0x00b5, 0x2202, 0x2211, 0x220f, 0x03c0, 0x222b, 0x00aa, 0x00ba, 0x03a9, 0x00e6, 0x00f8,
+        0x00bf, 0x00a1, 0x00ac, 0x221a, 0x0192, 0x2248, 0x2206, 0x00ab, 0x00bb, 0x2026, 0x00a0, 0x00c0, 0x00c3, 0x00d5,
+        0x0152, 0x0153, 0x2013, 0x2014, 0x201c, 0x201d, 0x2018, 0x2019, 0x00f7, 0x25ca, 0x00ff, 0x0178, 0x2044, 0x20ac,
+        0x2039, 0x203a, 0xfb01, 0xfb02, 0x2021, 0x00b7, 0x201a, 0x201e, 0x2030, 0x00c2, 0x00ca, 0x00c1, 0x00cb, 0x00c8,
+        0x00cd, 0x00ce, 0x00cf, 0x00cc, 0x00d3, 0x00d4, 0xf8ff, 0x00d2, 0x00da, 0x00db, 0x00d9, 0x0131, 0x02c6, 0x02dc,
+        0x00af, 0x02d8, 0x02d9, 0x02da, 0x00b8, 0x02dd, 0x02db, 0x02c7 } };
+
+    static constexpr SingleByteIndex windows874Index { { 0x20ac, 0x0081, 0x0082, 0x0083, 0x0084, 0x2026, 0x0086, 0x0087,
+        0x0088, 0x0089, 0x008a, 0x008b, 0x008c, 0x008d, 0x008e, 0x008f, 0x0090, 0x2018, 0x2019, 0x201c, 0x201d, 0x2022,
+        0x2013, 0x2014, 0x0098, 0x0099, 0x009a, 0x009b, 0x009c, 0x009d, 0x009e, 0x009f, 0x00a0, 0x0e01, 0x0e02, 0x0e03,
+        0x0e04, 0x0e05, 0x0e06, 0x0e07, 0x0e08, 0x0e09, 0x0e0a, 0x0e0b, 0x0e0c, 0x0e0d, 0x0e0e, 0x0e0f, 0x0e10, 0x0e11,
+        0x0e12, 0x0e13, 0x0e14, 0x0e15, 0x0e16, 0x0e17, 0x0e18, 0x0e19, 0x0e1a, 0x0e1b, 0x0e1c, 0x0e1d, 0x0e1e, 0x0e1f,
+        0x0e20, 0x0e21, 0x0e22, 0x0e23, 0x0e24, 0x0e25, 0x0e26, 0x0e27, 0x0e28, 0x0e29, 0x0e2a, 0x0e2b, 0x0e2c, 0x0e2d,
+        0x0e2e, 0x0e2f, 0x0e30, 0x0e31, 0x0e32, 0x0e33, 0x0e34, 0x0e35, 0x0e36, 0x0e37, 0x0e38, 0x0e39, 0x0e3a, 0xfffd,
+        0xfffd, 0xfffd, 0xfffd, 0x0e3f, 0x0e40, 0x0e41, 0x0e42, 0x0e43, 0x0e44, 0x0e45, 0x0e46, 0x0e47, 0x0e48, 0x0e49,
+        0x0e4a, 0x0e4b, 0x0e4c, 0x0e4d, 0x0e4e, 0x0e4f, 0x0e50, 0x0e51, 0x0e52, 0x0e53, 0x0e54, 0x0e55, 0x0e56, 0x0e57,
+        0x0e58, 0x0e59, 0x0e5a, 0x0e5b, 0xfffd, 0xfffd, 0xfffd, 0xfffd } };
+
+    static constexpr SingleByteIndex windows1250Index { { 0x20ac, 0x0081, 0x201a, 0x0083, 0x201e, 0x2026, 0x2020,
+        0x2021, 0x0088, 0x2030, 0x0160, 0x2039, 0x015a, 0x0164, 0x017d, 0x0179, 0x0090, 0x2018, 0x2019, 0x201c, 0x201d,
+        0x2022, 0x2013, 0x2014, 0x0098, 0x2122, 0x0161, 0x203a, 0x015b, 0x0165, 0x017e, 0x017a, 0x00a0, 0x02c7, 0x02d8,
+        0x0141, 0x00a4, 0x0104, 0x00a6, 0x00a7, 0x00a8, 0x00a9, 0x015e, 0x00ab, 0x00ac, 0x00ad, 0x00ae, 0x017b, 0x00b0,
+        0x00b1, 0x02db, 0x0142, 0x00b4, 0x00b5, 0x00b6, 0x00b7, 0x00b8, 0x0105, 0x015f, 0x00bb, 0x013d, 0x02dd, 0x013e,
+        0x017c, 0x0154, 0x00c1, 0x00c2, 0x0102, 0x00c4, 0x0139, 0x0106, 0x00c7, 0x010c, 0x00c9, 0x0118, 0x00cb, 0x011a,
+        0x00cd, 0x00ce, 0x010e, 0x0110, 0x0143, 0x0147, 0x00d3, 0x00d4, 0x0150, 0x00d6, 0x00d7, 0x0158, 0x016e, 0x00da,
+        0x0170, 0x00dc, 0x00dd, 0x0162, 0x00df, 0x0155, 0x00e1, 0x00e2, 0x0103, 0x00e4, 0x013a, 0x0107, 0x00e7, 0x010d,
+        0x00e9, 0x0119, 0x00eb, 0x011b, 0x00ed, 0x00ee, 0x010f, 0x0111, 0x0144, 0x0148, 0x00f3, 0x00f4, 0x0151, 0x00f6,
+        0x00f7, 0x0159, 0x016f, 0x00fa, 0x0171, 0x00fc, 0x00fd, 0x0163, 0x02d9 } };
+
+    static constexpr SingleByteIndex windows1251Index { { 0x0402, 0x0403, 0x201a, 0x0453, 0x201e, 0x2026, 0x2020,
+        0x2021, 0x20ac, 0x2030, 0x0409, 0x2039, 0x040a, 0x040c, 0x040b, 0x040f, 0x0452, 0x2018, 0x2019, 0x201c, 0x201d,
+        0x2022, 0x2013, 0x2014, 0x0098, 0x2122, 0x0459, 0x203a, 0x045a, 0x045c, 0x045b, 0x045f, 0x00a0, 0x040e, 0x045e,
+        0x0408, 0x00a4, 0x0490, 0x00a6, 0x00a7, 0x0401, 0x00a9, 0x0404, 0x00ab, 0x00ac, 0x00ad, 0x00ae, 0x0407, 0x00b0,
+        0x00b1, 0x0406, 0x0456, 0x0491, 0x00b5, 0x00b6, 0x00b7, 0x0451, 0x2116, 0x0454, 0x00bb, 0x0458, 0x0405, 0x0455,
+        0x0457, 0x0410, 0x0411, 0x0412, 0x0413, 0x0414, 0x0415, 0x0416, 0x0417, 0x0418, 0x0419, 0x041a, 0x041b, 0x041c,
+        0x041d, 0x041e, 0x041f, 0x0420, 0x0421, 0x0422, 0x0423, 0x0424, 0x0425, 0x0426, 0x0427, 0x0428, 0x0429, 0x042a,
+        0x042b, 0x042c, 0x042d, 0x042e, 0x042f, 0x0430, 0x0431, 0x0432, 0x0433, 0x0434, 0x0435, 0x0436, 0x0437, 0x0438,
+        0x0439, 0x043a, 0x043b, 0x043c, 0x043d, 0x043e, 0x043f, 0x0440, 0x0441, 0x0442, 0x0443, 0x0444, 0x0445, 0x0446,
+        0x0447, 0x0448, 0x0449, 0x044a, 0x044b, 0x044c, 0x044d, 0x044e, 0x044f } };
+
+    static constexpr SingleByteIndex windows1252Index { { 0x20ac, 0x0081, 0x201a, 0x0192, 0x201e, 0x2026, 0x2020,
+        0x2021, 0x02c6, 0x2030, 0x0160, 0x2039, 0x0152, 0x008d, 0x017d, 0x008f, 0x0090, 0x2018, 0x2019, 0x201c, 0x201d,
+        0x2022, 0x2013, 0x2014, 0x02dc, 0x2122, 0x0161, 0x203a, 0x0153, 0x009d, 0x017e, 0x0178, 0x00a0, 0x00a1, 0x00a2,
+        0x00a3, 0x00a4, 0x00a5, 0x00a6, 0x00a7, 0x00a8, 0x00a9, 0x00aa, 0x00ab, 0x00ac, 0x00ad, 0x00ae, 0x00af, 0x00b0,
+        0x00b1, 0x00b2, 0x00b3, 0x00b4, 0x00b5, 0x00b6, 0x00b7, 0x00b8, 0x00b9, 0x00ba, 0x00bb, 0x00bc, 0x00bd, 0x00be,
+        0x00bf, 0x00c0, 0x00c1, 0x00c2, 0x00c3, 0x00c4, 0x00c5, 0x00c6, 0x00c7, 0x00c8, 0x00c9, 0x00ca, 0x00cb, 0x00cc,
+        0x00cd, 0x00ce, 0x00cf, 0x00d0, 0x00d1, 0x00d2, 0x00d3, 0x00d4, 0x00d5, 0x00d6, 0x00d7, 0x00d8, 0x00d9, 0x00da,
+        0x00db, 0x00dc, 0x00dd, 0x00de, 0x00df, 0x00e0, 0x00e1, 0x00e2, 0x00e3, 0x00e4, 0x00e5, 0x00e6, 0x00e7, 0x00e8,
+        0x00e9, 0x00ea, 0x00eb, 0x00ec, 0x00ed, 0x00ee, 0x00ef, 0x00f0, 0x00f1, 0x00f2, 0x00f3, 0x00f4, 0x00f5, 0x00f6,
+        0x00f7, 0x00f8, 0x00f9, 0x00fa, 0x00fb, 0x00fc, 0x00fd, 0x00fe, 0x00ff } };
+
+    static constexpr SingleByteIndex windows1253Index { { 0x20ac, 0x0081, 0x201a, 0x0192, 0x201e, 0x2026, 0x2020,
+        0x2021, 0x0088, 0x2030, 0x008a, 0x2039, 0x008c, 0x008d, 0x008e, 0x008f, 0x0090, 0x2018, 0x2019, 0x201c, 0x201d,
+        0x2022, 0x2013, 0x2014, 0x0098, 0x2122, 0x009a, 0x203a, 0x009c, 0x009d, 0x009e, 0x009f, 0x00a0, 0x0385, 0x0386,
+        0x00a3, 0x00a4, 0x00a5, 0x00a6, 0x00a7, 0x00a8, 0x00a9, 0xfffd, 0x00ab, 0x00ac, 0x00ad, 0x00ae, 0x2015, 0x00b0,
+        0x00b1, 0x00b2, 0x00b3, 0x0384, 0x00b5, 0x00b6, 0x00b7, 0x0388, 0x0389, 0x038a, 0x00bb, 0x038c, 0x00bd, 0x038e,
+        0x038f, 0x0390, 0x0391, 0x0392, 0x0393, 0x0394, 0x0395, 0x0396, 0x0397, 0x0398, 0x0399, 0x039a, 0x039b, 0x039c,
+        0x039d, 0x039e, 0x039f, 0x03a0, 0x03a1, 0xfffd, 0x03a3, 0x03a4, 0x03a5, 0x03a6, 0x03a7, 0x03a8, 0x03a9, 0x03aa,
+        0x03ab, 0x03ac, 0x03ad, 0x03ae, 0x03af, 0x03b0, 0x03b1, 0x03b2, 0x03b3, 0x03b4, 0x03b5, 0x03b6, 0x03b7, 0x03b8,
+        0x03b9, 0x03ba, 0x03bb, 0x03bc, 0x03bd, 0x03be, 0x03bf, 0x03c0, 0x03c1, 0x03c2, 0x03c3, 0x03c4, 0x03c5, 0x03c6,
+        0x03c7, 0x03c8, 0x03c9, 0x03ca, 0x03cb, 0x03cc, 0x03cd, 0x03ce, 0xfffd } };
+
+    static constexpr SingleByteIndex windows1254Index { { 0x20ac, 0x0081, 0x201a, 0x0192, 0x201e, 0x2026, 0x2020,
+        0x2021, 0x02c6, 0x2030, 0x0160, 0x2039, 0x0152, 0x008d, 0x008e, 0x008f, 0x0090, 0x2018, 0x2019, 0x201c, 0x201d,
+        0x2022, 0x2013, 0x2014, 0x02dc, 0x2122, 0x0161, 0x203a, 0x0153, 0x009d, 0x009e, 0x0178, 0x00a0, 0x00a1, 0x00a2,
+        0x00a3, 0x00a4, 0x00a5, 0x00a6, 0x00a7, 0x00a8, 0x00a9, 0x00aa, 0x00ab, 0x00ac, 0x00ad, 0x00ae, 0x00af, 0x00b0,
+        0x00b1, 0x00b2, 0x00b3, 0x00b4, 0x00b5, 0x00b6, 0x00b7, 0x00b8, 0x00b9, 0x00ba, 0x00bb, 0x00bc, 0x00bd, 0x00be,
+        0x00bf, 0x00c0, 0x00c1, 0x00c2, 0x00c3, 0x00c4, 0x00c5, 0x00c6, 0x00c7, 0x00c8, 0x00c9, 0x00ca, 0x00cb, 0x00cc,
+        0x00cd, 0x00ce, 0x00cf, 0x011e, 0x00d1, 0x00d2, 0x00d3, 0x00d4, 0x00d5, 0x00d6, 0x00d7, 0x00d8, 0x00d9, 0x00da,
+        0x00db, 0x00dc, 0x0130, 0x015e, 0x00df, 0x00e0, 0x00e1, 0x00e2, 0x00e3, 0x00e4, 0x00e5, 0x00e6, 0x00e7, 0x00e8,
+        0x00e9, 0x00ea, 0x00eb, 0x00ec, 0x00ed, 0x00ee, 0x00ef, 0x011f, 0x00f1, 0x00f2, 0x00f3, 0x00f4, 0x00f5, 0x00f6,
+        0x00f7, 0x00f8, 0x00f9, 0x00fa, 0x00fb, 0x00fc, 0x0131, 0x015f, 0x00ff } };
+
+    static constexpr SingleByteIndex windows1255Index { { 0x20ac, 0x0081, 0x201a, 0x0192, 0x201e, 0x2026, 0x2020,
+        0x2021, 0x02c6, 0x2030, 0x008a, 0x2039, 0x008c, 0x008d, 0x008e, 0x008f, 0x0090, 0x2018, 0x2019, 0x201c, 0x201d,
+        0x2022, 0x2013, 0x2014, 0x02dc, 0x2122, 0x009a, 0x203a, 0x009c, 0x009d, 0x009e, 0x009f, 0x00a0, 0x00a1, 0x00a2,
+        0x00a3, 0x20aa, 0x00a5, 0x00a6, 0x00a7, 0x00a8, 0x00a9, 0x00d7, 0x00ab, 0x00ac, 0x00ad, 0x00ae, 0x00af, 0x00b0,
+        0x00b1, 0x00b2, 0x00b3, 0x00b4, 0x00b5, 0x00b6, 0x00b7, 0x00b8, 0x00b9, 0x00f7, 0x00bb, 0x00bc, 0x00bd, 0x00be,
+        0x00bf, 0x05b0, 0x05b1, 0x05b2, 0x05b3, 0x05b4, 0x05b5, 0x05b6, 0x05b7, 0x05b8, 0x05b9, 0x05ba, 0x05bb, 0x05bc,
+        0x05bd, 0x05be, 0x05bf, 0x05c0, 0x05c1, 0x05c2, 0x05c3, 0x05f0, 0x05f1, 0x05f2, 0x05f3, 0x05f4, 0xfffd, 0xfffd,
+        0xfffd, 0xfffd, 0xfffd, 0xfffd, 0xfffd, 0x05d0, 0x05d1, 0x05d2, 0x05d3, 0x05d4, 0x05d5, 0x05d6, 0x05d7, 0x05d8,
+        0x05d9, 0x05da, 0x05db, 0x05dc, 0x05dd, 0x05de, 0x05df, 0x05e0, 0x05e1, 0x05e2, 0x05e3, 0x05e4, 0x05e5, 0x05e6,
+        0x05e7, 0x05e8, 0x05e9, 0x05ea, 0xfffd, 0xfffd, 0x200e, 0x200f, 0xfffd } };
+
+    static constexpr SingleByteIndex windows1256Index { { 0x20ac, 0x067e, 0x201a, 0x0192, 0x201e, 0x2026, 0x2020,
+        0x2021, 0x02c6, 0x2030, 0x0679, 0x2039, 0x0152, 0x0686, 0x0698, 0x0688, 0x06af, 0x2018, 0x2019, 0x201c, 0x201d,
+        0x2022, 0x2013, 0x2014, 0x06a9, 0x2122, 0x0691, 0x203a, 0x0153, 0x200c, 0x200d, 0x06ba, 0x00a0, 0x060c, 0x00a2,
+        0x00a3, 0x00a4, 0x00a5, 0x00a6, 0x00a7, 0x00a8, 0x00a9, 0x06be, 0x00ab, 0x00ac, 0x00ad, 0x00ae, 0x00af, 0x00b0,
+        0x00b1, 0x00b2, 0x00b3, 0x00b4, 0x00b5, 0x00b6, 0x00b7, 0x00b8, 0x00b9, 0x061b, 0x00bb, 0x00bc, 0x00bd, 0x00be,
+        0x061f, 0x06c1, 0x0621, 0x0622, 0x0623, 0x0624, 0x0625, 0x0626, 0x0627, 0x0628, 0x0629, 0x062a, 0x062b, 0x062c,
+        0x062d, 0x062e, 0x062f, 0x0630, 0x0631, 0x0632, 0x0633, 0x0634, 0x0635, 0x0636, 0x00d7, 0x0637, 0x0638, 0x0639,
+        0x063a, 0x0640, 0x0641, 0x0642, 0x0643, 0x00e0, 0x0644, 0x00e2, 0x0645, 0x0646, 0x0647, 0x0648, 0x00e7, 0x00e8,
+        0x00e9, 0x00ea, 0x00eb, 0x0649, 0x064a, 0x00ee, 0x00ef, 0x064b, 0x064c, 0x064d, 0x064e, 0x00f4, 0x064f, 0x0650,
+        0x00f7, 0x0651, 0x00f9, 0x0652, 0x00fb, 0x00fc, 0x200e, 0x200f, 0x06d2 } };
+
+    static constexpr SingleByteIndex windows1257Index { { 0x20ac, 0x0081, 0x201a, 0x0083, 0x201e, 0x2026, 0x2020,
+        0x2021, 0x0088, 0x2030, 0x008a, 0x2039, 0x008c, 0x00a8, 0x02c7, 0x00b8, 0x0090, 0x2018, 0x2019, 0x201c, 0x201d,
+        0x2022, 0x2013, 0x2014, 0x0098, 0x2122, 0x009a, 0x203a, 0x009c, 0x00af, 0x02db, 0x009f, 0x00a0, 0xfffd, 0x00a2,
+        0x00a3, 0x00a4, 0xfffd, 0x00a6, 0x00a7, 0x00d8, 0x00a9, 0x0156, 0x00ab, 0x00ac, 0x00ad, 0x00ae, 0x00c6, 0x00b0,
+        0x00b1, 0x00b2, 0x00b3, 0x00b4, 0x00b5, 0x00b6, 0x00b7, 0x00f8, 0x00b9, 0x0157, 0x00bb, 0x00bc, 0x00bd, 0x00be,
+        0x00e6, 0x0104, 0x012e, 0x0100, 0x0106, 0x00c4, 0x00c5, 0x0118, 0x0112, 0x010c, 0x00c9, 0x0179, 0x0116, 0x0122,
+        0x0136, 0x012a, 0x013b, 0x0160, 0x0143, 0x0145, 0x00d3, 0x014c, 0x00d5, 0x00d6, 0x00d7, 0x0172, 0x0141, 0x015a,
+        0x016a, 0x00dc, 0x017b, 0x017d, 0x00df, 0x0105, 0x012f, 0x0101, 0x0107, 0x00e4, 0x00e5, 0x0119, 0x0113, 0x010d,
+        0x00e9, 0x017a, 0x0117, 0x0123, 0x0137, 0x012b, 0x013c, 0x0161, 0x0144, 0x0146, 0x00f3, 0x014d, 0x00f5, 0x00f6,
+        0x00f7, 0x0173, 0x0142, 0x015b, 0x016b, 0x00fc, 0x017c, 0x017e, 0x02d9 } };
+
+    static constexpr SingleByteIndex windows1258Index { { 0x20ac, 0x0081, 0x201a, 0x0192, 0x201e, 0x2026, 0x2020,
+        0x2021, 0x02c6, 0x2030, 0x008a, 0x2039, 0x0152, 0x008d, 0x008e, 0x008f, 0x0090, 0x2018, 0x2019, 0x201c, 0x201d,
+        0x2022, 0x2013, 0x2014, 0x02dc, 0x2122, 0x009a, 0x203a, 0x0153, 0x009d, 0x009e, 0x0178, 0x00a0, 0x00a1, 0x00a2,
+        0x00a3, 0x00a4, 0x00a5, 0x00a6, 0x00a7, 0x00a8, 0x00a9, 0x00aa, 0x00ab, 0x00ac, 0x00ad, 0x00ae, 0x00af, 0x00b0,
+        0x00b1, 0x00b2, 0x00b3, 0x00b4, 0x00b5, 0x00b6, 0x00b7, 0x00b8, 0x00b9, 0x00ba, 0x00bb, 0x00bc, 0x00bd, 0x00be,
+        0x00bf, 0x00c0, 0x00c1, 0x00c2, 0x0102, 0x00c4, 0x00c5, 0x00c6, 0x00c7, 0x00c8, 0x00c9, 0x00ca, 0x00cb, 0x0300,
+        0x00cd, 0x00ce, 0x00cf, 0x0110, 0x00d1, 0x0309, 0x00d3, 0x00d4, 0x01a0, 0x00d6, 0x00d7, 0x00d8, 0x00d9, 0x00da,
+        0x00db, 0x00dc, 0x01af, 0x0303, 0x00df, 0x00e0, 0x00e1, 0x00e2, 0x0103, 0x00e4, 0x00e5, 0x00e6, 0x00e7, 0x00e8,
+        0x00e9, 0x00ea, 0x00eb, 0x0301, 0x00ed, 0x00ee, 0x00ef, 0x0111, 0x00f1, 0x0323, 0x00f3, 0x00f4, 0x01a1, 0x00f6,
+        0x00f7, 0x00f8, 0x00f9, 0x00fa, 0x00fb, 0x00fc, 0x01b0, 0x20ab, 0x00ff } };
+
+    static constexpr SingleByteIndex xMacCyrillicIndex { { 0x0410, 0x0411, 0x0412, 0x0413, 0x0414, 0x0415, 0x0416,
+        0x0417, 0x0418, 0x0419, 0x041a, 0x041b, 0x041c, 0x041d, 0x041e, 0x041f, 0x0420, 0x0421, 0x0422, 0x0423, 0x0424,
+        0x0425, 0x0426, 0x0427, 0x0428, 0x0429, 0x042a, 0x042b, 0x042c, 0x042d, 0x042e, 0x042f, 0x2020, 0x00b0, 0x0490,
+        0x00a3, 0x00a7, 0x2022, 0x00b6, 0x0406, 0x00ae, 0x00a9, 0x2122, 0x0402, 0x0452, 0x2260, 0x0403, 0x0453, 0x221e,
+        0x00b1, 0x2264, 0x2265, 0x0456, 0x00b5, 0x0491, 0x0408, 0x0404, 0x0454, 0x0407, 0x0457, 0x0409, 0x0459, 0x040a,
+        0x045a, 0x0458, 0x0405, 0x00ac, 0x221a, 0x0192, 0x2248, 0x2206, 0x00ab, 0x00bb, 0x2026, 0x00a0, 0x040b, 0x045b,
+        0x040c, 0x045c, 0x0455, 0x2013, 0x2014, 0x201c, 0x201d, 0x2018, 0x2019, 0x00f7, 0x201e, 0x040e, 0x045e, 0x040f,
+        0x045f, 0x2116, 0x0401, 0x0451, 0x044f, 0x0430, 0x0431, 0x0432, 0x0433, 0x0434, 0x0435, 0x0436, 0x0437, 0x0438,
+        0x0439, 0x043a, 0x043b, 0x043c, 0x043d, 0x043e, 0x043f, 0x0440, 0x0441, 0x0442, 0x0443, 0x0444, 0x0445, 0x0446,
+        0x0447, 0x0448, 0x0449, 0x044a, 0x044b, 0x044c, 0x044d, 0x044e, 0x20ac } };
+
+    // Returns the index of a single-byte encoding, or null for any other encoding.
+    static const SingleByteIndex* singleByteIndex(TextDecoderEncoding encoding)
     {
         switch (encoding) {
         case TextDecoderEncoding::IBM866:
-            return ibm866Index;
+            return &ibm866Index;
+        case TextDecoderEncoding::ISO88592:
+            return &iso88592Index;
+        case TextDecoderEncoding::ISO88593:
+            return &iso88593Index;
+        case TextDecoderEncoding::ISO88594:
+            return &iso88594Index;
+        case TextDecoderEncoding::ISO88595:
+            return &iso88595Index;
+        case TextDecoderEncoding::ISO88596:
+            return &iso88596Index;
+        case TextDecoderEncoding::ISO88597:
+            return &iso88597Index;
+        case TextDecoderEncoding::ISO88598:
+        case TextDecoderEncoding::ISO88598I:
+            return &iso88598Index;
+        case TextDecoderEncoding::ISO885910:
+            return &iso885910Index;
+        case TextDecoderEncoding::ISO885913:
+            return &iso885913Index;
+        case TextDecoderEncoding::ISO885914:
+            return &iso885914Index;
+        case TextDecoderEncoding::ISO885915:
+            return &iso885915Index;
+        case TextDecoderEncoding::ISO885916:
+            return &iso885916Index;
+        case TextDecoderEncoding::KOI8R:
+            return &koi8rIndex;
         case TextDecoderEncoding::KOI8U:
-            return koi8uIndex;
+            return &koi8uIndex;
+        case TextDecoderEncoding::Macintosh:
+            return &macintoshIndex;
         case TextDecoderEncoding::Windows874:
-            return windows874Index;
+            return &windows874Index;
+        case TextDecoderEncoding::Windows1250:
+            return &windows1250Index;
+        case TextDecoderEncoding::Windows1251:
+            return &windows1251Index;
+        case TextDecoderEncoding::Windows1252:
+            return &windows1252Index;
         case TextDecoderEncoding::Windows1253:
-            return windows1253Index;
+            return &windows1253Index;
+        case TextDecoderEncoding::Windows1254:
+            return &windows1254Index;
         case TextDecoderEncoding::Windows1255:
-            return windows1255Index;
-        default:
+            return &windows1255Index;
+        case TextDecoderEncoding::Windows1256:
+            return &windows1256Index;
+        case TextDecoderEncoding::Windows1257:
+            return &windows1257Index;
+        case TextDecoderEncoding::Windows1258:
+            return &windows1258Index;
+        case TextDecoderEncoding::XMacCyrillic:
+            return &xMacCyrillicIndex;
+        case TextDecoderEncoding::Utf8:
+        case TextDecoderEncoding::Utf16BE:
+        case TextDecoderEncoding::Utf16LE:
+        case TextDecoderEncoding::XUserDefined:
+        case TextDecoderEncoding::Big5:
+        case TextDecoderEncoding::EUCJP:
+        case TextDecoderEncoding::ISO2022JP:
+        case TextDecoderEncoding::ShiftJIS:
+        case TextDecoderEncoding::EUCKR:
+        case TextDecoderEncoding::GBK:
+        case TextDecoderEncoding::GB18030:
             return nullptr;
         }
+        RELEASE_ASSERT_NOT_REACHED();
     }
 
     static JSValue getPropertyIfPresent(
@@ -2154,14 +1851,18 @@ namespace {
     // for all-ASCII input and copy it into a Latin-1 string without transcoding, so a scan here would read the bytes
     // twice. On the fatal path String::fromUTF8 transcodes with simdutf and returns a null string for invalid UTF-8,
     // which becomes a TypeError. On the replacing path fromUTF8ReplacingInvalidSequences emits one U+FFFD per maximal
-    // invalid subsequence, as the Encoding Standard's UTF-8 decoder does.
-    // FIXME: Both conversions RELEASE_ASSERT that the span is at most WTF::String::MaxLength bytes, and
-    // TextDecoder.decode passes its input through unchecked, so a larger buffer ends the worker instead of throwing.
+    // invalid subsequence, as the Encoding Standard's UTF-8 decoder does. Both conversions RELEASE_ASSERT that the
+    // span is at most WTF::String::MaxLength bytes, so a longer span throws an OutOfMemoryError here instead of
+    // ending the worker.
     static String decodeUtf8Span(JSColloTextDecoder* decoder, JSC::JSGlobalObject* global_object,
         JSC::ThrowScope& scope, std::span<const uint8_t> bytes)
     {
         if (bytes.empty())
             return emptyString();
+        if (isTooLargeForWTFString(bytes.size())) {
+            throwTextCodecOutOfMemory(global_object, scope);
+            return {};
+        }
         auto char_span = std::span<const char8_t> { reinterpret_cast<const char8_t*>(bytes.data()), bytes.size() };
         if (decoder->fatal()) {
             auto decoded = String::fromUTF8(char_span);
@@ -2341,28 +2042,32 @@ namespace {
         return false;
     }
 
-    static String decodeWhatwgSingleByteString(
-        JSColloTextDecoder* decoder, JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, ByteSpan input)
+    static char16_t singleByteCodeUnit(const SingleByteIndex& index, uint8_t byte)
     {
-        const uint32_t* index = whatwgSingleByteIndex(decoder->encoding());
-        RELEASE_ASSERT(index);
+        return byte < 0x80 ? static_cast<char16_t>(byte) : index[byte - 0x80];
+    }
 
+    // Decodes a single-byte encoding through its index. Every byte is one code unit and no state carries across
+    // calls, so a streaming chunk decodes like a whole buffer, and the result is Latin-1 when every unit fits. These
+    // encodings have no BOM: FF FE and EF BB BF decode as the characters their bytes map to.
+    static String decodeSingleByteString(JSColloTextDecoder* decoder, JSC::JSGlobalObject* global_object,
+        JSC::ThrowScope& scope, const SingleByteIndex& index, ByteSpan input)
+    {
+        // A fatal decoder scans every byte for an unmapped one; a replacing decoder stops at the first unit that
+        // needs UTF-16 storage.
+        const bool fatal = decoder->fatal();
         bool needs_utf16 = false;
         for (size_t offset = 0; offset < input.size; ++offset) {
-            uint32_t code_point = input.data[offset];
-            if (input.data[offset] >= 0x80)
-                code_point = index[input.data[offset] - 0x80];
-            if (code_point == invalidSingleByteCodePoint) {
-                if (decoder->fatal()) {
-                    JSC::throwVMTypeError(
-                        global_object, scope, "The encoded data was not valid for this TextDecoder"_s);
-                    return {};
-                }
-                code_point = 0xfffdu;
+            const char16_t unit = singleByteCodeUnit(index, input.data[offset]);
+            if (unit == unmappedSingleByte && fatal) {
+                JSC::throwVMTypeError(global_object, scope, "The encoded data was not valid for this TextDecoder"_s);
+                return {};
             }
-            RELEASE_ASSERT(code_point <= 0xffffu);
-            if (code_point > 0xffu)
+            if (unit > 0xff) {
                 needs_utf16 = true;
+                if (!fatal)
+                    break;
+            }
         }
 
         if (!needs_utf16) {
@@ -2370,28 +2075,18 @@ namespace {
             String decoded;
             if (!createDecodedLatin1String(global_object, scope, input.size, output, decoded))
                 return {};
-            for (size_t offset = 0; offset < input.size; ++offset) {
-                uint32_t code_point = input.data[offset];
-                if (input.data[offset] >= 0x80)
-                    code_point = index[input.data[offset] - 0x80];
-                output[offset] = static_cast<Latin1Character>(code_point);
-            }
-            return finishDecodedString(decoder, WTF::move(decoded));
+            for (size_t offset = 0; offset < input.size; ++offset)
+                output[offset] = static_cast<Latin1Character>(singleByteCodeUnit(index, input.data[offset]));
+            return decoded;
         }
 
         std::span<char16_t> output;
         String decoded;
         if (!createDecodedUtf16String(global_object, scope, input.size, output, decoded))
             return {};
-        for (size_t offset = 0; offset < input.size; ++offset) {
-            uint32_t code_point = input.data[offset];
-            if (input.data[offset] >= 0x80)
-                code_point = index[input.data[offset] - 0x80];
-            if (code_point == invalidSingleByteCodePoint)
-                code_point = 0xfffdu;
-            output[offset] = static_cast<char16_t>(code_point);
-        }
-        return finishDecodedString(decoder, WTF::move(decoded));
+        for (size_t offset = 0; offset < input.size; ++offset)
+            output[offset] = singleByteCodeUnit(index, input.data[offset]);
+        return decoded;
     }
 
     static String decodeXUserDefinedString(
@@ -2422,139 +2117,6 @@ namespace {
         for (size_t i = 0; i < input.size; ++i) {
             uint8_t byte = input.data[i];
             output[i] = byte < 0x80 ? byte : static_cast<char16_t>(0xf780 + byte - 0x80);
-        }
-        return finishDecodedString(decoder, WTF::move(decoded));
-    }
-
-    static String decodeIso885916String(
-        JSColloTextDecoder* decoder, JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, ByteSpan input)
-    {
-        static constexpr std::array<char16_t, 96> upper = {
-            0x00a0,
-            0x0104,
-            0x0105,
-            0x0141,
-            0x20ac,
-            0x201e,
-            0x0160,
-            0x00a7,
-            0x0161,
-            0x00a9,
-            0x0218,
-            0x00ab,
-            0x0179,
-            0x00ad,
-            0x017a,
-            0x017b,
-            0x00b0,
-            0x00b1,
-            0x010c,
-            0x0142,
-            0x017d,
-            0x201d,
-            0x00b6,
-            0x00b7,
-            0x017e,
-            0x010d,
-            0x0219,
-            0x00bb,
-            0x0152,
-            0x0153,
-            0x0178,
-            0x017c,
-            0x00c0,
-            0x00c1,
-            0x00c2,
-            0x0102,
-            0x00c4,
-            0x0106,
-            0x00c6,
-            0x00c7,
-            0x00c8,
-            0x00c9,
-            0x00ca,
-            0x00cb,
-            0x00cc,
-            0x00cd,
-            0x00ce,
-            0x00cf,
-            0x0110,
-            0x0143,
-            0x00d2,
-            0x00d3,
-            0x00d4,
-            0x0150,
-            0x00d6,
-            0x015a,
-            0x0170,
-            0x00d9,
-            0x00da,
-            0x00db,
-            0x00dc,
-            0x0118,
-            0x021a,
-            0x00df,
-            0x00e0,
-            0x00e1,
-            0x00e2,
-            0x0103,
-            0x00e4,
-            0x0107,
-            0x00e6,
-            0x00e7,
-            0x00e8,
-            0x00e9,
-            0x00ea,
-            0x00eb,
-            0x00ec,
-            0x00ed,
-            0x00ee,
-            0x00ef,
-            0x0111,
-            0x0144,
-            0x00f2,
-            0x00f3,
-            0x00f4,
-            0x0151,
-            0x00f6,
-            0x015b,
-            0x0171,
-            0x00f9,
-            0x00fa,
-            0x00fb,
-            0x00fc,
-            0x0119,
-            0x021b,
-            0x00ff,
-        };
-
-        auto code_point_for_byte
-            = [&](uint8_t byte) -> char16_t { return byte < 0xa0 ? static_cast<char16_t>(byte) : upper[byte - 0xa0]; };
-
-        bool needs_utf16 = false;
-        for (size_t i = 0; i < input.size; ++i) {
-            if (code_point_for_byte(input.data[i]) > 0xff) {
-                needs_utf16 = true;
-                break;
-            }
-        }
-
-        if (!needs_utf16) {
-            std::span<Latin1Character> output;
-            String decoded;
-            if (!createDecodedLatin1String(global_object, scope, input.size, output, decoded))
-                return {};
-            for (size_t i = 0; i < input.size; ++i)
-                output[i] = static_cast<Latin1Character>(code_point_for_byte(input.data[i]));
-            return finishDecodedString(decoder, WTF::move(decoded));
-        }
-
-        std::span<char16_t> output;
-        String decoded;
-        if (!createDecodedUtf16String(global_object, scope, input.size, output, decoded))
-            return {};
-        for (size_t i = 0; i < input.size; ++i) {
-            output[i] = code_point_for_byte(input.data[i]);
         }
         return finishDecodedString(decoder, WTF::move(decoded));
     }
@@ -2618,140 +2180,57 @@ namespace {
     // Decodes UTF-16LE bytes by copying them into char16_t storage, which matches the encoding only on little-endian
     // targets. x86_64 and ARM64, the runtime's targets, are little-endian, and WTF makes the same assumption when
     // StringImpl hands its char16_t storage to simdutf's UTF-16LE functions. The copy serves only a call that needs no
-    // state across calls: pending() is empty, this call flushes, the previous call flushed too, the byte count is even,
-    // and simdutf validates the units as well-formed UTF-16, the input for which ICU would emit the same units without
+    // state across calls: this call flushes, the previous call flushed too, the byte count is even, and simdutf
+    // validates the units as well-formed UTF-16, the input for which ICU would emit the same units without
     // substituting U+FFFD. The previous call matters because the ICU converter may still hold an odd byte from a
     // streaming call: the converter is reset after every flush and after a throw, never between streaming calls, so
-    // decoder->streaming() is true exactly when that byte may exist. Any other input returns nullopt, and the caller
-    // falls back to ICU for surrogate replacement, fatal errors and streaming carry.
+    // decoder->streaming() is true exactly when that byte may exist. Any other input returns nullopt with the
+    // decoder's BOM state untouched, and the caller falls back to ICU for surrogate replacement, fatal errors and
+    // streaming carry.
     static std::optional<String> tryDecodeUtf16LeFast(JSColloTextDecoder* decoder, JSC::JSGlobalObject* global_object,
         JSC::ThrowScope& scope, std::span<const uint8_t> bytes, bool stream)
     {
-        if (stream || decoder->streaming() || !decoder->pending().empty())
+        if (stream || decoder->streaming())
             return std::nullopt;
         if (bytes.size() % 2 != 0)
             return std::nullopt;
 
-        // bytes.data() may sit at any offset into an ArrayBuffer, so it can be misaligned for char16_t. The BOM check
-        // and the copy below read through the byte span.
-        // FIXME: simdutf documents no alignment requirement for validate_utf16le, but its scalar loop dereferences
-        // this possibly misaligned char16_t pointer, which is undefined behavior in C++ even though x86_64 and ARM64
-        // tolerate unaligned 16-bit loads.
-        const size_t unit_count = bytes.size() / 2;
-        if (!simdutf::validate_utf16le(reinterpret_cast<const char16_t*>(bytes.data()), unit_count))
-            return std::nullopt;
-
         // A leading U+FEFF, the bytes FF FE, is dropped once per stream unless ignoreBOM is set, as
-        // stringFromDecodedUnits does on the ICU path. Dropping it from the source span lets the result be allocated
-        // once.
+        // stringFromDecodedUnits does on the ICU path. The check reads the byte span, and dropping the BOM from it
+        // lets the result be allocated once.
+        const bool first_units = !decoder->bomSeen() && !bytes.empty();
         size_t byte_start = 0;
-        if (!decoder->bomSeen() && unit_count) {
-            if (!decoder->ignoreBOM() && bytes[0] == 0xff && bytes[1] == 0xfe)
-                byte_start = 2;
-            decoder->markBOMSeen();
-        }
+        if (first_units && !decoder->ignoreBOM() && bytes[0] == 0xff && bytes[1] == 0xfe)
+            byte_start = 2;
         std::span<const uint8_t> payload = bytes.subspan(byte_start);
-        if (payload.empty())
-            return emptyString();
 
+        // bytes.data() may sit at any offset into an ArrayBuffer, so it can be misaligned for char16_t, and simdutf's
+        // scalar loop dereferences the char16_t pointer it gets. The units are therefore copied into the string's own
+        // storage, which is aligned, and validated there.
         std::span<char16_t> output;
         String decoded;
         if (!tryCreateUninitializedTextCodecString(payload.size() / 2, output, decoded)) {
             throwTextCodecOutOfMemory(global_object, scope);
             return String {};
         }
-        std::memcpy(output.data(), payload.data(), payload.size());
+        if (!payload.empty()) {
+            std::memcpy(output.data(), payload.data(), payload.size());
+            if (!simdutf::validate_utf16le(output.data(), output.size()))
+                return std::nullopt;
+        }
+        if (first_units)
+            decoder->markBOMSeen();
         return decoded;
-    }
-
-    static bool switchUtf16Converter(JSColloTextDecoder* decoder, JSC::JSGlobalObject* global_object,
-        JSC::ThrowScope& scope, TextDecoderEncoding encoding)
-    {
-        auto* converter = createIcuConverter(global_object, scope, encoding, decoder->fatal());
-        RETURN_IF_EXCEPTION(scope, false);
-        if (!converter)
-            return false;
-        decoder->replaceConverter(converter);
-        return true;
-    }
-
-    static String decodeUtf16String(JSColloTextDecoder* decoder, JSC::JSGlobalObject* global_object,
-        JSC::ThrowScope& scope, ByteSpan input, bool stream)
-    {
-        WTF::Vector<uint8_t, 16> joined;
-        std::span<const uint8_t> bytes { input.data, input.size };
-        if (!decoder->pending().empty()) {
-            size_t joined_size = 0;
-            if (!checkedAddSize(decoder->pending().size(), bytes.size(), joined_size)
-                || !joined.tryReserveInitialCapacity(joined_size)) {
-                JSC::throwOutOfMemoryError(global_object, scope);
-                return {};
-            }
-            joined.append(decoder->pending());
-            joined.append(bytes);
-            bytes = joined.span();
-            decoder->clearPending();
-        }
-
-        // The fast path below needs to know that this call resolved little-endian, which is certain only when this
-        // call did the BOM sniff, as a whole-buffer decode does. A streaming call after the sniff goes to ICU.
-        // FIXME: The Encoding Standard maps "utf-16" and the other labels of this encoding to UTF-16LE and gives
-        // TextDecoder no BOM sniffing, so leading FE FF bytes should decode as U+FFFE instead of switching this
-        // decoder to UTF-16BE.
-        bool resolved_le = false;
-        if (!decoder->bomSeen()) {
-            if (bytes.size() < 2 && stream) {
-                decoder->setPending(bytes);
-                return emptyString();
-            }
-
-            if (bytes.size() >= 2) {
-                if (bytes[0] == 0xfe && bytes[1] == 0xff) {
-                    if (!switchUtf16Converter(decoder, global_object, scope, TextDecoderEncoding::Utf16BE))
-                        return {};
-                    if (!decoder->ignoreBOM())
-                        bytes = bytes.subspan(2);
-                } else {
-                    if (!switchUtf16Converter(decoder, global_object, scope, TextDecoderEncoding::Utf16LE))
-                        return {};
-                    if (!decoder->ignoreBOM() && bytes[0] == 0xff && bytes[1] == 0xfe)
-                        bytes = bytes.subspan(2);
-                    resolved_le = true;
-                }
-                decoder->markBOMSeen();
-            } else if (!bytes.empty()) {
-                if (!switchUtf16Converter(decoder, global_object, scope, TextDecoderEncoding::Utf16LE))
-                    return {};
-                decoder->markBOMSeen();
-                resolved_le = true;
-            }
-        }
-
-        // The sniff above consumed any BOM and set bomSeen(), so the fast path only validates and copies.
-        if (resolved_le) {
-            auto fast = tryDecodeUtf16LeFast(decoder, global_object, scope, bytes, stream);
-            RETURN_IF_EXCEPTION(scope, {});
-            if (fast)
-                return WTF::move(*fast);
-        }
-
-        ByteSpan adjusted { bytes.data(), bytes.size() };
-        return decodeIcuString(decoder, global_object, scope, adjusted, stream);
     }
 
     static String decodeTextDecoderString(JSColloTextDecoder* decoder, JSC::JSGlobalObject* global_object,
         JSC::ThrowScope& scope, ByteSpan input, bool stream)
     {
-        if (whatwgSingleByteIndex(decoder->encoding()))
-            return decodeWhatwgSingleByteString(decoder, global_object, scope, input);
-
         switch (decoder->encoding()) {
         case TextDecoderEncoding::Utf8:
             return decodeUtf8String(decoder, global_object, scope, input, stream);
         case TextDecoderEncoding::XUserDefined:
             return decodeXUserDefinedString(decoder, global_object, scope, input);
-        case TextDecoderEncoding::Utf16:
-            return decodeUtf16String(decoder, global_object, scope, input, stream);
         case TextDecoderEncoding::IBM866:
         case TextDecoderEncoding::ISO88592:
         case TextDecoderEncoding::ISO88593:
@@ -2765,11 +2244,10 @@ namespace {
         case TextDecoderEncoding::ISO885913:
         case TextDecoderEncoding::ISO885914:
         case TextDecoderEncoding::ISO885915:
-            return decodeIcuString(decoder, global_object, scope, input, stream);
         case TextDecoderEncoding::ISO885916:
-            return decodeIso885916String(decoder, global_object, scope, input);
         case TextDecoderEncoding::KOI8R:
         case TextDecoderEncoding::KOI8U:
+        case TextDecoderEncoding::Macintosh:
         case TextDecoderEncoding::Windows874:
         case TextDecoderEncoding::Windows1250:
         case TextDecoderEncoding::Windows1251:
@@ -2780,11 +2258,14 @@ namespace {
         case TextDecoderEncoding::Windows1256:
         case TextDecoderEncoding::Windows1257:
         case TextDecoderEncoding::Windows1258:
+        case TextDecoderEncoding::XMacCyrillic: {
+            const auto* index = singleByteIndex(decoder->encoding());
+            RELEASE_ASSERT(index);
+            return decodeSingleByteString(decoder, global_object, scope, *index, input);
+        }
         case TextDecoderEncoding::Utf16LE: {
-            // The "utf-16le" label has no BOM sniffing: tryDecodeUtf16LeFast or stringFromDecodedUnits drops a leading
-            // U+FEFF, and ICU handles what the fast path declines.
-            // FIXME: koi8-r and windows-1250, 1251, 1252, 1254, 1256, 1257 and 1258 share this block, so their
-            // even-length input that validates as UTF-16LE is decoded as UTF-16LE instead of by their converter.
+            // UTF-16LE sniffs no BOM: tryDecodeUtf16LeFast or stringFromDecodedUnits drops a leading U+FEFF, and ICU
+            // handles what the fast path declines.
             std::span<const uint8_t> bytes { input.data, input.size };
             auto fast = tryDecodeUtf16LeFast(decoder, global_object, scope, bytes, stream);
             RETURN_IF_EXCEPTION(scope, {});
@@ -2800,8 +2281,6 @@ namespace {
         case TextDecoderEncoding::EUCKR:
         case TextDecoderEncoding::GBK:
         case TextDecoderEncoding::GB18030:
-        case TextDecoderEncoding::Macintosh:
-        case TextDecoderEncoding::XMacCyrillic:
             return decodeIcuString(decoder, global_object, scope, input, stream);
         }
         RELEASE_ASSERT_NOT_REACHED();
@@ -3025,7 +2504,6 @@ namespace {
             return true;
 
         switch (decoder->encoding()) {
-        case TextDecoderEncoding::Utf16:
         case TextDecoderEncoding::Utf16BE:
         case TextDecoderEncoding::Utf16LE:
             return total_input_size > WebApiCodecStreamPendingOutputBytesMax;

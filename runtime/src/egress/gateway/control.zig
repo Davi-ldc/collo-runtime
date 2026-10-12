@@ -1,6 +1,6 @@
 //! The control protocol between the server and the egress gateway, over the one SEQPACKET
 //! socket each gateway inherits (`launch.zig`): the gateway's ready report, the server's hello
-//! with the token key and the network policy table, worker attaches with their session's ring
+//! with the token key and the network policy image, worker attaches with their session's ring
 //! memfds, eventfds and liveness descriptors (`egress_shared.RawFds`) and their acks, the batched
 //! `request_ended` notices, the gateway's report of each session it removed on its own, and
 //! shutdown. On the server, the thread that spawns the gateway reads the ready report and sends
@@ -15,8 +15,9 @@
 //! `common/ipc/egress.zig`, and the token is `common/ipc/egress_token.zig`.
 
 const std = @import("std");
+const fd_mod = @import("collo_os").fd;
 const ipc = @import("collo_ipc");
-const policy = @import("policy.zig");
+const network = @import("collo_egress_client").network;
 
 const egress_token = ipc.egress_token;
 
@@ -80,38 +81,28 @@ pub const SessionRemoved = extern struct {
     session_id: u64,
 };
 
-/// The hello's fixed part: the key the gateway verifies egress tokens with and the number of
-/// `PolicyEntry` records that follow it and end the packet. The server sends one hello per
-/// gateway, right after it reads `gateway_ready`, with a key drawn for that gateway alone, so a
-/// token minted for an earlier gateway fails here. The gateway accepts no other packet before it
-/// and refuses a second one.
+/// The hello's fixed part: the key the gateway verifies egress tokens with and the length of the
+/// policy image whose sealed memfd is the packet's one descriptor. The server sends one hello
+/// per gateway, right after it reads `gateway_ready`, with a key drawn for that gateway alone, so
+/// a token minted for an earlier gateway fails here. The gateway accepts no other packet before
+/// it and refuses a second one. The image travels as a memfd sealed against writes and resizes,
+/// so its size never depends on the socket's send buffer and the gateway reads the bytes the
+/// server wrote.
 pub const HelloHeader = extern struct {
     key: egress_token.Key,
-    policy_count: u32,
+    table_bytes: u32,
     _reserved0: u32 = 0,
 };
 
-/// One network policy as the hello carries it. Entries come in id order from 0, so `id` restates
-/// the entry's index and the decoder refuses any other value. The flags are 0 or 1.
-pub const PolicyEntry = extern struct {
-    id: u16,
-    kind: u8,
-    allow_private_networks: u8,
-    allow_http: u8,
-    _reserved0: [3]u8 = @splat(0),
-};
+/// The length of every hello.
+pub const hello_bytes: usize = @sizeOf(Header) + @sizeOf(HelloHeader);
 
-/// `PolicyEntry.kind` of `policy.PolicyKind.any_host`.
-pub const policy_kind_any_host: u8 = 1;
-
-/// The largest hello, a table of `policy.policies_max` entries.
-pub const hello_bytes_max: usize =
-    @sizeOf(Header) + @sizeOf(HelloHeader) + policy.policies_max * @sizeOf(PolicyEntry);
-
-/// A decoded hello, which owns its copy of the key and the table.
+/// A decoded hello. It owns its copy of the key and the image's descriptor, which the gateway
+/// checks, reads and closes (`runtime/control_flow.zig`).
 pub const Hello = struct {
     key: egress_token.Key,
-    table: policy.PolicyTable,
+    table_fd: fd_mod.OwnedFd,
+    table_bytes: u32,
 };
 
 /// The fixed part of a `request_ended` packet: `count` entries follow it and end the packet.
@@ -208,20 +199,16 @@ comptime {
     std.debug.assert(@sizeOf(AttachAck) == 24);
     std.debug.assert(@sizeOf(HelloHeader) == 40);
     std.debug.assert(@offsetOf(HelloHeader, "key") == 0);
-    std.debug.assert(@offsetOf(HelloHeader, "policy_count") == 32);
+    std.debug.assert(@offsetOf(HelloHeader, "table_bytes") == 32);
     std.debug.assert(@offsetOf(HelloHeader, "_reserved0") == 36);
-    std.debug.assert(@sizeOf(PolicyEntry) == 8);
-    std.debug.assert(@offsetOf(PolicyEntry, "id") == 0);
-    std.debug.assert(@offsetOf(PolicyEntry, "kind") == 2);
-    std.debug.assert(@offsetOf(PolicyEntry, "allow_private_networks") == 3);
-    std.debug.assert(@offsetOf(PolicyEntry, "allow_http") == 4);
-    std.debug.assert(@offsetOf(PolicyEntry, "_reserved0") == 5);
+    // The hello holds the image's length in a u32.
+    std.debug.assert(network.table.image_bytes_max <= std.math.maxInt(u32));
     std.debug.assert(@sizeOf(SessionRemoved) == 8);
     std.debug.assert(@sizeOf(RequestEndedHeader) == 8);
     std.debug.assert(@sizeOf(RequestEndedEntry) == 24);
     std.debug.assert(@offsetOf(RequestEndedEntry, "request_id") == 8);
     std.debug.assert(@offsetOf(RequestEndedEntry, "request_generation") == 16);
-    std.debug.assert(hello_bytes_max <= ipc.max_message_bytes);
+    std.debug.assert(hello_bytes <= ipc.max_message_bytes);
     std.debug.assert(request_ended_bytes_max <= ipc.max_message_bytes);
 }
 
@@ -351,39 +338,37 @@ fn decodeSessionRemoved(bytes: []const u8) !SessionRemoved {
 }
 
 /// Sends the hello for a gateway that has just reported ready: `key`, which must not be the
-/// zero key, and every entry of `table`, which holds at least one.
+/// zero key, and the policy image in `table_fd`, borrowed for the call: a memfd that carries
+/// `memfd_readonly_seals` and holds exactly `table_bytes` bytes, 1 to
+/// `network.table.image_bytes_max`. The server builds the image once at boot and lends it to
+/// each hello; the packet carries the descriptor.
 pub fn sendHello(
     fd: std.posix.fd_t,
     key: *const egress_token.Key,
-    table: *const policy.PolicyTable,
+    table_fd: std.posix.fd_t,
+    table_bytes: u32,
 ) !void {
     std.debug.assert(!key.isZero());
-    std.debug.assert(table.count >= 1);
+    std.debug.assert(table_fd >= 0);
+    std.debug.assert(table_bytes >= 1);
+    std.debug.assert(table_bytes <= network.table.image_bytes_max);
     const header = Header{
         .magic = magic,
         .kind = @intFromEnum(Kind.hello),
     };
     var fixed = HelloHeader{
         .key = key.*,
-        .policy_count = table.count,
+        .table_bytes = table_bytes,
     };
     // Both copies of the key on this stack are scrubbed, so a later frame that sends what it
     // never wrote cannot carry them.
     defer std.crypto.secureZero(u8, &fixed.key.bytes);
-    var buffer: [hello_bytes_max]u8 = undefined;
+    var buffer: [hello_bytes]u8 = undefined;
     defer std.crypto.secureZero(u8, &buffer);
     var cursor = ipc.packet.writeStruct(&buffer, &header);
     cursor += ipc.packet.writeStruct(buffer[cursor..], &fixed);
-    for (table.slice(), 0..) |entry, index| {
-        const wire = PolicyEntry{
-            .id = @intCast(index),
-            .kind = encodePolicyKind(entry.kind),
-            .allow_private_networks = @intFromBool(entry.allow_private_networks),
-            .allow_http = @intFromBool(entry.allow_http),
-        };
-        cursor += ipc.packet.writeStruct(buffer[cursor..], &wire);
-    }
-    try ipc.packet.sendWithFds(fd, buffer[0..cursor], &.{});
+    std.debug.assert(cursor == hello_bytes);
+    try ipc.packet.sendWithFds(fd, &buffer, &.{table_fd});
 }
 
 pub fn sendShutdown(fd: std.posix.fd_t) !void {
@@ -496,64 +481,23 @@ pub fn decode(packet: *ipc.ReceivedPacket) !Message {
     }
 }
 
-/// Checks a hello completely: a nonzero key, between one and `policy.policies_max` entries in
-/// id order, known kinds, flags of 0 or 1 and zero reserved bytes.
-fn decodeHello(packet: *const ipc.ReceivedPacket) !Hello {
-    const fixed_len = @sizeOf(Header) + @sizeOf(HelloHeader);
-    if (packet.fd_count != 0 or packet.bytes.len < fixed_len)
+/// Checks a hello's packet completely: the exact length, one descriptor, a nonzero key, zero
+/// reserved bytes and an image length of 1 to `network.table.image_bytes_max`, then takes the
+/// descriptor. Whether the descriptor is the sealed image it claims to be is the gateway's check
+/// when it reads it (`runtime/control_flow.zig`).
+fn decodeHello(packet: *ipc.ReceivedPacket) !Hello {
+    if (packet.fd_count != 1 or packet.bytes.len != hello_bytes)
         return error.InvalidEgressGatewayControl;
     const fixed_bytes = packet.bytes[@sizeOf(Header)..][0..@sizeOf(HelloHeader)];
     const fixed = ipc.packet.readStruct(HelloHeader, fixed_bytes);
     if (fixed._reserved0 != 0 or fixed.key.isZero())
         return error.InvalidEgressGatewayControl;
-    const count: usize = fixed.policy_count;
-    if (count == 0 or count > policy.policies_max)
-        return error.InvalidEgressGatewayControl;
-    if (packet.bytes.len != fixed_len + count * @sizeOf(PolicyEntry))
-        return error.InvalidEgressGatewayControl;
-    var hello = Hello{
-        .key = fixed.key,
-        .table = .{ .count = @intCast(count) },
-    };
-    for (hello.table.entries[0..count], 0..) |*out, index| {
-        const offset = fixed_len + index * @sizeOf(PolicyEntry);
-        const wire_bytes = packet.bytes[offset..][0..@sizeOf(PolicyEntry)];
-        const wire = ipc.packet.readStruct(PolicyEntry, wire_bytes);
-        out.* = try decodePolicyEntry(wire, index);
-    }
-    return hello;
-}
-
-fn decodePolicyEntry(wire: PolicyEntry, index: usize) !policy.NetworkPolicy {
-    if (wire.id != index)
-        return error.InvalidEgressGatewayControl;
-    if (!std.mem.allEqual(u8, &wire._reserved0, 0))
+    if (fixed.table_bytes == 0 or fixed.table_bytes > network.table.image_bytes_max)
         return error.InvalidEgressGatewayControl;
     return .{
-        .kind = try decodePolicyKind(wire.kind),
-        .allow_private_networks = try decodeFlag(wire.allow_private_networks),
-        .allow_http = try decodeFlag(wire.allow_http),
-    };
-}
-
-fn decodePolicyKind(raw: u8) !policy.PolicyKind {
-    return switch (raw) {
-        policy_kind_any_host => .any_host,
-        else => error.InvalidEgressGatewayControl,
-    };
-}
-
-fn encodePolicyKind(kind: policy.PolicyKind) u8 {
-    return switch (kind) {
-        .any_host => policy_kind_any_host,
-    };
-}
-
-fn decodeFlag(raw: u8) !bool {
-    return switch (raw) {
-        0 => false,
-        1 => true,
-        else => error.InvalidEgressGatewayControl,
+        .key = fixed.key,
+        .table_fd = packet.takeFd(0),
+        .table_bytes = fixed.table_bytes,
     };
 }
 

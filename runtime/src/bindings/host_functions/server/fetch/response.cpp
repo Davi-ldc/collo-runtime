@@ -1,6 +1,8 @@
 // The Response class's JavaScript surface and the ABI calls around it: creating a Response or a body read result from
 // host data, and extracting a handler's result into a ColloExtractedResponse for the host. The cell is JSColloResponse
-// in response_object.h. VM thread only; every ABI call takes the JSC lock.
+// in response_object.h. Extraction copies or shares a native body's bytes, moves a fetch body's identity to the host,
+// and locks a ReadableStream body for the host to read (response_body_stream.cpp). VM thread only; every ABI call
+// takes the JSC lock.
 //
 // A Response that an ABI call creates has immutable headers, as a fetch response has under the Fetch Standard. One
 // built from JavaScript keeps its headers under the None guard, so a handler can set every header, Set-Cookie
@@ -14,6 +16,7 @@
 #include "host_functions/server/fetch/extracted_response.h"
 #include "host_functions/server/fetch/headers.h"
 #include "host_functions/server/fetch/response_body.h"
+#include "host_functions/server/fetch/response_body_stream.h"
 #include "host_functions/server/fetch/response_object.h"
 #include "host_functions/webapi/dom/dom_exception.h"
 #include "host_functions/webapi/limits.h"
@@ -1042,8 +1045,27 @@ namespace {
             // The stream moves to the caller only after every step that can fail, so a failed extraction leaves the
             // fetch body with the Response.
             out->body.kind = COLLO_EXTRACTED_RESPONSE_BODY_FETCH_STREAM;
-            out->body.stream_identity = response->body().transferFetchStreamForHostResponse();
+            out->body.stream_identity = response->transferFetchStreamForHostResponse();
             return COLLO_STATUS_OK;
+        }
+
+        if (response->body().source() == BodyState::Source::ReadableStream) {
+            WTF::Vector<ColloHeaderPair> pairs;
+            if (!collectHeadersToPairs(global_object, scope, response->headers(), pairs)) {
+                if (auto exception_status = consumeExceptionStatus(vm, scope, out_exception);
+                    exception_status != COLLO_STATUS_OK)
+                    return exception_status;
+                return COLLO_STATUS_ERROR;
+            }
+            auto status = copyHeadersToExtracted(pairs, limits, &out->headers);
+            if (status != COLLO_STATUS_OK)
+                return status;
+
+            // Locking the stream comes last, because nothing undoes it.
+            status = extractResponseBodyStream(vm, global_object, scope, response->bodyStream(), out->body);
+            if (status == COLLO_STATUS_JS_EXCEPTION)
+                return statusOr(consumeExceptionStatus(vm, scope, out_exception), COLLO_STATUS_ERROR);
+            return status;
         }
 
         size_t body_byte_length = 0;
@@ -1231,20 +1253,22 @@ extern "C" ColloStatus collo_fetch_response_new(
     return Collo::makeValueHandle(vm, object, out_value);
 }
 
-extern "C" ColloStatus collo_response_extract(ColloVm* vm, const ColloValue* value,
+extern "C" ColloStatus collo_response_extract(ColloRealm* realm, const ColloValue* value,
     const ColloResponseExtractLimits* limits, ColloExtractedResponse* out_response, ColloValue** out_exception)
 {
     if (out_response)
         resetExtractedResponse(out_response);
     Collo::clearOutException(out_exception);
-    if (!vm || !vm->isReady() || !Collo::valueBelongsToVm(vm, value) || !limits || !out_response)
+    if (!realmIsReady(realm) || !Collo::valueBelongsToVm(realm->vm, value) || !limits || !out_response)
         return COLLO_STATUS_INVALID_ARGUMENT;
 
+    ColloVm* vm = realm->vm;
     JSC::JSLockHolder locker(*vm->vm);
     auto scope = DECLARE_THROW_SCOPE(*vm->vm);
     JSValue js_value = Collo::toJSValue(value);
-    // The handler's realm, which a body stream it read from or an error it raises belongs to.
-    auto* global_object = Collo::globalObjectForValue(vm, js_value);
+    // The value's realm, which a body stream it read from or an error it raises belongs to, or the handler's for a
+    // primitive result, such as a Symbol whose string conversion throws.
+    auto* global_object = Collo::globalObjectForValue(*realm, js_value);
 
     ColloStatus status = COLLO_STATUS_OK;
     if (auto* response = dynamicDowncast<JSColloResponse>(js_value)) {

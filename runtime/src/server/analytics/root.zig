@@ -1,8 +1,9 @@
 //! The server's local analytics: worker console lines, one access record per
-//! request the server answered or dispatched, and one usage record per
-//! finished request, appended as JSON Lines to files in the analytics
-//! directory. Console lines also always go to stderr, and without a directory
-//! they are the only output: every record is counted as discarded.
+//! request the server answered or dispatched, one usage record per finished
+//! request and one line per worker the server ended, appended as JSON Lines
+//! to files in the analytics directory. Console lines also always go to
+//! stderr, and without a directory they are the only output: every record is
+//! counted as discarded.
 //!
 //! - `sink.zig`: the files and the console stream, their bounded buffers, the
 //!   batched writes, the sync interval, the loss counters, the full flag a
@@ -14,6 +15,7 @@
 //!   of a dying worker's ring.
 //! - `access.zig`: access facts, access records and the lane handoff ring.
 //! - `usage.zig`: the usage record and its line format.
+//! - `workers.zig`: the worker line and its format.
 //!
 //! The server stamps every record's owner from its own tables: the worker, the
 //! route pattern, and the worker process's id and generation. No record takes
@@ -23,10 +25,11 @@
 //! carries a request id the server dispatched: a usage record the worker
 //! measured (origin `worker`) is written only for a request the server's
 //! table of that worker still expects a record for, under the table's id
-//! (`server/supervisor/usage_drain.zig`). The request id a console
-//! line names (`logs.zig`) is still the worker's own report; it appears only
-//! under the server-stamped worker that wrote it, so a worker can mislabel
-//! its own lines but cannot enter another worker's.
+//! (`server/supervisor/usage_drain.zig`). A console line keeps the request
+//! id the worker wrote with it only when that worker's request table holds
+//! the request or ended it recently, and prints that request's route
+//! (`logs.zig`); any other id prints as 0. A worker can still file a line
+//! under another of its own requests, but never under another worker's.
 //!
 //! The server owns the one `Sink` (`server/main.zig`). The ingress metrics
 //! thread drains rings into it and flushes the record files, the ingress
@@ -39,6 +42,7 @@ pub const record = @import("record.zig");
 pub const logs = @import("logs.zig");
 pub const access = @import("access.zig");
 pub const usage = @import("usage.zig");
+pub const workers = @import("workers.zig");
 
 pub const Sink = sink.Sink;
 pub const Stream = sink.Stream;

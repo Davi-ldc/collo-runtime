@@ -3,22 +3,24 @@
 //! worker endpoints. An error confined to one fetch fails only that fetch. Any other error
 //! restarts only its shard and leaves the other shards alone; the restart fails the shard's
 //! fetches except the replay-safe ones, which run again on the restarted engine under the request
-//! and the policy entry their routes recorded, and a replay whose entry the table lacks fails
+//! and the network policy their routes recorded, and a replay whose policy the table lacks fails
 //! alone. A shard past its restart budget ends the gateway process. Cases cover a fault in the
 //! middle of a collection pass, the restart budget, a shard at its memory budget, a fault that
-//! escapes the owner loop, the grant a redispatch keeps, and a restart under the gateway's
+//! escapes the owner loop, the policy a redispatch keeps, and a restart under the gateway's
 //! seccomp filter in a forked child. The restart's steps without engine threads are covered in
 //! `shard_lifecycle.zig`. Lane: egress-gateway-test.
 
 const std = @import("std");
 const gateway = @import("collo_egress_gateway");
 const engine_test = @import("support/engine.zig");
+const policy_image = @import("support/policy_image.zig");
 const shard_flow = gateway.testing.shard_flow;
 const control_flow = gateway.testing.control_flow;
 const egress = @import("collo_egress_client");
 const ipc = @import("collo_ipc");
 
 const body_credit = egress.core.body_credit;
+const network = egress.network;
 
 /// The security cell every route of these tests records.
 const route_security_cell_id: gateway.policy.SecurityCellId = [_]u8{9} ** 16;
@@ -226,26 +228,21 @@ test "chaos: owner-loop escape surfaces through collection and restarts the shar
     try std.testing.expect(!try chaos.collectOrSupervise(0));
 }
 
-test "chaos: a redispatched fetch keeps the request and the policy entry it was admitted under" {
+test "chaos: a redispatched fetch keeps the request and the policy it was admitted under" {
     PacketRecorder.reset();
     var chaos = try ChaosGateway.init(2, gateway.supervisor_limits.shard_memory.budget_bytes);
     defer chaos.deinit();
-    // Entry 1 lets plain HTTP through the scheme check and entry 0 does not, so the error that
-    // ends a resubmitted plain-HTTP fetch names the entry it ran under.
-    var table = gateway.policy.PolicyTable.single(gateway.policy.public_https);
-    table.entries[1] = .{ .kind = .any_host, .allow_private_networks = true, .allow_http = true };
-    table.count = 2;
-    chaos.hello = helloFor(&table);
     const victim = chaos.shards.get(0);
 
-    // Replay-safe and admitted under entry 1, which only its route records. Its loopback origin,
-    // which every entry denies, settles it on the engine threads without DNS or the network.
+    // Replay-safe and admitted under the policy that also allows plain HTTP, which only its route
+    // records. Its private origin, which that policy reaches the scheme check for and then
+    // refuses, settles it on the engine threads without DNS or the network.
     try engine_test.injectActiveRequest(&victim.engine, 1, 1, 1, .{
-        .url = "http://127.0.0.1:9/",
+        .url = "http://10.0.0.1/",
         .request_id = 42,
         .request_generation = 7,
     });
-    try chaos.recordRouteUnder(1, 1, 1, 0, 1);
+    try chaos.recordRouteUnder(1, 1, 1, 0, policy_image.public_http_and_https_id);
 
     try chaos.superviseShardFailure(0, error.InjectedShardFault);
     try std.testing.expectEqual(@as(u64, 1), victim.restarts);
@@ -256,8 +253,8 @@ test "chaos: a redispatched fetch keeps the request and the policy entry it was 
         engine_test.activeFetchBudgetKey(&victim.engine, 1, 1, 1).?,
     );
 
-    // Only the restarted engine's threads settle the resubmission. Under entry 0 the scheme
-    // check would refuse it as PlainHttpFetchDisabled before the address check runs.
+    // Only the restarted engine's threads settle the resubmission. Under the HTTPS-only policy the
+    // denial would name plain HTTP, and under policy 0 the missing grant.
     const wait_start = try std.time.Instant.now();
     while (PacketRecorder.findError(1, 1) == null) {
         try std.testing.expect(!try chaos.collectOrSupervise(0));
@@ -267,18 +264,22 @@ test "chaos: a redispatched fetch keeps the request and the policy entry it was 
         std.Thread.sleep(std.time.ns_per_ms);
     }
     const failure = PacketRecorder.findError(1, 1).?;
-    try std.testing.expect(std.mem.indexOf(u8, failure.message(), "EgressDenied") != null);
+    var expected_buffer: [network.grant.denial_bytes_max]u8 = undefined;
+    var expected: std.Io.Writer = .fixed(&expected_buffer);
+    try network.writeDenial(&expected, .{ .scheme = .http, .host = "10.0.0.1", .port = 80 }, .private_address);
+    try std.testing.expectEqualStrings(expected.buffered(), failure.message());
+    try std.testing.expectEqual(ipc.EgressFetchErrorCause.network_denied, failure.cause);
 }
 
-test "chaos: a replay whose route names an entry the table lacks fails only that fetch" {
+test "chaos: a replay whose route names a policy the table lacks fails only that fetch" {
     PacketRecorder.reset();
     var chaos = try ChaosGateway.init(1, gateway.supervisor_limits.shard_memory.budget_bytes);
     defer chaos.deinit();
     const victim = chaos.shards.get(0);
 
     // Two replay-safe fetches on one shard. Admission records only ids its table holds, so the
-    // first route's entry 5, past a table of one entry, stands for an admission bug; the second
-    // route names entry 0.
+    // first route's policy 5, past the table's three, stands for an admission bug; the second
+    // route names a policy the table holds.
     try engine_test.injectActiveRequest(&victim.engine, 1, 1, 1, .{ .url = "https://127.0.0.1:9/" });
     try engine_test.setActiveBodyEgressMeters(&victim.engine, 1, 1, 1, .{
         .billed_sent = 5,
@@ -420,9 +421,9 @@ const ChaosGateway = struct {
     completed_fetches: std.array_list.Aligned(gateway.active_fetch.WorkerScopedFetch, null) = .empty,
     coalesce_completion_notifies: bool = false,
     scratch: []u8,
-    /// What the server's hello brought, of which the supervisor's redispatch reads the policy
-    /// table and each entry's isolation id: the one-entry table, unless a test installs another.
-    hello: control_flow.HelloState,
+    /// What the server's hello brought, of which the supervisor's redispatch reads each policy
+    /// and its isolation id: those of `policy_image.standard`.
+    hello: control_flow.HelloState = .{},
 
     const ShardFlow = shard_flow.Methods(ChaosGateway);
     pub const collectShardReady = ShardFlow.collectShardReady;
@@ -430,13 +431,14 @@ const ChaosGateway = struct {
     pub const redispatchReplayFetch = ShardFlow.redispatchReplayFetch;
 
     fn init(shard_count: usize, memory_budget_bytes: u64) !ChaosGateway {
-        const table = gateway.policy.PolicyTable.single(gateway.policy.public_https);
         var chaos = ChaosGateway{
             .allocator = std.testing.allocator,
             .scratch = try std.testing.allocator.alloc(u8, ipc.max_message_bytes),
-            .hello = helloFor(&table),
         };
         errdefer chaos.deinit();
+        const image = try policy_image.standard(std.testing.allocator);
+        defer std.testing.allocator.free(image);
+        chaos.hello = try policy_image.helloState(std.testing.allocator, image, .{ .bytes = @splat(0x6b) });
         chaos.shards = try gateway.shard_set.Set.init(
             std.testing.allocator,
             shard_count,
@@ -457,6 +459,7 @@ const ChaosGateway = struct {
         self.shards.deinit(self.allocator);
         self.router.deinit(self.allocator);
         self.completed_fetches.deinit(self.allocator);
+        self.hello.deinit(self.allocator);
         self.allocator.free(self.scratch);
     }
 
@@ -473,7 +476,7 @@ const ChaosGateway = struct {
     }
 
     /// The route admission records for a fetch on `shard_index` admitted under the table's
-    /// `public_https_id` entry.
+    /// `policy_image.public_https_id`.
     fn recordRoute(
         self: *ChaosGateway,
         worker_session_id: u64,
@@ -486,18 +489,18 @@ const ChaosGateway = struct {
             fetch_id,
             body_id,
             shard_index,
-            gateway.policy.public_https_id,
+            policy_image.public_https_id,
         );
     }
 
-    /// `recordRoute` for a fetch admitted under table entry `policy_id`.
+    /// `recordRoute` for a fetch admitted under policy `policy_id`.
     fn recordRouteUnder(
         self: *ChaosGateway,
         worker_session_id: u64,
         fetch_id: u64,
         body_id: u64,
         shard_index: usize,
-        policy_id: u16,
+        policy_id: network.PolicyId,
     ) !void {
         try self.router.record(self.allocator, .{
             .worker_session_id = worker_session_id,
@@ -529,23 +532,6 @@ const ChaosGateway = struct {
     }
 };
 
-/// The state the gateway's control flow keeps after a hello carrying `table`: each entry's
-/// isolation id folds the gateway's limits into the entry, as `runtime/control_flow.zig` computes
-/// it when the hello arrives.
-fn helloFor(table: *const gateway.policy.PolicyTable) control_flow.HelloState {
-    var hello: control_flow.HelloState = .{
-        .received = true,
-        .key = .{ .bytes = @splat(0x6b) },
-        .policies = table.*,
-    };
-    const limits_id = gateway.policy.policyIsolationId(gateway.policy.production);
-    for (table.slice(), 0..) |entry, index| {
-        hello.isolation_ids[index] =
-            gateway.policy.networkPolicyIsolationId(limits_id, @intCast(index), entry);
-    }
-    return hello;
-}
-
 /// Packets meant for workers, recorded by session and fetch so every case can
 /// attribute error packets, their messages and meters. Only the test's thread
 /// touches it: packets are published during collection and supervision, on
@@ -559,6 +545,7 @@ const PacketRecorder = struct {
         billed_sent_total: u64,
         billed_received_total: u64,
         cost_total: u64,
+        cause: ipc.EgressFetchErrorCause,
         message_bytes: [message_bytes_max]u8,
         message_len: usize,
 
@@ -567,7 +554,8 @@ const PacketRecorder = struct {
         }
     };
 
-    const message_bytes_max: usize = 64;
+    /// A denial's text is the longest message a fetch here fails with.
+    const message_bytes_max: usize = network.grant.denial_bytes_max;
 
     var errors: [16]Entry = undefined;
     var error_count: usize = 0;
@@ -592,6 +580,7 @@ const PacketRecorder = struct {
                         .billed_sent_total = view.billed_sent_total,
                         .billed_received_total = view.billed_received_total,
                         .cost_total = view.cost_total,
+                        .cause = view.cause,
                         .message_bytes = undefined,
                         .message_len = message_len,
                     };

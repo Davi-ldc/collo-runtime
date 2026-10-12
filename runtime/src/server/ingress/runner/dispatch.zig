@@ -37,7 +37,10 @@
 //!   mutex and never waits for the gateway. The worker's egress session is
 //!   read only through `Supervisor.workerEgress` in
 //!   `server/supervisor/supervisor.zig`, since the launcher rewrites it under
-//!   the pool's mutex when it reattaches the worker to a new gateway.
+//!   the pool's mutex when it reattaches the worker to a new gateway. The
+//!   token names its route's network policy (`NetworkPolicies.routePolicy`
+//!   in `server/routes/network.zig`), compiled at boot and read without a
+//!   lock.
 
 const std = @import("std");
 const lifecycle = @import("collo_server_lifecycle");
@@ -90,13 +93,14 @@ pub const HandoffUse = enum {
 
 /// What the egress token of the request in `slot` says when it is minted
 /// for worker session `session_id`: the request's identity, its deadline,
-/// and the policy and fetch budget of `egress/gateway/policy.zig`. Pure and
+/// the fetch budget of `egress/gateway/policy.zig`, and `policy_id`, the
+/// network policy of the request's route (`server/routes/network.zig`),
+/// which holds whatever code runs during the request's turns. Pure and
 /// file-level, so the mapping is testable without a lane.
-pub fn requestTokenFields(slot: *const RequestSlot, session_id: u64) ipc.egress_token.Fields {
+pub fn requestTokenFields(slot: *const RequestSlot, session_id: u64, policy_id: u16) ipc.egress_token.Fields {
     return .{
         .kind = .request,
-        // Every route maps to the one entry of the gateway's policy table.
-        .policy_id = policy.public_https_id,
+        .policy_id = policy_id,
         .budget = policy.production.max_fetches_per_request,
         .session_id = session_id,
         .request_id = slot.request_id,
@@ -216,7 +220,7 @@ pub fn Methods(comptime Self: type) type {
             // A request that waited (it owns its head) for a worker launched
             // after it arrived rode that cold start.
             if (slot.head != null and worker.created_mono_ns >= slot.admitted_ns) {
-                accounting_flags |= worker_shared_page.CompletedRecordFlags.cold_start;
+                accounting_flags |= worker_shared_page.AccountingFlags.cold_start;
                 slot.access.cold_start = true;
                 slot.access.cold_start_ns = worker.boot_work_ns;
                 slot.access.cold_start_blocked_ns = now -| slot.admitted_ns;
@@ -256,7 +260,7 @@ pub fn Methods(comptime Self: type) type {
             if (egress.session_id != 0) {
                 dispatch_work.egress_token = self.egress_lease.mint(
                     egress.generation,
-                    requestTokenFields(slot, egress.session_id),
+                    requestTokenFields(slot, egress.session_id, self.service.routes.network.routePolicy(slot.route)),
                 );
                 // The slot keeps the session of a token the request carries,
                 // whose end its finish notes (`request_finish.zig`); `none`

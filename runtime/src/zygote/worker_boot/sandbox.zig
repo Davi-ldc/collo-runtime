@@ -254,14 +254,14 @@ pub const security = struct {
         "rt_sigprocmask",
         "rt_sigaction",
 
-        // A thread's own start. A thread created before this filter runs
-        // glibc's start code only when the scheduler first picks it, which
-        // under CPU contention can come after the filter. glibc aborts the
-        // whole process when that thread cannot register its rseq area. A
-        // failed set_robust_list is ignored, but the thread would then lack
-        // the robust-futex list glibc registers for every thread it starts.
-        // Both calls only register memory of the calling thread with the
-        // kernel.
+        // A thread's own start. A thread created before this filter runs its
+        // start code only when the scheduler first picks it, which under CPU
+        // contention can come after the filter, so the calls a thread makes
+        // at its own start must pass. glibc registers the thread's rseq area,
+        // aborting the whole process when it cannot, and its robust-futex
+        // list, which the thread otherwise lacks; WTF names the thread with
+        // prctl(PR_SET_NAME), which `appendPrctlPolicy` admits. Each call
+        // touches only the calling thread.
         "rseq",
         "set_robust_list",
 
@@ -339,6 +339,10 @@ pub const security = struct {
         return deny_direct_egress_template.renameat2_args_filter;
     }
 
+    pub fn denyDirectEgressFiltersPrctlName() bool {
+        return deny_direct_egress_template.prctl_name_filter;
+    }
+
     pub fn denyDirectEgressFilterInstructions() []const FilterInstruction {
         return deny_direct_egress_template.program[0..deny_direct_egress_template.len];
     }
@@ -381,7 +385,8 @@ pub const security = struct {
             !template.statx_flags_filter or
             !template.mkdirat_args_filter or
             !template.unlinkat_args_filter or
-            !template.renameat2_args_filter)
+            !template.renameat2_args_filter or
+            !template.prctl_name_filter)
         {
             return error.UnsupportedKernel;
         }
@@ -425,6 +430,7 @@ pub const security = struct {
         mkdirat_args_filter: bool = false,
         unlinkat_args_filter: bool = false,
         renameat2_args_filter: bool = false,
+        prctl_name_filter: bool = false,
     };
 
     const deny_direct_egress_template = buildDenyDirectEgressTemplate();
@@ -442,6 +448,7 @@ pub const security = struct {
             .mkdirat_args_filter = false,
             .unlinkat_args_filter = false,
             .renameat2_args_filter = false,
+            .prctl_name_filter = false,
         };
         append(&template.program, &template.len, stmt(bpf.LD | bpf.W | bpf.ABS, @intCast(@offsetOf(linux.SECCOMP.data, "arch"))));
         append(&template.program, &template.len, jump(bpf.JMP | bpf.JEQ | bpf.K, auditArchCurrent(), 1, 0));
@@ -457,6 +464,7 @@ pub const security = struct {
         appendUnlinkAtPolicy(&template);
         appendRenameAt2Policy(&template);
         appendFcntlPolicy(&template.program, &template.len);
+        appendPrctlPolicy(&template);
 
         inline for (allowed_syscalls) |name| {
             if (comptime hasSyscall(name)) {
@@ -700,6 +708,29 @@ pub const security = struct {
     const linux_f_getfd: u32 = 1;
     const linux_f_getfl: u32 = 3;
     const linux_f_get_seals: u32 = 1034;
+
+    // prctl takes only PR_SET_NAME, which a thread may call at its own start
+    // (see "rseq" in `allowed_syscalls`). It copies at most 16 bytes into
+    // the calling thread's name and reaches no other task, capability or
+    // resource, so a worker that runs native code gains only the power to
+    // rename its own threads. Every other option stays denied, among them
+    // PR_GET_NAME, PR_SET_DUMPABLE, PR_SET_SECCOMP, PR_SET_MM, PR_SET_PTRACER
+    // and PR_CAP_AMBIENT.
+    fn appendPrctlPolicy(template: *SeccompTemplate) void {
+        const jump_index = beginSyscallPolicy(&template.program, &template.len, "prctl") orelse return;
+        append(&template.program, &template.len, stmt(bpf.LD | bpf.W | bpf.ABS, arg0HighOffset()));
+        append(&template.program, &template.len, jump(bpf.JMP | bpf.JEQ | bpf.K, 0, 1, 0));
+        append(&template.program, &template.len, denyPerm());
+        append(&template.program, &template.len, stmt(bpf.LD | bpf.W | bpf.ABS, arg0LowOffset()));
+        append(&template.program, &template.len, jump(bpf.JMP | bpf.JEQ | bpf.K, pr_set_name, 1, 0));
+        append(&template.program, &template.len, denyPerm());
+        append(&template.program, &template.len, stmt(bpf.RET | bpf.K, linux.SECCOMP.RET.ALLOW));
+        template.prctl_name_filter = true;
+        endSyscallPolicy(&template.program, template.len, jump_index);
+    }
+
+    const pr_set_name: u32 = @intCast(@intFromEnum(linux.PR.SET_NAME));
+
     fn appendX86_64CompatGuards(program: []sock_filter, len: *usize) void {
         if (comptime builtin.target.cpu.arch != .x86_64)
             return;

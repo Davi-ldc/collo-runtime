@@ -16,19 +16,19 @@ const admission = server_main.ingress.runner.admission;
 const catch_all = [_]config.WorkerDefinition{.{
     .name = "app",
     .settings = config.default_settings,
-    .routes = &.{.{ .pattern = "/*", .entry_path = "/srv/app.js", .bindings = &.{} }},
+    .routes = &.{.{ .pattern = "/*", .entry_path = "/srv/app.js", .bindings = &.{}, .network = null }},
 }};
 
 const two_routes = [_]config.WorkerDefinition{
     .{
         .name = "users",
         .settings = config.default_settings,
-        .routes = &.{.{ .pattern = "/users/:id", .entry_path = "/srv/users.js", .bindings = &.{} }},
+        .routes = &.{.{ .pattern = "/users/:id", .entry_path = "/srv/users.js", .bindings = &.{}, .network = null }},
     },
     .{
         .name = "assets",
         .settings = config.default_settings,
-        .routes = &.{.{ .pattern = "/static/*", .entry_path = "/srv/assets.js", .bindings = &.{} }},
+        .routes = &.{.{ .pattern = "/static/*", .entry_path = "/srv/assets.js", .bindings = &.{}, .network = null }},
     },
 };
 

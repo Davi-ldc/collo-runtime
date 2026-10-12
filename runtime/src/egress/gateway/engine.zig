@@ -5,9 +5,9 @@
 //!
 //! The engine never reads the token in a start packet. The loop admits each fetch under its
 //! verified token and passes what the token grants with the submit (`SubmitOptions`): the request
-//! the fetch belongs to and its network policy entry. The transport takes that entry as the
-//! fetch's own configuration and checks the host before DNS and the address class after it, on
-//! every hop, redirects included.
+//! the fetch belongs to and its network policy. The transport takes that policy as the fetch's
+//! own configuration and checks the scheme, host and port before DNS and every resolved address
+//! after it, on every hop, redirects included.
 //!
 //! The gateway's main loop thread owns the `Engine`: its active table, the drain of its ready
 //! scan, its sinks and counters. Of what this file owns, the inner engine's owner and connector
@@ -120,11 +120,12 @@ pub const ReplayFetch = struct {
 /// What admission granted a fetch. `isolation`, `network` and `budget_key` have no default,
 /// since each decides what the fetch may reach or whose request it serves.
 pub const SubmitOptions = struct {
-    /// The pool key: the fetch's security cell and the isolation id of its policy entry
+    /// The pool key: the fetch's security cell and the isolation id of its policy
     /// (`policy.networkPolicyIsolationId`).
     isolation: policy_mod.PoolIsolation,
-    /// The policy table entry the fetch's token names, checked on every hop.
-    network: policy_mod.NetworkPolicy,
+    /// The policy the fetch's token names, checked on every hop. It points into the gateway's
+    /// decoded table, which outlives every fetch.
+    network: egress.network.Policy,
     /// The request the fetch's token names. `cancelRequest` cancels the fetch by it, and the
     /// response body carries its request id and generation. Its session is the submitting
     /// worker's.
@@ -266,20 +267,18 @@ pub const Engine = struct {
         };
         std.debug.assert(options.owned_body == null or fetch.body.len == 0);
         std.debug.assert(options.budget_key.session_id == worker_session_id);
-        const body_len = if (options.owned_body) |owned| owned.bytes.len else fetch.body.len;
+        const max_body_bytes = try validateStart(fetch, self.policy);
+        // An assembled body's length was the announced one `validateStart` checked at
+        // admission; the check here holds the engine's own bound whoever submits.
+        if (options.owned_body) |owned| {
+            if (owned.bytes.len > self.policy.max_request_body_bytes)
+                return error.EgressGatewayRequestBodyLimitExceeded;
+        }
         var header_storage: [ipc.max_request_header_count]bindings.NameValuePair = undefined;
-        if (fetch.fetch_id == 0 or fetch.body_id == 0)
-            return error.InvalidEgressGatewayFetchIdentity;
         if (self.active.hasWorkerIdentity(worker_session_id, fetch.fetch_id, fetch.body_id))
             return error.EgressGatewayDuplicateFetchIdentity;
         if (self.active.countForWorkerSession(worker_session_id) >= self.policy.max_active_fetches_per_worker_session)
             return error.EgressGatewayWorkerFetchLimitExceeded;
-        if (fetch.headers.len > @min(header_storage.len, self.policy.max_request_headers))
-            return error.TooManyFetchHeaders;
-        if (requestHeaderBytes(fetch.headers) > self.policy.max_request_header_bytes)
-            return error.EgressGatewayRequestHeadersTooLarge;
-        if (body_len > self.policy.max_request_body_bytes)
-            return error.EgressGatewayRequestBodyLimitExceeded;
         for (fetch.headers, 0..) |header, index| {
             header_storage[index] = .{
                 .name = rawString(header.name),
@@ -293,10 +292,6 @@ pub const Engine = struct {
             .fetch_id = fetch.fetch_id,
             .body_id = fetch.body_id,
         };
-        const max_body_bytes = try policy_mod.resolveMaxResponseBodyBytes(
-            fetch.max_body_bytes,
-            self.policy.max_response_body_bytes,
-        );
 
         const body = try self.allocator.create(fetch_body.Body);
         var body_owned = true;
@@ -352,10 +347,8 @@ pub const Engine = struct {
         if (options.egress_cost_base != 0)
             task.addEgressBase(0, 0, options.egress_cost_base);
 
-        const network = transportEgressPolicy(options.network);
         const config = transport.Config{
-            .allow_plain_http = network.allow_plain_http,
-            .allow_private_networks = network.allow_private_networks,
+            .network = options.network,
             .max_response_body_bytes = max_body_bytes,
             .max_encoded_response_bytes = @min(self.policy.max_encoded_response_bytes, max_body_bytes),
             .socket_timeout_ms = self.policy.socket_timeout_ms,
@@ -661,7 +654,7 @@ pub const Engine = struct {
         self: *Engine,
         item: ReplayFetch,
         isolation: policy_mod.PoolIsolation,
-        network: policy_mod.NetworkPolicy,
+        network: egress.network.Policy,
     ) !void {
         var header_storage: [ipc.max_request_header_count]ipc.RequestHeader = undefined;
         const task = item.task;
@@ -925,6 +918,29 @@ fn isReplaySafeForRedispatch(fetch: *active_fetch.Fetch) bool {
         std.ascii.eqlIgnoreCase(task.method, "DELETE");
 }
 
+/// The checks of a fetch start's shape, which admission runs on every start before anything is
+/// allocated for it, an inline body or a pooled one alike (`runtime/worker_flow.zig`), and
+/// `Engine.submit` runs again: nonzero fetch and body ids, the header count and bytes, the
+/// request body's length (the inline bytes, or the announced length of a pooled body) and the
+/// response cap the worker asked for. Returns the response cap the fetch runs under
+/// (`policy.resolveMaxResponseBodyBytes`). Every error is one the worker's packet caused, which
+/// `runtime/worker_flow.zig:isWorkerPolicySubmitError` lists.
+pub fn validateStart(fetch: ipc.EgressFetchStartView, policy: policy_mod.Policy) !usize {
+    if (fetch.fetch_id == 0 or fetch.body_id == 0)
+        return error.InvalidEgressGatewayFetchIdentity;
+    if (fetch.headers.len > @min(ipc.max_request_header_count, policy.max_request_headers))
+        return error.TooManyFetchHeaders;
+    if (requestHeaderBytes(fetch.headers) > policy.max_request_header_bytes)
+        return error.EgressGatewayRequestHeadersTooLarge;
+    const pooled = (fetch.flags & ipc.egress_fetch_start_flag_body_pooled) != 0;
+    const body_len: u64 = if (pooled) fetch.pooled_body_len else fetch.body.len;
+    if (pooled and body_len == 0)
+        return error.EgressGatewayRequestBodyLimitExceeded;
+    if (body_len > policy.max_request_body_bytes)
+        return error.EgressGatewayRequestBodyLimitExceeded;
+    return policy_mod.resolveMaxResponseBodyBytes(fetch.max_body_bytes, policy.max_response_body_bytes);
+}
+
 fn resolveReadyEventCapacity(config: Config) usize {
     if (config.ready_event_capacity != 0)
         return config.ready_event_capacity;
@@ -936,19 +952,6 @@ fn requestHeaderBytes(headers: []const ipc.RequestHeader) usize {
     for (headers) |header|
         total +|= header.name.len + header.value.len;
     return total;
-}
-
-/// The transport's checks for a fetch under `network`, which the transport runs on every hop,
-/// redirects included: the scheme and its host rules before DNS, then the class of every
-/// resolved address (`transport.EgressPolicy`).
-fn transportEgressPolicy(network: policy_mod.NetworkPolicy) transport.EgressPolicy {
-    return switch (network.kind) {
-        // The transport's own host rules are the whole host check of `any_host`.
-        .any_host => .{
-            .allow_plain_http = network.allow_http,
-            .allow_private_networks = network.allow_private_networks,
-        },
-    };
 }
 
 fn creditBytes(credit: body_credit.Handle) u64 {

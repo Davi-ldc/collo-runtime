@@ -9,8 +9,9 @@
 //! responses, and the end of a request context. It belongs to the worker's
 //! VM thread.
 //!
-//! The active map holds the boot context under `boot_request_id` beside the
-//! dispatched requests. A context in it dies only in
+//! The active map holds the open evaluations under their evaluation ids
+//! (`evaluations.zig`) beside the dispatched requests: every owner that may
+//! hold work, and never the worker owner. A context in it dies only in
 //! `destroyRequestContext`; `Requests` frees the map, never a context.
 //! `Requests.init` takes the credit eventfd, closing it on failure, and
 //! `deinitIngress` closes it after.
@@ -94,8 +95,13 @@ pub const Requests = struct {
         self.ingress_payload_credit_eventfd = null;
     }
 
+    /// Frees the map and leaves it empty, not undefined: the runtime's
+    /// teardown releases the fetch bodies after the requests, and a body's
+    /// release still looks its request up (`egress/body/common.zig:accountEgress`,
+    /// `egress/context.zig:Context.withdrawReady`), which must find none.
     pub fn deinitActiveMap(self: *Requests, allocator: std.mem.Allocator) void {
         self.active.deinit(allocator);
+        self.active = .empty;
     }
 };
 
@@ -133,7 +139,7 @@ pub fn Methods(comptime Runtime: type) type {
         /// keyed by `&ctx.exec`, and a reaction this request registered can still
         /// wait on a module-scope promise, so a token that outlived its storage
         /// would read freed memory the next time that promise settles. Teardown,
-        /// the boot context's close, a finished request and an enqueue rollback
+        /// an evaluation's close, a finished request and an enqueue rollback
         /// all come through here.
         pub fn destroyRequestContext(self: *Runtime, ctx: *request_context.RequestContext) void {
             self.core.vm.releaseExecCtx(&ctx.exec) catch |err|

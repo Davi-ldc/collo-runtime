@@ -1045,39 +1045,13 @@ test "a deadline answers 504 in place of a response whose head waits in the outb
 }
 
 test "a local failure resets a committed response whose rest waits in the outbox, and the worker keeps running" {
-    var fixture: SocketFullWorker = undefined;
-    try fixture.init(.{});
-    defer fixture.deinit();
-    const runtime = &fixture.runtime;
-
-    try fixture.dispatch(404, parts_source, "/socket-full-reset.js");
-    const committed_ctx = try runUntilParked(runtime, 404);
-    try std.testing.expect(committed_ctx.response_committed);
-
-    // The socket is still full, so the reset waits in the outbox in place of
-    // the rest of the body.
-    worker.testing.request_dispatch.handleLocalFailure(runtime, 404, error.TestInjectedFailure);
-    try std.testing.expect(runtime.core.running);
-    const request_ctx = runtime.requests.active.get(404) orelse return error.TestUnexpectedResult;
-    const internal_error_code: u32 = @intFromEnum(h2.ErrorCode.internal_error);
-    switch (request_ctx.response_outbox.pending) {
-        .stream_reset => |reset_code| try std.testing.expectEqual(internal_error_code, reset_code),
-        else => return error.TestUnexpectedResult,
-    }
-    try fixture.expectNoCompletion();
-
-    var response: ReadResponse = .{};
-    defer response.deinit();
-    try fixture.serveUntilFinished(&response, 404);
-    try response.readUntilEnd(&fixture);
-    try std.testing.expectEqual(@as(?u16, 202), response.status);
-    try std.testing.expectEqual(@as(?u32, internal_error_code), response.reset_code);
-    try std.testing.expect(response.body.items.len < parts_body_len);
-    try expectPartsBytes(response.body.items);
-
-    const done = try readWorkerCompletion(runtime, fixture.control_pair[1], 404);
-    try std.testing.expectEqual(@intFromEnum(ipc.RequestDoneStatus.internal_error), done.status);
-    try std.testing.expectEqual(@as(u16, 502), done.http_status);
+    try expectParkedRestReset(.{
+        .request_id = 404,
+        .specifier = "/socket-full-reset.js",
+        .end = .local_failure,
+        .done_status = .internal_error,
+        .http_status = 502,
+    });
 }
 
 test "a client reset drops the parked rest of a committed response and publishes its completion with nothing sent after it" {
@@ -1090,8 +1064,11 @@ test "a client reset drops the parked rest of a committed response and publishes
     });
 }
 
-test "a deadline drops the parked rest of a committed response and publishes its completion with nothing sent after it" {
-    try expectParkedRestDropped(.{
+// The client's stream ends at once rather than at the server's grace
+// backstop, which a completion parked behind an unfinished response waits
+// for.
+test "a deadline resets a committed response whose rest waits in the outbox, and the worker keeps running" {
+    try expectParkedRestReset(.{
         .request_id = 406,
         .specifier = "/socket-full-committed-deadline.js",
         .end = .deadline,
@@ -1169,7 +1146,10 @@ test "a fetch aborted while its streamed response's head waits resets that one s
     // The gateway's acknowledgment of the fetch's abort releases the body's
     // view (`gateway_runtime.handleAbortAck`), so the pull the head's flush
     // starts cannot begin.
-    const identity = request_ctx.response_stream_body orelse return error.TestUnexpectedResult;
+    const identity = switch (request_ctx.response_stream) {
+        .fetch => |fetch| fetch.identity,
+        else => return error.TestUnexpectedResult,
+    };
     const ack = ipc.messages.EgressAbortAck.init(identity.fetch_id, identity.body_id);
     const gateway = fixture.gateway orelse return error.TestUnexpectedResult;
     try gateway.queueCompletionPacket(std.mem.asBytes(&ack));
@@ -1242,7 +1222,15 @@ test "the loop sends a parked response once the server drains the socket, and pu
 
 /// How `expectParkedRestDropped` ends the request whose rest waits: as the
 /// server's reset of the stream does, or as its deadline does.
-const RequestEnd = enum { client_reset, deadline };
+const RequestEnd = enum { client_reset, deadline, local_failure };
+
+fn endRequest(runtime: *worker.Runtime, request_id: u64, end: RequestEnd) !void {
+    switch (end) {
+        .client_reset => try worker.testing.request_dispatch.cancelClientReset(runtime, request_id),
+        .deadline => try worker.testing.request_dispatch.deadlineTimeout(runtime, request_id),
+        .local_failure => worker.testing.request_dispatch.handleLocalFailure(runtime, request_id, error.TestInjectedFailure),
+    }
+}
 
 const ParkedRestCase = struct {
     request_id: u64,
@@ -1253,9 +1241,9 @@ const ParkedRestCase = struct {
 };
 
 /// Parks the rest of a committed response, ends the request as `case.end`
-/// says, and checks the completion, that the client got the head and a
-/// prefix of the body, and that the flush the parked send left to arm sends
-/// nothing more.
+/// says, which needs no frame of its own, and checks the completion, that
+/// the client got the head and a prefix of the body, and that the flush the
+/// parked send left to arm sends nothing more.
 fn expectParkedRestDropped(case: ParkedRestCase) !void {
     var fixture: SocketFullWorker = undefined;
     try fixture.init(.{});
@@ -1265,10 +1253,7 @@ fn expectParkedRestDropped(case: ParkedRestCase) !void {
     try fixture.dispatch(case.request_id, parts_source, case.specifier);
     const request_ctx = try runUntilParked(runtime, case.request_id);
     try std.testing.expect(request_ctx.response_committed);
-    switch (case.end) {
-        .client_reset => try worker.testing.request_dispatch.cancelClientReset(runtime, case.request_id),
-        .deadline => try worker.testing.request_dispatch.deadlineTimeout(runtime, case.request_id),
-    }
+    try endRequest(runtime, case.request_id, case.end);
     try std.testing.expect(!runtime.requests.active.contains(case.request_id));
     try std.testing.expect(runtime.core.running);
     const done = try readWorkerCompletion(runtime, fixture.control_pair[1], case.request_id);
@@ -1285,6 +1270,46 @@ fn expectParkedRestDropped(case: ParkedRestCase) !void {
     try fixture.flushWhenWritable();
     try std.testing.expect(!runtime.requests.control_send_blocked);
     try std.testing.expect(!(try socketReadable(fixture.control_pair[1], 0)));
+}
+
+/// Parks the rest of a committed response and ends the request as
+/// `case.end` says, which resets the client's stream: the socket is still
+/// full, so the reset waits in the outbox in place of the rest of the body,
+/// and the request finishes, publishing its completion, once the flush sends
+/// it. Checks that the client got the head, a prefix of the body and the
+/// reset, and the completion.
+fn expectParkedRestReset(case: ParkedRestCase) !void {
+    var fixture: SocketFullWorker = undefined;
+    try fixture.init(.{});
+    defer fixture.deinit();
+    const runtime = &fixture.runtime;
+
+    try fixture.dispatch(case.request_id, parts_source, case.specifier);
+    const committed_ctx = try runUntilParked(runtime, case.request_id);
+    try std.testing.expect(committed_ctx.response_committed);
+
+    try endRequest(runtime, case.request_id, case.end);
+    try std.testing.expect(runtime.core.running);
+    const request_ctx = runtime.requests.active.get(case.request_id) orelse return error.TestUnexpectedResult;
+    const internal_error_code: u32 = @intFromEnum(h2.ErrorCode.internal_error);
+    switch (request_ctx.response_outbox.pending) {
+        .stream_reset => |reset_code| try std.testing.expectEqual(internal_error_code, reset_code),
+        else => return error.TestUnexpectedResult,
+    }
+    try fixture.expectNoCompletion();
+
+    var response: ReadResponse = .{};
+    defer response.deinit();
+    try fixture.serveUntilFinished(&response, case.request_id);
+    try response.readUntilEnd(&fixture);
+    try std.testing.expectEqual(@as(?u16, 202), response.status);
+    try std.testing.expectEqual(@as(?u32, internal_error_code), response.reset_code);
+    try std.testing.expect(response.body.items.len < parts_body_len);
+    try expectPartsBytes(response.body.items);
+
+    const done = try readWorkerCompletion(runtime, fixture.control_pair[1], case.request_id);
+    try std.testing.expectEqual(@intFromEnum(case.done_status), done.status);
+    try std.testing.expectEqual(case.http_status, done.http_status);
 }
 
 /// The server's side of the loop test, on a thread of its own: it reads the

@@ -1,6 +1,8 @@
 // The engine side of the fork: what the zygote does to its VM before forking, what a worker child does after, the
-// collections both run, and the process-wide engine overrides set around those steps. Runs on the VM thread, except
-// collo_vm_request_termination, which the worker's sentinel thread calls.
+// collections both run, and the process-wide engine settings set around those steps: the helper threads' idle
+// behavior, the GC heap ceiling and the memory status the engine measures against. Runs on the VM thread, except
+// collo_vm_request_termination, which the worker's sentinel thread calls, and the process-wide functions abi.h marks
+// as callable from any thread.
 //
 // A worker forks from a single-threaded zygote and then installs a seccomp filter that denies clone, so the threads
 // it has when the filter goes on are all it will ever have. Everything here serves that: compilation is drained
@@ -20,8 +22,10 @@
 #include <bmalloc/pas_thread_suspender.h>
 #endif
 
+#include <wtf/AvailableMemory.h>
 #include <wtf/Scope.h>
 
+#include <cmath>
 #include <limits>
 #include <unistd.h>
 
@@ -103,14 +107,20 @@ void resumeFastMallocScavengerIfSuspended(ColloVm* vm)
 // thread's local cache by suspending that thread through WTF's signal-based
 // suspender. So the worker gives the scavenger one thread for life, born
 // here while clone is still permitted, and makes every remote cache stop
-// cooperative: an idle thread's cache is reclaimed the next time that thread
-// allocates, never by force. The thread lives because its deep sleep, where
-// it waits for the next eligibility notification, outlasts the worker.
+// cooperative. The thread lives because its deep sleep, where it waits for
+// the next eligibility notification, outlasts the worker; the state never
+// returns to no_thread, so the notification a cache release sends wakes this
+// thread and never creates one after the filter.
 // pas_scavenger_disable_shut_down would keep it alive too, but that is
 // libpas's continuous-scavenging mode: the loop never sleeps, and an idle
 // worker spends a whole core on it.
-// FIXME: A thread that parks without allocating never stops its cache, so the
-// scavenger keeps polling every period and never reaches that deep sleep.
+//
+// The scavenger reaches that deep sleep only once no thread holds an active
+// allocator, so every worker thread that can hold a libpas cache stops its
+// own allocators after `thread_cache_idle_release_ns`
+// (common/limits/worker.zig) of idleness: the engine's helper threads through
+// collo_set_helper_threads_cache_release_ns, the VM thread and the crypto
+// pool through collo_allocator_release_thread_cache.
 void resumeFastMallocScavengerForSandbox(ColloVm* vm)
 {
     if (!vm || !vm->fastmalloc_scavenger_suspended_for_fork)
@@ -185,7 +195,11 @@ extern "C" ColloStatus collo_vm_post_fork_child(ColloVm* vm)
         Collo::resumeFastMallocScavengerForSandbox(vm);
     else
         Collo::resumeFastMallocScavengerIfSuspended(vm);
-    WTF::clearColloAutomaticThreadTimeoutOverride();
+    // The child starts from the engine's defaults and sets its own helper-thread overrides and memory status override
+    // after this call. A parent's memory status override names the parent's memory.current descriptor and limit, so a
+    // child that kept it would measure itself against another cgroup.
+    WTF::clearColloAutomaticThreadOverrides();
+    WTF::clearColloMemoryStatusOverride();
     JSC::JSLockHolder locker(*vm->vm);
     vm->current_exec_ctx = nullptr;
     vm->entered_count = 0;
@@ -304,7 +318,17 @@ extern "C" ColloStatus collo_set_helper_threads_timeout_override_ns(uint64_t tim
     return COLLO_STATUS_OK;
 }
 
-extern "C" void collo_clear_helper_threads_timeout_override(void) { WTF::clearColloAutomaticThreadTimeoutOverride(); }
+extern "C" ColloStatus collo_set_helper_threads_cache_release_ns(uint64_t idle_ns)
+{
+    if (!idle_ns)
+        return COLLO_STATUS_INVALID_ARGUMENT;
+    WTF::setColloAutomaticThreadCacheRelease(WTF::Seconds::fromNanoseconds(static_cast<double>(idle_ns)));
+    return COLLO_STATUS_OK;
+}
+
+extern "C" void collo_clear_helper_threads_overrides(void) { WTF::clearColloAutomaticThreadOverrides(); }
+
+extern "C" void collo_allocator_release_thread_cache(void) { WTF::releaseFastMallocFreeMemoryForThisThread(); }
 
 extern "C" ColloStatus collo_set_gc_max_heap_size_override_bytes(uint64_t bytes)
 {
@@ -316,3 +340,35 @@ extern "C" ColloStatus collo_set_gc_max_heap_size_override_bytes(uint64_t bytes)
 }
 
 extern "C" void collo_clear_gc_max_heap_size_override(void) { JSC::clearColloGCMaxHeapSizeOverride(); }
+
+extern "C" ColloStatus collo_set_memory_status_override(uint64_t limit_bytes, int32_t memory_current_fd)
+{
+    // The engine asserts both in release builds, so they are refused here first.
+    if (!limit_bytes || limit_bytes > static_cast<uint64_t>(std::numeric_limits<size_t>::max())
+        || memory_current_fd < 0)
+        return COLLO_STATUS_INVALID_ARGUMENT;
+
+    WTF::setColloMemoryStatusOverride(static_cast<size_t>(limit_bytes), memory_current_fd);
+    return COLLO_STATUS_OK;
+}
+
+extern "C" void collo_clear_memory_status_override(void) { WTF::clearColloMemoryStatusOverride(); }
+
+extern "C" ColloStatus collo_memory_status(ColloMemoryStatus* out)
+{
+    if (!out)
+        return COLLO_STATUS_INVALID_ARGUMENT;
+    *out = {};
+
+    WTF::MemoryStatus status = WTF::memoryStatus();
+    // Rounded to the nearest part, because a share such as 0.9 is not exact in binary and truncating would read one
+    // part low. Anything that is not a share in [0, 1], a NaN included, is clamped into it.
+    double share = status.percentAvailableMemoryInUse;
+    if (!(share > 0))
+        share = 0;
+    if (share > 1)
+        share = 1;
+    out->footprint_bytes = static_cast<uint64_t>(status.memoryFootprint);
+    out->in_use_per_million = static_cast<uint32_t>(std::lround(share * 1'000'000.0));
+    return COLLO_STATUS_OK;
+}

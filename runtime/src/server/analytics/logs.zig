@@ -11,6 +11,8 @@
 //!   (`server/supervisor/worker_table.zig`), and the teardown clears the flag
 //!   under that mutex before it unmaps the page, so no drain reads a ring
 //!   another is reading or one that is gone.
+//! - A line's request id and route come from the server's request table of
+//!   the worker whose ring held the line, never from the line alone.
 //! - Every frame is worker-written and hostile. The ring validates lengths
 //!   and flags (`common/worker_state/page/console_ring.zig`); here an unknown level reads
 //!   as info, a stamp in the future reads as the drain's own time, and the
@@ -29,15 +31,22 @@
 //!      "dropped_lines":N}
 //!
 //! The second shape counts the lines the worker's ring dropped since that
-//! worker's previous drop marker. `request_id` is the worker's own report of
-//! the request that wrote the line, 0 outside any request (module
-//! evaluation). It is the one field the server cannot stamp from its tables,
-//! so a consumer joins a line to its access record on `worker_id`,
-//! `worker_generation` and `request_id` together, which no worker can point
-//! at another worker's request. On stderr each line reads `[<worker> <route>]
-//! <message>`, or `[<worker>] <message>` without a route; a line break inside
-//! a message continues on a line indented by two spaces, and control bytes and
-//! invalid UTF-8 print as `\xNN`.
+//! worker's previous drop marker. `request_id` and `route` name the request
+//! that wrote the line as the server's tables confirm it. A worker writes a
+//! request id with each line, 0 outside any request, and that id is its own
+//! claim; the drain keeps it only when the worker's request table holds that
+//! request or ended it recently (`WorkerRequests`), and prints the route that
+//! request matched. Any other id prints as 0 with no route and counts as
+//! refused (`Drained.ids_refused`), so a worker can file a line only under a
+//! request it was dispatched, never under another worker's or another
+//! tenant's. On stderr each line reads `[<worker> <route>] <message>`, or
+//! `[<worker>] <message>` without a route; a line break inside a message
+//! continues on a line indented by two spaces, and control bytes and invalid
+//! UTF-8 print as `\xNN`. A line the worker's runtime wrote for the operator
+//! (`LogLineFlags.runtime`) reads `[<worker> runtime] <message>` on stderr
+//! and never enters `logs.jsonl`, the tenant's log. The flag is the worker's
+//! claim, so a worker that sets it on its own lines only hides them from its
+//! own log.
 
 const std = @import("std");
 const limits = @import("collo_limits").runtime_logs;
@@ -97,7 +106,8 @@ comptime {
     std.debug.assert(console_record_bytes_max + 1 <= sink_mod.console_write_bytes_max);
 }
 
-/// One decoded console line. `message` borrows the drained frame's payload.
+/// One decoded console line. `message` borrows the drained frame's payload,
+/// and `request_id` is the id the worker wrote until the drain checks it.
 pub const Line = struct {
     request_id: u64,
     level: LogLevel,
@@ -105,7 +115,15 @@ pub const Line = struct {
     message: []const u8,
     truncated: bool,
     exception: bool,
+    /// The worker runtime's own line (`LogLineFlags.runtime`), for the
+    /// operator: it goes to stderr only, never into the tenant's log.
+    runtime: bool,
 };
+
+/// The label a runtime line carries in its stderr prefix where a tenant's
+/// line carries its route, `[<worker> runtime]`. No route pattern can read
+/// so, since every pattern starts with a slash.
+pub const runtime_label = "runtime";
 
 pub fn decodeLine(drained: DrainedLogLine, clock: Clock) Line {
     return .{
@@ -115,6 +133,7 @@ pub fn decodeLine(drained: DrainedLogLine, clock: Clock) Line {
         .message = drained.payload,
         .truncated = drained.header.flags & LogLineFlags.truncated != 0,
         .exception = drained.header.flags & LogLineFlags.js_exception != 0,
+        .runtime = drained.header.flags & LogLineFlags.runtime != 0,
     };
 }
 
@@ -249,6 +268,16 @@ fn emitLine(sink: *Sink, identity: Identity, line: Line, buffer: *[encode_buffer
     sink.appendLossy(.console, console.buffered());
 }
 
+/// Hands a runtime line to stderr alone, under `[<worker> runtime]`. Its
+/// request id names nothing the server checks or prints.
+fn emitRuntimeLine(sink: *Sink, identity: Identity, message: []const u8, buffer: *[encode_buffer_bytes]u8) void {
+    var runtime_identity = identity;
+    runtime_identity.route = runtime_label;
+    var console: std.Io.Writer = .fixed(buffer);
+    writeLineConsole(&console, runtime_identity, message) catch unreachable;
+    sink.appendLossy(.console, console.buffered());
+}
+
 fn emitDropped(sink: *Sink, identity: Identity, ts_ms: u64, dropped_lines: u64, buffer: *[encode_buffer_bytes]u8) void {
     if (sink.enabled(.logs)) {
         var json: std.Io.Writer = .fixed(buffer);
@@ -262,37 +291,101 @@ fn emitDropped(sink: *Sink, identity: Identity, ts_ms: u64, dropped_lines: u64, 
     sink.appendLossy(.console, console.buffered());
 }
 
+/// What one drain of a log ring did.
+pub const Drained = struct {
+    lines: usize = 0,
+    /// Lines whose request id the worker's request table did not confirm,
+    /// printed with request id 0. Lines the worker wrote under id 0 are not
+    /// counted.
+    ids_refused: u64 = 0,
+};
+
+/// A worker's request table as its console drain asks it whose request a
+/// line names. `Table` provides `routeOfRecent(request_id) ?RouteIndex`, the
+/// route of a request the table holds or ended among its most recent ones
+/// (`RequestTable` in `server/supervisor/request_table.zig`); `routes` are
+/// the routes of the worker's definition, in the order the table's route
+/// indexes count them, each with its `pattern`. The last answer is kept,
+/// since a worker usually writes a run of lines for one request.
+pub fn WorkerRequests(comptime Table: type, comptime Route: type) type {
+    return struct {
+        table: *Table,
+        routes: []const Route,
+        last_request_id: u64 = 0,
+        last_route: []const u8 = "",
+
+        const Self = @This();
+
+        /// The route pattern of the request `request_id` names, or null when
+        /// the worker was never dispatched that request or the table no
+        /// longer remembers it. `request_id` is never 0.
+        pub fn routeOf(self: *Self, request_id: u64) ?[]const u8 {
+            std.debug.assert(request_id != 0);
+            if (request_id == self.last_request_id)
+                return self.last_route;
+            const index = self.table.routeOfRecent(request_id) orelse return null;
+            // The table records only routes the lane matched within the
+            // worker's definition, so an index past them names no route.
+            if (index >= self.routes.len)
+                return null;
+            self.last_request_id = request_id;
+            self.last_route = self.routes[index].pattern;
+            return self.last_route;
+        }
+    };
+}
+
 /// Drains up to `line_budget` lines of a worker's log ring into `sink`: each
 /// line becomes a `logs.jsonl` record and a stderr line, and the lines the
 /// ring counted as dropped since `drop_reported.*` become one drop marker,
-/// after which `drop_reported.*` holds the ring's counter. `view` reads the ring like
-/// `WorkerWriterView` (`drainLogLinesChecked`, `loadLogDropCounters`), and
-/// the caller must be its only consumer. Returns the lines drained. Fails
-/// when the ring is fatal or corrupt; the lines before the fault are already
-/// in the sink, and a faulted ring gets no drop marker, because its counter
-/// is no longer trustworthy.
+/// after which `drop_reported.*` holds the ring's counter. `view` reads the
+/// ring like `WorkerWriterView` (`drainLogLinesChecked`,
+/// `loadLogDropCounters`), and the caller must be its only consumer.
+/// `requests` provides `routeOf(request_id) ?[]const u8`, as
+/// `WorkerRequests` does: a line keeps its request id and takes that route
+/// when it answers, and otherwise prints request id 0 under `identity`, whose
+/// route is the one a line under no request carries. Fails when the ring is
+/// fatal or corrupt; the lines before the fault are already in the sink, and
+/// a faulted ring gets no drop marker, because its counter is no longer
+/// trustworthy.
 pub fn drainRing(
     view: anytype,
+    requests: anytype,
     identity: Identity,
     drop_reported: *u64,
     sink: *Sink,
     clock: Clock,
     line_budget: usize,
-) !usize {
+) !Drained {
     var scratch: [worker_shared_page.LOG_LINE_BYTES_MAX]u8 = undefined;
     var batch: [drain_batch_lines]DrainedLogLine = undefined;
     var buffer: [encode_buffer_bytes]u8 = undefined;
 
-    var drained: usize = 0;
-    while (drained < line_budget) {
-        const batch_len = @min(batch.len, line_budget - drained);
+    var drained: Drained = .{};
+    while (drained.lines < line_budget) {
+        const batch_len = @min(batch.len, line_budget - drained.lines);
         const count = try view.drainLogLinesChecked(&scratch, batch[0..batch_len]);
         if (count == 0)
             break;
         std.debug.assert(count <= batch_len);
-        drained += count;
-        for (batch[0..count]) |frame|
-            emitLine(sink, identity, decodeLine(frame, clock), &buffer);
+        drained.lines += count;
+        for (batch[0..count]) |frame| {
+            var line = decodeLine(frame, clock);
+            var line_identity = identity;
+            if (line.runtime) {
+                emitRuntimeLine(sink, identity, line.message, &buffer);
+                continue;
+            }
+            if (line.request_id != 0) {
+                if (requests.routeOf(line.request_id)) |route| {
+                    line_identity.route = route;
+                } else {
+                    line.request_id = 0;
+                    drained.ids_refused += 1;
+                }
+            }
+            emitLine(sink, line_identity, line, &buffer);
+        }
     }
 
     const ring_dropped = view.loadLogDropCounters().lines;
@@ -304,15 +397,18 @@ pub fn drainRing(
 }
 
 /// Teardown's final drain of a worker's log ring, before its shared page is
-/// unmapped. The caller guarantees the periodic drain can no longer reach the
-/// worker (see the header), which makes this the ring's only consumer. A
-/// fault ends the drain, and lines still in the ring are lost with the page.
-pub fn drainDyingRing(view: anytype, identity: Identity, drop_reported: *u64, sink: *Sink) void {
-    _ = drainRing(view, identity, drop_reported, sink, Clock.capture(), dying_ring_line_budget) catch |err| {
+/// unmapped, with `requests` as `drainRing` takes it. The caller guarantees
+/// the periodic drain can no longer reach the worker (see the header), which
+/// makes this the ring's only consumer. A fault ends the drain, and lines
+/// still in the ring are lost with the page. Returns the lines whose request
+/// id was refused, for the caller's count.
+pub fn drainDyingRing(view: anytype, requests: anytype, identity: Identity, drop_reported: *u64, sink: *Sink) u64 {
+    const drained = drainRing(view, requests, identity, drop_reported, sink, Clock.capture(), dying_ring_line_budget) catch |err| {
         std.log.warn("log ring of a dying worker failed; its remaining lines are lost worker_id={d}: {s}", .{
             identity.worker_id,
             @errorName(err),
         });
-        return;
+        return 0;
     };
+    return drained.ids_refused;
 }

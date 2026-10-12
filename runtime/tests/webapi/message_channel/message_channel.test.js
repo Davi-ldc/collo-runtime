@@ -398,3 +398,34 @@ test("structuredClone transfers MessagePort", async () => {
   cloned.port.close();
   port2.close();
 });
+
+test("MessageEvent refuses more ports than its bound", () => {
+  const ports = Array.from({ length: 1025 }, () => new MessageChannel().port1);
+  assert.throws(() => new MessageEvent("message", { ports }), DOMException);
+  const event = new MessageEvent("message", { ports: ports.slice(0, 1024) });
+  assert.equal(event.ports.length, 1024);
+  assert(Object.isFrozen(event.ports));
+});
+
+test("postMessage transfers a port whose queue already holds messages", async () => {
+  const { port1, port2 } = new MessageChannel();
+  for (let i = 0; i < 8; i++) port1.postMessage(i);
+  const carrier = new MessageChannel();
+  const arrived = new Promise(resolve => {
+    carrier.port2.onmessage = event => resolve(event.ports[0]);
+  });
+  carrier.port1.postMessage(null, [port2]);
+  const moved = await arrived;
+  const received = [];
+  await new Promise(resolve => {
+    moved.onmessage = event => {
+      received.push(event.data);
+      if (received.length === 8) resolve();
+    };
+  });
+  assert.deepEqual(received, [0, 1, 2, 3, 4, 5, 6, 7]);
+  port1.close();
+  moved.close();
+  carrier.port1.close();
+  carrier.port2.close();
+});

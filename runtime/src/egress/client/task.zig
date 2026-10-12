@@ -14,6 +14,7 @@ const bindings = @import("collo_bindings");
 const http = @import("collo_http");
 const fetch_body = @import("collo_egress_core").fetch_body;
 const decompress = @import("collo_egress_core").decompress;
+const transport = @import("collo_egress_transport");
 
 const Header = http.Header;
 
@@ -33,11 +34,22 @@ pub const Result = union(enum) {
     failure: struct {
         message: []const u8,
         owned: bool = true,
+        cause: FailureCause = .failed,
     },
 
     pub fn deinit(self: *Result) void {
         self.* = undefined;
     }
+};
+
+/// Why a fetch failed, as far as its worker must tell the tenant. The
+/// gateway maps it onto the error packet's cause at the IPC boundary
+/// (`egress/gateway/body_pump.zig`).
+pub const FailureCause = enum {
+    failed,
+    /// The fetch's network policy refused a hop; the message names the
+    /// hop's origin and what to change (`collo_network.writeDenial`).
+    network_denied,
 };
 
 /// A request body allocated elsewhere, handed to a task with the allocator
@@ -216,14 +228,16 @@ pub const Task = struct {
         self.* = undefined;
     }
 
-    /// Replaces the request with a redirect hop's, copying everything into
-    /// the task's allocator; `body` may be a slice of the current body. On
-    /// error the task keeps its current request.
+    /// Replaces the request with a redirect hop's, copying the URL, method
+    /// and headers into the task's allocator. A kept body stays as it is,
+    /// with the allocator it came with, so no hop copies it and no budget
+    /// but its own counts it; a dropped body goes back to that allocator.
+    /// On error the task keeps its current request.
     pub fn replaceRequest(
         self: *Task,
         url: []const u8,
         method: []const u8,
-        body: []const u8,
+        body: transport.RedirectBody,
         headers: []const Header,
     ) !void {
         const allocator = self.allocator;
@@ -231,20 +245,23 @@ pub const Task = struct {
         errdefer allocator.free(next_url);
         const next_method = try allocator.dupe(u8, method);
         errdefer allocator.free(next_method);
-        const next_body = try allocator.dupe(u8, body);
-        errdefer allocator.free(next_body);
         const next_headers = try cloneHttpHeaders(allocator, headers);
         errdefer freeHeaders(allocator, next_headers);
 
         allocator.free(self.url);
         allocator.free(self.method);
-        self.body_allocator.free(self.body);
         freeHeaders(allocator, self.headers);
         self.url = next_url;
         self.method = next_method;
-        self.body = next_body;
-        self.body_allocator = allocator;
         self.headers = next_headers;
+        switch (body) {
+            .keep => {},
+            .drop => {
+                self.body_allocator.free(self.body);
+                self.body = &.{};
+                self.body_allocator = allocator;
+            },
+        }
     }
 
     pub fn markCanceled(self: *Task) void {

@@ -163,6 +163,30 @@ PendingBody PendingBody::fromStream(JSC::JSObject* stream)
     return body;
 }
 
+size_t BodyState::ownedMemoryCost() const
+{
+    switch (m_source) {
+    case Source::Text: {
+        // The whole buffer, even while a JavaScript string shares it: the share StringImpl::costDuringGC computes
+        // depends on the reference count at the moment of the call, and the owner stores its cost only when the body
+        // changes, so a share taken while the string was shared would undercount the buffer once the string dies.
+        auto* impl = m_text.impl();
+        if (!impl || impl->isStatic())
+            return 0;
+        return impl->sizeInBytes();
+    }
+    case Source::Bytes:
+        return m_bytes ? m_bytes->size() : 0;
+    case Source::Empty:
+    case Source::SharedBytes:
+    case Source::RequestLazy:
+    case Source::FetchStream:
+    case Source::ReadableStream:
+        return 0;
+    }
+    return 0;
+}
+
 // Fetch defines bodyUsed by the body's stream being disturbed, so a disturbed stream, whether the body's own or the
 // one `body` created for a native body, makes the body used.
 bool BodyState::bodyUsed(JSC::JSObject* stream) const
@@ -633,7 +657,15 @@ bool BodyState::clone(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope
 JSColloBodyOwner::JSColloBodyOwner(JSC::VM& vm, JSC::Structure* structure, BodyState&& body)
     : Base(vm, structure)
     , m_body(WTF::move(body))
+    , m_viewed_storage(m_body.sharedStorage())
 {
+}
+
+static size_t saturatingAdd(size_t left, size_t right)
+{
+    if (right > std::numeric_limits<size_t>::max() - left)
+        return std::numeric_limits<size_t>::max();
+    return left + right;
 }
 
 void JSColloBodyOwner::finishCreation(JSC::VM& vm, JSC::JSObject* body_stream)
@@ -641,6 +673,59 @@ void JSColloBodyOwner::finishCreation(JSC::VM& vm, JSC::JSObject* body_stream)
     Base::finishCreation(vm);
     ASSERT(m_body.source() != BodyState::Source::ReadableStream || body_stream);
     m_body_stream.setMayBeNull(vm, this, body_stream);
+
+    size_t cost = m_body.ownedMemoryCost();
+    m_owned_body_cost.store(cost, std::memory_order_relaxed);
+    if (m_viewed_storage && m_viewed_storage->tryClaimExtraMemoryReport(vm.heap.objectSpace().markingVersion()))
+        cost = saturatingAdd(cost, m_viewed_storage->memoryCost());
+    vm.heap.reportExtraMemoryAllocated(this, cost);
+}
+
+void JSColloBodyOwner::storeOwnedBodyCost()
+{
+    const size_t cost = m_body.ownedMemoryCost();
+    const size_t previous = m_owned_body_cost.exchange(cost, std::memory_order_relaxed);
+    if (cost > previous)
+        vm().heap.reportExtraMemoryAllocated(this, cost - previous);
+}
+
+bool JSColloBodyOwner::consumeToBytes(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope,
+    WTF::ASCIILiteral already_used_message, WTF::Vector<uint8_t>& out)
+{
+    bool consumed = m_body.consumeToBytes(global_object, scope, already_used_message, out);
+    storeOwnedBodyCost();
+    return consumed;
+}
+
+bool JSColloBodyOwner::consumeToSharedBytes(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope,
+    WTF::ASCIILiteral already_used_message, WTF::RefPtr<ColloSharedBytes>& out)
+{
+    bool consumed = m_body.consumeToSharedBytes(global_object, scope, already_used_message, out);
+    storeOwnedBodyCost();
+    return consumed;
+}
+
+bool JSColloBodyOwner::beginStreamRead(
+    JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, WTF::ASCIILiteral already_used_message)
+{
+    bool began = m_body.beginStreamRead(global_object, scope, already_used_message);
+    storeOwnedBodyCost();
+    return began;
+}
+
+bool JSColloBodyOwner::cancelStream(
+    JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, WTF::ASCIILiteral already_used_message)
+{
+    bool canceled = m_body.cancelStream(global_object, scope, already_used_message);
+    storeOwnedBodyCost();
+    return canceled;
+}
+
+ColloFetchBodyIdentity JSColloBodyOwner::transferFetchStreamForHostResponse()
+{
+    ColloFetchBodyIdentity identity = m_body.transferFetchStreamForHostResponse();
+    storeOwnedBodyCost();
+    return identity;
 }
 
 void JSColloBodyOwner::setBodyStream(JSC::VM& vm, JSC::JSObject* stream)
@@ -655,7 +740,9 @@ bool JSColloBodyOwner::cloneBody(JSC::JSGlobalObject* global_object, JSC::ThrowS
     WTF::ASCIILiteral already_used_message, PendingBody& out)
 {
     JSC::JSObject* kept_stream = nullptr;
-    if (!m_body.clone(global_object, scope, bodyStream(), already_used_message, kept_stream, out))
+    bool cloned = m_body.clone(global_object, scope, bodyStream(), already_used_message, kept_stream, out);
+    storeOwnedBodyCost();
+    if (!cloned)
         return false;
     if (kept_stream)
         m_body_stream.set(global_object->vm(), this, kept_stream);
@@ -665,46 +752,68 @@ bool JSColloBodyOwner::cloneBody(JSC::JSGlobalObject* global_object, JSC::ThrowS
 JSC::EncodedJSValue JSColloBodyOwner::consumeText(
     JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, WTF::ASCIILiteral already_used_message)
 {
-    return m_body.consumeText(global_object, scope, bodyStream(), already_used_message);
+    auto result = m_body.consumeText(global_object, scope, bodyStream(), already_used_message);
+    storeOwnedBodyCost();
+    return result;
 }
 
 JSC::EncodedJSValue JSColloBodyOwner::consumeJson(
     JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, WTF::ASCIILiteral already_used_message)
 {
-    return m_body.consumeJson(global_object, scope, bodyStream(), already_used_message);
+    auto result = m_body.consumeJson(global_object, scope, bodyStream(), already_used_message);
+    storeOwnedBodyCost();
+    return result;
 }
 
+// A Bytes body that holds the only reference to its buffer hands the buffer to the ArrayBuffer, Uint8Array or Blob
+// it resolves with, so its owned cost drops to zero here.
 JSC::EncodedJSValue JSColloBodyOwner::consumeArrayBuffer(
     JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, WTF::ASCIILiteral already_used_message)
 {
-    return m_body.consumeArrayBuffer(global_object, scope, bodyStream(), already_used_message);
+    auto result = m_body.consumeArrayBuffer(global_object, scope, bodyStream(), already_used_message);
+    storeOwnedBodyCost();
+    return result;
 }
 
 JSC::EncodedJSValue JSColloBodyOwner::consumeBytes(
     JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, WTF::ASCIILiteral already_used_message)
 {
-    return m_body.consumeBytes(global_object, scope, bodyStream(), already_used_message);
+    auto result = m_body.consumeBytes(global_object, scope, bodyStream(), already_used_message);
+    storeOwnedBodyCost();
+    return result;
 }
 
 JSC::EncodedJSValue JSColloBodyOwner::consumeBlob(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope,
     WTF::ASCIILiteral already_used_message, WTF::String type)
 {
-    return m_body.consumeBlob(global_object, scope, bodyStream(), already_used_message, WTF::move(type));
+    auto result = m_body.consumeBlob(global_object, scope, bodyStream(), already_used_message, WTF::move(type));
+    storeOwnedBodyCost();
+    return result;
 }
 
 JSC::EncodedJSValue JSColloBodyOwner::consumeFormData(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope,
     WTF::ASCIILiteral already_used_message, WTF::String content_type)
 {
-    return m_body.consumeFormData(global_object, scope, bodyStream(), already_used_message, WTF::move(content_type));
+    auto result
+        = m_body.consumeFormData(global_object, scope, bodyStream(), already_used_message, WTF::move(content_type));
+    storeOwnedBodyCost();
+    return result;
 }
 
-// The marker reads m_body_stream, one word the mutator writes through the
-// barrier, so it needs no cell lock.
+// The marker reads m_body_stream, one word the mutator writes through the barrier, and the two cost fields body.h
+// describes, so it needs no cell lock. A full collection resets the heap's extra memory count, so every live owner
+// reports its cost again here.
 template <typename Visitor> void JSColloBodyOwner::visitChildrenImpl(JSC::JSCell* cell, Visitor& visitor)
 {
     auto* this_object = static_cast<JSColloBodyOwner*>(cell);
     Base::visitChildren(this_object, visitor);
     visitor.append(this_object->m_body_stream);
+    size_t cost = this_object->m_owned_body_cost.load(std::memory_order_relaxed);
+    if (auto* storage = this_object->m_viewed_storage.get()) {
+        if (storage->tryClaimExtraMemoryReport(visitor.heap()->objectSpace().markingVersion()))
+            cost = saturatingAdd(cost, storage->memoryCost());
+    }
+    visitor.reportExtraMemoryVisited(cost);
 }
 
 DEFINE_VISIT_CHILDREN(JSColloBodyOwner);

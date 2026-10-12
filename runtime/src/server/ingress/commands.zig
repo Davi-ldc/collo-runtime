@@ -32,8 +32,9 @@
 //! - Every other command takes only ordinary places.
 //!
 //! A lane serving the configuration reserves, per worker table entry of every
-//! pool, one place for a death, one for a reader grant, one per slot for a
-//! completion, and the entry's forwarding window (`lane.obligationReserve`):
+//! pool, one place for a death, one for a reader grant, one per slot of its
+//! definition's `concurrency` for a completion, and the entry's forwarding
+//! window (`lane.obligationReserve`):
 //! a worker dies once, the pool grants its reader role to one lane at a time,
 //! a reader forwards at most one completion per request it was sent
 //! (`RequestTable.claimCompletion`), and an entry's forwarded descriptors and

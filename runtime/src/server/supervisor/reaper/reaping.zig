@@ -37,7 +37,7 @@ const soft_stage_2_idle_ns: u64 = limits.memory.soft_stage_2_idle_ns;
 const memory_pressure_reap_cap_max: usize = limits.memory.reap_cap_max;
 const sweep_cap_max: usize = limits.memory.sweep_cap_max;
 const sweep_budget_ns: u64 = limits.memory.sweep_budget_ns;
-const pool_workers_max = limits.capacity.pool_workers_max;
+const pool_workers_max = @import("collo_limits").pool.pool_workers_max;
 
 /// The soft plan's clock, kept across passes in the supervisor
 /// (`Supervisor.memory_pressure_state`) and touched by the reaper thread
@@ -198,7 +198,7 @@ pub fn reapWithPlan(reaper: *Reaper, now_ns: u64, plan: MemoryPressurePlan) usiz
         const victim = victims.takeBest() orelse break;
         if (!reaper.retireIdleWorker(victim.definition, victim.worker)) continue;
         retired += 1;
-        const updated = memory.readMemoryPressure(reaper.gpa) catch break;
+        const updated = memory.readMemoryPressure(reaper.gpa, &reaper.supervisor.memory_domains) catch break;
         if (updated.used_percent <= memory.memory_pressure_low_water_percent or updated.mode == .none)
             break;
     }

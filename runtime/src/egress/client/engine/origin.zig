@@ -1,8 +1,10 @@
 //! Origin parsing for engine routing, and the HTTP/1 origin hint: an https
 //! origin whose ALPN chose http/1.1, remembered so later fetches skip the
 //! HTTP/2 connect. A hint is scoped by both pool isolation ids as well as
-//! host, port and the TLS and private-network settings, so a downgrade
-//! learned in one security cell never changes routing in another.
+//! host, port and the TLS setting, so a downgrade learned in one security
+//! cell or under one network policy never changes routing in another. The
+//! policy id stands for the policy's admission of the origin, which never
+//! changes for one policy.
 
 const std = @import("std");
 const transport = @import("collo_egress_transport");
@@ -11,7 +13,6 @@ pub const Http1OriginHint = struct {
     authority_host_lower: []u8,
     port: u16,
     insecure_tls: bool,
-    allow_private_networks: bool,
     pool_security_cell_id: transport.PoolIsolationId,
     pool_policy_id: transport.PoolIsolationId,
 

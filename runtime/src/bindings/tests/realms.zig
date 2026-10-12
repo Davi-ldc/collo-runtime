@@ -1,8 +1,9 @@
 //! Realms (`ColloRealm` in `bindings/jsc/runtime/state.h`): a realm the VM
 //! adds has globals, intrinsics, a module registry, console labels, a blob:
 //! URL registry and a performance timeline of its own and every install the
-//! VM made; an object the ABI creates belongs to the realm it was created in;
-//! and a reseed gives every realm a Math.random sequence of its own. The
+//! VM made; an object the ABI creates belongs to the realm it was created in,
+//! and an error it raises for a primitive to the realm that asked; and a
+//! reseed gives every realm a Math.random sequence of its own. The
 //! worker serving its routes from their realms is covered by
 //! `worker/tests/runtime/routes.zig` and by local-e2e.
 
@@ -29,6 +30,7 @@ const probe_source =
     \\    return [typeof Request, typeof process, typeof globalThis.__collo_node_fs, navigator.hardwareConcurrency].join("|");
     \\}
     \\export function random() { return String(Math.random()); }
+    \\export function symbol() { return Symbol("probe"); }
     \\export function consoleProbe() {
     \\    console.count("hits");
     \\    console.time("t");
@@ -176,6 +178,31 @@ test "a realm the VM adds has globals, intrinsics and a module registry of its o
     try expectOwnedBy(&vm, main, second, "ownsObject", &object);
 }
 
+test "realm globals keep their own state across allocation blocks and full collection" {
+    var vm = try probeVm();
+    defer vm.deinit();
+    // More globals than JSCell::numberOfLowerTierPreciseCells, so both
+    // precise cells and the global subspace's block allocator are exercised.
+    var realms: [17]bindings.Realm = undefined;
+    realms[0] = vm.mainRealm();
+    for (realms[1..]) |*realm|
+        realm.* = try vm.createRealm();
+    for (realms, 0..) |realm, index| {
+        try support.evaluateInRealmOk(realm, probe_specifier);
+        var buffer: [32]u8 = undefined;
+        const text = try std.fmt.bufPrint(&buffer, "realm-{d}", .{index});
+        var marker = try vm.stringValueUtf8(text);
+        defer marker.deinit();
+        try expectCall(&vm, realm, "setMarker", &.{&marker}, text);
+    }
+    try vm.collectFullGCAndTrim();
+    for (realms, 0..) |realm, index| {
+        var buffer: [32]u8 = undefined;
+        const text = try std.fmt.bufPrint(&buffer, "realm-{d}", .{index});
+        try expectCall(&vm, realm, "readMarker", &.{}, text);
+    }
+}
+
 test "the ABI creates every object in the realm it is given" {
     var vm = try probeVm();
     defer vm.deinit();
@@ -243,6 +270,58 @@ test "the ABI creates every object in the realm it is given" {
     try expectOwnedBy(&vm, second, main, "ownsRequest", &request);
 }
 
+/// The exception an operation raised, which the caller owns. Any other
+/// outcome is released and fails.
+fn takeException(result: anytype) !bindings.Value {
+    return switch (result) {
+        .exception => |exception| exception,
+        inline else => |value| {
+            var owned = value;
+            owned.deinit();
+            return error.ExpectedJsException;
+        },
+    };
+}
+
+test "an error raised for a primitive belongs to the realm that asked, not the main realm" {
+    var vm = try probeVm();
+    defer vm.deinit();
+    const main = vm.mainRealm();
+    const second = try vm.createRealm();
+    for ([_]bindings.Realm{ main, second }) |realm|
+        try support.evaluateInRealmOk(realm, probe_specifier);
+
+    var number = try vm.numberValue(7);
+    defer number.deinit();
+    var symbol = try call(&vm, second, "symbol", &.{});
+    defer symbol.deinit();
+
+    // A handler of the second realm that returns a Symbol: the string
+    // conversion of its result throws.
+    var exec_ctx = support.makeExecCtx(default_request_id);
+    try vm.turnEnter(&exec_ctx);
+    const extract_limits = bindings.ResponseExtractLimits{
+        .max_body_bytes = 1024,
+        .max_header_count = 16,
+        .max_header_bytes = 1024,
+    };
+    const extract_result = second.extractResponse(&symbol, extract_limits);
+    const invoke_result = second.invoke(std.testing.allocator, &exec_ctx, &number, null, &.{});
+    try vm.turnExit();
+
+    var extract_error = try takeException(try extract_result);
+    defer extract_error.deinit();
+    try expectOwnedBy(&vm, second, main, "ownsTypeError", &extract_error);
+
+    var invoke_error = try takeException(try invoke_result);
+    defer invoke_error.deinit();
+    try expectOwnedBy(&vm, second, main, "ownsTypeError", &invoke_error);
+
+    var await_error = try takeException(try second.promiseAwaitSync(&number));
+    defer await_error.deinit();
+    try expectOwnedBy(&vm, second, main, "ownsTypeError", &await_error);
+}
+
 test "a realm gets every install the VM made before or after it, and one hardwareConcurrency" {
     var vm = try probeVm();
     defer vm.deinit();
@@ -258,14 +337,7 @@ test "a realm gets every install the VM made before or after it, and one hardwar
         try support.evaluateInRealmOk(realm, probe_specifier);
         var description = try call(&vm, realm, "describe", &.{});
         defer description.deinit();
-        var text = switch (try vm.valueToUtf8Copy(&description)) {
-            .success => |owned| owned,
-            .exception => |exception| {
-                var owned = exception;
-                owned.deinit();
-                return error.UnexpectedJsException;
-            },
-        };
+        var text = try support.valueString(realm, &description);
         try std.testing.expect(std.mem.startsWith(u8, text.slice(), "function|object|object|"));
         if (expected) |*first| {
             defer text.deinit();
@@ -295,14 +367,7 @@ fn sampleRealmRandoms(seeds: bindings.RandomSeeds, realm_before_reseed: bool) ![
         try support.evaluateInRealmOk(realm, probe_specifier);
         var value = try call(&vm, realm, "random", &.{});
         defer value.deinit();
-        samples[filled] = switch (try vm.valueToUtf8Copy(&value)) {
-            .success => |text| text,
-            .exception => |exception| {
-                var owned = exception;
-                owned.deinit();
-                return error.UnexpectedJsException;
-            },
-        };
+        samples[filled] = try support.valueString(realm, &value);
         filled += 1;
     }
     return samples;

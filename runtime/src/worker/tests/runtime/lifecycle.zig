@@ -3,8 +3,8 @@
 //! and immediates, the `host` and `expect` headers a handler receives as
 //! sent, client resets and late body chunks, the stop when the record or
 //! completion ring is full, the identity and measurements a usage record
-//! carries, the per-turn and process CPU clocks on every way a request can
-//! finish, a deadline that expires before or during a handler, an async
+//! carries, the CPU of the request's owner windows on every way a request can finish, a
+//! deadline that expires before or during a handler, an async
 //! handler's settlement, and the phase stamps of a traced request. Runs in
 //! `worker-test`, on a real VM with an injected clock.
 
@@ -406,24 +406,16 @@ test "a full record ring stops the worker and keeps the request live for death s
     defer std.posix.close(metrics_fd);
     var metrics_view = try worker_shared_page.mapReadWrite(metrics_fd);
     defer metrics_view.deinit();
-    metrics_view.initializeCrashDefault(99, 0, 0);
+    metrics_view.initializeCrashDefault();
 
     var metrics = worker_metrics_state.WorkState.init(&metrics_view);
     for (0..worker_shared_page.RECORD_RING_COUNT) |index| {
         try metrics.appendCompletedRecord(.{
             .request_id = @intCast(index + 1),
             .request_generation = 1,
-            .worker_id = 1,
-            .worker_generation = 1,
-            .started_mono_ns = @intCast(index),
-            .finished_mono_ns = @intCast(index + 1),
-            .cpu_time_ns = 0,
-            .io_time_ns = 0,
-            .billing_sequence = @intCast(index + 1),
             .request_slot = 0,
             .request_lane_id = 0,
             .status = @intFromEnum(worker_shared_page.CompletedStatus.done),
-            .flags = 0,
         });
     }
 
@@ -489,7 +481,7 @@ test "worker completion ring overflow stops worker before retrying finalization"
     defer std.posix.close(metrics_fd);
     var metrics_view = try worker_shared_page.mapReadWrite(metrics_fd);
     defer metrics_view.deinit();
-    metrics_view.initializeCrashDefault(99, 0, 0);
+    metrics_view.initializeCrashDefault();
 
     for (0..worker_shared_page.COMPLETION_RING_COUNT) |index| {
         try metrics_view.publishWorkerCompletion(.{
@@ -554,7 +546,7 @@ test "a usage record carries the dispatch's identity and the bytes served" {
     defer std.posix.close(metrics_fd);
     var metrics_view = try worker_shared_page.mapReadWrite(metrics_fd);
     defer metrics_view.deinit();
-    metrics_view.initializeCrashDefault(99, 0, 0);
+    metrics_view.initializeCrashDefault();
 
     const control_pair = try socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
     defer std.posix.close(control_pair[0]);
@@ -603,104 +595,21 @@ test "a usage record carries the dispatch's identity and the bytes served" {
     try std.testing.expectEqual(@as(u64, 18), records[0].request_id);
     try std.testing.expectEqual(@as(u64, 4), records[0].request_generation);
     try std.testing.expectEqual(@as(u32, 2), records[0].request_slot);
-    try std.testing.expectEqual(@as(u64, 6), records[0].worker_id);
-    try std.testing.expectEqual(@as(u64, 3), records[0].worker_generation);
-    try std.testing.expectEqual(@as(u64, 0), records[0].io_time_ns);
+    try std.testing.expectEqual(@as(u64, 0), records[0].io_ns);
     try std.testing.expect(records[0].client_served_bytes > 0);
 }
 
-test "a record's cpu is the process cpu since the previous record, beside the per-turn clock" {
-    var vm = try support.createVm();
-    defer vm.deinit();
+// A record's CPU (`CompletedRecord.cpu_ns`) is the CPU of the request's
+// owner windows (`worker/runtime/owner.zig`): the deltas of the VM thread's
+// CPU clock across each window, never the clock's reading. The native-finish
+// tests below inject that clock frozen at a nonzero reading, so a window
+// charges exactly zero, and a record that held the clock's reading, the
+// loop thread's whole CPU time, would show it. A request that ran
+// JavaScript gets the CPU of its own windows, never the thread's total.
 
-    const metrics_fd = try worker_shared_page.createMemfd("runtime-process-cpu-metrics");
-    defer std.posix.close(metrics_fd);
-    var metrics_view = try worker_shared_page.mapReadWrite(metrics_fd);
-    defer metrics_view.deinit();
-    metrics_view.initializeCrashDefault(99, 0, 0);
-
-    const control_pair = try socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
-    defer std.posix.close(control_pair[0]);
-    defer std.posix.close(control_pair[1]);
-
-    var now_mono_ns: u64 = 0;
-    var runtime = try worker.Runtime.init(std.testing.allocator, &vm, control_pair[0], &metrics_view, try rt.createCompletionEventfd(), .{
-        .ctx = &now_mono_ns,
-        .now_fn = fakeNow,
-    });
-    defer runtime.deinit();
-    try runtime.attachHostRuntime();
-
-    const route_specifier = try rt.routeSpecifier(std.testing.allocator, "/__test_route/process-cpu.js");
-    defer std.testing.allocator.free(route_specifier);
-    const route_index = try rt.registerRoute(&runtime, route_specifier,
-        \\export default function handle() {
-        \\    let acc = 0;
-        \\    for (let i = 0; i < 2000000; i++) acc += Math.sqrt(i);
-        \\    return String(acc);
-        \\}
-    );
-
-    // Two million square-root additions take well over 1 ms of CPU even fully
-    // compiled, so the floor shows the record measured the work done rather
-    // than a zero or garbage read.
-    const busy_floor_ns: u64 = std.time.ns_per_ms;
-    var usage_cursor: worker_shared_page.RecordCursor = .{};
-    var records: [1]worker_shared_page.CompletedRecord = undefined;
-
-    var dispatch_a = try initDispatchWork(std.testing.allocator, .{
-        .request_id = 31,
-        .route_index = route_index,
-        .request = .{ .path = "/burn-a" },
-    });
-    defer dispatch_a.deinit();
-    try rt.enqueueIngressRoute(&runtime, &dispatch_a, 1, .{ .path = "/burn-a" });
-    try executeNextReady(&runtime);
-    try executeUntilRequestDone(&runtime, 31);
-    var response_a = try rt.readIngressResponse(&runtime, control_pair[1], 31);
-    defer response_a.deinit();
-    try std.testing.expectEqual(@as(u16, 200), response_a.status);
-    try std.testing.expectEqual(@as(usize, 1), try drainUsageRecords(&usage_cursor, &metrics_view, &records));
-    const record_a = records[0];
-
-    try std.testing.expect(record_a.cpu_time_ns >= busy_floor_ns);
-    try std.testing.expect(record_a.turn_cpu_ns > 0);
-    // The first record's process CPU delta also covers what the process spent
-    // outside request turns (VM boot, module evaluation, compilation and
-    // collection), so it exceeds its own per-turn clock.
-    try std.testing.expect(record_a.cpu_time_ns > record_a.turn_cpu_ns);
-
-    var dispatch_b = try initDispatchWork(std.testing.allocator, .{
-        .request_id = 32,
-        .route_index = route_index,
-        .request = .{ .path = "/burn-b" },
-    });
-    defer dispatch_b.deinit();
-    try rt.enqueueIngressRoute(&runtime, &dispatch_b, 1, .{ .path = "/burn-b" });
-    try executeNextReady(&runtime);
-    try executeUntilRequestDone(&runtime, 32);
-    var response_b = try rt.readIngressResponse(&runtime, control_pair[1], 32);
-    defer response_b.deinit();
-    try std.testing.expectEqual(@as(u16, 200), response_b.status);
-    try std.testing.expectEqual(@as(usize, 1), try drainUsageRecords(&usage_cursor, &metrics_view, &records));
-    const record_b = records[0];
-
-    try std.testing.expect(record_b.cpu_time_ns >= busy_floor_ns);
-    try std.testing.expect(record_b.turn_cpu_ns > 0);
-    // A delta, not a total: the process total would make the second record
-    // at least the first, which absorbed the boot. The delta gives request B
-    // only the span from A's finish to B's, the same work without the boot,
-    // so it comes out smaller.
-    try std.testing.expect(record_b.cpu_time_ns < record_a.cpu_time_ns);
-}
-
-// A record's turn CPU (`CompletedRecord.turn_cpu_ns`) is the
-// `cpu_used_ns_total` the request's engine turns added at their exits, since
-// `finishRequest` (`worker/serve/response_finish.zig`) runs between engine
-// turns. A request cancelled, timed out or failed natively finishes inside a
-// scheduler turn attributed to it without entering the VM, so its turn CPU
-// is exactly zero, never the loop thread's CPU time, and a request that ran
-// JavaScript gets the CPU of its own turns, never the thread's total.
+/// A frozen CPU clock reading, far from zero: a record that took the
+/// reading instead of a window's delta would carry it.
+const frozen_cpu_reading_ns: u64 = 5 * std.time.ns_per_s;
 
 test "native cancel completion without a vm turn publishes zero turn cpu" {
     var vm = try support.createVm();
@@ -711,11 +620,13 @@ test "native cancel completion without a vm turn publishes zero turn cpu" {
     defer std.posix.close(control_pair[1]);
 
     var now_mono_ns: u64 = 100;
+    var cpu_ns: u64 = frozen_cpu_reading_ns;
     var completion_fixture = try rt.CompletionFixture.init();
     defer completion_fixture.deinit();
     var runtime = try worker.Runtime.init(std.testing.allocator, &vm, control_pair[0], &completion_fixture.view, try rt.createCompletionEventfd(), .{
         .ctx = &now_mono_ns,
         .now_fn = fakeNow,
+        .cpu_clock = worker.Clock{ .ctx = &cpu_ns, .now_fn = fakeNow },
     });
     defer runtime.deinit();
     try runtime.attachHostRuntime();
@@ -763,9 +674,9 @@ test "native cancel completion without a vm turn publishes zero turn cpu" {
     try std.testing.expectEqual(@as(usize, 1), try drainUsageRecords(&usage_cursor, &completion_fixture.view, &records));
     try std.testing.expectEqual(@as(u64, 61), records[0].request_id);
     try std.testing.expectEqual(@intFromEnum(worker_shared_page.CompletedStatus.client_closed), records[0].status);
-    // No VM turn ran for this request, so its per-turn clock is exactly zero,
-    // never the loop thread's whole CPU time.
-    try std.testing.expectEqual(@as(u64, 0), records[0].turn_cpu_ns);
+    // The frozen clock gave the request's windows no CPU, so the record
+    // carries exactly zero, never the loop thread's whole CPU time.
+    try std.testing.expectEqual(@as(u64, 0), records[0].cpu_ns);
 
     // Drain the stale .request_cancelled no-op the reset left queued.
     try executeNextReady(&runtime);
@@ -780,11 +691,13 @@ test "native deadline completion without a vm turn publishes zero turn cpu" {
     defer std.posix.close(control_pair[1]);
 
     var now_mono_ns: u64 = 10;
+    var cpu_ns: u64 = frozen_cpu_reading_ns;
     var completion_fixture = try rt.CompletionFixture.init();
     defer completion_fixture.deinit();
     var runtime = try worker.Runtime.init(std.testing.allocator, &vm, control_pair[0], &completion_fixture.view, try rt.createCompletionEventfd(), .{
         .ctx = &now_mono_ns,
         .now_fn = fakeNow,
+        .cpu_clock = worker.Clock{ .ctx = &cpu_ns, .now_fn = fakeNow },
     });
     defer runtime.deinit();
     try runtime.attachHostRuntime();
@@ -819,7 +732,7 @@ test "native deadline completion without a vm turn publishes zero turn cpu" {
     try std.testing.expectEqual(@as(usize, 1), try drainUsageRecords(&usage_cursor, &completion_fixture.view, &records));
     try std.testing.expectEqual(@as(u64, 62), records[0].request_id);
     try std.testing.expectEqual(@intFromEnum(worker_shared_page.CompletedStatus.deadline), records[0].status);
-    try std.testing.expectEqual(@as(u64, 0), records[0].turn_cpu_ns);
+    try std.testing.expectEqual(@as(u64, 0), records[0].cpu_ns);
 }
 
 test "native internal failure without a vm turn publishes zero turn cpu" {
@@ -831,11 +744,13 @@ test "native internal failure without a vm turn publishes zero turn cpu" {
     defer std.posix.close(control_pair[1]);
 
     var now_mono_ns: u64 = 100;
+    var cpu_ns: u64 = frozen_cpu_reading_ns;
     var completion_fixture = try rt.CompletionFixture.init();
     defer completion_fixture.deinit();
     var runtime = try worker.Runtime.init(std.testing.allocator, &vm, control_pair[0], &completion_fixture.view, try rt.createCompletionEventfd(), .{
         .ctx = &now_mono_ns,
         .now_fn = fakeNow,
+        .cpu_clock = worker.Clock{ .ctx = &cpu_ns, .now_fn = fakeNow },
     });
     defer runtime.deinit();
     try runtime.attachHostRuntime();
@@ -867,7 +782,7 @@ test "native internal failure without a vm turn publishes zero turn cpu" {
     try std.testing.expectEqual(@as(usize, 1), try drainUsageRecords(&usage_cursor, &completion_fixture.view, &records));
     try std.testing.expectEqual(@as(u64, 63), records[0].request_id);
     try std.testing.expectEqual(@intFromEnum(worker_shared_page.CompletedStatus.internal_error), records[0].status);
-    try std.testing.expectEqual(@as(u64, 0), records[0].turn_cpu_ns);
+    try std.testing.expectEqual(@as(u64, 0), records[0].cpu_ns);
 }
 
 test "vm turn completion publishes the turn cpu delta not accumulated thread cpu" {
@@ -906,8 +821,9 @@ test "vm turn completion publishes the turn cpu delta not accumulated thread cpu
         \\}
     );
 
-    // The same calibration as the process CPU test above: the floor shows the
-    // per-turn clock measured the turn's work.
+    // Two million square-root additions take well over 1 ms of CPU even fully
+    // compiled, so the floor shows the request's window measured its work
+    // rather than a zero or garbage read.
     const busy_floor_ns: u64 = std.time.ns_per_ms;
     var usage_cursor: worker_shared_page.RecordCursor = .{};
     var records: [1]worker_shared_page.CompletedRecord = undefined;
@@ -927,11 +843,7 @@ test "vm turn completion publishes the turn cpu delta not accumulated thread cpu
     try std.testing.expectEqual(@as(usize, 1), try drainUsageRecords(&usage_cursor, &completion_fixture.view, &records));
     const record_a = records[0];
 
-    try std.testing.expect(record_a.turn_cpu_ns >= busy_floor_ns);
-    // Below the same record's process CPU delta, which also absorbed the
-    // boot: the per-turn clock covers part of that span, so a turn CPU read
-    // from a zero or stale start could not satisfy this ordering.
-    try std.testing.expect(record_a.cpu_time_ns > record_a.turn_cpu_ns);
+    try std.testing.expect(record_a.cpu_ns >= busy_floor_ns);
 
     var dispatch_b = try initDispatchWork(std.testing.allocator, .{
         .request_id = 65,
@@ -948,12 +860,12 @@ test "vm turn completion publishes the turn cpu delta not accumulated thread cpu
     try std.testing.expectEqual(@as(usize, 1), try drainUsageRecords(&usage_cursor, &completion_fixture.view, &records));
     const record_b = records[0];
 
-    try std.testing.expect(record_b.turn_cpu_ns > 0);
-    // A per-turn delta, not the thread clock: by this finish the loop
+    try std.testing.expect(record_b.cpu_ns > 0);
+    // A per-window delta, not the thread clock: by this finish the loop
     // thread's total CPU already exceeds the heavy request's, so a reading of
     // the thread's clock would come out at least record A's value. The light
-    // turn measures only its own work.
-    try std.testing.expect(record_b.turn_cpu_ns < record_a.turn_cpu_ns);
+    // request's windows measure only its own work.
+    try std.testing.expect(record_b.cpu_ns < record_a.cpu_ns);
 }
 
 test "native completion after a vm turn on the same thread does not inherit turn cpu" {
@@ -1003,7 +915,7 @@ test "native completion after a vm turn on the same thread does not inherit turn
     defer response_a.deinit();
     try std.testing.expectEqual(@as(u16, 200), response_a.status);
     try std.testing.expectEqual(@as(usize, 1), try drainUsageRecords(&usage_cursor, &completion_fixture.view, &records));
-    try std.testing.expect(records[0].turn_cpu_ns >= busy_floor_ns);
+    try std.testing.expect(records[0].cpu_ns >= busy_floor_ns);
 
     // Request B, on the same runtime and thread, finishes natively: reset
     // before dispatch, it never enters the VM, and its record must not
@@ -1037,7 +949,10 @@ test "native completion after a vm turn on the same thread does not inherit turn
     try std.testing.expectEqual(@as(usize, 1), try drainUsageRecords(&usage_cursor, &completion_fixture.view, &records));
     try std.testing.expectEqual(@as(u64, 67), records[0].request_id);
     try std.testing.expectEqual(@intFromEnum(worker_shared_page.CompletedStatus.client_closed), records[0].status);
-    try std.testing.expectEqual(@as(u64, 0), records[0].turn_cpu_ns);
+    // B's record holds only its own window, the native finish, which takes
+    // far less than the floor request A's work cleared; a reading of the
+    // thread's clock would hold A's CPU too.
+    try std.testing.expect(records[0].cpu_ns < busy_floor_ns);
 
     // Drain the stale .request_cancelled no-op the reset left queued.
     try executeNextReady(&runtime);

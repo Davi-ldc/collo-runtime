@@ -61,19 +61,17 @@ JSC::VM& toolingVM()
 
 } // namespace
 
-// Generates the CachedBytecode blob for one ESM module. `specifier_utf8` must be the exact pack specifier the loader
-// will register the module under. On success `*out_bytes` and `*out_len` carry the blob in malloc'd storage the
-// caller frees with collo_tool_bytecode_release. An empty source or specifier fails with
-// COLLO_STATUS_INVALID_ARGUMENT, a parse or serialization failure with COLLO_STATUS_ERROR after a diagnostic on
-// stderr, since ColloStatus carries no message, and a failed copy with COLLO_STATUS_OUT_OF_MEMORY.
+// A parse or serialization failure also prints a diagnostic on stderr, since ColloStatus carries no message.
 extern "C" ColloStatus collo_tool_generate_module_bytecode(
     ColloBuffer source_utf8, ColloString specifier_utf8, uint8_t** out_bytes, size_t* out_len)
 {
+    if (out_bytes)
+        *out_bytes = nullptr;
+    if (out_len)
+        *out_len = 0;
     if (!out_bytes || !out_len || !source_utf8.ptr || source_utf8.len == 0 || !specifier_utf8.ptr
         || specifier_utf8.len == 0)
         return COLLO_STATUS_INVALID_ARGUMENT;
-    *out_bytes = nullptr;
-    *out_len = 0;
 
     JSC::VM& vm = toolingVM();
 

@@ -76,7 +76,7 @@ const decodeSamples = {
   "iso-8859-2": { bytes: [0xe8], text: "č" },
   "iso-8859-3": { bytes: [0xa1, 0x65, 0x6c, 0x6c, 0x6f], text: "Ħello" },
   "iso-8859-4": { bytes: [0xe0], text: "ā" },
-  "iso-8859-5": { bytes: [0xc0], text: "а" },
+  "iso-8859-5": { bytes: [0xd0], text: "а" },
   "iso-8859-6": { bytes: [0xc7], text: "ا" },
   "iso-8859-7": { bytes: [0xc3, 0xe5, 0xe9, 0xdc], text: "Γειά" }, // Γειά
   "iso-8859-8": { bytes: [0xf9, 0xec, 0xe5, 0xed], text: "שלום" }, // שלום
@@ -93,7 +93,7 @@ const decodeSamples = {
   "windows-1251": { bytes: [0xcf, 0xf0, 0xe8, 0xe2, 0xe5, 0xf2], text: "Привет" }, // Привет
   "windows-1252": { bytes: [0x80], text: "€" }, // €
   "windows-1253": { bytes: [0xca, 0xe1, 0xeb, 0xe7, 0xec, 0xdd, 0xf1, 0xe1], text: "Καλημέρα" }, // Καλημέρα
-  "windows-1254": { bytes: [0xfe], text: "þ" },
+  "windows-1254": { bytes: [0xfe], text: "ş" },
   "windows-1255": { bytes: [0xf9, 0xec, 0xe5, 0xed], text: "שלום" }, // שלום
   "windows-1256": { bytes: [0xc7, 0xe1, 0xd3, 0xe1, 0xc7, 0xe3], text: "السلام" }, // السلام
   "windows-1257": { bytes: [0xe0], text: "ą" },
@@ -173,7 +173,7 @@ describe("CJK malformed sequences", () => {
   // [encoding, malformed two-byte sequence] where the bytes cannot form a valid
   // character under the WHATWG decoder for that encoding.
   const malformed = {
-    "shift_jis": [0x80, 0x80], // 0x80 is not a Shift_JIS lead byte.
+    "shift_jis": [0x81, 0x20], // 0x81 lead + space (invalid trail).
     "euc-jp": [0x8e, 0xff], // 0x8E (JIS X 0201 prefix) + invalid follower.
     "gbk": [0x81, 0x7f], // 0x81 lead + 0x7F below the valid trail range.
     "big5": [0x81, 0x20], // 0x81 lead + space (invalid trail).

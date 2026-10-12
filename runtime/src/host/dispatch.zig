@@ -168,6 +168,11 @@ pub const Response = struct {
     /// `name: value\r\n` per header, in wire order.
     headers_wire: []u8 = &.{},
     body: []u8 = &.{},
+    /// The reason of a `worker_retiring` notice read among this response's
+    /// frames. A worker may send its one notice at any point after
+    /// WorkerReady, so the reader takes it wherever it falls and reports it
+    /// here.
+    retiring: ?ipc.WorkerRetiringReason = null,
 
     /// The status the worker published, read as the server reads it
     /// (`request_finish.zig`): a value `RequestDoneStatus` does not name is
@@ -372,6 +377,12 @@ fn drainResponseControlPacket(
                 defer received.deinit();
                 try appendResponsePayload(allocator, budget, response, body, received.descriptor, received.payload);
             }
+        },
+        .worker_retiring => {
+            // A worker sends one notice; a second is a broken contract.
+            if (response.retiring != null)
+                return error.DuplicateRetiringNotice;
+            response.retiring = try ipc.worker_retiring.decode(&packet);
         },
         else => return error.InvalidMessageKind,
     }

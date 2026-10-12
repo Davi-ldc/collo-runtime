@@ -209,11 +209,10 @@ bool sha3DigestRaw(const HashSpec& hash, std::span<const uint8_t> data, std::spa
     return true;
 }
 
-bool sha3DigestBytes(const HashSpec& hash, std::span<const uint8_t> data, WTF::Vector<uint8_t>& out)
+bool sha3DigestBytes(const HashSpec& hash, std::span<const uint8_t> data, SecretBytes& out)
 {
-    if (!out.tryReserveInitialCapacity(hash.digest_bytes))
+    if (!out.tryGrow(hash.digest_bytes))
         return false;
-    out.grow(hash.digest_bytes);
     if (sha3DigestRaw(hash, data, out.mutableSpan()))
         return true;
     out.clear();

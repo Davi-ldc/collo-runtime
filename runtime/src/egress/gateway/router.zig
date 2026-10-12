@@ -39,10 +39,13 @@ pub const BodyKey = struct {
 pub const Record = struct {
     shard_index: usize,
     security_cell_id: policy_mod.PoolIsolationId,
-    /// The id of the `policy.PolicyTable` entry the fetch's verified token named. The table
-    /// never changes for the life of the gateway, so the id names the same entry at any later
-    /// resubmission.
+    /// The id of the policy, in the table the hello's image decoded to, that the fetch's verified
+    /// token named. The table never changes for the life of the gateway, so the id names the
+    /// same policy at any later resubmission, which is checked under it again.
     policy_id: u16,
+    /// The announced length of the fetch's pooled request body, which the session's
+    /// `upload_bytes_in_flight` holds until the route retires; 0 for an inline body.
+    upload_bytes: u64 = 0,
 };
 
 pub const Route = struct {

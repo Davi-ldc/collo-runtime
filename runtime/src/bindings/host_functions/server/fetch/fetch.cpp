@@ -1,6 +1,6 @@
 // The `fetch` global that globals.def registers. Runs on the VM thread. A call needs the worker's host runtime and an
-// execution context, either a request turn or the boot context the worker installs for module evaluation, and
-// scheduleFetchFromRequest in request.cpp builds and schedules the request.
+// owner (Collo::ownerExecCtx), a request turn or the module evaluation the worker installs as the turnless context,
+// and scheduleFetchFromRequest in request.cpp builds and schedules the request.
 
 #include "host_functions/server/fetch/fetch.h"
 

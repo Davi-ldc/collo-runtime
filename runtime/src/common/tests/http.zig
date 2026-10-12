@@ -1,8 +1,10 @@
 //! The HTTP helpers in `collo_http` and the HPACK binding in `collo_hpack`:
 //! Host header and request-target validation, HTTP/1 body framing, header
-//! and status checks, HTTP/2 frame headers, SETTINGS, WINDOW_UPDATE and the
+//! and status checks, the connection-specific fields HTTP/2 refuses in each
+//! direction, HTTP/2 frame headers, SETTINGS, WINDOW_UPDATE and the
 //! connection preface, and HPACK encoding and decoding with prepared headers,
-//! scratch reuse, encoder poisoning and dynamic table size updates. Expected
+//! scratch reuse, encoder poisoning, dynamic table size updates and the skip
+//! that keeps the dynamic table in step past the header caps. Expected
 //! HPACK bytes follow RFC 7541: the high bits of a field's first byte select
 //! its representation (section 6), and indexes 1 to 61 name the static table
 //! (Appendix A). Besides `common-test`, the file runs alone, without JSC, as
@@ -121,6 +123,32 @@ test "http header validation rejects invalid response metadata" {
     try std.testing.expectError(error.InvalidResponseHeader, http.headers.validate("", "ok"));
     try std.testing.expectError(error.InvalidResponseHeader, http.headers.validate("bad name", "ok"));
     try std.testing.expectError(error.InvalidResponseHeader, http.headers.validate("x-demo", "bad\r\n"));
+}
+
+test "an HTTP/2 request may carry te only as trailers, a response never carries te, and the five connection fields are refused both ways" {
+    const headers = http.headers;
+    // `trailers` in any case, with the whitespace around a field value.
+    for ([_][]const u8{ "trailers", "TRAILERS", " trailers\t" }) |value|
+        try std.testing.expect(!headers.isConnectionSpecificField("te", value, .request));
+    for ([_][]const u8{ "gzip", "trailers, gzip", "", "trailer" }) |value|
+        try std.testing.expect(headers.isConnectionSpecificField("te", value, .request));
+    for ([_][]const u8{ "trailers", "gzip" }) |value| {
+        try std.testing.expect(headers.isConnectionSpecificField("te", value, .response));
+        try std.testing.expect(headers.isConnectionSpecificField("TE", value, .response));
+    }
+
+    const connection_fields = [_][]const u8{ "connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade" };
+    for (connection_fields) |name| {
+        try std.testing.expect(headers.isConnectionSpecificField(name, "x", .request));
+        try std.testing.expect(headers.isConnectionSpecificField(name, "x", .response));
+        try std.testing.expect(headers.isConnectionSpecificName(name));
+    }
+    try std.testing.expect(headers.isConnectionSpecificField("Transfer-Encoding", "chunked", .response));
+    // The name-only list the HTTP/1 serializer uses leaves `te` to the
+    // direction rule.
+    try std.testing.expect(!headers.isConnectionSpecificName("te"));
+    try std.testing.expect(!headers.isConnectionSpecificField("x-te", "gzip", .request));
+    try std.testing.expect(!headers.isConnectionSpecificField("accept", "*/*", .response));
 }
 
 test "common HTTP status phrase table covers common server statuses" {
@@ -466,6 +494,48 @@ test "hpack decode storage is sized to decoded bytes" {
         expected_storage_len += header.name.len + header.value.len;
     try std.testing.expectEqual(expected_storage_len, decoded.storage.len);
     try std.testing.expect(decoded.storage.len < 4096);
+}
+
+test "an hpack skip keeps the dynamic table in step past the header caps" {
+    const allocator = std.testing.allocator;
+    // Two literals with incremental indexing (RFC 7541 §6.2.1), which every
+    // decoder adds to its dynamic table, then `:status: 200` (static index 8)
+    // until the block holds 600 fields, past a cap of 512.
+    const field_count = 600;
+    const literals = "\x40\x07x-first\x03one" ++ "\x40\x08x-second\x03two";
+    const block = literals.* ++ [_]u8{0x88} ** (field_count - 2);
+    // The two entries by their dynamic indexes: 62 is the newest, `x-second`.
+    const references = [_]u8{ 0x80 | 63, 0x80 | 62 };
+
+    var capped = try hpack.Decoder.init();
+    defer capped.deinit();
+    try std.testing.expectError(error.HpackHeaderListTooLarge, capped.decodeBlock(allocator, &block, 512, 4096));
+
+    // A decoder that never saw the block has no entry the references name.
+    var fresh = try hpack.Decoder.init();
+    defer fresh.deinit();
+    try std.testing.expectError(error.HpackBadData, fresh.decodeBlock(allocator, &references, 16, 4096));
+
+    // The skip passes the block no cap would take, through the decoder's
+    // own scratch and through the caller's, and both tables stay in step.
+    var skipping = try hpack.Decoder.init();
+    defer skipping.deinit();
+    try skipping.skipBlock(allocator, &block);
+    var scratch_skipping = try hpack.Decoder.init();
+    defer scratch_skipping.deinit();
+    const scratch = try allocator.alloc(u8, hpack.max_single_header_decode_bytes);
+    defer allocator.free(scratch);
+    try scratch_skipping.skipBlockScratch(scratch, &block);
+
+    for ([_]*hpack.Decoder{ &skipping, &scratch_skipping }) |decoder| {
+        var decoded = try decoder.decodeBlock(allocator, &references, 16, 4096);
+        defer decoded.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 2), decoded.headers.len);
+        try std.testing.expectEqualStrings("x-first", decoded.headers[0].name);
+        try std.testing.expectEqualStrings("one", decoded.headers[0].value);
+        try std.testing.expectEqualStrings("x-second", decoded.headers[1].name);
+        try std.testing.expectEqualStrings("two", decoded.headers[1].value);
+    }
 }
 
 test "hpack dynamic table size update is only accepted at header block start" {

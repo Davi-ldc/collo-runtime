@@ -31,8 +31,9 @@ pub const AdoptSpans = struct {
 /// the rewrite here. Membership and limit read-back are not validated on
 /// this side: the child checks, fail-closed and on this same fd, that its
 /// own pid is the cgroup's only member, that `memory.high`, `memory.max` and
-/// the `cpu.max` quota match the WorkerInit values, and that `pids.max` and
-/// the `cpu.max` period match the defaults (`pids.DEFAULT_MAX` and
+/// the `cpu.max` quota match the WorkerInit values, that `memory.swap.max`
+/// is 0 where the kernel accounts swap, and that `pids.max` and the
+/// `cpu.max` period match the defaults (`pids.DEFAULT_MAX` and
 /// `cpu.DEFAULT_PERIOD_US` in `common/cgroup.zig`); the zygote refuses to
 /// clone into a non-empty cgroup; a child dead before init surfaces through
 /// the pidfd.

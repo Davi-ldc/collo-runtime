@@ -18,8 +18,5 @@ zig-out/
 # Native dependencies are provisioned per machine, not cloned: pinned
 # versions and patch series live in runtime/deps/*.version and
 # runtime/patches/, the trees and archives do not.
-runtime/deps/boringssl
-runtime/deps/ls-hpack
-runtime/deps/WebKit
-runtime/deps/webkit-authoring
-runtime/deps/jsc-build
+runtime/deps/*
+!runtime/deps/*.version

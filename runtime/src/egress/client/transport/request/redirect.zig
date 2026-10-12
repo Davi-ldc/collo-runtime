@@ -5,7 +5,9 @@
 //! and 301 and 302 turn POST into GET; a rewrite to GET drops the body and
 //! its content headers. User info in the redirect URL is stripped, and a hop
 //! to another origin drops credentials (authorization, proxy-authorization,
-//! cookie).
+//! cookie). A hop can only keep the request body or drop it, never bring
+//! one of its own, so the target says which (`RedirectBody`) and the body
+//! stays where it is (`task.zig:Task.replaceRequest`).
 
 const std = @import("std");
 const config_mod = @import("../config.zig");
@@ -38,11 +40,19 @@ pub const FetchOptions = struct {
     max_redirects: usize = 20,
 };
 
+/// What the next hop does with the request body.
+pub const RedirectBody = enum {
+    /// The same bytes go to the next hop.
+    keep,
+    /// The next hop sends no body.
+    drop,
+};
+
 pub const RedirectTarget = struct {
     url: []u8,
     method: []u8,
     headers: []Header,
-    body: []const u8,
+    body: RedirectBody,
 };
 
 pub fn redirectTarget(
@@ -50,7 +60,6 @@ pub fn redirectTarget(
     current_url: []const u8,
     current_method: []const u8,
     request_headers: []const Header,
-    body: []const u8,
     status: u16,
     headers: anytype,
     options: FetchOptions,
@@ -81,7 +90,7 @@ pub fn redirectTarget(
         .url = next_url,
         .method = next_method,
         .headers = next_headers,
-        .body = if (rewrite_to_get) "" else body,
+        .body = if (rewrite_to_get) .drop else .keep,
     };
 }
 

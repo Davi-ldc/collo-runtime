@@ -1,12 +1,17 @@
 //! The configuration `collo serve <entry>` runs when it is given an entry
 //! module instead of a configuration file: one worker named after the
 //! file's stem, with one route `/*` that matches every path, the entry's
-//! absolute path, no bindings, and every global default. It is the same
-//! `Config` the parser would build from the equivalent `collo.json`, so the
-//! two forms boot and serve the same way.
+//! absolute path, no bindings, every global default, and outbound access to
+//! any public host on the default ports of HTTPS. It is the same `Config`
+//! the parser builds from the equivalent `collo.json`, so the two forms boot
+//! and serve the same way:
+//!
+//!     { "globalSettings": { "network": { "allow": ["*"] } },
+//!       "workers": { "<stem>": { "routes": { "/*": { "entry": "<entry>" } } } } }
 
 const std = @import("std");
 const server_limits = @import("collo_limits").server;
+const collo_network = @import("collo_network");
 const model = @import("model.zig");
 const parse = @import("parse.zig");
 const Diagnostic = @import("diagnostic.zig").Diagnostic;
@@ -15,6 +20,19 @@ pub const Error = parse.Error;
 
 /// The pattern of the synthesized route.
 pub const route_pattern = "/*";
+
+const any_public_host = [_]collo_network.Pattern{.{ .host = .any, .port = 0 }};
+
+/// The synthesized `network` value, `{ "allow": ["*"] }`: any public host
+/// over HTTPS on its default port, with neither flag.
+pub const network: model.Network = .{ .allow = &any_public_host };
+
+/// The global settings of the synthesized configuration.
+const settings: model.Settings = .{
+    .isolate_realm = model.default_settings.isolate_realm,
+    .limits = model.default_settings.limits,
+    .network = network,
+};
 
 /// The name a stem with no usable byte falls back to.
 pub const fallback_worker_name = "worker";
@@ -47,11 +65,12 @@ pub fn synthesize(gpa: std.mem.Allocator, entry_path: []const u8, diagnostic: *D
         .pattern = try allocator.dupe(u8, route_pattern),
         .entry_path = absolute_entry,
         .bindings = &.{},
+        .network = settings.network,
     };
     const definitions = try allocator.alloc(model.WorkerDefinition, 1);
     definitions[0] = .{
         .name = try workerName(allocator, absolute_entry),
-        .settings = model.default_settings,
+        .settings = settings,
         .routes = routes,
     };
     return .{
@@ -60,7 +79,7 @@ pub fn synthesize(gpa: std.mem.Allocator, entry_path: []const u8, diagnostic: *D
         .listen = parse.parseListen(model.default_listen) catch unreachable,
         .tls = null,
         .analytics = null,
-        .defaults = model.default_settings,
+        .defaults = settings,
         .definitions = definitions,
         .route_count = 1,
     };

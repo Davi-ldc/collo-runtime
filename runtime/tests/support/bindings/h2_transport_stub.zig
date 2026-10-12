@@ -17,6 +17,7 @@ pub const Error = error{
 
 pub const RawPromiseDeferred = opaque {};
 pub const RawValue = opaque {};
+pub const RawResponseBodyStream = opaque {};
 
 pub const RawString = extern struct {
     ptr: ?[*]const u8,
@@ -94,13 +95,20 @@ pub const TerminationReason = enum(u8) {
     deadline = 5,
 };
 
+/// The real bindings' `request_id_max` (`COLLO_REQUEST_ID_MAX`): ids above it
+/// name the evaluations and the worker owner, never a dispatched request.
+pub const request_id_max: u64 =
+    std.math.maxInt(u64) - @as(u64, @import("collo_limits").server.routes_per_definition_max) - 1;
+
 pub const ExecCtx = extern struct {
     request_id: u64,
-    deadline_monotonic_ns: u64,
-    cpu_used_ns_total: u64,
-    turn_cpu_start_ns: u64,
-    termination_reason: u8,
-    _reserved: [7]u8,
+    deadline_monotonic_ns: u64 = 0,
+    termination_reason: u8 = @intFromEnum(TerminationReason.none),
+    reserved0: [7]u8 = @splat(0),
+
+    pub fn init(request_id: u64) ExecCtx {
+        return .{ .request_id = request_id };
+    }
 };
 
 pub const Value = struct {
@@ -126,24 +134,38 @@ pub const ValueResult = union(enum) {
     exception: Value,
 };
 
-/// Runs no JavaScript: `invoke`, `invokeWithTiming` and `fetchResponseValue`
-/// succeed with an empty value and `isCallable` answers true, so a test in the
-/// stub graph can check transport and bookkeeping but never a script's result.
-pub const Vm = struct {
-    pub fn fetchResponseValue(self: *Vm, init: *const FetchResponseInit) Error!ValueResult {
-        _ = self;
-        _ = init;
-        return .{ .success = .{} };
-    }
+/// A Response's locked ReadableStream body. `RequestContext` holds one in its
+/// response source, so its teardown reaches `deinit` here; no test of the stub
+/// graph streams a response, so nothing reads, cancels or frees a stream.
+pub const ResponseBodyStream = struct {
+    raw: *RawResponseBodyStream,
 
+    pub fn deinit(self: *ResponseBodyStream) void {
+        self.* = undefined;
+    }
+};
+
+/// Runs no JavaScript: `isCallable` answers true, so a test in the stub graph
+/// can check transport and bookkeeping but never a script's result.
+pub const Vm = struct {
     pub fn isCallable(self: *Vm, value: *const Value) Error!bool {
         _ = self;
         _ = value;
         return true;
     }
+};
+
+/// Runs no JavaScript: `invoke`, `invokeWithTiming` and `fetchResponseValue`
+/// succeed with an empty value.
+pub const Realm = struct {
+    pub fn fetchResponseValue(self: Realm, init: *const FetchResponseInit) Error!ValueResult {
+        _ = self;
+        _ = init;
+        return .{ .success = .{} };
+    }
 
     pub fn invokeWithTiming(
-        self: *Vm,
+        self: Realm,
         allocator: std.mem.Allocator,
         exec_ctx: *const ExecCtx,
         callable: *const Value,
@@ -156,7 +178,7 @@ pub const Vm = struct {
     }
 
     pub fn invoke(
-        self: *Vm,
+        self: Realm,
         allocator: std.mem.Allocator,
         exec_ctx: *const ExecCtx,
         callable: *const Value,

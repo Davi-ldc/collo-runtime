@@ -9,9 +9,17 @@
 //! this ring (`zygote/worker_boot/sandbox.zig`), so after boot no worker code
 //! can create another ring or change this one. Its user_data carries the
 //! `worker_scheduler_high_byte` tag of `collo_io_uring_tags`, and
-//! `WorkerRing.wait` drops any completion that does not decode.
+//! `WorkerRing.wait` drops any completion that does not decode. A worker
+//! whose definition has no network grant has no egress descriptor, and its
+//! two egress slots hold -1, which the kernel registers as empty slots
+//! (sparse fixed-file sets, Linux 5.5); a POLL_ADD on an empty slot fails
+//! with EBADF, so such a ring can never watch an egress descriptor. The
+//! worker ring and the egress rings are set up through `initRingParams`, so
+//! a kernel or a policy without a usable ring fails each of them with the
+//! same two errors.
 
 const std = @import("std");
+const socket = @import("collo_os").socket;
 const tags = @import("collo_io_uring_tags");
 
 const linux = std.os.linux;
@@ -130,13 +138,22 @@ comptime {
     std.debug.assert(@offsetOf(Restriction, "resv2") == 4);
 }
 
+/// Whether a worker's ring registers egress descriptors: `granted` when its
+/// definition has a network grant and WorkerInit brought the wake
+/// descriptors, `none` when it has neither.
+pub const EgressSlots = enum { granted, none };
+
+/// The value an empty slot holds in a sparse fixed-file set.
+pub const empty_slot: std.posix.fd_t = -1;
+
 /// Checks that every slot holds a distinct open fd of the kind its
-/// `FixedFile` names, failing with `error.InvalidWorkerRingFixedFile`
+/// `FixedFile` names, except that with `egress` set to `none` the two egress
+/// slots must be `empty_slot`; fails with `error.InvalidWorkerRingFixedFile`
 /// otherwise. It works without /proc, because the worker calls it after its
 /// chroot.
-pub fn validateWorkerFixedFiles(files: *const [FixedFile.count]std.posix.fd_t) !void {
+pub fn validateWorkerFixedFiles(files: *const [FixedFile.count]std.posix.fd_t, egress: EgressSlots) !void {
     for (files.*, 0..) |fd, index| {
-        validateOneWorkerFixedFile(files, fd, index) catch |err| {
+        validateOneWorkerFixedFile(files, fd, index, egress) catch |err| {
             // A rejected fixed file fails worker init. The log names the slot
             // and fd so a boot-time mismatch can be diagnosed without strace.
             // It warns rather than errs because the caller reports the
@@ -147,7 +164,23 @@ pub fn validateWorkerFixedFiles(files: *const [FixedFile.count]std.posix.fd_t) !
     }
 }
 
-fn validateOneWorkerFixedFile(files: *const [FixedFile.count]std.posix.fd_t, fd: std.posix.fd_t, index: usize) !void {
+fn validateOneWorkerFixedFile(
+    files: *const [FixedFile.count]std.posix.fd_t,
+    fd: std.posix.fd_t,
+    index: usize,
+    egress: EgressSlots,
+) !void {
+    const fixed_file: FixedFile = @enumFromInt(@as(u32, @intCast(index)));
+    if (egress == .none) {
+        switch (fixed_file) {
+            .egress_completion, .egress_liveness => {
+                if (fd != empty_slot)
+                    return error.InvalidWorkerRingFixedFile;
+                return;
+            },
+            .control, .wakeup, .timer, .ingress_payload_credit, .fs_fault => {},
+        }
+    }
     if (fd < 0)
         return error.InvalidWorkerRingFixedFile;
     for (files.*[0..index]) |previous_fd| {
@@ -156,16 +189,17 @@ fn validateOneWorkerFixedFile(files: *const [FixedFile.count]std.posix.fd_t, fd:
     }
     const stat = std.posix.fstat(fd) catch return error.InvalidWorkerRingFixedFile;
     const file_type = stat.mode & linux.S.IFMT;
-    const fixed_file: FixedFile = @enumFromInt(@as(u32, @intCast(index)));
     switch (fixed_file) {
         .control,
         .fs_fault,
         => {
             if (file_type != linux.S.IFSOCK)
                 return error.InvalidWorkerRingFixedFile;
-            if (try socketOptionInt(fd, linux.SO.DOMAIN) != std.posix.AF.UNIX)
+            const domain = socket.socketDomain(fd) catch return error.InvalidWorkerRingFixedFile;
+            if (domain != std.posix.AF.UNIX)
                 return error.InvalidWorkerRingFixedFile;
-            if (try socketOptionInt(fd, linux.SO.TYPE) != std.posix.SOCK.SEQPACKET)
+            const socket_type = socket.socketType(fd) catch return error.InvalidWorkerRingFixedFile;
+            if (socket_type != std.posix.SOCK.SEQPACKET)
                 return error.InvalidWorkerRingFixedFile;
         },
         .wakeup,
@@ -186,16 +220,6 @@ fn validateOneWorkerFixedFile(files: *const [FixedFile.count]std.posix.fd_t, fd:
             try validateTimerFd(fd);
         },
     }
-}
-
-fn socketOptionInt(fd: std.posix.fd_t, optname: u32) !i32 {
-    var value: i32 = 0;
-    var len: linux.socklen_t = @sizeOf(i32);
-    const rc = linux.getsockopt(fd, std.posix.SOL.SOCKET, optname, std.mem.asBytes(&value).ptr, &len);
-    return switch (linux.E.init(rc)) {
-        .SUCCESS => if (len == @sizeOf(i32)) value else error.InvalidWorkerRingFixedFile,
-        else => error.InvalidWorkerRingFixedFile,
-    };
 }
 
 fn validateTimerFd(fd: std.posix.fd_t) !void {
@@ -251,7 +275,8 @@ pub const WorkerRing = struct {
     ring: linux.IoUring,
 
     pub fn init(config: WorkerRingConfig) !WorkerRing {
-        var ring = try linux.IoUring.init(config.entries, linux.IORING_SETUP_R_DISABLED);
+        var params = std.mem.zeroInit(linux.io_uring_params, .{ .flags = linux.IORING_SETUP_R_DISABLED });
+        var ring = try initRingParams(config.entries, &params);
         errdefer ring.deinit();
         try ring.register_files(&config.files);
         try registerWorkerRestrictions(ring.fd);
@@ -326,6 +351,20 @@ pub fn enableRing(ring_fd: std.posix.fd_t) !void {
 
 pub fn registerRestrictions(ring_fd: std.posix.fd_t, restrictions: []Restriction) !void {
     try registerRaw(ring_fd, .REGISTER_RESTRICTIONS, restrictions.ptr, restrictions.len);
+}
+
+/// Sets up a ring as `IoUring.init_params` does, naming the failures that
+/// mean this kernel or its policy offers no usable ring as `registerRaw`
+/// names them: `UnsupportedKernel` for a kernel without io_uring (ENOSYS),
+/// without a setup flag the caller asks for (EINVAL) or without the single
+/// mapping of both queues (before Linux 5.4), and `PermissionDenied` for the
+/// `io_uring_disabled` sysctl or a seccomp filter (EPERM). Every other error
+/// passes through, so a caller can skip or fall back on these two alone.
+pub fn initRingParams(entries: u16, params: *linux.io_uring_params) !linux.IoUring {
+    return linux.IoUring.init_params(entries, params) catch |err| switch (err) {
+        error.SystemOutdated, error.ArgumentsInvalid => return error.UnsupportedKernel,
+        else => |other| return other,
+    };
 }
 
 pub fn registerRaw(ring_fd: std.posix.fd_t, opcode: linux.IORING_REGISTER, arg: ?*const anyopaque, count: usize) !void {

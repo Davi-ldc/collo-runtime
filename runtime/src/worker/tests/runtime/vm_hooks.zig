@@ -60,7 +60,7 @@ test "a runtime's teardown takes its owner-transition hook off the VM" {
     try runTurn(&vm, "/owner-hook.js", "fire", &exec_b);
 
     try std.testing.expect(vm.ownerCrossings() > crossings_before);
-    try std.testing.expectEqual(@as(u64, 0), runtime.observability.sentinel.turn_owner.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), runtime.observability.sentinel.publishedOwnerId());
 }
 
 /// Runs `export_name` of `specifier` in a turn owned by `exec_ctx`, then

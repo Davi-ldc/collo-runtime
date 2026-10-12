@@ -2,14 +2,15 @@
 //! temporary directory: one JSON Lines file per stream appended across opens,
 //! batched writes on flush, multi-line records and the room they take,
 //! whole-record refusal and drops at the buffer bound, the full flag and the
-//! one `err` line a full usage stream logs, a refusal that a producer keeping
-//! its record asks for and that marks nothing, the reopen a rotation that
-//! renames the files asks for, a reopen that waits for a line a failed write
-//! cut and a reopen that fails, the sync interval, the final write at close,
-//! a missing directory, a planted symlink, a failed write, the console's own
-//! flusher and its line-aligned write batches, and the console-only mode
-//! without a directory. The record encoders are covered beside it in
-//! `logs.zig` and `access.zig`, the ingress drain in
+//! one `err` line a full usage or workers stream logs, a refusal that a
+//! producer keeping its record asks for and that marks nothing, the reopen a
+//! rotation that renames the files asks for, a reopen that waits for a line a
+//! failed write cut and a reopen that fails, the sync interval, the final
+//! write at close, a missing directory, a planted symlink, a failed write,
+//! the console's own flusher and its line-aligned write batches, and the
+//! console-only mode without a directory. The record encoders are covered
+//! beside it in `logs.zig`, `access.zig`, `usage.zig` and `workers.zig`, the
+//! ingress drain in
 //! `tests/ingress/analytics_drain.zig`, and the signal that asks for a reopen
 //! in `tests/boot/signals.zig`.
 
@@ -72,6 +73,7 @@ test "records land as JSON Lines in one file per stream, appended across opens" 
     sink.appendLossy(.logs, "{\"n\":2}");
     try sink.append(.access, "{\"a\":1}");
     try sink.append(.usage, "{\"u\":1}");
+    try sink.append(.workers, "{\"w\":1}");
     sink.appendLossy(.console, "[w] hello");
     sink.flush(0);
     sink.close();
@@ -79,6 +81,7 @@ test "records land as JSON Lines in one file per stream, appended across opens" 
     try fixture.expectFile("logs.jsonl", "{\"n\":1}\n{\"n\":2}\n");
     try fixture.expectFile("access.jsonl", "{\"a\":1}\n");
     try fixture.expectFile("usage.jsonl", "{\"u\":1}\n");
+    try fixture.expectFile("workers.jsonl", "{\"w\":1}\n");
     try fixture.expectFile("console.txt", "[w] hello\n");
 
     // A second open appends after what the first one wrote.
@@ -176,8 +179,9 @@ test "a full buffer refuses or drops whole records and a flush frees the room" {
 }
 
 test "a refusal makes a stream full until a flush makes room for the largest record it refused" {
-    // Only the start of a full usage stream logs, once, at `err`.
-    @import("root").expect_log_errors = 1;
+    // Only the start of a full usage or workers stream logs, once each, at
+    // `err`.
+    @import("root").expect_log_errors = 2;
     var fixture: Fixture = undefined;
     try fixture.init();
     defer fixture.deinit();
@@ -204,6 +208,16 @@ test "a refusal makes a stream full until a flush makes room for the largest rec
     try std.testing.expect(sink.full(.usage));
     try std.testing.expectEqual(@as(u64, 2), sink.stats(.usage).refused);
 
+    // Worker lines are lost for good too when their stream refuses one, so
+    // its full episode logs the same way.
+    const workers_fit = sink_mod.workers_buffer_bytes_max / (record.len + 1);
+    appended = 0;
+    while (appended < workers_fit) : (appended += 1)
+        try sink.append(.workers, record);
+    try std.testing.expect(!sink.full(.workers));
+    try std.testing.expectError(error.SinkBufferFull, sink.append(.workers, record));
+    try std.testing.expect(sink.full(.workers));
+
     // A stream that drops instead of refusing is full the same way.
     const logs_fit = sink_mod.logs_buffer_bytes_max / (record.len + 1);
     appended = 0;
@@ -216,6 +230,7 @@ test "a refusal makes a stream full until a flush makes room for the largest rec
 
     sink.flush(0);
     try std.testing.expect(!sink.full(.usage));
+    try std.testing.expect(!sink.full(.workers));
     try std.testing.expect(!sink.full(.logs));
 }
 
@@ -465,6 +480,7 @@ test "without a directory record streams count what they discard and the console
     try std.testing.expect(!sink.enabled(.logs));
     try std.testing.expect(!sink.enabled(.access));
     try std.testing.expect(!sink.enabled(.usage));
+    try std.testing.expect(!sink.enabled(.workers));
     try std.testing.expect(sink.enabled(.console));
 
     // A disabled stream accepts the record, so a producer that retries on

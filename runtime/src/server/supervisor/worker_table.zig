@@ -53,7 +53,8 @@ pub const Record = struct {
     /// The worker's wake set, which every egress session the server builds
     /// for it shares (`ipc.egress_shared.WakeSet`): the record keeps it from
     /// `occupy` until `vacate` closes it. Holding no write end, it never
-    /// keeps the worker's exit from reaching a gateway.
+    /// keeps the worker's exit from reaching a gateway. Empty for a worker
+    /// of a definition without a `network` grant, which has no egress path.
     egress_wake_set: ipc.egress_shared.WakeSet = .{},
     /// The worker definition this storage serves; its pool is
     /// `Supervisor.pools[definition_index]`.

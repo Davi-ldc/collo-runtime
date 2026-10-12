@@ -14,8 +14,9 @@
 //!   before the other lanes hear of the death, so what was forwarded to them
 //!   precedes the notice in their queues.
 //! - Each request of this lane on the dead worker ends with 502, with 504
-//!   when the grace backstop found it past its deadline, or with RST_STREAM
-//!   once its response head went out.
+//!   when the worker died of a deadline (the grace backstop or the metrics
+//!   thread's `owner_overran`) and the request is past its own, or with
+//!   RST_STREAM once its response head went out.
 //! - Every retirement is the reaper's (`queueRetirement`). No kill, exit
 //!   wait, usage drain or cgroup removal runs on the lane.
 
@@ -50,7 +51,7 @@ const final_drain_rounds_max: usize = 64;
 pub fn errorCodeForFault(reason: fault.WorkerFaultReason) CompletedStatus {
     return switch (reason) {
         .allocation_failed, .egress_session_failed => .internal_error,
-        .deadline_grace_expired => .deadline,
+        .deadline_grace_expired, .owner_overran => .deadline,
         .packet_short,
         .packet_too_large,
         .unknown_kind,
@@ -72,8 +73,17 @@ pub fn errorCodeForFault(reason: fault.WorkerFaultReason) CompletedStatus {
         .exited,
         .usage_record_protocol,
         .log_ring_corrupt,
+        .retiring_notice_invalid,
         => .crash,
     };
+}
+
+/// Whether a fault for `reason` means the worker outran a deadline it could
+/// not end: a request's, at the grace backstop, or its VM thread's owner's,
+/// at the metrics thread's watch. Its requests past their own deadline then
+/// answer 504.
+fn diedOfDeadline(reason: fault.WorkerFaultReason) bool {
+    return errorCodeForFault(reason) == .deadline;
 }
 
 /// Whether what a worker wrote before a fault for `reason` is worth reading:
@@ -82,7 +92,12 @@ pub fn errorCodeForFault(reason: fault.WorkerFaultReason) CompletedStatus {
 /// and a failed channel or allocation would fail the read again.
 pub fn finalDrainTrusted(reason: fault.WorkerFaultReason) bool {
     return switch (reason) {
-        .peer_closed, .exited, .deadline_grace_expired, .egress_session_failed => true,
+        .peer_closed,
+        .exited,
+        .deadline_grace_expired,
+        .owner_overran,
+        .egress_session_failed,
+        => true,
         .packet_short,
         .packet_too_large,
         .unknown_kind,
@@ -103,6 +118,7 @@ pub fn finalDrainTrusted(reason: fault.WorkerFaultReason) bool {
         .channel_failed,
         .usage_record_protocol,
         .log_ring_corrupt,
+        .retiring_notice_invalid,
         => false,
     };
 }
@@ -274,9 +290,9 @@ pub fn Methods(comptime Self: type) type {
         }
 
         /// Ends each request of this lane on the worker of registration
-        /// `registration_index`, which is dead for `reason`. A request the
-        /// grace backstop found past its deadline answers 504, every other
-        /// one 502.
+        /// `registration_index`, which is dead for `reason`. When the worker
+        /// died of a deadline, the grace backstop's or an owner's it overran,
+        /// a request past its own deadline answers 504; every other one 502.
         fn finishRequestsOnWorker(
             self: *Self,
             registration_index: u32,
@@ -296,8 +312,8 @@ pub fn Methods(comptime Self: type) type {
                 const slot = &self.requests.entries[request_slot];
                 if (!slot.dispatched() or !slot.worker_key.eql(worker_key))
                     continue;
-                const outcome: RequestOutcome = if (reason == .deadline_grace_expired and now >= slot.deadline_ns)
-                    .deadline_expired
+                const outcome: RequestOutcome = if (diedOfDeadline(reason) and now >= slot.deadline_ns)
+                    .{ .deadline_expired = reason }
                 else
                     .{ .worker_died = .{ .status = status, .reason = reason } };
                 try RequestFinish.finishRequest(self, request_slot, outcome);

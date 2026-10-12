@@ -24,11 +24,10 @@
  * JavaScript exception as COLLO_STATUS_JS_EXCEPTION and stores it there as a
  * new handle; no C++ exception crosses the boundary.
  *
- * FIXME: Some functions cross the boundary without a declaration here, so no
- * shared prototype checks them: collo_tool_generate_module_bytecode and
- * collo_tool_bytecode_release (jsc/runtime/tooling_bytecode.cpp), and the
- * collo_worker_fs_* and collo_runtime_fs_fault_* functions that
- * host_functions/node/fs.cpp declares in an extern "C" block of its own.
+ * A function that operates on a value Zig hands it, rather than creating one,
+ * takes the ColloRealm* that serves a value with no realm of its own, such as
+ * a primitive: an error it raises for that value belongs to the caller's
+ * realm, never to the main realm. An object keeps working in its own realm.
  */
 #ifndef COLLO_ABI_H
 #define COLLO_ABI_H
@@ -62,10 +61,12 @@ enum {
     /* Module evaluation reached top-level await: the evaluation promise is
        parked and collo_runtime_module_eval_settled reports its settlement. */
     COLLO_STATUS_PENDING = 10,
+    /* The thing asked for does not exist: a file the fs fault's host does not
+       have, or no further entry of a listing. */
+    COLLO_STATUS_NOT_FOUND = 11,
 };
 
 enum {
-    COLLO_ABI_VERSION = 1,
     COLLO_MODULE_PACK_MAX_BYTES = 16 * 1024 * 1024,
     /* The largest file an fs fault materializes. It equals
        `max_fault_file_bytes` in common/limits/fs_fault.zig, as
@@ -76,8 +77,29 @@ enum {
     COLLO_FS_FAULT_MAX_FILE_BYTES = 256 * 1024 * 1024,
 };
 
+/* The owners a worker's VM can hold tokens for at once, and the request ids
+   they use. The first two equal `worker_concurrency_max` and
+   `routes_per_definition_max` in common/limits/server.zig, and root.zig checks
+   the values derived from them at compile time. */
 enum {
-    COLLO_VM_OPTION_DISABLE_WEBAPIS = 1u << 0,
+    COLLO_WORKER_CONCURRENCY_MAX = 16,
+    COLLO_ROUTES_PER_DEFINITION_MAX = 64,
+    /* The microtask owner table: every request a worker runs at once, at most
+       one module evaluation per route (routes that share a module instance
+       share one), and the worker owner, which owns the JavaScript no request
+       or evaluation owns. */
+    COLLO_OWNER_SLOT_COUNT = COLLO_WORKER_CONCURRENCY_MAX + COLLO_ROUTES_PER_DEFINITION_MAX + 1,
+};
+
+/* The largest id a dispatched request carries. The ids above it name the
+   owners that are not requests: one per module evaluation and, at UINT64_MAX,
+   the worker owner. The console charges them no per-request budget. */
+#define COLLO_REQUEST_ID_MAX (UINT64_MAX - COLLO_ROUTES_PER_DEFINITION_MAX - 1)
+
+/* The flags of collo_vm_create. */
+enum {
+    /* Creates the VM without the Web API globals. */
+    COLLO_VM_CREATE_DISABLE_WEB_APIS = 1u << 0,
 };
 
 typedef struct ColloVm ColloVm;
@@ -90,6 +112,7 @@ typedef struct ColloPromiseDeferred ColloPromiseDeferred;
 typedef struct ColloCryptoJob ColloCryptoJob;
 typedef struct ColloOwnedByteSegments ColloOwnedByteSegments;
 typedef struct ColloOwnedHeaderBlock ColloOwnedHeaderBlock;
+typedef struct ColloResponseBodyStream ColloResponseBodyStream;
 
 typedef struct {
     const uint8_t* ptr;
@@ -139,37 +162,30 @@ enum {
     COLLO_TERMINATION_DEADLINE = 5,
 };
 
-/* A request's execution context as the bridge sees it: identity, deadline,
-   CPU time and termination reason. Everything else about the request lives in
-   the Zig request context that holds this struct. */
+/* The execution context of one owner of JavaScript: a request, a module
+   evaluation or the worker itself. The bridge reads only its identity and
+   uses its address as the owner's key; it keeps no clock, so the CPU an owner
+   spends is counted in Zig, at the turn boundaries and the owner transition
+   hook. Everything else about the owner lives in the Zig struct that holds
+   this one. */
 typedef struct ColloExecCtx {
-    /* The request's id, set from its dispatch and never changed. */
+    /* The owner's id: a dispatched request's, never changed, or one above
+       COLLO_REQUEST_ID_MAX. Host calls report it to the collo_runtime_*
+       functions, and the console and collo_webapi_cleanup_request key the
+       state the owner creates by it. */
     uint64_t request_id;
 
-    /* The request's absolute CLOCK_MONOTONIC deadline in ns, or 0 for none.
+    /* The owner's absolute CLOCK_MONOTONIC deadline in ns, or 0 for none.
        The worker's sentinel enforces it; the bridge does not read it. */
     uint64_t deadline_monotonic_ns;
 
-    /* CPU ns the request's turns used, which the bridge adds at each turn
-       exit or owner hand-over as CLOCK_THREAD_CPUTIME_ID minus
-       turn_cpu_start_ns. */
-    uint64_t cpu_used_ns_total;
-
-    /* CLOCK_THREAD_CPUTIME_ID when the current turn started, or 0 outside a
-       turn. */
-    uint64_t turn_cpu_start_ns;
-
     /* Why the request ended, a ColloTerminationReason; NONE while it runs.
-       Zig decides and writes it before worker-fatal cleanup. */
+       Zig decides and writes it before worker-fatal cleanup; the bridge does
+       not read it. */
     uint8_t termination_reason;
 
-    uint8_t _reserved[7];
+    uint8_t reserved0[7];
 } ColloExecCtx;
-
-typedef struct {
-    uint32_t abi_version;
-    uint32_t flags;
-} ColloVmOptions;
 
 /* The seeds collo_vm_reseed_after_fork gives a forked VM, so a worker's random
    state differs from the zygote's. */
@@ -203,20 +219,6 @@ enum {
     COLLO_MODULE_LIFETIME_EVICTABLE = 0,
     COLLO_MODULE_LIFETIME_PERMANENT = 1,
 };
-
-typedef uint8_t ColloModuleType;
-
-enum {
-    COLLO_MODULE_TYPE_ESM = 0,
-};
-
-typedef struct ColloModuleRegisterOptions {
-    uint32_t abi_size;
-    uint8_t lifetime;
-    uint8_t module_type;
-    uint16_t reserved0;
-    uint32_t flags;
-} ColloModuleRegisterOptions;
 
 typedef struct ColloModuleEvictStats {
     size_t sources_removed;
@@ -291,6 +293,7 @@ enum {
     COLLO_EXTRACTED_RESPONSE_BODY_BYTES = 1,
     COLLO_EXTRACTED_RESPONSE_BODY_BYTE_SEGMENTS = 2,
     COLLO_EXTRACTED_RESPONSE_BODY_FETCH_STREAM = 3,
+    COLLO_EXTRACTED_RESPONSE_BODY_READABLE_STREAM = 4,
 };
 
 typedef struct ColloByteSegment {
@@ -299,12 +302,16 @@ typedef struct ColloByteSegment {
 
 typedef struct ColloExtractedResponseBody {
     uint32_t kind;
-    uint32_t flags;
+    uint32_t reserved0;
     size_t total_len;
     const ColloByteSegment* segments;
     size_t segments_len;
     ColloOwnedByteSegments* owner;
     ColloFetchBodyIdentity stream_identity;
+    /* For COLLO_EXTRACTED_RESPONSE_BODY_READABLE_STREAM: the Response's
+       ReadableStream, locked for the embedder, which reads it through the
+       collo_response_body_stream_* functions. Owned like `owner`. */
+    ColloResponseBodyStream* body_stream;
 } ColloExtractedResponseBody;
 
 typedef struct ColloHeaderView {
@@ -312,7 +319,6 @@ typedef struct ColloHeaderView {
     uint32_t name_len;
     uint32_t value_offset;
     uint32_t value_len;
-    uint32_t flags;
 } ColloHeaderView;
 
 typedef struct ColloExtractedHeaderBlock {
@@ -326,7 +332,9 @@ typedef struct ColloExtractedHeaderBlock {
    released only by collo_response_extract_free() unless the embedder takes
    ownership and nulls the corresponding owner pointer. If body.kind is
    COLLO_EXTRACTED_RESPONSE_BODY_FETCH_STREAM, body.stream_identity is
-   transferred to the caller and is not released by collo_response_extract_free(). */
+   transferred to the caller and is not released by collo_response_extract_free();
+   body.body_stream is released by it unless the embedder takes it and nulls
+   the pointer. */
 typedef struct ColloExtractedResponse {
     ColloExtractedResponseBody body;
     ColloExtractedHeaderBlock headers;
@@ -341,23 +349,111 @@ typedef struct ColloResponseExtractLimits {
     size_t max_header_bytes;
 } ColloResponseExtractLimits;
 
+/* What one read of a ColloResponseBodyStream returned. */
+typedef uint32_t ColloResponseBodyStreamResult;
+enum {
+    COLLO_RESPONSE_BODY_STREAM_RESULT_CHUNK = 0,
+    COLLO_RESPONSE_BODY_STREAM_RESULT_DONE = 1,
+    COLLO_RESPONSE_BODY_STREAM_RESULT_ERROR = 2,
+};
+
+/* The reason collo_response_body_stream_cancel gives the stream, built in its
+   realm: an AbortError for a client's reset or a response that ended early, a
+   TypeError for a chunk that is not bytes. */
+typedef uint32_t ColloResponseBodyStreamCancel;
+enum {
+    COLLO_RESPONSE_BODY_STREAM_CANCEL_CLIENT_RESET = 0,
+    COLLO_RESPONSE_BODY_STREAM_CANCEL_RESPONSE_FAILED = 1,
+    COLLO_RESPONSE_BODY_STREAM_CANCEL_INVALID_CHUNK = 2,
+};
+
+/* A chunk's bytes: lent from the chunk's buffer when `owner` is null, else
+   held by `owner`, which the caller releases with
+   collo_owned_byte_segments_destroy. */
+typedef struct ColloResponseBodyChunk {
+    ColloBuffer bytes;
+    ColloOwnedByteSegments* owner;
+} ColloResponseBodyChunk;
+
+/* What the engine measures its memory against, from collo_memory_status. */
+typedef struct ColloMemoryStatus {
+    /* Bytes in use: the decimal the memory status override's descriptor
+       holds, or the engine's own resident-size reading without an override. */
+    uint64_t footprint_bytes;
+    /* footprint_bytes over the override's limit, or over the engine's own
+       figure for available memory, capped at 1 and scaled to parts per
+       million, rounded to the nearest. */
+    uint32_t in_use_per_million;
+    uint32_t reserved0;
+} ColloMemoryStatus;
+
+/* The VM's heap, from collo_vm_heap_stats. */
+typedef struct ColloHeapStats {
+    /* JSC's Heap::size(): the bytes of the cells the last collection marked,
+       plus extra_memory_bytes. A cell allocated since that collection counts
+       only once a later collection marks it, so between collections this
+       trails the heap's real size. */
+    uint64_t size_bytes;
+    /* JSC's Heap::extraMemorySize(): memory outside the heap that cells
+       report as theirs, ArrayBuffer contents included. */
+    uint64_t extra_memory_bytes;
+} ColloHeapStats;
+
+/* The namespace collo_runtime_fs_route sorts a path into
+   (worker/fs/index.zig describes each). */
+typedef uint8_t ColloFsRouteClass;
+
+enum {
+    /* Outside every namespace: ENOENT on a read, EROFS on a mutation. */
+    COLLO_FS_ROUTE_NONE = 0,
+    /* /tmp and below, the writable tmpfs, where node:fs issues real syscalls. */
+    COLLO_FS_ROUTE_TMP = 1,
+    /* A file of the read-only tree, answered from the worker's fs index. */
+    COLLO_FS_ROUTE_DEPLOY_FILE = 2,
+    /* A directory of the read-only tree, or a virtual ancestor of its root. */
+    COLLO_FS_ROUTE_DEPLOY_DIR = 3,
+};
+
+enum {
+    /* A normalized path buffer with its trailing NUL: PATH_MAX, which is
+       `max_normalized_bytes` in worker/fs/index.zig. */
+    COLLO_FS_PATH_BYTES_MAX = 4096,
+    /* The longest name a listing of the tree returns: `path_bytes_max` in
+       common/ipc/fs_index.zig, since a name is part of an index path. */
+    COLLO_FS_NAME_BYTES_MAX = 1024,
+};
+
+/* The cursor that starts a collo_runtime_fs_readdir_next listing. */
+#define COLLO_FS_READDIR_CURSOR_START UINT64_MAX
+
+/* The output of collo_runtime_fs_route. Cleared, it names no namespace. */
+typedef struct ColloFsRoute {
+    /* A DEPLOY_FILE's size from the index; 0 otherwise. */
+    uint64_t size;
+    /* The index's mtime_ms for DEPLOY_FILE and DEPLOY_DIR; 0 otherwise. */
+    uint64_t mtime_ms;
+    /* Bytes of the normalized path before its NUL. */
+    uint32_t normalized_len;
+    /* A ColloFsRouteClass. */
+    uint8_t route_class;
+    uint8_t reserved0;
+    uint16_t reserved1;
+} ColloFsRoute;
+
 COLLO_STATIC_ASSERT(sizeof(ColloMapping) == 16, "ColloMapping ABI size mismatch");
 COLLO_STATIC_ASSERT(offsetof(ColloMapping, ptr) == 0, "ColloMapping.ptr offset mismatch");
 COLLO_STATIC_ASSERT(offsetof(ColloMapping, len) == 8, "ColloMapping.len offset mismatch");
 
-COLLO_STATIC_ASSERT(sizeof(ColloExecCtx) == 40, "ColloExecCtx ABI size mismatch");
+COLLO_STATIC_ASSERT(COLLO_OWNER_SLOT_COUNT == 81, "COLLO_OWNER_SLOT_COUNT mismatch");
+COLLO_STATIC_ASSERT(COLLO_REQUEST_ID_MAX == UINT64_MAX - 65, "COLLO_REQUEST_ID_MAX mismatch");
+
+COLLO_STATIC_ASSERT(sizeof(ColloExecCtx) == 24, "ColloExecCtx ABI size mismatch");
 COLLO_STATIC_ASSERT(offsetof(ColloExecCtx, request_id) == 0, "ColloExecCtx.request_id offset mismatch");
 COLLO_STATIC_ASSERT(
     offsetof(ColloExecCtx, deadline_monotonic_ns) == 8, "ColloExecCtx.deadline_monotonic_ns offset mismatch");
-COLLO_STATIC_ASSERT(offsetof(ColloExecCtx, cpu_used_ns_total) == 16, "ColloExecCtx.cpu_used_ns_total offset mismatch");
-COLLO_STATIC_ASSERT(offsetof(ColloExecCtx, turn_cpu_start_ns) == 24, "ColloExecCtx.turn_cpu_start_ns offset mismatch");
 COLLO_STATIC_ASSERT(
-    offsetof(ColloExecCtx, termination_reason) == 32, "ColloExecCtx.termination_reason offset mismatch");
-COLLO_STATIC_ASSERT(offsetof(ColloExecCtx, _reserved) == 33, "ColloExecCtx._reserved offset mismatch");
-
-COLLO_STATIC_ASSERT(sizeof(ColloVmOptions) == 8, "ColloVmOptions ABI size mismatch");
-COLLO_STATIC_ASSERT(offsetof(ColloVmOptions, abi_version) == 0, "ColloVmOptions.abi_version offset mismatch");
-COLLO_STATIC_ASSERT(offsetof(ColloVmOptions, flags) == 4, "ColloVmOptions.flags offset mismatch");
+    offsetof(ColloExecCtx, termination_reason) == 16, "ColloExecCtx.termination_reason offset mismatch");
+COLLO_STATIC_ASSERT(offsetof(ColloExecCtx, reserved0) == 17, "ColloExecCtx.reserved0 offset mismatch");
 
 COLLO_STATIC_ASSERT(sizeof(ColloFetchInit) == 80, "ColloFetchInit ABI size mismatch");
 COLLO_STATIC_ASSERT(offsetof(ColloFetchInit, request_id) == 0, "ColloFetchInit.request_id offset mismatch");
@@ -390,18 +486,6 @@ COLLO_STATIC_ASSERT(sizeof(ColloRequestIdentity) == 16, "ColloRequestIdentity AB
 COLLO_STATIC_ASSERT(offsetof(ColloRequestIdentity, request_id) == 0, "ColloRequestIdentity.request_id offset mismatch");
 COLLO_STATIC_ASSERT(
     offsetof(ColloRequestIdentity, request_generation) == 8, "ColloRequestIdentity.request_generation offset mismatch");
-
-COLLO_STATIC_ASSERT(sizeof(ColloModuleRegisterOptions) == 12, "ColloModuleRegisterOptions ABI size mismatch");
-COLLO_STATIC_ASSERT(
-    offsetof(ColloModuleRegisterOptions, abi_size) == 0, "ColloModuleRegisterOptions.abi_size offset mismatch");
-COLLO_STATIC_ASSERT(
-    offsetof(ColloModuleRegisterOptions, lifetime) == 4, "ColloModuleRegisterOptions.lifetime offset mismatch");
-COLLO_STATIC_ASSERT(
-    offsetof(ColloModuleRegisterOptions, module_type) == 5, "ColloModuleRegisterOptions.module_type offset mismatch");
-COLLO_STATIC_ASSERT(
-    offsetof(ColloModuleRegisterOptions, reserved0) == 6, "ColloModuleRegisterOptions.reserved0 offset mismatch");
-COLLO_STATIC_ASSERT(
-    offsetof(ColloModuleRegisterOptions, flags) == 8, "ColloModuleRegisterOptions.flags offset mismatch");
 
 COLLO_STATIC_ASSERT(sizeof(ColloModuleEvictStats) == 16, "ColloModuleEvictStats ABI size mismatch");
 COLLO_STATIC_ASSERT(
@@ -453,10 +537,10 @@ COLLO_STATIC_ASSERT(
 COLLO_STATIC_ASSERT(sizeof(ColloByteSegment) == 16, "ColloByteSegment ABI size mismatch");
 COLLO_STATIC_ASSERT(offsetof(ColloByteSegment, bytes) == 0, "ColloByteSegment.bytes offset mismatch");
 
-COLLO_STATIC_ASSERT(sizeof(ColloExtractedResponseBody) == 72, "ColloExtractedResponseBody ABI size mismatch");
+COLLO_STATIC_ASSERT(sizeof(ColloExtractedResponseBody) == 80, "ColloExtractedResponseBody ABI size mismatch");
 COLLO_STATIC_ASSERT(offsetof(ColloExtractedResponseBody, kind) == 0, "ColloExtractedResponseBody.kind offset mismatch");
 COLLO_STATIC_ASSERT(
-    offsetof(ColloExtractedResponseBody, flags) == 4, "ColloExtractedResponseBody.flags offset mismatch");
+    offsetof(ColloExtractedResponseBody, reserved0) == 4, "ColloExtractedResponseBody.reserved0 offset mismatch");
 COLLO_STATIC_ASSERT(
     offsetof(ColloExtractedResponseBody, total_len) == 8, "ColloExtractedResponseBody.total_len offset mismatch");
 COLLO_STATIC_ASSERT(
@@ -467,13 +551,14 @@ COLLO_STATIC_ASSERT(
     offsetof(ColloExtractedResponseBody, owner) == 32, "ColloExtractedResponseBody.owner offset mismatch");
 COLLO_STATIC_ASSERT(offsetof(ColloExtractedResponseBody, stream_identity) == 40,
     "ColloExtractedResponseBody.stream_identity offset mismatch");
+COLLO_STATIC_ASSERT(
+    offsetof(ColloExtractedResponseBody, body_stream) == 72, "ColloExtractedResponseBody.body_stream offset mismatch");
 
-COLLO_STATIC_ASSERT(sizeof(ColloHeaderView) == 20, "ColloHeaderView ABI size mismatch");
+COLLO_STATIC_ASSERT(sizeof(ColloHeaderView) == 16, "ColloHeaderView ABI size mismatch");
 COLLO_STATIC_ASSERT(offsetof(ColloHeaderView, name_offset) == 0, "ColloHeaderView.name_offset offset mismatch");
 COLLO_STATIC_ASSERT(offsetof(ColloHeaderView, name_len) == 4, "ColloHeaderView.name_len offset mismatch");
 COLLO_STATIC_ASSERT(offsetof(ColloHeaderView, value_offset) == 8, "ColloHeaderView.value_offset offset mismatch");
 COLLO_STATIC_ASSERT(offsetof(ColloHeaderView, value_len) == 12, "ColloHeaderView.value_len offset mismatch");
-COLLO_STATIC_ASSERT(offsetof(ColloHeaderView, flags) == 16, "ColloHeaderView.flags offset mismatch");
 
 COLLO_STATIC_ASSERT(sizeof(ColloExtractedHeaderBlock) == 40, "ColloExtractedHeaderBlock ABI size mismatch");
 COLLO_STATIC_ASSERT(
@@ -485,14 +570,14 @@ COLLO_STATIC_ASSERT(
 COLLO_STATIC_ASSERT(
     offsetof(ColloExtractedHeaderBlock, owner) == 32, "ColloExtractedHeaderBlock.owner offset mismatch");
 
-COLLO_STATIC_ASSERT(sizeof(ColloExtractedResponse) == 120, "ColloExtractedResponse ABI size mismatch");
+COLLO_STATIC_ASSERT(sizeof(ColloExtractedResponse) == 128, "ColloExtractedResponse ABI size mismatch");
 COLLO_STATIC_ASSERT(offsetof(ColloExtractedResponse, body) == 0, "ColloExtractedResponse.body offset mismatch");
-COLLO_STATIC_ASSERT(offsetof(ColloExtractedResponse, headers) == 72, "ColloExtractedResponse.headers offset mismatch");
-COLLO_STATIC_ASSERT(offsetof(ColloExtractedResponse, status) == 112, "ColloExtractedResponse.status offset mismatch");
+COLLO_STATIC_ASSERT(offsetof(ColloExtractedResponse, headers) == 80, "ColloExtractedResponse.headers offset mismatch");
+COLLO_STATIC_ASSERT(offsetof(ColloExtractedResponse, status) == 120, "ColloExtractedResponse.status offset mismatch");
 COLLO_STATIC_ASSERT(
-    offsetof(ColloExtractedResponse, reserved0) == 114, "ColloExtractedResponse.reserved0 offset mismatch");
+    offsetof(ColloExtractedResponse, reserved0) == 122, "ColloExtractedResponse.reserved0 offset mismatch");
 COLLO_STATIC_ASSERT(
-    offsetof(ColloExtractedResponse, reserved1) == 116, "ColloExtractedResponse.reserved1 offset mismatch");
+    offsetof(ColloExtractedResponse, reserved1) == 124, "ColloExtractedResponse.reserved1 offset mismatch");
 
 COLLO_STATIC_ASSERT(sizeof(ColloResponseExtractLimits) == 24, "ColloResponseExtractLimits ABI size mismatch");
 COLLO_STATIC_ASSERT(offsetof(ColloResponseExtractLimits, max_body_bytes) == 0,
@@ -501,6 +586,30 @@ COLLO_STATIC_ASSERT(offsetof(ColloResponseExtractLimits, max_header_count) == 8,
     "ColloResponseExtractLimits.max_header_count offset mismatch");
 COLLO_STATIC_ASSERT(offsetof(ColloResponseExtractLimits, max_header_bytes) == 16,
     "ColloResponseExtractLimits.max_header_bytes offset mismatch");
+
+COLLO_STATIC_ASSERT(sizeof(ColloResponseBodyChunk) == 24, "ColloResponseBodyChunk ABI size mismatch");
+COLLO_STATIC_ASSERT(offsetof(ColloResponseBodyChunk, bytes) == 0, "ColloResponseBodyChunk.bytes offset mismatch");
+COLLO_STATIC_ASSERT(offsetof(ColloResponseBodyChunk, owner) == 16, "ColloResponseBodyChunk.owner offset mismatch");
+
+COLLO_STATIC_ASSERT(sizeof(ColloMemoryStatus) == 16, "ColloMemoryStatus ABI size mismatch");
+COLLO_STATIC_ASSERT(
+    offsetof(ColloMemoryStatus, footprint_bytes) == 0, "ColloMemoryStatus.footprint_bytes offset mismatch");
+COLLO_STATIC_ASSERT(
+    offsetof(ColloMemoryStatus, in_use_per_million) == 8, "ColloMemoryStatus.in_use_per_million offset mismatch");
+COLLO_STATIC_ASSERT(offsetof(ColloMemoryStatus, reserved0) == 12, "ColloMemoryStatus.reserved0 offset mismatch");
+
+COLLO_STATIC_ASSERT(sizeof(ColloHeapStats) == 16, "ColloHeapStats ABI size mismatch");
+COLLO_STATIC_ASSERT(offsetof(ColloHeapStats, size_bytes) == 0, "ColloHeapStats.size_bytes offset mismatch");
+COLLO_STATIC_ASSERT(
+    offsetof(ColloHeapStats, extra_memory_bytes) == 8, "ColloHeapStats.extra_memory_bytes offset mismatch");
+
+COLLO_STATIC_ASSERT(sizeof(ColloFsRoute) == 24, "ColloFsRoute ABI size mismatch");
+COLLO_STATIC_ASSERT(offsetof(ColloFsRoute, size) == 0, "ColloFsRoute.size offset mismatch");
+COLLO_STATIC_ASSERT(offsetof(ColloFsRoute, mtime_ms) == 8, "ColloFsRoute.mtime_ms offset mismatch");
+COLLO_STATIC_ASSERT(offsetof(ColloFsRoute, normalized_len) == 16, "ColloFsRoute.normalized_len offset mismatch");
+COLLO_STATIC_ASSERT(offsetof(ColloFsRoute, route_class) == 20, "ColloFsRoute.route_class offset mismatch");
+COLLO_STATIC_ASSERT(offsetof(ColloFsRoute, reserved0) == 21, "ColloFsRoute.reserved0 offset mismatch");
+COLLO_STATIC_ASSERT(offsetof(ColloFsRoute, reserved1) == 22, "ColloFsRoute.reserved1 offset mismatch");
 
 #undef COLLO_STATIC_ASSERT
 
@@ -514,6 +623,13 @@ void collo_runtime_mapping_release(ColloMapping mapping);
 /* If value is non-null, runtime consumes it on every call, including non-OK. */
 ColloStatus collo_runtime_complete_request_task(void* runtime, uint32_t slot, uint32_t generation, uint64_t request_id,
     uint64_t request_generation, ColloValue* value, uint8_t is_error);
+/* Reports the outcome of one read collo_response_body_stream_read started for
+   request `request_id`: CHUNK with the read's value, DONE with none, ERROR
+   with the rejection reason, or with none when no handle could be made. The
+   bridge calls it on the VM thread from a microtask the read registered,
+   under that request's owner. `value` is consumed on every call. */
+void collo_runtime_response_body_stream_settled(
+    void* runtime, uint64_t request_id, ColloResponseBodyStreamResult result, ColloValue* value);
 /* Settlement of a module evaluation previously returned as
    COLLO_STATUS_PENDING, called on the VM thread from inside a microtask
    drain. realm_index is the evaluating realm's (collo_realm_index), since one
@@ -521,7 +637,10 @@ ColloStatus collo_runtime_complete_request_task(void* runtime, uint32_t slot, ui
    duration of the call; the runtime copies what it needs and only enqueues,
    so no JS runs. */
 void collo_runtime_module_eval_settled(void* runtime, uint32_t realm_index, ColloString specifier, uint8_t resolved);
-/* Runtime owns job on OK. On non-OK, caller still owns job. */
+/* Runtime owns job on OK. On non-OK, caller still owns job, and the status
+   names the cause: COLLO_STATUS_INVALID_ARGUMENT for a call outside an active
+   request turn or an invalid job, COLLO_STATUS_ERROR when the in-flight bound
+   is full, COLLO_STATUS_UNSUPPORTED when the crypto pool is not running. */
 ColloStatus collo_runtime_crypto_job_enqueue(void* runtime, uint64_t request_id, ColloCryptoJob* job);
 /* If deferred is non-null, Zig owns once passed, including non-OK. On OK,
    *out_fetch_id names the fetch for collo_runtime_fetch_cancel, or is 0 when
@@ -571,6 +690,61 @@ ColloStatus collo_runtime_clear_timeout(void* runtime, uint64_t request_id, uint
 ColloStatus collo_runtime_set_immediate(void* runtime, uint64_t request_id, ColloValue* callback, ColloValue* this_arg,
     ColloValue** args, size_t args_len, uint64_t* out_immediate_id);
 ColloStatus collo_runtime_clear_immediate(void* runtime, uint64_t request_id, uint64_t immediate_id);
+
+/* The worker's file tree, which only node:fs (host_functions/node/fs.cpp)
+   calls, on the VM thread. worker/fs/index.zig owns the namespaces and the
+   process-wide index the first three read; worker/fs/fault.zig owns the
+   faults. Paths are UTF-8 borrowed for the call, and every out-parameter is
+   cleared on entry. */
+
+/* Normalizes `path` against the worker's cwd and sorts it into a namespace.
+   On OK, out_path holds the normalized path followed by a NUL, which the
+   binding hands to its syscalls as is, and *out_route is filled. A path that
+   belongs to no namespace is OK with COLLO_FS_ROUTE_NONE. A path whose
+   normalized form needs more than COLLO_FS_PATH_BYTES_MAX - 1 bytes, or a
+   null path with a length, fails with COLLO_STATUS_INVALID_ARGUMENT. A null
+   out-parameter, an out_path_cap below COLLO_FS_PATH_BYTES_MAX or a worker
+   with no index installed fails with COLLO_STATUS_ERROR. */
+ColloStatus collo_runtime_fs_route(ColloString path, uint8_t* out_path, size_t out_path_cap, ColloFsRoute* out_route);
+/* One child of `dir`, the normalized path of a directory collo_runtime_fs_route
+   sorted into COLLO_FS_ROUTE_DEPLOY_DIR, per call. The caller starts *cursor
+   at COLLO_FS_READDIR_CURSOR_START and passes back what each call leaves
+   there. On OK, out_name holds the child's name without a NUL, *out_name_len
+   its length and *out_is_dir whether it is a directory. Past the last child
+   the call fails with COLLO_STATUS_NOT_FOUND. A null argument, a dir that is
+   not such a directory, a cursor this listing never produced, a name longer
+   than out_name_cap or a worker with no index fails with COLLO_STATUS_ERROR.
+   Stateless: the cursor is the listing's whole state. */
+ColloStatus collo_runtime_fs_readdir_next(ColloString dir, uint64_t* cursor, uint8_t* out_name, size_t out_name_cap,
+    uint32_t* out_name_len, uint8_t* out_is_dir);
+/* Where the tmpfs copy of the tree file `path`, a normalized path under the
+   tree's root, lives: on OK, out_path holds it followed by a NUL and *out_len
+   its length without the NUL. In a worker it is `path` itself; the in-process
+   test install copies files elsewhere, which is why a read after a fault asks.
+   Fails with COLLO_STATUS_ERROR for a null argument, a path outside the tree
+   or equal to its root, a buffer too short or a worker with no index. */
+ColloStatus collo_runtime_fs_materialized_path(
+    ColloString path, uint8_t* out_path, size_t out_path_cap, size_t* out_len);
+/* Parks a promise-returning read of the tree file `path`, a normalized path,
+   that has no copy yet, owned by request_id, and on OK names the fault in
+   *out_fault_id. deferred is consumed on every call, including non-OK: Zig
+   settles it on the event loop once the copy exists, resolving with
+   undefined, or releases it unsettled on failure. COLLO_STATUS_INVALID_ARGUMENT
+   for a null runtime, deferred or out_fault_id, request id 0 or an empty path;
+   COLLO_STATUS_ERROR when the fault cannot be scheduled. */
+ColloStatus collo_runtime_fs_fault_read_file(
+    void* runtime, uint64_t request_id, ColloString path, ColloPromiseDeferred* deferred, uint64_t* out_fault_id);
+/* Blocks the VM thread until the tree file `path` is copied into the tmpfs,
+   for a synchronous read; worker/fs/fault_sync.zig bounds the wait. OK once
+   the copy exists; COLLO_STATUS_NOT_FOUND when the host has no such file;
+   COLLO_STATUS_INVALID_ARGUMENT for a null runtime, request id 0 or an empty
+   path; COLLO_STATUS_ERROR for any other failure. */
+ColloStatus collo_runtime_fs_fault_sync(void* runtime, uint64_t request_id, ColloString path);
+/* Records that node:fs read the existing copy of the tree file `path`
+   directly, which keeps the copy from the idle sweep. A null runtime or path
+   records nothing. */
+void collo_runtime_fs_fault_hit_local(void* runtime, ColloString path);
+
 ColloStatus collo_webapi_immediate_mark_destroyed(ColloVm* vm, const ColloValue* value);
 /* Builds a handler's Request in `realm` from init (see ColloRequestInit). A
    VM that is not ready, a zero request id, an empty authority, or a nonzero
@@ -583,9 +757,34 @@ ColloStatus collo_response_new(
     ColloRealm* realm, const ColloResponseInit* init, ColloValue** out_value, ColloValue** out_exception);
 ColloStatus collo_fetch_response_new(
     ColloRealm* realm, const ColloFetchResponseInit* init, ColloValue** out_value, ColloValue** out_exception);
-ColloStatus collo_response_extract(ColloVm* vm, const ColloValue* value, const ColloResponseExtractLimits* limits,
+/* Converts a handler's result into a native response within `limits`: a
+   Response object as it is, any other value as a 200 whose body is its string
+   conversion. The conversion and its errors run in `realm` for a value with no
+   realm of its own. */
+ColloStatus collo_response_extract(ColloRealm* realm, const ColloValue* value, const ColloResponseExtractLimits* limits,
     ColloExtractedResponse* out_response, ColloValue** out_exception);
 void collo_response_extract_free(ColloExtractedResponse* response);
+/* Starts one read of `stream` for request `request_id`; its result reaches
+   collo_runtime_response_body_stream_settled. The first call fixes the
+   request, and a later call naming another fails with
+   COLLO_STATUS_INVALID_ARGUMENT. Runs the stream's pull, so the caller is
+   inside a turn of that request. One read at a time: the caller waits for a
+   read's result before it starts the next. */
+ColloStatus collo_response_body_stream_read(
+    ColloResponseBodyStream* stream, uint64_t request_id, ColloValue** out_exception);
+/* The bytes of `chunk`, a value a read of `stream` returned. An ArrayBuffer or
+   ArrayBufferView is lent in place until the next call into the VM; a string
+   is encoded to UTF-8 in `out_chunk->owner`. Any other value, or a detached or
+   out-of-bounds buffer, fails with COLLO_STATUS_JS_EXCEPTION and a TypeError.
+   `out_chunk` is cleared on entry. */
+ColloStatus collo_response_body_stream_chunk(ColloResponseBodyStream* stream, const ColloValue* chunk,
+    ColloResponseBodyChunk* out_chunk, ColloValue** out_exception);
+/* Cancels `stream` with the reason `reason` names. Runs the stream's cancel
+   algorithm, so the caller is inside a turn of the request that reads it. */
+ColloStatus collo_response_body_stream_cancel(
+    ColloResponseBodyStream* stream, ColloResponseBodyStreamCancel reason, ColloValue** out_exception);
+/* Frees `stream`; safe on any thread and after collo_vm_destroy. */
+void collo_response_body_stream_destroy(ColloResponseBodyStream* stream);
 void collo_owned_byte_segments_destroy(ColloOwnedByteSegments* owner);
 void collo_owned_header_block_destroy(ColloOwnedHeaderBlock* owner);
 /* Releases the Web API state request_id owns in the VM and in every realm:
@@ -593,8 +792,10 @@ void collo_owned_header_block_destroy(ColloOwnedHeaderBlock* owner);
 ColloStatus collo_webapi_cleanup_request(ColloVm* vm, uint64_t request_id);
 
 /* Creates a fully initialized VM in *out_vm, which the caller owns until
-   collo_vm_destroy, with its main realm. */
-ColloStatus collo_vm_create(const ColloVmOptions* options, ColloVm** out_vm);
+   collo_vm_destroy, with its main realm and its deferred-work wakeup gate.
+   `flags` holds COLLO_VM_CREATE_* bits; any other bit fails with
+   COLLO_STATUS_UNSUPPORTED. */
+ColloStatus collo_vm_create(uint32_t flags, ColloVm** out_vm);
 /* The realm created with the VM, or null when the VM is not ready. */
 ColloRealm* collo_vm_main_realm(ColloVm* vm);
 /* Adds a realm to the VM and stores it in *out_realm. The new global gets
@@ -638,51 +839,59 @@ ColloStatus collo_vm_collect_full_gc_and_trim(ColloVm* vm);
    when a write barrier remembered them, so a cell that gained an edge to a new
    cell without the barrier loses that cell here. */
 ColloStatus collo_vm_collect_eden_gc(ColloVm* vm);
+/* Reads the heap's size and the extra memory its cells report into *out,
+   which is cleared on entry. Inside or outside a turn. */
+ColloStatus collo_vm_heap_stats(ColloVm* vm, ColloHeapStats* out);
 /* Cross-thread cooperative termination trap. The caller must keep the ColloVm
    object alive. If VM destroy has begun, this returns invalid argument. */
 ColloStatus collo_vm_request_termination(ColloVm* vm);
 ColloStatus collo_vm_set_host_runtime(ColloVm* vm, void* runtime);
-/* Workers only: installs the boot exec context, the identity turnless JS
-   (module evaluation and its microtask drains) resolves to when no request
-   turn is active. It is never turn-entered and its deadline stays 0; the
-   worker runtime enforces the evaluation budget. The zygote's warmup VM never
-   calls this, so evaluation on a bare VM finds no context. */
-ColloStatus collo_vm_set_boot_exec_ctx(ColloVm* vm, uint64_t request_id);
-/* Workers only: uninstalls the boot exec context when the boot context closes,
-   once the evaluation of every route's entry settled. From then on turnless
-   JS finds no context, and the dynamic-import fallback and the console's boot
-   exemption close with it. Idempotent: clearing a context never installed is
-   OK. */
-ColloStatus collo_vm_clear_boot_exec_ctx(ColloVm* vm);
-/* Registers exec_ctx as a microtask owner and returns its token, or 0 if the
-   table is full. Idempotent: the same pointer always maps to the same live
-   token. collo_turn_enter registers on its own, so the worker only needs this
-   if it wants a token before the first turn.
+/* Owners. JavaScript running on a VM belongs to one ColloExecCtx or to none:
+   the context the outermost turn installed, or the one a restored continuation
+   installed for its duration (below); else, outside every turn and every
+   restored continuation, the turnless context; else none. Host calls report
+   that owner's request_id to the collo_runtime_* functions and fail without
+   one, the console stamps its lines with it, and a promise reaction records
+   it, as a token, when it is registered.
 
-   A promise reaction registered by this request can outlive it, as when one
-   request awaits a module-scope promise and the next settles it, so the
-   reaction stores this token, never the pointer. */
-uint64_t collo_vm_acquire_exec_ctx(ColloVm* vm, ColloExecCtx* exec_ctx);
-/* Required before the ColloExecCtx storage dies: frees the slot and drops
-   current_exec_ctx if it still points there. A microtask still carrying the
-   released token then resolves to "no owner", the fallback turnless JS takes,
-   instead of reading freed memory. Idempotent. */
+   A reaction runs under the owner that registered it, not under the turn that
+   settles its promise: the drain restores the recorded owner around it, and
+   around the work it enqueues in turn. The record is a token, never the
+   pointer, because a reaction can outlive its owner, as when one request
+   awaits a module-scope promise and the next settles it; a token whose owner
+   was released restores no owner. */
+
+/* Installs `exec_ctx` as the turnless context, the owner of JavaScript that
+   runs outside every turn and every restored continuation: module evaluation
+   and the microtask drains inside it. A reaction such code registers records
+   this context, so it runs under it whoever settles its promise later. NULL
+   uninstalls. The pointer is borrowed until collo_vm_release_exec_ctx
+   releases it: replacing or uninstalling it does not end the borrow, since a
+   reaction its code registered holds a token that resolves to this pointer
+   and installs it when the reaction runs. Inside a turn the call is allowed
+   but has no effect until the turn ends. A VM that is not ready fails with
+   COLLO_STATUS_INVALID_ARGUMENT. */
+ColloStatus collo_vm_set_turnless_exec_ctx(ColloVm* vm, ColloExecCtx* exec_ctx);
+/* Required before the ColloExecCtx storage dies: frees its token and
+   uninstalls it where it is the current or the turnless context. Every
+   reaction still carrying the token then runs with no owner instead of
+   reading freed memory. Call it outside JavaScript, between turns: a call
+   while a restored continuation runs ends the process, since the
+   continuation would put the released pointer back when it ends. Idempotent. */
 ColloStatus collo_vm_release_exec_ctx(ColloVm* vm, ColloExecCtx* exec_ctx);
 /* Microtasks this VM ran under a restored owner: promise reactions whose
-   registrant was not the request draining the queue. Monotonic and never
-   reset. */
+   registrant was not the owner draining the queue. Monotonic and never reset. */
 uint64_t collo_vm_owner_crossings(ColloVm* vm);
 
-/* Called in pairs whenever a microtask drain hands execution from one request
-   to another and back: `leaving` gives up the turn, `entering` takes it. Either
-   may be NULL, which means turnless execution: module evaluation, or an owner
-   whose request already ended. Runs on the VM thread with the JS lock held and
-   must not re-enter the VM.
+/* Called in pairs around each restored continuation whose owner differs from
+   the owner it interrupts: (interrupted, restored) before it runs and
+   (restored, interrupted) after. Both sides are owners as defined above, so a
+   turnless drain's side is the turnless context, and a reaction drained under
+   the owner that registered it causes no call. NULL means no owner. Runs on
+   the VM thread with the JS lock held and must not re-enter the VM.
 
-   The hook reports only the identity change, for the deadline arbiter and the
-   request timeline, which live outside this ABI. CPU time is not reported:
-   `cpu_used_ns_total` and `turn_cpu_start_ns` are fields of this ABI, and the
-   bridge moves the slice itself. */
+   The bridge keeps no clock: an embedder that charges CPU or enforces
+   deadlines per owner moves its windows here and at the turn boundaries. */
 typedef void (*ColloOwnerTransitionHook)(void* ctx, ColloExecCtx* leaving, ColloExecCtx* entering);
 ColloStatus collo_vm_set_owner_transition_hook(ColloVm* vm, ColloOwnerTransitionHook hook, void* ctx);
 
@@ -701,9 +910,9 @@ enum {
    ColloConsoleLevel. `flags` bit 0: the line was truncated at the registered
    byte budget. `flags` bit 1: the per-request output budget dropped the line,
    so bytes is null and len 0, a marker to count and never a line. The two bits
-   are never set together. `request_id` is the live turn's identity: the boot
-   identity for turnless JS, 0 on a bare VM. The sink must not call back into
-   the VM. */
+   are never set together. `request_id` is the request_id of the owner of the
+   JavaScript that logged, or 0 when it has none. The sink must not call back
+   into the VM. */
 typedef void (*ColloConsoleSink)(
     void* ctx, uint8_t level, uint8_t flags, uint64_t request_id, const uint8_t* bytes, size_t len);
 
@@ -714,7 +923,10 @@ typedef void (*ColloConsoleSink)(
    at. `request_lines_max` and `request_bytes_max` are the per-request output
    budgets: past either, the formatter stops formatting for that request and
    each suppressed call reaches the sink as a flags bit 1 marker, until
-   collo_webapi_cleanup_request clears the request's budget. All three must be
+   collo_webapi_cleanup_request clears the request's budget. They apply to the
+   ids of dispatched requests only: output with no owner or under an id above
+   COLLO_REQUEST_ID_MAX is never charged, and the sink's consumer bounds it
+   instead. All three must be
    above 0 when `sink` is non-null. Registration resets every per-request
    budget. A null sink unregisters. */
 ColloStatus collo_vm_set_console_sink(ColloVm* vm, ColloConsoleSink sink, void* sink_ctx, size_t line_bytes_max,
@@ -729,12 +941,51 @@ ColloStatus collo_vm_install_process(ColloVm* vm);
    worker is inside its chroot and seccomp confinement. No other VM calls it.
    Idempotent. */
 ColloStatus collo_vm_enable_node_fs_for_worker(ColloVm* vm);
+/* The process-global engine settings below are not scoped to a ColloVm and
+   take no API lock; each one says which thread may call it. */
 ColloStatus collo_prepare_process_for_fork(void);
+/* Replaces the idle timeout of every engine helper thread (JSC's compiler and
+   collector threads, WTF's AutomaticThread). A short one lets the zygote's
+   threads retire before it forks; one longer than the worker's life pins a
+   worker's threads, which its seccomp filter would never let it start again.
+   Any thread; a change wakes the parked threads so they apply it. */
 ColloStatus collo_set_helper_threads_timeout_override_ns(uint64_t timeout_ns);
-void collo_clear_helper_threads_timeout_override(void);
-/* Process-global WebKit GC heap override, not scoped to a single ColloVm. */
+/* Makes a helper thread that waited `idle_ns` without work release its
+   allocator cache once and go on waiting, which a pinned thread needs because
+   libpas reclaims another thread's cache only by suspending it with a signal
+   the worker's filter denies. Set it, like the timeout, after
+   collo_vm_post_fork_child and before collo_vm_prespawn_compiler_threads:
+   the post-fork registry reset means a later change never reaches threads
+   parked before it. 0 fails with COLLO_STATUS_INVALID_ARGUMENT. Any thread. */
+ColloStatus collo_set_helper_threads_cache_release_ns(uint64_t idle_ns);
+/* Clears the helper-thread timeout and cache release, so helper threads
+   behave as the engine's defaults. collo_vm_post_fork_child calls it too. */
+void collo_clear_helper_threads_overrides(void);
+/* Stops the calling thread's allocators and returns its cache to the
+   allocator, as an idle helper thread does after its cache release. Any
+   thread, VM-free. Never called between collo_vm_prepare_for_fork and a fork,
+   where the zygote's memory must stay as prepared. */
+void collo_allocator_release_thread_cache(void);
+/* The engine's GC heap ceiling, which a worker sets from its memory limit. */
 ColloStatus collo_set_gc_max_heap_size_override_bytes(uint64_t bytes);
 void collo_clear_gc_max_heap_size_override(void);
+/* Makes the engine measure its memory as the decimal byte count at offset 0
+   of `memory_current_fd`, a cgroup v2 memory.current file, against
+   `limit_bytes`, instead of its own resident size against the machine's
+   memory; its critical-memory collections then follow the worker's limit. The
+   descriptor is borrowed until collo_clear_memory_status_override returns, in
+   a worker for its whole life, and each reading costs one pread of it.
+   collo_vm_post_fork_child clears it, so a fork child never reads its
+   parent's descriptor and sets its own after that call. A zero
+   limit, a limit above SIZE_MAX or a negative descriptor fails with
+   COLLO_STATUS_INVALID_ARGUMENT. */
+ColloStatus collo_set_memory_status_override(uint64_t limit_bytes, int32_t memory_current_fd);
+/* Returns the engine to its own memory reading; once it returns, no thread
+   reads the override's descriptor. */
+void collo_clear_memory_status_override(void);
+/* The engine's current memory status into *out, which is cleared on entry.
+   A null `out` fails with COLLO_STATUS_INVALID_ARGUMENT. Any thread. */
+ColloStatus collo_memory_status(ColloMemoryStatus* out);
 
 /* Modules live in memory only and are registered a pack at a time. A module
    that no registered pack holds fails to load with an Error that names it. */
@@ -745,9 +996,10 @@ void collo_clear_gc_max_heap_size_override(void);
    bytes in place, then releases the mapping before returning unless a
    registered module keeps it, in which case the release comes when the last
    SourceProvider pointing into it dies. The caller must not read pack.ptr
-   after the call. options is borrowed for the call; null means an evictable
-   ESM pack. */
-ColloStatus collo_module_register_pack(ColloVm* vm, ColloMapping pack, const ColloModuleRegisterOptions* options);
+   after the call. Every module is an ES module; `lifetime` is a
+   ColloModuleLifetime, and any other value fails with
+   COLLO_STATUS_INVALID_ARGUMENT. */
+ColloStatus collo_module_register_pack(ColloVm* vm, ColloMapping pack, ColloModuleLifetime lifetime);
 /* Removes Collo-owned module providers and cached namespaces only. JSC may keep
    already-fetched/evaluated module records alive until the VM is recycled. */
 ColloStatus collo_module_evict_specifier(ColloVm* vm, ColloString specifier, ColloModuleEvictStats* out_stats);
@@ -765,16 +1017,39 @@ ColloStatus collo_module_evaluate(ColloRealm* realm, ColloString specifier, Coll
 ColloStatus collo_module_get_export(ColloRealm* realm, ColloString specifier, ColloString export_name,
     ColloValue** out_value, ColloValue** out_exception);
 
+/* Serializes the bytecode of one ES module, for a module pack's bytecode
+   segment, through a process-wide tooling VM that holds no ColloVm, on any
+   thread. `specifier` is the exact pack specifier the worker's loader
+   registers the module under; jsc/runtime/tooling_bytecode.cpp lists what
+   else must match the loader. On OK, *out_bytes and *out_len hold the blob,
+   which the caller releases with collo_tool_bytecode_release. An empty source
+   or specifier fails with COLLO_STATUS_INVALID_ARGUMENT, a parse or
+   serialization failure with COLLO_STATUS_ERROR and a failed copy with
+   COLLO_STATUS_OUT_OF_MEMORY. */
+ColloStatus collo_tool_generate_module_bytecode(
+    ColloBuffer source_utf8, ColloString specifier_utf8, uint8_t** out_bytes, size_t* out_len);
+void collo_tool_bytecode_release(uint8_t* bytes);
+
+/* Enters a turn owned by exec_ctx. The outermost enter installs it as the
+   owner, registers its token and holds the microtask drain; a nested enter
+   must pass the owner installed at that moment, which inside a restored
+   continuation is the continuation's. */
 ColloStatus collo_turn_enter(ColloVm* vm, ColloExecCtx* exec_ctx);
-/* Optional diagnostic output, borrowed for this call only. A non-null output
-   exposes __colloBenchHandlerEntered for the synchronous invocation; calling it
-   records CLOCK_MONOTONIC ns once. The fixture calls it as its first statement,
-   so the sample includes JSC preparation and marker dispatch. Zero means no
-   marker ran or the clock failed. Null installs no marker and reads no clock;
-   an existing application property with that name rejects instrumentation. */
-ColloStatus collo_invoke(ColloVm* vm, const ColloExecCtx* expected_ctx, const ColloValue* callable,
+/* Calls `callable` inside the turn `expected_ctx` owns. The call runs in the
+   callable's realm; `realm` serves a callable with none, a primitive, whose
+   TypeError it creates. out_call_started_ns is optional diagnostic output,
+   borrowed for this call only. A non-null output exposes
+   __colloBenchHandlerEntered for the synchronous invocation; calling it
+   records CLOCK_MONOTONIC ns once. The fixture calls it as its first
+   statement, so the sample includes JSC preparation and marker dispatch. Zero
+   means no marker ran or the clock failed. Null installs no marker and reads
+   no clock; an existing application property with that name rejects
+   instrumentation. */
+ColloStatus collo_invoke(ColloRealm* realm, const ColloExecCtx* expected_ctx, const ColloValue* callable,
     const ColloValue* this_value, const ColloValue* const* argv, size_t argc, ColloValue** out_result,
     ColloValue** out_exception, uint64_t* out_call_started_ns);
+/* Leaves the turn; the outermost exit drains the microtask queue first, each
+   reaction under the owner that registered it. */
 ColloStatus collo_turn_exit_ex(ColloVm* vm, ColloValue** out_exception);
 
 /* The worker never runs a JSC RunLoop, so it drives the VM's DeferredWorkTimer
@@ -798,13 +1073,13 @@ ColloStatus collo_turn_exit_ex(ColloVm* vm, ColloValue** out_exception);
    Returns nonzero when work was scheduled since the last call. Never takes
    the JS lock. */
 uint32_t collo_vm_deferred_work_scheduled(ColloVm* vm);
-/* Registers a per-VM timer-set notification that stores the pending flag and
-   then writes `wakeup_fd` (an eventfd) whenever deferred work is scheduled,
-   including from the wasm worklist thread, which is what wakes the blocked
-   worker loop. A new registration supersedes the old one, which goes inert
-   before the new fd is installed. `wakeup_fd < 0` unregisters: call it before
-   closing the fd, as Runtime.deinit does, so a recycled fd number is never
-   written. */
+/* Makes the VM's timer-set notification, registered when the VM was created,
+   write `wakeup_fd` (an eventfd) after it stores the pending flag whenever
+   deferred work is scheduled, including from the wasm worklist thread, which
+   is what wakes the blocked worker loop. It only stores the fd, so it
+   allocates nothing and may run after the worker's seccomp filter. A new fd
+   replaces the old one. `wakeup_fd < 0` unregisters: call it before closing
+   the fd, as Runtime.deinit does, so a recycled fd number is never written. */
 ColloStatus collo_vm_set_deferred_work_wakeup_fd(ColloVm* vm, int32_t wakeup_fd);
 /* Runs every ready deferred task (DeferredWorkTimer::doWork) as one Collo
    turn on `exec_ctx`, then reports what is still pending in `out_state`
@@ -812,18 +1087,26 @@ ColloStatus collo_vm_set_deferred_work_wakeup_fd(ColloVm* vm, int32_t wakeup_fd)
    happens inside doWork, continuations run in the turn's end-of-turn
    microtask drain, and a drain exception surfaces exactly as from
    collo_turn_exit_ex (COLLO_STATUS_JS_EXCEPTION and out_exception). The JSC
-   ticket carries no request identity, so the caller decides whose turn it is.
-   Call it outside any turn, on the VM thread. */
+   ticket carries no owner, so the caller decides whose turn it is; a worker
+   passes its worker owner's context. Call it outside any turn, on the VM
+   thread. */
 ColloStatus collo_vm_pump_deferred_work(
     ColloVm* vm, ColloExecCtx* exec_ctx, uint32_t* out_state, ColloValue** out_exception);
 
 ColloStatus collo_value_retain(ColloValue* value, ColloValue** out_value);
 void collo_value_release(ColloValue* value);
 ColloStatus collo_value_is_callable(ColloVm* vm, const ColloValue* value, uint8_t* out_is_callable);
+/* Whether `value` is an object with a callable `then`. The read runs in the
+   object's realm, or in `realm` for an object with none, and a getter it runs
+   can throw. A primitive is not thenable. */
 ColloStatus collo_value_is_thenable(
-    ColloVm* vm, const ColloValue* value, uint8_t* out_is_thenable, ColloValue** out_exception);
+    ColloRealm* realm, const ColloValue* value, uint8_t* out_is_thenable, ColloValue** out_exception);
+/* The result of an already-settled promise, outside any turn. A value that is
+   not a promise fails with a TypeError of its own realm, or of `realm` for a
+   primitive; a pending promise with a TypeError of its realm and
+   COLLO_STATUS_UNSUPPORTED. */
 ColloStatus collo_promise_await_sync(
-    ColloVm* vm, const ColloValue* promise, ColloValue** out_value, ColloValue** out_exception);
+    ColloRealm* realm, const ColloValue* promise, ColloValue** out_value, ColloValue** out_exception);
 ColloStatus collo_promise_deferred_resolve(
     ColloVm* vm, ColloPromiseDeferred* deferred, const ColloValue* value, ColloValue** out_exception);
 ColloStatus collo_promise_deferred_reject(
@@ -835,8 +1118,12 @@ ColloStatus collo_promise_deferred_reject(
    released, but the returned pointer must not be used. */
 ColloRealm* collo_promise_deferred_realm(const ColloPromiseDeferred* deferred);
 void collo_promise_deferred_release(ColloPromiseDeferred* deferred);
+/* Reports `value`, a handler's result, to collo_runtime_complete_request_task
+   once it settles: it goes through Promise.resolve of its own realm, or of
+   `realm` for a primitive, and the task's settlers are attached to the
+   result. */
 ColloStatus collo_request_task_settle_thenable(
-    ColloVm* vm, const ColloRequestCompletionToken* token, const ColloValue* value, ColloValue** out_exception);
+    ColloRealm* realm, const ColloRequestCompletionToken* token, const ColloValue* value, ColloValue** out_exception);
 /* Runs the job's native work. A crypto pool thread calls it, off the VM
    thread, so the job carries only native data; collo_crypto_job_settle later
    settles its promise on the VM thread. */
@@ -885,15 +1172,20 @@ ColloStatus collo_global_this(ColloRealm* realm, ColloValue** out_value);
 ColloStatus collo_env_object_new(
     ColloRealm* realm, const ColloNameValuePair* entries, size_t entry_count, ColloValue** out_value);
 
+/* Property access on an object, run in the object's realm. A value that is
+   not an object, or not an array for collo_array_set, fails with a TypeError
+   of `realm`, or of its own realm when it is an object. */
 ColloStatus collo_object_get_utf8(
-    ColloVm* vm, const ColloValue* object, ColloString key, ColloValue** out_value, ColloValue** out_exception);
+    ColloRealm* realm, const ColloValue* object, ColloString key, ColloValue** out_value, ColloValue** out_exception);
 ColloStatus collo_object_set_utf8(
-    ColloVm* vm, const ColloValue* object, ColloString key, const ColloValue* value, ColloValue** out_exception);
+    ColloRealm* realm, const ColloValue* object, ColloString key, const ColloValue* value, ColloValue** out_exception);
 ColloStatus collo_array_set(
-    ColloVm* vm, const ColloValue* array, size_t index, const ColloValue* value, ColloValue** out_exception);
+    ColloRealm* realm, const ColloValue* array, size_t index, const ColloValue* value, ColloValue** out_exception);
 
+/* ToString of `value` as UTF-8, run in the value's realm or, for a primitive,
+   in `realm`, whose TypeError a Symbol gets. */
 ColloStatus collo_value_to_utf8_copy(
-    ColloVm* vm, const ColloValue* value, ColloString* out_string, ColloValue** out_exception);
+    ColloRealm* realm, const ColloValue* value, ColloString* out_string, ColloValue** out_exception);
 ColloStatus collo_exception_format(ColloVm* vm, const ColloValue* exception, ColloString* out_string);
 void collo_free_buffer(const void* ptr);
 

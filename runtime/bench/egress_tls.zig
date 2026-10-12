@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const bench_metadata = @import("metadata.zig");
+const local_origin = @import("local_origin.zig");
 const pool_mod = @import("collo_egress_pool");
 
 const data_io = pool_mod.data_io;
@@ -136,9 +137,10 @@ fn runResumptionScenario(
         return error.EgressBenchOriginStartFailed;
     defer collo_test_tls_resumption_origin_stop(origin.?);
 
-    var host_buffer: [64]u8 = undefined;
-    const host = try routableLocalIpv4(&host_buffer);
-    const address = try std.net.Address.parseIp(host, port);
+    const routable = try local_origin.routableLocalIpv4();
+    var host_buffer: [15]u8 = undefined;
+    const host = local_origin.formatIpv4(routable, &host_buffer);
+    const address = std.net.Address.initIp4(routable, port);
     const cell: [16]u8 = [_]u8{7} ** 16;
     // A ticket is only reusable under the offer that produced it, so the key
     // and the handshake must read the same offer.
@@ -205,12 +207,15 @@ fn runSample(allocator: std.mem.Allocator, scenario: Scenario) !Sample {
     defer allocator.free(body);
     @memset(body, 'p');
 
-    var host_buffer: [64]u8 = undefined;
-    const host = try routableLocalIpv4(&host_buffer);
+    const routable = try local_origin.routableLocalIpv4();
+    var host_buffer: [15]u8 = undefined;
+    const host = local_origin.formatIpv4(routable, &host_buffer);
     const url = try std.fmt.allocPrint(allocator, "https://{s}:{d}/bench", .{ host, port });
     defer allocator.free(url);
+    var grant: local_origin.LocalGrant = undefined;
+    try grant.init(routable, &.{port});
     const config = transport.Config{
-        .allow_private_networks = true,
+        .network = grant.policy(),
         .insecure_tls = true,
         .socket_timeout_ms = 15_000,
         .max_response_body_bytes = @max(scenario.response_body_bytes, 1),
@@ -437,44 +442,6 @@ fn envUsize(allocator: std.mem.Allocator, name: []const u8, default: usize) !usi
     };
     defer allocator.free(raw);
     return std.fmt.parseUnsigned(usize, std.mem.trim(u8, raw, " \t\r\n"), 10);
-}
-
-const route_probe_ipv4 = "1.1.1.1";
-const route_probe_port: u16 = 9;
-
-// The egress policy always denies loopback, so the bench reaches its local
-// origins through the machine's default-route source address, as
-// runtime/tests/support/net/local_address.zig does for the tests.
-fn routableLocalIpv4(out: *[64]u8) ![]const u8 {
-    const address = try defaultRouteSourceAddress();
-    (transport.EgressPolicy{ .allow_private_networks = true }).validateResolvedAddress(address) catch {
-        std.debug.print("egress_tls: default-route source address is not egress-permitted\n", .{});
-        return error.BenchNoRoutableLocalAddress;
-    };
-    const bytes = transport.ipv4Bytes(address);
-    return std.fmt.bufPrint(out, "{d}.{d}.{d}.{d}", .{ bytes[0], bytes[1], bytes[2], bytes[3] });
-}
-
-fn defaultRouteSourceAddress() !std.net.Address {
-    const remote = try std.net.Address.parseIp4(route_probe_ipv4, route_probe_port);
-    const socket = try std.posix.socket(
-        std.posix.AF.INET,
-        std.posix.SOCK.DGRAM | std.posix.SOCK.CLOEXEC,
-        0,
-    );
-    defer std.posix.close(socket);
-
-    // UDP connect does not send a packet; it only asks the kernel which source
-    // address would be used for a normal routed connection.
-    try std.posix.connect(socket, &remote.any, remote.getOsSockLen());
-
-    var storage: std.posix.sockaddr.storage = undefined;
-    var storage_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
-    try std.posix.getsockname(socket, @ptrCast(&storage), &storage_len);
-    if (storage.family != std.posix.AF.INET)
-        return error.BenchNoRoutableLocalAddress;
-    const socket_address: *align(4) const std.posix.sockaddr = @ptrCast(&storage);
-    return std.net.Address.initPosix(socket_address);
 }
 
 fn printJsonSample(path: Path, scenario: Scenario, iteration: usize, sample: Sample) void {

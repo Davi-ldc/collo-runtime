@@ -1,6 +1,7 @@
 //! The scheduler's policy numbers: the memory levels that gate pool growth
-//! and drive the reaper, and the capacity of each worker definition's pool.
-//! Consumers import them from here instead of repeating them.
+//! and drive the reaper, and the launches each worker definition's pool may
+//! have in flight. Consumers import them from here instead of repeating
+//! them; the pool's own bounds live in `common/limits/pool.zig`.
 //!
 //! Each number is a policy choice tied to a metric that says which way to
 //! move it (`skills/runtime/references/internals/scheduler.md`), so a
@@ -11,11 +12,9 @@
 const std = @import("std");
 
 /// Memory levels, in percent of the memory `readMemoryPressure` in
-/// `reaper/memory.zig` reads: the server's own cgroup against its
-/// `memory.max`, or the machine's `/proc/meminfo` when that cgroup has no
-/// limit. In the delegated placement the server's cgroup is `<own>/main`,
-/// which it creates without a limit, so the levels are of the machine's
-/// memory.
+/// `reaper/memory.zig` reads: the highest share in use of any bound above
+/// the runtime, the machine's `/proc/meminfo` and the `memory.max` of every
+/// cgroup above the workers and the server (`MemoryDomains`).
 ///
 /// The high water does not cap pool growth. Launches continue above it, and
 /// the room up to `fork_deny_percent` absorbs load while more nodes come up;
@@ -104,15 +103,19 @@ pub const memory = struct {
     /// A count bound under the time budget, so that a clock that does not
     /// advance cannot leave a sweep unbounded.
     pub const sweep_cap_max: usize = 256;
+    /// The cgroup directories a node memory reading watches, every ancestor
+    /// of the workers' cgroup and of the server's. The kernel caps a cgroup
+    /// v2 hierarchy's depth only by `cgroup.max.depth`, unlimited by default,
+    /// but a systemd slice, a container runtime and the delegated subtree
+    /// together nest well under this; a deeper limit is left out with a
+    /// warning (`MemoryDomains.init`).
+    pub const cgroup_ancestors_max: usize = 32;
 };
 
-/// The capacity of one worker definition's pool (`pool.zig`).
+/// The launch capacity of one worker definition's pool (`pool.zig`). Its
+/// table entries, `pool_workers_max`, are a bound other processes read, so
+/// they live in `common/limits/pool.zig`.
 pub const capacity = struct {
-    /// Table entries of one pool: the workers of one definition that are
-    /// live, retiring, dead or launching at once. A safety belt so a single
-    /// definition cannot swallow the machine; the real ceiling is the memory
-    /// gate.
-    pub const pool_workers_max: u32 = 16;
     /// Launches one pool may have in flight at once. The launcher and the
     /// zygote serve one fork at a time for the whole node, so the cap keeps
     /// a burst on one definition from queueing every other definition's

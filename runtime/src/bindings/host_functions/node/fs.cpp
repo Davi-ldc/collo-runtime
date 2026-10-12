@@ -4,7 +4,7 @@
 // `fs.promises` twins, and take no callback. It runs on the VM thread of a worker, which installs it after its seccomp
 // filter, and it is the one place the bridge performs file I/O.
 //
-// Every path is first routed through collo_worker_fs_route, and worker/fs/index.zig defines the namespaces it sorts
+// Every path is first routed through collo_runtime_fs_route, and worker/fs/index.zig defines the namespaces it sorts
 // paths into. A /tmp path reaches the real syscalls. A path in the read-only tree is answered from the index, and
 // every mutation there fails with EROFS. Reading a file of the tree that is not yet copied into the tmpfs faults it
 // in through worker/fs/fault.zig: a promise-returning read parks its promise, which settles on the event loop, and a
@@ -32,6 +32,7 @@
 #include <JavaScriptCore/JSNativeStdFunction.h>
 #include <JavaScriptCore/JSPromise.h>
 #include <JavaScriptCore/JSString.h>
+#include <wtf/StdLibExtras.h>
 #include <wtf/Vector.h>
 #include <wtf/text/CString.h>
 #include <wtf/text/MakeString.h>
@@ -45,60 +46,14 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
-// Zig exports that abi.h does not declare: the routing calls of worker/fs/index.zig, which documents them and keeps the
-// twin of every route constant below, and the fault entry points of worker/host/fs_fault.zig.
-// FIXME: cpp.md allows extern "C" only on definitions of functions abi.h declares, so these belong in abi.h.
-extern "C" {
-
-// Laid out like RouteInfo in worker/fs/index.zig.
-struct ColloWorkerFsRouteInfo {
-    uint64_t size;
-    uint64_t mtimeMs;
-    uint32_t normalizedLen;
-    uint32_t reserved;
-};
-
-int32_t collo_worker_fs_route(
-    const char* path, size_t pathLen, char* outPath, size_t outPathCap, ColloWorkerFsRouteInfo* outInfo);
-
-int32_t collo_worker_fs_readdir_next(const char* dir, size_t dirLen, uint64_t* cursor, char* outName, size_t outNameCap,
-    uint32_t* outNameLen, uint8_t* outIsDir);
-
-// The path of a file's copy in the tmpfs: the normalized path itself in a worker, but under another root in the
-// in-process test install, which is why the read after an async fault asks instead of assuming. Returns the length
-// written or a negative route error.
-int32_t collo_worker_fs_materialized_path(const char* path, size_t pathLen, char* outPath, size_t outPathCap);
-
-// Parks a promise-returning read of a file of the tree that is not yet in the tmpfs. Takes `deferred` on every path,
-// including a non-zero return, and settles it on the worker's event loop.
-int collo_runtime_fs_fault_read_file(void* runtime, uint64_t requestId, const char* path, size_t pathLen,
-    ColloPromiseDeferred* deferred, uint64_t* outFaultId);
-
-// Blocks the VM thread until the file is copied into the tmpfs or the request's deadline passes. Returns
-// faultSyncStatusOk once the copy exists, faultSyncStatusNotFound when the file does not exist, and another value for
-// any other failure.
-int collo_runtime_fs_fault_sync(void* runtime, uint64_t requestId, const char* path, size_t pathLen);
-
-// Records a direct read of an existing copy: it traces `worker.fs_fault.hit_local` and stamps the copy's last read,
-// which keeps the idle sweep from evicting it (`recordLocalHit` in worker/fs/copies.zig).
-void collo_runtime_fs_fault_hit_local(void* runtime, const char* path, size_t pathLen);
-
-} // extern "C"
-
 namespace {
 
-// Copies of the route_class_* and route_error_* constants in worker/fs/index.zig.
-constexpr int32_t routeClassTmp = 0;
-constexpr int32_t routeClassDeployFile = 1;
-constexpr int32_t routeClassDeployDir = 2;
-constexpr int32_t routeClassNone = 3;
-constexpr int32_t routeErrorTooLong = -1;
-// `max_normalized_bytes` in worker/fs/index.zig, PATH_MAX with the NUL; collo_worker_fs_route refuses a smaller buffer.
-constexpr size_t routePathCapacity = 4096;
-// `path_bytes_max` in common/ipc/fs_index.zig plus one. A name arrives without a NUL, so the last byte is spare.
-constexpr size_t routeNameCapacity = 1025;
-// `readdir_cursor_start` in worker/fs/index.zig.
-constexpr uint64_t readdirCursorStart = ~0ull;
+// A path as the collo_runtime_fs_* functions take it: the bytes of `path`, borrowed for the call.
+ColloString fsPathArgument(std::span<const char> path)
+{
+    auto bytes = byteCast<uint8_t>(path);
+    return { bytes.empty() ? nullptr : bytes.data(), bytes.size() };
+}
 
 constexpr size_t readChunkBytes = 16 * 1024;
 // The largest file of the read-only tree a read accepts: abi.h's copy of `max_fault_file_bytes` in
@@ -228,34 +183,51 @@ FsResult ok(JSC::JSValue value) { return { value, JSC::jsUndefined(), true }; }
 FsResult fail(JSC::JSValue error) { return { JSC::jsUndefined(), error, false }; }
 
 struct RoutedPath {
-    int32_t klass { routeClassNone };
+    ColloFsRouteClass klass { COLLO_FS_ROUTE_NONE };
     uint64_t size { 0 };
     uint64_t mtimeMs { 0 };
     uint32_t normalizedLen { 0 };
     // The normalized absolute path with a trailing NUL, which the syscalls receive as is: inside a worker, lexical
     // resolution names the file the kernel would (`normalizePath` in worker/fs/index.zig says why).
-    char normalized[routePathCapacity];
+    char normalized[COLLO_FS_PATH_BYTES_MAX];
+
+    std::span<const char> normalizedPath() const { return std::span { normalized }.first(normalizedLen); }
 };
+
+// Routes `path` into `out`. Returns the collo_runtime_fs_route status: COLLO_STATUS_INVALID_ARGUMENT for a path too
+// long to normalize, another failure for no installed index or a misused call.
+ColloStatus routePath(const WTF::CString& path, RoutedPath& out)
+{
+    ColloFsRoute route {};
+    ColloStatus status = collo_runtime_fs_route(fsPathArgument(path.span()),
+        byteCast<uint8_t>(std::span { out.normalized }).data(), sizeof(out.normalized), &route);
+    if (status != COLLO_STATUS_OK)
+        return status;
+    // Checked rather than trusted: the syscalls read up to the NUL at this length, and a class this file does not
+    // know would otherwise fall through to the /tmp branch of a caller and reach a real syscall.
+    if (route.normalized_len >= sizeof(out.normalized) || route.route_class > COLLO_FS_ROUTE_DEPLOY_DIR)
+        return COLLO_STATUS_ERROR;
+    out.klass = route.route_class;
+    out.size = route.size;
+    out.mtimeMs = route.mtime_ms;
+    out.normalizedLen = route.normalized_len;
+    return COLLO_STATUS_OK;
+}
 
 bool routeFsPath(JSC::JSGlobalObject* globalObject, JSC::VM& vm, const WTF::CString& path,
     WTF::ASCIILiteral syscallName, RoutedPath& out, JSC::JSValue& outError)
 {
-    ColloWorkerFsRouteInfo info {};
-    int32_t klass = collo_worker_fs_route(path.data(), path.length(), out.normalized, sizeof(out.normalized), &info);
-    if (klass == routeErrorTooLong) {
+    ColloStatus status = routePath(path, out);
+    if (status == COLLO_STATUS_INVALID_ARGUMENT) {
         outError = createFsError(globalObject, vm, ENAMETOOLONG, syscallName, path);
         return false;
     }
-    if (klass < 0) {
-        // Any other negative value means no installed index or a misused call, a worker bug rather than anything the
-        // caller did, so the operation fails with EIO.
+    if (status != COLLO_STATUS_OK) {
+        // No installed index or a misused call, a worker bug rather than anything the caller did, so the operation
+        // fails with EIO.
         outError = createFsError(globalObject, vm, EIO, syscallName, path);
         return false;
     }
-    out.klass = klass;
-    out.size = info.size;
-    out.mtimeMs = info.mtimeMs;
-    out.normalizedLen = info.normalizedLen;
     return true;
 }
 
@@ -567,7 +539,7 @@ FsResult statOperation(JSC::JSGlobalObject* globalObject, JSC::CallFrame* callFr
     if (!routeFsPath(globalObject, vm, path, "stat"_s, routed, error))
         return fail(error);
 
-    if (routed.klass == routeClassTmp) {
+    if (routed.klass == COLLO_FS_ROUTE_TMP) {
         struct stat statBuffer;
         if (sysNewFstatAt(routed.normalized, &statBuffer) != 0)
             return fail(createFsError(globalObject, vm, errno, "stat"_s, path));
@@ -576,9 +548,9 @@ FsResult statOperation(JSC::JSGlobalObject* globalObject, JSC::CallFrame* callFr
     }
     // A path in the tree is answered from the index: a file reports its size, both kinds report the index's
     // `deploy_epoch_ms` as mtime, and the modes are read-only.
-    if (routed.klass == routeClassDeployFile)
+    if (routed.klass == COLLO_FS_ROUTE_DEPLOY_FILE)
         return ok(makeStatObject(globalObject, vm, routed.size, S_IFREG | 0444, static_cast<double>(routed.mtimeMs)));
-    if (routed.klass == routeClassDeployDir)
+    if (routed.klass == COLLO_FS_ROUTE_DEPLOY_DIR)
         return ok(makeStatObject(globalObject, vm, 0, S_IFDIR | 0555, static_cast<double>(routed.mtimeMs)));
     return fail(createFsError(globalObject, vm, ENOENT, "stat"_s, path));
 }
@@ -595,14 +567,11 @@ FsResult existsOperation(JSC::JSGlobalObject* globalObject, JSC::CallFrame* call
 
     // A routing failure, such as a path too long or no installed index, answers false instead of throwing.
     RoutedPath routed;
-    ColloWorkerFsRouteInfo info {};
-    int32_t klass
-        = collo_worker_fs_route(path.data(), path.length(), routed.normalized, sizeof(routed.normalized), &info);
-    if (klass < 0)
+    if (routePath(path, routed) != COLLO_STATUS_OK)
         return ok(JSC::jsBoolean(false));
-    if (klass == routeClassDeployFile || klass == routeClassDeployDir)
+    if (routed.klass == COLLO_FS_ROUTE_DEPLOY_FILE || routed.klass == COLLO_FS_ROUTE_DEPLOY_DIR)
         return ok(JSC::jsBoolean(true));
-    if (klass == routeClassNone)
+    if (routed.klass != COLLO_FS_ROUTE_TMP)
         return ok(JSC::jsBoolean(false));
 
     struct stat statBuffer;
@@ -685,9 +654,9 @@ FsResult scheduleDeployReadFault(JSC::JSGlobalObject* globalObject, JSC::ThrowSc
     }
 
     uint64_t fault_id = 0;
-    int status = collo_runtime_fs_fault_read_file(runtime.host_runtime, runtime.exec_ctx->request_id, routed.normalized,
-        routed.normalizedLen, deferred_promise.value.deferred, &fault_id);
-    if (status != 0) {
+    ColloStatus status = collo_runtime_fs_fault_read_file(runtime.host_runtime, runtime.exec_ctx->request_id,
+        fsPathArgument(routed.normalizedPath()), deferred_promise.value.deferred, &fault_id);
+    if (status != COLLO_STATUS_OK) {
         // Zig took the deferred although the call failed and released it unsettled, so nothing references the
         // promise any more and the collector reclaims it.
         return fail(createFsError(globalObject, vm, EIO, "openat"_s, path));
@@ -700,16 +669,17 @@ FsResult scheduleDeployReadFault(JSC::JSGlobalObject* globalObject, JSC::ThrowSc
     // The fault resolves its promise with undefined once the copy exists (`resolveWaiters` in
     // worker/fs/fault_completion.zig). The value the caller sees comes from the reaction chained below, which reads the
     // copy and applies the encoding the same way a synchronous read does.
-    WTF::CString normalizedCopy(std::span<const char> { routed.normalized, routed.normalizedLen });
+    WTF::CString normalizedCopy(routed.normalizedPath());
     auto* settled = JSC::JSNativeStdFunction::create(vm, globalObject, 1, "fsFaultSettleRead"_s,
         [path, normalizedCopy, output](JSC::JSGlobalObject* lambdaGlobal, JSC::CallFrame*) -> JSC::EncodedJSValue {
             JSC::VM& lambdaVm = lambdaGlobal->vm();
             auto lambdaScope = DECLARE_THROW_SCOPE(lambdaVm);
-            // The copy may live outside the normalized path, as collo_worker_fs_materialized_path explains.
-            char physical[routePathCapacity];
-            int32_t physicalLen = collo_worker_fs_materialized_path(
-                normalizedCopy.data(), normalizedCopy.length(), physical, sizeof(physical));
-            if (physicalLen < 0) {
+            // The copy may live outside the normalized path, as collo_runtime_fs_materialized_path explains.
+            char physical[COLLO_FS_PATH_BYTES_MAX];
+            size_t physicalLen = 0;
+            ColloStatus physicalStatus = collo_runtime_fs_materialized_path(fsPathArgument(normalizedCopy.span()),
+                byteCast<uint8_t>(std::span { physical }).data(), sizeof(physical), &physicalLen);
+            if (physicalStatus != COLLO_STATUS_OK || physicalLen >= sizeof(physical)) {
                 return JSC::JSValue::encode(JSC::throwException(
                     lambdaGlobal, lambdaScope, createFsError(lambdaGlobal, lambdaVm, EIO, "read"_s, path)));
             }
@@ -750,9 +720,6 @@ FsResult scheduleDeployReadFault(JSC::JSGlobalObject* globalObject, JSC::ThrowSc
     return result;
 }
 
-constexpr int faultSyncStatusOk = 0;
-constexpr int faultSyncStatusNotFound = 3;
-
 // Faults a file of the tree in for a synchronous read, blocking the VM thread until the copy exists or the request's
 // deadline passes, then reads the copy at the normalized path, where a worker keeps it. `faultSync` in
 // worker/fs/fault_sync.zig owns the wait and explains why a timeout cannot outlast the request. A file the host does
@@ -766,16 +733,16 @@ FsResult syncDeployReadFault(JSC::JSGlobalObject* globalObject, JSC::VM& vm, con
         return fail(createFsError(globalObject, vm, ENOENT, "openat"_s, path));
     }
 
-    int status = collo_runtime_fs_fault_sync(
-        runtime.host_runtime, runtime.exec_ctx->request_id, routed.normalized, routed.normalizedLen);
-    if (status == faultSyncStatusNotFound)
+    ColloStatus status = collo_runtime_fs_fault_sync(
+        runtime.host_runtime, runtime.exec_ctx->request_id, fsPathArgument(routed.normalizedPath()));
+    if (status == COLLO_STATUS_NOT_FOUND)
         return fail(createFsError(globalObject, vm, ENOENT, "openat"_s, path));
-    if (status != faultSyncStatusOk)
+    if (status != COLLO_STATUS_OK)
         return fail(createFsError(globalObject, vm, EIO, "openat"_s, path));
 
     // No local hit is recorded, for the reason given in scheduleDeployReadFault.
     // FIXME: this open and the direct one in readFileOperation use the normalized path instead of asking
-    // collo_worker_fs_materialized_path, so under the in-process test install they miss the copy.
+    // collo_runtime_fs_materialized_path, so under the in-process test install they miss the copy.
     int deployFd = sysOpenAt(routed.normalized, O_RDONLY | O_CLOEXEC, 0);
     if (deployFd < 0)
         return fail(createFsError(globalObject, vm, errno, "openat"_s, path));
@@ -799,7 +766,7 @@ FsResult readFileOperation(JSC::JSGlobalObject* globalObject, JSC::CallFrame* ca
     RoutedPath routed;
     if (!routeFsPath(globalObject, vm, path, "openat"_s, routed, error))
         return fail(error);
-    if (routed.klass == routeClassDeployFile) {
+    if (routed.klass == COLLO_FS_ROUTE_DEPLOY_FILE) {
         // A copy already in the tmpfs is read directly, and the read is recorded as a local hit.
         int deployFd = sysOpenAt(routed.normalized, O_RDONLY | O_CLOEXEC, 0);
         if (deployFd >= 0) {
@@ -807,7 +774,7 @@ FsResult readFileOperation(JSC::JSGlobalObject* globalObject, JSC::CallFrame* ca
             if (collo_global) {
                 void* host_runtime = Collo::HostFunctions::Runtime::hostRuntime(collo_global->owner());
                 if (host_runtime)
-                    collo_runtime_fs_fault_hit_local(host_runtime, routed.normalized, routed.normalizedLen);
+                    collo_runtime_fs_fault_hit_local(host_runtime, fsPathArgument(routed.normalizedPath()));
             }
             return readDeployFileExact(globalObject, vm, path, deployFd, output);
         }
@@ -821,9 +788,9 @@ FsResult readFileOperation(JSC::JSGlobalObject* globalObject, JSC::CallFrame* ca
             return scheduleDeployReadFault(globalObject, scope, path, routed, output);
         return syncDeployReadFault(globalObject, vm, path, routed, output);
     }
-    if (routed.klass == routeClassDeployDir)
+    if (routed.klass == COLLO_FS_ROUTE_DEPLOY_DIR)
         return fail(createFsError(globalObject, vm, EISDIR, "read"_s, path));
-    if (routed.klass == routeClassNone)
+    if (routed.klass == COLLO_FS_ROUTE_NONE)
         return fail(createFsError(globalObject, vm, ENOENT, "openat"_s, path));
 
     int fd = sysOpenAt(routed.normalized, O_RDONLY | O_CLOEXEC, 0);
@@ -884,7 +851,7 @@ FsResult writeFileOperation(JSC::JSGlobalObject* globalObject, JSC::CallFrame* c
     if (!routeFsPath(globalObject, vm, path, "openat"_s, routed, error))
         return fail(error);
     // Only /tmp is writable: any other path fails with EROFS, whether or not the index lists it.
-    if (routed.klass != routeClassTmp)
+    if (routed.klass != COLLO_FS_ROUTE_TMP)
         return fail(createFsError(globalObject, vm, EROFS, "openat"_s, path));
 
     int fd = sysOpenAt(routed.normalized, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
@@ -919,7 +886,7 @@ FsResult mkdirOperation(JSC::JSGlobalObject* globalObject, JSC::CallFrame* callF
     RoutedPath routed;
     if (!routeFsPath(globalObject, vm, path, "mkdir"_s, routed, error))
         return fail(error);
-    if (routed.klass != routeClassTmp)
+    if (routed.klass != COLLO_FS_ROUTE_TMP)
         return fail(createFsError(globalObject, vm, EROFS, "mkdir"_s, path));
     if (sysMkdirAt(routed.normalized, 0700) != 0)
         return fail(createFsError(globalObject, vm, errno, "mkdir"_s, path));
@@ -939,7 +906,7 @@ FsResult unlinkOperation(JSC::JSGlobalObject* globalObject, JSC::CallFrame* call
     RoutedPath routed;
     if (!routeFsPath(globalObject, vm, path, "unlink"_s, routed, error))
         return fail(error);
-    if (routed.klass != routeClassTmp)
+    if (routed.klass != COLLO_FS_ROUTE_TMP)
         return fail(createFsError(globalObject, vm, EROFS, "unlink"_s, path));
     if (sysUnlinkAt(routed.normalized) != 0)
         return fail(createFsError(globalObject, vm, errno, "unlink"_s, path));
@@ -966,7 +933,7 @@ FsResult renameOperation(JSC::JSGlobalObject* globalObject, JSC::CallFrame* call
     if (!routeFsPath(globalObject, vm, newPath, "rename"_s, newRouted, error))
         return fail(error);
     // Both ends must be under /tmp; a rename from or into any other namespace fails with EROFS.
-    if (oldRouted.klass != routeClassTmp || newRouted.klass != routeClassTmp)
+    if (oldRouted.klass != COLLO_FS_ROUTE_TMP || newRouted.klass != COLLO_FS_ROUTE_TMP)
         return fail(createFsErrorWithDest(globalObject, vm, EROFS, "rename"_s, oldPath, newPath));
     if (sysRenameAt2(oldRouted.normalized, newRouted.normalized) != 0)
         return fail(createFsErrorWithDest(globalObject, vm, errno, "rename"_s, oldPath, newPath));
@@ -986,34 +953,32 @@ FsResult readdirOperation(JSC::JSGlobalObject* globalObject, JSC::CallFrame* cal
     RoutedPath routed;
     if (!routeFsPath(globalObject, vm, path, "openat"_s, routed, error))
         return fail(error);
-    if (routed.klass == routeClassDeployDir) {
+    if (routed.klass == COLLO_FS_ROUTE_DEPLOY_DIR) {
         // A directory of the tree lists from the index alone: its immediate children in the index's byte order, each
         // subdirectory once. The tree and /tmp never overlap, so nothing local is merged in, and the virtual "/" and
         // "/var" list the namespace roots through the same call. `entries_max` in common/ipc/fs_index.zig bounds a
         // listing.
         auto* array = JSC::constructEmptyArray(globalObject, nullptr);
-        uint64_t cursor = readdirCursorStart;
-        char nameBuffer[routeNameCapacity];
+        uint64_t cursor = COLLO_FS_READDIR_CURSOR_START;
+        uint8_t nameBuffer[COLLO_FS_NAME_BYTES_MAX];
         unsigned index = 0;
         for (;;) {
             uint32_t nameLen = 0;
             uint8_t isDir = 0;
-            int32_t rc = collo_worker_fs_readdir_next(
-                routed.normalized, routed.normalizedLen, &cursor, nameBuffer, sizeof(nameBuffer), &nameLen, &isDir);
-            if (rc == 0)
+            ColloStatus status = collo_runtime_fs_readdir_next(
+                fsPathArgument(routed.normalizedPath()), &cursor, nameBuffer, sizeof(nameBuffer), &nameLen, &isDir);
+            if (status == COLLO_STATUS_NOT_FOUND)
                 break;
-            if (rc < 0)
+            if (status != COLLO_STATUS_OK || nameLen > sizeof(nameBuffer))
                 return fail(createFsError(globalObject, vm, EIO, "getdents64"_s, path));
-            array->putDirectIndex(globalObject, index++,
-                JSC::jsString(vm,
-                    stringFromUtf8Bytes(
-                        std::span<const uint8_t> { reinterpret_cast<const uint8_t*>(nameBuffer), nameLen })));
+            array->putDirectIndex(
+                globalObject, index++, JSC::jsString(vm, stringFromUtf8Bytes(std::span { nameBuffer }.first(nameLen))));
         }
         return ok(array);
     }
-    if (routed.klass == routeClassDeployFile)
+    if (routed.klass == COLLO_FS_ROUTE_DEPLOY_FILE)
         return fail(createFsError(globalObject, vm, ENOTDIR, "openat"_s, path));
-    if (routed.klass == routeClassNone)
+    if (routed.klass == COLLO_FS_ROUTE_NONE)
         return fail(createFsError(globalObject, vm, ENOENT, "openat"_s, path));
 
     int fd = sysOpenAt(routed.normalized, O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);

@@ -35,8 +35,8 @@ public:
     // pulls only while a read is pending and never starts a second pull before the first settles.
     virtual JSC::EncodedJSValue pull(JSC::JSGlobalObject*, JSC::ThrowScope&) = 0;
     // Called when a readable stream is canceled. The stream's cancel promise follows the returned value or promise and
-    // then resolves to undefined, and the stream closes. An exception thrown into the scope propagates out of the
-    // stream's cancel and leaves the stream readable.
+    // then resolves to undefined, and the stream closes. An exception thrown into the scope rejects the stream's
+    // cancel promise with it; the stream closes all the same.
     virtual JSC::EncodedJSValue cancel(JSC::JSGlobalObject*, JSC::ThrowScope&, JSC::JSValue reason) = 0;
     // Moves the unread remainder into two new sources and returns true; the original stream stays locked and never
     // pulls from this source again. Returns false after throwing into the scope, or without an exception when the
@@ -48,7 +48,6 @@ public:
         out_second = nullptr;
         return false;
     }
-    virtual bool appendRemainingBytes(WTF::Vector<uint8_t>&) { return false; }
     // Appends every unread byte to the output in one step and returns true. Returns false with out_supported false
     // when the source cannot drain synchronously, which leaves it untouched and makes the caller read chunk by chunk;
     // with out_exceeds_limit true when the output would grow past the given total size; and otherwise when the output

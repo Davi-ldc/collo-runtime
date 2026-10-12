@@ -2,7 +2,8 @@
 //! supervisor over routes and an analytics sink of its own, worker records
 //! whose handles can actually be torn down, the publish a launch makes into a
 //! definition's pool, the egress attachment a gateway hands a launch, and a
-//! temporary analytics directory whose `usage.jsonl` a test reads back.
+//! temporary analytics directory whose `usage.jsonl` and `workers.jsonl` a
+//! test reads back.
 //!
 //! The routes come from a configuration of `definition_names.len` worker
 //! definitions, one route each, built from entry modules written to a
@@ -34,7 +35,6 @@ const Supervisor = supervision.Supervisor;
 const worker_table = supervision.worker_table;
 const WorkerRecord = worker_table.Record;
 const WorkerHandle = host.WorkerHandle;
-const pool_workers_max = supervision.scheduler_limits.capacity.pool_workers_max;
 
 /// The worker definitions of the fixture configuration, in definition-index
 /// order. Each has one route, `/<name>/*`.
@@ -63,7 +63,7 @@ var inert_zygote = zygote_mod.host_client.SpawnedZygote{
     .next_fork_job_id = 1,
 };
 
-/// The limits every fixture definition gets, through the configuration's
+/// The settings every fixture definition gets, through the configuration's
 /// global settings.
 pub const RoutesOptions = struct {
     /// Requests one worker runs at once: the pool's slots per worker.
@@ -71,6 +71,12 @@ pub const RoutesOptions = struct {
     /// Each request's deadline.
     timeout_ms: u32 = 30_000,
     memory_mib: u32 = 128,
+    /// Each request's CPU budget, or none.
+    cpu_ms: ?u32 = null,
+    /// Whether each definition, in `definition_names` order, keeps the
+    /// global `network` grant of any public host; one without it drops the
+    /// grant with an empty allow list, so its workers get no egress session.
+    granted: [definition_names.len]bool = @splat(true),
 };
 
 /// The fixture's routes with the temporary directory their entry modules
@@ -96,16 +102,20 @@ pub const OwnedRoutes = struct {
         defer source.deinit(allocator);
         try source.print(
             allocator,
-            "{{\"globalSettings\": {{\"limits\": {{\"concurrency\": {d}, \"timeoutMs\": {d}, \"memoryMiB\": {d}}}}}, \"workers\": {{",
+            "{{\"globalSettings\": {{\"network\": {{\"allow\": [\"*\"]}}, \"limits\": {{\"concurrency\": {d}, \"timeoutMs\": {d}, \"memoryMiB\": {d}",
             .{ options.concurrency, options.timeout_ms, options.memory_mib },
         );
-        for (definition_names, route_patterns, 0..) |name, pattern, index| {
+        if (options.cpu_ms) |cpu_ms|
+            try source.print(allocator, ", \"cpuMs\": {d}", .{cpu_ms});
+        try source.appendSlice(allocator, "}}, \"workers\": {");
+        for (definition_names, route_patterns, options.granted, 0..) |name, pattern, granted, index| {
             var entry_name_buffer: [64]u8 = undefined;
             const entry_name = try std.fmt.bufPrint(&entry_name_buffer, "{s}.js", .{name});
             try owned.tmp.dir.writeFile(.{ .sub_path = entry_name, .data = entry_source });
             if (index != 0)
                 try source.append(allocator, ',');
-            try source.print(allocator, "\"{s}\": {{\"routes\": {{\"{s}\": {{\"entry\": \"./{s}\"}}}}}}", .{ name, pattern, entry_name });
+            const settings = if (granted) "" else ", \"settings\": {\"network\": {\"allow\": []}}";
+            try source.print(allocator, "\"{s}\": {{\"routes\": {{\"{s}\": {{\"entry\": \"./{s}\"}}}}{s}}}", .{ name, pattern, entry_name, settings });
         }
         try source.appendSlice(allocator, "}}");
 
@@ -242,9 +252,9 @@ pub fn openScratchDir(allocator: std.mem.Allocator, out_path: *[]u8) !std.fs.Dir
     return dir;
 }
 
-/// A worker handle `handle.deinit` can take apart end to end: the temp tree is
-/// real and gets deleted, both owned strings are real allocations, and every
-/// descriptor teardown unconditionally closes is real. The one exception is
+/// A worker handle `handle.deinit` can take apart end to end: the owned cgroup
+/// path is a real allocation, and every descriptor teardown unconditionally
+/// closes is real. The one exception is
 /// `fs_fault_fd`, left at -1: teardown guards it, and it names the host end
 /// of a channel a worker that never launched never had.
 ///
@@ -265,11 +275,11 @@ pub fn openScratchDir(allocator: std.mem.Allocator, out_path: *[]u8) !std.fs.Dir
 /// which is exactly true here and makes the score depend only on idle age
 /// and pool position.
 ///
-/// The cgroup directory is a path inside the temp tree that is never created,
-/// so a test never reaches into the delegated cgroup subtree the kernel lanes
-/// own: teardown deletes the temp tree first, and the cgroup kill and rmdir
-/// that follow find nothing. The victim score's fallback reading of
-/// `memory.current` finds nothing there either.
+/// The cgroup directory is a path under /tmp that is never created, so a test
+/// never reaches into the delegated cgroup subtree the kernel lanes own and
+/// leaves nothing on disk: the teardown's cgroup kill and rmdir find nothing,
+/// and neither do the victim score's fallback reading of `memory.current` and
+/// the worker line's readings of `cpu.stat` and `memory.peak`.
 pub fn inertHandle(allocator: std.mem.Allocator) !WorkerHandle {
     const child_pid = try std.posix.fork();
     if (child_pid == 0) {
@@ -291,12 +301,7 @@ pub fn inertHandle(allocator: std.mem.Allocator) !WorkerHandle {
     errdefer std.posix.close(pair[0]);
     std.posix.close(pair[1]);
 
-    const tmp_root = try uniqueTempPath(allocator, "collo-test-worker");
-    defer allocator.free(tmp_root);
-    try std.fs.makeDirAbsolute(tmp_root);
-    errdefer std.fs.deleteTreeAbsolute(tmp_root) catch {};
-
-    const cgroup_dir = try std.fmt.allocPrint(allocator, "{s}/cgroup", .{tmp_root});
+    const cgroup_dir = try uniqueTempPath(allocator, "collo-test-worker-cgroup");
     defer allocator.free(cgroup_dir);
 
     const completion_eventfd = try std.posix.eventfd(0, 0);
@@ -310,14 +315,13 @@ pub fn inertHandle(allocator: std.mem.Allocator) !WorkerHandle {
     errdefer std.posix.close(metrics_fd);
     var metrics = try worker_shared_page.mapReadWrite(metrics_fd);
     errdefer metrics.deinit();
-    metrics.initializeCrashDefault(1, 0, 0);
+    metrics.initializeCrashDefault();
 
     return WorkerHandle.init(
         allocator,
         0,
         pidfd,
         pair[0],
-        tmp_root,
         cgroup_dir,
         64 * 1024 * 1024,
         1,
@@ -377,8 +381,9 @@ pub fn unmapForDrains(worker: *WorkerRecord) void {
 /// Where a definition's pool keeps the record of table entry `entry`, the
 /// entry a `LaunchTicket` names.
 pub fn recordFor(supervisor: *Supervisor, definition: config.DefinitionIndex, entry: u8) *WorkerRecord {
-    std.debug.assert(entry < pool_workers_max);
-    return &supervisor.recordsOf(definition)[entry];
+    const records = supervisor.recordsOf(definition);
+    std.debug.assert(entry < records.len);
+    return &records[entry];
 }
 
 pub const RecordOptions = struct {
@@ -570,34 +575,35 @@ pub fn dispatchedRequest(request_id: u64) supervision.request_table.Dispatched {
     };
 }
 
+/// When the lanes of the fixtures end a request (CLOCK_MONOTONIC), after its
+/// dispatch at `dispatchedRequest`'s 1 ns.
+pub const request_ended_ns: u64 = 2;
+
 /// One request the server dispatched to `worker` and the worker completed: its
-/// entry in the worker's request table, settled to wait for the record, and
-/// the record on the worker's shared page, so a drain has something real to
-/// consume and keep.
+/// entry in the worker's request table, ended and settled to wait for the
+/// record, and the record on the worker's shared page, so a drain has
+/// something real to consume and keep.
 pub fn publishCompletedRecord(worker: *WorkerRecord, request_id: u64) !void {
     const view = &(worker.handle.metrics orelse return error.NoSharedPage);
     try worker.requests.record(dispatchedRequest(request_id));
     var work_state = worker_metrics.WorkState.init(view);
-    try work_state.appendCompletedRecord(completedRecord(worker, request_id));
-    if (worker.requests.settle(request_id, true) != .awaiting_record)
+    try work_state.appendCompletedRecord(completedRecord(request_id));
+    worker.requests.noteEnded(request_id, request_ended_ns);
+    if (worker.requests.settle(request_id, true) != .parked)
         return error.RequestTableFull;
 }
 
-/// A successful completion record for `request_id`, with the identity fields a
-/// well-behaved worker writes.
-pub fn completedRecord(worker: *const WorkerRecord, request_id: u64) worker_shared_page.CompletedRecord {
+/// A successful completion record for `request_id`, as a well-behaved worker
+/// writes it.
+pub fn completedRecord(request_id: u64) worker_shared_page.CompletedRecord {
     return std.mem.zeroInit(worker_shared_page.CompletedRecord, .{
         .request_id = request_id,
-        .worker_id = worker.id,
-        .worker_generation = worker.generation,
-        .started_mono_ns = 1,
-        .finished_mono_ns = 2,
         .status = @intFromEnum(worker_shared_page.CompletedStatus.done),
     });
 }
 
 /// A temporary analytics directory. A test hands `path` to a sink, then reads
-/// back exactly what reached `usage.jsonl`.
+/// back exactly what reached `usage.jsonl` or `workers.jsonl`.
 pub const AnalyticsDir = struct {
     tmp: std.testing.TmpDir,
     path: []u8,
@@ -617,22 +623,37 @@ pub const AnalyticsDir = struct {
     /// Flushes `sink`, then parses every usage record in `usage.jsonl`. A line
     /// that is not exactly one usage record, with every field and no other,
     /// fails the call, so the parse doubles as a check of the record format.
-    /// The lines `fillUsageStream` wrote are skipped.
+    /// The lines `fillStream` wrote are skipped.
     pub fn readUsage(self: *AnalyticsDir, allocator: std.mem.Allocator, sink: *analytics.Sink) !UsageLines {
         sink.flush(process.monotonicNowNsOrZero());
+        return self.readLines(UsageLine, allocator, .usage);
+    }
+
+    /// Parses every worker line in `workers.jsonl` as `readUsage` parses
+    /// usage records, after flushing `sink`; a test whose sink is already
+    /// closed, which wrote everything out, passes null.
+    pub fn readWorkers(self: *AnalyticsDir, allocator: std.mem.Allocator, sink: ?*analytics.Sink) !WorkerLines {
+        if (sink) |open_sink|
+            open_sink.flush(process.monotonicNowNsOrZero());
+        return self.readLines(WorkerLine, allocator, .workers);
+    }
+
+    fn readLines(self: *AnalyticsDir, comptime Line: type, allocator: std.mem.Allocator, stream: analytics.Stream) !Lines(Line) {
         var arena = std.heap.ArenaAllocator.init(allocator);
         errdefer arena.deinit();
         const arena_allocator = arena.allocator();
-        const contents = self.tmp.dir.readFileAlloc(arena_allocator, "usage.jsonl", 16 * 1024 * 1024) catch |err| switch (err) {
+        // Every stream but the console has a file.
+        const file_name = analytics.sink.fileName(stream).?;
+        const contents = self.tmp.dir.readFileAlloc(arena_allocator, file_name, 16 * 1024 * 1024) catch |err| switch (err) {
             error.FileNotFound => return .{ .arena = arena, .items = &.{} },
             else => return err,
         };
-        var items: std.array_list.Aligned(UsageLine, null) = .empty;
+        var items: std.array_list.Aligned(Line, null) = .empty;
         var lines = std.mem.splitScalar(u8, contents, '\n');
         while (lines.next()) |line| {
             if (line.len == 0 or std.mem.startsWith(u8, line, filler_prefix))
                 continue;
-            try items.append(arena_allocator, try std.json.parseFromSliceLeaky(UsageLine, arena_allocator, line, .{}));
+            try items.append(arena_allocator, try std.json.parseFromSliceLeaky(Line, arena_allocator, line, .{}));
         }
         return .{ .arena = arena, .items = items.items };
     }
@@ -640,23 +661,23 @@ pub const AnalyticsDir = struct {
 
 const filler_prefix = "{\"filler\"";
 
-/// Takes all but `leave_free` bytes of the sink's usage stream with filler
-/// lines, as if drains had appended that much since the last flush. The sink
-/// must keep a usage file whose stream is empty, as it is when opened or
-/// just flushed; `AnalyticsDir.readUsage` skips the filler.
-pub fn fillUsageStream(allocator: std.mem.Allocator, sink: *analytics.Sink, leave_free: usize) !void {
-    const buffer_bytes = analytics.sink.usage_buffer_bytes_max;
+/// Takes all but `leave_free` bytes of the sink's `stream` with filler lines,
+/// as if producers had appended that much since the last flush. The sink must
+/// keep a file for `stream` whose buffer is empty, as it is when opened or
+/// just flushed; `AnalyticsDir` skips the filler when it reads the file.
+pub fn fillStream(allocator: std.mem.Allocator, sink: *analytics.Sink, stream: analytics.Stream, leave_free: usize) !void {
+    const buffer_bytes = analytics.sink.bufferBytesMax(stream);
     // Each filler line takes its bytes plus the newline the sink adds. The
     // first one keeps every other byte free, so only an empty stream takes it.
     const first_bytes = filler_prefix.len + 1;
-    if (!sink.tryAppendKeepingFree(.usage, filler_prefix, buffer_bytes - first_bytes))
-        return error.UsageStreamNotEmpty;
+    if (!sink.tryAppendKeepingFree(stream, filler_prefix, buffer_bytes - first_bytes))
+        return error.StreamNotEmpty;
     std.debug.assert(buffer_bytes - first_bytes > leave_free + first_bytes);
     const filler = try allocator.alloc(u8, buffer_bytes - first_bytes - leave_free - 1);
     defer allocator.free(filler);
     @memset(filler, ' ');
     @memcpy(filler[0..filler_prefix.len], filler_prefix);
-    try sink.append(.usage, filler);
+    try sink.append(stream, filler);
 }
 
 /// Makes every write to a regular file fail, as a file system that takes no
@@ -700,10 +721,11 @@ pub const UsageLine = struct {
     request_id: u64,
     error_code: []const u8,
     cold_start: bool,
-    wall_time_ns: u64,
-    cpu_time_ns: u64,
-    io_time_ns: u64,
+    wall_ns: u64,
+    exec_ns: u64,
     waiting_ns: u64,
+    io_ns: u64,
+    cpu_ns: u64,
     client_served_bytes: u64,
     fetch_sent_bytes: u64,
     fetch_received_bytes: u64,
@@ -711,11 +733,30 @@ pub const UsageLine = struct {
     worker_fault: []const u8,
 };
 
-pub const UsageLines = struct {
-    arena: std.heap.ArenaAllocator,
-    items: []const UsageLine,
-
-    pub fn deinit(self: *UsageLines) void {
-        self.arena.deinit();
-    }
+/// One line of `workers.jsonl`, field for field.
+pub const WorkerLine = struct {
+    ts: u64,
+    worker: []const u8,
+    worker_id: u64,
+    worker_generation: u64,
+    started_ts: u64,
+    life_ns: u64,
+    worker_cpu_ns: ?u64,
+    memory_peak_bytes: ?u64,
+    ending: []const u8,
 };
+
+/// The parsed lines of one record file, which live in `arena`.
+pub fn Lines(comptime Line: type) type {
+    return struct {
+        arena: std.heap.ArenaAllocator,
+        items: []const Line,
+
+        pub fn deinit(self: *@This()) void {
+            self.arena.deinit();
+        }
+    };
+}
+
+pub const UsageLines = Lines(UsageLine);
+pub const WorkerLines = Lines(WorkerLine);

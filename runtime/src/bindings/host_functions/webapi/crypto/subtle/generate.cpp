@@ -158,7 +158,7 @@ JSC_DEFINE_HOST_FUNCTION(subtleGenerateKey, (JSC::JSGlobalObject * global_object
                 result.private_key = WTF::move(private_pkey);
                 return true;
             }));
-        return enqueueCryptoJobPromise(global_object, scope, context.value, WTF::move(job));
+        return enqueueCryptoJobPromise(global_object, context.value, WTF::move(job));
     }
 
     if (auto okp_algorithm = okpAlgorithmFromName(algorithm_name)) {
@@ -197,7 +197,7 @@ JSC_DEFINE_HOST_FUNCTION(subtleGenerateKey, (JSC::JSGlobalObject * global_object
                 result.private_key = WTF::move(private_pkey);
                 return true;
             }));
-        return enqueueCryptoJobPromise(global_object, scope, context.value, WTF::move(job));
+        return enqueueCryptoJobPromise(global_object, context.value, WTF::move(job));
     }
 
     if (auto ec_algorithm = ecAlgorithmFromName(algorithm_name)) {
@@ -241,7 +241,7 @@ JSC_DEFINE_HOST_FUNCTION(subtleGenerateKey, (JSC::JSGlobalObject * global_object
                 result.private_key = WTF::move(private_pkey);
                 return true;
             }));
-        return enqueueCryptoJobPromise(global_object, scope, context.value, WTF::move(job));
+        return enqueueCryptoJobPromise(global_object, context.value, WTF::move(job));
     }
 
     if (auto aes_algorithm = aesAlgorithmFromName(algorithm_name)) {
@@ -272,11 +272,9 @@ JSC_DEFINE_HOST_FUNCTION(subtleGenerateKey, (JSC::JSGlobalObject * global_object
         if (!validateRequiredUsages(usages, error, global_object))
             return rejectedPromise(global_object, error);
 
-        WTF::Vector<uint8_t> material;
-        SecureVectorGuard material_guard(material);
-        if (!material.tryReserveInitialCapacity(bits / 8))
+        SecretBytes material;
+        if (!material.tryGrow(bits / 8))
             return rejectedPromise(global_object, JSC::createOutOfMemoryError(global_object));
-        material.grow(bits / 8);
         if (!fillCryptoRandom(material.mutableSpan()))
             return rejectedDOMException(global_object, DOMExceptionCode::OperationError);
 
@@ -284,8 +282,6 @@ JSC_DEFINE_HOST_FUNCTION(subtleGenerateKey, (JSC::JSGlobalObject * global_object
             call_frame->argument(1).toBoolean(global_object), usages);
         if (takePendingException(scope, error))
             return rejectedPromise(global_object, error);
-        if (key)
-            material_guard.dismiss();
         return resolvedPromise(global_object, key);
     }
 
@@ -307,11 +303,9 @@ JSC_DEFINE_HOST_FUNCTION(subtleGenerateKey, (JSC::JSGlobalObject * global_object
     if (bits == 0 || (bits % 8) != 0 || bits / 8 > maxWebCryptoGeneratedSecretBytes)
         return rejectedDOMException(global_object, DOMExceptionCode::OperationError);
 
-    WTF::Vector<uint8_t> material;
-    SecureVectorGuard material_guard(material);
-    if (!material.tryReserveInitialCapacity(bits / 8))
+    SecretBytes material;
+    if (!material.tryGrow(bits / 8))
         return rejectedPromise(global_object, JSC::createOutOfMemoryError(global_object));
-    material.grow(bits / 8);
     if (!fillCryptoRandom(material.mutableSpan()))
         return rejectedDOMException(global_object, DOMExceptionCode::OperationError);
 
@@ -319,8 +313,6 @@ JSC_DEFINE_HOST_FUNCTION(subtleGenerateKey, (JSC::JSGlobalObject * global_object
         global_object, hash->id, WTF::move(material), call_frame->argument(1).toBoolean(global_object), usages);
     if (takePendingException(scope, error))
         return rejectedPromise(global_object, error);
-    if (key)
-        material_guard.dismiss();
     return resolvedPromise(global_object, key);
 }
 

@@ -8,11 +8,22 @@ def stats:
      p95:$values[(($n*0.95|ceil)-1)], max:$values[-1]}
   end;
 def mib: . / 1048576;
+def kib: . / 1024;
 . as $rows |
 [$rows[] | select(.kind == "cold_sample")] as $cold |
 [$rows[] | select(.kind == "memory_sample")] as $memory |
 [$rows[] | select(.kind == "process_memory" and .role == "sandbox")] as $processes |
 [$rows[] | select(.kind == "process_memory")] as $all_processes |
+[$rows[] | select(.kind == "idle_sample")] as $idle |
+[$rows[] | select(.kind == "cgroup_memory")] as $groups |
+# One row per region of one record: the target worker's own regions, and the
+# server's and the gateway's share of them. A process's totals over every
+# worker are in the raw records only.
+[$rows[] | select(.kind == "region_memory") |
+  . as $record |
+  (if .role == "sandbox" then .regions else (.target_regions // []) end)[] |
+  {phase:$record.phase, population_before:$record.population_before, step:$record.step,
+   moment:$record.moment, role:$record.role} + .] as $regions |
 # Sums over every runtime process read at one moment of one insertion. PSS and
 # private bytes are additive across processes, unlike RSS or shared bytes.
 def process_sums($sample; $moment):
@@ -31,6 +42,7 @@ def process_sum_marginal:
   if any(. == null) then null
   else {pss_mib:(map(.pss)|stats), private_dirty_mib:(map(.private_dirty)|stats),
         uss_mib:(map(.uss)|stats)} end;
+def maybe_stats: if length == 0 then null else stats end;
 {
   schema:"collo.microbench.summary.v1",
   metadata:[$rows[] | select(.kind == "metadata")],
@@ -72,5 +84,34 @@ def process_sum_marginal:
     | group_by([.phase,.population,.cycle]) | map({
         phase:.[0].phase, population:.[0].population, cycle:.[0].cycle,
         retained_mib:(map(.retained_bytes|mib)|stats)
-      }))
+      })),
+  idle:(if ($idle|length) == 0 then null else {
+    samples:($idle|length),
+    window_ms:($idle|map(.window_ms)|stats),
+    cpu_ms:($idle|map(.cpu_usage_usec_delta/1000)|stats),
+    context_switches:($idle|map(.context_switches_delta)|stats),
+    private_dirty_end_kib:($idle|map(.end.memory.private_dirty_bytes|kib)|stats),
+    private_dirty_delta_kib:($idle|map(.private_dirty_delta_bytes|kib)|stats),
+    tasks_start:($idle|map(.start.switches.tasks)|stats),
+    tasks_end:($idle|map(.end.switches.tasks)|stats)
+  } end),
+  # Which cgroup holds the shared regions: shmem is charged to the cgroup of
+  # the process that first touched each page.
+  shmem_kib:($groups | group_by([.phase,.population_before,.step,.moment]) | map({
+    phase:.[0].phase, population_before:.[0].population_before, step:.[0].step,
+    moment:.[0].moment,
+    runtime:(map(.runtime.stat.shmem_bytes|kib)|stats),
+    main:(map(.main.stat.shmem_bytes|kib)|stats),
+    worker_leaf:([.[] | .worker_leaf | select(. != null) | .stat.shmem_bytes|kib]|maybe_stats)
+  })),
+  regions_kib:($regions | group_by([.phase,.population_before,.step,.moment,.role,.name]) | map({
+    phase:.[0].phase, population_before:.[0].population_before, step:.[0].step,
+    moment:.[0].moment, role:.[0].role, region:.[0].name,
+    mappings:(map(.mappings)|stats),
+    rss:(map(.rss_bytes|kib)|stats),
+    pss:(map(.pss_bytes|kib)|stats),
+    shared_dirty:(map(.shared_dirty_bytes|kib)|stats),
+    private_dirty:(map(.private_dirty_bytes|kib)|stats),
+    allocated:(map(.allocated_bytes|kib)|stats)
+  }))
 }

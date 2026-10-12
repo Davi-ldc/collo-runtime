@@ -196,8 +196,7 @@ JSC_DEFINE_HOST_FUNCTION(subtleExportKey, (JSC::JSGlobalObject * global_object, 
         if (isRsaAlgorithm(key->algorithm()))
             return rejectedDOMException(global_object, DOMExceptionCode::NotSupportedError);
         if (isEcAlgorithm(key->algorithm())) {
-            WTF::Vector<uint8_t> exported;
-            SecureVectorGuard exported_guard(exported);
+            SecretBytes exported;
             if (!exportEcRaw(global_object, key, exported, error))
                 return rejectedPromise(global_object, error);
             auto result = createArrayBufferCopy(global_object, scope, exported.span(), error);
@@ -206,8 +205,7 @@ JSC_DEFINE_HOST_FUNCTION(subtleExportKey, (JSC::JSGlobalObject * global_object, 
             return resolvedPromise(global_object, result);
         }
         if (isOkpAlgorithm(key->algorithm())) {
-            WTF::Vector<uint8_t> exported;
-            SecureVectorGuard exported_guard(exported);
+            SecretBytes exported;
             if (!exportOkpRaw(global_object, key, exported, error))
                 return rejectedPromise(global_object, error);
             auto result = createArrayBufferCopy(global_object, scope, exported.span(), error);
@@ -224,8 +222,7 @@ JSC_DEFINE_HOST_FUNCTION(subtleExportKey, (JSC::JSGlobalObject * global_object, 
     if (format == "spki"_s || format == "pkcs8"_s) {
         if (!isRsaAlgorithm(key->algorithm()) && !isEcAlgorithm(key->algorithm()) && !isOkpAlgorithm(key->algorithm()))
             return rejectedDOMException(global_object, DOMExceptionCode::NotSupportedError);
-        WTF::Vector<uint8_t> exported;
-        SecureVectorGuard exported_guard(exported);
+        SecretBytes exported;
         bool ok = format == "spki"_s ? exportAsymmetricSpki(global_object, key, exported, error)
                                      : exportAsymmetricPkcs8(global_object, key, exported, error);
         if (!ok)
@@ -262,7 +259,10 @@ JSC_DEFINE_HOST_FUNCTION(subtleExportKey, (JSC::JSGlobalObject * global_object, 
         result->putDirect(vm, JSC::Identifier::fromString(vm, "kty"_s), JSC::jsString(vm, String("oct"_s)));
         // `k` is the raw secret, so it is encoded through `secretBase64UrlJsString` (key_io.h), as every secret JWK
         // member must be.
-        result->putDirect(vm, JSC::Identifier::fromString(vm, "k"_s), secretBase64UrlJsString(vm, key->material()));
+        auto* encoded_secret = secretBase64UrlJsString(vm, key->material());
+        if (!encoded_secret)
+            return rejectedPromise(global_object, JSC::createOutOfMemoryError(global_object));
+        result->putDirect(vm, JSC::Identifier::fromString(vm, "k"_s), encoded_secret);
         if (algorithm == CryptoKeyAlgorithm::Hmac) {
             const auto& spec = hashSpec(key->hash());
             if (!spec.jwk_alg.isEmpty())
@@ -325,8 +325,7 @@ JSC_DEFINE_HOST_FUNCTION(subtleWrapKey, (JSC::JSGlobalObject * global_object, JS
             return rejectedDOMException(
                 global_object, DOMExceptionCode::InvalidAccessError, "CryptoKey doesn't support key wrapping"_s);
 
-        WTF::Vector<uint8_t> plaintext;
-        SecureVectorGuard plaintext_guard(plaintext);
+        SecretBytes plaintext;
         if (!exportKeyBytesForWrap(global_object, format, key, plaintext, error))
             return rejectedPromise(global_object, error);
 
@@ -336,18 +335,15 @@ JSC_DEFINE_HOST_FUNCTION(subtleWrapKey, (JSC::JSGlobalObject * global_object, JS
 
         const auto hash = wrapping_key->hash();
         WTF::Vector<uint8_t> label = WTF::move(params.label);
-        SecureBytes plaintext_secret(WTF::move(plaintext));
-        plaintext_guard.dismiss();
         auto context = createCryptoAsyncContext(global_object, scope);
         if (!context.ok)
             return context.error;
         auto job
             = std::unique_ptr<CryptoJob>(new (std::nothrow) BytesCryptoJob(context.value.owner, context.value.deferred,
-                [pkey, hash, label = WTF::move(label), plaintext = WTF::move(plaintext_secret)](
-                    WTF::Vector<uint8_t>& out) mutable {
+                [pkey, hash, label = WTF::move(label), plaintext = WTF::move(plaintext)](SecretBytes& out) mutable {
                     return rsaOaepEncryptNative(pkey.get(), hash, label.span(), plaintext.span(), out);
                 }));
-        return enqueueCryptoJobPromise(global_object, scope, context.value, WTF::move(job));
+        return enqueueCryptoJobPromise(global_object, context.value, WTF::move(job));
     }
 
     auto algorithm = aesAlgorithmFromName(algorithm_name);
@@ -403,25 +399,22 @@ JSC_DEFINE_HOST_FUNCTION(subtleWrapKey, (JSC::JSGlobalObject * global_object, JS
         return rejectedDOMException(global_object, DOMExceptionCode::NotSupportedError);
     }
 
-    WTF::Vector<uint8_t> plaintext;
-    SecureVectorGuard plaintext_guard(plaintext);
+    SecretBytes plaintext;
     if (!exportKeyBytesForWrap(global_object, format, key, plaintext, error))
         return rejectedPromise(global_object, error);
 
-    SecureBytes key_material;
+    SecretBytes key_material;
     if (!key_material.tryAppend(wrapping_key->material()))
         return rejectedPromise(global_object, JSC::createOutOfMemoryError(global_object));
-    SecureBytes plaintext_secret(WTF::move(plaintext));
-    plaintext_guard.dismiss();
 
     auto context = createCryptoAsyncContext(global_object, scope);
     if (!context.ok)
         return context.error;
     const auto selected_algorithm = *algorithm;
     auto job = std::unique_ptr<CryptoJob>(new (std::nothrow) BytesCryptoJob(context.value.owner, context.value.deferred,
-        [selected_algorithm, key_material = WTF::move(key_material), plaintext = WTF::move(plaintext_secret),
+        [selected_algorithm, key_material = WTF::move(key_material), plaintext = WTF::move(plaintext),
             gcm_params = WTF::move(gcm_params), cbc_params = WTF::move(cbc_params), cfb_params = WTF::move(cfb_params),
-            ctr_params = WTF::move(ctr_params)](WTF::Vector<uint8_t>& out) mutable {
+            ctr_params = WTF::move(ctr_params)](SecretBytes& out) mutable {
             switch (selected_algorithm) {
             case CryptoKeyAlgorithm::AesGcm:
                 return aesGcmEncrypt(key_material.span(), gcm_params, plaintext.span(), out);
@@ -448,7 +441,7 @@ JSC_DEFINE_HOST_FUNCTION(subtleWrapKey, (JSC::JSGlobalObject * global_object, JS
             }
             return false;
         }));
-    return enqueueCryptoJobPromise(global_object, scope, context.value, WTF::move(job));
+    return enqueueCryptoJobPromise(global_object, context.value, WTF::move(job));
 }
 
 JSC_DEFINE_HOST_FUNCTION(subtleUnwrapKey, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
@@ -510,11 +503,10 @@ JSC_DEFINE_HOST_FUNCTION(subtleUnwrapKey, (JSC::JSGlobalObject * global_object, 
             return context.error;
         auto job = std::unique_ptr<CryptoJob>(
             new (std::nothrow) UnwrapKeyCryptoJob(context.value.owner, context.value.deferred, format, import_spec,
-                [pkey, hash, label = WTF::move(label), ciphertext = WTF::move(ciphertext)](
-                    WTF::Vector<uint8_t>& out) mutable {
+                [pkey, hash, label = WTF::move(label), ciphertext = WTF::move(ciphertext)](SecretBytes& out) mutable {
                     return rsaOaepDecryptNative(pkey.get(), hash, label.span(), ciphertext.span(), out);
                 }));
-        return enqueueCryptoJobPromise(global_object, scope, context.value, WTF::move(job));
+        return enqueueCryptoJobPromise(global_object, context.value, WTF::move(job));
     }
 
     auto algorithm = aesAlgorithmFromName(algorithm_name);
@@ -572,7 +564,7 @@ JSC_DEFINE_HOST_FUNCTION(subtleUnwrapKey, (JSC::JSGlobalObject * global_object, 
 
     WTF::Vector<uint8_t> ciphertext = WTF::move(wrapped_bytes);
 
-    SecureBytes key_material;
+    SecretBytes key_material;
     if (!key_material.tryAppend(unwrapping_key->material()))
         return rejectedPromise(global_object, JSC::createOutOfMemoryError(global_object));
 
@@ -585,38 +577,38 @@ JSC_DEFINE_HOST_FUNCTION(subtleUnwrapKey, (JSC::JSGlobalObject * global_object, 
     auto context = createCryptoAsyncContext(global_object, scope);
     if (!context.ok)
         return context.error;
-    auto job = std::unique_ptr<CryptoJob>(new (std::nothrow) UnwrapKeyCryptoJob(context.value.owner,
-        context.value.deferred, format, import_spec,
-        [selected_algorithm, key_material = WTF::move(key_material), ciphertext = WTF::move(ciphertext),
-            gcm_params = WTF::move(gcm_params), cbc_params = WTF::move(cbc_params), cfb_params = WTF::move(cfb_params),
-            ctr_params = WTF::move(ctr_params)](WTF::Vector<uint8_t>& out) mutable {
-            switch (selected_algorithm) {
-            case CryptoKeyAlgorithm::AesGcm:
-                return aesGcmDecrypt(key_material.span(), gcm_params, ciphertext.span(), out);
-            case CryptoKeyAlgorithm::AesCbc:
-                return aesCbcDecrypt(key_material.span(), cbc_params, ciphertext.span(), out);
-            case CryptoKeyAlgorithm::AesCfb:
-                return aesCfb8Decrypt(key_material.span(), cfb_params, ciphertext.span(), out);
-            case CryptoKeyAlgorithm::AesCtr:
-                return aesCtrTransform(key_material.span(), ctr_params, ciphertext.span(), out);
-            case CryptoKeyAlgorithm::AesKw:
-                return aesKwUnwrap(key_material.span(), ciphertext.span(), out);
-            case CryptoKeyAlgorithm::Hmac:
-            case CryptoKeyAlgorithm::RsaEsPkcs1V15:
-            case CryptoKeyAlgorithm::RsaSsaPkcs1V15:
-            case CryptoKeyAlgorithm::RsaPss:
-            case CryptoKeyAlgorithm::RsaOaep:
-            case CryptoKeyAlgorithm::Ecdsa:
-            case CryptoKeyAlgorithm::Ecdh:
-            case CryptoKeyAlgorithm::Ed25519:
-            case CryptoKeyAlgorithm::X25519:
-            case CryptoKeyAlgorithm::Pbkdf2:
-            case CryptoKeyAlgorithm::Hkdf:
+    auto job = std::unique_ptr<CryptoJob>(
+        new (std::nothrow) UnwrapKeyCryptoJob(context.value.owner, context.value.deferred, format, import_spec,
+            [selected_algorithm, key_material = WTF::move(key_material), ciphertext = WTF::move(ciphertext),
+                gcm_params = WTF::move(gcm_params), cbc_params = WTF::move(cbc_params),
+                cfb_params = WTF::move(cfb_params), ctr_params = WTF::move(ctr_params)](SecretBytes& out) mutable {
+                switch (selected_algorithm) {
+                case CryptoKeyAlgorithm::AesGcm:
+                    return aesGcmDecrypt(key_material.span(), gcm_params, ciphertext.span(), out);
+                case CryptoKeyAlgorithm::AesCbc:
+                    return aesCbcDecrypt(key_material.span(), cbc_params, ciphertext.span(), out);
+                case CryptoKeyAlgorithm::AesCfb:
+                    return aesCfb8Decrypt(key_material.span(), cfb_params, ciphertext.span(), out);
+                case CryptoKeyAlgorithm::AesCtr:
+                    return aesCtrTransform(key_material.span(), ctr_params, ciphertext.span(), out);
+                case CryptoKeyAlgorithm::AesKw:
+                    return aesKwUnwrap(key_material.span(), ciphertext.span(), out);
+                case CryptoKeyAlgorithm::Hmac:
+                case CryptoKeyAlgorithm::RsaEsPkcs1V15:
+                case CryptoKeyAlgorithm::RsaSsaPkcs1V15:
+                case CryptoKeyAlgorithm::RsaPss:
+                case CryptoKeyAlgorithm::RsaOaep:
+                case CryptoKeyAlgorithm::Ecdsa:
+                case CryptoKeyAlgorithm::Ecdh:
+                case CryptoKeyAlgorithm::Ed25519:
+                case CryptoKeyAlgorithm::X25519:
+                case CryptoKeyAlgorithm::Pbkdf2:
+                case CryptoKeyAlgorithm::Hkdf:
+                    return false;
+                }
                 return false;
-            }
-            return false;
-        }));
-    return enqueueCryptoJobPromise(global_object, scope, context.value, WTF::move(job));
+            }));
+    return enqueueCryptoJobPromise(global_object, context.value, WTF::move(job));
 }
 
 } // namespace Collo::HostFunctions

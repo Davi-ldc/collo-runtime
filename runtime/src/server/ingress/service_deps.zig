@@ -105,6 +105,13 @@ pub fn Methods(comptime Self: type) type {
                     .idle => {},
                     .handed_to => |again| next = again,
                     .retire => self.queueRetirement(handoff.worker),
+                    // The worker retires on its notice and this was its last
+                    // slot: its reader gives the role up, or the reaper asks
+                    // it again when this post is refused.
+                    .release_reader => |tenure| _ = try self.postToLane(tenure.lane, .{ .release_worker = .{
+                        .worker_key = handoff.worker.key(),
+                        .epoch = tenure.epoch,
+                    } }),
                 }
             }
         }
@@ -170,8 +177,8 @@ pub fn Methods(comptime Self: type) type {
 
         /// Queues the retirement of `worker` to the reaper after a pool call
         /// answered `.retire`: the worker left service through a death, an
-        /// idle retirement or an egress retirement, and nothing holds or reads
-        /// it. The reaper counts each departure apart.
+        /// idle retirement, an egress retirement or its own notice, and
+        /// nothing holds or reads it. The reaper counts each departure apart.
         pub fn queueRetirement(self: *Self, worker: *WorkerRecord) void {
             const worker_pool = self.supervisor.poolFor(worker.definition_index);
             const departure: pool.Departure = if (worker_pool.inspect(worker)) |view|
@@ -182,6 +189,7 @@ pub fn Methods(comptime Self: type) type {
                 .idle => .idle,
                 .died => .died,
                 .egress => .egress_reattach,
+                .recycled => .recycled,
             });
         }
 

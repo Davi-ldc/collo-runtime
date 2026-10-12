@@ -1,10 +1,13 @@
 // Shared vocabulary of the WebCrypto bridge: the algorithm, hash, curve, key type and usage enumerations, the hash
-// table, the bounds Collo puts on WebCrypto inputs, and containers that zero secret bytes. Nothing here touches JSC,
-// so crypto pool threads use these types as freely as the VM thread.
+// table, the bounds Collo puts on WebCrypto inputs, and `SecretBytes`, the container every secret byte lives in
+// (secret_bytes.h). Nothing here touches JSC, so crypto pool threads use these types as freely as the VM thread.
 
 #pragma once
 
+#include "host_functions/webapi/crypto/secret_bytes.h"
+
 #include <openssl/digest.h>
+#include <wtf/FastMalloc.h>
 #include <wtf/Forward.h>
 #include <wtf/Vector.h>
 #include <wtf/text/ASCIILiteral.h>
@@ -105,47 +108,21 @@ struct HashSpec {
     WTF::ASCIILiteral jwk_alg;
 };
 
-// Owns bytes that may be secret and zeroes them on destruction, on `clear`, and before a move assignment overwrites
-// them. `release` hands the vector to a new owner without zeroing it, and that owner takes over the duty.
-class SecureBytes {
-public:
-    SecureBytes() = default;
-    explicit SecureBytes(WTF::Vector<uint8_t>&&);
-    SecureBytes(SecureBytes&&);
-    SecureBytes& operator=(SecureBytes&&);
-    SecureBytes(const SecureBytes&) = delete;
-    SecureBytes& operator=(const SecureBytes&) = delete;
-    ~SecureBytes();
+// The allocator of the bridge's `SecretBytes`: fastMalloc, which every other buffer of the bridge uses too.
+struct FastMallocSecretAllocator {
+    static uint8_t* tryAllocate(size_t size)
+    {
+        void* data = nullptr;
+        if (!WTF::tryFastMalloc(size).getValue(data))
+            return nullptr;
+        return static_cast<uint8_t*>(data);
+    }
 
-    bool tryAppend(std::span<const uint8_t>);
-    std::span<const uint8_t> span() const;
-    bool isEmpty() const;
-    WTF::Vector<uint8_t>& vector();
-    WTF::Vector<uint8_t>&& release();
-    void clear();
-
-private:
-    WTF::Vector<uint8_t> m_bytes;
+    static void deallocate(uint8_t* data, size_t) { WTF::fastFree(data); }
 };
 
-// Zeroes a vector it does not own when the guard goes out of scope. Call `dismiss` once the bytes have moved to an
-// owner that zeroes them itself. The vector must outlive the guard.
-class SecureVectorGuard {
-public:
-    explicit SecureVectorGuard(WTF::Vector<uint8_t>&);
-    SecureVectorGuard(SecureVectorGuard&&);
-    SecureVectorGuard& operator=(SecureVectorGuard&&);
-    SecureVectorGuard(const SecureVectorGuard&) = delete;
-    SecureVectorGuard& operator=(const SecureVectorGuard&) = delete;
-    ~SecureVectorGuard();
+using SecretBytes = BasicSecretBytes<FastMallocSecretAllocator>;
 
-    void dismiss();
-
-private:
-    WTF::Vector<uint8_t>* m_vector { nullptr };
-};
-
-void secureZeroVector(WTF::Vector<uint8_t>&);
 // True when `number` is a finite integer within [min, max]. The typed variants store the value in `out` only then.
 bool checkedIntegerInRange(double, double min, double max);
 bool checkedSizeFromNumber(double, size_t min, size_t max, size_t& out);

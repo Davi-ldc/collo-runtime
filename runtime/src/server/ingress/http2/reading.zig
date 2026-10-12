@@ -5,14 +5,16 @@
 //! passes and the switch over frame types, the batch path for a run of whole
 //! DATA frames on one stream, header blocks with the HPACK decoding of
 //! request heads and trailers, and the receive windows each frame consumes.
-//! A request head goes to the lane's `startDynamicH2`, body bytes to
-//! `handleH2DataFrame` or `handleH2DataFrameBatch`, and a client's RST_STREAM
-//! to `handleH2ResetFrame`; whatever answers the client is queued through
-//! `writing.zig`.
+//! A request head goes to the lane's `startDynamicH2`, one that fails its
+//! checks to its `refuseH2Stream`, body bytes to `handleH2DataFrame` or
+//! `handleH2DataFrameBatch`, and a client's RST_STREAM to
+//! `handleH2ResetFrame`; whatever answers the client is queued through
+//! `writing.zig`. Each socket read takes one reading of the lane's clock
+//! (`monotonicNowNs`), which every request head the read completes carries.
 //!
 //! An error a frame causes returns to `drive`, which closes the connection,
 //! unless it concerns one stream: a request head that fails its checks is
-//! answered on its stream, and a stream error resets the stream.
+//! answered on its stream by the lane, and a stream error resets the stream.
 //!
 //! Invariants:
 //! - Every byte a read returns is handled before the read returns, since the
@@ -41,9 +43,7 @@ const connection_slot = @import("../runner/connection_slot.zig");
 const fault = @import("../fault.zig");
 const frame_reader = @import("frame_reader.zig");
 const h2_request = @import("request_head.zig");
-const server_responses = @import("../server_responses.zig");
 const writing = @import("writing.zig");
-const process = @import("collo_os").process;
 const h2 = @import("collo_http").http2;
 const hpack = @import("collo_hpack");
 const ipc = @import("collo_ipc");
@@ -78,8 +78,10 @@ const FrameBudget = struct {
 };
 
 /// Reads the socket once into the lane's read buffer and handles every byte
-/// that arrived. Returns false when the socket would block, which ends the
-/// drive's reads.
+/// that arrived. The lane's clock is read once per read, and that reading is
+/// when every request head the read completes arrived
+/// (`ParsedHead.received_ns`). Returns false when the socket would block,
+/// which ends the drive's reads.
 pub fn readAndProcess(comptime Worker: type, worker: *Worker, runtime: *Slot) Http2Failure!bool {
     const buffer = worker.h2_lane.read_buffer;
     const read_len = readH2Bytes(runtime, buffer) catch |err|
@@ -89,8 +91,9 @@ pub fn readAndProcess(comptime Worker: type, worker: *Worker, runtime: *Slot) Ht
         _ = try connection.actOnClientIo(Worker, worker, runtime, .read, error.PeerClosed);
         return true;
     }
-    runtime.noteProgress(process.monotonicNowNsOrZero());
-    try processInput(Worker, worker, runtime, buffer[0..read_len]);
+    const received_ns = worker.monotonicNowNs();
+    runtime.noteProgress(received_ns);
+    try processInput(Worker, worker, runtime, buffer[0..read_len], received_ns);
     return true;
 }
 
@@ -100,10 +103,16 @@ fn readH2Bytes(runtime: *Slot, buffer: []u8) !usize {
     return std.posix.read(runtime.fd, buffer);
 }
 
-/// Handles every event the bytes of one read make, until they are used up
-/// or the connection closes. Whole DATA frames on one stream at a frame
-/// boundary go to the batch path.
-pub fn processInput(comptime Worker: type, worker: *Worker, runtime: *Slot, bytes: []const u8) Http2Failure!void {
+/// Handles every event the bytes of one read made at `received_ns` make,
+/// until they are used up or the connection closes. Whole DATA frames on one
+/// stream at a frame boundary go to the batch path.
+pub fn processInput(
+    comptime Worker: type,
+    worker: *Worker,
+    runtime: *Slot,
+    bytes: []const u8,
+    received_ns: u64,
+) Http2Failure!void {
     var input = bytes;
     var budget: FrameBudget = .{};
     while (runtime.isOpen()) {
@@ -123,7 +132,7 @@ pub fn processInput(comptime Worker: type, worker: *Worker, runtime: *Slot, byte
             .header => |header| try runtime.frame_reader.accept(try frameDisposition(runtime, header, &budget)),
             .control => |payload| try handleControlFrame(Worker, worker, runtime, runtime.frame_reader.header, payload),
             .data => |piece| try handleDataPiece(Worker, worker, runtime, piece, &budget),
-            .fragment => |piece| try handleFragment(Worker, worker, runtime, piece),
+            .fragment => |piece| try handleFragment(Worker, worker, runtime, piece, received_ns),
         }
     }
 }
@@ -455,13 +464,16 @@ fn dropRestOfData(runtime: *Slot, piece: frame_reader.Piece) Http2Failure!void {
 }
 
 /// Handles a piece of a HEADERS or CONTINUATION frame's header block
-/// fragment. A whole block in one piece of one frame is decoded where it
-/// lies; any other block is assembled on the connection first.
+/// fragment, which a read made at `received_ns` brought. A whole block in
+/// one piece of one frame is decoded where it lies; any other block is
+/// assembled on the connection first, and a request head counts as arrived
+/// with the read that completes its block.
 fn handleFragment(
     comptime Worker: type,
     worker: *Worker,
     runtime: *Slot,
     piece: frame_reader.Piece,
+    received_ns: u64,
 ) Http2Failure!void {
     const header = runtime.frame_reader.header;
     const allocator = worker.service.allocator;
@@ -471,7 +483,12 @@ fn handleFragment(
         if (kind == .request_headers)
             try runtime.h2AcceptClientStreamId(header.stream_id);
         if (piece.last and end_headers)
-            return processHeaderBlock(Worker, worker, runtime, header.stream_id, kind, piece.bytes, header.flags.end_stream);
+            return processHeaderBlock(Worker, worker, runtime, .{
+                .stream_id = header.stream_id,
+                .kind = kind,
+                .bytes = piece.bytes,
+                .end_stream = header.flags.end_stream,
+            }, received_ns);
         try runtime.h2BeginHeaderBlock(header.stream_id, header.flags.end_stream, kind);
     }
     try runtime.h2AppendHeaderBlock(allocator, &worker.h2_lane.header_blocks, piece.bytes);
@@ -479,8 +496,22 @@ fn handleFragment(
         return;
     var block = runtime.h2TakeHeaderBlock(&worker.h2_lane.header_blocks);
     defer block.deinit(allocator);
-    try processHeaderBlock(Worker, worker, runtime, block.stream_id, block.kind, block.bytes, block.end_stream);
+    try processHeaderBlock(Worker, worker, runtime, .{
+        .stream_id = block.stream_id,
+        .kind = block.kind,
+        .bytes = block.bytes,
+        .end_stream = block.end_stream,
+    }, received_ns);
 }
+
+/// A whole header block, borrowed for the call that handles it.
+const HeaderBlock = struct {
+    stream_id: u32,
+    kind: connection_slot.H2HeaderBlockKind,
+    bytes: []const u8,
+    /// The END_STREAM flag of the HEADERS frame that opened the block.
+    end_stream: bool,
+};
 
 fn isAckFlagSet(header: h2.FrameHeader) bool {
     return header.flags.toByte() & 0x1 != 0;
@@ -533,18 +564,16 @@ fn processHeaderBlock(
     comptime Worker: type,
     worker: *Worker,
     runtime: *Slot,
-    stream_id: u32,
-    kind: connection_slot.H2HeaderBlockKind,
-    block: []const u8,
-    end_stream: bool,
+    block: HeaderBlock,
+    received_ns: u64,
 ) Http2Failure!void {
-    switch (kind) {
-        .request_headers => try processRequestHead(Worker, worker, runtime, stream_id, block, end_stream),
-        .trailers => if (takesTrailers(runtime, stream_id))
-            try processTrailers(Worker, worker, runtime, stream_id, block, end_stream)
+    switch (block.kind) {
+        .request_headers => try processRequestHead(Worker, worker, runtime, block, received_ns),
+        .trailers => if (takesTrailers(runtime, block.stream_id))
+            try processTrailers(Worker, worker, runtime, block.stream_id, block.bytes, block.end_stream)
         else
-            try discardHeaderBlock(Worker, worker, runtime, block),
-        .discarded => try discardHeaderBlock(Worker, worker, runtime, block),
+            try discardHeaderBlock(Worker, worker, runtime, block.bytes),
+        .discarded => try discardHeaderBlock(Worker, worker, runtime, block.bytes),
     }
 }
 
@@ -590,87 +619,54 @@ fn decodeHeaderBlock(comptime Worker: type, worker: *Worker, runtime: *Slot, blo
 }
 
 /// Decompresses and checks a request head and hands it to the lane's
-/// stream handler. A head over the bounds or malformed fails only its
-/// stream (`refuseRequestHead`). A head that waits to send its body gets 100
-/// (Continue) before the handler runs, so the interim response precedes
-/// anything the handler answers. The stream counts as opened for the
-/// connection's deadlines whatever becomes of it, since a stream the lane
-/// answers within this drive leaves no other trace for the drive's end.
+/// stream handler (`startDynamicH2`). A head whose block decoded but which
+/// is over a head's bounds or malformed fails only its stream: the lane
+/// answers it alone (`refuseH2Stream`), since both ends' header tables are in
+/// step and the stream can carry a response (RFC 9113 §8.1.1). A head that
+/// waits to send its body gets 100 (Continue) before the handler runs, so
+/// the interim response precedes anything the handler answers. The stream
+/// counts as opened for the connection's deadlines whatever becomes of it,
+/// since a stream the lane answers within this drive leaves no other trace
+/// for the drive's end.
 fn processRequestHead(
     comptime Worker: type,
     worker: *Worker,
     runtime: *Slot,
-    stream_id: u32,
-    block: []const u8,
-    end_stream: bool,
+    block: HeaderBlock,
+    received_ns: u64,
 ) Http2Failure!void {
     runtime.noteStreamOpened();
     const allocator = worker.service.allocator;
-    var decoded = decodeHeaderBlock(Worker, worker, runtime, block) catch |err| switch (err) {
-        // More fields or bytes than a head may hold, answered 431 either way.
-        error.HpackHeaderListTooLarge => return refuseRequestHead(Worker, worker, runtime, stream_id, end_stream, error.TooManyRequestHeaders),
+    const stream_id = block.stream_id;
+    var decoded = decodeHeaderBlock(Worker, worker, runtime, block.bytes) catch |err| switch (err) {
+        // More fields or bytes than a head may hold, refused once the whole
+        // block was decompressed, so no field of it is kept.
+        error.HpackHeaderListTooLarge => return worker.refuseH2Stream(runtime, stream_id, &.{
+            .reason = .fields_too_large,
+            .request_ended = block.end_stream,
+            .received_ns = received_ns,
+        }),
         else => |other| return other,
     };
     defer decoded.deinit(allocator);
-    const head = h2_request.parse(decoded.headers, end_stream) catch |err|
-        return refuseRequestHead(Worker, worker, runtime, stream_id, end_stream, err);
+    const head = h2_request.parse(decoded.headers, block.end_stream, received_ns) catch |err| {
+        switch (try fault.classifyConnectionError(.{ .request_head = err })) {
+            .keep => {},
+            .close => |close| return worker.closeRuntimeConnection(runtime, close),
+        }
+        const reason: h2_request.RefusedHead.Reason = if (err == error.TooManyRequestHeaders)
+            .fields_too_large
+        else
+            .malformed;
+        const refused = h2_request.RefusedHead.of(decoded.headers, reason, block.end_stream, received_ns);
+        return worker.refuseH2Stream(runtime, stream_id, &refused);
+    };
     if (head.expects_continue)
         _ = try writing.queueResponseHead(Worker, worker, runtime, stream_id, continue_status, &.{}, false);
     if (!try worker.startDynamicH2(runtime, stream_id, &head))
         return error.Http2ProtocolError;
     // A handler that answered at once may have ended the stream.
     _ = runtime.h2CloseStreamIfDone(allocator, stream_id);
-}
-
-/// Answers a request whose head failed its checks. The block was
-/// decompressed, so the connection goes on: 431 for more fields or bytes
-/// than a head may hold, 413 for a declared body over the limit, and
-/// RST_STREAM PROTOCOL_ERROR for a malformed head.
-fn refuseRequestHead(
-    comptime Worker: type,
-    worker: *Worker,
-    runtime: *Slot,
-    stream_id: u32,
-    request_ended: bool,
-    err: (fault.LaneFault || fault.RequestHeadError),
-) Http2Failure!void {
-    switch (try fault.classifyConnectionError(.{ .request_head = err })) {
-        .keep => {},
-        .close => |close| return worker.closeRuntimeConnection(runtime, close),
-    }
-    const response_id: server_responses.Id = switch (err) {
-        error.TooManyRequestHeaders => .request_header_fields_too_large,
-        error.RequestTooLarge => .payload_too_large,
-        else => return writing.queueRstStream(Worker, worker, runtime, stream_id, .protocol_error),
-    };
-    try answerStreamAlone(Worker, worker, runtime, stream_id, server_responses.get(response_id), request_ended);
-}
-
-/// Answers a new stream with `server_response` before any request takes it.
-/// The stream enters the table, or is refused with REFUSED_STREAM past the
-/// connection's or the lane's bound; the response is queued whole; and a
-/// client still sending its request is asked to stop with RST_STREAM
-/// NO_ERROR once the response's END_STREAM is queued (RFC 9113 §8.1).
-fn answerStreamAlone(
-    comptime Worker: type,
-    worker: *Worker,
-    runtime: *Slot,
-    stream_id: u32,
-    server_response: server_responses.Response,
-    request_ended: bool,
-) Http2Failure!void {
-    runtime.h2ReserveStream(stream_id) catch |err| switch (err) {
-        error.Http2TooManyConcurrentStreams,
-        error.Http2StreamSlabFull,
-        => return writing.queueRstStream(Worker, worker, runtime, stream_id, .refused_stream),
-        error.Http2StreamAlreadyOpen => return error.Http2StreamAlreadyOpen,
-    };
-    if (!try writing.queueServerResponse(Worker, worker, runtime, stream_id, server_response))
-        return;
-    const tail_pending = runtime.h2HasPendingResponse(stream_id);
-    _ = runtime.h2FinishLocalResponse(worker.service.allocator, stream_id);
-    if (!tail_pending and !request_ended)
-        try writing.queueRstStream(Worker, worker, runtime, stream_id, .no_error);
 }
 
 /// Checks a trailer block and drops it: a worker never sees request
@@ -701,15 +697,17 @@ fn processTrailers(
     _ = runtime.h2CloseStreamIfDone(allocator, stream_id);
 }
 
-/// Decompresses a block on a stream that takes no more headers, so both
-/// ends' header tables stay in step, and drops it.
+/// Decompresses a block on a stream that takes no more headers, only so
+/// both ends' header tables stay in step, in the lane's decode scratch. No
+/// field is kept, so no count or size cap applies and nothing is allocated
+/// (`Decoder.skipBlockScratch`). A block past
+/// `INGRESS_H2_REQUEST_HEADER_BLOCK_BYTES` still fails undecoded, as in
+/// `decodeHeaderBlock`, and one the decoder cannot decompress leaves its
+/// table out of step, so either error closes the connection.
 fn discardHeaderBlock(comptime Worker: type, worker: *Worker, runtime: *Slot, block: []const u8) Http2Failure!void {
-    var decoded = decodeHeaderBlock(Worker, worker, runtime, block) catch |err| switch (err) {
-        // Refused after it was decompressed in full, and nothing is kept.
-        error.HpackHeaderListTooLarge => return,
-        else => |other| return other,
-    };
-    decoded.deinit(worker.service.allocator);
+    if (block.len > limits.headers.INGRESS_H2_REQUEST_HEADER_BLOCK_BYTES)
+        return error.Http2HeaderBlockTooLarge;
+    try runtime.h2_hpack_decoder.skipBlockScratch(worker.h2_lane.decode_scratch, block);
 }
 
 /// Resets a stream the table holds on an error the stream alone caused. The

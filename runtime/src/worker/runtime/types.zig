@@ -1,6 +1,6 @@
 //! The types a worker runtime is built from: the options the worker boot
 //! hands `Runtime.init`, the per-worker limits WorkerInit carries, the
-//! injectable clock, and a route's evaluated module. Plain data; the runtime
+//! injectable clocks, and a route's evaluated module. Plain data; the runtime
 //! built from them runs on the worker's VM thread.
 
 const std = @import("std");
@@ -23,7 +23,9 @@ pub const RouteModule = struct {
 };
 
 /// `ipc.WorkerRuntimeBootOptions`, which WorkerInit carries, is where the
-/// limit defaults are set; this file only widens them to usize.
+/// limit defaults are set; this file only widens them to usize. The crypto
+/// pool's stack is no limit: it is a property of the binary, which
+/// `runtime/crypto.zig` takes from `common/limits/worker.zig`.
 const wire_defaults = ipc.WorkerRuntimeBootOptions{};
 
 pub const RuntimeLimits = struct {
@@ -47,7 +49,6 @@ pub const RuntimeLimits = struct {
     /// WebCrypto progress while keeping CPU ownership predictable for the JS
     /// event loop.
     crypto_thread_count: usize = default_crypto_thread_count,
-    crypto_thread_stack_bytes: usize = wire_defaults.crypto_thread_stack_bytes,
     crypto_max_in_flight_per_request: usize = default_crypto_max_in_flight_per_request,
     /// 0 derives the worker's cap as `request_task_capacity` times
     /// `crypto_max_in_flight_per_request` (`resolveAutoRuntimeLimits`), the
@@ -63,8 +64,6 @@ pub const RuntimeLimits = struct {
 pub fn resolveAutoRuntimeLimits(base: RuntimeLimits) RuntimeLimits {
     var limits = base;
     limits.crypto_thread_count = resolveCryptoThreadCount(limits.crypto_thread_count);
-    if (limits.crypto_thread_stack_bytes == 0)
-        limits.crypto_thread_stack_bytes = wire_defaults.crypto_thread_stack_bytes;
     if (limits.crypto_max_in_flight_per_request == 0) {
         limits.crypto_max_in_flight_per_request =
             RuntimeLimits.default_crypto_max_in_flight_per_request;
@@ -102,9 +101,11 @@ pub const WorkerSchedulerMetrics = struct {
     timeout_cancels: u64 = 0,
 };
 
-/// The runtime's clock in nanoseconds. `monotonic` reads CLOCK_MONOTONIC,
-/// and 0 when the read fails; tests inject their own. The sentinel always
-/// reads CLOCK_MONOTONIC, whatever clock the runtime has.
+/// A clock in nanoseconds the runtime reads. `monotonic` reads
+/// CLOCK_MONOTONIC and `threadCpu` the calling thread's
+/// CLOCK_THREAD_CPUTIME_ID, each 0 when the read fails; tests inject their
+/// own. The sentinel always reads CLOCK_MONOTONIC and the VM thread's kernel
+/// CPU clock, whatever clocks the runtime has.
 pub const Clock = struct {
     ctx: ?*anyopaque,
     now_fn: *const fn (?*anyopaque) u64,
@@ -116,6 +117,16 @@ pub const Clock = struct {
         };
     }
 
+    /// The CPU time of the thread that reads it. The runtime reads it only on
+    /// the VM thread (`owner.zig`), where it measures that thread alone,
+    /// whatever thread id glibc cached for it.
+    pub fn threadCpu() Clock {
+        return .{
+            .ctx = null,
+            .now_fn = threadCpuNow,
+        };
+    }
+
     pub fn now(self: Clock) u64 {
         return self.now_fn(self.ctx);
     }
@@ -123,6 +134,9 @@ pub const Clock = struct {
 
 pub const RuntimeOptions = struct {
     clock: Clock = Clock.monotonic(),
+    /// The VM thread's CPU clock, which every owner window reads at its
+    /// borders (`owner.zig`).
+    cpu_clock: Clock = Clock.threadCpu(),
     limits: RuntimeLimits = .{},
     memory_events_fd: ?std.posix.fd_t = null,
     trace_fd: ?std.posix.fd_t = null,
@@ -130,6 +144,9 @@ pub const RuntimeOptions = struct {
     ingress_payload_fd: ?std.posix.fd_t = null,
     /// Owned eventfd; `Runtime.init` closes it on failure or runtime teardown.
     ingress_payload_credit_eventfd: ?std.posix.fd_t = null,
+    /// WorkerInit's egress descriptors, which `Runtime.init` takes once they
+    /// check out; null or empty for a worker whose definition grants no
+    /// network access (`egress/state.zig:State.grant`).
     egress_shared_fds: ?*ipc.egress_shared.RawFds = null,
     /// The route table of the worker's definition (`common/ipc/route_table.zig`),
     /// borrowed for the runtime's whole life, since every route's bindings
@@ -139,6 +156,17 @@ pub const RuntimeOptions = struct {
     /// (`WorkerInit.flag_isolate_realm`); false runs every route in the VM's
     /// main realm.
     isolate_realm: bool = false,
+    /// WorkerInit's boot token, which every evaluation copies so that module
+    /// top-level code fetches under it (`evaluations.zig`). With
+    /// `egress_token.none`, the default, the worker refuses those fetches
+    /// before they leave (`fetch_runtime.refusal`).
+    boot_egress_token: ipc.egress_token.Bytes = ipc.egress_token.none,
+    /// The CPU budget of each request, `WorkerInit.request_cpu_budget_ns`; 0
+    /// sets none (`runtime/owner.zig`).
+    request_cpu_budget_ns: u64 = 0,
+    /// The wall-clock limit of each stretch of JavaScript the worker owner
+    /// runs, `WorkerInit.unowned_time_limit_ns`; never 0.
+    unowned_time_limit_ns: u64 = ipc.WorkerInit.default_unowned_time_limit_ns,
     trace_requests: bool = false,
     trace_all_requests: bool = false,
     /// Gives the first handler call the benchmark marker
@@ -219,6 +247,11 @@ fn isClockLike(comptime T: type) bool {
             has_now_fn = true;
     }
     return has_ctx and has_now_fn;
+}
+
+fn threadCpuNow(_: ?*anyopaque) u64 {
+    const ts = std.posix.clock_gettime(std.posix.CLOCK.THREAD_CPUTIME_ID) catch return 0;
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
 }
 
 fn monotonicNow(_: ?*anyopaque) u64 {

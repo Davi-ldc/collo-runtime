@@ -1,5 +1,5 @@
 //! WebCrypto's request check: a `crypto.subtle` call made with no active request, here from
-//! module top-level code on a VM with no host runtime and no boot context, rejects with an
+//! module top-level code on a VM with no host runtime and no turnless context, rejects with an
 //! OperationError before any job runs (`enqueueCryptoJobPromise` in
 //! `host_functions/webapi/crypto/jobs.cpp`). That holds even for a digest small enough to run
 //! inline (`inlineDigestByteLimit` in `host_functions/webapi/crypto/types.h`, checked in
@@ -23,7 +23,7 @@ test "WebCrypto inline jobs require an active request turn" {
     var promise = try support.getExportOk(&vm, "/webcrypto-outside-turn.js", "promise");
     defer promise.deinit();
 
-    var exception = switch (try vm.promiseAwaitSync(&promise)) {
+    var exception = switch (try vm.mainRealm().promiseAwaitSync(&promise)) {
         .success => |value| {
             var owned_value = value;
             defer owned_value.deinit();

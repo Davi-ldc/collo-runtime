@@ -5,7 +5,7 @@ set -euo pipefail
 
 repo="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd -P)"
 mode="${1:-all}"
-case "$mode" in cold|memory|all) ;; *) printf 'Usage: bash %s [cold|memory|all] [results-dir]\n' "$0" >&2; exit 2 ;; esac
+case "$mode" in cold|memory|all|idle|regions) ;; *) printf 'Usage: bash %s [cold|memory|all|idle|regions] [results-dir]\n' "$0" >&2; exit 2 ;; esac
 prefix="${COLLO_BENCH_PREFIX:-$repo/.zig-cache/sandbox-bench}"
 [[ "$prefix" = /* ]] || { printf 'COLLO_BENCH_PREFIX must be absolute\n' >&2; exit 2; }
 if (( EUID != 0 )); then
@@ -32,17 +32,21 @@ trap finish EXIT
 cd -- "$repo"
 sha256sum "$prefix/bin/sandbox-bench" "$prefix/bin/wsl-config" > "$results/binaries.sha256"
 sha256sum runtime/deps/webkit.version runtime/patches/webkit/*.patch > "$results/engine-inputs.sha256"
-find runtime/bench/sandbox runtime/tests/contracts -maxdepth 1 -type f \
-    \( -name '*.zig' -o -name '*.cc' -o -name '*.h' -o -name '*.jq' -o -name '*.js' -o -name 'run.sh' \) -print0 \
-    | sort -z | xargs -0 sha256sum > "$results/measurement-sources.sha256"
+{
+    find runtime/bench/sandbox runtime/tests/contracts -maxdepth 1 -type f \
+        \( -name '*.zig' -o -name '*.cc' -o -name '*.h' -o -name '*.jq' -o -name '*.js' -o -name 'run.sh' \) -print0
+    printf '%s\0' runtime/bench/sandbox.zig runtime/bench/local_origin.zig
+} | sort -z | xargs -0 sha256sum > "$results/measurement-sources.sha256"
 {
     date -Iseconds
     uname -srmo
     grep -m1 'model name' /proc/cpuinfo
     grep -E 'MemTotal|MemAvailable|SwapTotal' /proc/meminfo
     grep Cpus_allowed_list /proc/self/status
-    printf 'mode=%s\nworkload=%s\nsettle_ms=%s\nrounds=%s\ncold_samples_per_round=%s\nload_requests=%s\n' \
-        "$mode" "${COLLO_BENCH_WORKLOAD:-hello}" "${COLLO_BENCH_SETTLE_MS:-0}" \
+    printf 'mode=%s\nworkload=%s\nnetwork=%s\nconcurrency=%s\nsettle_ms=%s\nidle_window_ms=%s\n' \
+        "$mode" "${COLLO_BENCH_WORKLOAD:-hello}" "${COLLO_BENCH_NETWORK:-granted}" \
+        "${COLLO_BENCH_CONCURRENCY:-2}" "${COLLO_BENCH_SETTLE_MS:-0}" "${COLLO_BENCH_IDLE_WINDOW_MS:-30000}"
+    printf 'rounds=%s\ncold_samples_per_round=%s\nload_requests=%s\n' \
         "${COLLO_BENCH_ROUNDS:-3}" "${COLLO_BENCH_SAMPLES:-32}" \
         "${COLLO_BENCH_LOAD_REQUESTS:-workload default}"
 } > "$results/environment.txt"
@@ -78,7 +82,22 @@ jq -se --arg mode "$mode" '
           .after.snapshot.swap_bytes == 0 and
           .marginal_bytes == (.after.snapshot.current_bytes - .before.snapshot.current_bytes) and
           .load_growth_bytes == (.after.snapshot.current_bytes - .ready.snapshot.current_bytes))
-      else true end))
+      else true end) and
+      (if $mode == "idle" then
+        ([.[] | select(.kind == "idle_sample")] | length) == $meta.rounds and
+        all(.[] | select(.kind == "idle_sample");
+          .end.monotonic_ns > .start.monotonic_ns and
+          .cpu_usage_usec_delta == (.end.cpu.usage_usec - .start.cpu.usage_usec) and
+          .context_switches_delta == ((.end.switches.voluntary + .end.switches.nonvoluntary) -
+            (.start.switches.voluntary + .start.switches.nonvoluntary)))
+      else true end) and
+      (if $mode == "regions" then
+        ([.[] | select(.kind == "region_sample")] | length) ==
+          ($meta.rounds * (($meta.load_steps | length) + 1) * 2) and
+        all(.[] | select(.kind == "region_sample"); .group.stable and .group.snapshot.swap_bytes == 0)
+      else true end) and
+      ([.[] | select(.kind == "origin_summary")] | length) == (if $meta.origin == null then 0 else 1 end) and
+      all(.[] | select(.kind == "origin_summary"); .served.failures == 0))
 ' "$results/results.partial.jsonl" > /dev/null
 jq -s -f runtime/bench/sandbox/summary.jq "$results/results.partial.jsonl" > "$results/summary.json"
 rmdir -- "$results/runtime-cache"

@@ -27,15 +27,10 @@ pub const WorkState = struct {
         return .{ .view = view };
     }
 
-    /// Claims an empty live slot for the request `identity` names, started
-    /// at `started_mono_ns`. Fails with `error.InvalidRequestId` for a zero
-    /// request id and with `error.NoFreeLiveSlot` when every slot holds a
-    /// request in flight.
-    pub fn allocateLiveSlot(
-        self: *WorkState,
-        identity: page.LifecycleIdentity,
-        started_mono_ns: u64,
-    ) !LiveSlotHandle {
+    /// Claims an empty live slot for the request `identity` names. Fails with
+    /// `error.InvalidRequestId` for a zero request id and with
+    /// `error.NoFreeLiveSlot` when every slot holds a request in flight.
+    pub fn allocateLiveSlot(self: *WorkState, identity: page.LifecycleIdentity) !LiveSlotHandle {
         if (identity.external_request_id == 0)
             return error.InvalidRequestId;
 
@@ -52,9 +47,7 @@ pub const WorkState = struct {
             @atomicStore(u64, &slot.request_generation, identity.request_generation, .release);
             @atomicStore(u64, &slot.worker_id, identity.worker_id, .release);
             @atomicStore(u64, &slot.worker_generation, identity.worker_generation, .release);
-            @atomicStore(u64, &slot.billing_sequence, identity.billing_sequence, .release);
-            @atomicStore(u64, &slot.started_mono_ns, started_mono_ns, .release);
-            @atomicStore(u64, &slot.cpu_time_ns, 0, .release);
+            @atomicStore(u64, &slot.cpu_ns, 0, .release);
             @atomicStore(u32, &slot.request_slot, identity.request_slot, .release);
             @atomicStore(u16, &slot.request_lane_id, identity.request_lane_id, .release);
             @atomicStore(u16, &slot._reserved1, 0, .release);
@@ -80,21 +73,19 @@ pub const WorkState = struct {
         @atomicStore(u64, &slot.request_generation, 0, .release);
         @atomicStore(u64, &slot.worker_id, 0, .release);
         @atomicStore(u64, &slot.worker_generation, 0, .release);
-        @atomicStore(u64, &slot.billing_sequence, 0, .release);
-        @atomicStore(u64, &slot.started_mono_ns, 0, .release);
-        @atomicStore(u64, &slot.cpu_time_ns, 0, .release);
+        @atomicStore(u64, &slot.cpu_ns, 0, .release);
         @atomicStore(u32, &slot.request_slot, 0, .release);
         @atomicStore(u16, &slot.request_lane_id, 0, .release);
         @atomicStore(u16, &slot._reserved1, 0, .release);
         @atomicStore(u32, &slot.state, @intFromEnum(page.LiveSlotState.empty), .release);
     }
 
-    /// Publishes the CPU time the request has used so far, which a death
-    /// record reports if the worker dies before it finishes. Fails like
-    /// `freeLiveSlot`.
-    pub fn updateLiveSlotCpu(self: *WorkState, handle: LiveSlotHandle, cpu_time_ns: u64) !void {
+    /// Publishes the CPU the request has used so far, which a record the host
+    /// writes for the request reports if the worker never completes it. Fails
+    /// like `freeLiveSlot`.
+    pub fn updateLiveSlotCpu(self: *WorkState, handle: LiveSlotHandle, cpu_ns: u64) !void {
         const slot = try self.claimedSlot(handle);
-        @atomicStore(u64, &slot.cpu_time_ns, cpu_time_ns, .release);
+        @atomicStore(u64, &slot.cpu_ns, cpu_ns, .release);
     }
 
     /// Appends `record` to the usage record ring. A full ring marks the
@@ -128,59 +119,40 @@ pub const WorkState = struct {
     }
 };
 
-/// Host side. The usage record of a request whose worker died, built from
-/// what its live slot measured until then, as `snapshot` copied it. The
-/// caller matched the snapshot against the request's identity first
-/// (`LiveSlotSnapshot.find`), so the identity copied here is the one the
-/// host dispatched, and the caller stamps `flags` from its own state. A live
-/// slot holds no byte meters, so they stay zero, and so does
-/// `billing_sequence`, which the snapshot does not copy.
+/// Host side. The usage record of a request its worker never completed,
+/// built from what its live slot measured until then, as `snapshot` copied
+/// it: the request key and the CPU. The caller matched the snapshot against
+/// the request's identity first (`LiveSlotSnapshot.find`), so the key copied
+/// here is the one the host dispatched. A live slot holds no partition of the
+/// request's time and no byte meter, so those stay zero.
 pub fn synthesizeDeathRecord(
     snapshot: page.LiveSlotSnapshot,
-    death_mono_ns: u64,
     status: page.CompletedStatus,
 ) page.CompletedRecord {
     return .{
         .request_id = snapshot.request_id,
         .request_generation = snapshot.request_generation,
-        .worker_id = snapshot.worker_id,
-        .worker_generation = snapshot.worker_generation,
-        .started_mono_ns = snapshot.started_mono_ns,
-        .finished_mono_ns = death_mono_ns,
-        .cpu_time_ns = snapshot.cpu_time_ns,
-        .io_time_ns = 0,
-        .client_served_bytes = 0,
-        .fetch_billed_sent_bytes = 0,
-        .fetch_billed_received_bytes = 0,
-        .fetch_cost_bytes = 0,
+        .cpu_ns = snapshot.cpu_ns,
         .request_slot = snapshot.request_slot,
         .request_lane_id = snapshot.request_lane_id,
         .status = @intFromEnum(status),
-        .flags = 0,
     };
 }
 
 fn storeCompletedRecord(dst: *page.CompletedRecord, record: page.CompletedRecord) void {
     @atomicStore(u64, &dst.request_id, record.request_id, .release);
     @atomicStore(u64, &dst.request_generation, record.request_generation, .release);
-    @atomicStore(u64, &dst.worker_id, record.worker_id, .release);
-    @atomicStore(u64, &dst.worker_generation, record.worker_generation, .release);
-    @atomicStore(u64, &dst.started_mono_ns, record.started_mono_ns, .release);
-    @atomicStore(u64, &dst.finished_mono_ns, record.finished_mono_ns, .release);
-    @atomicStore(u64, &dst.cpu_time_ns, record.cpu_time_ns, .release);
-    @atomicStore(u64, &dst.io_time_ns, record.io_time_ns, .release);
+    @atomicStore(u64, &dst.exec_ns, record.exec_ns, .release);
     @atomicStore(u64, &dst.waiting_ns, record.waiting_ns, .release);
-    @atomicStore(u64, &dst.queued_ns, record.queued_ns, .release);
-    @atomicStore(u64, &dst.max_turn_ns, record.max_turn_ns, .release);
-    @atomicStore(u64, &dst.turn_cpu_ns, record.turn_cpu_ns, .release);
+    @atomicStore(u64, &dst.io_ns, record.io_ns, .release);
+    @atomicStore(u64, &dst.cpu_ns, record.cpu_ns, .release);
     @atomicStore(u64, &dst.client_served_bytes, record.client_served_bytes, .release);
-    @atomicStore(u64, &dst.fetch_billed_sent_bytes, record.fetch_billed_sent_bytes, .release);
-    @atomicStore(u64, &dst.fetch_billed_received_bytes, record.fetch_billed_received_bytes, .release);
-    @atomicStore(u64, &dst.fetch_cost_bytes, record.fetch_cost_bytes, .release);
-    @atomicStore(u64, &dst.billing_sequence, record.billing_sequence, .release);
+    @atomicStore(u64, &dst.fetch_sent_bytes, record.fetch_sent_bytes, .release);
+    @atomicStore(u64, &dst.fetch_received_bytes, record.fetch_received_bytes, .release);
+    @atomicStore(u64, &dst.fetch_wire_bytes, record.fetch_wire_bytes, .release);
     @atomicStore(u32, &dst.request_slot, record.request_slot, .release);
     @atomicStore(u16, &dst.request_lane_id, record.request_lane_id, .release);
     @atomicStore(u16, &dst._reserved1, record._reserved1, .release);
     @atomicStore(u32, &dst.status, record.status, .release);
-    @atomicStore(u32, &dst.flags, record.flags, .release);
+    @atomicStore(u32, &dst._reserved2, record._reserved2, .release);
 }

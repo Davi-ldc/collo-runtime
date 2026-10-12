@@ -84,6 +84,9 @@ pub const createSessionForWorker = session_fds.createSessionForWorker;
 pub const Endpoint = endpoint.Endpoint;
 pub const mapEndpointTakeForWorker = endpoint.mapEndpointTakeForWorker;
 pub const mapEndpointTakeForGateway = endpoint.mapEndpointTakeForGateway;
+pub const gateway_held_fd_count = endpoint.gateway_held_fd_count;
+pub const gateway_mapping_count = endpoint.gateway_mapping_count;
+pub const gatewayMappedBytes = endpoint.gatewayMappedBytes;
 
 pub const notify = wake.notify;
 pub const notifyAfterPacketWrite = wake.notifyAfterPacketWrite;

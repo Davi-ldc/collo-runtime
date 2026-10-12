@@ -1,30 +1,43 @@
 //! The worker's event loop on its VM thread: collecting ready work, pumping
 //! the engine's deferred work, reading the control channel, and running one
-//! work item per turn. Each turn publishes its owning request to the
-//! sentinel and records turn telemetry for a request; the two attributions
-//! differ for timer and immediate turns (`turnOwnerRequestId`). A fault turn
-//! has no single owner in either; its settle publishes each waiter's request
-//! per sub-turn (`fs/fault_completion.zig`). The loop returns when the
-//! control channel hangs up or `core.running` turns false. An egress gateway
-//! that closes only detaches the worker (`egress/gateway_runtime.zig`), and
-//! an `egress_attach` packet on the control channel attaches it again. The
+//! work item per turn. Each work item runs in a window of its one owner, the
+//! request or evaluation its queue slot names (`runtime/owner.zig`), which
+//! charges it the item's CPU, lets the sentinel stop only that owner's
+//! JavaScript and moves a request's timeline. A request that already spent
+//! its CPU budget or passed its deadline is answered instead of running the
+//! item's JavaScript, and one a window took past its budget is answered
+//! after the item (`serve/termination.zig`). An fs fault item has no single
+//! owner; its settle opens a window per waiter (`fs/fault_completion.zig`).
+//! The deferred-work pump always runs under the worker owner.
+//!
+//! Each tick starts with the retirement check (`runtime/retirement.zig`): a
+//! sentinel fire or a worker none of whose routes can serve sends the
+//! server one `worker_retiring` notice, and the loop goes on serving until
+//! the server closes the control channel. The loop returns when the control
+//! channel hangs up or `core.running` turns false, which only a failure the
+//! server's synthesis covers sets. An egress gateway that closes only
+//! detaches the worker (`egress/gateway_runtime.zig`), and an
+//! `egress_attach` packet on the control channel attaches it again. The
 //! worker's end of the control channel does not block
-//! (`zygote/child_boot.zig`): a response send that finds it full parks in
-//! its request's outbox, and the loop flushes the outboxes when the socket
-//! turns writable or the payload ring gets room (`serve/response.zig`).
+//! (`zygote/child_boot.zig`): a response or a notice that finds it full
+//! waits, and the loop sends it when the socket turns writable or the
+//! payload ring gets room (`serve/response.zig`).
 
 const std = @import("std");
 const bindings = @import("collo_bindings");
 const ipc = @import("collo_ipc");
+const worker_limits = @import("collo_limits").worker;
 const state = @import("../runtime/root.zig");
+const runtime_owner = @import("../runtime/owner.zig");
 const uring_backend = @import("uring_backend.zig");
 const ready_queue = @import("queue.zig");
 const immediates = @import("immediates.zig");
 const timers = @import("timers.zig");
 const request_dispatch = @import("../serve/dispatch.zig");
+const termination = @import("../serve/termination.zig");
+const response_body_stream = @import("../serve/response_body_stream.zig");
 const egress_completion = @import("../egress/completion_runtime.zig");
 const egress_gateway = @import("../egress/gateway_runtime.zig");
-const scheduler_resources = @import("resources.zig");
 const exception_log = @import("collo_worker_js").exception_log;
 
 /// Runs the loop until the control channel hangs up or `core.running` turns
@@ -43,21 +56,25 @@ pub fn run(runtime: *state.Runtime) !void {
     // scheduler closes it.
     if (runtime.scheduler.wakeup_fd) |wakeup_fd|
         try runtime.core.vm.setDeferredWorkWakeupFd(wakeup_fd);
-    // The request-less exec context of deferred-work turns after boot (see
-    // `pumpDeferredWork`).
-    var host_pump_exec_ctx = bindings.ExecCtx.init(0);
     var deferred_pending_imminent = false;
 
     var egress_completion_debt = false;
     while (runtime.core.running) {
         runtime.scheduler.metrics.worker_loop_ticks += 1;
+        // Two loads in the common case. A fire in the last tick's work item
+        // answers the requests it stopped and sends the notice here, before
+        // this tick reads any begin.
+        runtime.checkRetirement() catch |err| switch (err) {
+            error.ControlPeerClosed => return,
+            else => return err,
+        };
         // A body-pool release that failed inside a handler or a turn detaches
         // the worker here, where none runs. The wait below checks again
         // first, so a failure in this tick never waits for the next wake.
         runtime.detachEgressAfterFailedRelease();
         // A death record reads the live slot, so each tick publishes the CPU
         // used so far; a worker killed mid-request still accounts for the
-        // turns it already ran.
+        // windows it already ran.
         runtime.flushLiveRequestCpuBestEffort();
         try collectFast(runtime);
         if (!runtime.core.running)
@@ -68,11 +85,8 @@ pub fn run(runtime: *state.Runtime) !void {
         // backstop deadline keeps the loop rechecking, so a settle whose
         // scheduling a termination cut short still runs instead of waiting
         // forever; the eventfd above is the normal signal.
-        deferred_pending_imminent = pumpDeferredWork(
-            runtime,
-            &host_pump_exec_ctx,
-            deferred_pending_imminent,
-        );
+        deferred_pending_imminent = pumpDeferredWork(runtime, deferred_pending_imminent);
+        runtime.endSpentBudgets();
         backend.deferred_backstop_deadline_ns = if (deferred_pending_imminent)
             runtime.nowMonoNs() + uring_backend.deferred_work_backstop_ns
         else
@@ -121,24 +135,27 @@ pub fn run(runtime: *state.Runtime) !void {
         if (!runtime.core.running)
             break;
 
-        // A worker none of whose routes can serve, or a deadline fire that
-        // left the VM terminated, stops the loop only here and only once no
-        // queued work or live request remains, so every parked request has
-        // been answered by this worker before it stops.
-        runtime.maybeRecycleAfterFailedEvaluation();
-        if (!runtime.core.running)
-            break;
-
-        // Published again before blocking, so the CPU of this tick's turns
+        // A settlement the drained events collected may have spent a
+        // request's budget, and a fire in this tick's collect pass or pump
+        // retires the worker now, not at the next wake.
+        runtime.endSpentBudgets();
+        runtime.checkRetirement() catch |err| switch (err) {
+            error.ControlPeerClosed => return,
+            else => return err,
+        };
+        // Published again before blocking, so the CPU of this tick's windows
         // is not lost if the worker is killed during the wait.
         runtime.flushLiveRequestCpuBestEffort();
         runtime.detachEgressAfterFailedRelease();
+        backend.idle_cache_release_deadline_ns = idleCacheReleaseDeadline(runtime);
         try backend.arm(runtime);
         var events: [8]uring_backend.Event = undefined;
         const ready = backend.wait(runtime, &events) catch |err| switch (err) {
             error.ControlPeerClosed => return,
             else => return err,
         };
+        releaseIdleThreadCache(runtime);
+        backend.idle_cache_release_deadline_ns = 0;
         if (ready == 0)
             continue;
 
@@ -150,6 +167,31 @@ pub fn run(runtime: *state.Runtime) !void {
         if (!runtime.core.running)
             break;
     }
+}
+
+/// When the blocked loop must wake to release the VM thread's allocator
+/// cache: `thread_cache_idle_release_ns` after its last owner window ended,
+/// or 0 when the cache is already released. The worker's seccomp filter
+/// denies the signals libpas suspends an idle thread with, so the thread
+/// stops its own allocators after the same idle time; otherwise the
+/// scavenger polls for the worker's life (`common/limits/worker.zig`). Idle
+/// means no owner's work, not no live request: a request parked on a slow
+/// fetch leaves the thread just as idle.
+fn idleCacheReleaseDeadline(runtime: *const state.Runtime) u64 {
+    if (runtime.owners.thread_cache_released)
+        return 0;
+    return runtime.owners.idle_since_mono_ns +| worker_limits.thread_cache_idle_release_ns;
+}
+
+/// Releases the VM thread's allocator cache once it has been idle long
+/// enough (`idleCacheReleaseDeadline`), at most once per idle stretch.
+fn releaseIdleThreadCache(runtime: *state.Runtime) void {
+    if (runtime.owners.thread_cache_released or runtime.owners.current_id != 0)
+        return;
+    if (runtime.nowMonoNs() < idleCacheReleaseDeadline(runtime))
+        return;
+    bindings.releaseThreadAllocatorCache();
+    runtime.owners.thread_cache_released = true;
 }
 
 fn handleEvent(
@@ -183,15 +225,17 @@ fn handleEvent(
     }
 }
 
-/// Sends what the requests' outboxes hold (`serve/response.zig`). A send
-/// that finds the server gone fails with `error.ControlPeerClosed`, which
-/// stops the loop as a hangup seen by a control poll does; the server may
-/// close between a poll's report and the send.
+/// Sends what the requests' outboxes hold (`serve/response.zig`), then a
+/// retirement notice that found the socket full (`runtime/retirement.zig`).
+/// A send that finds the server gone fails with `error.ControlPeerClosed`,
+/// which stops the loop as a hangup seen by a control poll does; the server
+/// may close between a poll's report and the send.
 pub fn flushParkedResponses(runtime: *state.Runtime) !void {
     runtime.flushPendingIngressResponses() catch |err| switch (err) {
         error.PeerClosed => return error.ControlPeerClosed,
         else => return err,
     };
+    try runtime.sendRetirementNotice();
 }
 
 fn gatewayIpcDrainBatch(runtime: *const state.Runtime) usize {
@@ -302,14 +346,32 @@ pub fn collectControlPacket(runtime: *state.Runtime) !void {
     }
 }
 
-/// Runs one work item as a turn: publishes its owner to the sentinel,
-/// records its telemetry and hands it to its handler. Each handler's failure
-/// is answered or logged per item and never ends the loop.
+/// Runs one work item, the one the ready queue popped last, as a turn in a
+/// window of its owner: the request or evaluation its queue slot names,
+/// resolved when it was queued because the handler maps may no longer hold
+/// the entry (`readyItemOwnerRequestId`). The turn consumes the ready item
+/// that enqueue counted. An item with no owner, an fs fault completion or
+/// one whose entry was gone at enqueue, opens no window. A request owner
+/// that already reached an ending, its CPU budget spent or its deadline
+/// passed, is answered first, and the item then runs with its request
+/// finished, which only releases what the item held. A request a window of
+/// the item took past its budget is answered after it. Each handler's
+/// failure is answered or logged per item and never ends the loop.
 pub fn executeWorkItem(runtime: *state.Runtime, item: ready_queue.WorkItem) !void {
-    beginTurnTelemetry(runtime, item);
-    defer finishTurnTelemetry(runtime);
-    scheduler_resources.publishTurnOwner(runtime, turnOwnerRequestId(runtime, item));
-    defer scheduler_resources.clearTurnOwner(runtime);
+    const owner_id = runtime.scheduler.ready_queue.last_popped_meta.owner_request_id;
+    runtime.scheduler.ready_queue.last_popped_meta = .{};
+    if (owner_id != 0) {
+        const previous_owner_id = runtime_owner.enter(runtime, owner_id, .{ .consumes_ready_item = true });
+        defer runtime_owner.leave(runtime, previous_owner_id);
+        termination.endAtBoundary(runtime, owner_id);
+        runItem(runtime, item);
+    } else {
+        runItem(runtime, item);
+    }
+    runtime.endSpentBudgets();
+}
+
+fn runItem(runtime: *state.Runtime, item: ready_queue.WorkItem) void {
     switch (item) {
         .request => |request_id| request_dispatch.execute(runtime, request_id) catch |err|
             request_dispatch.handleLocalFailure(runtime, request_id, err),
@@ -337,6 +399,8 @@ pub fn executeWorkItem(runtime: *state.Runtime, item: ready_queue.WorkItem) !voi
             runtime.handleFetchBodyReadyFailure(body_id, err),
         .fs_fault_completion => |fault_id| runtime.executeFsFaultCompletion(fault_id) catch |err|
             runtime.handleFsFaultCompletionFailure(fault_id, err),
+        .response_body_stream => |request_id| response_body_stream.execute(runtime, request_id) catch |err|
+            request_dispatch.handleLocalFailure(runtime, request_id, err),
     }
 }
 
@@ -346,28 +410,17 @@ pub fn executeWorkItem(runtime: *state.Runtime, item: ready_queue.WorkItem) !voi
 /// stranded by a pass cut short. The caller keeps the backstop deadline
 /// armed while it returns true.
 ///
-/// The JSC ticket carries no request identity, because its script execution
-/// owner is the shared global object, so the turn's owner is never inferred
-/// from the requests that happen to be live. A settle can outlive the
-/// request that started it, and handing it to the only live request would
-/// spend that stranger's deadline, CPU and egress identity. While the boot
-/// context exists the settle runs under it, which is sound because a worker
-/// has one boot, registered under the reserved boot id, and boot-time code is
-/// what produces these settles; its exec context carries the boot's deadline
-/// and CPU, and its id feeds the sentinel's owner gate. After the boot
-/// context closes, every settle runs under the request-less host context
-/// with owner 0, so request-scoped host calls from it fail.
-///
-/// FIXME: a settle continuation that hangs after boot runs outside the
-/// sentinel's owner gate, since no deadline matches owner 0, so no request
-/// deadline can stop it; only the host killing the worker bounds it, and its
-/// CPU is charged to no request. Closing the gap needs the JSC ticket to
-/// carry an owner {request_id, generation}; the loop cannot infer one.
-pub fn pumpDeferredWork(
-    runtime: *state.Runtime,
-    host_exec_ctx: *bindings.ExecCtx,
-    pending_imminent: bool,
-) bool {
+/// The JSC ticket carries no owner, because its script execution owner is
+/// the shared global object, so no single request or evaluation owns a
+/// settle: one can outlive the code that started it, and handing it to the
+/// only live request would spend that stranger's deadline, CPU and egress
+/// identity. Every settle therefore runs on the worker owner's exec context
+/// (`runtime/owner.zig`), which charges no request and which no host call
+/// that needs an active owner accepts, and under the worker owner's wall
+/// limit, so a settle continuation that never yields is stopped by the
+/// sentinel. A reaction in it whose registrant is still open runs restored
+/// to that registrant, under its limits.
+pub fn pumpDeferredWork(runtime: *state.Runtime, pending_imminent: bool) bool {
     const vm = runtime.core.vm;
     // Always consume the gate, even on a backstop-driven pass: a flag raced
     // in for work this pass is about to run would otherwise buy one extra
@@ -376,23 +429,12 @@ pub fn pumpDeferredWork(
     if (!pending_imminent and !scheduled)
         return false;
 
-    var owner: u64 = 0;
-    var exec_ctx: *bindings.ExecCtx = host_exec_ctx;
-    if (runtime.bootContext()) |boot_ctx| {
-        owner = boot_ctx.exec.request_id;
-        exec_ctx = &boot_ctx.exec;
-    }
-
-    scheduler_resources.publishTurnOwner(runtime, owner);
-    defer scheduler_resources.clearTurnOwner(runtime);
-    runtime.scheduler.executing_turn_request_id = owner;
     // A deferred settle has no popped slot, so no request executes in the
     // timeline while it runs: its duration falls in each live request's open
     // slice, as waiting or I/O (`worker/request/context.zig`).
-    runtime.scheduler.executing_turn_real_owner = 0;
-    runtime.scheduler.turn_started_mono_ns = runtime.nowMonoNs();
-    runtime.scheduler.turn_queued_wait_ns = 0;
-    defer finishTurnTelemetry(runtime);
+    const exec_ctx = &runtime.owners.worker_exec;
+    const previous_owner_id = runtime_owner.enter(runtime, exec_ctx.request_id, .{});
+    defer runtime_owner.leave(runtime, previous_owner_id);
 
     var pump_state = bindings.DeferredWorkState.none;
     const result = vm.pumpDeferredWork(exec_ctx, &pump_state) catch |err| {
@@ -404,97 +446,8 @@ pub fn pumpDeferredWork(
         .exception => |exception| {
             var owned = exception;
             defer owned.deinit();
-            exception_log.logException(vm, owner, &owned, "deferred work settle");
+            exception_log.logException(vm, exec_ctx.request_id, &owned, "deferred work settle");
         },
     }
     return pump_state.pending_imminent;
-}
-
-/// The request the sentinel treats as the turn's owner. It differs from the
-/// telemetry attribution in `beginTurnTelemetry`, which counts timer and
-/// immediate turns as no request's because their duration shows up as other
-/// requests' queued time: the sentinel needs a callback turn's owning
-/// request too, or a hung callback could never be stopped, since its
-/// deadline would never match the published owner.
-fn turnOwnerRequestId(runtime: *state.Runtime, item: ready_queue.WorkItem) u64 {
-    // The resolver the enqueue used, called before the work item removes
-    // its entry from the handler maps. A fault completion resolves to 0
-    // because it spans several requests; its settle publishes each waiter's
-    // request per sub-turn instead (`fs/fault_completion.zig`).
-    return runtime.readyItemOwnerRequestId(item);
-}
-
-/// Attributes the turn to its owning request before it runs. A request's
-/// completed record carries its queued time and longest turn
-/// (`CompletedRecord` in `common/worker_state/page/usage_records.zig`), and
-/// `finishRequest` must find the request's final turn while it writes that
-/// record in the middle of it.
-fn beginTurnTelemetry(runtime: *state.Runtime, item: ready_queue.WorkItem) void {
-    const scheduler = &runtime.scheduler;
-    const now = runtime.nowMonoNs();
-    const meta = scheduler.ready_queue.last_popped_meta;
-    scheduler.ready_queue.last_popped_meta = .{};
-    scheduler.turn_started_mono_ns = now;
-    scheduler.turn_queued_wait_ns = if (meta.enqueued_mono_ns != 0 and now > meta.enqueued_mono_ns)
-        now - meta.enqueued_mono_ns
-    else
-        0;
-    // The slot's owner, resolved at enqueue because the handler maps may no
-    // longer hold the entry, starts executing in the io/waiting timeline and
-    // consumes the ready item its enqueue counted.
-    scheduler.executing_turn_real_owner = meta.owner_request_id;
-    if (meta.owner_request_id != 0) {
-        if (runtime.requests.active.get(meta.owner_request_id)) |request_ctx|
-            request_ctx.noteTurnBegin(now, true);
-    }
-    scheduler.executing_turn_request_id = switch (item) {
-        .request,
-        .request_body_ready,
-        .request_cancelled,
-        .request_deadline,
-        => |request_id| request_id,
-        .request_completion => |token| if (runtime.requests.tasks.get(token)) |task|
-            task.request_id
-        else
-            0,
-        .fetch_completion => |fetch_id| if (runtime.egress.state.tasks.get(fetch_id)) |task|
-            task.request_id
-        else
-            0,
-        .fetch_body_ready => |body_id| if (runtime.egress.state.bodies.get(body_id)) |body|
-            body.identity.request_id
-        else
-            0,
-        // Timer and immediate turns count as no request's; their duration
-        // still shows up as other requests' queued time. A fault settle can
-        // span several requests, so it has no single owner either.
-        .timer_callback, .immediate_callback, .fs_fault_completion => 0,
-    };
-}
-
-fn finishTurnTelemetry(runtime: *state.Runtime) void {
-    const scheduler = &runtime.scheduler;
-    const request_id = scheduler.executing_turn_request_id;
-    const real_owner = scheduler.executing_turn_real_owner;
-    const started_ns = scheduler.turn_started_mono_ns;
-    const queued_ns = scheduler.turn_queued_wait_ns;
-    scheduler.executing_turn_request_id = 0;
-    scheduler.executing_turn_real_owner = 0;
-    scheduler.turn_started_mono_ns = 0;
-    scheduler.turn_queued_wait_ns = 0;
-    const now = runtime.nowMonoNs();
-    // The slot's owner leaves the executing state. A request that finished
-    // during this turn is gone from the table, and `noteFinish` already
-    // sealed its timeline.
-    if (real_owner != 0) {
-        if (runtime.requests.active.get(real_owner)) |request_ctx|
-            request_ctx.noteTurnEnd(now);
-    }
-    if (request_id == 0 or started_ns == 0)
-        return;
-    // A request that finished during this turn is gone from the table here;
-    // finishRequest already folded the partial turn into its record.
-    const request_ctx = runtime.requests.active.get(request_id) orelse return;
-    request_ctx.max_turn_ns = @max(request_ctx.max_turn_ns, now - started_ns);
-    request_ctx.queued_ns_total +|= queued_ns;
 }

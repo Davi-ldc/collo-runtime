@@ -1,10 +1,11 @@
 //! One shard engine (`egress/gateway/engine.zig`) driven from the test's thread with fake sinks,
 //! and without engine threads except where the transport must run: worker messages reach only
 //! their own session's fetches, the end of a request cancels exactly its own fetches, the
-//! transport checks each fetch against the network policy entry it was submitted with, the
-//! active table's indexes survive swap removal, a ready queue asks for a wake only when it stops
-//! being empty, the body drain batches chunks and pauses for pool room instead of losing a chunk,
-//! a fetch past body end retires on its last returned extent, an allocation failure in one
+//! transport checks each fetch against the network policy it was submitted with, a denial reaches
+//! the worker as `network_denied` with the denial's text while any other failure stays `failed`,
+//! the active table's indexes survive swap removal, a ready queue asks for a wake only when it
+//! stops being empty, the body drain batches chunks and pauses for pool room instead of losing a
+//! chunk, a fetch past body end retires on its last returned extent, an allocation failure in one
 //! fetch's drain fails only that fetch, and submit and init leave nothing behind when they fail,
 //! an upload body going back to the allocator it came with.
 //! A real worker endpoint is covered in `thin_demux.zig`, shard restarts in `shard_lifecycle.zig`
@@ -18,6 +19,7 @@ const egress = @import("collo_egress_client");
 const ipc = @import("collo_ipc");
 
 const body_credit = egress.core.body_credit;
+const network = egress.network;
 
 test "egress gateway fetch identity is scoped by worker session" {
     const key = gateway.active_fetch.WorkerScopedFetch{
@@ -833,39 +835,75 @@ fn uploadOptions(len: usize) !gateway.engine.SubmitOptions {
     return options;
 }
 
-test "egress gateway checks each fetch against its own network policy entry" {
+test "egress gateway checks each fetch against its own network policy" {
+    // Numeric hosts need no DNS and every case is refused before DNS, so nothing leaves the
+    // host. The second and third fetches share a URL and differ only in their policy, so no
+    // engine-wide policy could give both outcomes.
+    try expectNetworkOutcomes(&.{
+        .{
+            .url = "https://10.0.0.1/",
+            .network = network.public_https,
+            .origin = .{ .scheme = .https, .host = "10.0.0.1", .port = 443 },
+            .denial = .private_address,
+        },
+        .{
+            .url = "http://10.0.0.1/",
+            .network = network.public_https,
+            .origin = .{ .scheme = .http, .host = "10.0.0.1", .port = 80 },
+            .denial = .http_not_allowed,
+        },
+        .{
+            .url = "http://10.0.0.1/",
+            .network = public_http_and_https,
+            .origin = .{ .scheme = .http, .host = "10.0.0.1", .port = 80 },
+            .denial = .private_address,
+        },
+        // Loopback stays denied even under a grant that names it and allows private networks.
+        .{
+            .url = "https://127.0.0.1/",
+            .network = loopback_named,
+            .origin = .{ .scheme = .https, .host = "127.0.0.1", .port = 443 },
+            .denial = .reserved_address,
+        },
+    });
+}
+
+test "a fetch its policy denies fails with the network_denied cause and the denial text, and other failures keep the failed cause" {
+    try expectNetworkOutcomes(&.{
+        // A policy without grants, as policy 0 is, refuses every hop.
+        .{
+            .url = "https://api.example.test/",
+            .network = network.deny_all,
+            .origin = .{ .scheme = .https, .host = "api.example.test", .port = 443 },
+            .denial = .no_grant,
+        },
+        // A policy that names another host; the denial names the port the URL gives.
+        .{
+            .url = "https://api.example.test:8443/",
+            .network = other_host_named,
+            .origin = .{ .scheme = .https, .host = "api.example.test", .port = 8443 },
+            .denial = .host_not_allowed,
+        },
+        // A scheme the transport does not speak fails before the policy is asked, as no denial.
+        .{
+            .url = "ftp://api.example.test/",
+            .network = network.public_https,
+            .origin = .{ .scheme = .https, .host = "api.example.test", .port = 443 },
+            .denial = null,
+        },
+    });
+}
+
+/// Submits each case as its own fetch to an engine with live threads, collects until every fetch
+/// has failed, and checks each failure: a denial as `network_denied` with the text
+/// `network.writeDenial` writes for its origin, anything else as `failed`.
+fn expectNetworkOutcomes(cases: []const NetworkCase) !void {
     var engine = try gateway.engine.Engine.init(std.testing.allocator, .{ .h2_connector_count = 1 });
     defer engine.deinit();
     var errors = FetchErrorLog{};
     engine.setPacketSender(&errors, recordFetchError);
     try engine.start();
 
-    // Numeric hosts resolve without DNS and every case is refused before it connects, so nothing
-    // leaves the host. The second and third fetches share a URL and differ only in their entry,
-    // so no engine-wide policy could give both outcomes.
-    const cases = [_]NetworkCase{
-        .{
-            .url = "https://10.0.0.1/",
-            .network = gateway.policy.public_https,
-            .refusal = "EgressDenied",
-        },
-        .{
-            .url = "http://10.0.0.1/",
-            .network = gateway.policy.public_https,
-            .refusal = "PlainHttpFetchDisabled",
-        },
-        .{
-            .url = "http://10.0.0.1/",
-            .network = .{ .kind = .any_host, .allow_private_networks = false, .allow_http = true },
-            .refusal = "EgressDenied",
-        },
-        // Loopback stays denied whatever an entry's flags allow.
-        .{
-            .url = "https://127.0.0.1/",
-            .network = .{ .kind = .any_host, .allow_private_networks = true, .allow_http = true },
-            .refusal = "EgressDenied",
-        },
-    };
     for (cases, 1..) |case, fetch_id| {
         try engine.submit(submit_session_id, .{
             .fetch_id = fetch_id,
@@ -896,10 +934,16 @@ test "egress gateway checks each fetch against its own network policy entry" {
         try engine.collectReadyCompleted(&completed);
     }
     for (cases, 1..) |case, fetch_id| {
-        const message = errors.messageFor(fetch_id) orelse return error.TestUnexpectedResult;
-        if (std.mem.indexOf(u8, message, case.refusal) == null) {
-            std.debug.print("fetch {d} to {s} failed with \"{s}\"\n", .{ fetch_id, case.url, message });
-            return error.TestUnexpectedResult;
+        const logged = errors.find(fetch_id) orelse return error.TestUnexpectedResult;
+        if (case.denial) |denial| {
+            var expected_buffer: [network.grant.denial_bytes_max]u8 = undefined;
+            var expected: std.Io.Writer = .fixed(&expected_buffer);
+            try network.writeDenial(&expected, case.origin, denial);
+            try std.testing.expectEqualStrings(expected.buffered(), logged.message());
+            try std.testing.expectEqual(ipc.EgressFetchErrorCause.network_denied, logged.cause);
+        } else {
+            try std.testing.expect(std.mem.startsWith(u8, logged.message(), "fetch failed: "));
+            try std.testing.expectEqual(ipc.EgressFetchErrorCause.failed, logged.cause);
         }
     }
 }
@@ -1214,7 +1258,7 @@ const submit_options = gateway.engine.SubmitOptions{
         .security_cell_id = [_]u8{9} ** 16,
         .policy_id = [_]u8{8} ** 16,
     },
-    .network = gateway.policy.public_https,
+    .network = network.public_https,
     .budget_key = .{
         .session_id = submit_session_id,
         .request_id = 202,
@@ -1222,13 +1266,54 @@ const submit_options = gateway.engine.SubmitOptions{
     },
 };
 
-/// One fetch of the network policy test: the entry it runs under and the transport error its
-/// failure message names.
+/// One fetch of the network policy tests: the policy it runs under and how it fails.
 const NetworkCase = struct {
     url: []const u8,
-    network: gateway.policy.NetworkPolicy,
-    refusal: []const u8,
+    network: network.Policy,
+    /// The hop's origin, as a denial names it.
+    origin: network.Origin,
+    /// The denial the fetch fails with, or null for a failure that is no denial.
+    denial: ?network.Denial,
 };
+
+const public_http_and_https_grant: network.Grant = .{
+    .allow_http = true,
+    .allow_private_networks = false,
+    .any = true,
+    .names = &.{},
+    .suffixes = &.{},
+    .ipv4 = &.{},
+    .ipv6 = &.{},
+};
+/// Any public host over HTTP on port 80 or HTTPS on port 443.
+const public_http_and_https: network.Policy = .{ .grants = &.{&public_http_and_https_grant} };
+
+const loopback_rules = [_]network.Pattern{.{ .host = .{ .ipv4 = .{ 127, 0, 0, 1 } }, .port = 0 }};
+const loopback_named_grant: network.Grant = .{
+    .allow_http = true,
+    .allow_private_networks = true,
+    .any = false,
+    .names = &.{},
+    .suffixes = &.{},
+    .ipv4 = &loopback_rules,
+    .ipv6 = &.{},
+};
+/// A grant no configuration can hold, since an entry cannot name a loopback address: the
+/// transport refuses loopback before it reads any grant.
+const loopback_named: network.Policy = .{ .grants = &.{&loopback_named_grant} };
+
+const other_host_rules = [_]network.Pattern{.{ .host = .{ .name = "other.example.test" }, .port = 0 }};
+const other_host_grant: network.Grant = .{
+    .allow_http = false,
+    .allow_private_networks = false,
+    .any = false,
+    .names = &other_host_rules,
+    .suffixes = &.{},
+    .ipv4 = &.{},
+    .ipv6 = &.{},
+};
+/// HTTPS to `other.example.test` alone.
+const other_host_named: network.Policy = .{ .grants = &.{&other_host_grant} };
 
 /// Collection passes a threaded test waits for before it fails. Each pass follows a wake, and
 /// every settled fetch wakes the engine at least once.
@@ -1249,18 +1334,28 @@ fn waitForWake(wake_fd: std.posix.fd_t) !void {
 /// The fetch error packets an engine sent, kept by fetch id so a test can read why each fetch
 /// failed. Only the collecting thread writes it.
 const FetchErrorLog = struct {
-    fetch_ids: [entries_max]u64 = undefined,
-    messages: [entries_max][message_bytes_max]u8 = undefined,
-    message_lens: [entries_max]usize = undefined,
+    entries: [entries_max]Entry = undefined,
     count: usize = 0,
 
     const entries_max: usize = 8;
-    const message_bytes_max: usize = 128;
+    /// A denial's text is the longest message the engine sends a test here.
+    const message_bytes_max: usize = network.grant.denial_bytes_max;
 
-    fn messageFor(self: *const FetchErrorLog, fetch_id: u64) ?[]const u8 {
-        for (self.fetch_ids[0..self.count], 0..) |logged_id, index| {
-            if (logged_id == fetch_id)
-                return self.messages[index][0..self.message_lens[index]];
+    const Entry = struct {
+        fetch_id: u64,
+        cause: ipc.EgressFetchErrorCause,
+        message_bytes: [message_bytes_max]u8,
+        message_len: usize,
+
+        fn message(self: *const Entry) []const u8 {
+            return self.message_bytes[0..self.message_len];
+        }
+    };
+
+    fn find(self: *const FetchErrorLog, fetch_id: u64) ?*const Entry {
+        for (self.entries[0..self.count]) |*entry| {
+            if (entry.fetch_id == fetch_id)
+                return entry;
         }
         return null;
     }
@@ -1277,10 +1372,16 @@ fn recordFetchError(ctx: ?*anyopaque, worker_session_id: u64, bytes: []const u8)
     const view = try ipc.decodeEgressFetchError(bytes);
     if (log.count == FetchErrorLog.entries_max)
         return error.TooManyFetchErrors;
-    const len = @min(view.message.len, FetchErrorLog.message_bytes_max);
-    @memcpy(log.messages[log.count][0..len], view.message[0..len]);
-    log.message_lens[log.count] = len;
-    log.fetch_ids[log.count] = view.fetch_id;
+    if (view.message.len > FetchErrorLog.message_bytes_max)
+        return error.FetchErrorMessageTooLong;
+    const entry = &log.entries[log.count];
+    entry.* = .{
+        .fetch_id = view.fetch_id,
+        .cause = view.cause,
+        .message_bytes = undefined,
+        .message_len = view.message.len,
+    };
+    @memcpy(entry.message_bytes[0..view.message.len], view.message);
     log.count += 1;
 }
 

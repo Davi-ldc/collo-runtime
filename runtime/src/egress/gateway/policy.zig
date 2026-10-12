@@ -1,5 +1,5 @@
-//! The limits and the network policies the egress gateway enforces on every fetch, the identity
-//! of each in pool and session keys, and the worker pressure the body drain consults.
+//! The limits the egress gateway enforces on every fetch, the identity of its fetches in pool
+//! and session keys, and the worker pressure the body drain consults.
 //!
 //! Nothing configures the limits: every gateway runs `production`, and the server stamps the
 //! fetch budgets of `production` into the tokens it mints. A `Policy` with other values exists
@@ -7,17 +7,18 @@
 //! `common/limits` and `common/ipc/fetch_limits.zig`, and `runtime/tests/contracts/limits.zig`
 //! asserts that they keep doing so.
 //!
-//! The network policies form a `PolicyTable` that the server builds at boot and sends in each
-//! gateway's hello (`control.zig`); a token names its route's entry by id, and the table never
-//! changes for the life of a gateway. Until the configuration accepts `network`, the table holds
-//! one entry, `public_https`, and every route maps to it; a test harness may loosen that entry
-//! (`Manager.Config.network_policy` in `server/gateway/manager.zig`).
+//! The network policies are the server's policy image (`collo_network`'s `table.zig`), which
+//! each gateway's hello hands over (`control.zig`) and the gateway decodes once; a token names
+//! its route's policy by id, and the table never changes for the life of a gateway.
+//! `networkPolicyIsolationId` names one policy of one image under one set of limits in pool
+//! keys.
 
 const std = @import("std");
 const ipc = @import("collo_ipc");
 const limits = @import("collo_limits");
 const egress = @import("collo_egress_client");
 
+const network = egress.network;
 const transport = egress.transport;
 
 pub const PoolIsolationId = transport.PoolIsolationId;
@@ -58,86 +59,22 @@ comptime {
     std.debug.assert(production.max_fetches_per_boot <= std.math.maxInt(u32));
 }
 
-/// Network policies one table holds at most. A route's effective `network` setting is one entry,
-/// so the table never needs more entries than the configuration has routes, and a token's u16
-/// policy id reaches every one.
-pub const policies_max: usize = limits.server.routes_max;
-
-/// The id of the one entry every table holds until the configuration accepts `network`.
-pub const public_https_id: u16 = 0;
-
-pub const PolicyKind = enum {
-    /// Any host whose resolved address the entry's flags admit, on every hop, redirects included.
-    any_host,
-};
-
-/// One network policy as the gateway enforces it on each hop of a fetch whose token names it:
-/// the host before DNS by `kind`, then the scheme and the address class. Loopback, link-local
-/// and metadata addresses are denied whatever the flags say.
-pub const NetworkPolicy = struct {
-    kind: PolicyKind,
-    /// Private network addresses pass the address check.
-    allow_private_networks: bool,
-    /// Plain `http:` URLs pass the scheme check.
-    allow_http: bool,
-};
-
-/// The grant every route has until the configuration accepts `network`: any public host over
-/// HTTPS.
-pub const public_https: NetworkPolicy = .{
-    .kind = .any_host,
-    .allow_private_networks = false,
-    .allow_http = false,
-};
-
-/// The network policies of one gateway, indexed by id from 0.
-pub const PolicyTable = struct {
-    entries: [policies_max]NetworkPolicy = undefined,
-    count: u16 = 0,
-
-    /// The table of one entry, `public_https_id`, that the server sends while every route maps to
-    /// the same policy.
-    pub fn single(entry: NetworkPolicy) PolicyTable {
-        var table: PolicyTable = .{ .count = 1 };
-        table.entries[public_https_id] = entry;
-        return table;
-    }
-
-    /// The entry a verified token's `policy_id` names, or null for an id past the table, which
-    /// only a server bug produces.
-    pub fn lookup(self: *const PolicyTable, id: u16) ?*const NetworkPolicy {
-        if (id < self.count)
-            return &self.entries[id];
-        return null;
-    }
-
-    pub fn slice(self: *const PolicyTable) []const NetworkPolicy {
-        return self.entries[0..self.count];
-    }
-
-    comptime {
-        std.debug.assert(policies_max <= std.math.maxInt(u16));
-    }
-};
-
-/// The identity of table entry `id` in the keys of pooled connections, TLS sessions and shard
-/// placement: fetches under two entries, or under one entry with other limits, never share a
-/// pooled connection. `limits_id` is `policyIsolationId` of the gateway's limits. The gateway
-/// computes one per entry when it takes its hello.
+/// The identity of policy `id` of the image whose digest is `table_digest` in the keys of pooled
+/// connections, TLS sessions and shard placement: fetches under two policies, under one policy
+/// of two images, or under one policy with other limits never share a pooled connection.
+/// `limits_id` is `policyIsolationId` of the gateway's limits. Pools never outlive their gateway,
+/// which decodes one image, so the digest only guards against ids reused across tables. The
+/// gateway computes one per policy when it takes its hello.
 pub fn networkPolicyIsolationId(
     limits_id: PoolIsolationId,
-    id: u16,
-    entry: NetworkPolicy,
+    table_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+    id: network.PolicyId,
 ) PoolIsolationId {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hasher.update("collo-egress-network-policy-v1");
+    hasher.update("collo-egress-network-policy-v2");
     hasher.update(&limits_id);
+    hasher.update(&table_digest);
     hasher.update(std.mem.asBytes(&id));
-    hasher.update(&[_]u8{
-        @intFromEnum(entry.kind),
-        @intFromBool(entry.allow_private_networks),
-        @intFromBool(entry.allow_http),
-    });
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     hasher.final(&digest);
     var isolation_id: PoolIsolationId = undefined;

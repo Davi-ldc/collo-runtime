@@ -10,7 +10,6 @@ const std = @import("std");
 const test_support = @import("support.zig");
 const limits = @import("collo_limits");
 const fetch_body = test_support.fetch_body;
-const decompress = test_support.decompress;
 const stream_pump = test_support.stream_pump;
 const encoded_body = @import("collo_egress_client").core.encoded_body;
 const identity = test_support.identity;
@@ -84,9 +83,6 @@ test "encoded body decoder limits from half-filled head fall back to defaults" {
 }
 
 test "encoded body decoder decodes gzip across extents and releases each only on full consumption" {
-    if (!decompress.supportsZlib())
-        return error.SkipZigTest;
-
     var releases = ReleaseLog{};
     var body = fetch_body.Body.initOpen(std.testing.allocator, identity(201), 64);
     defer body.deinitAfterQueuedResourcesReleased(std.testing.allocator);
@@ -135,9 +131,6 @@ test "encoded body decoder decodes gzip across extents and releases each only on
 }
 
 test "encoded body decoder accepts concatenated gzip members" {
-    if (!decompress.supportsZlib())
-        return error.SkipZigTest;
-
     var releases = ReleaseLog{};
     var body = fetch_body.Body.initOpen(std.testing.allocator, identity(202), 64);
     defer body.deinitAfterQueuedResourcesReleased(std.testing.allocator);
@@ -177,9 +170,6 @@ test "encoded body decoder accepts concatenated gzip members" {
 }
 
 test "encoded body decoder pauses at decoded watermark and resumes after pulls" {
-    if (!decompress.supportsZlib())
-        return error.SkipZigTest;
-
     var releases = ReleaseLog{};
     var body = fetch_body.Body.initOpen(std.testing.allocator, identity(202), 64);
     defer body.deinitAfterQueuedResourcesReleased(std.testing.allocator);
@@ -239,9 +229,6 @@ test "encoded body decoder pauses at decoded watermark and resumes after pulls" 
 }
 
 test "encoded body decoder finishes trailer exactly at decoded budget" {
-    if (!decompress.supportsZlib())
-        return error.SkipZigTest;
-
     var releases = ReleaseLog{};
     var body = fetch_body.Body.initOpen(std.testing.allocator, identity(203), 64);
     defer body.deinitAfterQueuedResourcesReleased(std.testing.allocator);
@@ -282,9 +269,6 @@ test "encoded body decoder finishes trailer exactly at decoded budget" {
 }
 
 test "encoded body decoder finish over watermark completes only after drain" {
-    if (!decompress.supportsZlib())
-        return error.SkipZigTest;
-
     var releases = ReleaseLog{};
     var body = fetch_body.Body.initOpen(std.testing.allocator, identity(204), 64);
     defer body.deinitAfterQueuedResourcesReleased(std.testing.allocator);
@@ -337,9 +321,6 @@ test "encoded body decoder finish over watermark completes only after drain" {
 }
 
 test "encoded body decoder fails decoded budget and releases the extent exactly once" {
-    if (!decompress.supportsZlib())
-        return error.SkipZigTest;
-
     var releases = ReleaseLog{};
     var body = fetch_body.Body.initOpen(std.testing.allocator, identity(205), 64);
     defer {
@@ -370,9 +351,6 @@ test "encoded body decoder fails decoded budget and releases the extent exactly 
 }
 
 test "encoded body decoder ratio guard fails decompression bombs" {
-    if (!decompress.supportsZlib())
-        return error.SkipZigTest;
-
     var releases = ReleaseLog{};
     var body = fetch_body.Body.initOpen(std.testing.allocator, identity(206), null);
     defer {
@@ -404,9 +382,6 @@ test "encoded body decoder ratio guard fails decompression bombs" {
 }
 
 test "encoded body decoder handles empty extents and tolerates double finish" {
-    if (!decompress.supportsZlib())
-        return error.SkipZigTest;
-
     var releases = ReleaseLog{};
     var body = fetch_body.Body.initOpen(std.testing.allocator, identity(207), 64);
     defer body.deinitAfterQueuedResourcesReleased(std.testing.allocator);
@@ -449,9 +424,6 @@ test "encoded body decoder handles empty extents and tolerates double finish" {
 }
 
 test "encoded body decoder deinit releases all unconsumed extents" {
-    if (!decompress.supportsZlib())
-        return error.SkipZigTest;
-
     var releases = ReleaseLog{};
     var body = fetch_body.Body.initOpen(std.testing.allocator, identity(208), 64);
     defer {

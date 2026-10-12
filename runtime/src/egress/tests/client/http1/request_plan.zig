@@ -3,10 +3,27 @@
 //! call the builders directly and never touch the network.
 
 const std = @import("std");
+const network_policy = @import("../network_policy.zig");
 const test_support = @import("support.zig");
 const transport = test_support.transport;
 const decompress = test_support.decompress;
 const containsHeader = test_support.containsHeader;
+
+const network = transport.network;
+const https_only: transport.Config = .{ .network = network_policy.public_https };
+const http_and_https: transport.Config = .{ .network = network_policy.public_http_and_https };
+
+const example_com_443_grant: network.Grant = .{
+    .allow_http = true,
+    .allow_private_networks = false,
+    .any = false,
+    .names = &.{.{ .host = .{ .name = "example.com" }, .port = 443 }},
+    .suffixes = &.{},
+    .ipv4 = &.{},
+    .ipv6 = &.{},
+};
+/// `example.com:443` for plain HTTP and HTTPS.
+const example_com_443: network.Policy = .{ .grants = &.{&example_com_443_grant} };
 
 test "egress client core rejects unsupported protocols without a task runtime" {
     try std.testing.expectError(error.UnsupportedFetchProtocol, transport.prepareRequest(
@@ -14,18 +31,20 @@ test "egress client core rejects unsupported protocols without a task runtime" {
         "file:///tmp/no-network",
         "GET",
         &.{},
-        .{},
+        https_only,
     ));
 }
 
 test "egress request plan prepares shared http1 and http2 request state" {
+    var origins: network_policy.Origins = .{};
+    try origins.init("93.184.216.34", &.{8443});
     const headers = [_]transport.Header{.{ .name = "accept", .value = "text/plain" }};
     var plan = try transport.prepareRequest(
         std.testing.allocator,
         "https://93.184.216.34:8443/hello?x=1",
         "get",
         &headers,
-        .{},
+        .{ .network = origins.policy() },
     );
     defer plan.deinit();
 
@@ -39,15 +58,15 @@ test "egress request plan prepares shared http1 and http2 request state" {
 }
 
 test "egress request plan accepts uppercase schemes and HTTP method tokens" {
-    try transport.validateProtocol("HTTPS://example.com/data", false);
-    try transport.validateProtocol("HTTP://example.com/data", true);
+    _ = try transport.parseTarget(network_policy.public_https, "HTTPS://example.com/data");
+    _ = try transport.parseTarget(network_policy.public_http_and_https, "HTTP://example.com/data");
 
     var custom = try transport.prepareRequest(
         std.testing.allocator,
         "HTTPS://example.com/data",
         "REPORT",
         &.{},
-        .{},
+        https_only,
     );
     defer custom.deinit();
     try std.testing.expectEqualStrings("REPORT", custom.method);
@@ -58,14 +77,14 @@ test "egress request plan accepts uppercase schemes and HTTP method tokens" {
         "https://example.com/data",
         "CONNECT",
         &.{},
-        .{},
+        https_only,
     ));
     try std.testing.expectError(error.UnsupportedFetchMethod, transport.prepareRequest(
         std.testing.allocator,
         "https://example.com/data",
         "bad method",
         &.{},
-        .{},
+        https_only,
     ));
 }
 
@@ -75,7 +94,7 @@ test "egress request plan omits scheme-default ports from the authority" {
         "https://example.com:443/x",
         "GET",
         &.{},
-        .{},
+        https_only,
     );
     defer tls_default.deinit();
     try std.testing.expectEqualStrings("example.com", tls_default.request_authority);
@@ -85,7 +104,7 @@ test "egress request plan omits scheme-default ports from the authority" {
         "http://example.com:80/x",
         "GET",
         &.{},
-        .{ .allow_plain_http = true },
+        http_and_https,
     );
     defer plain_default.deinit();
     try std.testing.expectEqualStrings("example.com", plain_default.request_authority);
@@ -95,7 +114,7 @@ test "egress request plan omits scheme-default ports from the authority" {
         "http://example.com:443/x",
         "GET",
         &.{},
-        .{ .allow_plain_http = true },
+        .{ .network = example_com_443 },
     );
     defer cross_scheme.deinit();
     try std.testing.expectEqualStrings("example.com:443", cross_scheme.request_authority);
@@ -142,7 +161,7 @@ test "egress request plan preserves explicit accept-encoding" {
         "https://example.com/data",
         "GET",
         &headers,
-        .{},
+        https_only,
     );
     defer plan.deinit();
 
@@ -159,7 +178,7 @@ test "egress request plan rejects protocol-managed request headers before connec
         "https://example.com/data",
         "POST",
         &headers,
-        .{},
+        https_only,
     ));
 }
 
@@ -176,7 +195,6 @@ test "egress redirect target rewrites method and strips unsafe headers" {
         "https://example.com/a/b",
         "POST",
         &original_headers,
-        "payload",
         302,
         &[_]Header{.{ .name = "location", .value = "../next" }},
         .{},
@@ -189,7 +207,7 @@ test "egress redirect target rewrites method and strips unsafe headers" {
     }
     try std.testing.expectEqualStrings("https://example.com/next", rewritten.url);
     try std.testing.expectEqualStrings("GET", rewritten.method);
-    try std.testing.expectEqualStrings("", rewritten.body);
+    try std.testing.expectEqual(transport.RedirectBody.drop, rewritten.body);
     try std.testing.expect(!containsHeader(rewritten.headers, "content-type"));
     try std.testing.expect(!containsHeader(rewritten.headers, "content-length"));
     try std.testing.expect(containsHeader(rewritten.headers, "authorization"));
@@ -205,7 +223,6 @@ test "egress redirect target rewrites method and strips unsafe headers" {
         "https://example.com/a",
         "GET",
         &cross_origin_headers,
-        "",
         307,
         &[_]Header{.{ .name = "location", .value = "https://other.example/path" }},
         .{},
@@ -218,6 +235,7 @@ test "egress redirect target rewrites method and strips unsafe headers" {
     }
     try std.testing.expectEqualStrings("https://other.example/path", cross_origin.url);
     try std.testing.expectEqualStrings("GET", cross_origin.method);
+    try std.testing.expectEqual(transport.RedirectBody.keep, cross_origin.body);
     try std.testing.expect(!containsHeader(cross_origin.headers, "authorization"));
     try std.testing.expect(!containsHeader(cross_origin.headers, "cookie"));
     try std.testing.expect(containsHeader(cross_origin.headers, "x-keep"));
@@ -227,7 +245,6 @@ test "egress redirect target rewrites method and strips unsafe headers" {
         "https://example.com/a",
         "GET",
         &.{},
-        "",
         302,
         &[_]Header{.{ .name = "location", .value = "https://user:pass@other.example/secret" }},
         .{},
@@ -243,6 +260,7 @@ test "egress redirect target rewrites method and strips unsafe headers" {
 
 test "egress config exposes HTTP2 limits for pooled sessions" {
     const limits = (transport.Config{
+        .network = network_policy.public_https,
         .max_pending_decoded_body_bytes = 2 * 1024 * 1024,
         .http2_max_active_streams = 7,
         .http2_stream_receive_window = 2 * 1024 * 1024,
@@ -261,16 +279,16 @@ test "egress config exposes HTTP2 limits for pooled sessions" {
     try std.testing.expectEqual(@as(usize, 2 * 1024 * 1024), limits.max_pending_body_credit_per_connection);
     try std.testing.expectEqual(
         transport.default_http2_max_outgoing_buffer_bytes,
-        (transport.Config{}).http2_max_outgoing_buffer_bytes,
+        https_only.http2_max_outgoing_buffer_bytes,
     );
     try std.testing.expectEqual(
         transport.default_tls_ciphertext_buffer_bytes,
-        (transport.Config{}).tls_ciphertext_buffer_bytes,
+        https_only.tls_ciphertext_buffer_bytes,
     );
 }
 
 test "egress config does not advertise h2 stream credit above decoded queue budget" {
-    const config = transport.Config{};
+    const config = https_only;
     const pump_limits = try config.streamPumpLimits().normalized();
     const h2_limits = try config.http2Limits().normalized();
 
@@ -278,6 +296,7 @@ test "egress config does not advertise h2 stream credit above decoded queue budg
     try std.testing.expect(h2_limits.max_pending_body_credit_per_stream <= pump_limits.max_pending_decoded_bytes);
 
     const clamped = (transport.Config{
+        .network = network_policy.public_https,
         .max_pending_decoded_body_bytes = 128 * 1024,
         .http2_stream_receive_window = 1024 * 1024,
         .http2_max_pending_body_credit_per_stream = 1024 * 1024,
@@ -288,6 +307,7 @@ test "egress config does not advertise h2 stream credit above decoded queue budg
 
 test "egress http1 pump uses decoded queue watermark for backpressure" {
     const config = transport.Config{
+        .network = network_policy.public_https,
         .max_response_body_bytes = 1024 * 1024,
         .max_pending_decoded_body_bytes = 64 * 1024,
     };

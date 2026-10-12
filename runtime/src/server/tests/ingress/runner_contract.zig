@@ -158,12 +158,22 @@ test "a connection slot holds positions into the lane's stream slab, not its str
     );
 }
 
-test "the command reserve counts, per worker entry, a death, a reader grant, one completion per slot and the forwarding window" {
-    const per_entry = 2 + @as(usize, supervision.pool.slots_per_worker_max) + limits.ingress.forwarded_commands_per_worker_max;
-    const entries = supervision.scheduler_limits.capacity.pool_workers_max;
-    try std.testing.expectEqual(@as(usize, 0), ingress.lane.obligationReserve(0));
-    try std.testing.expectEqual(per_entry * entries, ingress.lane.obligationReserve(1));
-    try std.testing.expectEqual(3 * per_entry * entries, ingress.lane.obligationReserve(3));
+test "the command reserve counts, per worker entry, a death, a reader grant, one completion per slot of its own definition and the forwarding window" {
+    const per_entry_without_slots = 2 + limits.ingress.forwarded_commands_per_worker_max;
+    const entries = limits.pool.pool_workers_max;
+    try std.testing.expectEqual(@as(usize, 0), ingress.lane.obligationReserve(0, 0));
+    // One definition at the default `concurrency` of 2.
+    try std.testing.expectEqual((per_entry_without_slots + 2) * entries, ingress.lane.obligationReserve(1, 2));
+    // One at the largest `concurrency`, whose entries need a place for every
+    // slot a worker has.
+    const slots_max: usize = supervision.pool.slots_per_worker_max;
+    try std.testing.expectEqual((per_entry_without_slots + slots_max) * entries, ingress.lane.obligationReserve(1, slots_max));
+    // Three definitions of `concurrency` 1, 2 and 16: each entry counts its
+    // own definition's slots, not the largest a worker may have.
+    try std.testing.expectEqual(
+        (3 * per_entry_without_slots + 1 + 2 + 16) * entries,
+        ingress.lane.obligationReserve(3, 1 + 2 + 16),
+    );
 }
 
 test "connection interest registers newly required write readiness while read poll is armed" {

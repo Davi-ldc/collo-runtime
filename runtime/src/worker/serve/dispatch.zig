@@ -2,7 +2,9 @@
 //! `Request`, calls `handler(request, env)` and answers with what the
 //! handler returns or throws. It also owns the request's failure paths: a
 //! client reset, a deadline and a local error each end the request with a
-//! response or a reset. It runs on the worker's VM thread.
+//! response or a reset, and a begin that reached a retiring worker answers
+//! 503 without running JavaScript (`termination.zig` owns those answers and
+//! how an exception becomes one). It runs on the worker's VM thread.
 //!
 //! The server chose the route from the request path and names it in the
 //! dispatch by its index in the definition's route table
@@ -12,6 +14,7 @@
 
 const std = @import("std");
 const bindings = @import("collo_bindings");
+const ipc = @import("collo_ipc");
 const state = @import("../runtime/root.zig");
 const request_head = @import("collo_worker_request").head;
 const request_context = @import("collo_worker_request").context;
@@ -24,11 +27,15 @@ const js_value = @import("collo_worker_js").value;
 const request_task = @import("collo_worker_request").task;
 const worker_shared_page = @import("collo_worker_state").page;
 const response_flow = @import("response.zig");
+const termination = @import("termination.zig");
 const tracing = @import("trace.zig");
 const module_routes = @import("../modules/routes.zig");
 
+/// Starts the request's run. A request already answered, as one the
+/// worker ended while its begin waited in the queue, is gone or finishing,
+/// and its item does nothing.
 pub fn execute(runtime: *state.Runtime, request_id: u64) !void {
-    const request_ctx = runtime.requests.active.get(request_id) orelse return error.RequestNotFound;
+    const request_ctx = runtime.requests.active.get(request_id) orelse return;
     request_ctx.dispatch_queued = false;
     if (request_ctx.finish_started)
         return;
@@ -37,6 +44,13 @@ pub fn execute(runtime: *state.Runtime, request_id: u64) !void {
         return;
     }
     request_ctx.dispatch_started = true;
+    if (request_ctx.arrived_retiring) {
+        // The server may already be replacing this worker, and the VM may
+        // be unable to run the handler, so none of its JavaScript runs and
+        // the 503 lets the client retry elsewhere.
+        try termination.end(runtime, request_ctx, .worker_retiring);
+        return;
+    }
     executeLoaded(runtime, request_ctx) catch |err|
         handleLocalFailure(runtime, request_id, err);
 }
@@ -63,49 +77,31 @@ pub fn cancelClientReset(runtime: *state.Runtime, request_id: u64) !void {
 
 /// The request's deadline passed. It answers 504 in place of a response
 /// whose head has not gone out, or ends a committed response with that
-/// status.
+/// status; a request that reached another ending first, as a fire for
+/// another owner, answers that one (`termination.endingOf`).
 pub fn deadlineTimeout(runtime: *state.Runtime, request_id: u64) !void {
     const request_ctx = runtime.requests.active.get(request_id) orelse return;
     if (!request_ctx.deadline_armed and !request_ctx.deadline_due_queued)
         return;
     // A top-level await still pending past its budget pins its route failed
     // and nothing else (`expireRouteEvaluations`). A deadline is the wake
-    // that finds it: the boot context's, armed to the latest budget of the
-    // routes the boot evaluated, reaches every route even when no request
-    // waits, and a parked request's reaches its own route sooner.
+    // that finds it: an evaluation's, armed to its routes' budget, reaches
+    // its routes even when no request waits, and a parked request's reaches
+    // its own route sooner.
     runtime.expireRouteEvaluations();
-    if (request_id == request_context.boot_request_id) {
-        // The boot context's deadline is the evaluation budget, and it has no
-        // client stream to answer. Every route the boot evaluated has expired
-        // or settled by now, so the expiry above has closed the context,
-        // which frees `request_ctx`. One still open has only routes left
-        // that a request evaluated after the boot, each bounded by its own
-        // budget, and the window is over all the same. A sentinel fire under
-        // the boot id is folded into the worker's stop by either disarm
-        // (`disarmRequestDeadline`), since it poisons the VM for every route.
-        if (runtime.bootContext()) |boot_ctx| {
-            runtime.disarmRequestDeadline(boot_ctx);
-            boot_ctx.exec.deadline_monotonic_ns = 0;
-        }
+    if (request_context.isEvaluationId(request_id)) {
+        // An evaluation's deadline is its routes' budget, and it has no
+        // client stream to answer. Its routes have expired by now, so the
+        // expiry above has closed it, which frees `request_ctx`. One still
+        // open is armed again at its routes' deadline.
+        runtime.armEvaluationBudget(request_id) catch |err|
+            std.log.warn("evaluation budget re-arm failed evaluation_id={d}: {s}", .{
+                request_id,
+                @errorName(err),
+            });
         return;
     }
-    // A sentinel that fired terminated the VM for good, so once this 504 is
-    // written the worker stops after the drain instead of answering every
-    // later request with a 500. The fired bit is read before the disarm,
-    // which erases it.
-    const sentinel_fired = runtime.requestDeadlineSentinelFired(request_ctx);
-    defer if (sentinel_fired) {
-        runtime.stop_after_deadline_fire = true;
-    };
-    runtime.disarmRequestDeadline(request_ctx);
-    if (!request_ctx.body.isComplete()) {
-        request_ctx.body.pipe.fail("request deadline exceeded");
-    }
-    if (request_ctx.response_committed) {
-        _ = try response_flow.finishRequest(runtime, request_ctx, .deadline_timeout, 504);
-        return;
-    }
-    try response_flow.replaceUnsentResponse(runtime, request_ctx, 504, "gateway timeout", .deadline_timeout);
+    try termination.end(runtime, request_ctx, termination.endingOf(runtime, request_ctx) orelse .deadline);
 }
 
 /// The funnel for an error a request's work returned. A full record ring or
@@ -133,14 +129,15 @@ pub fn handleLocalFailure(runtime: *state.Runtime, request_id: u64, err: anyerro
         });
         return;
     }
-    // The boot context has no response path. `failInternal` would send
-    // frames with a zeroed dispatch identity, publish a record for no
-    // request and destroy the boot context while later top-level fetches and
+    // An evaluation or the worker owner has no response path. `failInternal`
+    // would send frames with a zeroed dispatch identity, publish a record for
+    // no request and destroy an evaluation while its top-level fetches and
     // timers still need it. The failed operation already reached JavaScript
     // as a rejection, so the error is only logged; at warn, because a test
     // exercises this guard and the test runner fails a run on any err line.
-    if (request_id == request_context.boot_request_id) {
-        std.log.warn("instance-context work failed (dropped, no response path): {s}", .{
+    if (request_context.isReservedId(request_id)) {
+        std.log.warn("work of an owner with no response path failed owner_id={d}: {s}", .{
+            request_id,
             @errorName(err),
         });
         return;
@@ -199,30 +196,29 @@ pub fn executeCompletion(runtime: *state.Runtime, token: request_task.TaskToken)
         task.pending_thenable = null;
     }
     tracing.mark(runtime, request_ctx, "completion_received_ns");
-    if (runtime.requestDeadlineTerminationRequested(request_ctx)) {
+    if (termination.endingOf(runtime, request_ctx)) |ending| {
         task.timed_out = true;
-        try deadlineTimeout(runtime, request_id);
+        try termination.end(runtime, request_ctx, ending);
         return;
     }
     task.state = .extracting_response;
     if (completion.is_error) {
         task.state = .failed;
-        try response_flow.writeException(runtime, request_ctx, &completion.value);
+        try termination.answerException(runtime, request_ctx, &completion.value, "js exception");
     } else {
-        try response_bridge.writeValueResponse(runtime, request_ctx, &completion.value, response_flow.writeAndFinishResponse);
+        try response_bridge.writeValueResponse(runtime, request_ctx, &completion.value);
     }
 }
 
 fn executeLoaded(runtime: *state.Runtime, request_ctx: *request_context.RequestContext) !void {
     tracing.mark(runtime, request_ctx, "execute_request_start_ns");
     try runtime.armRequestDeadline(request_ctx);
-    if (runtime.requestDeadlineTerminationRequested(request_ctx)) {
-        try deadlineTimeout(runtime, request_ctx.exec.request_id);
+    if (termination.endingOf(runtime, request_ctx)) |ending| {
+        try termination.end(runtime, request_ctx, ending);
         return;
     }
 
-    var modules_ctx = runtime.modulesContext();
-    const route = switch (try module_routes.ensureRouteHandler(&modules_ctx, request_ctx)) {
+    const route = switch (try runtime.ensureRouteHandler(request_ctx)) {
         .ready => |route| route,
         // The entry's evaluation (a top-level await) is still running: the
         // request waits in the module's waiter list, settlement queues it
@@ -231,14 +227,7 @@ fn executeLoaded(runtime: *state.Runtime, request_ctx: *request_context.RequestC
         .exception => |exception| {
             var owned = exception;
             defer owned.deinit();
-            // A sentinel fire can surface as this exception too, so the
-            // worker stops once the response is written, as on the handler
-            // path.
-            const sentinel_fired = runtime.requestDeadlineSentinelFired(request_ctx);
-            defer if (sentinel_fired) {
-                runtime.stop_after_deadline_fire = true;
-            };
-            try response_flow.writeException(runtime, request_ctx, &owned);
+            try termination.answerException(runtime, request_ctx, &owned, "js exception");
             return;
         },
     };
@@ -248,39 +237,52 @@ fn executeLoaded(runtime: *state.Runtime, request_ctx: *request_context.RequestC
 
 fn failInternal(runtime: *state.Runtime, request_ctx: *request_context.RequestContext, err: anyerror) void {
     const request_id = request_ctx.exec.request_id;
-    // `handleLocalFailure` already keeps the boot context out; this guard
-    // keeps it from the response and finish paths whatever the caller.
-    if (request_id == request_context.boot_request_id) {
-        std.log.err("refusing response-path failure for the boot context: {s}", .{@errorName(err)});
+    // `handleLocalFailure` already keeps every owner without a response path
+    // out; this guard keeps an evaluation from the response and finish paths
+    // whatever the caller.
+    if (request_context.isReservedId(request_id)) {
+        std.log.err("refusing response-path failure for owner_id={d}: {s}", .{ request_id, @errorName(err) });
         return;
     }
-    // A sentinel fire that unwound as an internal error, such as a
-    // settlement turn trapped mid-drain, arrives with the deadline still
-    // armed. The fired bit is read before the finish path disarms it, and
-    // the worker stops once the 500 is written.
-    const sentinel_fired = runtime.requestDeadlineSentinelFired(request_ctx);
-    defer if (sentinel_fired) {
-        runtime.stop_after_deadline_fire = true;
-    };
     std.log.warn("request-local failure request_id={d}: {s}", .{ request_id, @errorName(err) });
+    // A termination can surface as an internal error, such as a settlement
+    // turn trapped mid-drain, so a request that reached an ending answers it
+    // instead of a 500 or a 502.
+    if (termination.endingOf(runtime, request_ctx)) |ending| {
+        termination.end(runtime, request_ctx, ending) catch |end_err| {
+            std.log.warn("failed to end request request_id={d}: {s}", .{ request_id, @errorName(end_err) });
+            finishAfterFailedAnswer(runtime, request_id, .internal_error, 500);
+        };
+        return;
+    }
     if (request_ctx.response_committed) {
         // A committed response that broke can never end its stream, so the
         // stream is reset and the server aborts the client now instead of
         // holding a truncated response open until the deadline.
-        response_flow.failResponse(runtime, request_ctx, 502) catch |fail_err| {
+        response_flow.failResponse(runtime, request_ctx, .internal_error, 502) catch |fail_err| {
             std.log.warn("failed to finalize committed failed request_id={d}: {s}", .{ request_id, @errorName(fail_err) });
         };
         return;
     }
     response_flow.replaceUnsentResponse(runtime, request_ctx, 500, "internal server error", .internal_error) catch |write_err| {
         std.log.warn("failed to write internal error response request_id={d}: {s}", .{ request_id, @errorName(write_err) });
-        const active_request = runtime.requests.active.get(request_id) orelse return;
-        if (active_request.finish_started)
-            return;
-        _ = response_flow.finishRequest(runtime, active_request, .internal_error, 500) catch |finish_err| {
-            std.log.warn("failed to finalize internal error request_id={d}: {s}", .{ request_id, @errorName(finish_err) });
-            return;
-        };
+        finishAfterFailedAnswer(runtime, request_id, .internal_error, 500);
+    };
+}
+
+/// Finishes a request whose answer could not be written, so the server
+/// still gets its completion; does nothing once its finish started.
+fn finishAfterFailedAnswer(
+    runtime: *state.Runtime,
+    request_id: u64,
+    done_status: ipc.RequestDoneStatus,
+    http_status: u16,
+) void {
+    const active_request = runtime.requests.active.get(request_id) orelse return;
+    if (active_request.finish_started)
+        return;
+    _ = response_flow.finishRequest(runtime, active_request, done_status, http_status) catch |finish_err| {
+        std.log.warn("failed to finalize failed request request_id={d}: {s}", .{ request_id, @errorName(finish_err) });
     };
 }
 
@@ -313,16 +315,16 @@ fn invokeHandlerAfterParse(
     tracing.mark(runtime, request_ctx, "make_request_done_ns");
     defer request_value.deinit();
 
-    try invokeHandlerOrFinish(runtime, request_ctx, route.module, &request_value);
+    try invokeHandlerOrFinish(runtime, request_ctx, route, &request_value);
 }
 
-/// Calls `handler(request, env)`, where `env` is the route's frozen bindings
-/// object (`worker/modules/route_env.zig`), the same object for every request
-/// of the route.
+/// Calls `handler(request, env)` in the route's realm, where `env` is the
+/// route's frozen bindings object (`worker/modules/route_env.zig`), the same
+/// object for every request of the route.
 fn invokeHandlerOrFinish(
     runtime: *state.Runtime,
     request_ctx: *request_context.RequestContext,
-    route: *const module_routes.RouteModule,
+    route: module_routes.ReadyRoute,
     request_value: *const bindings.Value,
 ) !void {
     const token = try ensureRequestTask(runtime, request_ctx);
@@ -333,11 +335,12 @@ fn invokeHandlerOrFinish(
     var handler_started_ns: u64 = 0;
     const invocation = turn.invokeWithTiming(
         runtime.core.vm,
+        route.realm,
         request_ctx.requestAllocator(),
         &request_ctx.exec,
-        route.handler.ptr(),
+        route.module.handler.ptr(),
         null,
-        &.{ request_value, route.env.inner.ptr() },
+        &.{ request_value, route.module.env.inner.ptr() },
         if (bench_handler) &handler_started_ns else null,
     );
     if (bench_handler) {
@@ -355,14 +358,7 @@ fn invokeHandlerOrFinish(
             var owned = exception;
             defer owned.deinit();
             task.state = .failed;
-            // A sentinel that terminated this handler turn surfaces as this
-            // exception, so the fired bit is read here and the worker stops
-            // once the response is written.
-            const sentinel_fired = runtime.requestDeadlineSentinelFired(request_ctx);
-            defer if (sentinel_fired) {
-                runtime.stop_after_deadline_fire = true;
-            };
-            try response_flow.writeException(runtime, request_ctx, &owned);
+            try termination.answerException(runtime, request_ctx, &owned, "js exception");
             return;
         },
     };
@@ -381,22 +377,22 @@ fn invokeHandlerOrFinish(
     }
     runtime.observability.sync_handler_fast_path_count += 1;
     task.state = .completed_sync;
-    try response_bridge.writeValueResponse(runtime, request_ctx, &result, response_flow.writeAndFinishResponse);
+    try response_bridge.writeValueResponse(runtime, request_ctx, &result);
 }
 
 fn ensureRequestTask(runtime: *state.Runtime, request_ctx: *request_context.RequestContext) !request_task.TaskToken {
     if (request_ctx.request_task) |token|
         return token;
     // Every live request needs a live slot on the shared page, so the worker
-    // admits at most `LIVE_SLOT_COUNT` at once. The server sends a worker at
-    // most `worker_concurrency_max` requests at a time
-    // (`common/limits/server.zig`), pinned equal to that count in
-    // `tests/contracts/limits.zig`, and the worker still checks it instead of
-    // trusting the server. Two requests can share the VM because
-    // each microtask runs under the request that registered it, which
-    // `runtime/patches/webkit/0004-microtask-owner-context.patch` carries
-    // from registration to execution (`worker/tests/runtime/multiplexing.zig`
-    // covers it).
+    // admits at most `LIVE_SLOT_COUNT` at once, the
+    // `worker_concurrency_max` of `common/limits/server.zig` that count is
+    // defined from. The server sends a worker at most its definition's
+    // `concurrency` requests at a time, and the worker still checks the
+    // bound instead of trusting the server. Requests can share the VM
+    // because each microtask runs under the request that registered it,
+    // which `runtime/patches/webkit/0004-microtask-owner-context.patch`
+    // carries from registration to execution
+    // (`worker/tests/runtime/multiplexing.zig` covers it).
     if (runtime.requests.tasks.activeCount() >= worker_shared_page.LIVE_SLOT_COUNT)
         return error.RequestSlotsExhausted;
     const token = try runtime.requests.tasks.create(.{

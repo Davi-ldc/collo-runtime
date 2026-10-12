@@ -1,0 +1,230 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Davi <davilimacarv2536@gmail.com>
+Date: Sat, 10 Oct 2026 12:02:28 -0300
+Subject: [PATCH 5/5] random source getrandom
+
+On Linux, WTF's and bmalloc's cryptographically random sources draw
+every value from `getrandom` and keep no state in the process: no
+`/dev/urandom` descriptor and no ARC4 stream. Both used to be created
+on first use and kept for the life of the process, which assumes that
+the process that opened them is the one that reads them. An embedder
+that forks with `clone3` and then closes the descriptors it did not
+hand to the child breaks that assumption twice. The child inherits
+`RandomDevice`'s descriptor number, closes it, and gives the number to
+the next file it opens, so the next stir of the ARC4 stream reads that
+file. A closed descriptor or an io_uring ring crashes the child, a
+nonblocking eventfd spins on `EAGAIN` with the generator's lock held,
+and a regular file yields predictable text and then loops forever at
+its end. A sandboxed child cannot reopen `/dev/urandom` to recover.
+Every child also inherits its parent's ARC4 state, so sibling children
+hand out the same numbers until each one stirs again, 1,600,000 bytes
+of draws later: the same `createVersion4UUIDString` values, and the
+same seed for `VM::random` after each collection.
+
+`RandomDevice::cryptographicallyRandomValues` calls
+`getrandom(buffer, length, 0)` on Linux, retrying on `EINTR` and short
+reads and crashing on any other failure. `cryptographicallyRandomNumber`
+and `cryptographicallyRandomValues` call it directly instead of reading
+the ARC4 stream, and bmalloc's `cryptoRandom`, which places the
+Gigacage, does the same, so the parent holds no stray descriptor
+either. The callers are cold (VM and global object creation, the start
+of each collection, UUIDs, Gigacage setup), so a system call per draw
+costs little. The embedder cannot get this from outside: the
+descriptor and the stream are private statics with no reset, and a
+reseed after each fork would hold only while every fork path remembered
+to call it. Other platforms keep the ARC4 stream.
+---
+ .../WTF/wtf/CryptographicallyRandomNumber.cpp | 26 +++++++++++++++
+ Source/WTF/wtf/RandomDevice.cpp               | 33 +++++++++++++++++--
+ Source/WTF/wtf/RandomDevice.h                 |  4 +--
+ Source/bmalloc/bmalloc/CryptoRandom.cpp       | 25 ++++++++++++++
+ 4 files changed, 83 insertions(+), 5 deletions(-)
+
+diff --git a/Source/WTF/wtf/CryptographicallyRandomNumber.cpp b/Source/WTF/wtf/CryptographicallyRandomNumber.cpp
+index d203d901..322477ef 100644
+--- a/Source/WTF/wtf/CryptographicallyRandomNumber.cpp
++++ b/Source/WTF/wtf/CryptographicallyRandomNumber.cpp
+@@ -36,11 +36,36 @@
+ #include <wtf/Lock.h>
+ #include <wtf/NeverDestroyed.h>
+ #include <wtf/OSRandomSource.h>
++#include <wtf/StdLibExtras.h>
+ 
+ namespace WTF {
+ 
+ namespace {
+ 
++#if OS(LINUX)
++// Every draw goes to the kernel. A generator that keeps its state in the process, like the ARC4 stream the other
++// platforms use, is copied into every child a fork or clone3 creates: sibling children would hand out the same
++// numbers until each one stirs again, and that stir reads the random device's descriptor, which a child may have
++// closed. The callers are cold (VM and global object creation, the start of each collection, UUIDs), so a system call
++// per draw costs little.
++class OSRandomNumberGenerator {
++public:
++    template<typename IntegerType>
++    IntegerType randomNumber()
++    {
++        IntegerType value { };
++        cryptographicallyRandomValuesFromOS(asMutableByteSpan(value));
++        return value;
++    }
++
++    void randomValues(std::span<uint8_t> buffer) { cryptographicallyRandomValuesFromOS(buffer); }
++};
++
++OSRandomNumberGenerator sharedRandomNumberGenerator()
++{
++    return { };
++}
++#else
+ class ARC4Stream {
+     WTF_DEPRECATED_MAKE_FAST_ALLOCATED(ARC4Stream);
+ public:
+@@ -151,6 +176,7 @@ ARC4RandomNumberGenerator& NODELETE sharedRandomNumberGenerator()
+     static NeverDestroyed<ARC4RandomNumberGenerator> randomNumberGenerator;
+     return randomNumberGenerator;
+ }
++#endif
+ 
+ }
+ 
+diff --git a/Source/WTF/wtf/RandomDevice.cpp b/Source/WTF/wtf/RandomDevice.cpp
+index 342682db..f91e93c0 100644
+--- a/Source/WTF/wtf/RandomDevice.cpp
++++ b/Source/WTF/wtf/RandomDevice.cpp
+@@ -35,6 +35,10 @@
+ #include <unistd.h>
+ #endif
+ 
++#if OS(LINUX)
++#include <sys/random.h>
++#endif
++
+ #if OS(WINDOWS)
+ #include <windows.h>
+ #endif
+@@ -71,7 +75,12 @@ static void processPrng(std::span<uint8_t> buffer)
+ }
+ #endif
+ 
+-#if !OS(DARWIN) && !OS(FUCHSIA) && OS(UNIX)
++#if OS(LINUX)
++NEVER_INLINE NO_RETURN_DUE_TO_CRASH static void crashUnableToGetRandom()
++{
++    CRASH();
++}
++#elif !OS(DARWIN) && !OS(FUCHSIA) && OS(UNIX)
+ NEVER_INLINE NO_RETURN_DUE_TO_CRASH static void crashUnableToOpenURandom()
+ {
+     CRASH();
+@@ -83,7 +92,7 @@ NEVER_INLINE NO_RETURN_DUE_TO_CRASH static void crashUnableToReadFromURandom()
+ }
+ #endif
+ 
+-#if !OS(DARWIN) && !OS(FUCHSIA) && !OS(WINDOWS)
++#if !OS(DARWIN) && !OS(FUCHSIA) && !OS(WINDOWS) && !OS(LINUX)
+ RandomDevice::RandomDevice()
+ {
+     int ret = 0;
+@@ -96,7 +105,7 @@ RandomDevice::RandomDevice()
+ }
+ #endif
+ 
+-#if !OS(DARWIN) && !OS(FUCHSIA) && !OS(WINDOWS)
++#if !OS(DARWIN) && !OS(FUCHSIA) && !OS(WINDOWS) && !OS(LINUX)
+ RandomDevice::~RandomDevice()
+ {
+     close(m_fd);
+@@ -111,6 +120,24 @@ void RandomDevice::cryptographicallyRandomValues(std::span<uint8_t> buffer)
+     RELEASE_ASSERT(!CCRandomGenerateBytes(buffer.data(), buffer.size()));
+ #elif OS(FUCHSIA)
+     zx_cprng_draw(buffer.data(), buffer.size());
++#elif OS(LINUX)
++    // getrandom keeps no descriptor in the process. A /dev/urandom descriptor opened once and kept is inherited by
++    // every child of a fork or clone3; a child that closes the descriptors it inherited hands that number to the next
++    // file it opens, the next read then comes from that file, and a sandboxed child cannot open /dev/urandom again.
++    // A signal can interrupt the call or shorten a large read, and any other failure means the kernel has no
++    // randomness to give.
++    size_t filled = 0;
++    while (filled < buffer.size()) {
++        auto remaining = buffer.subspan(filled);
++        ssize_t got = getrandom(remaining.data(), remaining.size(), 0);
++        if (got > 0) {
++            filled += static_cast<size_t>(got);
++            continue;
++        }
++        if (got < 0 && errno == EINTR)
++            continue;
++        crashUnableToGetRandom();
++    }
+ #elif OS(UNIX)
+     ssize_t amountRead = 0;
+     while (static_cast<size_t>(amountRead) < buffer.size()) {
+diff --git a/Source/WTF/wtf/RandomDevice.h b/Source/WTF/wtf/RandomDevice.h
+index ce4af347..4c9a4d0f 100644
+--- a/Source/WTF/wtf/RandomDevice.h
++++ b/Source/WTF/wtf/RandomDevice.h
+@@ -36,7 +36,7 @@ class RandomDevice {
+     WTF_MAKE_NONCOPYABLE(RandomDevice);
+     WTF_DEPRECATED_MAKE_FAST_ALLOCATED(RandomDevice);
+ public:
+-#if OS(DARWIN) || OS(FUCHSIA) || OS(WINDOWS)
++#if OS(DARWIN) || OS(FUCHSIA) || OS(WINDOWS) || OS(LINUX)
+     RandomDevice() = default;
+ #else
+     RandomDevice();
+@@ -49,7 +49,7 @@ public:
+     void cryptographicallyRandomValues(std::span<uint8_t> buffer);
+ 
+ private:
+-#if OS(DARWIN) || OS(FUCHSIA) || OS(WINDOWS)
++#if OS(DARWIN) || OS(FUCHSIA) || OS(WINDOWS) || OS(LINUX)
+ #elif OS(UNIX)
+     int m_fd { -1 };
+ #else
+diff --git a/Source/bmalloc/bmalloc/CryptoRandom.cpp b/Source/bmalloc/bmalloc/CryptoRandom.cpp
+index 4724cad6..57d6a00f 100644
+--- a/Source/bmalloc/bmalloc/CryptoRandom.cpp
++++ b/Source/bmalloc/bmalloc/CryptoRandom.cpp
+@@ -48,8 +48,32 @@
+ #include <CommonCrypto/CommonRandom.h>
+ #endif
+ 
++#if BOS(LINUX)
++#include <sys/random.h>
++#endif
++
+ namespace bmalloc {
+ 
++#if BOS(LINUX)
++// Every call goes to the kernel through getrandom, so the process keeps neither a /dev/urandom descriptor nor an
++// ARC4 stream. Both would be copied into every child of a fork or clone3: the children would share the stream, and
++// one that closes the descriptors it inherited would read its next stir from whatever file then holds the number.
++// A signal can interrupt the call or shorten a large read; any other failure means the kernel has no randomness to
++// give.
++void cryptoRandom(void* buffer, size_t length)
++{
++    unsigned char* bytes = static_cast<unsigned char*>(buffer);
++    size_t filled = 0;
++    while (filled < length) {
++        ssize_t got = getrandom(bytes + filled, length - filled, 0);
++        if (got > 0) {
++            filled += static_cast<size_t>(got);
++            continue;
++        }
++        RELEASE_BASSERT(got < 0 && errno == EINTR);
++    }
++}
++#else
+ class ARC4Stream {
+ public:
+     ARC4Stream();
+@@ -184,6 +208,7 @@ void cryptoRandom(void* buffer, size_t length)
+ {
+     ARC4RandomNumberGenerator::get()->randomValues(buffer, length);
+ }
++#endif
+ 
+ } // namespace bmalloc
+ 

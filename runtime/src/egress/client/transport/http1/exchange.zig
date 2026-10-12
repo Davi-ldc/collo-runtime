@@ -552,7 +552,6 @@ pub const Exchange = struct {
             self.url,
             self.method,
             self.headers,
-            self.request_body,
             head.status_code,
             head.headers,
             self.options,

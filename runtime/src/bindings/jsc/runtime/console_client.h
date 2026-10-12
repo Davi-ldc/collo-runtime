@@ -100,9 +100,10 @@ private:
     // where the log ring bounds them.
     static constexpr unsigned request_budget_entries_max = 1024;
 
-    // Console output a request has spent: lines emitted and UTF-8 bytes after the line cut, keyed by request id. The
-    // boot identity and id 0 are exempt and never enter the map, because a per-request cap on an identity that lives
-    // as long as the worker would silence its output for good.
+    // Console output a request has spent: lines emitted and UTF-8 bytes after the line cut, keyed by request id. Id 0,
+    // no owner, and the ids above COLLO_REQUEST_ID_MAX, the owners that are not requests, are exempt and never enter
+    // the map: the worker owner lives as long as the worker, and a per-request cap on it would silence its output for
+    // good.
     struct RequestOutputSpent {
         uint64_t lines { 0 };
         uint64_t bytes { 0 };

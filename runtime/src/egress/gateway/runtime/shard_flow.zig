@@ -267,11 +267,11 @@ pub fn Methods(comptime Gateway: type) type {
             // Admission records a route only for a policy id the table holds, and the table
             // never changes, so the lookup finds the entry the fetch ran under. A miss still
             // fails only this fetch.
-            const resubmitted = if (self.hello.policies.lookup(route.record.policy_id)) |entry|
+            const resubmitted = if (self.hello.lookup(route.record.policy_id)) |granted|
                 self.shards.get(shard_index).engine.resubmitReplayFetch(item, .{
                     .security_cell_id = route.record.security_cell_id,
-                    .policy_id = self.hello.isolation_ids[route.record.policy_id],
-                }, entry.*)
+                    .policy_id = granted.isolation_id,
+                }, granted.policy)
             else
                 error.EgressPolicyUnknown;
             resubmitted catch |err| {

@@ -1,6 +1,7 @@
 //! The view of the worker runtime that the egress files work through: its
 //! allocator, VM, limits and clock, its request table and ready queues, and
-//! callbacks for a gateway disconnect and a request failure. The worker's
+//! callbacks for a gateway disconnect, a request failure and a network
+//! denial's line in the tenant's log. The worker's
 //! event loop thread, which is also the VM thread, is the only one that uses
 //! it. `Runtime.egressContext` (`runtime/egress.zig`) builds one per call, so a
 //! context holds no state of its own; everything mutable sits behind its
@@ -19,6 +20,7 @@ pub const RequestMap = std.AutoHashMapUnmanaged(u64, *request_context.RequestCon
 
 pub const DisconnectFn = *const fn (?*anyopaque, []const u8) void;
 pub const RequestFailureFn = *const fn (?*anyopaque, u64, anyerror) void;
+pub const DenialLogFn = *const fn (?*anyopaque, u64, []const u8) void;
 
 pub const Context = struct {
     allocator: std.mem.Allocator,
@@ -27,6 +29,10 @@ pub const Context = struct {
     clock: runtime_types.Clock,
     egress_state: *state.State,
     requests: *RequestMap,
+    /// `Evaluations.boot_fetches_started` (`runtime/evaluations.zig`): the
+    /// one count of fetches under the boot token, which every evaluation's
+    /// fetch adds to instead of its context's own.
+    boot_fetches_started: *u64,
     ready_queue: *ready_queue.ReadyQueue,
     ready_backlog: *ready_queue.ReadyQueue,
     /// The runtime's one packet buffer, shared by everything the event loop
@@ -46,6 +52,8 @@ pub const Context = struct {
     disconnect_fn: DisconnectFn,
     request_failure_context: ?*anyopaque,
     request_failure_fn: RequestFailureFn,
+    denial_log_context: ?*anyopaque,
+    denial_log_fn: DenialLogFn,
 
     pub fn wake(self: *Context) void {
         const fd = self.wakeup_fd orelse return;
@@ -105,8 +113,27 @@ pub const Context = struct {
         return false;
     }
 
+    /// Gives back the ready count of every queued `item` whose work vanished,
+    /// as a body that left the table, the way `Runtime.withdrawReadyWork`
+    /// does for a cleared timer (`runtime/scheduler.zig`): each slot naming
+    /// it stops charging its owner, and a dispatched request that owned one
+    /// closes its runnable time now. The items still pop, in no window. Each
+    /// pass clears one slot, so the loop ends within the queue's and the
+    /// backlog's capacity.
+    pub fn withdrawReady(self: *Context, item: ready_queue.WorkItem) void {
+        const now = self.clock.now();
+        while (self.ready_queue.withdraw(item) orelse self.ready_backlog.withdraw(item)) |owner_id| {
+            if (request_context.isReservedId(owner_id))
+                continue;
+            const ctx = self.requests.get(owner_id) orelse continue;
+            ctx.noteReadyWithdrawn(now);
+        }
+    }
+
+    /// Only a dispatched request keeps a timeline, so an evaluation's items
+    /// count nothing.
     fn noteOwnerReady(self: *Context, meta: ready_queue.SlotMeta) void {
-        if (meta.owner_request_id == 0 or meta.owner_request_id == request_context.boot_request_id)
+        if (meta.owner_request_id == 0 or request_context.isReservedId(meta.owner_request_id))
             return;
         const ctx = self.requests.get(meta.owner_request_id) orelse return;
         ctx.noteReady(meta.ready_since_mono_ns, meta.enqueued_mono_ns, true);
@@ -139,6 +166,13 @@ pub const Context = struct {
 
     pub fn handleRequestFailure(self: *Context, request_id: u64, err: anyerror) void {
         self.request_failure_fn(self.request_failure_context, request_id, err);
+    }
+
+    /// Writes `message`, the text of a fetch the network setting denied, as
+    /// one `warn` line in the tenant's log under `request_id`
+    /// (`Runtime.logNetworkDenial`).
+    pub fn logNetworkDenial(self: *Context, request_id: u64, message: []const u8) void {
+        self.denial_log_fn(self.denial_log_context, request_id, message);
     }
 
     pub fn traceRuntimeEvent(self: *Context, comptime fmt: []const u8, args: anytype) void {

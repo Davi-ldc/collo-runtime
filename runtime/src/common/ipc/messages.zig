@@ -8,7 +8,8 @@
 //! struct; they do not keep older peers working, and nothing else does.
 //! The codecs that add variable data or descriptors to these headers live
 //! beside this file: `dispatch.zig` (DispatchWork), `zygote_worker.zig` (fork
-//! and WorkerInit), `egress.zig`, `egress_attach.zig` and `fs_fault.zig`. An
+//! and WorkerInit), `egress.zig`, `egress_attach.zig`, `worker_retiring.zig`
+//! and `fs_fault.zig`. An
 //! egress token rides in these headers as `egress_token.Bytes`, whose layout
 //! `egress_token.zig` owns and pins. The file holds only types and pure
 //! functions, callable from any thread.
@@ -54,6 +55,22 @@ pub const MessageKind = enum(u32) {
     /// to was replaced: the worker half of its new egress session (`EgressAttach`,
     /// `egress_attach.zig`).
     egress_attach = 26,
+    /// Worker to server on the worker's control socket, after WorkerReady: the
+    /// worker asks to be retired (`WorkerRetiring`, `worker_retiring.zig`).
+    worker_retiring = 27,
+};
+
+/// Why a worker asks to be retired. A worker never exits on its own for
+/// either reason: it sends `worker_retiring` once and keeps answering every
+/// request that reaches it until the server, which alone knows whether a
+/// request is still on its way, retires it.
+pub const WorkerRetiringReason = enum(u32) {
+    /// Every route of the worker failed its evaluation, so a fresh worker may
+    /// serve where this one cannot.
+    routes_failed = 1,
+    /// A termination poisoned the worker's VM, which runs no JavaScript
+    /// again.
+    vm_terminated = 2,
 };
 
 pub const WorkerInitFailedReason = enum(u32) {
@@ -92,6 +109,11 @@ pub const FsFaultResponseStatus = enum(u32) {
     fetch_failed = 3,
 };
 
+/// How a worker ended a request, as it publishes the request's completion.
+/// The completion ring refuses a value above its bound
+/// (`worker_completion_status_max` in
+/// `common/worker_state/page/completion_ring.zig`), which
+/// `runtime/tests/contracts/limits.zig` holds equal to the last tag.
 pub const RequestDoneStatus = enum(u32) {
     ok = 0,
     bad_request = 1,
@@ -100,6 +122,14 @@ pub const RequestDoneStatus = enum(u32) {
     deadline_timeout = 4,
     worker_crash = 5,
     client_closed = 6,
+    /// The request used up its CPU budget (`WorkerInit.request_cpu_budget_ns`).
+    cpu_exceeded = 7,
+    /// The request reached a worker that had already sent `worker_retiring`,
+    /// which ran none of its JavaScript.
+    worker_retiring = 8,
+    /// A termination that another owner of the VM caused stopped the request,
+    /// which did nothing wrong.
+    worker_stopped = 9,
 };
 
 pub const RouteCapture = struct {
@@ -218,14 +248,11 @@ pub const WorkerRuntimeBootOptions = extern struct {
     max_fetches_per_worker: u64 = 64,
     max_timers_per_worker: u64 = 256,
     ready_queue_capacity: u64 = 256,
+    /// Requests the worker keeps a task for at once. The server may send a
+    /// worker `worker_concurrency_max` requests at a time
+    /// (`common/limits/server.zig`), so `validate` refuses less.
     request_task_capacity: u64 = 64,
     crypto_thread_count: u64 = default_crypto_thread_count,
-    /// Stack of each crypto pool thread (`start` in `worker/js/crypto/jobs.zig`).
-    /// glibc places static TLS inside each thread's stack and fails thread
-    /// creation when the stack cannot hold static TLS, the guard page and
-    /// PTHREAD_STACK_MIN, so an override must leave room for the binary's
-    /// static TLS.
-    crypto_thread_stack_bytes: u64 = 4 * 1024 * 1024,
     crypto_max_in_flight_per_request: u64 = default_crypto_max_in_flight_per_request,
     crypto_max_in_flight_per_worker: u64 = default_crypto_max_in_flight_per_worker,
 
@@ -265,15 +292,15 @@ pub const WorkerRuntimeBootOptions = extern struct {
             self.max_fetches_per_worker == 0 or
             self.max_timers_per_worker == 0 or
             self.ready_queue_capacity == 0 or
-            self.request_task_capacity == 0 or
             self.crypto_thread_count == 0 or
             self.crypto_thread_count > max_crypto_thread_count or
-            self.crypto_thread_stack_bytes == 0 or
             self.crypto_max_in_flight_per_request == 0 or
             self.crypto_max_in_flight_per_worker == 0)
         {
             return error.InvalidWorkerRuntimeOptions;
         }
+        if (self.request_task_capacity < limits.server.worker_concurrency_max)
+            return error.InvalidWorkerRuntimeOptions;
     }
 };
 
@@ -307,6 +334,19 @@ pub const WorkerInit = extern struct {
     /// report `init_deadline_exceeded` before the host kills the child.
     /// Required nonzero; senders set it explicitly.
     init_deadline_mono_ns: u64 = 0,
+    /// The CPU budget of each request the worker serves, its definition's
+    /// `cpuMs` in nanoseconds: the VM thread's CPU while the request owns it
+    /// plus the crypto pool's on the request's jobs. 0 for a definition that
+    /// sets none; at most `request_cpu_budget_ns_max`.
+    request_cpu_budget_ns: u64 = 0,
+    /// The wall-clock limit of each stretch of JavaScript that no request and
+    /// no module evaluation owns, which the worker runs as its own owner: its
+    /// definition's `timeoutMs` in nanoseconds, so no JavaScript in the worker
+    /// runs longer than `timeoutMs` without an owner's deadline. Nonzero and
+    /// at most `unowned_time_limit_ns_max`; `init` sets
+    /// `default_unowned_time_limit_ns`, which a launch for a definition
+    /// replaces.
+    unowned_time_limit_ns: u64 = default_unowned_time_limit_ns,
     runtime: WorkerRuntimeBootOptions,
 
     pub const flag_isolated_network: u32 = 1 << 0;
@@ -324,20 +364,37 @@ pub const WorkerInit = extern struct {
     /// VM's main realm. Fixed for the worker's life, and set only beside
     /// `flag_serves_routes` (`validate`).
     pub const flag_isolate_realm: u32 = 1 << 3;
+    /// The packet carries the worker's egress wake descriptors, so the worker
+    /// can be attached to a gateway and fetch through it. Without the flag it
+    /// carries no egress descriptor at all. A boot token needs the flag
+    /// (`validate`). The sender in `zygote_worker.zig` owns the bit: it sets
+    /// it exactly when the wake descriptors travel, whatever the caller's
+    /// message says.
+    pub const flag_egress: u32 = 1 << 4;
     pub const valid_flags: u32 = flag_isolated_network | flag_deny_direct_egress | flag_serves_routes |
-        flag_isolate_realm;
+        flag_isolate_realm | flag_egress;
     pub const default_tmpfs_size_bytes: u64 = 256 * 1024 * 1024;
     /// Keeps a corrupt value from becoming a cgroup quota; far above the
     /// core count of any machine Collo runs on.
     pub const max_cpu_max_cores: u32 = 256;
+    pub const request_cpu_budget_ns_max: u64 =
+        @as(u64, limits.server.request_cpu_ms_max) * std.time.ns_per_ms;
+    pub const unowned_time_limit_ns_max: u64 =
+        @as(u64, limits.server.request_timeout_ms_max) * std.time.ns_per_ms;
+    /// The unowned limit of a launch made without a worker definition, such
+    /// as a test's: the `timeoutMs` a definition gets when it sets none
+    /// (`default_settings` in `server/config/model.zig`), which
+    /// `runtime/tests/contracts/limits.zig` holds equal.
+    pub const default_unowned_time_limit_ns: u64 = 30 * std.time.ns_per_s;
 
     pub fn init(memory_limit_bytes: u64, runtime: WorkerRuntimeBootOptions) !WorkerInit {
         var message = std.mem.zeroes(WorkerInit);
         message.kind = @intFromEnum(MessageKind.worker_init);
         message.memory_limit_bytes = memory_limit_bytes;
-        // `zeroes` cleared the field default; a caller with another CPU limit
-        // overwrites it.
+        // `zeroes` cleared the field defaults; a caller with another CPU
+        // limit or another unowned limit overwrites them.
         message.cpu_max_cores = limits.worker.cpu_max_cores;
+        message.unowned_time_limit_ns = default_unowned_time_limit_ns;
         message.tmpfs_size_bytes = defaultTmpfsSizeBytes(memory_limit_bytes);
         message.route_table_len = route_table.empty_blob.len;
         message.runtime = runtime;
@@ -368,12 +425,20 @@ pub const WorkerInit = extern struct {
         return (self.flags & flag_isolate_realm) != 0;
     }
 
+    pub fn hasEgress(self: *const WorkerInit) bool {
+        return (self.flags & flag_egress) != 0;
+    }
+
     pub fn validate(self: *const WorkerInit) !void {
         if ((self.flags & ~valid_flags) != 0)
             return error.InvalidWorkerInitFlags;
         if (self._reserved0 != 0)
             return error.InvalidWorkerInitFlags;
         if (self.wantsDenyDirectEgress() and !self.wantsIsolatedNetwork())
+            return error.InvalidWorkerInitFlags;
+        // A boot token is spent through the session's descriptors, which a
+        // packet without the wake descriptors never carries.
+        if (!egress_token.isNone(&self.boot_egress_token) and !self.hasEgress())
             return error.InvalidWorkerInitFlags;
         if (self.memory_limit_bytes == 0)
             return error.ZeroMemoryLimit;
@@ -393,6 +458,12 @@ pub const WorkerInit = extern struct {
             return error.InvalidWorkerInitFlags;
         if (self.cpu_max_cores == 0 or self.cpu_max_cores > max_cpu_max_cores)
             return error.InvalidWorkerInitCpuQuota;
+        if (self.request_cpu_budget_ns > request_cpu_budget_ns_max)
+            return error.InvalidWorkerInitTimeLimit;
+        if (self.unowned_time_limit_ns == 0)
+            return error.InvalidWorkerInitTimeLimit;
+        if (self.unowned_time_limit_ns > unowned_time_limit_ns_max)
+            return error.InvalidWorkerInitTimeLimit;
         try self.runtime.validate();
         // Checked last so a probe of any other field fails on that field,
         // not on a missing deadline.
@@ -416,6 +487,23 @@ pub const WorkerInitFailed = extern struct {
     pub fn init(reason: WorkerInitFailedReason) WorkerInitFailed {
         return .{
             .kind = @intFromEnum(MessageKind.worker_init_failed),
+            .reason = @intFromEnum(reason),
+        };
+    }
+};
+
+/// Worker to server on the worker's control socket, at most once, after
+/// WorkerReady: the whole packet, with no descriptor (`worker_retiring.zig`).
+/// The server takes the worker out of service and retires it once no lane
+/// holds one of its slots, so no request can be sent into its exit.
+pub const WorkerRetiring = extern struct {
+    kind: u32,
+    /// `WorkerRetiringReason`, validated on decode.
+    reason: u32,
+
+    pub fn init(reason: WorkerRetiringReason) WorkerRetiring {
+        return .{
+            .kind = @intFromEnum(MessageKind.worker_retiring),
             .reason = @intFromEnum(reason),
         };
     }
@@ -646,6 +734,17 @@ pub const EgressBodyEnd = extern struct {
     }
 };
 
+/// Why a fetch failed, as its `egress_fetch_error` names it. The decoder
+/// refuses any other value.
+pub const EgressFetchErrorCause = enum(u32) {
+    /// The fetch failed on its way: a connection, the origin's answer, a
+    /// limit or the gateway itself.
+    failed = 0,
+    /// The `network` setting of the request's route denied the fetch: its
+    /// host, port or scheme, or the address its host resolved to.
+    network_denied = 1,
+};
+
 pub const EgressFetchErrorHeader = extern struct {
     kind: u32,
     message_len: u32,
@@ -657,6 +756,9 @@ pub const EgressFetchErrorHeader = extern struct {
     cost_total: u64 = 0,
     /// Readiness stamp, as `EgressFetchHeadHeader.ready_at_mono_ns`.
     ready_at_mono_ns: u64 = 0,
+    /// `EgressFetchErrorCause`, validated on decode.
+    cause: u32 = @intFromEnum(EgressFetchErrorCause.failed),
+    _reserved0: u32 = 0,
 };
 
 pub const EgressAbortAck = extern struct {
@@ -710,7 +812,16 @@ pub fn decodeMessageKind(raw: u32) !MessageKind {
         24 => .fs_fault_request,
         25 => .fs_fault_response,
         26 => .egress_attach,
+        27 => .worker_retiring,
         else => error.InvalidMessageKind,
+    };
+}
+
+pub fn decodeWorkerRetiringReason(raw: u32) !WorkerRetiringReason {
+    return switch (raw) {
+        1 => .routes_failed,
+        2 => .vm_terminated,
+        else => error.InvalidWorkerRetiringReason,
     };
 }
 
@@ -745,9 +856,11 @@ comptime {
         @compileError("ipc.ForkRequest size mismatch");
     if (@sizeOf(ForkReply) != 16)
         @compileError("ipc.ForkReply size mismatch");
-    if (@sizeOf(WorkerRuntimeBootOptions) != 80)
+    if (@sizeOf(WorkerRuntimeBootOptions) != 72)
         @compileError("ipc.WorkerRuntimeBootOptions size mismatch");
-    if (@sizeOf(WorkerInit) != 184)
+    if ((WorkerRuntimeBootOptions{}).request_task_capacity < limits.server.worker_concurrency_max)
+        @compileError("ipc.WorkerRuntimeBootOptions default must hold every request a worker may get");
+    if (@sizeOf(WorkerInit) != 192)
         @compileError("ipc.WorkerInit size mismatch");
     if (@offsetOf(WorkerInit, "route_table_len") != 24)
         @compileError("ipc.WorkerInit route_table_len offset mismatch");
@@ -759,8 +872,16 @@ comptime {
         @compileError("ipc.WorkerInit boot_egress_token offset mismatch");
     if (@offsetOf(WorkerInit, "init_deadline_mono_ns") != 96)
         @compileError("ipc.WorkerInit init_deadline_mono_ns offset mismatch");
-    if (@offsetOf(WorkerInit, "runtime") != 104)
+    if (@offsetOf(WorkerInit, "request_cpu_budget_ns") != 104)
+        @compileError("ipc.WorkerInit request_cpu_budget_ns offset mismatch");
+    if (@offsetOf(WorkerInit, "unowned_time_limit_ns") != 112)
+        @compileError("ipc.WorkerInit unowned_time_limit_ns offset mismatch");
+    if (@offsetOf(WorkerInit, "runtime") != 120)
         @compileError("ipc.WorkerInit runtime offset mismatch");
+    if (WorkerInit.default_unowned_time_limit_ns > WorkerInit.unowned_time_limit_ns_max)
+        @compileError("ipc.WorkerInit default unowned limit must pass validate");
+    if (@sizeOf(WorkerRetiring) != 8)
+        @compileError("ipc.WorkerRetiring size mismatch");
     if (@sizeOf(DispatchPacketHeader) != 152)
         @compileError("ipc.DispatchPacketHeader size mismatch");
     if (@sizeOf(EgressAttach) != 4)
@@ -809,8 +930,10 @@ comptime {
         @compileError("ipc.EgressUploadChunkBatchDescriptor size mismatch");
     if (@sizeOf(EgressBodyEnd) != 56)
         @compileError("ipc.EgressBodyEnd size mismatch");
-    if (@sizeOf(EgressFetchErrorHeader) != 56)
+    if (@sizeOf(EgressFetchErrorHeader) != 64)
         @compileError("ipc.EgressFetchErrorHeader size mismatch");
+    if (@offsetOf(EgressFetchErrorHeader, "cause") != 56)
+        @compileError("ipc.EgressFetchErrorHeader.cause offset mismatch");
     if (@sizeOf(EgressAbortAck) != 24)
         @compileError("ipc.EgressAbortAck size mismatch");
     if (@offsetOf(DispatchPacketHeader, "kind") != 0)

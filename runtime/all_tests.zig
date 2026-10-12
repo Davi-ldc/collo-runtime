@@ -8,7 +8,6 @@
 //! filter table in runtime/build/tests.zig reads `tests.*` for root-local
 //! suites, `src.<module>.tests.*` for moved domains, and `build.tests.*`
 //! for the build-tool suite.
-const test_options = @import("collo_test_build_options");
 
 comptime {
     _ = @import("src/bindings/tests/all.zig");
@@ -18,6 +17,7 @@ comptime {
     _ = @import("tests/contracts/abi.zig");
     _ = @import("tests/contracts/module_pack.zig");
     _ = @import("tests/contracts/benchmark_all.zig");
+    _ = @import("tests/contracts/binary_dependencies.zig");
     _ = @import("collo_common_io");
     _ = @import("collo_common_io").uring;
     _ = @import("collo_worker_state").page;
@@ -38,8 +38,6 @@ comptime {
     _ = @import("src/egress/tests/all.zig");
     _ = @import("src/zygote/tests/all.zig");
     _ = @import("src/host/tests/all.zig");
-    if (test_options.include_webapi_compat) {
-        _ = @import("tests/webapi/suites.zig");
-        _ = @import("tests/webapi/forked.zig");
-    }
+    _ = @import("tests/webapi/suites.zig");
+    _ = @import("tests/webapi/forked.zig");
 }

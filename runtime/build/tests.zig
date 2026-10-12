@@ -1,8 +1,10 @@
 //! All test steps. Step names are stable; `test` aggregates the full JSC
-//! suite plus every JSC-free deterministic suite. The kernel lanes
-//! (zygote-integration, local-e2e) need the delegated cgroup subtree and stay
-//! out of `test`, as does test-bindings-valgrind; `smoke` (smoke.zig) runs
-//! `test` and both kernel lanes with strict skips.
+//! suite, the WebAPI suites among them, plus every JSC-free deterministic
+//! suite. The kernel lanes (zygote-integration, local-e2e) need the delegated
+//! cgroup subtree and stay out of `test`, as do the two `bindings-gc-stress`
+//! profiles, which rerun part of the aggregate binary under collector
+//! debugging options, and test-bindings-valgrind; `smoke` (smoke.zig) runs
+//! `test`, both GC stress profiles and both kernel lanes with strict skips.
 //!
 //! Every suite except the two bindings smokes runs under the custom runner
 //! (runtime/tests/support/test_runner.zig), and every run is handed its suite
@@ -10,6 +12,7 @@
 //! environment makes any lane strict. A run made only for `smoke` sets the
 //! variable itself.
 const std = @import("std");
+const codecs_mod = @import("codecs.zig");
 const context_mod = @import("context.zig");
 const link_mod = @import("link.zig");
 const modules_mod = @import("modules.zig");
@@ -24,8 +27,10 @@ const skip_allowlist_path = "runtime/tests/support/skip_allowlist.zon";
 /// The test steps other build files extend or order.
 pub const Lanes = struct {
     aggregate: Aggregate,
-    /// zygote-integration and local-e2e with strict skips, gated like the
-    /// aggregate's strict runs; smoke.zig orders them.
+    /// Both `bindings-gc-stress` profiles, zygote-integration and local-e2e
+    /// with strict skips, gated like the aggregate's strict runs; smoke.zig
+    /// orders them.
+    strict_gc_stress: StrictGcStress,
     strict_zygote_integration: *std.Build.Step.Run,
     strict_local_e2e: *std.Build.Step.Run,
 };
@@ -107,15 +112,18 @@ pub fn addAll(
     aggregate.dependOn(ctx.check_step);
 
     const fixtures = createTestFixtureModules(b, ctx);
-    addMainSuite(b, ctx, aggregate, fixtures);
+    const main_suite = addMainSuite(b, ctx, aggregate, fixtures);
+    const strict_gc_stress = addGcStressLane(b, ctx, main_suite, strict_gate);
     addGatewayControlSuite(b, ctx, aggregate);
     addSanitizedSmoke(b, ctx);
     addValgrindSmoke(b, ctx);
     const strict_zygote_integration = addZygoteIntegration(b, ctx, fixtures.test_harness, strict_gate);
     const strict_local_e2e = addLocalE2e(b, ctx, fixtures.test_harness, fixtures.tls_test_shim, strict_gate);
     addH2TransportSuites(b, ctx, aggregate, fixtures);
+    addWslConfigSuite(b, ctx, aggregate);
     return .{
         .aggregate = aggregate,
+        .strict_gc_stress = strict_gc_stress,
         .strict_zygote_integration = strict_zygote_integration,
         .strict_local_e2e = strict_local_e2e,
     };
@@ -187,9 +195,10 @@ fn addHiddenStep(b: *std.Build, name: []const u8) *std.Build.Step {
 const TestFixtureModules = struct {
     /// collo_test_net — local-address fixture (support/net/local_address.zig).
     /// Two flavored instances, mirroring the jsc/h2_stub module-graph split:
-    /// the fixture imports collo_egress_client, and a compilation must never
-    /// contain both flavors of the client graph (same source files under two
-    /// module identities is a hard error since Zig 0.15).
+    /// the fixture imports collo_network, which each graph builds, and a
+    /// compilation must never contain both flavors of a graph's module (same
+    /// source files under two module identities is a hard error since Zig
+    /// 0.15).
     test_net_jsc: *std.Build.Module,
     test_net_stub: *std.Build.Module,
     /// collo_test_harness — worker runtime harness (support/worker/runtime_harness.zig).
@@ -220,10 +229,8 @@ fn createTestNetModule(
         .link_libc = true,
         .link_libcpp = false,
     });
-    // The fixture only touches egress transport policy (address validation)
-    // and returns plain strings, so no client types cross its API; lazy
-    // compilation keeps everything outside transport policy code inert.
-    set.importInto(test_net_module, &.{.egress_client});
+    // The fixture reads only the address classes and returns plain strings.
+    set.importInto(test_net_module, &.{.network});
     return test_net_module;
 }
 
@@ -273,7 +280,8 @@ fn createTestFixtureModules(b: *std.Build, ctx: *const context_mod.Context) Test
     });
     test_harness_module.addImport("collo_worker", ctx.jsc_set.get(.worker));
     ctx.jsc_set.importInto(test_harness_module, &.{
-        .ipc, .os, .http, .egress_client, .egress_gateway, .worker_state, .host,
+        .ipc,          .os,   .http,    .egress_client, .egress_gateway,
+        .worker_state, .host, .network,
     });
     test_harness_module.addImport("collo_worker_test_support", worker_test_support_module);
     test_harness_module.addImport("collo_test_net", test_net_jsc);
@@ -322,19 +330,26 @@ fn addJscTest(
     // forwarded --assert-partition is rejected. `.simple` keeps the run steps
     // plain (no --listen).
     useCustomRunner(b, compile);
-    if (ctx.opts.sanitizer.enabled())
+    if (ctx.opts.sanitizer.instrumentsZig())
         shims.sanitizeZigModule(compile.root_module);
     shims.configureBindingsTestObject(compile, ctx.libc_file);
-    shims.configureBoringSslShim(b, compile, ctx.toolchain, ctx.opts.sanitizer);
+    shims.configureBoringSslShim(b, compile, ctx.toolchain, ctx.boringssl.headers(), ctx.opts.sanitizer);
     return compile;
 }
+
+/// The aggregate binary, compiled once from `runtime/all_tests.zig` and
+/// linked once; every domain step and both GC stress profiles run it.
+const MainSuite = struct {
+    compile: *std.Build.Step.Compile,
+    linked: link_mod.LinkedArtifact,
+};
 
 fn addMainSuite(
     b: *std.Build,
     ctx: *const context_mod.Context,
     aggregate: Aggregate,
     fixtures: TestFixtureModules,
-) void {
+) MainSuite {
     const bench_common_module = b.createModule(.{
         .root_source_file = b.path("runtime/bench/common.zig"),
         .target = ctx.opts.target,
@@ -356,6 +371,11 @@ fn addMainSuite(
         .link_libc = true,
         .link_libcpp = false,
     });
+    const validate_webapi_module = b.createModule(.{
+        .root_source_file = b.path("runtime/build/validate_webapi_tool.zig"),
+        .target = ctx.opts.target,
+        .optimize = ctx.opts.optimize,
+    });
     const buildtool_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("runtime/build/tests/all.zig"),
@@ -368,6 +388,7 @@ fn addMainSuite(
     useCustomRunner(b, buildtool_tests);
     buildtool_tests.root_module.addImport("collo_buildtool", buildtool_module);
     buildtool_tests.root_module.addImport("collo_build_shims", build_shims_module);
+    buildtool_tests.root_module.addImport("collo_validate_webapi", validate_webapi_module);
     ctx.check_step.dependOn(&buildtool_tests.step);
     const buildtool_run = aggregate.addRun(b, ctx, .{ .compile = buildtool_tests });
     b.step("buildtool-test", "Run JSC-free build-tool contract tests")
@@ -410,6 +431,9 @@ fn addMainSuite(
     benchmark_tests.root_module.addImport("benchmark_memory", benchmark_memory);
     benchmark_tests.root_module.addImport("benchmark_timing", benchmark_timing);
     benchmark_tests.root_module.addImport("benchmark_protocol", benchmark_protocol);
+    benchmark_tests.root_module.addImport("collo_bench_common", bench_common_module);
+    // `benchmark_config.zig` parses what the daemon writes with the server's parser.
+    ctx.stub_set.importInto(benchmark_tests.root_module, &.{.server_config});
     ctx.check_step.dependOn(&benchmark_tests.step);
     const benchmark_run = aggregate.addRun(b, ctx, .{ .compile = benchmark_tests });
     b.step("microbench-test", "Test benchmark measurement parsers and timestamp arithmetic")
@@ -421,8 +445,8 @@ fn addMainSuite(
     all_tests.root_module.addImport("benchmark_protocol", benchmark_protocol);
     ctx.check_step.dependOn(&all_tests.step);
     shims.configureBoringSslTestShim(b, all_tests, ctx.toolchain, ctx.opts.sanitizer);
+    shims.configureSecretBytesTestShim(b, all_tests, ctx.toolchain, ctx.opts.sanitizer);
     shims.configureHpackShim(b, all_tests, ctx.patched_ls_hpack);
-    all_tests.root_module.addImport("collo_test_build_options", ctx.test_build_options_module);
     all_tests.root_module.addImport("bindings_support", ctx.bindings_support_module);
     all_tests.root_module.addImport("zygote_support", ctx.zygote_support_module);
     // The installed `collo`, which the gateway suite spawns as a real gateway.
@@ -430,6 +454,7 @@ fn addMainSuite(
     all_tests.root_module.addImport("collo_bench_common", bench_common_module);
     all_tests.root_module.addImport("collo_buildtool", buildtool_module);
     all_tests.root_module.addImport("collo_build_shims", build_shims_module);
+    all_tests.root_module.addImport("collo_validate_webapi", validate_webapi_module);
     all_tests.root_module.addImport("collo_worker_test_support", fixtures.worker_test_support);
     // The comment provenance gate in conventions.zig counts markers with the
     // same matcher as the `provenance-baseline` step.
@@ -447,13 +472,13 @@ fn addMainSuite(
     all_tests.root_module.addImport("supervisor_fixture", fixtures.supervisor_fixture_jsc);
     all_tests.root_module.addImport("collo_test_tls_shim", fixtures.tls_test_shim);
     ctx.jsc_set.importInto(all_tests.root_module, &.{
-        .bindings,         .ipc,           .dns_name,         .os,
-        .cgroup,           .ktls,          .http,             .hpack,
-        .common_io,        .io_uring_tags, .worker_state,     .worker,
-        .worker_request,   .egress_client, .egress_transport, .egress_gateway,
-        .boringssl,        .server_main,   .server_gateway,   .server_supervisor,
-        .server_lifecycle, .zygote,        .limits,           .host,
-        .server_analytics, .server_config, .server_routes,
+        .bindings,          .ipc,              .dns_name,      .network,
+        .os,                .cgroup,           .ktls,          .http,
+        .hpack,             .common_io,        .io_uring_tags, .worker_state,
+        .worker,            .worker_request,   .egress_client, .egress_transport,
+        .egress_gateway,    .boringssl,        .server_main,   .server_gateway,
+        .server_supervisor, .server_lifecycle, .zygote,        .limits,
+        .host,              .server_analytics, .server_config, .server_routes,
     });
 
     const linked_all = link_mod.addJscLink(b, ctx.link_ctx, .{
@@ -468,13 +493,6 @@ fn addMainSuite(
         for (domain.filters) |prefix|
             partition_args.append(b.allocator, b.fmt("--assert-partition={s}", .{prefix})) catch @panic("OOM");
     }
-    // webapi tests are compiled into the binary only under -Dwebapi-compat
-    // (the sole conditional import in runtime/all_tests.zig); the runner's
-    // partition-liveness audit (a prefix matching zero tests fails the run)
-    // would false-positive on every non-compat build if this were
-    // unconditional.
-    if (ctx.opts.webapi_compat)
-        partition_args.append(b.allocator, "--assert-partition=tests.webapi.") catch @panic("OOM");
     _ = aggregate.addRun(b, ctx, .{
         .compile = all_tests,
         .linked = linked_all,
@@ -484,31 +502,151 @@ fn addMainSuite(
     });
 
     for (domain_steps) |domain| {
-        var filter_args: std.ArrayList([]const u8) = .empty;
-        for (domain.filters) |prefix|
-            filter_args.append(b.allocator, b.fmt("--filter={s}", .{prefix})) catch @panic("OOM");
         const run = addRunnerRun(b, ctx, .{
             .compile = all_tests,
             .linked = linked_all,
-            .configured_args = filter_args.items,
+            .configured_args = filterArgs(b, domain.filters),
             .spawns_collo = true,
             .release_only_tests = true,
         }, .inherited);
         b.step(domain.step_name, domain.description).dependOn(&run.step);
     }
-    // webapi tests are compiled only under -Dwebapi-compat; registering the
-    // step without them would be a 0-tests-green trap (the runner treats a
-    // dead --filter prefix as failure, so the gate is double-locked).
-    if (ctx.opts.webapi_compat) {
-        const run = addRunnerRun(b, ctx, .{
-            .compile = all_tests,
-            .linked = linked_all,
-            .configured_args = &.{"--filter=tests.webapi."},
+    return .{ .compile = all_tests, .linked = linked_all };
+}
+
+/// `--filter=<prefix>` for each prefix, in order.
+fn filterArgs(b: *std.Build, prefixes: []const []const u8) []const []const u8 {
+    var args: std.ArrayList([]const u8) = .empty;
+    for (prefixes) |prefix|
+        args.append(b.allocator, b.fmt("--filter={s}", .{prefix})) catch @panic("OOM");
+    return args.items;
+}
+
+/// One engine profile of `bindings-gc-stress`. JSC applies its `JSC_<option>`
+/// environment variables before Collo's options callback runs
+/// (`Options::initializeWithOptionsCustomization`), and that callback sets no
+/// collector debugging option, so the profile needs no bridge code. Production
+/// never sees these variables: the server spawns the zygote with a canonical
+/// environment (`worker_environment_retained_names` in
+/// `runtime/src/zygote/host_client.zig`), and so does every test that forks a
+/// worker from the installed `collo`.
+const GcStressProfile = struct {
+    name: []const u8,
+    environment: []const EnvironmentVariable,
+    /// The tests the profile runs, as runner prefixes.
+    filters: []const []const u8,
+};
+
+const EnvironmentVariable = struct { name: []const u8, value: []const u8 };
+
+/// The window tests and churn workloads of the bindings, under
+/// `runtime/src/bindings/tests/gc_stress/`.
+const gc_stress_filter = "src.bindings.tests.gc_stress.";
+
+const gc_stress_profiles = [_]GcStressProfile{
+    .{
+        // A synchronous full collection each time a size-class allocator
+        // takes its slow path (`LocalAllocator::doTestCollectionsIfNeeded`;
+        // a precise allocation past `MarkedSpace::largeCutoff` never does),
+        // swept at once with freed cells scribbled: a cell left unrooted
+        // across script or allocation dies inside the window that holds it.
+        // Deterministic when the test allocates a cell inside that window.
+        .name = "forced",
+        .environment = &.{
+            .{ .name = "JSC_slowPathAllocsBetweenGCs", .value = "1" },
+            .{ .name = "JSC_sweepSynchronously", .value = "true" },
+            .{ .name = "JSC_scribbleFreeCells", .value = "true" },
+            .{ .name = "JSC_verifyGC", .value = "true" },
+        },
+        .filters = &.{gc_stress_filter},
+    },
+    .{
+        // Back-to-back concurrent collections on a thread of their own, each
+        // followed by a stop-the-world re-mark from the roots that aborts on a
+        // live cell the cycle left unmarked (`Heap::verifyGC`): a missed write
+        // barrier or a container changed without the cell lock. Evidence, not
+        // proof, since the marker must visit the owner inside a window a few
+        // instructions wide. The promise and body-stream rooting tests add
+        // young collections between a cell's stores and its barriers, and the
+        // WebAPI suites the churn of every stream, event, port and timeline
+        // they drive.
+        .name = "concurrent",
+        .environment = &.{
+            .{ .name = "JSC_collectContinuously", .value = "true" },
+            .{ .name = "JSC_verifyGC", .value = "true" },
+            .{ .name = "JSC_scribbleFreeCells", .value = "true" },
+        },
+        .filters = &.{
+            gc_stress_filter,
+            "src.bindings.tests.stream_promise_roots.",
+            "src.bindings.tests.body_stream_roots.",
+            "tests.webapi.",
+        },
+    },
+};
+
+/// The strict runs of both GC stress profiles, one after the other, between
+/// two hidden steps smoke.zig orders against its other lanes.
+pub const StrictGcStress = struct {
+    /// Every strict run waits on it.
+    start: *std.Build.Step,
+    /// Completes when both strict runs pass.
+    done: *std.Build.Step,
+};
+
+/// `bindings-gc-stress`: both profiles over the aggregate binary already
+/// linked, one run each, the second after the first so their collector
+/// threads never share the machine. Each profile is sized to finish in about
+/// two minutes on the reference machine, and one that outgrows that narrows
+/// its filters rather than leaving smoke.
+fn addGcStressLane(
+    b: *std.Build,
+    ctx: *const context_mod.Context,
+    main_suite: MainSuite,
+    strict_gate: *std.Build.Step,
+) StrictGcStress {
+    const lane = b.step(
+        "bindings-gc-stress",
+        "Run the bindings' GC window tests and churn workloads under the forced and concurrent collector profiles",
+    );
+    const strict: StrictGcStress = .{
+        .start = addHiddenStep(b, "bindings-gc-stress with strict skips: start"),
+        .done = addHiddenStep(b, "bindings-gc-stress with strict skips"),
+    };
+    var previous_run: ?*std.Build.Step.Run = null;
+    var previous_strict_run: ?*std.Build.Step.Run = null;
+    for (gc_stress_profiles) |profile| {
+        const suite: RunnerSuite = .{
+            .compile = main_suite.compile,
+            .linked = main_suite.linked,
+            .configured_args = filterArgs(b, profile.filters),
             .spawns_collo = true,
-        }, .inherited);
-        b.step("webapi-test", "Run the webapi compat domain (needs -Dwebapi-compat)")
-            .dependOn(&run.step);
+        };
+        const run = addRunnerRun(b, ctx, suite, .inherited);
+        applyGcStressProfile(b, run, profile, "");
+        if (previous_run) |previous| run.step.dependOn(&previous.step);
+        lane.dependOn(&run.step);
+        previous_run = run;
+
+        const strict_run = addRunnerRun(b, ctx, suite, .{ .strict = strict_gate });
+        applyGcStressProfile(b, strict_run, profile, " with strict skips");
+        strict_run.step.dependOn(strict.start);
+        if (previous_strict_run) |previous| strict_run.step.dependOn(&previous.step);
+        strict.done.dependOn(&strict_run.step);
+        previous_strict_run = strict_run;
     }
+    return strict;
+}
+
+fn applyGcStressProfile(
+    b: *std.Build,
+    run: *std.Build.Step.Run,
+    profile: GcStressProfile,
+    comptime name_suffix: []const u8,
+) void {
+    run.setName(b.fmt("run the {s} GC stress profile" ++ name_suffix, .{profile.name}));
+    for (profile.environment) |variable|
+        run.setEnvironmentVariable(variable.name, variable.value);
 }
 
 /// Tests that tear down a terminated VM trip a JSC debug-build assertion, so
@@ -550,6 +688,7 @@ const domain_steps = [_]DomainStep{
     .{ .step_name = "zygote-test", .description = "Run the zygote domain", .filters = &.{"src.zygote.tests."} },
     .{ .step_name = "host-test", .description = "Run the host (launch/cgroup/dispatch) domain", .filters = &.{"src.host.tests."} },
     .{ .step_name = "meta-test", .description = "Run conventions/buildtool/contracts/test-runner self-tests", .filters = &.{ "tests.conventions.", "build.tests.", "tests.contracts.", "tests.support." } },
+    .{ .step_name = "webapi-test", .description = "Run the WebAPI compatibility suites, in process and in a forked worker", .filters = &.{"tests.webapi."} },
 };
 
 /// The server's gateway control client and the control wire, without JSC.
@@ -585,11 +724,17 @@ fn addGatewayControlSuite(
         "collo_server_gateway_control_client",
         control_client_module,
     );
+    // The gateway module's graph reaches the egress decoders.
+    codecs_mod.linkInto(control_tests, ctx.codecs);
     const run = aggregate.addRun(b, ctx, .{ .compile = control_tests });
     b.step(
         "server-gateway-control-test",
         "Run JSC-free tests of the server's egress gateway control client",
     ).dependOn(&run.step);
+}
+
+fn bridgeLibraries(b: *std.Build, ctx: *const context_mod.Context) shims.BridgeLibraries {
+    return .{ .icu = ctx.link_ctx.icu.headers(b), .boringssl = ctx.boringssl.headers(), .codecs = ctx.codecs };
 }
 
 fn addSanitizedSmoke(b: *std.Build, ctx: *const context_mod.Context) void {
@@ -626,6 +771,7 @@ fn addSanitizedSmoke(b: *std.Build, ctx: *const context_mod.Context) void {
         ctx.jsc.cmake_build_type,
         ctx.jsc.build_dir,
         ctx.jsc.webkit_source_dir,
+        bridgeLibraries(b, ctx),
         sanitizer,
     );
 
@@ -634,7 +780,7 @@ fn addSanitizedSmoke(b: *std.Build, ctx: *const context_mod.Context) void {
         .emit_object = true,
     });
     shims.configureBindingsTestObject(smoke_tests, ctx.libc_file);
-    shims.configureBoringSslShim(b, smoke_tests, ctx.toolchain, sanitizer);
+    shims.configureBoringSslShim(b, smoke_tests, ctx.toolchain, ctx.boringssl.headers(), sanitizer);
 
     const run = link_mod.addBindingsTestRunner(b, ctx.link_ctx, .{
         .name = "bindings-smoke-asan",
@@ -681,6 +827,7 @@ fn addValgrindSmoke(b: *std.Build, ctx: *const context_mod.Context) void {
         ctx.jsc.cmake_build_type,
         ctx.jsc.build_dir,
         ctx.jsc.webkit_source_dir,
+        bridgeLibraries(b, ctx),
         .{},
     );
 
@@ -689,7 +836,7 @@ fn addValgrindSmoke(b: *std.Build, ctx: *const context_mod.Context) void {
         .emit_object = true,
     });
     shims.configureBindingsTestObject(smoke_tests, ctx.libc_file);
-    shims.configureBoringSslShim(b, smoke_tests, ctx.toolchain, .{});
+    shims.configureBoringSslShim(b, smoke_tests, ctx.toolchain, ctx.boringssl.headers(), .{});
 
     const run = link_mod.addBindingsValgrindRunner(b, ctx.link_ctx, .{
         .name = "bindings-smoke-valgrind",
@@ -715,8 +862,8 @@ fn addZygoteIntegration(
     shims.configureHpackShim(b, integration_tests, ctx.patched_ls_hpack);
     integration_tests.root_module.addImport("zygote_support", ctx.zygote_support_module);
     integration_tests.root_module.addImport("collo_test_harness", test_harness_module);
-    // .limits holds the worker CPU quota the tests give `createWorkerDir`
-    // (`limits.worker.cpu_max_cores`).
+    // `.limits` holds the worker limits the tests size their launches and
+    // waits by (`limits.worker`, `limits.process`).
     ctx.jsc_set.importInto(integration_tests.root_module, &.{ .os, .host, .limits });
 
     const suite: RunnerSuite = .{
@@ -752,10 +899,12 @@ fn addLocalE2e(
     local_server_options.addOption([]const u8, "egress_gateway_executable_path", b.getInstallPath(.bin, "collo"));
     e2e_tests.root_module.addImport("local_server_options", local_server_options.createModule());
     e2e_tests.root_module.addImport("zygote_support", ctx.zygote_support_module);
+    // `.network` writes the denial texts the network tests expect, with the
+    // function the gateway and the worker write them with.
     ctx.jsc_set.importInto(e2e_tests.root_module, &.{
         .worker,           .server_main, .server_supervisor, .server_config, .server_routes,
         .server_lifecycle, .os,          .http,              .hpack,         .ipc,
-        .worker_state,     .host,        .egress_gateway,
+        .worker_state,     .host,        .egress_gateway,    .network,       .limits,
     });
 
     const suite: RunnerSuite = .{
@@ -797,6 +946,14 @@ const stub_suites = [_]StubSuite{
         .libc = false,
         .imports = &.{ .http, .hpack },
         .hpack = true,
+    },
+    .{
+        // The rules of the network setting are data in and data out.
+        .name = "common-network",
+        .domain = .common,
+        .root = "runtime/src/common/tests/network/all.zig",
+        .libc = false,
+        .imports = &.{ .network, .dns_name },
     },
     .{
         .name = "h2-request",
@@ -844,15 +1001,15 @@ const stub_suites = [_]StubSuite{
         .name = "server-config",
         .domain = .server,
         .root = "runtime/src/server/tests/config/all.zig",
-        .imports = &.{ .server_config, .limits },
+        .imports = &.{ .server_config, .limits, .network },
     },
     .{
-        // The route table is a pure lookup, and the artifacts are files read
-        // from a temporary directory into sealed memfds; no engine runs.
+        // The route table is a pure lookup, and the artifacts and the network
+        // policy image are bytes sealed into memfds; no engine runs.
         .name = "server-routes",
         .domain = .server,
         .root = "runtime/src/server/tests/routes/all.zig",
-        .imports = &.{ .server_routes, .server_config, .limits, .ipc, .os, .host },
+        .imports = &.{ .server_routes, .server_config, .limits, .ipc, .os, .network },
     },
     .{
         // Worker supervision is the pools, the launcher and the reaper over
@@ -986,14 +1143,44 @@ fn addH2TransportSuites(
         if (suite.hpack)
             shims.configureHpackShim(b, compile, ctx.patched_ls_hpack);
         if (suite.boringssl_shim)
-            shims.configureBoringSslShim(b, compile, ctx.toolchain, .{});
+            shims.configureBoringSslShim(b, compile, ctx.toolchain, ctx.boringssl.headers(), .{});
         if (suite.tls_test_shim)
             shims.configureBoringSslTestShim(b, compile, ctx.toolchain, .{});
         if (suite.boringssl_archives)
-            shims.linkBoringSslArchives(b, compile, ctx.opts.boringssl_build_dir);
+            ctx.boringssl.linkArchives(b, compile);
+        // Most module graphs reach the egress decoders; an archive no test
+        // calls into adds nothing to the executable. A suite built without
+        // libc stays without it.
+        if (suite.libc)
+            codecs_mod.linkInto(compile, ctx.codecs);
 
         const run = aggregate.addRun(b, ctx, .{ .compile = compile });
         h2_step.dependOn(&run.step);
         fast_steps.get(suite.domain).dependOn(&run.step);
     }
+}
+
+/// The JSC-free suite of `wsl-config` (dev/wsl), run against temporary
+/// directories shaped like a cgroup2 root, so it needs no delegated subtree.
+fn addWslConfigSuite(b: *std.Build, ctx: *const context_mod.Context, aggregate: Aggregate) void {
+    const wsl_config_module = b.createModule(.{
+        .root_source_file = b.path("dev/wsl/cgroup_env.zig"),
+        .target = ctx.opts.target,
+        .optimize = ctx.opts.optimize,
+        .link_libc = true,
+    });
+    const wsl_config_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("dev/wsl/tests/cgroup_env.zig"),
+            .target = ctx.opts.target,
+            .optimize = ctx.opts.optimize,
+            .link_libc = true,
+        }),
+    });
+    useCustomRunner(b, wsl_config_tests);
+    wsl_config_tests.root_module.addImport("collo_wsl_config", wsl_config_module);
+    ctx.check_step.dependOn(&wsl_config_tests.step);
+    const run = aggregate.addRun(b, ctx, .{ .compile = wsl_config_tests });
+    b.step("wsl-config-test", "Test wsl-config's prepare against directories shaped like a cgroup2 root (JSC-free)")
+        .dependOn(&run.step);
 }

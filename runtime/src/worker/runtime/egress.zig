@@ -98,11 +98,6 @@ pub fn Methods(comptime Runtime: type) type {
             flags: u32,
             deferred: promise_deferred.DeferredOwned,
         ) !u64 {
-            if (self.bootIdentityClosed(request_id)) {
-                var owned_deferred = deferred;
-                owned_deferred.deinit();
-                return error.FetchOutsideActiveRequest;
-            }
             var egress_ctx = self.egressContext();
             return egress_fetch.schedule(
                 &egress_ctx,
@@ -296,6 +291,7 @@ pub fn Methods(comptime Runtime: type) type {
                 .clock = self.core.clock,
                 .egress_state = &self.egress.state,
                 .requests = &self.requests.active,
+                .boot_fetches_started = &self.evaluations.boot_fetches_started,
                 .ready_queue = &self.scheduler.ready_queue,
                 .ready_backlog = &self.scheduler.ready_backlog,
                 .dispatch_recv_scratch = self.core.dispatch_recv_scratch,
@@ -307,6 +303,8 @@ pub fn Methods(comptime Runtime: type) type {
                 .disconnect_fn = disconnectEgressGatewayCallback,
                 .request_failure_context = context,
                 .request_failure_fn = requestFailureCallback,
+                .denial_log_context = context,
+                .denial_log_fn = networkDenialCallback,
             };
         }
 
@@ -367,6 +365,11 @@ pub fn Methods(comptime Runtime: type) type {
         fn requestFailureCallback(context: ?*anyopaque, request_id: u64, err: anyerror) void {
             const runtime: *Runtime = @ptrCast(@alignCast(context orelse return));
             request_dispatch.handleLocalFailure(runtime, request_id, err);
+        }
+
+        fn networkDenialCallback(context: ?*anyopaque, request_id: u64, message: []const u8) void {
+            const runtime: *Runtime = @ptrCast(@alignCast(context orelse return));
+            runtime.logNetworkDenial(request_id, message);
         }
     };
 }

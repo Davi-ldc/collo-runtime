@@ -208,13 +208,17 @@ pub const Driver = struct {
         return initWithConfig(allocator, .{});
     }
 
+    /// Fails with `error.UnsupportedKernel` or `error.PermissionDenied` when
+    /// this kernel or its policy offers no usable ring
+    /// (`restricted_uring.initRingParams`), so a caller can tell a missing
+    /// capability from a real failure, which keeps its own error.
     pub fn initWithConfig(allocator: std.mem.Allocator, config: Config) !Driver {
         var params = std.mem.zeroInit(linux.io_uring_params, .{
             .flags = linux.IORING_SETUP_R_DISABLED | linux.IORING_SETUP_CQSIZE,
             .cq_entries = cq_ring_entries,
             .sq_thread_idle = 1000,
         });
-        const ring = try linux.IoUring.init_params(ring_entries, &params);
+        const ring = try restricted_uring.initRingParams(ring_entries, &params);
         if ((params.features & linux.IORING_FEAT_NODROP) == 0)
             std.log.warn("egress data io_uring lacks IORING_FEAT_NODROP; completions may drop under CQ overflow", .{});
         return .{

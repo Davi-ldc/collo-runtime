@@ -1,6 +1,7 @@
-// ColloVm's life and its turns: VM creation with the engine options a worker needs, its realms, value handles, turns
-// with per-request CPU accounting, the microtask owner table, and the pump that runs JSC's deferred work in place of
-// a RunLoop. Runs on the VM thread, except where a comment names another thread.
+// ColloVm's life and its turns: VM creation with the engine options a worker needs, its realms, value handles, turns,
+// the owners of running JavaScript with their microtask owner table, and the pump that runs JSC's deferred work in
+// place of a RunLoop. Runs on the VM thread, except where a comment names another thread. No clock is read here: the
+// embedder measures each owner at the turn boundaries and the owner transition hook.
 //
 // The JSC API lock comes before a value owner state's mutex, as destroyVmContents takes them; releaseValueHandle
 // drops the mutex before it takes the API lock so it never inverts that order. destroyVmContents clears every
@@ -25,6 +26,8 @@
 #include <wtf/FastMalloc.h>
 #include <wtf/StdLibExtras.h>
 
+#include <unicode/udata.h>
+
 #include <atomic>
 #include <cassert>
 #include <cstdio>
@@ -36,7 +39,7 @@
 #include <new>
 #include <span>
 #include <thread>
-#include <time.h>
+#include <type_traits>
 #include <unistd.h>
 
 namespace {
@@ -63,22 +66,16 @@ struct ColloValueOwnerState {
 
 namespace {
 
-constexpr uint32_t allowedVmOptionFlags = COLLO_VM_OPTION_DISABLE_WEBAPIS;
+constexpr uint32_t allowedVmCreateFlags = COLLO_VM_CREATE_DISABLE_WEB_APIS;
 
-bool allowsAbiVersion(const ColloVmOptions* options)
+// ICU reads only the data linked into the binary, never an icudt file from a working or data directory; its default,
+// UDATA_FILES_FIRST, tries files first. The setting is process-wide and holds only if made before ICU first loads data.
+UErrorCode restrictIcuDataToBinary()
 {
-    if (!options)
-        return true;
-    if (!options->abi_version)
-        return false;
-    return options->abi_version == COLLO_ABI_VERSION;
-}
-
-bool shouldInstallWebApis(const ColloVmOptions* options)
-{
-    if (!options)
-        return true;
-    return !(options->flags & COLLO_VM_OPTION_DISABLE_WEBAPIS);
+    static UErrorCode status = U_ZERO_ERROR;
+    static std::once_flag once;
+    std::call_once(once, [] { udata_setFileAccess(UDATA_NO_FILES, &status); });
+    return status;
 }
 
 // The client is attached only while a sink exists. JSC's console object returns on a null client before it coerces
@@ -135,7 +132,7 @@ ColloStatus createRealm(ColloVm* vm, ColloRealm** out_realm)
     return COLLO_STATUS_OK;
 }
 
-ColloStatus initializeVm(ColloVm* vm, const ColloVmOptions* options)
+ColloStatus initializeVm(ColloVm* vm, uint32_t flags)
 {
     if (!vm)
         return COLLO_STATUS_INVALID_ARGUMENT;
@@ -158,19 +155,25 @@ ColloStatus initializeVm(ColloVm* vm, const ColloVmOptions* options)
     if (vm->vm->clientData)
         return COLLO_STATUS_ERROR;
 
+    JSC::JSLockHolder locker(*vm->vm);
     vm->vm->clientData = new (std::nothrow) Collo::VmClientData(vm);
     if (!vm->vm->clientData)
         return COLLO_STATUS_OUT_OF_MEMORY;
 
-    JSC::JSLockHolder locker(*vm->vm);
     vm->vm->forbidExecutionOnTermination();
     // JSC creates its termination exception lazily, when its Watchdog or a termination deadline is first set up, and
     // Collo uses neither, since the worker's sentinel replaces them. The sentinel's cross-thread
     // notifyNeedTermination cannot allocate, and the throw path's terminationException accessor asserts the object
     // exists, so it is created here, on the VM thread, before any trap can fire.
     vm->vm->ensureTerminationException();
+    // Registered before the VM can schedule deferred work, so no schedule goes unnoticed, and here, in the zygote, so
+    // a worker never allocates it after its seccomp filter. The pump section below owns the protocol.
+    vm->deferred_work_wakeup_gate = ColloDeferredWorkWakeupGate::tryCreate();
+    if (!vm->deferred_work_wakeup_gate)
+        return COLLO_STATUS_OUT_OF_MEMORY;
+    vm->vm->deferredWorkTimer->addTimerSetNotification(vm->deferred_work_wakeup_gate);
 
-    vm->web_apis_installed = shouldInstallWebApis(options);
+    vm->web_apis_installed = !(flags & COLLO_VM_CREATE_DISABLE_WEB_APIS);
     vm->hardware_concurrency = Collo::HostFunctions::readHardwareConcurrency();
     // JSC's built-in console object is on every global. The client that routes it to the ColloConsoleSink is created
     // now but attached to the globals only while a sink is registered. Without a client every console method returns
@@ -305,6 +308,7 @@ void destroyVmContents(ColloVm* vm)
     RELEASE_ASSERT(vm->module_sources.isEmpty());
     RELEASE_ASSERT(vm->realms.isEmpty());
     vm->current_exec_ctx = nullptr;
+    vm->turnless_exec_ctx = nullptr;
     vm->entered_count = 0;
     vm->host_runtime.store(nullptr, std::memory_order_release);
     vm->ready = false;
@@ -322,7 +326,7 @@ void waitForTerminationRequestsToDrain(ColloVm* vm)
 #ifndef NDEBUG
 bool execCtxReservedFieldsAreZero(const ColloExecCtx* exec_ctx)
 {
-    for (uint8_t value : exec_ctx->_reserved) {
+    for (uint8_t value : exec_ctx->reserved0) {
         if (value)
             return false;
     }
@@ -386,14 +390,6 @@ ColloStatus copyWTFStringToColloString(const WTF::String& string, ColloString* o
     if (!result || !result.value())
         return status != COLLO_STATUS_OK ? status : COLLO_STATUS_OUT_OF_MEMORY;
     return COLLO_STATUS_OK;
-}
-
-uint64_t threadCpuTimeNs()
-{
-    timespec ts {};
-    int rc = clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
-    RELEASE_ASSERT(!rc);
-    return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull + static_cast<uint64_t>(ts.tv_nsec);
 }
 
 ColloStatus makeValueHandle(ColloVm* vm, JSC::JSValue value, ColloValue** out_value)
@@ -534,7 +530,7 @@ ColloStatus caughtExceptionStatus(ColloVm* vm, JSC::TopExceptionScope& scope, Co
     if (!scope.exception())
         return COLLO_STATUS_ERROR;
     JSC::JSValue exception = scope.exception()->value();
-    scope.clearExceptionExceptTermination();
+    (void)scope.clearExceptionExceptTermination();
     return statusOr(setJsException(vm, exception, out_exception), COLLO_STATUS_JS_EXCEPTION);
 }
 
@@ -547,13 +543,13 @@ ColloStatus setInternalError(ColloRealm* realm, const WTF::String& message, Coll
     return setJsException(realm->vm, error, out_exception);
 }
 
-GlobalObject* globalObjectForValue(ColloVm* vm, JSC::JSValue value)
+GlobalObject* globalObjectForValue(ColloRealm& realm, JSC::JSValue value)
 {
     if (auto* object = dynamicDowncast<JSC::JSObject>(value)) {
         if (auto* global_object = dynamicDowncast<GlobalObject>(object->realmMayBeNull()))
             return global_object;
     }
-    return vm->main_realm->global_object;
+    return realm.global_object;
 }
 
 void seedRealmWeakRandom(ColloRealm& realm)
@@ -576,16 +572,17 @@ void seedRealmWeakRandom(ColloRealm& realm)
 
 } // namespace Collo
 
-extern "C" ColloStatus collo_vm_create(const ColloVmOptions* options, ColloVm** out_vm)
+extern "C" ColloStatus collo_vm_create(uint32_t flags, ColloVm** out_vm)
 {
     if (!out_vm)
         return COLLO_STATUS_INVALID_ARGUMENT;
 
     *out_vm = nullptr;
-    if (!allowsAbiVersion(options))
-        return COLLO_STATUS_INVALID_ARGUMENT;
-    if (options && (options->flags & ~allowedVmOptionFlags))
+    if (flags & ~allowedVmCreateFlags)
         return COLLO_STATUS_UNSUPPORTED;
+
+    if (U_FAILURE(restrictIcuDataToBinary()))
+        return COLLO_STATUS_ERROR;
 
     // Both run their bodies once per process, so the options below apply to every VM the process creates, unless
     // tooling_bytecode.cpp ran them first with its own options.
@@ -634,7 +631,7 @@ extern "C" ColloStatus collo_vm_create(const ColloVmOptions* options, ColloVm** 
         return COLLO_STATUS_OUT_OF_MEMORY;
     vm->process_id_at_creation = static_cast<uint64_t>(getpid());
 
-    ColloStatus status = initializeVm(vm, options);
+    ColloStatus status = initializeVm(vm, flags);
     if (status != COLLO_STATUS_OK) {
         delete vm;
         return status;
@@ -689,26 +686,27 @@ extern "C" ColloStatus collo_vm_set_host_runtime(ColloVm* vm, void* runtime)
     return COLLO_STATUS_OK;
 }
 
-extern "C" ColloStatus collo_vm_set_boot_exec_ctx(ColloVm* vm, uint64_t request_id)
-{
-    if (!vm || !vm->isReady() || request_id == 0)
-        return COLLO_STATUS_INVALID_ARGUMENT;
-
-    vm->boot_exec_ctx = ColloExecCtx {};
-    vm->boot_exec_ctx.request_id = request_id;
-    vm->boot_exec_ctx_installed = true;
-    return COLLO_STATUS_OK;
-}
-
-extern "C" ColloStatus collo_vm_clear_boot_exec_ctx(ColloVm* vm)
+extern "C" ColloStatus collo_vm_set_turnless_exec_ctx(ColloVm* vm, ColloExecCtx* exec_ctx)
 {
     if (!vm || !vm->isReady())
         return COLLO_STATUS_INVALID_ARGUMENT;
 
-    // Idempotent, unlike installation: the worker runtime closes the boot context once on every settlement path,
-    // including after a boot that installed none because the host delivered no boot egress capability.
-    vm->boot_exec_ctx = ColloExecCtx {};
-    vm->boot_exec_ctx_installed = false;
+    // No token is minted here: the owner token hook mints one the first time turnless code registers a reaction, so
+    // an evaluation that registers none never holds a slot.
+    vm->turnless_exec_ctx = exec_ctx;
+    return COLLO_STATUS_OK;
+}
+
+extern "C" ColloStatus collo_vm_heap_stats(ColloVm* vm, ColloHeapStats* out)
+{
+    if (out)
+        *out = {};
+    if (!vm || !vm->isReady() || !out)
+        return COLLO_STATUS_INVALID_ARGUMENT;
+
+    JSC::JSLockHolder locker(*vm->vm);
+    out->size_bytes = vm->vm->heap.size();
+    out->extra_memory_bytes = vm->vm->heap.extraMemorySize();
     return COLLO_STATUS_OK;
 }
 
@@ -768,44 +766,48 @@ ColloVm* ownerVmFromGlobal(JSC::JSGlobalObject* global_object)
     return collo_global ? &collo_global->owner() : nullptr;
 }
 
-uint64_t ownerTokenFor(ColloVm* vm, ColloExecCtx* exec_ctx)
-{
-    if (!exec_ctx)
-        return ColloVm::owner_token_turnless;
-    for (const auto& slot : vm->owner_slots) {
-        if (slot.token && slot.exec_ctx == exec_ctx)
-            return slot.token;
-    }
-    return 0;
-}
-
-// Idempotent: the same ColloExecCtx always maps to the same live token. Returns 0 when the table is full.
+// Idempotent: the same ColloExecCtx always maps to the same live token, and no owner to owner_token_none. Returns 0
+// when the table is full.
 uint64_t acquireOwnerToken(ColloVm* vm, ColloExecCtx* exec_ctx)
 {
     if (!exec_ctx)
-        return ColloVm::owner_token_turnless;
-    if (uint64_t existing = ownerTokenFor(vm, exec_ctx))
-        return existing;
-    for (auto& slot : vm->owner_slots) {
-        if (!slot.token) {
-            slot.token = vm->next_owner_token++;
-            slot.exec_ctx = exec_ctx;
-            return slot.token;
+        return ColloVm::owner_token_none;
+    if (vm->cached_owner_exec_ctx == exec_ctx)
+        return vm->cached_owner_token;
+    uint64_t token = 0;
+    for (const auto& slot : vm->owner_slots) {
+        if (slot.token && slot.exec_ctx == exec_ctx) {
+            token = slot.token;
+            break;
         }
     }
-    return 0;
+    if (!token) {
+        for (size_t index = 0; index < ColloVm::owner_slot_count; ++index) {
+            auto& slot = vm->owner_slots[index];
+            if (slot.token)
+                continue;
+            slot.token = (vm->next_owner_serial++ << ColloVm::owner_token_index_bits) | index;
+            slot.exec_ctx = exec_ctx;
+            token = slot.token;
+            break;
+        }
+    }
+    if (!token)
+        return 0;
+    vm->cached_owner_exec_ctx = exec_ctx;
+    vm->cached_owner_token = token;
+    return token;
 }
 
 ColloExecCtx* execCtxForOwnerToken(ColloVm* vm, uint64_t token)
 {
-    if (token == ColloVm::owner_token_turnless)
+    if (token == ColloVm::owner_token_none)
         return nullptr;
-    for (const auto& slot : vm->owner_slots) {
-        if (slot.token && slot.token == token)
-            return slot.exec_ctx;
-    }
-    // A released token: the owning request is gone. Resolving to no owner is deliberate, since charging its leftovers
-    // to whoever happens to be running is what the owner table exists to prevent.
+    size_t index = static_cast<size_t>(token & ((uint64_t { 1 } << ColloVm::owner_token_index_bits) - 1));
+    if (index < ColloVm::owner_slot_count && vm->owner_slots[index].token == token)
+        return vm->owner_slots[index].exec_ctx;
+    // A released token: its owner is gone. Resolving to no owner is deliberate, since charging its leftovers to
+    // whoever happens to be running is what the owner table exists to prevent.
     return nullptr;
 }
 
@@ -845,41 +847,29 @@ private:
     uint64_t m_owner_token;
 };
 
-// Closes `from`'s thread-CPU slice and opens `to`'s at the same instant, so the two never overlap or leave a gap. A
-// null side has no slice on purpose: turnless execution and a released owner both resolve to no context, and
-// inventing a slice for them would charge one request's CPU to another.
-void moveCpuSlice(ColloExecCtx* from, ColloExecCtx* to)
-{
-    uint64_t now = Collo::threadCpuTimeNs();
-    if (from && from->turn_cpu_start_ns) {
-        RELEASE_ASSERT(now >= from->turn_cpu_start_ns);
-        from->cpu_used_ns_total += now - from->turn_cpu_start_ns;
-        from->turn_cpu_start_ns = 0;
-    }
-    if (to)
-        to->turn_cpu_start_ns = now;
-}
-
-// Swaps the running owner for the one that registered the work, and puts back whatever was there. The previous owner
-// is saved as the raw ColloExecCtx* rather than as a token, so a turn whose owner is not in the table still restores
-// exactly; a released owner resolves to turnless, the fallback turnless JS takes.
+// Swaps the running owner for the one that registered the work, and puts back whatever was there. The previous
+// current_exec_ctx is saved as the raw pointer rather than as a token, so a turn whose owner is not in the table
+// still restores exactly; a released owner restores no owner. The hook hears the owners as ownerExecCtx defines them,
+// so a turnless drain reports the turnless context it belongs to, and it hears nothing when the restored owner is the
+// one already running.
 struct ColloRestoredTurnScope {
     ColloRestoredTurnScope(ColloVm* vm, JSC::VM& jsc_vm, uint64_t owner_token)
         : m_vm(vm)
         , m_jsc_vm(jsc_vm)
         , m_previous_ctx(vm->current_exec_ctx)
+        , m_interrupted_owner(Collo::ownerExecCtx(*vm))
         , m_previous_token(jsc_vm.crossTaskToken())
     {
-        m_vm->owner_crossings += 1;
         m_restored_ctx = execCtxForOwnerToken(vm, owner_token);
-        // The thread-CPU slice follows the owner. Otherwise the whole drain is charged to the turn that ran it, and
-        // that number is more than telemetry: when a workload fault kills the worker, the live slot is charged from
-        // it.
-        m_previous_was_armed = m_previous_ctx && m_previous_ctx->turn_cpu_start_ns;
-        moveCpuSlice(m_previous_ctx, m_restored_ctx);
         m_vm->current_exec_ctx = m_restored_ctx;
-        if (m_vm->owner_transition_hook)
-            m_vm->owner_transition_hook(m_vm->owner_transition_ctx, m_previous_ctx, m_restored_ctx);
+        m_vm->restored_scope_depth += 1;
+        // A reaction enqueued under another owner may still drain under its own, as when a restored continuation
+        // settles a promise the draining turn registered on; only a restore over a different owner is a crossing.
+        m_notifies = m_restored_ctx != m_interrupted_owner;
+        if (m_notifies)
+            m_vm->owner_crossings += 1;
+        if (m_notifies && m_vm->owner_transition_hook)
+            m_vm->owner_transition_hook(m_vm->owner_transition_ctx, m_interrupted_owner, m_restored_ctx);
         // Unconditional, even when the token is null: leaving the enclosing scope's token installed would hand this
         // continuation's descendants the enclosing owner, a wrong answer, while dropping it only gives an incomplete
         // one, as they fall back to the turn that drains them.
@@ -898,19 +888,18 @@ struct ColloRestoredTurnScope {
     ~ColloRestoredTurnScope()
     {
         m_jsc_vm.setCrossTaskToken(WTF::move(m_previous_token));
-        // Only a slice that was open is reopened. A turn that never opened one must not gain one here, or the
-        // enclosing collo_turn_exit_ex would charge CPU from an instant it never chose.
-        moveCpuSlice(m_restored_ctx, m_previous_was_armed ? m_previous_ctx : nullptr);
+        m_vm->restored_scope_depth -= 1;
         m_vm->current_exec_ctx = m_previous_ctx;
-        if (m_vm->owner_transition_hook)
-            m_vm->owner_transition_hook(m_vm->owner_transition_ctx, m_restored_ctx, m_previous_ctx);
+        if (m_notifies && m_vm->owner_transition_hook)
+            m_vm->owner_transition_hook(m_vm->owner_transition_ctx, m_restored_ctx, m_interrupted_owner);
     }
 
     ColloVm* m_vm;
     JSC::VM& m_jsc_vm;
     ColloExecCtx* m_previous_ctx;
+    ColloExecCtx* m_interrupted_owner;
     ColloExecCtx* m_restored_ctx { nullptr };
-    bool m_previous_was_armed { false };
+    bool m_notifies { false };
     RefPtr<JSC::CrossTaskToken> m_previous_token;
 };
 
@@ -984,17 +973,20 @@ RefPtr<JSC::MicrotaskDispatcher> colloOwnerDispatcherFactoryHook(JSC::VM&, JSC::
     return dispatcher;
 }
 
+// Asked when a reaction is registered, for the owner it records, and when a promise settles, for the owner running,
+// which the engine compares with each reaction's to decide whether it needs a restore. A turnless context gets its
+// token here, on first use.
 uint64_t colloCurrentOwnerTokenHook(JSC::JSGlobalObject* global_object)
 {
     ColloVm* vm = ownerVmFromGlobal(global_object);
     if (!vm)
         return 0;
-    uint64_t token = acquireOwnerToken(vm, vm->current_exec_ctx);
+    uint64_t token = acquireOwnerToken(vm, Collo::ownerExecCtx(*vm));
     if (!token) {
         // A full table means a release was missed, a leak rather than a capacity limit. The reaction records no
         // owner, 0, so it gets no dispatcher and runs under whoever settles it, the engine's behavior without owner
-        // hooks. Returning the turnless token instead would be worse, because the restore would install a null owner
-        // over a turn that has a live one. It warns once, since this is the hot reaction registration path.
+        // hooks. Returning owner_token_none instead would be worse, because the restore would install no owner over
+        // a turn that has a live one. It warns once, since this is the hot reaction registration path.
         static bool table_full_warned = false;
         if (!table_full_warned) {
             table_full_warned = true;
@@ -1006,13 +998,6 @@ uint64_t colloCurrentOwnerTokenHook(JSC::JSGlobalObject* global_object)
 }
 
 } // namespace
-
-extern "C" uint64_t collo_vm_acquire_exec_ctx(ColloVm* vm, ColloExecCtx* exec_ctx)
-{
-    if (!vm || !exec_ctx)
-        return 0;
-    return acquireOwnerToken(vm, exec_ctx);
-}
 
 extern "C" ColloStatus collo_vm_set_owner_transition_hook(ColloVm* vm, ColloOwnerTransitionHook hook, void* ctx)
 {
@@ -1029,15 +1014,24 @@ extern "C" ColloStatus collo_vm_release_exec_ctx(ColloVm* vm, ColloExecCtx* exec
 {
     if (!vm || !exec_ctx)
         return COLLO_STATUS_INVALID_ARGUMENT;
+    // A restored continuation holds the owners it interrupted and replaced as raw pointers and writes them back when
+    // it ends, so a release under one would hand the VM a pointer to freed storage.
+    RELEASE_ASSERT(!vm->restored_scope_depth);
     for (auto& slot : vm->owner_slots) {
         if (slot.token && slot.exec_ctx == exec_ctx) {
             slot.token = 0;
             slot.exec_ctx = nullptr;
         }
     }
-    // The turn must not end holding a pointer the caller is about to free.
+    if (vm->cached_owner_exec_ctx == exec_ctx) {
+        vm->cached_owner_exec_ctx = nullptr;
+        vm->cached_owner_token = 0;
+    }
+    // Nothing may keep a pointer the caller is about to free.
     if (vm->current_exec_ctx == exec_ctx)
         vm->current_exec_ctx = nullptr;
+    if (vm->turnless_exec_ctx == exec_ctx)
+        vm->turnless_exec_ctx = nullptr;
     return COLLO_STATUS_OK;
 }
 
@@ -1052,22 +1046,14 @@ extern "C" ColloStatus collo_turn_enter(ColloVm* vm, ColloExecCtx* exec_ctx)
 
     JSC::JSLockHolder locker(*vm->vm);
 
-    uint64_t now = Collo::threadCpuTimeNs();
-
     if (!vm->entered_count) {
         vm->current_exec_ctx = exec_ctx;
-        vm->turn_exec_ctx = exec_ctx;
         // Registered here rather than at dispatch, so a running owner has a token on every path that enters a turn.
         acquireOwnerToken(vm, exec_ctx);
         vm->microtask_delay_scope.emplace(vm->vm->drainMicrotaskDelayScope());
-    } else if (vm->current_exec_ctx != exec_ctx) {
+    } else if (vm->current_exec_ctx != exec_ctx)
         return COLLO_STATUS_INVALID_ARGUMENT;
-    } else if (exec_ctx->turn_cpu_start_ns) {
-        RELEASE_ASSERT(now >= exec_ctx->turn_cpu_start_ns);
-        exec_ctx->cpu_used_ns_total += now - exec_ctx->turn_cpu_start_ns;
-    }
 
-    exec_ctx->turn_cpu_start_ns = now;
     vm->entered_count += 1;
     return COLLO_STATUS_OK;
 }
@@ -1079,13 +1065,12 @@ extern "C" ColloStatus collo_turn_exit_ex(ColloVm* vm, ColloValue** out_exceptio
         return COLLO_STATUS_INVALID_ARGUMENT;
 
     JSC::JSLockHolder locker(*vm->vm);
-    ColloExecCtx* exec_ctx = vm->current_exec_ctx;
 
     bool microtask_exception = false;
     JSC::Strong<JSC::Unknown> microtask_exception_value;
 
-    // Microtasks drain inside the outermost turn, before its CPU slice closes, so the turn pays for the ones it owns.
-    // One that another owner registered runs under ColloRestoredTurnScope, which moves the slice for its duration.
+    // Microtasks drain inside the outermost turn, while its owner is still installed, so the turn's own reactions run
+    // under it. One that another owner registered runs under ColloRestoredTurnScope, whose hook tells the embedder.
     if (vm->entered_count == 1) {
         auto scope = DECLARE_TOP_EXCEPTION_SCOPE(*vm->vm);
         vm->microtask_delay_scope.reset();
@@ -1094,25 +1079,14 @@ extern "C" ColloStatus collo_turn_exit_ex(ColloVm* vm, ColloValue** out_exceptio
             microtask_exception = true;
             JSC::JSValue exception = scope.exception()->value();
             microtask_exception_value.set(*vm->vm, exception);
-            scope.clearExceptionExceptTermination();
+            (void)scope.clearExceptionExceptTermination();
         }
     }
 
-    uint64_t now = Collo::threadCpuTimeNs();
-    if (exec_ctx->turn_cpu_start_ns) {
-        RELEASE_ASSERT(now >= exec_ctx->turn_cpu_start_ns);
-        exec_ctx->cpu_used_ns_total += now - exec_ctx->turn_cpu_start_ns;
-    }
-
     vm->entered_count -= 1;
-    if (!vm->entered_count) {
-        exec_ctx->turn_cpu_start_ns = 0;
+    // Cleared only after the drain above, so it names the turn's owner for as long as the turn's microtasks run.
+    if (!vm->entered_count)
         vm->current_exec_ctx = nullptr;
-        // Cleared only after the drain above, so it names the turn's owner for as long as the turn's microtasks run.
-        vm->turn_exec_ctx = nullptr;
-    } else {
-        exec_ctx->turn_cpu_start_ns = now;
-    }
 
     if (microtask_exception) {
         ColloStatus microtask_exception_status
@@ -1138,58 +1112,52 @@ extern "C" ColloStatus collo_turn_exit_ex(ColloVm* vm, ColloValue** out_exceptio
 //     under the timer's lock, so reading it here is a data race, and a stale false loses a wake rather than
 //     delaying it: the loop can drain the wakeup eventfd for an unrelated reason in the same tick, read the stale
 //     false, skip the pump, never arm the backstop because it never saw imminent work, and sleep with no wake left.
-//   - The notification: JSRunLoopTimer::addTimerSetNotification fires synchronously on whichever thread called
+//   - The notification, which is the gate itself: VM creation registers it with
+//     JSRunLoopTimer::addTimerSetNotification, which fires it synchronously on whichever thread called
 //     setTimeUntilFire, such as the wasm worklist thread. It stores the pending flag and then writes the worker's
-//     wakeup eventfd, so a blocked scheduler sees the schedule without polling.
+//     wakeup eventfd, so a blocked scheduler sees the schedule without polling. Registered before the VM can run
+//     anything, it misses no schedule, so the flag starts clear.
 //   - The pump, which runs the ready tasks as the RunLoop timer callback would, through DeferredWorkTimer::doWork,
-//     but inside a Collo turn, so the settling JS gets an exec context, CPU accounting and the single end-of-turn
-//     microtask drain. doWork's per-task drainMicrotasks does nothing under the turn's DrainMicrotaskDelayScope.
+//     but inside a Collo turn, so the settling JS gets an owner and the single end-of-turn microtask drain. doWork's
+//     per-task drainMicrotasks does nothing under the turn's DrainMicrotaskDelayScope.
+// Each VM has its own gate, so two live VMs in one process, as in-process tests run them, cannot hide each other's
+// wakes.
 // ---------------------------------------------------------------------------
 
-namespace {
+static_assert(std::is_same_v<JSC::JSRunLoopTimer::TimerNotificationType, void()>,
+    "ColloDeferredWorkWakeupGate is a SharedTask<void()> so the timer can hold it as its notification");
 
-// Returns the VM's wakeup gate, installing it on first use. Every pump export runs on the VM thread, the worker loop
-// or a test driver standing in for it, so the lazy install needs no lock; the worklist thread reaches the gate only
-// through the shared_ptr its notification captured, which JSRunLoopTimer keeps until the DeferredWorkTimer dies. Each
-// VM has its own gate, so two live VMs in one process, as in-process tests run them, cannot hide each other's wakes.
-ColloDeferredWorkWakeupGate& ensureDeferredWorkWakeupGate(ColloVm* vm)
+RefPtr<ColloDeferredWorkWakeupGate> ColloDeferredWorkWakeupGate::tryCreate()
 {
-    if (!vm->deferred_work_wakeup_gate) {
-        auto gate = std::make_shared<ColloDeferredWorkWakeupGate>();
-        // Seeded pending, because schedules made before this install fired no notification: wasm compiled during
-        // boot evaluation queues work before the loop registers its wakeup fd, and tests pump without registering
-        // one. One spurious first pump, doWork over an empty queue, is cheaper than any handshake with the timer's
-        // own state.
-        gate->pending.store(true, std::memory_order_release);
-        vm->vm->deferredWorkTimer->addTimerSetNotification(
-            WTF::createSharedTask<JSC::JSRunLoopTimer::TimerNotificationType>([gate] {
-                // Runs synchronously inside setTimeUntilFire, on whichever thread scheduled: the wasm worklist
-                // thread when a plan completes, or the JS thread for a same-thread schedule.
-                //
-                // No wake is lost, given the consuming exchange in collo_vm_deferred_work_scheduled and this order:
-                // the pending store comes before the eventfd write. Suppose the loop's exchange reads false while
-                // this schedule is in flight. Then no eventfd drain on the loop thread has consumed this write,
-                // because a drain that had would follow the store and the write, and the exchange runs after the
-                // drain on the same thread, so it would have seen true. The write is therefore still coming or still
-                // undrained. Either way the eventfd counter is or becomes nonzero, the level-triggered ring wait
-                // cannot sleep through it, and the tick it wakes runs its exchange after its drain and sees true. A
-                // wake with no work left costs one doWork that does nothing.
-                gate->pending.store(true, std::memory_order_release);
-                int fd = gate->wakeup_fd.load(std::memory_order_acquire);
-                if (fd < 0)
-                    return;
-                // An eventfd write is async-signal-safe and allowed by the worker's seccomp filter. EAGAIN on a
-                // saturated counter is harmless, since the fd is already readable and the loop will wake.
-                uint64_t one = 1;
-                ssize_t rc = ::write(fd, &one, sizeof(one));
-                (void)rc;
-            }));
-        vm->deferred_work_wakeup_gate = std::move(gate);
-    }
-    return *vm->deferred_work_wakeup_gate;
+    void* storage = nullptr;
+    if (!WTF::tryFastMalloc(sizeof(ColloDeferredWorkWakeupGate)).getValue(storage))
+        return nullptr;
+    auto* gate = new (NotNull, storage) ColloDeferredWorkWakeupGate();
+    return adoptRef(*gate);
 }
 
-} // namespace
+void ColloDeferredWorkWakeupGate::run()
+{
+    // Runs synchronously inside setTimeUntilFire, on whichever thread scheduled: the wasm worklist thread when a
+    // plan completes, or the JS thread for a same-thread schedule.
+    //
+    // No wake is lost, given the consuming exchange in collo_vm_deferred_work_scheduled and this order: the pending
+    // store comes before the eventfd write. Suppose the loop's exchange reads false while this schedule is in flight.
+    // Then no eventfd drain on the loop thread has consumed this write, because a drain that had would follow the
+    // store and the write, and the exchange runs after the drain on the same thread, so it would have seen true. The
+    // write is therefore still coming or still undrained. Either way the eventfd counter is or becomes nonzero, the
+    // level-triggered ring wait cannot sleep through it, and the tick it wakes runs its exchange after its drain and
+    // sees true. A wake with no work left costs one doWork that does nothing.
+    pending.store(true, std::memory_order_release);
+    int fd = wakeup_fd.load(std::memory_order_acquire);
+    if (fd < 0)
+        return;
+    // An eventfd write is async-signal-safe and allowed by the worker's seccomp filter. EAGAIN on a saturated counter
+    // is harmless, since the fd is already readable and the loop will wake.
+    uint64_t one = 1;
+    ssize_t rc = ::write(fd, &one, sizeof(one));
+    (void)rc;
+}
 
 extern "C" uint32_t collo_vm_deferred_work_scheduled(ColloVm* vm)
 {
@@ -1197,9 +1165,9 @@ extern "C" uint32_t collo_vm_deferred_work_scheduled(ColloVm* vm)
         return 0;
     // Consumes the gate: 1 when deferred work was scheduled since the last call. acq_rel pairs with the
     // notification's release store, and the comment in the notification shows why a 0 here never strands a schedule.
-    // A spurious 1, from the install seed or a schedule the backstop already swept, costs one doWork that does
-    // nothing.
-    return ensureDeferredWorkWakeupGate(vm).pending.exchange(false, std::memory_order_acq_rel) ? 1u : 0u;
+    // A spurious 1, from a schedule the backstop already swept or one the zygote made before the fork, costs one
+    // doWork that does nothing.
+    return vm->deferred_work_wakeup_gate->pending.exchange(false, std::memory_order_acq_rel) ? 1u : 0u;
 }
 
 extern "C" ColloStatus collo_vm_set_deferred_work_wakeup_fd(ColloVm* vm, int32_t wakeup_fd)
@@ -1211,12 +1179,7 @@ extern "C" ColloStatus collo_vm_set_deferred_work_wakeup_fd(ColloVm* vm, int32_t
     // remains: a notification already past its fd load when this store lands can still write the closing fd before
     // its write. Closing it would need the gate to own a dup of the eventfd, closed only by the gate's destructor,
     // and the worker's seccomp filter does not allow dup.
-    if (wakeup_fd < 0) {
-        if (auto& gate = vm->deferred_work_wakeup_gate)
-            gate->wakeup_fd.store(-1, std::memory_order_release);
-        return COLLO_STATUS_OK;
-    }
-    ensureDeferredWorkWakeupGate(vm).wakeup_fd.store(wakeup_fd, std::memory_order_release);
+    vm->deferred_work_wakeup_gate->wakeup_fd.store(wakeup_fd < 0 ? -1 : wakeup_fd, std::memory_order_release);
     return COLLO_STATUS_OK;
 }
 
@@ -1229,9 +1192,8 @@ extern "C" ColloStatus collo_vm_pump_deferred_work(
     *out_state = 0;
 
     // The settle tasks run JS, resolving or rejecting the wasm promises, so the pump is a real turn. The caller
-    // supplies the exec context it is charged to: the boot context while the boot is open, and a host context with
-    // no request afterwards, never a live request's, because the JSC ticket carries no request identity to infer one
-    // from. pumpDeferredWork in worker/scheduler/loop.zig owns that choice.
+    // supplies the owner it runs under, never a live request's, because the JSC ticket carries no owner to infer one
+    // from; pumpDeferredWork in worker/scheduler/loop.zig owns that choice.
     ColloStatus enter_status = collo_turn_enter(vm, exec_ctx);
     if (enter_status != COLLO_STATUS_OK)
         return enter_status;

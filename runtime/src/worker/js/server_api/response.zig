@@ -3,58 +3,92 @@
 //! response bounds and hands it to the serve layer to write. It belongs to
 //! the `worker` module and runs on the VM thread.
 //!
-//! A response that fails extraction or the checks is answered with a 500
-//! instead. A streamed fetch body is released through the runtime on every
-//! path that does not hand it to the writer.
+//! An extraction that throws is answered as any exception of the request is
+//! (`serve/termination.zig:answerException`). A response that fails the
+//! checks is named in the tenant's log and answered with a 500 instead. A
+//! streamed fetch body is released through the runtime on every path that
+//! does not hand it to the writer, and a ReadableStream body the checks
+//! refuse is cancelled (`serve/response_body_stream.zig:discard`).
 
 const std = @import("std");
 const bindings = @import("collo_bindings");
 const limits = @import("collo_limits");
+const exception_log = @import("collo_worker_js").exception_log;
 const request_context = @import("collo_worker_request").context;
 const request_response = @import("../../serve/response.zig");
+const response_body_stream = @import("../../serve/response_body_stream.zig");
 const response_model = @import("collo_worker_request").response_model;
 const state = @import("../../runtime/root.zig");
+const termination = @import("../../serve/termination.zig");
 const turn = @import("collo_worker_js").turn;
-const ipc = @import("collo_ipc");
-
-/// Writes the response and finishes the request. The last two arguments are
-/// the done status and the HTTP status recorded for the request. The writer
-/// may take the body out of the response; the caller releases whatever it
-/// leaves.
-pub const WriteAndFinishFn = *const fn (
-    *state.Runtime,
-    *request_context.RequestContext,
-    *response_model.Response,
-    ipc.RequestDoneStatus,
-    u16,
-) anyerror!void;
 
 /// Writes `value`, the handler's borrowed result, as the answer to `request`
-/// through `write_and_finish`. An extraction or validation failure is logged
-/// and answered with a 500 instead. Fails only when `write_and_finish` fails.
+/// and finishes the request (`serve/response.zig:writeAndFinishResponse`).
+/// An extraction that throws answers as the exception it threw; a response
+/// that fails a check writes one line naming the check to the tenant's log
+/// and answers 500 instead. Fails only when writing an answer fails.
 pub fn writeValueResponse(
     runtime: *state.Runtime,
     request: *request_context.RequestContext,
     value: *const bindings.Value,
-    write_and_finish: WriteAndFinishFn,
 ) !void {
     runtime.observability.response_extraction_count += 1;
-    var extracted = extractNativeResponse(runtime, request, value) catch |err| {
-        std.log.warn("response extraction failed request_id={d}: {s}", .{ request.exec.request_id, @errorName(err) });
-        try writeInternalErrorResponse(runtime, request, write_and_finish, "invalid response");
-        return;
+    const extraction = extractNativeResponse(runtime, request, value) catch |err| switch (err) {
+        // The request's boundary decides what running out of memory means
+        // (`handleLocalFailure` in `serve/dispatch.zig`); it is no check
+        // the tenant's response failed.
+        error.OutOfMemory => return err,
+        else => {
+            try answerInvalidResponse(runtime, request, err);
+            return;
+        },
+    };
+    var extracted = switch (extraction) {
+        .extracted => |extracted| extracted,
+        .exception => |exception| {
+            var owned = exception;
+            defer owned.deinit();
+            try termination.answerException(runtime, request, &owned, "response extraction");
+            return;
+        },
     };
     defer extracted.deinit(runtime);
 
     var owned_response = extracted.toResponse();
     defer deinitResponseBody(runtime, &owned_response);
     response_model.validate(owned_response) catch |err| {
-        std.log.warn("response validation failed request_id={d}: {s}", .{ request.exec.request_id, @errorName(err) });
-        try writeInternalErrorResponse(runtime, request, write_and_finish, "invalid response");
+        try answerInvalidResponse(runtime, request, err);
         return;
     };
 
-    try write_and_finish(runtime, request, &owned_response, .ok, extracted.status);
+    try request_response.writeAndFinishResponse(runtime, request, &owned_response, .ok, extracted.status);
+}
+
+/// What extracting a handler's result gave: the response, or the exception
+/// the extraction's JavaScript threw, which the caller owns.
+const Extraction = union(enum) {
+    extracted: ExtractedHandlerResult,
+    exception: bindings.Value,
+};
+
+/// Answers a response the worker refused, `err` naming the failed check, as
+/// a 500 that records the request as an internal error. The check's name
+/// goes to the tenant's log under the request's id, since the tenant's
+/// handler returned the response.
+fn answerInvalidResponse(
+    runtime: *state.Runtime,
+    request: *request_context.RequestContext,
+    err: anyerror,
+) !void {
+    var line_buffer: [128]u8 = undefined;
+    const line = std.fmt.bufPrint(&line_buffer, "invalid response: {s}", .{@errorName(err)}) catch
+        "invalid response";
+    exception_log.logMessage(runtime.core.vm, request.exec.request_id, "response validation", line);
+    var error_response = response_model.Response{
+        .status = 500,
+        .body = .{ .bytes = "invalid response" },
+    };
+    try request_response.writeAndFinishResponse(runtime, request, &error_response, .internal_error, 500);
 }
 
 const ExtractedHandlerResult = struct {
@@ -84,21 +118,19 @@ const ExtractedHandlerResult = struct {
     }
 };
 
-/// Extracts the Response `value` in a turn, checks it and takes its status,
-/// headers and body. A JavaScript exception during extraction is released
-/// and returned as `error.JsException`; a failed check returns its error.
+/// Extracts the Response `value` in a turn, in the realm of the request's
+/// route, checks it and takes its status, headers and body. A JavaScript
+/// exception during extraction comes back as `.exception`, which the caller
+/// owns; a failed check returns its error.
 fn extractNativeResponse(
     runtime: *state.Runtime,
     request: *request_context.RequestContext,
     value: *const bindings.Value,
-) !ExtractedHandlerResult {
-    var host = switch (try turn.extractResponse(runtime.core.vm, &request.exec, value, response_model.extractionLimits())) {
+) !Extraction {
+    const realm = runtime.realmOfRoute(request.dispatch_work.route_index);
+    var host = switch (try turn.extractResponse(runtime.core.vm, realm, &request.exec, value, response_model.extractionLimits())) {
         .success => |response| response,
-        .exception => |exception| {
-            var owned = exception;
-            defer owned.deinit();
-            return error.JsException;
-        },
+        .exception => |exception| return .{ .exception = exception },
     };
     defer host.deinit();
     var host_stream_moved = false;
@@ -107,7 +139,15 @@ fn extractNativeResponse(
             _ = runtime.releaseFetchBody(host.body.stream_identity);
     }
 
-    try validateHostResponseShape(host, request);
+    validateHostResponseShape(host, request) catch |err| {
+        // A refused body stream is cancelled, so the tenant's source learns
+        // that nothing will read it, rather than only destroyed unread.
+        if (host.body.takeBodyStream()) |stream| {
+            var refused = stream;
+            response_body_stream.discard(runtime, request, &refused);
+        }
+        return err;
+    };
 
     var extracted = ExtractedHandlerResult{
         .status = host.status,
@@ -116,7 +156,10 @@ fn extractNativeResponse(
         .body = if (host.hasFetchBodyStream()) blk: {
             host_stream_moved = true;
             break :blk .{ .fetch_stream = host.body.stream_identity };
-        } else .{ .abi = host.takeBody() },
+        } else if (host.body.takeBodyStream()) |stream|
+            .{ .body_stream = stream }
+        else
+            .{ .abi = host.takeBody() },
     };
     errdefer extracted.deinit(runtime);
 
@@ -130,7 +173,7 @@ fn extractNativeResponse(
         try extracted.headers.append(runtime.core.allocator, .{ .name = name, .value = header_value });
     }
 
-    return extracted;
+    return .{ .extracted = extracted };
 }
 
 /// Checks the extracted response before any of it is kept: the body kind, a
@@ -169,6 +212,9 @@ fn validateHostResponseShape(
             if (identity.request_generation != request.request_generation)
                 return error.FetchBodyOutsideActiveRequest;
         },
+        // A stream has no length to bound; its chunks pass the payload
+        // writer's own bounds as they are sent.
+        bindings.extracted_response_body_readable_stream => {},
         else => return error.InvalidResponseBody,
     }
 
@@ -213,21 +259,6 @@ fn shouldDropHostHeader(host: bindings.ExtractedResponse, name: []const u8) bool
     if (std.ascii.eqlIgnoreCase(name, "content-encoding"))
         return true;
     return false;
-}
-
-/// Answers with status 500 and `body`, recording the request as an internal
-/// error.
-fn writeInternalErrorResponse(
-    runtime: *state.Runtime,
-    request: *request_context.RequestContext,
-    write_and_finish: WriteAndFinishFn,
-    body: []const u8,
-) !void {
-    var error_response = response_model.Response{
-        .status = 500,
-        .body = .{ .bytes = body },
-    };
-    try write_and_finish(runtime, request, &error_response, .internal_error, 500);
 }
 
 fn deinitResponseBody(runtime: *state.Runtime, response: *response_model.Response) void {

@@ -14,6 +14,7 @@
 //! closed once the attach succeeds.
 
 const std = @import("std");
+const os_socket = @import("collo_os").socket;
 const linux = std.os.linux;
 const bpf = linux.BPF;
 
@@ -104,7 +105,7 @@ pub fn attachCpuSelector(listeners: []const std.net.Server, lane_cpu_ids: []cons
     };
     errdefer std.posix.close(program);
 
-    try attachProgram(listeners[0].stream.handle, program);
+    try os_socket.attachReuseportProgram(listeners[0].stream.handle, program);
 
     std.posix.close(program);
     std.posix.close(socket_map);
@@ -179,18 +180,6 @@ fn loadSelectorProgram(
         .PERM => error.PermissionDenied,
         else => |err| std.posix.unexpectedErrno(err),
     };
-}
-
-fn attachProgram(listener_fd: std.posix.fd_t, program_fd: linux.fd_t) !void {
-    if (!@hasDecl(std.posix.SO, "ATTACH_REUSEPORT_EBPF"))
-        return error.ReusePortBpfUnavailable;
-    const program_fd_c: c_int = @intCast(program_fd);
-    try std.posix.setsockopt(
-        listener_fd,
-        std.posix.SOL.SOCKET,
-        std.posix.SO.ATTACH_REUSEPORT_EBPF,
-        std.mem.asBytes(&program_fd_c),
-    );
 }
 
 fn logVerifierFailure(err: anyerror, log_buffer: []const u8) void {

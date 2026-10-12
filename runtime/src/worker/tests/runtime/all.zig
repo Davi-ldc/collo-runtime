@@ -9,15 +9,18 @@ comptime {
     _ = @import("boot_eval.zig");
     _ = @import("console.zig");
     _ = @import("core.zig");
+    _ = @import("crypto_pool.zig");
     _ = @import("env.zig");
     _ = @import("fetch.zig");
     _ = @import("lifecycle.zig");
-    _ = @import("process_cpu.zig");
+    _ = @import("limits.zig");
     _ = @import("modules.zig");
     _ = @import("multiplexing.zig");
     _ = @import("response.zig");
+    _ = @import("response_body_stream.zig");
     _ = @import("routes.zig");
     _ = @import("server_api.zig");
+    _ = @import("timeline.zig");
     _ = @import("vm_hooks.zig");
     _ = @import("wasm.zig");
 }

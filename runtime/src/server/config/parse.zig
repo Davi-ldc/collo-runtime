@@ -2,18 +2,24 @@
 //! comments outside strings and no trailing commas.
 //!
 //! The parser checks everything a configuration can get wrong before boot
-//! goes on: unknown keys (named by their key path), value types and ranges,
-//! worker names, binding names and sizes (by the rules of
-//! `common/ipc/route_bindings.zig`, which the worker enforces too), the route
-//! pattern grammar (`pattern.zig`), two routes that match the same paths,
-//! the path prefix the server reserves, the bounds in `common/limits/server.zig`,
-//! and the features the runtime does not implement yet (`network`, binding
-//! kinds other than `text`, `cpuMs`). A
-//! limit with no enforcing mechanism is rejected rather than ignored: the
-//! worker's sentinel (`worker/runtime/sentinel.zig`) arms a wall-clock
-//! deadline per request, which `timeoutMs` sets, and the worker measures a
-//! request's CPU time without bounding it, so `cpuMs` fails as not
-//! supported yet.
+//! goes on: unknown keys (named by their key path, array indexes included),
+//! value types and ranges, worker names, binding names and sizes (by the
+//! rules of `common/ipc/route_bindings.zig`, which the worker enforces too),
+//! the route pattern grammar (`pattern.zig`), two routes that match the same
+//! paths, the path prefix the server reserves, every `network` value (each
+//! entry's grammar and the value's own rules, from `common/network/`, which
+//! the gateway's policy image holds again), the bounds in
+//! `common/limits/server.zig`, and binding kinds other than `text`, which
+//! the runtime does not implement yet. A limit with no enforcing mechanism
+//! is rejected rather than ignored: the worker's sentinel stops a request at
+//! its `timeoutMs` on the wall clock and at its `cpuMs` on the CPU it is
+//! charged (`worker/runtime/owner.zig`, `worker/runtime/sentinel.zig`).
+//!
+//! `network` cascades unlike the other settings. Global settings, a worker's
+//! settings and a route may each name it, and a level that does replaces the
+//! inherited value whole instead of merging allow lists. Each route's
+//! effective value is resolved here, once, into `Route.network`. A file that
+//! names `network` nowhere grants no route any outbound access.
 //!
 //! Relative paths resolve against the configuration file's directory. The
 //! JSON tree and the comment-free copy of the text live in a scratch arena
@@ -24,6 +30,7 @@
 const std = @import("std");
 const server_limits = @import("collo_limits").server;
 const route_bindings = @import("collo_ipc").route_bindings;
+const collo_network = @import("collo_network");
 const model = @import("model.zig");
 const pattern = @import("pattern.zig");
 const Diagnostic = @import("diagnostic.zig").Diagnostic;
@@ -159,18 +166,34 @@ fn parsePort(text: []const u8) ?u16 {
 }
 
 /// The key path of the value being read, for messages: object keys joined
-/// with `.`, and a key quoted when it holds anything but `[A-Za-z0-9_-]`.
+/// with `.`, a key quoted when it holds anything but `[A-Za-z0-9_-]`, and an
+/// array index as `[i]` right after its array's key.
 const KeyPath = struct {
-    keys: [depth_max][]const u8 = undefined,
+    segments: [depth_max]Segment = undefined,
     len: usize = 0,
 
-    /// Deeper than any key the schema defines
-    /// (`workers.<name>.routes.<pattern>.bindings.<name>.text`).
+    const Segment = union(enum) {
+        key: []const u8,
+        index: usize,
+    };
+
+    /// Deeper than any value the schema defines: the two deepest paths,
+    /// `workers.<name>.routes.<pattern>.bindings.<name>.text` and
+    /// `workers.<name>.routes.<pattern>.network.allow[i]`, have seven
+    /// segments.
     const depth_max = 8;
 
     fn push(self: *KeyPath, key: []const u8) void {
+        self.pushSegment(.{ .key = key });
+    }
+
+    fn pushIndex(self: *KeyPath, index: usize) void {
+        self.pushSegment(.{ .index = index });
+    }
+
+    fn pushSegment(self: *KeyPath, segment: Segment) void {
         std.debug.assert(self.len < depth_max);
-        self.keys[self.len] = key;
+        self.segments[self.len] = segment;
         self.len += 1;
     }
 
@@ -180,10 +203,15 @@ const KeyPath = struct {
     }
 
     pub fn format(self: KeyPath, writer: *std.Io.Writer) std.Io.Writer.Error!void {
-        for (self.keys[0..self.len], 0..) |key, index| {
-            if (index != 0)
-                try writer.writeByte('.');
-            try writeKey(writer, key);
+        for (self.segments[0..self.len], 0..) |segment, position| {
+            switch (segment) {
+                .key => |key| {
+                    if (position != 0)
+                        try writer.writeByte('.');
+                    try writeKey(writer, key);
+                },
+                .index => |index| try writer.print("[{d}]", .{index}),
+            }
         }
     }
 };
@@ -208,6 +236,9 @@ const Parser = struct {
     directory: []const u8,
     diagnostic: *Diagnostic,
     path: KeyPath = .{},
+    /// Allow entries across every `network` value read so far, for
+    /// `network_allow_entries_total_max`.
+    network_entries: usize = 0,
 
     fn fail(self: *Parser, comptime format: []const u8, args: anytype) Error {
         if (self.path.len == 0) {
@@ -345,6 +376,13 @@ const Parser = struct {
             route_count += definition.routes.len;
         if (route_count > server_limits.routes_max)
             return self.fail("the configuration declares {d} routes; at most {d} are allowed", .{ route_count, server_limits.routes_max });
+        // The bound is the configuration's, not one value's, so the message
+        // names no key.
+        if (self.network_entries > server_limits.network_allow_entries_total_max)
+            return self.fail("the network values declare {d} allow entries; at most {d} are allowed in all", .{
+                self.network_entries,
+                server_limits.network_allow_entries_total_max,
+            });
         try self.rejectSameShapes(definitions);
 
         return .{
@@ -375,13 +413,11 @@ const Parser = struct {
     }
 
     /// The settings keys of `object` (`isolateRealm`, `limits`, `network`)
-    /// applied over `base`. The caller already rejected the other keys.
+    /// applied over `base`: the limits merge key by key, and a `network`
+    /// value replaces `base.network` whole. The caller already rejected the
+    /// other keys.
     fn readSettings(self: *Parser, object: ObjectMap, base: model.Settings) Error!model.Settings {
         var settings = base;
-        if (object.get("network") != null) {
-            self.path.push("network");
-            return self.fail("network access is not supported yet; remove the key", .{});
-        }
         if (object.get("isolateRealm")) |isolate_value| {
             self.path.push("isolateRealm");
             settings.isolate_realm = try self.expectBool(isolate_value);
@@ -392,6 +428,11 @@ const Parser = struct {
             settings.limits = try self.readLimits(limits_value, base.limits);
             self.path.pop();
         }
+        if (object.get("network")) |network_value| {
+            self.path.push("network");
+            settings.network = try self.readNetwork(network_value);
+            self.path.pop();
+        }
         return settings;
     }
 
@@ -399,10 +440,6 @@ const Parser = struct {
         const object = try self.expectObject(value);
         try self.rejectUnknownKeys(object, &.{ "memoryMiB", "concurrency", "cpuMs", "timeoutMs" });
         var limits = base;
-        if (object.get("cpuMs") != null) {
-            self.path.push("cpuMs");
-            return self.fail("a per-request CPU budget is not supported yet; remove the key (timeoutMs bounds wall-clock time)", .{});
-        }
         if (object.get("memoryMiB")) |memory_value| {
             self.path.push("memoryMiB");
             limits.memory_mib = @intCast(try self.expectInteger(
@@ -422,7 +459,95 @@ const Parser = struct {
             limits.timeout_ms = @intCast(try self.expectInteger(timeout_value, 1, server_limits.request_timeout_ms_max));
             self.path.pop();
         }
+        // Not capped at `timeoutMs`: crypto jobs run beside the VM thread,
+        // so a request's CPU can grow faster than its wall time.
+        if (object.get("cpuMs")) |cpu_value| {
+            self.path.push("cpuMs");
+            limits.cpu_ms = try self.expectInteger(cpu_value, 1, server_limits.request_cpu_ms_max);
+            self.path.pop();
+        }
         return limits;
+    }
+
+    /// One `network` value; the caller pushed its key. A problem names the
+    /// entry or the flag at fault, an entry by its index in `allow`.
+    fn readNetwork(self: *Parser, value: Value) Error!model.Network {
+        const object = try self.expectObject(value);
+        try self.rejectUnknownKeys(object, &.{ "allow", "allowHttp", "allowPrivateNetworks" });
+        var result: model.Network = .{ .allow = &.{} };
+        if (object.get("allowHttp")) |flag_value| {
+            self.path.push("allowHttp");
+            result.allow_http = try self.expectBool(flag_value);
+            self.path.pop();
+        }
+        if (object.get("allowPrivateNetworks")) |flag_value| {
+            self.path.push("allowPrivateNetworks");
+            result.allow_private_networks = try self.expectBool(flag_value);
+            self.path.pop();
+        }
+
+        const allow_value = object.get("allow") orelse return self.fail("missing key 'allow'", .{});
+        self.path.push("allow");
+        const entries = try self.expectArray(allow_value);
+        if (entries.len > collo_network.setting.entries_max)
+            return self.fail("{s}", .{collo_network.setting.Problem.too_many_entries.describe()});
+        const allow = try self.arena.alloc(collo_network.Pattern, entries.len);
+        for (entries, allow, 0..) |entry_value, *entry, index| {
+            self.path.pushIndex(index);
+            const text = try self.expectString(entry_value);
+            var name_buffer: [collo_network.pattern.name_bytes_max]u8 = undefined;
+            entry.* = switch (collo_network.pattern.parse(text, &name_buffer)) {
+                .problem => |problem| return self.fail("'{s}': {s}", .{ text, problem.describe() }),
+                .pattern => |parsed| try self.ownPattern(parsed),
+            };
+            self.path.pop();
+        }
+        self.path.pop();
+        result.allow = allow;
+        self.network_entries += allow.len;
+
+        const violation = collo_network.setting.check(result) orelse return result;
+        const problem = violation.problem;
+        switch (problem) {
+            .too_many_entries => {
+                self.path.push("allow");
+                return self.fail("{s}", .{problem.describe()});
+            },
+            .duplicate_entry => {
+                self.path.push("allow");
+                self.path.pushIndex(violation.index);
+                return self.fail("'{s}': {s} (allow[{d}])", .{
+                    entries[violation.index].string,
+                    problem.describe(),
+                    violation.earlier,
+                });
+            },
+            .private_address_needs_flag => {
+                self.path.push("allow");
+                self.path.pushIndex(violation.index);
+                return self.fail("'{s}': {s}", .{ entries[violation.index].string, problem.describe() });
+            },
+            .private_flag_unused => {
+                self.path.push("allowPrivateNetworks");
+                return self.fail("{s}", .{problem.describe()});
+            },
+            .http_flag_unused => {
+                self.path.push("allowHttp");
+                return self.fail("{s}", .{problem.describe()});
+            },
+        }
+    }
+
+    /// `parsed` with its name, if it has one, copied into the `Config`
+    /// arena; `pattern.parse` wrote it into a buffer on the caller's stack.
+    fn ownPattern(self: *Parser, parsed: collo_network.Pattern) Error!collo_network.Pattern {
+        var owned = parsed;
+        switch (parsed.host) {
+            .name => |name| owned.host = .{ .name = try self.arena.dupe(u8, name) },
+            .suffix => |name| owned.host = .{ .suffix = try self.arena.dupe(u8, name) },
+            .any, .ipv4, .ipv6 => {},
+        }
+        return owned;
     }
 
     fn readWorkers(self: *Parser, value: Value, defaults: model.Settings) Error![]model.WorkerDefinition {
@@ -460,7 +585,7 @@ const Parser = struct {
         }
         const routes_value = object.get("routes") orelse return self.fail("missing key 'routes'", .{});
         self.path.push("routes");
-        const routes = try self.readRoutes(routes_value);
+        const routes = try self.readRoutes(routes_value, settings.network);
         self.path.pop();
         return .{
             .name = try self.arena.dupe(u8, name),
@@ -469,7 +594,9 @@ const Parser = struct {
         };
     }
 
-    fn readRoutes(self: *Parser, value: Value) Error![]model.Route {
+    /// `inherited` is the definition's resolved `network`, which a route
+    /// runs under unless it names its own.
+    fn readRoutes(self: *Parser, value: Value, inherited: ?model.Network) Error![]model.Route {
         const object = try self.expectObject(value);
         const count = object.count();
         if (count == 0)
@@ -485,19 +612,15 @@ const Parser = struct {
             self.path.push(route_pattern);
             if (pattern.validate(route_pattern)) |problem|
                 return self.fail("{s}", .{problem.describe()});
-            routes[index] = try self.readRoute(route_pattern, entry.value_ptr.*);
+            routes[index] = try self.readRoute(route_pattern, entry.value_ptr.*, inherited);
             self.path.pop();
         }
         return routes;
     }
 
-    fn readRoute(self: *Parser, route_pattern: []const u8, value: Value) Error!model.Route {
+    fn readRoute(self: *Parser, route_pattern: []const u8, value: Value, inherited: ?model.Network) Error!model.Route {
         const object = try self.expectObject(value);
         try self.rejectUnknownKeys(object, &.{ "entry", "bindings", "network" });
-        if (object.get("network") != null) {
-            self.path.push("network");
-            return self.fail("network access is not supported yet; remove the key", .{});
-        }
         const entry_path = try self.readRequiredPath(object, "entry");
         var bindings: []model.Binding = &.{};
         if (object.get("bindings")) |bindings_value| {
@@ -505,10 +628,17 @@ const Parser = struct {
             bindings = try self.readBindings(bindings_value);
             self.path.pop();
         }
+        var network = inherited;
+        if (object.get("network")) |network_value| {
+            self.path.push("network");
+            network = try self.readNetwork(network_value);
+            self.path.pop();
+        }
         return .{
             .pattern = try self.arena.dupe(u8, route_pattern),
             .entry_path = entry_path,
             .bindings = bindings,
+            .network = network,
         };
     }
 
@@ -617,6 +747,14 @@ const Parser = struct {
         switch (value) {
             .object => |object| return object,
             else => return self.fail("expected an object, found {s}", .{kindName(value)}),
+        }
+    }
+
+    /// The items borrow the scratch arena's tree.
+    fn expectArray(self: *Parser, value: Value) Error![]const Value {
+        switch (value) {
+            .array => |array| return array.items,
+            else => return self.fail("expected an array, found {s}", .{kindName(value)}),
         }
     }
 

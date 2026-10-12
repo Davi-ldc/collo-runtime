@@ -98,3 +98,45 @@ test "JSC Release ABI selection preserves bridge ASan instrumentation" {
     for (expected, flags.items) |expected_flag, actual_flag|
         try std.testing.expectEqualStrings(expected_flag, actual_flag);
 }
+
+test "the undefined-behavior mode aborts on misaligned reads and float casts in the C++ and leaves Zig alone" {
+    const sanitizer = shims.parseBindingsSanitizer("undefined");
+    try std.testing.expectEqual(shims.BindingsSanitizerMode.undefined_behavior, sanitizer.mode);
+    try std.testing.expect(!sanitizer.instrumentsZig());
+
+    const expected_compile = [_][]const u8{
+        "-fsanitize=alignment,float-cast-overflow",
+        "-fno-sanitize-recover=alignment,float-cast-overflow",
+        "-fno-sanitize-trap=alignment,float-cast-overflow",
+        "-fno-omit-frame-pointer",
+        "-g",
+    };
+    const compile_flags = sanitizer.cFlags();
+    try std.testing.expectEqual(expected_compile.len, compile_flags.len);
+    for (expected_compile, compile_flags) |expected_flag, actual_flag|
+        try std.testing.expectEqualStrings(expected_flag, actual_flag);
+
+    // The link names the same checks, so the driver adds their runtime.
+    try std.testing.expectEqualStrings("-fsanitize=alignment,float-cast-overflow", sanitizer.linkArgs()[0]);
+    const env = sanitizer.runEnv() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("UBSAN_OPTIONS", env.key);
+}
+
+test "every sanitizer spelling selects its mode, and only ASan instruments Zig" {
+    const cases = [_]struct { name: []const u8, mode: shims.BindingsSanitizerMode }{
+        .{ .name = "none", .mode = .none },
+        .{ .name = "address", .mode = .address_leak },
+        .{ .name = "address,leak", .mode = .address_leak },
+        .{ .name = "asan", .mode = .address_leak },
+        .{ .name = "asan,lsan", .mode = .address_leak },
+        .{ .name = "undefined", .mode = .undefined_behavior },
+        .{ .name = "ubsan", .mode = .undefined_behavior },
+    };
+    for (cases) |case| {
+        const sanitizer = shims.parseBindingsSanitizer(case.name);
+        try std.testing.expectEqual(case.mode, sanitizer.mode);
+        try std.testing.expectEqual(case.mode == .address_leak, sanitizer.instrumentsZig());
+    }
+    try std.testing.expectEqual(@as(usize, 0), shims.parseBindingsSanitizer("none").cFlags().len);
+    try std.testing.expect(shims.parseBindingsSanitizer("none").runEnv() == null);
+}

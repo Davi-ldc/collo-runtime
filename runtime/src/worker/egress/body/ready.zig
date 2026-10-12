@@ -1,9 +1,16 @@
 //! Settlement of fetch body readers from the ready queue: a `fetch_body_ready`
 //! item runs `executeReady`, which answers the waiting JS promise in a turn of
 //! the body's request and lets the body's decoder resume. Runs on the worker's
-//! event loop thread. Resolving a promise runs JS, which may release the body
-//! being settled. In a stream pull, the reference `schedulePull` took keeps
-//! the body's pointer valid after its table entry is gone.
+//! event loop thread.
+//!
+//! A stored reader holds no reference of its own: it never outlives the
+//! body's table entry, since every removal drops the reader and a release
+//! that finds a reader waiting keeps the entry (`cleanup.releaseInternal`).
+//! The settlement is the one span in which JavaScript runs while the body
+//! must stay alive, since resolving a promise drains reactions that may
+//! release the body and a collection there may sweep its Response, so the
+//! settlement takes a reference of its own for its whole run and reads the
+//! body's identity before any JavaScript runs.
 
 const std = @import("std");
 const bindings = @import("collo_bindings");
@@ -100,22 +107,24 @@ fn failBodyDecodeOnResume(runtime: *egress_context.Context, body: *FetchBody, er
 /// new generation is dropped unanswered.
 fn settleReady(runtime: *egress_context.Context, body_id: u64) !void {
     const body = runtime.egress_state.bodies.get(body_id) orelse return;
+    // Declared first, so it runs last, after every use of `body` below.
+    body.retain();
+    defer body.releaseAfterQueuedResourcesReleased(runtime.allocator);
+    const identity = body.identity;
 
     var pull = try body.drainReadyForPull(runtime.allocator);
     defer pull.deinit(runtime.allocator);
     for (pull.credits.slice()) |credit|
         gateway_control.releaseBodyCredit(runtime, credit);
     if (pull.waiter) |*waiter| {
-        // A pull without a promise is a response stream's, which took no
-        // reference and which `serve/response.zig` drains before this runs.
-        // Reaching here means its request no longer streams this body, so the
-        // chunk is dropped.
+        // A pull without a promise is a response stream's, which
+        // `serve/response.zig` drains before this runs. Reaching here means
+        // its request no longer streams this body, so the chunk is dropped.
         if (waiter.deferred == null)
             return;
-        defer body.releaseAfterQueuedResourcesReleased(runtime.allocator);
         common.accountEgress(runtime, body);
-        const request = runtime.requests.get(body.identity.request_id) orelse return;
-        if (request.request_generation != body.identity.request_generation)
+        const request = runtime.requests.get(identity.request_id) orelse return;
+        if (request.request_generation != identity.request_generation)
             return;
 
         const raw_deferred = try waiter.takeDeferredRaw();
@@ -125,7 +134,7 @@ fn settleReady(runtime: *egress_context.Context, body_id: u64) !void {
         if (pull.failed) {
             rejectFailure(runtime, request, &deferred, body) catch |err| {
                 if (rejectSettlementError(runtime, request, &deferred, "fetch body pull rejection", err)) {
-                    cleanup.cancel(runtime, body.identity);
+                    cleanup.cancel(runtime, identity);
                     return;
                 }
                 return err;
@@ -135,22 +144,21 @@ fn settleReady(runtime: *egress_context.Context, body_id: u64) !void {
 
         var value = pullResultValue(bindings.promiseDeferredRealm(raw_deferred), &pull.bytes, pull.done) catch |err| {
             _ = rejectSettlementError(runtime, request, &deferred, "fetch body pull value", err);
-            cleanup.cancel(runtime, body.identity);
+            cleanup.cancel(runtime, identity);
             return;
         };
         defer value.deinit();
         turn.resolvePromise(runtime.vm, &request.exec, &deferred, &value) catch |err| {
-            cleanup.cancel(runtime, body.identity);
+            cleanup.cancel(runtime, identity);
             return err;
         };
         if (body.viewReleased()) {
             // The view was released, either by JS that the resolution ran or
             // by a release that arrived while this read was pending and kept
             // the body for it; either way the release finishes now. The
-            // reference `schedulePull` took is dropped only by the deferred
-            // release above, so `body` is valid even when its table entry is
-            // already gone.
-            _ = cleanup.releaseInternal(runtime, body.identity, false);
+            // settlement's own reference keeps `body` valid even when its
+            // table entry is already gone, and finds it gone without harm.
+            _ = cleanup.releaseInternal(runtime, identity, false);
         }
         return;
     }
@@ -162,19 +170,18 @@ fn settleReady(runtime: *egress_context.Context, body_id: u64) !void {
     if (!drain.terminal)
         return;
 
-    defer {
-        const removed = cleanup.releaseInternal(runtime, body.identity, false);
-        std.debug.assert(removed);
-    }
+    // A terminal body leaves the table once its reader is answered. The
+    // JavaScript the answer runs may have released it first, so finding no
+    // entry is no error.
+    defer _ = cleanup.releaseInternal(runtime, identity, false);
     common.accountEgress(runtime, body);
 
     var waiter = drain.waiter orelse return;
     drain.waiter = null;
-    defer body.releaseAfterQueuedResourcesReleased(runtime.allocator);
     defer waiter.deinit(runtime.allocator);
 
-    const request = runtime.requests.get(body.identity.request_id) orelse return;
-    if (request.request_generation != body.identity.request_generation)
+    const request = runtime.requests.get(identity.request_id) orelse return;
+    if (request.request_generation != identity.request_generation)
         return;
 
     const raw_deferred = try waiter.takeDeferredRaw();
@@ -184,7 +191,7 @@ fn settleReady(runtime: *egress_context.Context, body_id: u64) !void {
     if (body.isFailed()) {
         rejectFailure(runtime, request, &deferred, body) catch |err| {
             if (rejectSettlementError(runtime, request, &deferred, "fetch body read rejection", err)) {
-                cleanup.cancel(runtime, body.identity);
+                cleanup.cancel(runtime, identity);
                 return;
             }
             return err;
@@ -195,10 +202,10 @@ fn settleReady(runtime: *egress_context.Context, body_id: u64) !void {
     const bytes = body.borrowCompleteBytes() orelse return;
     resolveWaiter(runtime, request, &deferred, waiter, bytes) catch |err| {
         if (rejectSettlementError(runtime, request, &deferred, "fetch body read settlement", err)) {
-            cleanup.cancel(runtime, body.identity);
+            cleanup.cancel(runtime, identity);
             return;
         }
-        cleanup.cancel(runtime, body.identity);
+        cleanup.cancel(runtime, identity);
         return err;
     };
 }

@@ -64,12 +64,51 @@ pub const worker_memory_mib_min: u32 = 16;
 /// on.
 pub const worker_memory_mib_max: u32 = 64 * 1024;
 
-/// Largest `concurrency`: the number of request slots on a worker's shared
-/// state page (`LIVE_SLOT_COUNT` in `common/worker_state/page/live_slots.zig`).
-pub const worker_concurrency_max: u8 = 2;
+/// Largest `concurrency`, the requests one worker holds at once. Every
+/// worker's state page has this many live slots whatever its definition sets
+/// (`LIVE_SLOT_COUNT` in `common/worker_state/page/live_slots.zig` derives
+/// from it), so raising it costs every worker. The server sizes each worker's
+/// request table and pool slots from it, and the gateway each session's
+/// budgets. A definition that sets no `concurrency` gets the default in
+/// `default_settings` (`server/config/model.zig`).
+pub const worker_concurrency_max: u8 = 16;
 
 /// Largest `timeoutMs`, the wall-clock deadline of one request.
 pub const request_timeout_ms_max: u32 = 15 * 60 * 1000;
+
+/// Largest `cpuMs`, the CPU time one request may use: the VM thread's while
+/// the request owns it, plus the crypto pool's on the request's jobs. Crypto
+/// jobs run beside the VM thread, so a request's CPU can grow faster than its
+/// wall time, and `cpuMs` is not capped at the definition's `timeoutMs`.
+pub const request_cpu_ms_max: u32 = request_timeout_ms_max;
+
+/// Most entries one `network.allow` list may hold. Every gateway holds every
+/// entry, and it matches a fetch's host against each grant of the fetch's
+/// policy on every hop, so a list that needs more hosts names a common
+/// `*.suffix` instead.
+pub const network_allow_entries_max: usize = 256;
+
+/// Most entries across every `network` value one configuration declares. It
+/// bounds, with `network_allow_entry_bytes_max`, the rules of the policy table
+/// the server hands each gateway.
+pub const network_allow_entries_total_max: usize = 4096;
+
+/// Longest `network.allow` entry: `*.`, a host name at the DNS bound
+/// (`max_name_bytes` in `common/dns_name.zig`) and `:65535`, which
+/// `runtime/tests/contracts/limits.zig` ties together. A bracketed IPv6
+/// literal with a port is shorter.
+pub const network_allow_entry_bytes_max: usize = 261;
+
+comptime {
+    if (worker_concurrency_max < 1)
+        @compileError("a worker must hold at least one request");
+    if (request_cpu_ms_max < 1)
+        @compileError("cpuMs must admit at least one millisecond");
+    if ("[ffff:ffff:ffff:ffff:ffff:ffff:255.255.255.255]:65535".len > network_allow_entry_bytes_max)
+        @compileError("the longest IPv6 entry must fit the entry bound");
+    if (network_allow_entries_max > network_allow_entries_total_max)
+        @compileError("one allow list must fit the configuration's total");
+}
 
 comptime {
     // The shortest pattern with the most segments, `/a` repeated, must fit

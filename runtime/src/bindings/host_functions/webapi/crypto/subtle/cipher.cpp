@@ -1,6 +1,6 @@
 // `SubtleCrypto.encrypt` and `decrypt` for RSA-OAEP, RSAES-PKCS1-v1_5 and AES in the CTR, CBC, 8-bit CFB and GCM
 // modes; AES-KW only wraps keys, so it rejects here with NotSupportedError. Arguments are validated and copied on the
-// VM thread, a secret key's bytes into `SecureBytes` and an RSA key through `retainSharedPkey`, so the job never reads
+// VM thread, a secret key's bytes into `SecretBytes` and an RSA key through `retainSharedPkey`, so the job never reads
 // the CryptoKey cell from the crypto pool.
 
 #include "jsc/runtime/state.h"
@@ -86,10 +86,9 @@ JSC_DEFINE_HOST_FUNCTION(subtleEncrypt, (JSC::JSGlobalObject * global_object, JS
             return rejectedDOMException(
                 global_object, DOMExceptionCode::InvalidAccessError, "CryptoKey doesn't support encryption"_s);
 
-        WTF::Vector<uint8_t> data;
-        if (!copyBufferSource(global_object, scope, call_frame->argument(2), data, error))
+        SecretBytes plaintext;
+        if (!copySecretBufferSource(global_object, scope, call_frame->argument(2), plaintext, error))
             return rejectedPromise(global_object, error);
-        SecureBytes plaintext(WTF::move(data));
 
         WTF::Vector<uint8_t> label = WTF::move(params.label);
         auto pkey = retainSharedPkey(key->rsaKey());
@@ -103,11 +102,11 @@ JSC_DEFINE_HOST_FUNCTION(subtleEncrypt, (JSC::JSGlobalObject * global_object, JS
         auto job
             = std::unique_ptr<CryptoJob>(new (std::nothrow) BytesCryptoJob(context.value.owner, context.value.deferred,
                 [is_rsaes, pkey, hash, label = WTF::move(label), plaintext = WTF::move(plaintext)](
-                    WTF::Vector<uint8_t>& out) mutable {
+                    SecretBytes& out) mutable {
                     return is_rsaes ? rsaPkcs1EncryptNative(pkey.get(), plaintext.span(), out)
                                     : rsaOaepEncryptNative(pkey.get(), hash, label.span(), plaintext.span(), out);
                 }));
-        return enqueueCryptoJobPromise(global_object, scope, context.value, WTF::move(job));
+        return enqueueCryptoJobPromise(global_object, context.value, WTF::move(job));
     }
 
     auto algorithm = aesAlgorithmFromName(algorithm_name);
@@ -164,12 +163,11 @@ JSC_DEFINE_HOST_FUNCTION(subtleEncrypt, (JSC::JSGlobalObject * global_object, JS
         return rejectedDOMException(
             global_object, DOMExceptionCode::InvalidAccessError, "CryptoKey doesn't support encryption"_s);
 
-    WTF::Vector<uint8_t> data;
-    if (!copyBufferSource(global_object, scope, call_frame->argument(2), data, error))
+    SecretBytes plaintext;
+    if (!copySecretBufferSource(global_object, scope, call_frame->argument(2), plaintext, error))
         return rejectedPromise(global_object, error);
-    SecureBytes plaintext(WTF::move(data));
 
-    SecureBytes key_material;
+    SecretBytes key_material;
     if (!key_material.tryAppend(key->material()))
         return rejectedPromise(global_object, JSC::createOutOfMemoryError(global_object));
 
@@ -180,7 +178,7 @@ JSC_DEFINE_HOST_FUNCTION(subtleEncrypt, (JSC::JSGlobalObject * global_object, JS
     auto job = std::unique_ptr<CryptoJob>(new (std::nothrow) BytesCryptoJob(context.value.owner, context.value.deferred,
         [selected_algorithm, key_material = WTF::move(key_material), gcm_params = WTF::move(gcm_params),
             cbc_params = WTF::move(cbc_params), cfb_params = WTF::move(cfb_params), ctr_params = WTF::move(ctr_params),
-            plaintext = WTF::move(plaintext)](WTF::Vector<uint8_t>& out) mutable {
+            plaintext = WTF::move(plaintext)](SecretBytes& out) mutable {
             switch (selected_algorithm) {
             case CryptoKeyAlgorithm::AesGcm:
                 return aesGcmEncrypt(key_material.span(), gcm_params, plaintext.span(), out);
@@ -194,7 +192,7 @@ JSC_DEFINE_HOST_FUNCTION(subtleEncrypt, (JSC::JSGlobalObject * global_object, JS
                 return false;
             }
         }));
-    return enqueueCryptoJobPromise(global_object, scope, context.value, WTF::move(job));
+    return enqueueCryptoJobPromise(global_object, context.value, WTF::move(job));
 }
 
 JSC_DEFINE_HOST_FUNCTION(subtleDecrypt, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
@@ -247,12 +245,11 @@ JSC_DEFINE_HOST_FUNCTION(subtleDecrypt, (JSC::JSGlobalObject * global_object, JS
             return context.error;
         auto job
             = std::unique_ptr<CryptoJob>(new (std::nothrow) BytesCryptoJob(context.value.owner, context.value.deferred,
-                [is_rsaes, pkey, hash, label = WTF::move(label), data = WTF::move(data)](
-                    WTF::Vector<uint8_t>& out) mutable {
+                [is_rsaes, pkey, hash, label = WTF::move(label), data = WTF::move(data)](SecretBytes& out) mutable {
                     return is_rsaes ? rsaPkcs1DecryptNative(pkey.get(), data.span(), out)
                                     : rsaOaepDecryptNative(pkey.get(), hash, label.span(), data.span(), out);
                 }));
-        return enqueueCryptoJobPromise(global_object, scope, context.value, WTF::move(job));
+        return enqueueCryptoJobPromise(global_object, context.value, WTF::move(job));
     }
 
     auto algorithm = aesAlgorithmFromName(algorithm_name);
@@ -313,7 +310,7 @@ JSC_DEFINE_HOST_FUNCTION(subtleDecrypt, (JSC::JSGlobalObject * global_object, JS
     if (!copyBufferSource(global_object, scope, call_frame->argument(2), data, error))
         return rejectedPromise(global_object, error);
 
-    SecureBytes key_material;
+    SecretBytes key_material;
     if (!key_material.tryAppend(key->material()))
         return rejectedPromise(global_object, JSC::createOutOfMemoryError(global_object));
 
@@ -324,7 +321,7 @@ JSC_DEFINE_HOST_FUNCTION(subtleDecrypt, (JSC::JSGlobalObject * global_object, JS
     auto job = std::unique_ptr<CryptoJob>(new (std::nothrow) BytesCryptoJob(context.value.owner, context.value.deferred,
         [selected_algorithm, key_material = WTF::move(key_material), gcm_params = WTF::move(gcm_params),
             cbc_params = WTF::move(cbc_params), cfb_params = WTF::move(cfb_params), ctr_params = WTF::move(ctr_params),
-            data = WTF::move(data)](WTF::Vector<uint8_t>& out) mutable {
+            data = WTF::move(data)](SecretBytes& out) mutable {
             switch (selected_algorithm) {
             case CryptoKeyAlgorithm::AesGcm:
                 return aesGcmDecrypt(key_material.span(), gcm_params, data.span(), out);
@@ -338,7 +335,7 @@ JSC_DEFINE_HOST_FUNCTION(subtleDecrypt, (JSC::JSGlobalObject * global_object, JS
                 return false;
             }
         }));
-    return enqueueCryptoJobPromise(global_object, scope, context.value, WTF::move(job));
+    return enqueueCryptoJobPromise(global_object, context.value, WTF::move(job));
 }
 
 } // namespace Collo::HostFunctions

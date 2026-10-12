@@ -1,6 +1,8 @@
 //! The gateway manager (`server/gateway/manager.zig`): the security cell it derives from a worker
-//! definition, a spawn that fails, and, against real gateways spawned from the installed binary,
-//! the supervisor's hooks and the loss of a gateway. A spawn that fails leaves no gateway current
+//! definition, a spawn that fails, and, against real gateways spawned from the installed binary
+//! with a policy image compiled from a configuration (`policy_image.zig`), whose hello each
+//! gateway takes before it attaches anything, the supervisor's hooks and the loss of a gateway. A
+//! spawn that fails leaves no gateway current
 //! and reports no loss. An attach leaves only the worker's half of the new session open on the
 //! server's side. Killing the gateway hangs up its control socket, which the manager's reader sees
 //! as an error: the manager retires the gateway, so no generation is current and its key is gone,
@@ -16,6 +18,7 @@ const ipc = @import("collo_ipc");
 const gateway = @import("collo_server_gateway");
 const launch = @import("collo_egress_gateway").launch;
 const process_options = @import("collo_process_options");
+const CompiledImage = @import("policy_image.zig").CompiledImage;
 
 const egress_token = ipc.egress_token;
 const linux = std.os.linux;
@@ -50,10 +53,14 @@ test "a gateway whose control channel fails is retired and the next attach spawn
         return error.SkipZigTest;
     }
 
+    var compiled: CompiledImage = undefined;
+    try compiled.init(std.testing.allocator);
+    defer compiled.deinit(std.testing.allocator);
     var losses: LossRecorder = .{};
     var manager: Manager = undefined;
     manager.init(std.testing.allocator, .{
         .executable_path = process_options.collo_executable_path,
+        .policy_image = compiled.image(),
     });
     defer manager.deinit();
     manager.setDeps(losses.deps());
@@ -114,10 +121,14 @@ test "a session the worker gives up reaches Deps.sessionLost under its gateway's
         return error.SkipZigTest;
     }
 
+    var compiled: CompiledImage = undefined;
+    try compiled.init(std.testing.allocator);
+    defer compiled.deinit(std.testing.allocator);
     var losses: LossRecorder = .{};
     var manager: Manager = undefined;
     manager.init(std.testing.allocator, .{
         .executable_path = process_options.collo_executable_path,
+        .policy_image = compiled.image(),
     });
     defer manager.deinit();
     manager.setDeps(losses.deps());
@@ -146,9 +157,15 @@ test "a session the worker gives up reaches Deps.sessionLost under its gateway's
 }
 
 test "a gateway that cannot be spawned leaves no gateway current and reports no loss" {
+    var compiled: CompiledImage = undefined;
+    try compiled.init(std.testing.allocator);
+    defer compiled.deinit(std.testing.allocator);
     var losses: LossRecorder = .{};
     var manager: Manager = undefined;
-    manager.init(std.testing.allocator, .{ .executable_path = "/nonexistent/collo-egress-gateway" });
+    manager.init(std.testing.allocator, .{
+        .executable_path = "/nonexistent/collo-egress-gateway",
+        .policy_image = compiled.image(),
+    });
     defer manager.deinit();
     manager.setDeps(losses.deps());
     defer manager.clearDeps();
@@ -180,9 +197,13 @@ test "the supervisor's hooks reach a live gateway, whose attach leaves only the 
         return error.SkipZigTest;
     }
 
+    var compiled: CompiledImage = undefined;
+    try compiled.init(std.testing.allocator);
+    defer compiled.deinit(std.testing.allocator);
     var manager: Manager = undefined;
     manager.init(std.testing.allocator, .{
         .executable_path = process_options.collo_executable_path,
+        .policy_image = compiled.image(),
     });
     defer manager.deinit();
 

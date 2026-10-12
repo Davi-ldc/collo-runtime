@@ -1,7 +1,16 @@
 //! The lives of the supervisor's worker records beyond what a pool decides.
 //! A pool says which table entry a launch holds and when a worker is finished
 //! (`pool.zig`); this file fills the entry's record for the launch's publish
-//! and empties it again in the teardown that ends a finished worker.
+//! and empties it again in the teardown that ends a finished worker, which
+//! writes the worker's line in `workers.jsonl`.
+//!
+//! The worker line is the record of what no request owns: the CPU of the
+//! worker's whole life, boot, collection, compilation and JavaScript no
+//! request owned included, as the kernel counted it in the worker's cgroup
+//! (`cpu.stat` `usage_usec`), so the worker cannot forge it, and the peak of
+//! its memory (`memory.peak`). It is read after the worker's exit, so the
+//! count is final, and before `Record.vacate` removes the cgroup. Every
+//! worker the server ends gets one, the ones its shutdown stops included.
 //!
 //! `buildRecord` runs on the launcher thread, which alone touches a launching
 //! entry's record and the supervisor's worker counters. `teardown` blocks on
@@ -12,16 +21,22 @@
 const std = @import("std");
 const ipc = @import("collo_ipc");
 const process = @import("collo_os").process;
+const cgroup = @import("collo_cgroup");
 const lifecycle = @import("collo_server_lifecycle");
 const config = @import("collo_server_config");
+const analytics = @import("collo_server_analytics");
 
 const launcher = @import("launcher.zig");
 const pool = @import("pool.zig");
 const worker_table = @import("worker_table.zig");
 const usage_drain = @import("usage_drain.zig");
+const reaper_memory = @import("reaper/memory.zig");
 
 const Supervisor = @import("supervisor.zig").Supervisor;
 const WorkerRecord = worker_table.Record;
+
+/// How a worker's life ended, as its line in `workers.jsonl` says it.
+pub const Ending = analytics.workers.Ending;
 
 /// Builds the record of the worker `ready` describes in the storage of the
 /// entry `ticket` holds in `definition`'s pool, under the next worker key,
@@ -59,7 +74,8 @@ pub fn buildRecord(
 
 /// Ends the life of the worker `worker` holds and leaves the record vacant:
 /// SIGKILL, the exit wait, the final drains of its usage and console rings
-/// (`usage_drain.drainFinal`), then its handle and send scratch released
+/// (`usage_drain.drainFinal`), its line in `workers.jsonl`, which says it
+/// ended as `ending`, then its handle and send scratch released
 /// (`Record.vacate`), which removes its cgroup leaf. The server keeps no
 /// record of the worker's egress session: the gateway drops the session
 /// when the exit hangs up its liveness descriptor. The worker must be
@@ -67,7 +83,7 @@ pub fn buildRecord(
 /// its pool must be gone. The reaper calls `Pool.remove` after this returns,
 /// which lets a launch reuse the entry. Blocks for up to the exit wait and
 /// the cgroup removal's retries.
-pub fn teardown(supervisor: *Supervisor, worker: *WorkerRecord) void {
+pub fn teardown(supervisor: *Supervisor, worker: *WorkerRecord, ending: Ending) void {
     worker.signalKill();
     if (!worker.awaitExit())
         std.log.warn("worker pid={d} worker_id={d} did not exit after SIGKILL; its final drains may miss its last records", .{
@@ -75,5 +91,61 @@ pub fn teardown(supervisor: *Supervisor, worker: *WorkerRecord) void {
             worker.id,
         });
     usage_drain.drainFinal(supervisor.usageDrain(), worker);
+    writeWorkerRecord(supervisor, worker, ending);
     worker.vacate(supervisor.allocator);
+}
+
+/// Appends `worker`'s line to `workers.jsonl` (`analytics.workers`). A
+/// figure its cgroup cannot give is null. A full stream is written out and
+/// offered the line again, which the teardown's thread may block for (file
+/// header), since a shutdown tears down every worker still held with no
+/// flush between them; a line that still finds no room is dropped and
+/// counted.
+fn writeWorkerRecord(supervisor: *Supervisor, worker: *WorkerRecord, ending: Ending) void {
+    const sink = supervisor.analytics;
+    if (!sink.enabled(.workers)) {
+        sink.noteDiscarded(.workers, 1);
+        return;
+    }
+    const clock = analytics.Clock.capture();
+    const record: analytics.workers.WorkerRecord = .{
+        .worker = worker.name,
+        .worker_id = worker.id,
+        .worker_generation = worker.generation,
+        .started_ts_ms = clock.wallMs(worker.created_mono_ns),
+        .ts_ms = clock.wall_now_ms,
+        .life_ns = clock.mono_now_ns -| worker.created_mono_ns,
+        .worker_cpu_ns = readWorkerCpuNs(supervisor.allocator, worker),
+        .memory_peak_bytes = readWorkerMemoryPeak(supervisor.allocator, worker),
+        .ending = ending,
+    };
+    var buffer: [analytics.workers.json_record_bytes_max]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    // The buffer holds the largest record, so the writer cannot run out.
+    analytics.workers.writeRecordJson(&writer, &record) catch unreachable;
+    const line = writer.buffered();
+    if (sink.tryAppendKeepingFree(.workers, line, 0)) return;
+    sink.flush(process.monotonicNowNsOrZero());
+    sink.append(.workers, line) catch |err| switch (err) {
+        error.SinkBufferFull => sink.noteDropped(.workers, 1),
+    };
+}
+
+/// The CPU every thread of the worker used over its life, from its cgroup;
+/// null when the cgroup cannot say.
+fn readWorkerCpuNs(allocator: std.mem.Allocator, worker: *const WorkerRecord) ?u64 {
+    const usage_usec = cgroup.cpu.readStatUsageUsec(allocator, worker.handle.cgroup_dir) catch |err| {
+        std.log.debug("worker line: cpu.stat read failed for worker_id={d}: {s}", .{ worker.id, @errorName(err) });
+        return null;
+    };
+    return usage_usec *| std.time.ns_per_us;
+}
+
+/// The worker's peak memory from its cgroup; null on a kernel without
+/// `memory.peak` (before Linux 5.19) or when the cgroup cannot say.
+fn readWorkerMemoryPeak(allocator: std.mem.Allocator, worker: *const WorkerRecord) ?u64 {
+    return reaper_memory.readWorkerMemoryPeak(allocator, worker.handle.cgroup_dir) catch |err| {
+        std.log.debug("worker line: memory.peak read failed for worker_id={d}: {s}", .{ worker.id, @errorName(err) });
+        return null;
+    };
 }

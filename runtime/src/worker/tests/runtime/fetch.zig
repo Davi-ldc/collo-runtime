@@ -1,25 +1,31 @@
 //! Covers fetch from a handler in the worker runtime, through the in-process
-//! gateway of the harness (`LocalEgressGateway`) to a local origin: URLs
-//! refused before or by the gateway, the request's egress token a FetchStart
-//! carries byte for byte, the refusal with a TypeError, before anything
-//! leaves the worker, of a fetch whose request carries no token or whose
-//! worker has no egress session, even on a signal already at its listener
+//! gateway of the harness (`LocalEgressGateway`) to a local origin, or
+//! through a session whose gateway end the test plays (`RawSession`): URLs
+//! refused before or by the gateway; the request's egress token a FetchStart
+//! carries byte for byte; the TypeError, before anything leaves the worker,
+//! of a fetch whose request carries no token, whose worker has no network
+//! grant or no egress session, even on a signal already at its listener
 //! limit, and of a request's fetch past `max_fetches_per_request` started,
-//! finished ones included, the active fetch failed with a TypeError when
-//! the gateway is lost while the worker keeps serving, a body-pool release
-//! the pool refuses, which detaches the worker between handlers and leaves it
-//! serving, a worker booted without
-//! a session that an `egress_attach` on its control socket attaches, the
-//! response's status, bytes, headers and streaming body, `clone`, a fetch
-//! response returned as the handler's response, a saved one refused in a later
-//! request, and live clones released at teardown. Runs in `worker-test`; the
-//! gateway's admission and policy are covered by its own tests, a forked
-//! worker attached again after it lost its gateway by the zygote integration
-//! lane, and fetch's Web API surface by the `webapi` lane.
+//! finished ones included; the network setting's denial, by the gateway or
+//! for want of a grant, written once to the tenant's log; a pooled start
+//! that waits for room in the session's upload bytes in flight; a reader
+//! cancelled while its body's ready item waits, which gives the request's
+//! ready count back; the active fetch failed with a TypeError when the
+//! gateway is lost while the worker keeps serving; a body-pool release the
+//! pool refuses, which detaches the worker between handlers and leaves it
+//! serving; a worker booted without a session that an `egress_attach` on its
+//! control socket attaches; the response's status, bytes, headers and
+//! streaming body, `clone`, a fetch response returned as the handler's
+//! response, a saved one refused in a later request, and live clones
+//! released at teardown. Runs in `worker-test`; the gateway's admission and
+//! policy are covered by its own tests, a forked worker attached again after
+//! it lost its gateway by the zygote integration lane, and fetch's Web API
+//! surface by the `webapi` lane.
 
 const std = @import("std");
 const support = @import("bindings_support");
 const ipc = @import("collo_ipc");
+const limits = @import("collo_limits");
 const worker_metrics_state = @import("collo_worker_state").metrics;
 const worker_shared_page = @import("collo_worker_state").page;
 const worker = @import("collo_worker");
@@ -301,7 +307,15 @@ test "a fetch of a request dispatched without an egress token rejects with a Typ
     try std.testing.expectEqual(@as(usize, 0), origin.accepted.load(.acquire));
 }
 
-test "a fetch in a worker without an egress session rejects at once with a TypeError" {
+/// The text a worker without a network grant rejects a fetch of
+/// `https://example.test/` with, as the gateway writes a denial
+/// (`collo_network.writeDenial` with `no_grant`).
+const no_grant_denial = "fetch to https://example.test denied by the network setting: no network setting grants access to this route";
+
+// A worker without a grant used to refuse as a worker whose gateway is
+// gone, "fetch failed: no egress gateway", which named no setting to change
+// and left nothing in the tenant's log.
+test "a fetch in a worker without a network grant rejects at once with the network setting's denial, written once to the tenant's log" {
     var vm = try support.createVm();
     defer vm.deinit();
 
@@ -311,13 +325,15 @@ test "a fetch in a worker without an egress session rejects at once with a TypeE
     var now_mono_ns: u64 = 0;
     var completion_fixture = try rt.CompletionFixture.init();
     defer completion_fixture.deinit();
-    // No egress descriptors, as for a worker whose definition has no egress
-    // grant: the worker runs detached from any gateway.
+    // No egress descriptors, as for a worker whose definition has no network
+    // grant (WorkerInit without `flag_egress`).
+    var no_egress: ipc.egress_shared.RawFds = .{};
     var runtime = try worker.Runtime.init(std.testing.allocator, &vm, control_pair[0], &completion_fixture.view, try rt.createCompletionEventfd(), worker.RuntimeOptions{
         .clock = .{
             .ctx = &now_mono_ns,
             .now_fn = fakeNow,
         },
+        .egress_shared_fds = &no_egress,
     });
     defer runtime.deinit();
     try runtime.attachHostRuntime();
@@ -331,7 +347,21 @@ test "a fetch in a worker without an egress session rejects at once with a TypeE
         \\        return Response.json({ typeError: err instanceof TypeError, message: err.message });
         \\    }
         \\}
-    , 33, "/fetch-detached.js", "\"typeError\":true,\"message\":\"fetch failed: no egress gateway\"");
+    , 33, "/fetch-no-grant.js", "\"typeError\":true,\"message\":\"" ++ no_grant_denial ++ "\"");
+    try expectOneDenialLine(&completion_fixture.view, 33, no_grant_denial);
+}
+
+/// Fails unless the tenant's log holds exactly one line since the last
+/// drain: a `warn` under `request_id` whose text is `text`.
+fn expectOneDenialLine(view: *worker_shared_page.WorkerWriterView, request_id: u64, text: []const u8) !void {
+    var scratch: [4 * worker_shared_page.LOG_LINE_BYTES_MAX]u8 = undefined;
+    var lines: [4]worker_shared_page.DrainedLogLine = undefined;
+    const count = try view.drainLogLinesChecked(&scratch, &lines);
+    try std.testing.expectEqual(@as(usize, 1), count);
+    try std.testing.expectEqual(@intFromEnum(worker_shared_page.LogLevel.warn), lines[0].header.level);
+    try std.testing.expectEqual(@as(u8, 0), lines[0].header.flags);
+    try std.testing.expectEqual(request_id, lines[0].header.request_id);
+    try std.testing.expectEqualStrings(text, lines[0].payload);
 }
 
 test "a request's fetch past max_fetches_per_request is refused in the worker, finished fetches included, and never reaches the gateway" {
@@ -427,7 +457,7 @@ test "a refused fetch on a signal at its listener limit rejects with the refusal
         \\        return Response.json({ typeError: err instanceof TypeError, message: err.message });
         \\    }
         \\}
-    , 41, "/fetch-refused-signal-limit.js", "\"typeError\":true,\"message\":\"fetch failed: no egress gateway\"");
+    , 41, "/fetch-refused-signal-limit.js", "\"typeError\":true,\"message\":\"" ++ no_grant_denial ++ "\"");
 }
 
 test "losing the gateway fails the active fetch with a TypeError and the worker serves the next request, whose fetch rejects at once (#47)" {
@@ -1377,4 +1407,576 @@ test "runtime deinit releases live cloned fetch bodies" {
     try std.testing.expect(std.mem.containsAtLeast(u8, response, 1, "kept"));
     // Both bodies are still reachable from a global when the runtime tears
     // down; the testing allocator's leak check is the assertion.
+}
+
+/// Both ends of a real egress session with no gateway thread: the test plays
+/// the gateway, so it decides which completions the worker gets, and the
+/// worker's command ring is never drained.
+const RawSession = struct {
+    wake_set: ipc.egress_shared.WakeSet,
+    session: ipc.egress_shared.SessionFds,
+    gateway: ipc.egress_shared.Endpoint,
+    worker_raw: ipc.egress_shared.RawFds,
+
+    fn init(self: *RawSession) !void {
+        self.wake_set = try ipc.egress_shared.WakeSet.create();
+        errdefer self.wake_set.deinit();
+        self.session = try ipc.egress_shared.createSessionForWorker(&self.wake_set);
+        errdefer self.session.deinit();
+        var gateway_raw = try rt.dupSharedFds(self.session.rawForGateway());
+        errdefer gateway_raw.close();
+        self.gateway = try ipc.egress_shared.mapEndpointTakeForGateway(&gateway_raw);
+        self.gateway.command.setSession(rt.local_egress_session_id, rt.local_egress_session_id);
+        self.gateway.completion.setSession(rt.local_egress_session_id, rt.local_egress_session_id);
+        self.gateway.body_pool.setSession(rt.local_egress_session_id, rt.local_egress_session_id);
+        self.gateway.upload_pool.setSession(rt.local_egress_session_id, rt.local_egress_session_id);
+        self.worker_raw = self.session.takeWorkerHalf();
+    }
+
+    fn deinit(self: *RawSession) void {
+        self.worker_raw.close();
+        self.gateway.deinit();
+        self.session.deinit();
+        self.wake_set.deinit();
+    }
+
+    /// Answers the runtime's only fetch with a 200 head and leaves its body
+    /// open: no chunk and no end follow.
+    fn sendOpenHead(self: *RawSession, runtime: *worker.Runtime) !void {
+        try std.testing.expectEqual(@as(usize, 1), runtime.egress.state.tasks.count());
+        var tasks = runtime.egress.state.tasks.valueIterator();
+        const task = tasks.next().?.*;
+        var buffer: [4096]u8 = undefined;
+        const head = try ipc.encodeEgressFetchHeadInto(&buffer, .{
+            .fetch_id = task.id,
+            .body_id = task.response_body_identity.body_id,
+            .status = 200,
+            .status_text = "OK",
+            .url = "https://origin.test/open",
+            .headers = &.{},
+        });
+        _ = try self.gateway.completion.writePacket(head);
+        _ = try runtime.collectEgressGatewayPacketsBounded(8);
+    }
+
+    /// Ends the body `identity` names, as the gateway does once the whole
+    /// response arrived, and lets the runtime read the packet.
+    fn sendBodyEnd(self: *RawSession, runtime: *worker.Runtime, identity: support.bindings.FetchBodyIdentity) !void {
+        const end = ipc.EgressBodyEnd.init(identity.fetch_id, identity.body_id);
+        _ = try self.gateway.completion.writePacket(std.mem.asBytes(&end));
+        _ = try runtime.collectEgressGatewayPacketsBounded(8);
+    }
+
+    /// Fails the runtime's only fetch before its head with `message`, for
+    /// `cause`.
+    fn sendError(
+        self: *RawSession,
+        runtime: *worker.Runtime,
+        cause: ipc.EgressFetchErrorCause,
+        message: []const u8,
+    ) !void {
+        try std.testing.expectEqual(@as(usize, 1), runtime.egress.state.tasks.count());
+        var tasks = runtime.egress.state.tasks.valueIterator();
+        try self.sendErrorFor(runtime, tasks.next().?.*.id, cause, message);
+    }
+
+    /// Fails the fetch `fetch_id` before its head with `message`, for
+    /// `cause`, and lets the runtime read the packet.
+    fn sendErrorFor(
+        self: *RawSession,
+        runtime: *worker.Runtime,
+        fetch_id: u64,
+        cause: ipc.EgressFetchErrorCause,
+        message: []const u8,
+    ) !void {
+        const task = runtime.egress.state.tasks.get(fetch_id) orelse return error.TestExpectedFetchTask;
+        var buffer: [4096]u8 = undefined;
+        const packet = try ipc.encodeEgressFetchErrorInto(&buffer, .{
+            .fetch_id = fetch_id,
+            .body_id = task.response_body_identity.body_id,
+            .message = message,
+            .cause = cause,
+        });
+        _ = try self.gateway.completion.writePacket(packet);
+        _ = try runtime.collectEgressGatewayPacketsBounded(8);
+    }
+};
+
+/// A runtime on a fake clock attached to `session`.
+fn initSessionRuntime(
+    vm: *support.bindings.Vm,
+    control_fd: std.posix.fd_t,
+    completion_fixture: *rt.CompletionFixture,
+    now_mono_ns: *u64,
+    session: *RawSession,
+) !worker.Runtime {
+    // The caller attaches the host runtime once the value has its final
+    // address: the VM keeps a pointer to it.
+    return worker.Runtime.init(std.testing.allocator, vm, control_fd, &completion_fixture.view, try rt.createCompletionEventfd(), worker.RuntimeOptions{
+        .clock = .{ .ctx = now_mono_ns, .now_fn = fakeNow },
+        .egress_shared_fds = &session.worker_raw,
+    });
+}
+
+/// Runs the route `source` as request `request_id` until it ends and
+/// returns its body, which the caller frees. Fetch heads come from the test.
+fn serveOnSession(
+    runtime: *worker.Runtime,
+    session: *RawSession,
+    server_control_fd: std.posix.fd_t,
+    request_id: u64,
+    specifier: []const u8,
+    source: []const u8,
+) ![]u8 {
+    const route_index = try rt.registerRoute(runtime, specifier, source);
+    var dispatch = try initDispatchWork(std.testing.allocator, .{
+        .request_id = request_id,
+        .route_index = route_index,
+        .deadline_monotonic_ns = std.time.ns_per_hour,
+    });
+    defer dispatch.deinit();
+    try rt.enqueueIngressRoute(runtime, &dispatch, 1, .{});
+    try executeNextReady(runtime);
+    try session.sendOpenHead(runtime);
+    try executeUntilRequestDone(runtime, request_id);
+    return rt.readIngressResponseBody(runtime, server_control_fd, request_id);
+}
+
+// A stored reader takes no reference of its own; the table's covers it, and
+// every removal drops the reader. A reader that took one and was discarded
+// with the request left its body allocated forever, which the testing
+// allocator's leak check at the runtime's teardown reports.
+test "a request that ends while its text() waits on an open body frees the body" {
+    var session: RawSession = undefined;
+    try session.init();
+    defer session.deinit();
+    var vm = try support.createVm();
+    defer vm.deinit();
+    const control_pair = try socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
+    defer std.posix.close(control_pair[0]);
+    defer std.posix.close(control_pair[1]);
+    var now_mono_ns: u64 = 0;
+    var completion_fixture = try rt.CompletionFixture.init();
+    defer completion_fixture.deinit();
+    var runtime = try initSessionRuntime(&vm, control_pair[0], &completion_fixture, &now_mono_ns, &session);
+    defer runtime.deinit();
+    try runtime.attachHostRuntime();
+
+    const body = try serveOnSession(&runtime, &session, control_pair[1], 701, "/__collo_route/demo/fetch-open-text.js",
+        \\export default async function handle() {
+        \\    const res = await fetch("https://origin.test/open");
+        \\    res.text();
+        \\    return new Response("ended");
+        \\}
+    );
+    defer std.testing.allocator.free(body);
+    try std.testing.expectEqualStrings("ended", body);
+    try std.testing.expectEqual(@as(usize, 0), runtime.egress.state.bodies.count());
+}
+
+test "a reader cancelled while its read waits on an open body frees the body" {
+    var session: RawSession = undefined;
+    try session.init();
+    defer session.deinit();
+    var vm = try support.createVm();
+    defer vm.deinit();
+    const control_pair = try socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
+    defer std.posix.close(control_pair[0]);
+    defer std.posix.close(control_pair[1]);
+    var now_mono_ns: u64 = 0;
+    var completion_fixture = try rt.CompletionFixture.init();
+    defer completion_fixture.deinit();
+    var runtime = try initSessionRuntime(&vm, control_pair[0], &completion_fixture, &now_mono_ns, &session);
+    defer runtime.deinit();
+    try runtime.attachHostRuntime();
+
+    const body = try serveOnSession(&runtime, &session, control_pair[1], 702, "/__collo_route/demo/fetch-open-cancel.js",
+        \\export default async function handle() {
+        \\    const res = await fetch("https://origin.test/open");
+        \\    const reader = res.body.getReader();
+        \\    reader.read().catch(() => {});
+        \\    await reader.cancel();
+        \\    return new Response("cancelled");
+        \\}
+    );
+    defer std.testing.allocator.free(body);
+    try std.testing.expectEqualStrings("cancelled", body);
+}
+
+/// A route that starts `max_fetches_per_request` fetches whose starts are
+/// near the gateway's packet limits, more than the command ring holds, so
+/// the last starts park; `abort` aborts the last fetch at once and answers
+/// with the name of its rejection.
+fn parkedStartsSource(comptime abort: bool) []const u8 {
+    return 
+    \\export default async function handle() {
+    \\    const value = "x".repeat(4000);
+    \\    const headers = {};
+    \\    for (let i = 0; i < 15; i++) headers["x-large-" + i] = value;
+    \\    const url = "https://origin.test/" + "u".repeat(15000) + "?";
+    \\    const controller = new AbortController();
+    \\    let last;
+    \\    for (let i = 0; i < 16; i++)
+    \\        last = fetch(url + i, i === 15 ? { headers, signal: controller.signal } : { headers });
+    \\
+++ (if (abort)
+    \\    controller.abort();
+    \\    return new Response(await last.then(() => "resolved", (err) => err.name));
+    \\}
+else
+    \\    last.catch(() => {});
+    \\    await new Promise((resolve) => setTimeout(resolve, 1));
+    \\    return new Response("returned");
+    \\}
+);
+}
+
+/// The tasks of the runtime whose start never reached the command ring.
+fn unsentStarts(runtime: *worker.Runtime) usize {
+    var count: usize = 0;
+    var tasks = runtime.egress.state.tasks.valueIterator();
+    while (tasks.next()) |task| {
+        if (!task.*.start_sent)
+            count += 1;
+    }
+    return count;
+}
+
+// A canceled task used to wait for the gateway's answer to its cancel, which
+// the gateway sends only for a start it received; a start parked on a full
+// ring never got one, so its task stayed until the gateway went away.
+test "a fetch whose start never left the worker is ended without the gateway when its request ends" {
+    var session: RawSession = undefined;
+    try session.init();
+    defer session.deinit();
+    var vm = try support.createVm();
+    defer vm.deinit();
+    const control_pair = try socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
+    defer std.posix.close(control_pair[0]);
+    defer std.posix.close(control_pair[1]);
+    var now_mono_ns: u64 = 0;
+    var completion_fixture = try rt.CompletionFixture.init();
+    defer completion_fixture.deinit();
+    var runtime = try initSessionRuntime(&vm, control_pair[0], &completion_fixture, &now_mono_ns, &session);
+    defer runtime.deinit();
+    try runtime.attachHostRuntime();
+
+    const route_index = try rt.registerRoute(&runtime, "/__collo_route/demo/fetch-parked.js", comptime parkedStartsSource(false));
+    var dispatch = try initDispatchWork(std.testing.allocator, .{
+        .request_id = 703,
+        .route_index = route_index,
+        .deadline_monotonic_ns = std.time.ns_per_hour,
+    });
+    defer dispatch.deinit();
+    try rt.enqueueIngressRoute(&runtime, &dispatch, 1, .{});
+    try executeNextReady(&runtime);
+    try std.testing.expect(unsentStarts(&runtime) > 0);
+
+    now_mono_ns += std.time.ns_per_ms;
+    try executeUntilRequestDone(&runtime, 703);
+    while (runtime.scheduler.ready_queue.pop()) |item|
+        try worker.testing.executeWorkItem(&runtime, item);
+    try std.testing.expectEqual(@as(usize, 0), unsentStarts(&runtime));
+}
+
+test "an abort of a fetch whose start never left the worker rejects with its AbortError at once" {
+    var session: RawSession = undefined;
+    try session.init();
+    defer session.deinit();
+    var vm = try support.createVm();
+    defer vm.deinit();
+    const control_pair = try socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
+    defer std.posix.close(control_pair[0]);
+    defer std.posix.close(control_pair[1]);
+    var now_mono_ns: u64 = 0;
+    var completion_fixture = try rt.CompletionFixture.init();
+    defer completion_fixture.deinit();
+    var runtime = try initSessionRuntime(&vm, control_pair[0], &completion_fixture, &now_mono_ns, &session);
+    defer runtime.deinit();
+    try runtime.attachHostRuntime();
+
+    const route_index = try rt.registerRoute(&runtime, "/__collo_route/demo/fetch-parked-abort.js", comptime parkedStartsSource(true));
+    var dispatch = try initDispatchWork(std.testing.allocator, .{
+        .request_id = 704,
+        .route_index = route_index,
+        .deadline_monotonic_ns = std.time.ns_per_hour,
+    });
+    defer dispatch.deinit();
+    try rt.enqueueIngressRoute(&runtime, &dispatch, 1, .{});
+    try executeNextReady(&runtime);
+    try executeUntilRequestDone(&runtime, 704);
+    const body = try rt.readIngressResponseBody(&runtime, control_pair[1], 704);
+    defer std.testing.allocator.free(body);
+    try std.testing.expectEqualStrings("AbortError", body);
+}
+
+// The finish's cleanup rejects a body read still pending, and that rejection
+// runs the request's JavaScript after its response was decided. A fetch it
+// starts used to reach the gateway after the response; a request whose
+// finish started now refuses new work.
+test "a fetch started by a reaction to a finishing request's body read never leaves the worker" {
+    var session: RawSession = undefined;
+    try session.init();
+    defer session.deinit();
+    var vm = try support.createVm();
+    defer vm.deinit();
+    const control_pair = try socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
+    defer std.posix.close(control_pair[0]);
+    defer std.posix.close(control_pair[1]);
+    var now_mono_ns: u64 = 0;
+    var completion_fixture = try rt.CompletionFixture.init();
+    defer completion_fixture.deinit();
+    var runtime = try initSessionRuntime(&vm, control_pair[0], &completion_fixture, &now_mono_ns, &session);
+    defer runtime.deinit();
+    try runtime.attachHostRuntime();
+
+    const route_index = try rt.registerRoute(&runtime, "/__collo_route/demo/fetch-after-finish.js",
+        \\export default function handle(request) {
+        \\    request.text().catch(() => fetch("https://origin.test/after-finish").catch(() => {}));
+        \\    return new Response("returned");
+        \\}
+    );
+    // The body never completes: the stream stays open after the head.
+    const parts: RequestParts = .{
+        .method = "POST",
+        .body_framing = .ingress_channel,
+        .body_end_stream = false,
+    };
+    var dispatch = try initDispatchWork(std.testing.allocator, .{
+        .request_id = 705,
+        .route_index = route_index,
+        .deadline_monotonic_ns = std.time.ns_per_hour,
+        .request = parts,
+    });
+    defer dispatch.deinit();
+    try rt.enqueueIngressRoute(&runtime, &dispatch, 1, parts);
+    try executeNextReady(&runtime);
+    try executeUntilRequestDone(&runtime, 705);
+    const body = try rt.readIngressResponseBody(&runtime, control_pair[1], 705);
+    defer std.testing.allocator.free(body);
+    try std.testing.expectEqualStrings("returned", body);
+    try std.testing.expectEqual(@as(usize, 0), runtime.egress.state.tasks.count());
+}
+
+// The gateway's error packet carries why a fetch failed. A denial used to
+// reject with its text like any failure and leave nothing in the tenant's
+// log, so a handler that swallowed the error hid which setting to change.
+test "a fetch the network setting denied at the gateway rejects with the gateway's text, written once to the tenant's log, and a failed fetch writes no line" {
+    var session: RawSession = undefined;
+    try session.init();
+    defer session.deinit();
+    var vm = try support.createVm();
+    defer vm.deinit();
+    const control_pair = try socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
+    defer std.posix.close(control_pair[0]);
+    defer std.posix.close(control_pair[1]);
+    var now_mono_ns: u64 = 0;
+    var completion_fixture = try rt.CompletionFixture.init();
+    defer completion_fixture.deinit();
+    var runtime = try initSessionRuntime(&vm, control_pair[0], &completion_fixture, &now_mono_ns, &session);
+    defer runtime.deinit();
+    try runtime.attachHostRuntime();
+
+    const route_index = try rt.registerRoute(&runtime, "/__collo_route/demo/fetch-denied.js",
+        \\export default async function handle() {
+        \\    const outcomes = [];
+        \\    for (const path of ["denied", "failed"]) {
+        \\        try {
+        \\            await fetch("https://origin.test/" + path);
+        \\            outcomes.push("fetched");
+        \\        } catch (err) {
+        \\            outcomes.push((err instanceof TypeError ? "TypeError: " : "other: ") + err.message);
+        \\        }
+        \\    }
+        \\    return new Response(outcomes.join("|"));
+        \\}
+    );
+    var dispatch = try initDispatchWork(std.testing.allocator, .{
+        .request_id = 706,
+        .route_index = route_index,
+        .deadline_monotonic_ns = std.time.ns_per_hour,
+    });
+    defer dispatch.deinit();
+    try rt.enqueueIngressRoute(&runtime, &dispatch, 1, .{});
+    try executeNextReady(&runtime);
+
+    const denial = "fetch to https://origin.test denied by the network setting: the host is not in the allow list";
+    try session.sendError(&runtime, .network_denied, denial);
+    // The first fetch's settlement runs the handler on to its second fetch.
+    try executeNextReady(&runtime);
+    try session.sendError(&runtime, .failed, "fetch failed: ConnectionRefused");
+    try executeUntilRequestDone(&runtime, 706);
+
+    const body = try rt.readIngressResponseBody(&runtime, control_pair[1], 706);
+    defer std.testing.allocator.free(body);
+    try std.testing.expectEqualStrings("TypeError: " ++ denial ++ "|TypeError: fetch failed: ConnectionRefused", body);
+    try expectOneDenialLine(&completion_fixture.view, 706, denial);
+}
+
+// The gateway admits a session's pooled starts only while their announced
+// lengths fit its bytes in flight, and refuses the next one otherwise. The
+// worker used to send every start at once, so a third large upload failed
+// although the first two would end.
+test "a pooled start that would pass the session's upload bytes in flight waits until an earlier pooled fetch ends, then leaves" {
+    var session: RawSession = undefined;
+    try session.init();
+    defer session.deinit();
+    var vm = try support.createVm();
+    defer vm.deinit();
+    const control_pair = try socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
+    defer std.posix.close(control_pair[0]);
+    defer std.posix.close(control_pair[1]);
+    var now_mono_ns: u64 = 0;
+    var completion_fixture = try rt.CompletionFixture.init();
+    defer completion_fixture.deinit();
+
+    // The bridge materializes every fetch body, so the largest one is the
+    // materialized cap. `fit` of them fill the bytes in flight exactly, and
+    // one more must wait: the request may start `fit + 1` fetches.
+    const body_bytes: u64 = limits.http_body.MATERIALIZED_BODY_BYTES_MAX;
+    const in_flight_max: u64 = ipc.fetch_limits.request_body_pooled_in_flight_bytes_max;
+    const fit = in_flight_max / body_bytes;
+    comptime std.debug.assert(body_bytes > ipc.fetch_limits.request_body_inline_bytes_max);
+    comptime std.debug.assert(fit * body_bytes == in_flight_max);
+    const starts = fit + 1;
+    var runtime = try worker.Runtime.init(std.testing.allocator, &vm, control_pair[0], &completion_fixture.view, try rt.createCompletionEventfd(), worker.RuntimeOptions{
+        .clock = .{ .ctx = &now_mono_ns, .now_fn = fakeNow },
+        .egress_shared_fds = &session.worker_raw,
+        .limits = .{ .max_fetches_per_request = starts },
+    });
+    defer runtime.deinit();
+    try runtime.attachHostRuntime();
+
+    const source = try std.fmt.allocPrint(std.testing.allocator,
+        \\export default async function handle() {{
+        \\    const body = new Uint8Array({d});
+        \\    const outcomes = [];
+        \\    for (let i = 0; i < {d}; i++)
+        \\        outcomes.push(fetch("https://origin.test/upload/" + i, {{ method: "POST", body }})
+        \\            .then(() => "fetched", (err) => err.message));
+        \\    return new Response((await Promise.all(outcomes)).join("|"));
+        \\}}
+    , .{ body_bytes, starts });
+    defer std.testing.allocator.free(source);
+    const route_index = try rt.registerRoute(&runtime, "/__collo_route/demo/fetch-upload-room.js", source);
+    var dispatch = try initDispatchWork(std.testing.allocator, .{
+        .request_id = 707,
+        .route_index = route_index,
+        .deadline_monotonic_ns = std.time.ns_per_hour,
+    });
+    defer dispatch.deinit();
+    try rt.enqueueIngressRoute(&runtime, &dispatch, 1, .{});
+    try executeNextReady(&runtime);
+
+    // Fetch ids count from 1 in a fresh runtime.
+    try std.testing.expectEqual(@as(usize, starts), runtime.egress.state.tasks.count());
+    try std.testing.expectEqual(@as(usize, 1), unsentStarts(&runtime));
+    try std.testing.expect(!runtime.egress.state.tasks.get(starts).?.start_sent);
+    try std.testing.expectEqual(in_flight_max, runtime.egress.state.upload_reserved_bytes);
+
+    // The first fetch ends at the gateway: its bytes return, and the pump
+    // that follows the packet sends the last start.
+    try session.sendErrorFor(&runtime, 1, .failed, "fetch failed: test");
+    try std.testing.expectEqual(@as(usize, 0), unsentStarts(&runtime));
+    try std.testing.expectEqual(in_flight_max, runtime.egress.state.upload_reserved_bytes);
+
+    var fetch_id: u64 = 2;
+    while (fetch_id <= starts) : (fetch_id += 1)
+        try session.sendErrorFor(&runtime, fetch_id, .failed, "fetch failed: test");
+    try std.testing.expectEqual(@as(u64, 0), runtime.egress.state.upload_reserved_bytes);
+    try executeUntilRequestDone(&runtime, 707);
+    const body = try rt.readIngressResponseBody(&runtime, control_pair[1], 707);
+    defer std.testing.allocator.free(body);
+    const outcome = "fetch failed: test";
+    try std.testing.expectEqual(starts * outcome.len + fit, body.len);
+    var outcomes = std.mem.splitScalar(u8, body, '|');
+    while (outcomes.next()) |each|
+        try std.testing.expectEqualStrings(outcome, each);
+}
+
+// A body's ready item counts for its request from its enqueue to its pop. A
+// reader cancelled after the item was queued left nothing for it to do, but
+// the count stayed until the pop, so the request read as runnable, and its
+// I/O as waiting, until then.
+test "a reader cancelled while its body's ready item is queued gives the count back, so the time until the item pops is I/O" {
+    var session: RawSession = undefined;
+    try session.init();
+    defer session.deinit();
+    var vm = try support.createVm();
+    defer vm.deinit();
+    const control_pair = try socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
+    defer std.posix.close(control_pair[0]);
+    defer std.posix.close(control_pair[1]);
+    // Away from 0, which a readiness stamp reads as now.
+    var now_mono_ns: u64 = std.time.ns_per_s;
+    var completion_fixture = try rt.CompletionFixture.init();
+    defer completion_fixture.deinit();
+    var runtime = try initSessionRuntime(&vm, control_pair[0], &completion_fixture, &now_mono_ns, &session);
+    defer runtime.deinit();
+    try runtime.attachHostRuntime();
+
+    const route_index = try rt.registerRoute(&runtime, "/__collo_route/demo/fetch-cancel-queued.js",
+        \\export default async function handle() {
+        \\    const res = await fetch("https://origin.test/open");
+        \\    const reader = res.body.getReader();
+        \\    reader.read().catch(() => {});
+        \\    return new Promise((resolve) => {
+        \\        setTimeout(() => {
+        \\            reader.cancel().catch(() => {});
+        \\            setTimeout(() => resolve(new Response("cancelled")), 100);
+        \\        }, 0);
+        \\    });
+        \\}
+    );
+    const request_id: u64 = 708;
+    var dispatch = try initDispatchWork(std.testing.allocator, .{
+        .request_id = request_id,
+        .route_index = route_index,
+        .deadline_monotonic_ns = std.time.ns_per_hour,
+    });
+    defer dispatch.deinit();
+    try rt.enqueueIngressRoute(&runtime, &dispatch, 1, .{});
+    try executeNextReady(&runtime);
+    try session.sendOpenHead(&runtime);
+    // The head's settlement starts the read, which waits on the open body,
+    // and sets the timer.
+    try executeNextReady(&runtime);
+    try runtime.collectDueTimers();
+
+    // The body ends while the read waits, which queues its item behind the
+    // timer's.
+    try std.testing.expectEqual(@as(usize, 1), runtime.egress.state.bodies.count());
+    var bodies = runtime.egress.state.bodies.valueIterator();
+    try session.sendBodyEnd(&runtime, bodies.next().?.*.identity);
+
+    // The timer cancels the reader, and the body's item stays queued.
+    try executeNextReady(&runtime);
+    try std.testing.expect(!runtime.scheduler.ready_queue.isEmpty());
+
+    // 50 ms pass before the stale item pops, with nothing of the request
+    // ready: I/O. A count left behind made them waiting.
+    now_mono_ns += 50 * std.time.ns_per_ms;
+    try executeNextReady(&runtime);
+    now_mono_ns += 50 * std.time.ns_per_ms;
+    try executeUntilRequestDone(&runtime, request_id);
+
+    const body = try rt.readIngressResponseBody(&runtime, control_pair[1], request_id);
+    defer std.testing.allocator.free(body);
+    try std.testing.expectEqualStrings("cancelled", body);
+    const record = try usageRecord(&completion_fixture.view, request_id);
+    try std.testing.expect(record.waiting_ns < std.time.ns_per_ms);
+    try std.testing.expect(record.io_ns >= 100 * std.time.ns_per_ms);
+}
+
+/// The usage record the runtime published for `request_id`.
+fn usageRecord(view: *worker_shared_page.WorkerWriterView, request_id: u64) !worker_shared_page.CompletedRecord {
+    var records: [8]worker_shared_page.CompletedRecord = undefined;
+    var cursor: worker_shared_page.RecordCursor = .{};
+    const count = cursor.drain(view.header, view.completed_records, &records) orelse
+        return error.UsageRingCorrupt;
+    for (records[0..count]) |record| {
+        if (record.request_id == request_id)
+            return record;
+    }
+    return error.UsageRecordMissing;
 }

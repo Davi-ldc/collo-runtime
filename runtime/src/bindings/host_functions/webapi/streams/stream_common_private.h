@@ -2,17 +2,13 @@
 // identifiers that tie a native callback to its cell, buffer and promise
 // helpers, and the stream state enums. All of it runs on the VM thread.
 //
-// A ColloPromiseDeferred from createDeferredPromise (defined in
-// jsc/runtime/promise.cpp) owns Strong handles to its promise's resolving
-// functions, so it roots that promise, and whatever the promise's reactions
-// reach, until settleDeferred settles and releases it.
-//
-// FIXME: a cell that holds one releases it in its destructor, but only if the
-// cell dies first. A reaction that reaches the cell, such as a script closure
-// over the stream or a cachedThenCallback function whose state cell leads back
-// to it, keeps the cell alive until the deferred settles or destroyVmContents
-// clears every value handle, so a stream abandoned with such a promise pending
-// lives until VM teardown.
+// A stream cell holds every promise it will settle in a
+// JSC::WriteBarrier<JSC::JSPromise> field it visits, so a promise whose
+// reactions lead back to the cell forms a cycle the collector can reclaim, and
+// settles it through Collo::settlePromise (jsc/runtime/promise.cpp). A false
+// result from that, or from the helpers below, means a termination is pending:
+// the caller returns without entering JavaScript or settling anything else.
+// Lists of edges are Collo::CellEdgeList (jsc/runtime/cell_edges.h).
 #pragma once
 
 #include "host_functions/webapi/streams/readable_stream.h"
@@ -20,6 +16,7 @@
 #include "host_functions/support.h"
 #include "host_functions/webapi/buffer_source.h"
 #include "host_functions/webapi/events/abort.h"
+#include "jsc/runtime/cell_edges.h"
 
 #include <JavaScriptCore/ArrayBufferSharingMode.h>
 #include <JavaScriptCore/Error.h>
@@ -145,27 +142,28 @@ bool valueIsCallable(JSValue);
 // per code unit, and any other value for one byte.
 size_t streamChunkMemoryCost(JSValue);
 JSC::JSObject* createStreamQueueLimitExceededError(JSC::JSGlobalObject*, WTF::ASCIILiteral message);
-// On success, sets the promise and an owned deferred for settleDeferred. On
-// failure, throws an OutOfMemoryError or a TypeError and returns false with
-// both outputs cleared.
-bool createDeferredPromise(JSC::JSGlobalObject*, JSC::ThrowScope&, JSC::JSValue&, ColloPromiseDeferred*&);
-// Resolves or rejects the deferred's promise, then releases the deferred and
-// nulls the caller's pointer. A null deferred is ignored, and an exception from
-// the resolving function is dropped unless it is a termination.
-void settleDeferred(JSC::JSGlobalObject*, ColloPromiseDeferred*&, JSC::JSValue, bool);
 
-// A promise with its resolving functions as plain JSValues, rooted only while
-// they sit on the stack or in a traced field.
-struct JSDeferredPromise {
-    JSC::JSValue promise;
-    JSC::JSValue resolve;
-    JSC::JSValue reject;
-};
-
-bool createJSDeferredPromise(JSC::JSGlobalObject*, JSC::ThrowScope&, JSDeferredPromise&);
-// Calls a resolving function with the value. A callback that is not callable
-// ends the process; an exception is dropped unless it is a termination.
-void settleJSDeferredPromise(JSC::JSGlobalObject*, JSC::JSValue, JSC::JSValue);
+// True while no exception, such as a termination, is pending on the VM.
+inline bool noExceptionPending(JSC::VM& vm)
+{
+    auto scope = DECLARE_TOP_EXCEPTION_SCOPE(vm);
+    return !scope.exception();
+}
+inline bool promiseIsPending(JSC::JSPromise* promise)
+{
+    return promise && promise->status() == JSC::JSPromise::Status::Pending;
+}
+// Settles the promise in `slot` and empties the slot first, so script the
+// settlement runs finds no pending promise there. An empty slot settles
+// nothing. Returns false when an exception is pending.
+bool settleAndClearPromise(JSC::JSGlobalObject*, JSC::WriteBarrier<JSC::JSPromise>& slot, JSValue, bool is_rejection);
+// WritableStreamDefaultWriterEnsureReadyPromiseRejected, and the closed promise
+// of ReadableStreamReaderGenericRelease: rejects the promise in `slot` with
+// `reason` while it is pending, otherwise puts a promise rejected with `reason`
+// in its place, and marks the result handled. `owner` holds `slot`. Returns
+// false when an exception is pending.
+bool ensurePromiseRejected(
+    JSC::JSGlobalObject*, const JSC::JSCell* owner, JSC::WriteBarrier<JSC::JSPromise>& slot, JSValue reason);
 JSC::JSObject* createReadResult(JSC::JSGlobalObject*, JSC::JSValue, bool);
 EncodedJSValue promiseThenUndefined(JSC::JSGlobalObject*, JSC::ThrowScope&, JSValue);
 EncodedJSValue resolvedReadResult(JSC::JSGlobalObject*, JSC::JSValue, bool);

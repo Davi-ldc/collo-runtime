@@ -91,30 +91,3 @@ export async function readableStreamToText(stream) {
   }
   return text + decoder.decode();
 }
-
-export const collectBytes = readableStreamToBytes;
-
-export function makeWeakRefs(count, factory) {
-  const refs = [];
-  for (let index = 0; index < count; index++) {
-    let value = factory(index);
-    refs.push(new WeakRef(value));
-    value = null;
-  }
-  return refs;
-}
-
-export function weakRecord(label, refs, maxLive = 4) {
-  if (typeof WeakRef !== "function") {
-    throw new TypeError("WeakRef must exist for retention tests");
-  }
-  return { label, refs, maxLive };
-}
-
-export function expectLeakRecordsCollected(records) {
-  const checker = globalThis.expectLeakRecordsCollected;
-  if (typeof checker !== "function") {
-    throw new Error("leak checks require runCompatLeakSuite or runLeakSuite");
-  }
-  return checker(records);
-}

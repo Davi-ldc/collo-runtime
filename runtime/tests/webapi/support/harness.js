@@ -97,13 +97,55 @@ function test(name, fn) {
   __colloWebApiTests.push({ name: fullName, fn });
 }
 
+// A skipped or pending case registers as a failure that names it. A strict
+// run fails on any skip, and a case hidden inside a fixture would escape that
+// rule; a known defect is fixed, or its case removed, instead.
+function __colloRegisterSkipped(kind, name) {
+  test(`${name} (${kind})`, () => {
+    __colloFail(`${kind} hides this case; fix the defect it covers or remove the case`);
+  });
+}
+
+test.skip = function skip(name) {
+  __colloRegisterSkipped("test.skip", name);
+};
+test.todo = function todo(name) {
+  __colloRegisterSkipped("test.todo", name);
+};
+describe.skip = function skip(name) {
+  __colloRegisterSkipped("describe.skip", name);
+};
+
 const it = test;
+
+// Bun's default, and the same in `collo_test.js`.
+const __colloWebApiTestTimeoutMs = 5000;
+
+// Settles `run`'s promise, or fails after `__colloWebApiTestTimeoutMs`, and
+// clears its timer either way, so a finished test leaves no timer behind to
+// count against the worker's timer budget. The runner moves its fake clock
+// while the loop waits (`executeUntilRequestDoneOnFakeClock`), so the timer
+// fires.
+async function __colloWithTimeout(name, run) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`test timed out after ${__colloWebApiTestTimeoutMs}ms: ${name}`)),
+      __colloWebApiTestTimeoutMs,
+    );
+  });
+  try {
+    return await Promise.race([run(), timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 async function __colloRunWebApiTests() {
   const failures = [];
   for (const entry of __colloWebApiTests) {
     try {
-      await entry.fn();
+      await __colloWithTimeout(entry.name, entry.fn);
     } catch (err) {
       failures.push({
         name: entry.name,

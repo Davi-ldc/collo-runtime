@@ -49,6 +49,7 @@ Current exact compact ports:
 - `streams/streams_globals.bun.test.js`
 - `streams/wpt_compact.wpt.test.js`
 - `text_codec/text_decoder_cjk.bun.test.js`
+- `text_codec/text_decoder_repertoire.bun.test.js`
 - `text_codec/text_decoder_single_byte.bun.test.js`
 - `text_codec/text_decoder_wpt.bun.test.js`
 
@@ -79,17 +80,15 @@ directory without those suffixes and must keep matching bench files.
 
 ## Running
 
-Run the JavaScript compatibility matrix explicitly:
+The suites are part of the `test` aggregate, so `zig build test` and `zig build smoke` run them, and the concurrent `bindings-gc-stress` profile runs them again under a collector that never stops. To run only them:
 
 ```sh
-zig build test -Dwebapi-compat=true
+zig build webapi-test
 ```
 
-The common long-build cache used during local work is:
+`COLLO_WEBAPI_TEST_FILTER=<text>` keeps only the tests whose names contain the text, in every suite but the `_leak` ones and the forked one. Every `*.test.js` here must be embedded by `suites.zig` or `forked.zig`; the build's fixture check (`runtime/build/validate_webapi_tool.zig`) fails on one that is not, as on a contract fixture without its bench.
 
-```sh
-ZIG_LOCAL_CACHE_DIR=/tmp/collo-zig-cache-build-long zig build test -Dwebapi-compat=true
-```
+A suite fails when it reports no test, unless the filter is set. `test.skip`, `test.todo` and `describe.skip` register a failing test that names the case, because a skip hides a known defect from the strict gate: fix the defect or remove the case. A test, a hook or a leak setup or check that has not settled after 5 s fails by name; the runner's fake clock moves while the suite runs and while it waits, so harness timeouts and fixture timers fire.
 
 Bench runs default to three measurements per case for each runtime. Override
 the run count with:

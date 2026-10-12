@@ -184,6 +184,9 @@ pub const FetchErrorView = struct {
     fetch_id: u64,
     body_id: u64,
     message: []const u8,
+    /// Why the fetch failed. A gateway-side failure that is no denial is
+    /// `failed`.
+    cause: messages.EgressFetchErrorCause = .failed,
     /// The fetch's cumulative byte meters.
     billed_sent_total: u64 = 0,
     billed_received_total: u64 = 0,
@@ -623,6 +626,7 @@ pub fn encodeFetchErrorInto(out: []u8, view: FetchErrorView) ![]u8 {
         .billed_received_total = view.billed_received_total,
         .cost_total = view.cost_total,
         .ready_at_mono_ns = view.ready_at_mono_ns,
+        .cause = @intFromEnum(view.cause),
     };
     var cursor: usize = 0;
     writeStruct(out, &cursor, messages.EgressFetchErrorHeader, header);
@@ -630,6 +634,9 @@ pub fn encodeFetchErrorInto(out: []u8, view: FetchErrorView) ![]u8 {
     return out[0..cursor];
 }
 
+/// Fails with `error.InvalidEgressPacket` for a length other than the header
+/// and its message, a cause `EgressFetchErrorCause` does not name or a
+/// nonzero reserved field.
 pub fn decodeFetchError(bytes: []const u8) !FetchErrorView {
     if (bytes.len < @sizeOf(messages.EgressFetchErrorHeader))
         return error.ShortRead;
@@ -638,11 +645,16 @@ pub fn decodeFetchError(bytes: []const u8) !FetchErrorView {
         return error.InvalidMessageKind;
     if (@sizeOf(messages.EgressFetchErrorHeader) + @as(usize, @intCast(header.message_len)) != bytes.len)
         return error.InvalidEgressPacket;
+    const cause = std.enums.fromInt(messages.EgressFetchErrorCause, header.cause) orelse
+        return error.InvalidEgressPacket;
+    if (header._reserved0 != 0)
+        return error.InvalidEgressPacket;
     var cursor: usize = @sizeOf(messages.EgressFetchErrorHeader);
     return .{
         .fetch_id = header.fetch_id,
         .body_id = header.body_id,
         .message = take(bytes, &cursor, @intCast(header.message_len)),
+        .cause = cause,
         .billed_sent_total = header.billed_sent_total,
         .billed_received_total = header.billed_received_total,
         .cost_total = header.cost_total,

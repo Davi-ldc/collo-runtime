@@ -2,21 +2,23 @@
 //! routes of the worker's definition, registered packs and route module
 //! state (`modules/state.zig`). `Methods` holds the runtime's module
 //! operations, which `Runtime` declares as its own (`root.zig`): the modules
-//! context, the settlements and expiries of route module evaluations, and
-//! the worker's stop, once drained, when no route can serve or after a
-//! deadline fire. It belongs to the worker's VM thread.
+//! context, the realm of a route, and the settlements and expiries of route
+//! module evaluations with the close of the evaluations they end
+//! (`evaluations.zig`). A worker none of whose routes can serve asks to
+//! retire (`retirement.zig`). It belongs to the worker's VM thread.
 //!
 //! `collo_runtime_module_eval_settled` only parks a settlement, in the
 //! middle of a JavaScript drain; the settlement runs from the scheduler loop
-//! (`collectModuleSettlements`), never inside a drain.
+//! (`collectModuleSettlements`), never inside a drain, under the evaluation
+//! of its module instance, or under the worker owner once that evaluation
+//! closed.
 
 const std = @import("std");
+const bindings = @import("collo_bindings");
 const route_table = @import("collo_ipc").route_table;
-const request_context = @import("collo_worker_request").context;
 const modules_context = @import("../modules/context.zig");
 const modules_routes = @import("../modules/routes.zig");
 const modules_state = @import("../modules/state.zig");
-const scheduler_resources = @import("../scheduler/resources.zig");
 
 pub const Modules = struct {
     state: modules_state.State,
@@ -56,30 +58,46 @@ pub fn Methods(comptime Runtime: type) type {
             // their module record no longer lists them, so this retry is the only
             // path left that runs them.
             while (self.modules.state.stalled_waiters.items.len > 0) {
-                const request_id = self.modules.state.stalled_waiters.items[self.modules.state.stalled_waiters.items.len - 1];
-                if (!self.tryQueueReadyWork(.{ .request = request_id }))
+                const waiter = self.modules.state.stalled_waiters.items[self.modules.state.stalled_waiters.items.len - 1];
+                if (!self.tryQueueReadyWorkReadySince(.{ .request = waiter.request_id }, waiter.ready_since_ns))
                     break;
                 _ = self.modules.state.stalled_waiters.pop();
             }
-            if (self.modules.state.pending_settlements.items.len != 0) {
-                // The settlement's JavaScript (the export read and the drains
-                // around it) runs outside any turn, so the boot identity is
-                // published for the deadline arbiter. Only when work is pending,
-                // so a pass with none stores nothing.
-                scheduler_resources.publishTurnOwner(self, request_context.boot_request_id);
-                defer scheduler_resources.clearTurnOwner(self);
-                while (self.modules.state.pending_settlements.pop()) |entry| {
-                    self.handleModuleEvaluationSettled(entry.realm_index, entry.specifier, entry.resolved);
-                    self.core.allocator.free(entry.specifier);
-                }
+            while (self.modules.state.pending_settlements.pop()) |entry| {
+                defer self.core.allocator.free(entry.specifier);
+                settleUnderOwner(self, entry);
             }
         }
 
+        /// Runs one parked settlement. Its JavaScript, the export read and
+        /// the drains around it, runs outside any turn, so the evaluation of
+        /// its module instance is installed as the turnless context and its
+        /// owner window is open around it; once that evaluation closed, as
+        /// for a settlement that came late or twice, the worker owner takes
+        /// its place.
+        fn settleUnderOwner(self: *Runtime, entry: modules_state.PendingSettlement) void {
+            var ctx = self.modulesContext();
+            const evaluation = if (modules_routes.instanceEvaluation(&ctx, entry.realm_index, entry.specifier)) |evaluation_id|
+                self.requests.active.get(evaluation_id)
+            else
+                null;
+            const exec_ctx: *bindings.ExecCtx = if (evaluation) |context| &context.exec else &self.owners.worker_exec;
+            const previous_owner_id = self.enterTurnless(exec_ctx) catch |err| {
+                // The settlement still runs: its JavaScript then finds no
+                // owner for host calls, which refuse it.
+                std.log.warn("module settlement runs without its owner: {s}", .{@errorName(err)});
+                self.handleModuleEvaluationSettled(entry.realm_index, entry.specifier, entry.resolved);
+                return;
+            };
+            defer self.leaveTurnless(previous_owner_id);
+            self.handleModuleEvaluationSettled(entry.realm_index, entry.specifier, entry.resolved);
+        }
+
         /// Moves every route that evaluates `specifier` in the realm
-        /// `realm_index` to its settled state and queues every request that
-        /// waited on it. Once no route's evaluation is left in flight, the
-        /// boot context closes. Only `collectModuleSettlements` calls it, from
-        /// the scheduler loop, never from inside a JavaScript drain.
+        /// `realm_index` to its settled state, queues every request that
+        /// waited on it, and closes the instance's evaluation once its last
+        /// route settled. `collectModuleSettlements` calls it from the
+        /// scheduler loop, never from inside a JavaScript drain.
         pub fn handleModuleEvaluationSettled(
             self: *Runtime,
             realm_index: u32,
@@ -87,97 +105,50 @@ pub fn Methods(comptime Runtime: type) type {
             resolved: bool,
         ) void {
             var ctx = self.modulesContext();
-            var settled_any = false;
             while (modules_routes.settleEvaluation(&ctx, realm_index, specifier, resolved)) |settled| {
-                settled_any = true;
                 var settlement = settled;
                 defer settlement.waiters.deinit(self.core.allocator);
                 queueSettledWaiters(self, settlement.waiters.items);
+                self.closeEvaluationOnceSettled(settlement.evaluation_id);
             }
-            if (settled_any)
-                closeBootContextOnceSettled(self);
         }
 
         /// Pins failed every route whose top-level await outlived its budget
-        /// (`expireEvaluation` in `worker/modules/routes.zig`) and queues the
-        /// requests parked on each, which then get the 500 of a failed route.
-        /// Once no route's evaluation is left in flight, the boot context
-        /// closes and ends the timers and fetches the expired evaluations
-        /// left behind; until then they run under the boot context, whose
-        /// deadline is the latest route's budget. Runs no JavaScript.
+        /// (`expireEvaluation` in `worker/modules/routes.zig`), queues the
+        /// requests parked on each, which then get the 500 of a failed route,
+        /// and closes each expired instance's evaluation, which ends the
+        /// timers and fetches its top-level code left behind. Routes that
+        /// share an instance share its deadline, so they expire in the same
+        /// call. Runs no JavaScript.
         pub fn expireRouteEvaluations(self: *Runtime) void {
             var ctx = self.modulesContext();
-            var expired_any = false;
             while (modules_routes.expireEvaluation(&ctx)) |expired| {
-                expired_any = true;
                 var settlement = expired;
                 defer settlement.waiters.deinit(self.core.allocator);
                 queueSettledWaiters(self, settlement.waiters.items);
+                self.closeEvaluationOnceSettled(settlement.evaluation_id);
             }
-            if (expired_any)
-                closeBootContextOnceSettled(self);
-        }
-
-        /// The boot context is the owner of every route's top-level code, so
-        /// it closes only once no route evaluates any more. The close disarms
-        /// its budget too, so a deadline entry already queued for the boot id
-        /// does nothing and no stale deadline reaches later work.
-        fn closeBootContextOnceSettled(self: *Runtime) void {
-            if (self.bootContext() == null)
-                return;
-            var ctx = self.modulesContext();
-            if (modules_routes.anyEvaluating(&ctx))
-                return;
-            self.closeBootContext();
         }
 
         fn queueSettledWaiters(self: *Runtime, waiters: []const u64) void {
+            // Every waiter became ready at the settlement, whenever the
+            // queue takes it.
+            const ready_since_ns = self.nowMonoNs();
             for (waiters) |request_id| {
-                if (self.tryQueueReadyWork(.{ .request = request_id }))
+                if (self.tryQueueReadyWorkReadySince(.{ .request = request_id }, ready_since_ns))
                     continue;
                 // The queue and its backlog are both full. The settled route
                 // record no longer lists the waiter, so it is parked where the
-                // stalled retry in `collectModuleSettlements` finds it. If even
-                // that allocation fails, the request ends at its deadline, and
-                // the drop is logged at err.
-                self.modules.state.stalled_waiters.append(self.core.allocator, request_id) catch {
+                // stalled retry in `collectModuleSettlements` finds it, with
+                // its readiness. If even that allocation fails, the request
+                // ends at its deadline, and the drop is logged at err.
+                self.modules.state.stalled_waiters.append(self.core.allocator, .{
+                    .request_id = request_id,
+                    .ready_since_ns = ready_since_ns,
+                }) catch {
                     std.log.err("module settlement re-queue dropped request_id={d}", .{request_id});
                 };
             }
-        }
-
-        /// Stops the loop once no route can serve (`recycle_after_drain`), or
-        /// after a sentinel deadline fire whose request already has its response
-        /// (`stop_after_deadline_fire`), once everything drained: the ready
-        /// queue, its backlog, the stalled waiters and the pending settlements
-        /// are empty, and no request but the boot context is active. The drain
-        /// gives every waiting request its own 500, since each turn on the
-        /// terminated VM fails through the response path, before the worker
-        /// stops. The scheduler loop calls it when its ready queue runs dry.
-        pub fn maybeRecycleAfterFailedEvaluation(self: *Runtime) void {
-            if (!self.modules.state.recycle_after_drain and !self.stop_after_deadline_fire)
-                return;
-            if (!self.scheduler.ready_queue.isEmpty())
-                return;
-            // The loop normally drains the backlog before calling this, but the
-            // guarantee must not depend on where the call sits: a waiter in the
-            // backlog still gets its own 500.
-            if (!self.scheduler.ready_backlog.isEmpty())
-                return;
-            if (self.modules.state.stalled_waiters.items.len != 0)
-                return;
-            if (self.modules.state.pending_settlements.items.len != 0)
-                return;
-            const active_count = self.requests.active.count();
-            const only_boot = active_count == 0 or
-                (active_count == 1 and self.requests.active.contains(request_context.boot_request_id));
-            if (!only_boot)
-                return;
-            if (self.modules.state.recycle_after_drain)
-                std.log.warn("no route of the worker can serve; recycling worker after drain", .{})
-            else
-                std.log.warn("deadline termination poisoned the VM; stopping worker after drain", .{});
-            self.core.running = false;
         }
 
         pub fn modulesContext(self: *Runtime) modules_context.Context {
@@ -187,6 +158,22 @@ pub fn Methods(comptime Runtime: type) type {
                 .modules = &self.modules.state,
                 .clock = self.core.clock,
             };
+        }
+
+        /// The realm the route at `route_index` runs in, for JavaScript the
+        /// worker calls on behalf of one of the route's contexts: a request's
+        /// handler, extraction and thenable check, a timer or immediate
+        /// callback, a request's or an evaluation's. The VM's main realm for
+        /// a route without a realm yet or an index past the table; the realm
+        /// serves only an input that has none of its own, a primitive
+        /// (`collo_invoke` in `abi.h`).
+        pub fn realmOfRoute(self: *Runtime, route_index: u16) bindings.Realm {
+            const routes = self.modules.state.routes.items;
+            if (route_index < routes.len) {
+                if (routes[route_index].realm) |realm|
+                    return realm;
+            }
+            return self.core.vm.mainRealm();
         }
     };
 }

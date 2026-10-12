@@ -28,7 +28,7 @@ std::shared_ptr<EVP_PKEY> retainSharedPkey(EVP_PKEY* key)
     return std::shared_ptr<EVP_PKEY>(key, EVP_PKEY_free);
 }
 
-JSColloCryptoKey* createHmacKey(JSC::JSGlobalObject* global_object, WebCryptoHash hash, WTF::Vector<uint8_t>&& material,
+JSColloCryptoKey* createHmacKey(JSC::JSGlobalObject* global_object, WebCryptoHash hash, SecretBytes&& material,
     bool extractable, uint8_t usages, size_t declared_length_bits)
 {
     auto& vm = global_object->vm();
@@ -88,8 +88,8 @@ std::optional<CryptoKeyAlgorithm> aesAlgorithmFromName(const String& name)
     return std::nullopt;
 }
 
-JSColloCryptoKey* createAesKey(JSC::JSGlobalObject* global_object, CryptoKeyAlgorithm algorithm,
-    WTF::Vector<uint8_t>&& material, bool extractable, uint8_t usages)
+JSColloCryptoKey* createAesKey(JSC::JSGlobalObject* global_object, CryptoKeyAlgorithm algorithm, SecretBytes&& material,
+    bool extractable, uint8_t usages)
 {
     ASSERT(isAesAlgorithm(algorithm));
     auto& vm = global_object->vm();
@@ -107,7 +107,7 @@ uint8_t allowedUsagesForAes(CryptoKeyAlgorithm algorithm)
 }
 
 JSColloCryptoKey* createRawDeriveKey(
-    JSC::JSGlobalObject* global_object, CryptoKeyAlgorithm algorithm, WTF::Vector<uint8_t>&& material, uint8_t usages)
+    JSC::JSGlobalObject* global_object, CryptoKeyAlgorithm algorithm, SecretBytes&& material, uint8_t usages)
 {
     ASSERT(algorithm == CryptoKeyAlgorithm::Pbkdf2 || algorithm == CryptoKeyAlgorithm::Hkdf);
     auto& vm = global_object->vm();
@@ -277,6 +277,18 @@ bool bnToBytes(const BIGNUM* bn, WTF::Vector<uint8_t>& out)
     out.grow(byte_length);
     if (byte_length)
         BN_bn2bin(bn, out.mutableSpan().data());
+    return true;
+}
+
+bool bnToBytes(const BIGNUM* bn, SecretBytes& out)
+{
+    if (!bn)
+        return false;
+    const size_t byte_length = BN_num_bytes(bn);
+    if (!out.tryGrow(byte_length))
+        return false;
+    if (byte_length)
+        BN_bn2bin(bn, out.data());
     return true;
 }
 

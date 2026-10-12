@@ -6,8 +6,9 @@
 //! Invariants:
 //! - A request finishes once and emits one access record. The lane writes
 //!   the record's identity, duration and every status it synthesizes; a
-//!   worker's completion supplies only its status, error code and the CPU,
-//!   I/O and waiting times.
+//!   worker's completion supplies only its status and error code, and not
+//!   even those once the lane answered the client itself
+//!   (`RequestSlot.local_answer`).
 //! - A completion parked on a request means the worker answered, so the
 //!   request ends with it whatever else ended it: a deadline, a death, a
 //!   reset or the lane's shutdown.
@@ -15,7 +16,9 @@
 //!   (`Supervisor.settleRequest` in `server/supervisor/supervisor.zig`)
 //!   before its worker slot goes back, so a worker never has more entries
 //!   than slots. A request whose begin never reached the worker leaves no
-//!   usage.
+//!   usage. The settle carries the lane's end of the request, the instant
+//!   its access record ends at, so the usage record's wall time and the
+//!   access record's duration end together.
 //! - A request that carried an egress token notes its end on the lane's
 //!   lease (`Lease.noteEnded` in `server/gateway/lease.zig`). The loop sends
 //!   the noted entries to the gateway at the end of the pass
@@ -81,10 +84,11 @@ pub const RequestOutcome = union(enum) {
     /// The client reset the stream, or its connection closed, before the
     /// worker heard of the request.
     stream_gone,
-    /// The request outlived its deadline on a worker that left service for
-    /// it (`deadline_grace_expired`): 504, or RST_STREAM once its response
-    /// head went out.
-    deadline_expired,
+    /// The request outlived its deadline on a worker that left service for a
+    /// deadline, the one this fault reason names: a request's past the grace
+    /// backstop (`deadline_grace_expired`), or its VM thread's owner's
+    /// (`owner_overran`). 504, or RST_STREAM once its response head went out.
+    deadline_expired: fault.WorkerFaultReason,
     /// The request's deadline passed while its `request_begin` waited for
     /// room in its worker's control socket: 504. The worker never heard of
     /// the request, and a send that would block is backpressure, so the
@@ -133,17 +137,19 @@ pub fn endingFor(outcome: RequestOutcome) Ending {
             .status = server_responses.get(.service_unavailable).status,
             .error_code = .done,
         },
+        // The lane refuses a request for its body alone, which the client
+        // sent wrong.
         .rejected => |response_id| .{
             .response = null,
             .status = server_responses.get(response_id).status,
-            .error_code = .done,
+            .error_code = .bad_request,
         },
         .stream_gone => .{ .response = null, .status = client_closed_status, .error_code = .client_closed },
-        .deadline_expired => .{
+        .deadline_expired => |reason| .{
             .response = .gateway_timeout,
             .status = server_responses.get(.gateway_timeout).status,
             .error_code = .deadline,
-            .worker_fault = .deadline_grace_expired,
+            .worker_fault = reason,
         },
         .send_expired => .{
             .response = .gateway_timeout,
@@ -178,6 +184,9 @@ pub fn errorCodeFromDoneStatus(status: ipc.RequestDoneStatus) CompletedStatus {
         .deadline_timeout => .deadline,
         .worker_crash => .crash,
         .client_closed => .client_closed,
+        .cpu_exceeded => .cpu,
+        .worker_retiring => .worker_retiring,
+        .worker_stopped => .worker_stopped,
     };
 }
 
@@ -274,13 +283,13 @@ pub fn Methods(comptime Self: type) type {
             _ = self.service.supervisor.poolFor(slot.route.definition).cancelWaiter(slot.request_key);
             const ending = endingFor(outcome);
             slot.access.error_code = ending.error_code;
-            emitAccessRecord(self, slot, ending.status, .server);
+            emitAccessRecord(self, slot, ending.status, .server, self.monotonicNowNs());
             if (outcome != .shutdown) {
                 if (Admission.requestConnection(self, slot)) |runtime| {
                     const stream_id = slot.ingress_channel_id;
                     if ((runtime.h2StreamState(stream_id) orelse .vacant) == .preparing) {
                         if (ending.response) |response_id|
-                            try Admission.writeH2ServerResponse(self, runtime, stream_id, response_id);
+                            _ = try Admission.writeH2ServerResponse(self, runtime, stream_id, response_id);
                         Admission.finishH2LocalResponse(self, runtime, stream_id);
                     }
                 }
@@ -313,21 +322,33 @@ pub fn Methods(comptime Self: type) type {
                 else => ending.response,
             };
             switch (ended) {
-                .worker_completion => |completion| {
+                .worker_completion => {
                     if (answer) |response_id|
                         ending.status = server_responses.get(response_id).status;
-                    // Only the worker can measure these; the duration and the
-                    // identity stay the lane's, so a worker cannot forge them.
-                    slot.access.cpu_time_ns = completion.cpu_time_ns;
-                    slot.access.io_time_ns = completion.io_time_ns;
-                    slot.access.waiting_ns = completion.waiting_ns;
                 },
                 else => self.lane.counters.completed_requests += 1,
             }
+            var answered_by: access_log.AnsweredBy = .worker;
+            if (slot.local_answer) |local| {
+                // The client got the lane's refusal of its body, and nothing
+                // the worker or its end wrote after it.
+                ending.status = server_responses.get(local).status;
+                ending.error_code = endingFor(.{ .rejected = local }).error_code;
+                answered_by = .server;
+            }
             slot.access.error_code = ending.error_code;
             slot.access.worker_fault = workerFaultLabel(ending.worker_fault);
-            emitAccessRecord(self, slot, ending.status, .worker);
-            self.service.supervisor.settleRequest(worker, slot.request_id, settleOutcomeFor(slot.begin_sent, ended));
+            // One end for both records: the usage record's wall time ends
+            // where the access record's duration does, and a drain writes
+            // the worker's usage record only once this end is noted.
+            const finished_ns = self.monotonicNowNs();
+            emitAccessRecord(self, slot, ending.status, answered_by, finished_ns);
+            self.service.supervisor.settleRequest(
+                worker,
+                slot.request_id,
+                settleOutcomeFor(slot.begin_sent, ended),
+                finished_ns,
+            );
             if (slot.egress_gateway_session_id != 0) {
                 self.egress_lease.noteEnded(slot.egress_gateway_generation, .{
                     .session_id = slot.egress_gateway_session_id,
@@ -418,6 +439,19 @@ pub fn Methods(comptime Self: type) type {
                         self.service.queueRetirement(worker);
                         break;
                     },
+                    // The last slot of a worker retiring on its notice, which
+                    // a lane still reads: that reader gives its role up
+                    // through its queue, after whatever drain runs now,
+                    // this lane's own included. A refused post leaves the
+                    // release to the reaper's retry.
+                    .release_reader => |tenure| {
+                        if (!try self.postToLane(tenure.lane, .{ .release_worker = .{
+                            .worker_key = worker.key(),
+                            .epoch = tenure.epoch,
+                        } }))
+                            self.lane.counters.release_worker_refusals += 1;
+                        break;
+                    },
                     .handed_to => |handoff| {
                         // A lane past its loop, at teardown, has no ring to
                         // dispatch with; its own waiter goes the way a refused
@@ -459,15 +493,17 @@ pub fn Methods(comptime Self: type) type {
                 try Admission.placeWaitingRequest(self, request_slot);
         }
 
-        /// Pushes the request's one access record onto this lane's ring and
-        /// clears the slot's facts, so no path emits twice. Facts never
-        /// stamped (`request_id` 0) emit nothing. The worker identity is the
-        /// slot's own, the worker this lane dispatched the request to.
+        /// Pushes the request's one access record, ended at `finished_ns` on
+        /// the lane's clock, onto this lane's ring and clears the slot's
+        /// facts, so no path emits twice. Facts never stamped (`request_id`
+        /// 0) emit nothing. The worker identity is the slot's own, the
+        /// worker this lane dispatched the request to.
         fn emitAccessRecord(
             self: *Self,
             slot: *RequestSlot,
             http_status: u16,
             answered_by: access_log.AnsweredBy,
+            finished_ns: u64,
         ) void {
             if (slot.access.request_id == 0)
                 return;
@@ -477,7 +513,7 @@ pub fn Methods(comptime Self: type) type {
                 slot.access,
                 http_status,
                 answered_by,
-                self.monotonicNowNs(),
+                finished_ns,
             ));
             slot.access.request_id = 0;
         }

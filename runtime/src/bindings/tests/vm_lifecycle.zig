@@ -1,9 +1,10 @@
 //! VM lifecycle through the wrappers: a value handle with no VM, or one whose VM was destroyed,
 //! fails instead of crashing; the fork sequence (`prepareForFork`, `postForkChild`,
-//! `reseedAfterFork`) leaves a VM that evaluates and invokes, with and without web APIs; and
-//! `postForkChild` refuses a VM inside a turn. The sequence runs in this process without a
-//! fork; a real fork is covered in `zygote-integration`. Lanes: `bindings-test` and both
-//! bindings smokes.
+//! `reseedAfterFork`) leaves a VM that evaluates and invokes, with and without web APIs;
+//! `postForkChild` refuses a VM inside a turn; and a VM watches for deferred work from its
+//! creation, so a worker never sets that up after its filter. The sequence runs in this
+//! process without a fork; a real fork is covered in `zygote-integration`. Lanes:
+//! `bindings-test` and both bindings smokes.
 
 const std = @import("std");
 const support = @import("bindings_support");
@@ -37,7 +38,7 @@ test "prepare_for_fork post_fork_child reseed roundtrip stays valid" {
 
     try support.registerModule(&vm, "/forkable.js", source);
     try bindings.setHelperThreadsTimeoutOverrideNs(5_000_000);
-    defer bindings.clearHelperThreadsTimeoutOverride();
+    defer bindings.clearHelperThreadsOverrides();
 
     try vm.prepareForFork();
     try vm.postForkChild();
@@ -76,7 +77,7 @@ fn expectForkLifecycleHolds(vm: *bindings.Vm, request_id: u64) !void {
 
     try support.registerModule(vm, "/forkable-flags.js", source);
     try bindings.setHelperThreadsTimeoutOverrideNs(5_000_000);
-    defer bindings.clearHelperThreadsTimeoutOverride();
+    defer bindings.clearHelperThreadsOverrides();
 
     try vm.prepareForFork();
     try vm.postForkChild();
@@ -145,4 +146,15 @@ test "post_fork_child rejects active turn state" {
 test "gc max heap size override setters are callable" {
     try bindings.setGcMaxHeapSizeOverrideBytes(32 * 1024 * 1024);
     bindings.clearGcMaxHeapSizeOverride();
+}
+
+test "a VM watches for deferred work from its creation, so a fresh one reports none and needs no fd" {
+    var vm = try support.createVm();
+    defer vm.deinit();
+
+    // The notification registered at creation misses no schedule, so nothing makes the gate read
+    // pending until work is scheduled, and registering or dropping a wakeup fd only stores it.
+    try std.testing.expect(!vm.deferredWorkScheduled());
+    try vm.setDeferredWorkWakeupFd(-1);
+    try std.testing.expect(!vm.deferredWorkScheduled());
 }

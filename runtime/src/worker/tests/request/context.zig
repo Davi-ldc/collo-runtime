@@ -1,8 +1,9 @@
 //! Covers the request timeline of `RequestContext` (`request/context.zig`):
 //! each transition closes the elapsed slice into the total of the state it
 //! leaves, so the request's turns, its waiting time and its I/O time
-//! partition wall time, whatever order readiness drains in, and nothing
-//! moves after the finish seals the timeline. The stamps are derived by
+//! partition wall time, whatever order readiness drains in, a ready item
+//! that vanishes before its turn gives its count back, and nothing moves
+//! after the finish seals the timeline. The stamps are derived by
 //! hand, with no clock. Runs in `worker-test`.
 
 const std = @import("std");
@@ -190,4 +191,38 @@ test "finish outside a turn closes into waiting when runnable, io when not" {
     try std.testing.expectEqual(@as(u64, 80), idle.io_time_ns);
     try std.testing.expectEqual(@as(u64, 0), idle.waiting_ns);
     try std.testing.expect(idle.timeline_sealed);
+}
+
+test "a runnable request whose only ready item is withdrawn closes waiting there and accrues I/O after" {
+    var ctx = timelineCtx(0);
+
+    // Runnable from 100; its only item vanishes at 130.
+    ctx.noteReady(100, 100, true);
+    ctx.noteReadyWithdrawn(130);
+    try std.testing.expectEqual(@as(u32, 0), ctx.ready_items);
+    try std.testing.expectEqual(@as(u64, 100), ctx.io_time_ns);
+    try std.testing.expectEqual(@as(u64, 30), ctx.waiting_ns);
+
+    // Nothing is ready from 130 to 180, which is I/O; the request is
+    // runnable again from 180 until the finish at 200. Without the
+    // withdrawal, all of 100 to 200 would read as waiting.
+    ctx.noteReady(180, 180, true);
+    try std.testing.expectEqual(@as(u64, 150), ctx.io_time_ns);
+    ctx.noteFinish(200);
+    try std.testing.expectEqual(@as(u64, 150), ctx.io_time_ns);
+    try std.testing.expectEqual(@as(u64, 50), ctx.waiting_ns);
+}
+
+test "a withdrawal inside the request's own turn only takes the count back" {
+    var ctx = timelineCtx(0);
+    ctx.noteReady(10, 10, true);
+    ctx.noteReady(10, 10, true);
+    ctx.noteTurnBegin(20, true);
+    ctx.noteReadyWithdrawn(25);
+    try std.testing.expectEqual(@as(u32, 0), ctx.ready_items);
+    ctx.noteTurnEnd(40);
+    // With nothing left ready, the time after the turn is I/O.
+    ctx.noteFinish(90);
+    try std.testing.expectEqual(@as(u64, 10 + 50), ctx.io_time_ns);
+    try std.testing.expectEqual(@as(u64, 10), ctx.waiting_ns);
 }

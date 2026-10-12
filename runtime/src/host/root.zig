@@ -11,6 +11,11 @@
 //!
 //! - `cgroup_root.zig`, `cgroup.zig`: the delegated cgroup subtree and each
 //!   worker's leaf.
+//! - `tmp_mount.zig`: the one directory every worker of the host mounts its
+//!   tmpfs over.
+//! - `host_identity.zig`: the names a host claims in a shared parent and the
+//!   proof that a host behind such a name is gone, which the boot sweeps of
+//!   the two above share.
 //! - `launch.zig`: the WorkerInit handoff, from a forked child to a ready
 //!   worker.
 //! - `handle.zig`: a ready worker's descriptors and mappings.
@@ -24,11 +29,14 @@ const process_limits = @import("collo_limits").process;
 
 pub const cgroup_root = @import("cgroup_root.zig");
 pub const cgroup = @import("cgroup.zig");
+pub const tmp_mount = @import("tmp_mount.zig");
+pub const host_identity = @import("host_identity.zig");
 pub const launch = @import("launch.zig");
 pub const handle = @import("handle.zig");
 pub const dispatch = @import("dispatch.zig");
 
 pub const WorkerCgroupRoot = cgroup_root.WorkerCgroupRoot;
+pub const TmpMountPoint = tmp_mount.TmpMountPoint;
 pub const WorkerHandle = handle.WorkerHandle;
 pub const LaunchOptions = launch.LaunchOptions;
 pub const runToReady = launch.runToReady;

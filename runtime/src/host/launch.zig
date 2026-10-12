@@ -1,19 +1,21 @@
 //! The WorkerInit handoff as a machine: from a forked child to a ready
 //! worker, or to a typed failure that hands the child back to its caller.
 //!
-//! The local steps (route table dup, tmp root, cgroup adopt, shared pages,
-//! the WorkerInit sendmsg) are microsecond syscalls and run inline in
-//! `start`. The wait for the child's answer belongs to the host: an evented
-//! host (the server's launcher, `server/supervisor/launcher.zig`) polls the
-//! init socket and the pidfd among its own descriptors and feeds `onEvent`,
-//! and the synchronous driver `runToReady` drives the same transition table
-//! with poll(2). The definition's route table and pack and the worker's
-//! egress descriptors ride WorkerInit itself: both are resident, every launch
-//! sends the worker's wake descriptors, and a launch with an egress session,
-//! which the host attaches before it starts the launch, sends the session's
-//! regions too (`LaunchEgress`). The boot token for the session is minted
-//! here, when WorkerInit is sent, because its deadline is the child window
-//! this file fixes. A launch without a session boots its child detached.
+//! The local steps (route table dup, cgroup adopt, shared pages, the
+//! WorkerInit sendmsg) are microsecond syscalls and run inline in `start`.
+//! The wait for the child's answer belongs to the host: an evented host (the
+//! server's launcher, `server/supervisor/launcher.zig`) polls the init socket
+//! and the pidfd among its own descriptors and feeds `onEvent`, and the
+//! synchronous driver `runToReady` drives the same transition table with
+//! poll(2). The definition's route table and pack, the host's tmpfs mount
+//! point (`tmp_mount.zig`) and the worker's egress descriptors ride
+//! WorkerInit itself (`LaunchEgress`): a launch for a definition without a
+//! network grant sends no egress descriptor, every other launch sends the
+//! worker's wake descriptors, and a launch with an egress session, which the
+//! host attaches before it starts the launch, sends the session's regions
+//! too. The boot token for the session is minted here, when WorkerInit is
+//! sent, because its deadline is the child window this file fixes. A granted
+//! launch without a session boots its child detached.
 //!
 //! A launch that fails neither kills, waits nor removes a cgroup on the
 //! host's thread: `abandon` releases what the machine holds and hands the
@@ -41,9 +43,6 @@ const cgroup_root = @import("cgroup_root.zig");
 const handle_mod = @import("handle.zig");
 
 const route_table = ipc.route_table;
-
-const TMP_ROOT_RANDOM_SUFFIX_BYTES: usize = 16;
-const WORKER_TMP_ROOT_MODE: u32 = zygote.worker_boot.sandbox.tmp_root.required_mode;
 
 /// Per-call packet cap of a boot-window fault drain. The deadline stays the
 /// primary bound; this bounds one drain call so a flooding worker yields the
@@ -74,7 +73,6 @@ pub const DrainOutcome = enum {
 /// Host-side cold-start spans, recorded from phase-entry timestamps.
 pub const LaunchSpans = struct {
     route_table_ns: u64 = 0,
-    tmp_root_ns: u64 = 0,
     cgroup_adopt_ns: u64 = 0,
     /// The inside of `cgroup_adopt_ns`: probe, rewrite, path resolution.
     cgroup_adopt: cgroup.AdoptSpans = .{},
@@ -86,8 +84,6 @@ pub const LaunchSpans = struct {
 
 pub const LaunchError = error{
     WorkerCgroupNotPrepared,
-    InvalidWorkerTmpRootMode,
-    InvalidWorkerTmpRootOwner,
     InvalidBootOptions,
     /// A detached launch could not open the worker's wake descriptors from
     /// its wake set (`ipc.egress_shared.WakeSet.openWorkerWake`), for want of
@@ -158,10 +154,15 @@ pub const BootEgress = struct {
     budget: u32,
 };
 
-/// The egress descriptors a launch sends with WorkerInit: the worker's wake
-/// descriptors always, and with a session its regions beside the boot token,
-/// the pairing `ipc.zygote_worker` requires.
+/// The egress descriptors a launch sends with WorkerInit: none for a
+/// definition without a network grant, else the worker's wake descriptors,
+/// and with a session its regions beside the boot token, the pairing
+/// `ipc.zygote_worker` requires.
 pub const LaunchEgress = union(enum) {
+    /// The definition has no network grant: WorkerInit carries no egress
+    /// descriptor and leaves `flag_egress` clear, and the worker can never
+    /// be attached to a gateway.
+    none,
     /// No session: the child boots detached with wake descriptors this launch
     /// opens from the worker's wake set, borrowed for the length of `start`
     /// (`ipc.egress_shared.WakeSet.openWorkerWake`). Every fetch is refused
@@ -196,9 +197,12 @@ pub const LaunchRoutes = struct {
 };
 
 pub const LaunchOptions = struct {
-    /// Every launch sends the worker's wake descriptors, so every host
-    /// passes the worker's wake set or a session built on it.
+    /// What the worker gets to reach the egress gateway with.
     egress: LaunchEgress,
+    /// The host's tmpfs mount point (`tmp_mount.zig:TmpMountPoint.fd`),
+    /// borrowed for the length of `start`; every worker of the host mounts
+    /// its own tmpfs over it.
+    tmp_mount_point_fd: std.posix.fd_t,
     /// The routes the worker launches with. A launch with routes sets
     /// `flag_serves_routes`, and the child evaluates every route's entry
     /// before it reports ready, with timers for module top-level code and,
@@ -215,6 +219,13 @@ pub const LaunchOptions = struct {
     /// Runtime limits and diagnostic flags the child boots with; validated
     /// before WorkerInit is sent.
     boot: ipc.WorkerRuntimeBootOptions = ipc.WorkerRuntimeBootOptions.default(),
+    /// The CPU each request of the worker may spend, 0 for no budget
+    /// (`WorkerInit.request_cpu_budget_ns`).
+    request_cpu_budget_ns: u64 = 0,
+    /// The wall time JavaScript no request owns may run at a stretch in the
+    /// worker (`WorkerInit.unowned_time_limit_ns`); a server passes its
+    /// definition's request timeout.
+    unowned_time_limit_ns: u64 = ipc.WorkerInit.default_unowned_time_limit_ns,
     /// The sealed fs index, borrowed; null sends the placeholder index of a
     /// tree with no files.
     fs_index_memfd: ?std.posix.fd_t = null,
@@ -330,8 +341,6 @@ pub const Machine = struct {
     // Local resources, owned until handle assembly or `abandon`.
     route_table_memfd: std.posix.fd_t = -1,
     route_table_len: u64 = 0,
-    tmp_root: ?[]u8 = null,
-    tmp_root_dir_fd: std.posix.fd_t = -1,
     cgroup_dir: ?[]u8 = null,
     cgroup_dir_fd: std.posix.fd_t = -1,
     metrics_fd: std.posix.fd_t = -1,
@@ -372,8 +381,8 @@ pub const Machine = struct {
     }
 
     /// Takes every descriptor `forked` holds, so `forked` is empty whatever
-    /// the outcome, runs the local steps (route table, tmp root, cgroup
-    /// adopt, shared resources) and sends WorkerInit. The result asks the
+    /// the outcome, runs the local steps (route table, cgroup adopt, shared
+    /// resources) and sends WorkerInit. The result asks the
     /// host to poll the init socket and the pidfd, or reports the failure;
     /// after a failure the host calls `abandon`.
     pub fn start(self: *Machine, forked: *zygote.host_client.ForkedWorker) StepResult {
@@ -438,21 +447,6 @@ pub const Machine = struct {
         self.route_table_len = table.blob_len;
         self.spans.route_table_ns = spanDelta(&span_cursor_ns);
 
-        const tmp_root = makeTmpRoot(self.allocator, self.pid) catch return error.OutOfMemory;
-        self.tmp_root = tmp_root;
-        createTmpRoot(tmp_root) catch return error.ZygoteProtocol;
-        const tmp_dir = openValidatedTmpRoot(tmp_root) catch |err| return switch (err) {
-            error.InvalidWorkerTmpRootMode => error.InvalidWorkerTmpRootMode,
-            error.InvalidWorkerTmpRootOwner => error.InvalidWorkerTmpRootOwner,
-            else => error.ZygoteProtocol,
-        };
-        self.tmp_root_dir_fd = tmp_dir.fd;
-        self.traceFmt("host.worker.tmp_root={s}", .{tmp_root});
-        // Every span closes after its own trace write: a trace write is a
-        // write(2) into the zygote's pipe, and one between two cursors would
-        // be counted in the phase that follows.
-        self.spans.tmp_root_ns = spanDelta(&span_cursor_ns);
-
         self.cgroup_dir = cgroup.adoptPreparedWorkerDir(
             self.allocator,
             self.cgroup_dir_fd,
@@ -480,11 +474,7 @@ pub const Machine = struct {
 
         var metrics = worker_shared_page.mapReadWrite(self.metrics_fd) catch
             return error.ZygoteProtocol;
-        metrics.initializeCrashDefault(
-            self.pid,
-            self.memory_limit_bytes,
-            process.monotonicNowNs() catch return error.ZygoteProtocol,
-        );
+        metrics.initializeCrashDefault();
         self.metrics = metrics;
         self.ingress_payload = ipc.ingress_channel.mapSharedPayloadReadWrite(self.ingress_payload_fd, .server) catch
             return error.ZygoteProtocol;
@@ -542,7 +532,10 @@ pub const Machine = struct {
         self.options.boot.validate() catch return error.InvalidBootOptions;
         var detached_wake: ipc.egress_shared.WakeFds = .{};
         defer detached_wake.close();
+        // The sender sets `flag_egress` exactly when the set holds the wake
+        // descriptors, so an empty set leaves the child without any.
         const egress_fds: ipc.egress_shared.RawFds = switch (self.options.egress) {
+            .none => .{},
             .detached => |wake_set| blk: {
                 detached_wake = wake_set.openWorkerWake() catch return error.EgressWakeUnavailable;
                 break :blk ipc.egress_shared.RawFds.wakeOnly(detached_wake);
@@ -556,8 +549,10 @@ pub const Machine = struct {
         message.tmpfs_size_bytes = resolveTmpfsSizeBytes(self.memory_limit_bytes, self.options.tmpfs_size_bytes);
         message.route_table_len = self.route_table_len;
         message.init_deadline_mono_ns = self.child_init_deadline_abs_ns;
+        message.request_cpu_budget_ns = self.options.request_cpu_budget_ns;
+        message.unowned_time_limit_ns = self.options.unowned_time_limit_ns;
         message.boot_egress_token = switch (self.options.egress) {
-            .detached => ipc.egress_token.none,
+            .none, .detached => ipc.egress_token.none,
             .attached => |*attached| self.mintBootToken(&attached.boot),
         };
         message.enableEgressGatewaySandbox();
@@ -573,7 +568,7 @@ pub const Machine = struct {
             self.completion_eventfd,
             self.ingress_payload_fd,
             self.ingress_payload_credit_eventfd,
-            self.tmp_root_dir_fd,
+            self.options.tmp_mount_point_fd,
             self.cgroup_dir_fd,
             self.route_table_memfd,
             egress_fds,
@@ -753,7 +748,6 @@ pub const Machine = struct {
             self.pid,
             self.pidfd,
             self.worker_init_fd,
-            self.tmp_root.?,
             self.cgroup_dir.?,
             self.memory_limit_bytes,
             self.options.cpu_max_cores,
@@ -765,14 +759,11 @@ pub const Machine = struct {
             self.metrics.?,
             self.fs_fault_server_fd,
         ) catch return error.OutOfMemory;
-        self.allocator.free(self.tmp_root.?);
-        self.tmp_root = null;
         // The prepared fd rode the WorkerInit; the handle cleans by path.
         std.posix.close(self.cgroup_dir_fd);
         self.cgroup_dir_fd = -1;
         self.allocator.free(self.cgroup_dir.?);
         self.cgroup_dir = null;
-        self.tmp_root_dir_fd = closeIfHeld(self.tmp_root_dir_fd);
         self.placeholder_fs_index_fd = closeIfHeld(self.placeholder_fs_index_fd);
         self.pidfd = -1;
         self.worker_init_fd = -1;
@@ -807,11 +798,9 @@ pub const Machine = struct {
     /// Releases everything the machine owns except the child's pidfd and its
     /// cgroup leaf, which the result hands to the caller: the init socket,
     /// the descriptors and mappings shared with the child, the bindings
-    /// memfd, the fault scratch and the tmp root, whose directory the child
-    /// sees only through its own mount namespace. Never signals, waits or
-    /// retries, so an evented host calls it on its loop and leaves
-    /// `AbandonedChild.reap` to a thread that may block. The machine is
-    /// spent afterwards.
+    /// memfd and the fault scratch. Never signals, waits or retries, so an
+    /// evented host calls it on its loop and leaves `AbandonedChild.reap` to
+    /// a thread that may block. The machine is spent afterwards.
     pub fn abandon(self: *Machine) AbandonedChild {
         var child: AbandonedChild = .{ .pid = self.pid };
         if (self.pidfd >= 0) {
@@ -839,18 +828,6 @@ pub const Machine = struct {
         self.placeholder_fs_index_fd = closeIfHeld(self.placeholder_fs_index_fd);
         self.fs_fault_server_fd = closeIfHeld(self.fs_fault_server_fd);
         self.fs_fault_worker_fd = closeIfHeld(self.fs_fault_worker_fd);
-        self.tmp_root_dir_fd = closeIfHeld(self.tmp_root_dir_fd);
-        if (self.tmp_root) |tmp_root| {
-            std.fs.deleteTreeAbsolute(tmp_root) catch |err| switch (err) {
-                error.FileNotFound => {},
-                else => std.log.warn(
-                    "failed to cleanup tmp_root '{s}': {s}",
-                    .{ tmp_root, @errorName(err) },
-                ),
-            };
-            self.allocator.free(tmp_root);
-            self.tmp_root = null;
-        }
         if (self.cgroup_dir) |dir| {
             self.allocator.free(dir);
             self.cgroup_dir = null;
@@ -1086,29 +1063,4 @@ fn resolveTmpfsSizeBytes(memory_limit_bytes: u64, configured_bytes: ?u64) u64 {
             return @min(bytes, memory_limit_bytes);
     }
     return ipc.WorkerInit.defaultTmpfsSizeBytes(memory_limit_bytes);
-}
-
-fn makeTmpRoot(allocator: std.mem.Allocator, pid: u32) ![]u8 {
-    var suffix: [TMP_ROOT_RANDOM_SUFFIX_BYTES]u8 = undefined;
-    std.crypto.random.bytes(&suffix);
-    const suffix_hex = std.fmt.bytesToHex(suffix, .lower);
-    return std.fmt.allocPrint(allocator, "/tmp/collo-{d}-{s}", .{ pid, suffix_hex });
-}
-
-fn createTmpRoot(path: []const u8) !void {
-    // The path carries a cryptographically random suffix, and creation is
-    // still exclusive so a pre-created path or symlink never becomes a
-    // worker tmp.
-    try std.posix.mkdir(path, WORKER_TMP_ROOT_MODE);
-}
-
-fn openValidatedTmpRoot(path: []const u8) !std.fs.Dir {
-    var dir = try std.fs.openDirAbsolute(path, .{ .no_follow = true });
-    errdefer dir.close();
-    const stat = try std.posix.fstat(dir.fd);
-    if ((stat.mode & 0o7777) != WORKER_TMP_ROOT_MODE)
-        return error.InvalidWorkerTmpRootMode;
-    if (stat.uid != std.os.linux.getuid())
-        return error.InvalidWorkerTmpRootOwner;
-    return dir;
 }

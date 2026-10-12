@@ -1,7 +1,30 @@
 //! C/C++ pieces that ride along the Zig build: the JSC bridge, the BoringSSL
 //! and ls-hpack shims, and the sanitizer plumbing shared by all of them.
+//! Every third-party header they include comes from a pinned build or tree
+//! (deps.zig, codecs.zig), never from the machine.
+//!
+//! The build-tool suites compile this file and buildtool.zig as two modules
+//! of one test binary, and Zig refuses a file that belongs to two modules, so
+//! nothing this file imports may reach buildtool.zig: the native builds
+//! arrive as `HeaderDir` values deps.zig makes.
 const std = @import("std");
+const codecs_mod = @import("codecs.zig");
+const tool_mod = @import("tool.zig");
 const toolchain_mod = @import("toolchain.zig");
+
+/// A directory of headers a compilation includes, and the step that
+/// produces it when a build outside Zig's cache does.
+pub const HeaderDir = struct {
+    /// Absolute.
+    path: []const u8,
+    step: ?*std.Build.Step = null,
+
+    pub fn addTo(headers: HeaderDir, compile: *std.Build.Step.Compile) void {
+        compile.addIncludePath(.{ .cwd_relative = headers.path });
+        if (headers.step) |step|
+            compile.step.dependOn(step);
+    }
+};
 
 pub const binding_include_paths = [_][]const u8{
     "runtime/src/bindings",
@@ -105,6 +128,7 @@ const binding_sources = [_][]const u8{
     "runtime/src/bindings/host_functions/webapi/url/pattern/binding.cpp",
     "runtime/src/bindings/host_functions/server/fetch/request.cpp",
     "runtime/src/bindings/host_functions/server/fetch/response.cpp",
+    "runtime/src/bindings/host_functions/server/fetch/response_body_stream.cpp",
     "runtime/src/bindings/host_functions/server/fetch/fetch.cpp",
     "runtime/src/bindings/host_functions/webapi/platform/timers.cpp",
     "runtime/src/bindings/host_functions/registry.cpp",
@@ -167,16 +191,33 @@ const hpack_cflags = [_][]const u8{
     "-DXXH_HEADER_NAME=\"xxhash.h\"",
 };
 
+/// What `-Dsanitize` instruments. Every mode covers Collo's C++ (the bridge,
+/// the BoringSSL shim, the TLS and SecretBytes test shims and the sandbox
+/// bench's client) and never the engine, ICU, BoringSSL or the codecs, which
+/// are built by their own recipes.
 pub const BindingsSanitizerMode = enum {
     none,
+    /// ASan and LSan, in the C++ and, where the toolchain can, in Zig.
     address_leak,
+    /// UBSan's alignment and float-cast-overflow checks, in the C++ only.
+    /// They catch the two kinds of undefined behavior that x86_64 and ARM64
+    /// execute without a fault (a misaligned `char16_t` read, a float cast to
+    /// an integer that cannot hold it), so no other lane can fail on them.
+    /// A report aborts the process instead of continuing.
+    undefined_behavior,
 };
+
+/// The checks of `BindingsSanitizerMode.undefined_behavior`. The recover and
+/// trap lists repeat them so each check reports, then aborts.
+const undefined_behavior_checks = "alignment,float-cast-overflow";
 
 pub const BindingsSanitizer = struct {
     mode: BindingsSanitizerMode = .none,
 
-    pub fn enabled(self: BindingsSanitizer) bool {
-        return self.mode != .none;
+    /// Whether Zig modules are instrumented too. UBSan's checks exist only
+    /// for C and C++; Zig's safety checks cover the same faults in Zig.
+    pub fn instrumentsZig(self: BindingsSanitizer) bool {
+        return self.mode == .address_leak;
     }
 
     pub fn cFlags(self: BindingsSanitizer) []const []const u8 {
@@ -187,14 +228,29 @@ pub const BindingsSanitizer = struct {
                 "-fno-omit-frame-pointer",
                 "-g",
             },
+            .undefined_behavior => &.{
+                "-fsanitize=" ++ undefined_behavior_checks,
+                "-fno-sanitize-recover=" ++ undefined_behavior_checks,
+                // Zig's own C flags may ask for trap mode, which would end
+                // the process with SIGILL and no report.
+                "-fno-sanitize-trap=" ++ undefined_behavior_checks,
+                "-fno-omit-frame-pointer",
+                "-g",
+            },
         };
     }
 
+    /// The final link is driven by the native C++ driver, which adds the
+    /// sanitizer's runtime library for these flags.
     pub fn linkArgs(self: BindingsSanitizer) []const []const u8 {
         return switch (self.mode) {
             .none => &.{},
             .address_leak => &.{
                 "-fsanitize=address,leak",
+                "-fno-omit-frame-pointer",
+            },
+            .undefined_behavior => &.{
+                "-fsanitize=" ++ undefined_behavior_checks,
                 "-fno-omit-frame-pointer",
             },
         };
@@ -206,6 +262,10 @@ pub const BindingsSanitizer = struct {
             .address_leak => .{
                 .key = "ASAN_OPTIONS",
                 .value = "detect_leaks=1:halt_on_error=1:allocator_may_return_null=1",
+            },
+            .undefined_behavior => .{
+                .key = "UBSAN_OPTIONS",
+                .value = "print_stacktrace=1:halt_on_error=1",
             },
         };
     }
@@ -240,11 +300,21 @@ pub fn parseBindingsSanitizer(name: []const u8) BindingsSanitizer {
     {
         return .{ .mode = .address_leak };
     }
+    if (std.mem.eql(u8, name, "undefined") or std.mem.eql(u8, name, "ubsan")) {
+        return .{ .mode = .undefined_behavior };
+    }
     std.process.fatal(
-        "invalid bindings sanitizer '{s}'; expected none or address,leak",
+        "invalid bindings sanitizer '{s}'; expected none, address,leak or undefined",
         .{name},
     );
 }
+
+/// The pinned libraries whose headers the bridge includes.
+pub const BridgeLibraries = struct {
+    icu: HeaderDir,
+    boringssl: HeaderDir,
+    codecs: *const codecs_mod.Codecs,
+};
 
 pub fn configureBridgeLibrary(
     b: *std.Build,
@@ -254,6 +324,7 @@ pub fn configureBridgeLibrary(
     jsc_cmake_build_type: []const u8,
     jsc_build_dir: []const u8,
     webkit_source_dir: []const u8,
+    libraries: BridgeLibraries,
     sanitizer: BindingsSanitizer,
 ) void {
     const cflags = bindingCFlags(jsc_cmake_build_type) catch
@@ -266,12 +337,17 @@ pub fn configureBridgeLibrary(
         .flags = toolchain_mod.cxxFlagsWithTarget(b, toolchain, cflags, sanitizer),
     });
     artifact.root_module.link_libc = true;
-    if (sanitizer.enabled())
+    if (sanitizer.instrumentsZig())
         sanitizeZigModule(artifact.root_module);
 
     for (binding_include_paths) |path|
         artifact.addIncludePath(b.path(path));
-    artifact.addIncludePath(b.path("runtime/deps/boringssl/include"));
+    libraries.boringssl.addTo(artifact);
+    // The engine's headers include ICU's, and they must resolve to the build
+    // the engine compiled against. An include path is searched before every
+    // system directory below, so the machine's ICU, if any, is never read.
+    libraries.icu.addTo(artifact);
+    codecs_mod.addBridgeIncludes(artifact, libraries.codecs);
     for (webkit_include_suffixes) |suffix|
         artifact.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ webkit_source_dir, suffix }) });
     for (jscIncludeDirs(b, jsc_build_dir)) |path|
@@ -310,17 +386,21 @@ pub fn configureBindingsTestObject(artifact: *std.Build.Step.Compile, libc_file:
     artifact.setLibCFile(libc_file);
 }
 
+/// The production BoringSSL shim, compiled against BoringSSL's patched
+/// headers (`deps.BoringSsl.headers`). `configureBoringSslTestShim` relies on
+/// the include path this adds.
 pub fn configureBoringSslShim(
     b: *std.Build,
     artifact: *std.Build.Step.Compile,
     toolchain: *const toolchain_mod.ToolchainPaths,
+    boringssl_headers: HeaderDir,
     sanitizer: BindingsSanitizer,
 ) void {
     artifact.root_module.addCSourceFiles(.{
         .files = &.{"runtime/src/bindings/boringssl/shim.cc"},
         .flags = toolchain_mod.cxxFlagsWithTarget(b, toolchain, &boringssl_shim_cflags, sanitizer),
     });
-    artifact.addIncludePath(b.path("runtime/deps/boringssl/include"));
+    boringssl_headers.addTo(artifact);
     for (toolchain.systemIncludeDirs()) |path|
         artifact.addSystemIncludePath(.{ .cwd_relative = path });
 }
@@ -335,6 +415,24 @@ pub fn configureBoringSslTestShim(
         .files = &.{"runtime/tests/support/tls/tls_shim.cc"},
         .flags = toolchain_mod.cxxFlagsWithTarget(b, toolchain, &boringssl_shim_cflags, sanitizer),
     });
+}
+
+/// The test harness of WebCrypto's `SecretBytes`
+/// (`runtime/tests/support/bindings/secret_bytes_shim.cc`), which includes
+/// the bridge header under test from `runtime/src/bindings` and BoringSSL's
+/// headers through the include path `configureBoringSslShim` adds to the
+/// same artifact. `bindings_support.runSecretBytesScenarios` calls it.
+pub fn configureSecretBytesTestShim(
+    b: *std.Build,
+    artifact: *std.Build.Step.Compile,
+    toolchain: *const toolchain_mod.ToolchainPaths,
+    sanitizer: BindingsSanitizer,
+) void {
+    artifact.root_module.addCSourceFiles(.{
+        .files = &.{"runtime/tests/support/bindings/secret_bytes_shim.cc"},
+        .flags = toolchain_mod.cxxFlagsWithTarget(b, toolchain, &boringssl_shim_cflags, sanitizer),
+    });
+    artifact.addIncludePath(b.path("runtime/src/bindings"));
 }
 
 /// `collo_test_tls_shim`: the one Zig declaration of each export of the test
@@ -364,11 +462,16 @@ fn addLsHpackFileInputs(
     root_path: []const u8,
     mode: LsHpackInputMode,
 ) void {
-    var root = b.build_root.handle.openDir(root_path, .{ .iterate = true }) catch |err|
-        std.process.fatal("cannot enumerate ls-hpack inputs in {s}: {s}", .{
+    var root = b.build_root.handle.openDir(root_path, .{ .iterate = true }) catch |err| switch (err) {
+        // A clone that has not run `deps-provision` must still configure, or
+        // that step could never run. The patch run waits on the pinned-tree
+        // verification, which fails the build first and names the step.
+        error.FileNotFound => return,
+        else => std.process.fatal("cannot enumerate ls-hpack inputs in {s}: {s}", .{
             root_path,
             @errorName(err),
-        });
+        }),
+    };
     defer root.close();
 
     var paths: std.ArrayList([]const u8) = .empty;
@@ -389,6 +492,10 @@ fn addLsHpackFileInputs(
                     @errorName(err),
                 })) |entry|
             {
+                // The checkout's git metadata is not source, and the patch
+                // tool leaves it out of the generated copy.
+                if (std.mem.eql(u8, entry.path, ".git") or std.mem.startsWith(u8, entry.path, ".git" ++ std.fs.path.sep_str))
+                    continue;
                 const kind = if (entry.kind == .unknown) blk: {
                     var target_buffer: [std.fs.max_path_bytes]u8 = undefined;
                     if (root.readLink(entry.path, &target_buffer)) |_| {
@@ -452,18 +559,20 @@ fn addLsHpackFileInputs(
         run.addFileInput(b.path(path));
 }
 
-pub fn addPatchedLsHpackSourceStep(b: *std.Build) std.Build.LazyPath {
-    const tool = b.addExecutable(.{
-        .name = "patch-ls-hpack",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("runtime/build/buildtool.zig"),
-            .target = b.graph.host,
-            .optimize = .Debug,
-        }),
-    });
-    const run = b.addRunArtifact(tool);
-    // argv: apply-patches <source_dir> <patch_dir> <out_dir>; the output dir is
-    // content-addressed by zig, so a stable tool yields a cache hit.
+/// The ls-hpack tree with its series applied, as a directory in Zig's cache.
+/// `verify` proves the tree pristine at its pin before it is read.
+pub fn addPatchedLsHpackSourceStep(
+    b: *std.Build,
+    tool: *const tool_mod.Tool,
+    verify: *std.Build.Step,
+) std.Build.LazyPath {
+    // Not `tool.addRun`: this run is pure, and its output directory is
+    // content-addressed by Zig, so a stable tool and stable inputs hit the
+    // cache.
+    const run = b.addRunArtifact(tool.executable);
+    run.setName("patch ls-hpack");
+    run.step.dependOn(verify);
+    // argv: apply-patches <source_dir> <patch_dir> <out_dir>
     run.addArg("apply-patches"); // buildtool subcommand
     run.addDirectoryArg(b.path("runtime/deps/ls-hpack"));
     run.addDirectoryArg(b.path("runtime/patches/ls-hpack"));
@@ -494,17 +603,4 @@ pub fn configureHpackShim(
     });
     artifact.addIncludePath(patched_ls_hpack_source);
     artifact.addIncludePath(b.path("runtime/deps/ls-hpack/deps/xxhash"));
-}
-
-/// BoringSSL static archives for an artifact that links TLS without the JSC
-/// bridge (stub-graph tests and benches).
-pub fn linkBoringSslArchives(
-    b: *std.Build,
-    artifact: *std.Build.Step.Compile,
-    boringssl_build_dir: []const u8,
-) void {
-    artifact.root_module.addObjectFile(b.path(b.pathJoin(&.{ boringssl_build_dir, "libssl.a" })));
-    artifact.root_module.addObjectFile(b.path(b.pathJoin(&.{ boringssl_build_dir, "libcrypto.a" })));
-    artifact.root_module.linkSystemLibrary("dl", .{});
-    artifact.root_module.linkSystemLibrary("pthread", .{});
 }

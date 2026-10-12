@@ -1,14 +1,15 @@
 //! The test-network fixture, module `collo_test_net`: an IPv4 address of this
-//! host that the egress client agrees to connect to. The egress policy refuses
-//! loopback, so a test that serves an origin on this host has the client dial
-//! the source address the kernel picks for the default route. A host without
-//! such an address skips the test instead of failing it. The fixture imports
-//! `collo_egress_client`, so `runtime/build/tests.zig` builds one instance per
-//! bindings flavor. It keeps no state and runs on the calling test's thread.
+//! host that the egress client agrees to connect to. Every `network` grant
+//! refuses loopback, so a test that serves an origin on this host has the
+//! client dial the source address the kernel picks for the default route. A
+//! host without such an address skips the test instead of failing it. The
+//! fixture imports `collo_network`, which both module graphs build, so
+//! `runtime/build/tests.zig` builds one instance per bindings flavor. It
+//! keeps no state and runs on the calling test's thread.
 
 const std = @import("std");
 
-const transport = @import("collo_egress_client").transport;
+const address_rules = @import("collo_network").address;
 
 // A public address, so the probe follows the default route.
 const route_probe_ipv4 = "1.1.1.1";
@@ -16,15 +17,14 @@ const route_probe_port: u16 = 9;
 
 /// Writes the address into `out` in dotted decimal and returns that slice.
 /// Fails with `error.SkipZigTest` when the host has no IPv4 default route, or
-/// when its source address is one the egress policy refuses even with private
+/// when its source address is of a class no grant reaches even with private
 /// networks allowed, such as link-local or shared carrier space.
 pub fn routableLocalIpv4(out: *[64]u8) ![]const u8 {
     const address = try defaultRouteSourceAddress();
-    (transport.EgressPolicy{ .allow_private_networks = true }).validateResolvedAddress(address) catch {
+    if (!address_rules.permitted(address_rules.classify(address), true))
         return error.SkipZigTest;
-    };
 
-    const bytes = transport.ipv4Bytes(address);
+    const bytes = address_rules.ipv4Bytes(address);
     return std.fmt.bufPrint(
         out,
         "{d}.{d}.{d}.{d}",

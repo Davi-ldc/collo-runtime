@@ -1092,20 +1092,6 @@ namespace {
             return true;
         }
 
-        bool appendRemainingBytes(WTF::Vector<uint8_t>& out) override
-        {
-            if (!m_storage || m_position >= m_size) {
-                m_position = m_size;
-                m_storage = nullptr;
-                return true;
-            }
-            if (!m_storage->appendTo(out, m_offset + m_position, m_size - m_position))
-                return false;
-            m_position = m_size;
-            m_storage = nullptr;
-            return true;
-        }
-
         bool appendRemainingBytes(
             WTF::Vector<uint8_t>& out, size_t max_size, bool& out_exceeds_limit, bool& out_supported) override
         {

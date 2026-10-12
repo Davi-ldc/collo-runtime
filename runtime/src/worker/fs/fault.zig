@@ -11,13 +11,13 @@
 //! ended or moved to a new generation, so a fault never settles into the
 //! wrong request.
 //!
-//! A fault request carries its first reader's identity. The boot context
-//! has no worker identity, which a worker learns only from DispatchWork, so
-//! inside the boot evaluation window it faults with an all-zero identity.
-//! After the window its faults are denied here (`faultIdentity`), as the
-//! host end refuses that identity once the worker is ready. Responses are
-//! never gated by the window: an async boot fault answered after ready
-//! still settles.
+//! A fault request carries its first reader's identity. An evaluation, the
+//! owner of a route module's top-level code, has no worker identity, which a
+//! worker learns only from DispatchWork, so inside the boot evaluation window
+//! it faults with an all-zero identity. After the window its faults are
+//! denied here (`faultIdentity`), as the host end refuses that identity once
+//! the worker is ready. Responses are never gated by the window: an async
+//! boot fault answered after ready still settles.
 //!
 //! Which file holds what:
 //! - This file: the fault table with its caps, the identity a fault request
@@ -124,8 +124,8 @@ pub const State = struct {
     rescan_needed: bool = false,
     /// True only while the synchronous evaluation of the routes' entries
     /// runs (`Runtime.evaluateBootRoutes`), which ends before the worker
-    /// sends its ready message. Inside it the boot context faults with the
-    /// all-zero identity; after it `faultIdentity` denies the boot context,
+    /// sends its ready message. Inside it an evaluation faults with the
+    /// all-zero identity; after it `faultIdentity` denies every evaluation,
     /// as the host end refuses that identity once the worker is ready.
     /// Responses are never gated by it.
     boot_window_open: bool = false,
@@ -151,15 +151,15 @@ const FaultIdentity = struct {
 };
 
 /// The request's own ids with the worker identity from its DispatchWork, or
-/// all zeros for the boot context inside the boot window. Fails with
-/// `error.FsFaultOutsideActiveRequest` when no such request is active, or
-/// when it has no generation and is not the boot context inside the window.
+/// all zeros for an evaluation inside the boot window. Fails with
+/// `error.FsFaultOutsideActiveRequest` when no such owner is active, or when
+/// it has no generation and is not an evaluation inside the window.
 pub fn faultIdentity(runtime: anytype, request_id: u64, key: []const u8) !FaultIdentity {
     const state: *State = &runtime.fs_fault;
     const request = runtime.requests.active.get(request_id) orelse
         return error.FsFaultOutsideActiveRequest;
     if (request.request_generation == 0) {
-        if (request_id != request_context.boot_request_id or !state.boot_window_open) {
+        if (!request_context.isEvaluationId(request_id) or !state.boot_window_open) {
             runtime.traceRuntimeEvent("worker.fs_fault.boot_denied={s}", .{key});
             return error.FsFaultOutsideActiveRequest;
         }
@@ -245,8 +245,8 @@ pub fn schedule(
             // its settle sub-turn is queue wait, not io. Its ready item is
             // counted here, which only increments the counter because the
             // request is running its own turn, and the settle consumes it as
-            // for every other waiter.
-            if (existing.done and existing.queued) {
+            // for every other waiter. An evaluation keeps no timeline.
+            if (existing.done and existing.queued and !request_context.isReservedId(request_id)) {
                 const joined = &existing.waiters.items[existing.waiters.items.len - 1];
                 request.noteReady(existing.completed_at_ns, runtime.nowMonoNs(), true);
                 joined.ready_counted = true;

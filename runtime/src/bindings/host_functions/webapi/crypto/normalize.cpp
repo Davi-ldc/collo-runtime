@@ -10,6 +10,7 @@
 #include "host_functions/webapi/crypto/keys.h"
 #include "jsc/runtime/js_support.h"
 
+#include <JavaScriptCore/Error.h>
 #include <JavaScriptCore/IdentifierInlines.h>
 #include <JavaScriptCore/JSCInlines.h>
 #include <wtf/text/MakeString.h>
@@ -236,6 +237,19 @@ JSC::JSArray* createUsagesArray(JSC::JSGlobalObject* global_object, JSC::VM& vm,
             return nullptr;
     }
     return result;
+}
+
+bool copySecretBufferSource(JSC::JSGlobalObject* global_object, JSC::TopExceptionScope& scope, JSValue value,
+    SecretBytes& out, JSC::JSValue& out_error)
+{
+    std::span<const uint8_t> bytes;
+    if (!borrowBufferSource(global_object, value, bytes, out_error))
+        return false;
+    if (!out.tryAppend(bytes)) {
+        out_error = JSC::createOutOfMemoryError(global_object);
+        return false;
+    }
+    return !takePendingException(scope, out_error);
 }
 
 static bool getRequiredBufferSourcePropertyCopy(JSC::JSGlobalObject* global_object, JSC::TopExceptionScope& scope,

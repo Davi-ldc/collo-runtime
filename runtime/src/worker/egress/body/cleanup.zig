@@ -6,6 +6,12 @@
 //! while JS may hold tee branches cloned from it. Releasing a view therefore
 //! stops the fetch only once no view can still read it, and `release` keeps a
 //! released source in the table while it is open and feeds branches.
+//!
+//! A body that leaves the table, or a cancelled view left with no reader and
+//! no decoder, may still have a `fetch_body_ready` item queued that will
+//! answer no reader; its request takes that ready count back at once
+//! (`Context.withdrawReady`), so the time until the item pops is not counted
+//! as waiting, and the item pops in no window.
 
 const std = @import("std");
 const bindings = @import("collo_bindings");
@@ -31,10 +37,17 @@ pub fn cancel(runtime: *egress_context.Context, identity: bindings.FetchBodyIden
     if (cancel_identity) |source_identity|
         cancelSource(runtime, source_identity);
     const ready = body.cancelViewOnly(runtime.allocator, "fetch aborted", null) catch body.cancelViewOnlyNoAlloc();
-    if (ready and body.claimReadyForQueue()) {
-        if (!runtime.tryQueueReady(.{ .fetch_body_ready = body.identity.body_id })) {
-            body.clearReadyQueued();
+    if (ready) {
+        if (body.claimReadyForQueue()) {
+            if (!runtime.tryQueueReady(.{ .fetch_body_ready = body.identity.body_id })) {
+                body.clearReadyQueued();
+            }
         }
+    } else if (!runtime.egress_state.body_decoders.contains(body.identity.body_id)) {
+        // The view lost its readers and has no decoder to resume, so an item
+        // queued for it before the cancel answers nobody; it only drops the
+        // view, which needs no window of the request.
+        runtime.withdrawReady(.{ .fetch_body_ready = body.identity.body_id });
     }
     runtime.wake();
 }
@@ -163,6 +176,8 @@ pub fn releaseInternal(
     // its pending pool extents.
     _ = runtime.egress_state.removeBodyDecoder(runtime.allocator, identity.body_id);
     removed.value.releaseAfterQueuedResourcesReleased(runtime.allocator);
+    // An item still queued for the body finds no body and runs nothing.
+    runtime.withdrawReady(.{ .fetch_body_ready = identity.body_id });
     if (source_identity.body_id != identity.body_id) {
         removeReleasedSourceIfIdle(runtime, source_identity);
     }
@@ -189,6 +204,7 @@ fn removeReleasedSourceIfIdle(
     const removed = runtime.egress_state.bodies.fetchRemove(identity.body_id) orelse return;
     _ = runtime.egress_state.removeBodyDecoder(runtime.allocator, identity.body_id);
     removed.value.releaseAfterQueuedResourcesReleased(runtime.allocator);
+    runtime.withdrawReady(.{ .fetch_body_ready = identity.body_id });
 }
 
 /// Removes every body, for runtime teardown.

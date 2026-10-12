@@ -97,17 +97,40 @@ pub const H2Response = extern struct {
     header_block_len: u64,
     /// The RST_STREAM or GOAWAY error code when `reset` is 1.
     reset_code: u32,
-    /// 1 when the stream ended without END_STREAM: the server reset it, or a
+    /// 1 when the stream ended without END_STREAM: either end reset it, or a
     /// GOAWAY refused it.
     reset: u8,
     reserved0: [3]u8,
+    /// `CLOCK_MONOTONIC` instants, in nanoseconds, at which the client read
+    /// the response's first HEADERS, its first and last DATA frame with a
+    /// payload, and the frame that ended the stream, or sent its own reset
+    /// of it; 0 for what never arrived. The gaps show whether the body left
+    /// the server as it was produced or all at the end.
+    head_ns: u64,
+    first_data_ns: u64,
+    last_data_ns: u64,
+    end_ns: u64,
+    /// DATA frames with a payload.
+    data_frame_count: u64,
     /// The HPACK payload of the response's first HEADERS frame.
     header_block: [1024]u8,
     body: [2048]u8,
 };
 
 comptime {
-    if (@sizeOf(H2Response) != 3096) @compileError("H2Response must mirror collo_test_h2_response");
+    if (@sizeOf(H2Response) != 3136) @compileError("H2Response must mirror collo_test_h2_response");
+    if (@offsetOf(H2Response, "body_len") != 0) @compileError("H2Response.body_len offset mismatch");
+    if (@offsetOf(H2Response, "header_block_len") != 8) @compileError("H2Response.header_block_len offset mismatch");
+    if (@offsetOf(H2Response, "reset_code") != 16) @compileError("H2Response.reset_code offset mismatch");
+    if (@offsetOf(H2Response, "reset") != 20) @compileError("H2Response.reset offset mismatch");
+    if (@offsetOf(H2Response, "reserved0") != 21) @compileError("H2Response.reserved0 offset mismatch");
+    if (@offsetOf(H2Response, "head_ns") != 24) @compileError("H2Response.head_ns offset mismatch");
+    if (@offsetOf(H2Response, "first_data_ns") != 32) @compileError("H2Response.first_data_ns offset mismatch");
+    if (@offsetOf(H2Response, "last_data_ns") != 40) @compileError("H2Response.last_data_ns offset mismatch");
+    if (@offsetOf(H2Response, "end_ns") != 48) @compileError("H2Response.end_ns offset mismatch");
+    if (@offsetOf(H2Response, "data_frame_count") != 56) @compileError("H2Response.data_frame_count offset mismatch");
+    if (@offsetOf(H2Response, "header_block") != 64) @compileError("H2Response.header_block offset mismatch");
+    if (@offsetOf(H2Response, "body") != 1088) @compileError("H2Response.body offset mismatch");
 }
 
 pub const TestH2Origin = opaque {};
@@ -231,6 +254,30 @@ pub extern fn collo_test_h2_client_send_request(
     content_length: i64,
     end_stream: c_int,
 ) c_int;
+/// `collo_test_h2_field`: one request field a caller adds to a request head.
+pub const H2Field = extern struct {
+    name: [*:0]const u8,
+    value: [*:0]const u8,
+};
+
+comptime {
+    if (@sizeOf(H2Field) != 16) @compileError("H2Field must mirror collo_test_h2_field");
+}
+
+/// As `collo_test_h2_client_send_request`, with `field_count` fields of
+/// `fields` after the pseudo-header fields and content-length, each a
+/// literal with a new name. The head must fit one HEADERS frame of the
+/// smallest maximum frame size, since the client sends no CONTINUATION.
+pub extern fn collo_test_h2_client_send_request_fields(
+    client: *TestH2Client,
+    stream_id: u32,
+    method: [*:0]const u8,
+    path: [*:0]const u8,
+    content_length: i64,
+    end_stream: c_int,
+    fields: ?[*]const H2Field,
+    field_count: u32,
+) c_int;
 /// Sends `body_bytes` filler bytes on open stream `stream_id` in DATA frames
 /// of at most `frame_bytes`, within the server's frame size and send windows,
 /// reading the server's frames while a window is closed. The last frame
@@ -252,6 +299,24 @@ pub extern fn collo_test_h2_client_read_response(
     client: *TestH2Client,
     stream_id: u32,
     out: *H2Response,
+) c_int;
+/// Reads the server's frames until open stream `stream_id` has received at
+/// least `body_bytes_min` body bytes or has ended, and keeps the stream for
+/// `collo_test_h2_client_read_response` or
+/// `collo_test_h2_client_reset_stream`.
+pub extern fn collo_test_h2_client_read_body_at_least(
+    client: *TestH2Client,
+    stream_id: u32,
+    body_bytes_min: u64,
+) c_int;
+/// Sends RST_STREAM with `error_code` on stream `stream_id`, which has not
+/// ended, and ends it on the client's side: a later
+/// `collo_test_h2_client_read_response` returns what arrived before, with
+/// `reset` 1 and `reset_code` the code sent.
+pub extern fn collo_test_h2_client_reset_stream(
+    client: *TestH2Client,
+    stream_id: u32,
+    error_code: u32,
 ) c_int;
 
 /// Starts a TLS origin on an ephemeral port of every IPv4 address, presenting
@@ -277,7 +342,9 @@ pub extern fn collo_bench_h2_origin_start(
 pub extern fn collo_test_h2_origin_stop(origin: *TestH2Origin) void;
 /// The origin thread's failure, or an empty string.
 pub extern fn collo_test_h2_origin_last_error(origin: *TestH2Origin) [*:0]const u8;
-/// The responses sent so far; the origin counts each one after writing it.
+/// The responses the origin has answered. It counts each one before writing
+/// that response's last frame, so a caller that has read a response's end
+/// sees it counted.
 pub extern fn collo_test_h2_origin_stream_count(origin: *TestH2Origin) u32;
 pub extern fn collo_test_h2_origin_selected_alpn(origin: *TestH2Origin) c_int;
 

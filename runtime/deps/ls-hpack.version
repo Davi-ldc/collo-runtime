@@ -1,0 +1,9 @@
+Source: https://github.com/litespeedtech/ls-hpack.git
+Tag: v2.3.5
+Commit: cf0f70dd10b352194c97448eb5d00b4aa484f531
+Patches: patches/ls-hpack
+
+The HPACK codec, consumed as a shallow checkout of this commit
+(`zig build deps-provision`). The build applies the series to a generated
+copy and compiles the HPACK shim against that copy; the checkout itself is
+never edited.

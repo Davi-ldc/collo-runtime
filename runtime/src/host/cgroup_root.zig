@@ -14,32 +14,21 @@
 //! `worker-<id>` in there, so a `collo serve` server, a test binary and a
 //! bench can share one delegated parent without reaching each other's
 //! workers. Boot reclaims only the directories of hosts that are provably
-//! gone: the pid in the name is not running, or its start time (field 22 of
-//! `/proc/<pid>/stat`, ticks since boot) differs, which tells a reused pid
-//! apart from the host that created the directory. cgroupfs does not survive
-//! a reboot, so every `host-*` present was made in this boot, where a
-//! (pid, start) pair names one process; `<n>` only separates several roots
-//! held by that one process, which the test harness does when it claims one
-//! root per launched worker. The proof reads `/proc` of this pid namespace,
-//! so hosts that share a parent must share the pid namespace: a live host in
-//! another one would have no visible pid and be judged gone. A `worker-*`
-//! sitting directly under the parent has no owner the host can identify and
-//! is left alone.
+//! gone, by the proof `host_identity.zig` owns; cgroupfs does not survive a
+//! reboot, so every `host-*` present was made in this boot. `<n>` separates
+//! several roots held by one process, which the test harness does when it
+//! claims one root per launched worker. A `worker-*` sitting directly under
+//! the parent has no owner the host can identify and is left alone.
 
 const std = @import("std");
 const common = @import("collo_cgroup");
 const fd_mod = @import("collo_os").fd;
-const process = @import("collo_os").process;
+const host_identity = @import("host_identity.zig");
 
 const worker_dir_prefix = "worker-";
 // "worker-" + u64 in decimal (max 20 digits) + null margin.
 const worker_dir_name_max = worker_dir_prefix.len + 20;
 const host_dir_prefix = "host-";
-// "host-" + u32 pid + "-" + u64 start ticks + "-" + u32 claim number, all decimal.
-const host_dir_name_max = host_dir_prefix.len + 10 + 1 + 20 + 1 + 10;
-/// Upper bound on the roots one process can hold under one parent; the
-/// claim tries `<n>` = 1, 2, ... until the filesystem accepts the name.
-const host_dir_claim_max_attempts: u32 = 4096;
 const controller_enable = "+memory +cpu +pids";
 const rmdir_max_attempts: u32 = 50;
 const rmdir_retry_interval_ns: u64 = 10 * std.time.ns_per_ms;
@@ -149,42 +138,25 @@ pub const WorkerCgroupRoot = struct {
     pub fn claimHostDir(allocator: std.mem.Allocator, parent_fd: std.posix.fd_t) !WorkerCgroupRoot {
         sweepDeadHostDirs(parent_fd);
 
-        const owner = HostIdentity{
-            .pid = @intCast(std.os.linux.getpid()),
-            .start_ticks = try process.selfStartTicks(),
-        };
-        var claim: u32 = 1;
-        while (claim <= host_dir_claim_max_attempts) : (claim += 1) {
-            var name_buffer: [host_dir_name_max + 1]u8 = undefined;
-            const name = hostDirName(&name_buffer, owner, claim);
-            std.posix.mkdirat(parent_fd, name, 0o755) catch |err| switch (err) {
-                // The sweep above reclaimed every dead host's directory, so
-                // only another root of this very process can be in the way.
-                error.PathAlreadyExists => continue,
-                else => return err,
-            };
-            errdefer removeDirWithRetry(.{ .at = .{ .parent_fd = parent_fd, .name = name } });
-            // The sweep must read back exactly the identity written here.
-            const parsed = parseHostDirName(name) orelse unreachable;
-            std.debug.assert(parsed.pid == owner.pid and parsed.start_ticks == owner.start_ticks);
+        var name_buffer: [host_dir_prefix.len + host_identity.name_suffix_bytes_max]u8 = undefined;
+        const name = try host_identity.claimDirAt(parent_fd, host_dir_prefix, 0o755, &name_buffer);
+        errdefer removeDirWithRetry(.{ .at = .{ .parent_fd = parent_fd, .name = name } });
 
-            const workers_dir_fd = try openDirAt(parent_fd, name);
-            errdefer std.posix.close(workers_dir_fd);
-            // The path comes from the fd, canonical, so it agrees with the
-            // leaf paths the launch resolves the same way even when the env
-            // root was named with a trailing slash or through a symlink.
-            var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-            const workers_dir_path = try allocator.dupe(
-                u8,
-                try fd_mod.procFdTarget(workers_dir_fd, &path_buffer),
-            );
-            return .{
-                .mode = .env_root,
-                .workers_dir_path = workers_dir_path,
-                .workers_dir_fd = workers_dir_fd,
-            };
-        }
-        return error.HostDirClaimExhausted;
+        const workers_dir_fd = try openDirAt(parent_fd, name);
+        errdefer std.posix.close(workers_dir_fd);
+        // The path comes from the fd, canonical, so it agrees with the leaf
+        // paths the launch resolves the same way even when the env root was
+        // named with a trailing slash or through a symlink.
+        var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const workers_dir_path = try allocator.dupe(
+            u8,
+            try fd_mod.procFdTarget(workers_dir_fd, &path_buffer),
+        );
+        return .{
+            .mode = .env_root,
+            .workers_dir_path = workers_dir_path,
+            .workers_dir_fd = workers_dir_fd,
+        };
     }
 
     pub fn deinit(self: *WorkerCgroupRoot, allocator: std.mem.Allocator) void {
@@ -242,55 +214,11 @@ pub const WorkerCgroupRoot = struct {
     }
 };
 
-const HostIdentity = struct {
-    pid: u32,
-    start_ticks: u64,
-};
-
 /// Reclaims, under `parent_fd`, every `host-*` directory whose owner is
 /// provably gone, worker leaves included. Directories of live hosts, names
 /// this host cannot attribute, and ownerless `worker-*` entries stay.
 pub fn sweepDeadHostDirs(parent_fd: std.posix.fd_t) void {
-    const iterator_fd = openIterable(parent_fd) catch |err| {
-        std.log.warn("failed to reopen cgroup parent dir for host sweep: {s}", .{
-            @errorName(err),
-        });
-        return;
-    };
-    defer std.posix.close(iterator_fd);
-
-    var dir = std.fs.Dir{ .fd = iterator_fd };
-    var iterator = dir.iterate();
-    while (iterator.next() catch null) |entry| {
-        if (entry.kind != .directory)
-            continue;
-        if (!std.mem.startsWith(u8, entry.name, host_dir_prefix))
-            continue;
-        const owner = parseHostDirName(entry.name) orelse {
-            std.log.debug("leaving unattributable host cgroup dir {s}", .{entry.name});
-            continue;
-        };
-        if (hostIsGone(owner))
-            reapHostDirAt(parent_fd, entry.name);
-    }
-}
-
-/// True only when the process that created a host directory is certainly
-/// gone: no process has its pid, or the pid belongs to a later incarnation.
-/// A pid that cannot be inspected counts as alive, since it may still be
-/// serving workers.
-fn hostIsGone(owner: HostIdentity) bool {
-    const start_ticks = process.processStartTicks(owner.pid) catch |err| switch (err) {
-        error.ProcessNotFound => return true,
-        else => {
-            std.log.debug("cannot inspect host pid {d} for the cgroup sweep: {s}", .{
-                owner.pid,
-                @errorName(err),
-            });
-            return false;
-        },
-    };
-    return start_ticks != owner.start_ticks;
+    host_identity.sweepDeadAt(parent_fd, host_dir_prefix, reapHostDirAt);
 }
 
 fn reapHostDirAt(parent_fd: std.posix.fd_t, name: []const u8) void {
@@ -536,32 +464,6 @@ fn validateCgroup2DirFd(dir_fd: std.posix.fd_t) !void {
 
 fn workerDirName(buffer: []u8, fork_job_id: u64) []const u8 {
     return std.fmt.bufPrint(buffer, "{s}{d}", .{ worker_dir_prefix, fork_job_id }) catch unreachable;
-}
-
-fn hostDirName(buffer: []u8, owner: HostIdentity, claim: u32) []const u8 {
-    return std.fmt.bufPrint(buffer, "{s}{d}-{d}-{d}", .{
-        host_dir_prefix,
-        owner.pid,
-        owner.start_ticks,
-        claim,
-    }) catch unreachable;
-}
-
-/// The owner named by a `host-<pid>-<start>-<n>` entry; null for any other
-/// shape, which the sweep leaves in place.
-fn parseHostDirName(name: []const u8) ?HostIdentity {
-    if (!std.mem.startsWith(u8, name, host_dir_prefix))
-        return null;
-    var fields = std.mem.splitScalar(u8, name[host_dir_prefix.len..], '-');
-    const pid_field = fields.next() orelse return null;
-    const start_field = fields.next() orelse return null;
-    const claim_field = fields.next() orelse return null;
-    if (fields.next() != null)
-        return null;
-    const pid = std.fmt.parseUnsigned(u32, pid_field, 10) catch return null;
-    const start_ticks = std.fmt.parseUnsigned(u64, start_field, 10) catch return null;
-    _ = std.fmt.parseUnsigned(u32, claim_field, 10) catch return null;
-    return .{ .pid = pid, .start_ticks = start_ticks };
 }
 
 fn writeAll(fd: std.posix.fd_t, bytes: []const u8) !void {

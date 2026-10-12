@@ -1,7 +1,8 @@
 //! The timer heap and the execution of timer callbacks, on the worker's VM
 //! thread. The timer host functions only hand timers to the runtime; this
 //! file orders them by due time, breaking ties by timer id, and runs each
-//! callback as a turn of the request that scheduled it. The heap is a slab of
+//! callback as a turn of the owner that scheduled it, a request or an
+//! evaluation (`callbacks.zig`). The heap is a slab of
 //! `RuntimeLimits.max_timers_per_worker` slots allocated at init that never
 //! grows.
 

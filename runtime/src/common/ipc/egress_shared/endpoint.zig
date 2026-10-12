@@ -7,7 +7,10 @@
 //! wrong access or from another region fails the map. Taking a half
 //! closes the region descriptors once they are mapped and moves the eventfds
 //! and liveness ends into the endpoint; the gateway's body pool also keeps
-//! its data memfd for `punchFreeRange`.
+//! its data memfd for `punchFreeRange`. What a mapped gateway endpoint keeps
+//! (`gateway_held_fd_count`, `gateway_mapping_count`, `gatewayMappedBytes`)
+//! is stated here, beside the mapping that decides it, and the gateway's
+//! sizing plan charges it per session (`egress/gateway/sizing.zig`).
 
 const std = @import("std");
 const fd_mod = @import("collo_os").fd;
@@ -28,6 +31,34 @@ const BodyPoolProducerState = @import("body_pool.zig").BodyPoolProducerState;
 const BodyPoolView = @import("body_pool.zig").BodyPoolView;
 const body_pool_capacity = @import("body_pool.zig").body_pool_capacity;
 const RawFds = @import("session_fds.zig").RawFds;
+const wake_fd_count = @import("session_fds.zig").wake_fd_count;
+
+/// Descriptors a gateway's mapped endpoint keeps (`mapEndpointTakeForGateway`):
+/// the two eventfds, the two liveness ends and the body pool's data memfd,
+/// which `punchFreeRange` needs.
+pub const gateway_held_fd_count: usize = wake_fd_count + 1;
+
+/// Mappings a mapped endpoint holds, on either side: per region its meta, its
+/// producer state, its consumer state and its data.
+pub const gateway_mapping_count: usize = 4 * 4;
+
+/// Bytes a mapped endpoint's mappings span with pages of `page_size` bytes,
+/// on either side: per region its meta, its two state blocks and its data,
+/// each rounded up to whole pages.
+pub fn gatewayMappedBytes(page_size: usize) u64 {
+    return regionMappedBytes(RingProducerState, RingConsumerState, command_ring_capacity, page_size) +
+        regionMappedBytes(RingProducerState, RingConsumerState, completion_ring_capacity, page_size) +
+        2 * regionMappedBytes(BodyPoolProducerState, BodyPoolConsumerState, body_pool_capacity, page_size);
+}
+
+fn regionMappedBytes(comptime Producer: type, comptime Consumer: type, data_bytes: usize, page_size: usize) u64 {
+    return pageRounded(@sizeOf(RingMeta), page_size) + pageRounded(@sizeOf(Producer), page_size) +
+        pageRounded(@sizeOf(Consumer), page_size) + pageRounded(data_bytes, page_size);
+}
+
+fn pageRounded(bytes: usize, page_size: usize) u64 {
+    return std.mem.alignForward(u64, bytes, page_size);
+}
 
 /// One side's mapped session. It owns the mappings and the eventfd and
 /// liveness descriptors, and `deinit` releases all of them.
@@ -84,6 +115,26 @@ pub const Endpoint = struct {
             command_generation != body_generation or
             command_generation != upload_generation)
             return error.InvalidEgressSharedEndpoint;
+    }
+
+    /// The descriptors this endpoint keeps open; a gateway endpoint keeps
+    /// `gateway_held_fd_count`, which the gateway's sizing plan charges per
+    /// session.
+    pub fn heldFdCount(self: *const Endpoint) usize {
+        const fds = [_]std.posix.fd_t{
+            self.command_eventfd,
+            self.completion_eventfd,
+            self.liveness_fd,
+            self.peer_liveness_fd,
+            self.body_pool.data_fd,
+            self.upload_pool.data_fd,
+        };
+        var count: usize = 0;
+        for (fds) |fd| {
+            if (fd >= 0)
+                count += 1;
+        }
+        return count;
     }
 };
 

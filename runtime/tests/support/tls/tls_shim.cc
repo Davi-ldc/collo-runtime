@@ -19,6 +19,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -125,19 +126,25 @@ struct TempFiles {
 };
 
 // One origin and the thread that serves its single connection. That thread writes client_fd, selected_alpn,
-// stream_count and error; collo_test_h2_origin_stop joins it before freeing the struct.
-// FIXME: collo_test_h2_origin_stop shuts down and closes client_fd before the join, racing the thread, which closes
-// it too. collo_test_h2_origin_stream_count reads stream_count unsynchronized, and the thread counts a response only
-// after sending it, so a caller that has just read a response can see one too few.
+// stream_count and error, and owns the connection's descriptor from accept to close; collo_test_h2_origin_stop only
+// shuts the sockets down to wake it, joins it, and then closes the listener and frees the struct.
 struct collo_test_h2_origin_server {
     TempFiles files;
     pthread_t thread;
     int listen_fd;
+    // Guards client_fd and stopping: the thread publishes the connection under it and sets -1 under it before the
+    // close, and stop shuts the connection down under it, so stop never reaches a descriptor number the thread closed
+    // and the process gave to something else.
+    pthread_mutex_t client_fd_mutex;
     int client_fd;
+    // Set by stop, so a connection the thread accepted before the stop and publishes after it is shut down too.
+    int stopping;
     uint16_t port;
     int alpn_mode;
     int thread_started;
     int selected_alpn;
+    // Responses sent, read and written only through the __atomic builtins (h2_origin_count_response,
+    // collo_test_h2_origin_stream_count).
     uint32_t stream_count;
     uint32_t expected_stream_count;
     size_t response_body_bytes;
@@ -584,7 +591,16 @@ static int h2_origin_select_alpn(SSL*, const uint8_t** out, uint8_t* out_len, co
     return SSL_TLSEXT_ERR_OK;
 }
 
-static int h2_origin_send_response(SSL* ssl, const struct collo_test_h2_origin_server* server, uint32_t stream_id)
+// Publishes `count` responses as sent. The origin's thread stores it before it writes the response's last frame, so a
+// caller that has read that frame and then reads collo_test_h2_origin_stream_count sees the response counted.
+static void h2_origin_count_response(struct collo_test_h2_origin_server* server, uint32_t count)
+{
+    __atomic_store_n(&server->stream_count, count, __ATOMIC_RELEASE);
+}
+
+// Sends the response of `stream_id`, the `response_index`th the connection answers, counting from 0.
+static int h2_origin_send_response(
+    SSL* ssl, const struct collo_test_h2_origin_server* server, uint32_t stream_id, uint32_t response_index)
 {
     static const uint8_t response_headers[] = { 0x88 }; // :status: 200
     static const uint8_t benchmark_body[16384] = { 'x' };
@@ -609,7 +625,7 @@ static int h2_origin_send_response(SSL* ssl, const struct collo_test_h2_origin_s
         }
         // The first stream only primes SETTINGS and WINDOW_UPDATE before the timed workload, so it carries no body
         // bytes for the benchmark to count.
-        size_t remaining = server->stream_count == 0 ? 0 : server->response_body_bytes;
+        size_t remaining = response_index == 0 ? 0 : server->response_body_bytes;
         do {
             const size_t chunk_len = remaining > sizeof(benchmark_body) ? sizeof(benchmark_body) : remaining;
             const uint8_t flags = chunk_len == remaining ? 0x1 : 0;
@@ -634,11 +650,14 @@ static int h2_origin_handle_http11(SSL* ssl, struct collo_test_h2_origin_server*
     while (request_len < sizeof(request)) {
         int read_len = SSL_read(ssl, request + request_len, 1);
         if (read_len <= 0) {
-            int err = SSL_get_error(ssl, read_len);
-            if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+            // The socket's SO_RCVTIMEO ends a stalled read: only a signal's interruption is retried.
+            int err = SSL_ERROR_NONE;
+            if (ssl_io_interrupted(ssl, read_len, &err)) {
                 continue;
             }
-            h2_origin_set_error(server, "read local HTTP/1.1 origin request");
+            const bool timed_out = err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE;
+            h2_origin_set_error(server,
+                timed_out ? "local HTTP/1.1 origin request read timed out" : "read local HTTP/1.1 origin request");
             return -1;
         }
         request_len += static_cast<size_t>(read_len);
@@ -656,11 +675,12 @@ static int h2_origin_handle_http11(SSL* ssl, struct collo_test_h2_origin_server*
                                    "connection: close\r\n"
                                    "\r\n"
                                    "fallback";
+    // Counted before the client can read the response's last byte (h2_origin_count_response).
+    h2_origin_count_response(server, 1);
     if (ssl_write_all(ssl, response, sizeof(response) - 1) != 0) {
         h2_origin_set_error(server, "write local HTTP/1.1 origin response");
         return -1;
     }
-    server->stream_count = 1;
     return 0;
 }
 
@@ -694,7 +714,14 @@ static void* h2_origin_thread_main(void* arg)
         h2_origin_set_error(server, "accept local HTTP/2 origin connection");
         goto done;
     }
+    pthread_mutex_lock(&server->client_fd_mutex);
     server->client_fd = client_fd;
+    // A stop that ran between the accept and this publish found no connection to shut down, so the thread does it,
+    // and the handshake below fails at once instead of waiting out its read timeout.
+    if (server->stopping) {
+        shutdown(client_fd, SHUT_RDWR);
+    }
+    pthread_mutex_unlock(&server->client_fd_mutex);
     timeout.tv_sec = 15;
     timeout.tv_usec = 0;
     setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
@@ -780,12 +807,13 @@ static void* h2_origin_thread_main(void* arg)
             continue;
         }
         if ((type == 0x1 || type == 0x0) && (flags & 0x1) != 0) {
-            if (h2_origin_send_response(ssl, server, stream_id) != 0) {
+            // Counted before the response's END_STREAM can reach the client (h2_origin_count_response).
+            h2_origin_count_response(server, responses_sent + 1);
+            if (h2_origin_send_response(ssl, server, stream_id, responses_sent) != 0) {
                 h2_origin_set_error(server, "write local HTTP/2 origin response");
                 goto done;
             }
             responses_sent++;
-            server->stream_count = responses_sent;
         }
     }
     if (responses_sent < server->expected_stream_count) {
@@ -810,8 +838,10 @@ done:
         SSL_free(ssl);
     }
     if (client_fd >= 0) {
-        close(client_fd);
+        pthread_mutex_lock(&server->client_fd_mutex);
         server->client_fd = -1;
+        close(client_fd);
+        pthread_mutex_unlock(&server->client_fd_mutex);
     }
     if (ctx != NULL) {
         SSL_CTX_free(ctx);
@@ -835,6 +865,7 @@ static int h2_origin_start_config(int alpn_mode, uint32_t expected_stream_count,
     }
     server->listen_fd = -1;
     server->client_fd = -1;
+    pthread_mutex_init(&server->client_fd_mutex, NULL);
     server->alpn_mode = alpn_mode;
     server->expected_stream_count = expected_stream_count;
     server->response_body_bytes = response_body_bytes;
@@ -960,19 +991,25 @@ extern "C" void collo_test_h2_origin_stop(struct collo_test_h2_origin_server* se
     if (server == NULL) {
         return;
     }
+    // Shutting the sockets down wakes a thread blocked in accept or in a read; the thread closes its connection
+    // itself, and the listener, which it only accepts on, is closed once it has been joined.
     if (server->listen_fd >= 0) {
         shutdown(server->listen_fd, SHUT_RDWR);
-        close(server->listen_fd);
-        server->listen_fd = -1;
     }
+    pthread_mutex_lock(&server->client_fd_mutex);
+    server->stopping = 1;
     if (server->client_fd >= 0) {
         shutdown(server->client_fd, SHUT_RDWR);
-        close(server->client_fd);
-        server->client_fd = -1;
     }
+    pthread_mutex_unlock(&server->client_fd_mutex);
     if (server->thread_started) {
         pthread_join(server->thread, NULL);
     }
+    if (server->listen_fd >= 0) {
+        close(server->listen_fd);
+        server->listen_fd = -1;
+    }
+    pthread_mutex_destroy(&server->client_fd_mutex);
     cleanup_temp_files(&server->files);
     free(server);
 }
@@ -987,7 +1024,7 @@ extern "C" const char* collo_test_h2_origin_last_error(struct collo_test_h2_orig
 
 extern "C" uint32_t collo_test_h2_origin_stream_count(struct collo_test_h2_origin_server* server)
 {
-    return server == NULL ? 0 : server->stream_count;
+    return server == NULL ? 0 : __atomic_load_n(&server->stream_count, __ATOMIC_ACQUIRE);
 }
 
 extern "C" int collo_test_h2_origin_selected_alpn(struct collo_test_h2_origin_server* server)
@@ -1915,20 +1952,43 @@ struct collo_test_h2_response {
     uint64_t header_block_len;
     // The RST_STREAM or GOAWAY error code when `reset` is set.
     uint32_t reset_code;
-    // 1 when the stream ended without END_STREAM: the server reset it, or a GOAWAY refused it.
+    // 1 when the stream ended without END_STREAM: either end reset it, or a GOAWAY refused it.
     uint8_t reset;
     uint8_t reserved0[3];
+    // CLOCK_MONOTONIC instants, in nanoseconds, at which the client read the response's first HEADERS, its first and
+    // its last DATA frame with a payload, and the frame that ended the stream, or sent its own reset of it; 0 for what
+    // never arrived. The gaps between them show whether the server sent the body as it was produced or all at the end.
+    uint64_t head_ns;
+    uint64_t first_data_ns;
+    uint64_t last_data_ns;
+    uint64_t end_ns;
+    // DATA frames with a payload.
+    uint64_t data_frame_count;
     // The HPACK payload of the response's first HEADERS frame.
     uint8_t header_block[1024];
     char body[2048];
 };
 
-static_assert(sizeof(struct collo_test_h2_response) == 3096, "H2Response in shim.zig mirrors this layout");
+static_assert(sizeof(struct collo_test_h2_response) == 3136, "H2Response in shim.zig mirrors this layout");
+static_assert(offsetof(struct collo_test_h2_response, body_len) == 0, "H2Response.body_len offset mismatch");
+static_assert(
+    offsetof(struct collo_test_h2_response, header_block_len) == 8, "H2Response.header_block_len offset mismatch");
+static_assert(offsetof(struct collo_test_h2_response, reset_code) == 16, "H2Response.reset_code offset mismatch");
+static_assert(offsetof(struct collo_test_h2_response, reset) == 20, "H2Response.reset offset mismatch");
+static_assert(offsetof(struct collo_test_h2_response, reserved0) == 21, "H2Response.reserved0 offset mismatch");
+static_assert(offsetof(struct collo_test_h2_response, head_ns) == 24, "H2Response.head_ns offset mismatch");
+static_assert(offsetof(struct collo_test_h2_response, first_data_ns) == 32, "H2Response.first_data_ns offset mismatch");
+static_assert(offsetof(struct collo_test_h2_response, last_data_ns) == 40, "H2Response.last_data_ns offset mismatch");
+static_assert(offsetof(struct collo_test_h2_response, end_ns) == 48, "H2Response.end_ns offset mismatch");
+static_assert(
+    offsetof(struct collo_test_h2_response, data_frame_count) == 56, "H2Response.data_frame_count offset mismatch");
+static_assert(offsetof(struct collo_test_h2_response, header_block) == 64, "H2Response.header_block offset mismatch");
+static_assert(offsetof(struct collo_test_h2_response, body) == 1088, "H2Response.body offset mismatch");
 
 struct H2TrackedStream {
     // 0 marks a free entry.
     uint32_t stream_id;
-    // END_STREAM or RST_STREAM arrived, or a GOAWAY refused the stream.
+    // END_STREAM or RST_STREAM arrived, the client reset the stream, or a GOAWAY refused it.
     bool done;
     // What the server still lets the client send on this stream.
     int64_t send_window;
@@ -1996,6 +2056,7 @@ static void h2_client_refuse_streams(struct collo_test_h2_client* client, uint32
         }
         stream->response.reset = 1;
         stream->response.reset_code = error_code;
+        stream->response.end_ns = monotonic_ns();
         stream->done = true;
     }
 }
@@ -2030,9 +2091,11 @@ static int h2_client_handle_frame(
             }
             memcpy(stream->response.header_block, payload, header.length);
             stream->response.header_block_len = header.length;
+            stream->response.head_ns = monotonic_ns();
         }
         if ((header.flags & h2_flag_end_stream) != 0) {
             stream->done = true;
+            stream->response.end_ns = monotonic_ns();
         }
         return 0;
     case h2_frame_data: {
@@ -2040,8 +2103,17 @@ static int h2_client_handle_frame(
         if (stream != NULL) {
             append_body_sample(stream->response.body, sizeof(stream->response.body), &stream->response.body_len,
                 payload, header.length);
+            const uint64_t now_ns = monotonic_ns();
+            if (header.length != 0) {
+                if (stream->response.first_data_ns == 0) {
+                    stream->response.first_data_ns = now_ns;
+                }
+                stream->response.last_data_ns = now_ns;
+                stream->response.data_frame_count++;
+            }
             if ((header.flags & h2_flag_end_stream) != 0) {
                 stream->done = true;
+                stream->response.end_ns = now_ns;
             }
             stream_open = !stream->done;
         }
@@ -2082,6 +2154,7 @@ static int h2_client_handle_frame(
         if (stream != NULL) {
             stream->response.reset = 1;
             stream->response.reset_code = header.length >= 4 ? read_u32(payload) : 0;
+            stream->response.end_ns = monotonic_ns();
             stream->done = true;
         }
         return 0;
@@ -2182,11 +2255,50 @@ extern "C" int collo_test_h2_client_open(const struct collo_test_h2_peer* peer, 
     return 0;
 }
 
+// One request field a caller adds after the pseudo-header fields and content-length. Mirrored by H2Field in
+// runtime/tests/support/tls/shim.zig.
+struct collo_test_h2_field {
+    const char* name;
+    const char* value;
+};
+
+static_assert(sizeof(struct collo_test_h2_field) == 16, "H2Field in shim.zig mirrors this layout");
+
+// The largest request HEADERS block a client builds with caller fields: one frame of the smallest maximum frame size
+// a server may set, since the client sends no CONTINUATION.
+static constexpr size_t h2_client_fields_block_max = h2_max_frame_size_min;
+
+static_assert(h2_client_header_block_max <= h2_client_fields_block_max, "the pseudo-header fields fit the block");
+
+static int h2_client_open_stream(struct collo_test_h2_client* client, uint32_t stream_id, const char* method,
+    const char* path, int64_t content_length, int end_stream, const struct collo_test_h2_field* fields,
+    uint32_t field_count);
+
 // Opens stream `stream_id`, an odd id above every earlier stream of the connection, with the HEADERS of a `method`
 // request of `path`: content-length when `content_length` is not negative, END_STREAM when `end_stream` is set. The
 // stream's response is kept until collo_test_h2_client_read_response.
 extern "C" int collo_test_h2_client_send_request(struct collo_test_h2_client* client, uint32_t stream_id,
     const char* method, const char* path, int64_t content_length, int end_stream)
+{
+    return h2_client_open_stream(client, stream_id, method, path, content_length, end_stream, NULL, 0);
+}
+
+// As collo_test_h2_client_send_request, with `field_count` caller fields after the pseudo-header fields and
+// content-length, each as a literal with a new name. The block must fit one HEADERS frame, since the client sends no
+// CONTINUATION.
+extern "C" int collo_test_h2_client_send_request_fields(struct collo_test_h2_client* client, uint32_t stream_id,
+    const char* method, const char* path, int64_t content_length, int end_stream,
+    const struct collo_test_h2_field* fields, uint32_t field_count)
+{
+    if (field_count != 0 && fields == NULL) {
+        return fail("missing HTTP/2 client request fields");
+    }
+    return h2_client_open_stream(client, stream_id, method, path, content_length, end_stream, fields, field_count);
+}
+
+static int h2_client_open_stream(struct collo_test_h2_client* client, uint32_t stream_id, const char* method,
+    const char* path, int64_t content_length, int end_stream, const struct collo_test_h2_field* fields,
+    uint32_t field_count)
 {
     if (client == NULL || method == NULL || path == NULL) {
         return fail("missing HTTP/2 client request input");
@@ -2209,11 +2321,24 @@ extern "C" int collo_test_h2_client_send_request(struct collo_test_h2_client* cl
         snprintf(length_text, sizeof(length_text), "%lld", static_cast<long long>(content_length));
         length_value = length_text;
     }
-    uint8_t header_block[h2_client_header_block_max];
-    const int header_len
-        = h2_build_request_headers(header_block, sizeof(header_block), method, client->authority, path, length_value);
+    uint8_t header_block[h2_client_fields_block_max];
+    // The pseudo-header fields and content-length stay within the block every other client builds, which also bounds
+    // a request path.
+    int header_len = h2_build_request_headers(
+        header_block, h2_client_header_block_max, method, client->authority, path, length_value);
     if (header_len < 0) {
         return -1;
+    }
+    for (uint32_t index = 0; index < field_count; index++) {
+        if (fields[index].name == NULL || fields[index].value == NULL) {
+            return fail("missing HTTP/2 client request field");
+        }
+        const int wrote = h2_write_literal_new_name(header_block + header_len,
+            sizeof(header_block) - static_cast<size_t>(header_len), fields[index].name, fields[index].value);
+        if (wrote < 0) {
+            return fail("HTTP/2 client request fields exceed one HEADERS frame");
+        }
+        header_len += wrote;
     }
     memset(stream, 0, sizeof(*stream));
     stream->stream_id = stream_id;
@@ -2329,6 +2454,65 @@ extern "C" int collo_test_h2_client_read_response(
     }
     memcpy(out, &stream->response, sizeof(*out));
     memset(stream, 0, sizeof(*stream));
+    return 0;
+}
+
+// Reads frames of a held connection until stream `stream_id` has received at least `body_bytes_min` body bytes or has
+// ended, and keeps the stream for collo_test_h2_client_read_response or collo_test_h2_client_reset_stream. Lets a test
+// act in the middle of a response, as a client that cancels a stream does.
+extern "C" int collo_test_h2_client_read_body_at_least(
+    struct collo_test_h2_client* client, uint32_t stream_id, uint64_t body_bytes_min)
+{
+    if (client == NULL) {
+        return fail("missing HTTP/2 client");
+    }
+    tls_test_error[0] = '\0';
+    ERR_clear_error();
+    H2TrackedStream* stream = stream_id == 0 ? NULL : h2_client_find_stream(client, stream_id);
+    if (stream == NULL) {
+        return fail("HTTP/2 client stream is not open");
+    }
+    for (size_t frame_count = 0;
+        frame_count < h2_client_response_frames_max && !stream->done && stream->response.body_len < body_bytes_min;
+        frame_count++) {
+        if (h2_client_read_frame(client) != 0) {
+            return -1;
+        }
+    }
+    if (stream->response.body_len < body_bytes_min && !stream->done) {
+        return fail("HTTP/2 response body did not reach the bytes asked for");
+    }
+    return 0;
+}
+
+// Sends RST_STREAM with `error_code` on stream `stream_id`, which has not ended, and ends it on the client's side:
+// collo_test_h2_client_read_response then returns what arrived before, with `reset` set to 1 and `reset_code` the code
+// sent. Frames the server sent before it saw the reset are dropped, as RFC 9113 section 5.4.2 lets them arrive.
+extern "C" int collo_test_h2_client_reset_stream(
+    struct collo_test_h2_client* client, uint32_t stream_id, uint32_t error_code)
+{
+    if (client == NULL) {
+        return fail("missing HTTP/2 client");
+    }
+    tls_test_error[0] = '\0';
+    ERR_clear_error();
+    H2TrackedStream* stream = stream_id == 0 ? NULL : h2_client_find_stream(client, stream_id);
+    if (stream == NULL) {
+        return fail("HTTP/2 client stream is not open");
+    }
+    if (stream->done) {
+        return fail("HTTP/2 client stream already ended");
+    }
+    uint8_t payload[4];
+    write_u32(payload, error_code);
+    if (h2_write_frame(client->connection.ssl.get(), h2_frame_rst_stream, 0, stream_id, payload, sizeof(payload))
+        != 0) {
+        return -1;
+    }
+    stream->response.reset = 1;
+    stream->response.reset_code = error_code;
+    stream->response.end_ns = monotonic_ns();
+    stream->done = true;
     return 0;
 }
 

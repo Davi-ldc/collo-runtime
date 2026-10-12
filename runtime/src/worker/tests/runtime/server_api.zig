@@ -614,3 +614,67 @@ test "web api count caps reject form data url params and codec stream floods" {
     try std.testing.expect(std.mem.containsAtLeast(u8, response, 1, "\"paramsWithinCapWorks\":true"));
     try std.testing.expect(std.mem.containsAtLeast(u8, response, 1, "\"headersJsSideUncapped\":true"));
 }
+
+// An exception thrown while the worker extracts the returned Response is the
+// tenant's, like one its handler throws: one rule answers both
+// (`serve/termination.zig:answerException`). Extraction once released the
+// exception and answered an operator-only 500, so the tenant's log never saw
+// it. A body stream already locked by a reader makes extraction throw.
+test "a returned Response whose extraction throws writes the exception to the tenant's log and answers 500 js_exception" {
+    var vm = try support.createVm();
+    defer vm.deinit();
+    const control_pair = try socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
+    defer std.posix.close(control_pair[0]);
+    defer std.posix.close(control_pair[1]);
+    const page_fd = try worker_shared_page.createMemfd("server-api-extraction-throws");
+    defer std.posix.close(page_fd);
+    var view = try worker_shared_page.mapReadWrite(page_fd);
+    defer view.deinit();
+    view.initializeCrashDefault();
+
+    var now_mono_ns: u64 = 0;
+    var runtime = try worker.Runtime.init(std.testing.allocator, &vm, control_pair[0], &view, try rt.createCompletionEventfd(), .{
+        .ctx = &now_mono_ns,
+        .now_fn = fakeNow,
+    });
+    defer runtime.deinit();
+    try runtime.attachHostRuntime();
+
+    const route_index = try rt.registerRoute(&runtime, "/__collo_route/demo/server-api-extraction-throws.js",
+        \\export default function handle() {
+        \\    const response = new Response(new ReadableStream());
+        \\    response.body.getReader();
+        \\    return response;
+        \\}
+    );
+    const request_id: u64 = 601;
+    var dispatch = try initDispatchWork(std.testing.allocator, .{
+        .request_id = request_id,
+        .route_index = route_index,
+        .deadline_monotonic_ns = std.time.ns_per_hour,
+    });
+    defer dispatch.deinit();
+    try rt.enqueueIngressRoute(&runtime, &dispatch, 1, .{});
+    try executeNextReady(&runtime);
+    try executeUntilRequestDone(&runtime, request_id);
+    var response = try rt.readIngressResponse(&runtime, control_pair[1], request_id);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 500), response.status);
+    try std.testing.expectEqual(ipc.RequestDoneStatus.js_exception, response.doneStatus());
+
+    var exception_lines: usize = 0;
+    var scratch: [worker_shared_page.LOG_LINE_BYTES_MAX]u8 = undefined;
+    var out: [16]worker_shared_page.DrainedLogLine = undefined;
+    while (true) {
+        const count = try view.drainLogLinesChecked(&scratch, &out);
+        if (count == 0) break;
+        for (out[0..count]) |line| {
+            if (line.header.request_id != request_id)
+                continue;
+            if (line.header.flags & worker_shared_page.LogLineFlags.js_exception == 0)
+                continue;
+            exception_lines += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), exception_lines);
+}

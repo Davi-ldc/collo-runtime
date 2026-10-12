@@ -67,11 +67,18 @@ pub const BodyProgress = enum {
 };
 
 /// Body bytes and their place: `bytes` starts at `body_offset` of a body
-/// `body_len` long, so the chunk that reaches `body_len` ends the stream.
+/// `body_len` long. With `ends_stream`, the chunk that reaches `body_len`
+/// ends the stream; without it, as for one chunk of a streamed body whose
+/// end comes later, no chunk does.
 const BodySpan = struct {
     bytes: []const u8,
     body_offset: usize = 0,
     body_len: usize,
+    ends_stream: bool = true,
+
+    fn endsStreamAt(span: BodySpan, chunk_end: usize) bool {
+        return span.ends_stream and span.body_offset + chunk_end == span.body_len;
+    }
 };
 
 /// Turns a send's `error.WouldBlock` into `.blocked` and marks the control
@@ -138,6 +145,31 @@ pub fn writeBody(
     sent_len: *usize,
 ) !BodyProgress {
     return writeSpan(runtime, request_ctx, .{ .bytes = body, .body_len = body.len }, sent_len);
+}
+
+/// Sends `bytes`, one chunk of a streamed body, from `sent_len.*` on, split
+/// as `writeSpan` splits a body, and advances `sent_len.*` past every chunk
+/// that went out, so a write that stops resumes there. With `ends_stream`
+/// the last of them ends the stream, and empty bytes send the stream's end
+/// alone; without it the end goes out later (`writeStreamEnd`).
+pub fn writeStreamBytes(
+    runtime: *state.Runtime,
+    request_ctx: *request_context.RequestContext,
+    bytes: []const u8,
+    sent_len: *usize,
+    ends_stream: bool,
+) !BodyProgress {
+    if (ends_stream and bytes.len == 0) {
+        return switch (try writeStreamEnd(runtime, request_ctx)) {
+            .sent => .sent,
+            .blocked => .socket_full,
+        };
+    }
+    return writeSpan(runtime, request_ctx, .{
+        .bytes = bytes,
+        .body_len = bytes.len,
+        .ends_stream = ends_stream,
+    }, sent_len);
 }
 
 /// Sends a body held in `segments`, `total_len` bytes in all, from its
@@ -224,7 +256,7 @@ fn writeSpan(
                         request_ctx.ingress_channel_id,
                         0,
                         @intCast(next_len),
-                        span.body_offset + next_start + next_len == span.body_len,
+                        span.endsStreamAt(next_start + next_len),
                     ),
                     .payload = span.bytes[next_start..][0..next_len],
                 };
@@ -252,7 +284,7 @@ fn writeSpan(
             request_ctx.ingress_channel_id,
             0,
             @intCast(chunk_len),
-            span.body_offset + chunk_end == span.body_len,
+            span.endsStreamAt(chunk_end),
         );
         switch (try sentOrBlocked(runtime, ipc.ingress_channel.sendDescriptorPayloadRequireRing(
             control_fd,
@@ -404,52 +436,6 @@ fn sendHead(
         .blocked => {},
     }
     return sent;
-}
-
-/// Sends one chunk of a streamed body. A chunk the ring has no room for
-/// fails with `error.IngressSharedPayloadNeedsCredit`; check `canWritePayload`
-/// first.
-pub fn writeStreamChunk(
-    runtime: *state.Runtime,
-    request_ctx: *request_context.RequestContext,
-    bytes: []const u8,
-    end_stream: bool,
-) !Sent {
-    const control_fd = runtime.core.control_fd orelse return error.InvalidArgument;
-    if (bytes.len == 0 and end_stream)
-        return writeStreamEnd(runtime, request_ctx);
-    if (!try canWritePayload(runtime, bytes.len))
-        return error.IngressSharedPayloadNeedsCredit;
-
-    const descriptor = ipc.ingress_channel.Descriptor.responseChunk(
-        h2Identity(request_ctx),
-        request_ctx.ingress_channel_id,
-        0,
-        @intCast(bytes.len),
-        end_stream,
-    );
-    switch (try sentOrBlocked(runtime, ipc.ingress_channel.sendDescriptorPayloadRequireRing(
-        control_fd,
-        descriptor,
-        bytes,
-        runtime.core.dispatch_recv_scratch,
-        if (runtime.requests.ingress_payload) |*ingress_payload| ingress_payload.writer(.worker_to_server) else null,
-    ))) {
-        .sent => {},
-        .blocked => return .blocked,
-    }
-    request_ctx.client_served_bytes += bytes.len;
-    return .sent;
-}
-
-/// Whether `byte_len` bytes can be sent now: inline at or below
-/// `shared_payload_threshold`, through the ring above it. False marks the
-/// worker waiting for the ring's room (`ringFits`).
-pub fn canWritePayload(runtime: *state.Runtime, byte_len: usize) !bool {
-    if (byte_len <= ipc.ingress_channel.shared_payload_threshold)
-        return true;
-    const ingress_payload = if (runtime.requests.ingress_payload) |*view| view else return error.IngressSharedPayloadUnavailable;
-    return ringFits(ingress_payload, byte_len);
 }
 
 /// Sends the end of a streamed response.

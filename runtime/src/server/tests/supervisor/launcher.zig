@@ -569,12 +569,17 @@ test "WorkerInit carries a boot token for the launch's session under its gateway
     const board = &harness.board;
     try board.expectNoFailure();
     try testing.expect(board.init_carried_egress);
+    try testing.expect(board.init_carried_wake);
     try testing.expect(board.init_deadline_ns != 0);
+    // The boot token names the definition's boot policy, the union of its
+    // routes' grants.
+    const boot_policy = harness.routes.?.routes.network.bootPolicy(launch_definition);
+    try testing.expect(boot_policy != 0);
     const token = egress_token.fromBytes(&board.init_boot_egress_token);
     const fields = try egress_token.verify(&keyOf(test_gateway_generation), &token);
     try testing.expectEqual(egress_token.Fields{
         .kind = .boot,
-        .policy_id = egress_policy.public_https_id,
+        .policy_id = boot_policy,
         .budget = @intCast(egress_policy.production.max_fetches_per_boot),
         .session_id = board.attached_session_id,
         .request_id = 0,
@@ -598,12 +603,14 @@ test "WorkerInit carries a boot token for the launch's session under its gateway
     try testing.expect(!board.published[0].egress_attach_queued);
 }
 
-test "a definition without an egress grant launches with no session and no boot token, and its WorkerReady ends nothing" {
+test "a definition without a network grant launches with no wake set, no attach, no session and no boot token, and its WorkerReady ends nothing" {
+    var granted: [fixture.definition_names.len]bool = @splat(true);
+    granted[launch_definition] = false;
     var harness: Harness = undefined;
-    try harness.init(.{ .root = .delegated });
+    try harness.init(.{ .root = .delegated, .limits = .{ .granted = granted } });
     defer harness.deinit();
 
-    harness.board.withholdGrant(launch_definition);
+    try testing.expect(!harness.routes.?.routes.network.definitionGranted(launch_definition));
     harness.board.script(&.{.ready});
     harness.board.grantClaims(launch_definition, 1);
     harness.launcher.submit(launch_definition, .waiter);
@@ -612,13 +619,17 @@ test "a definition without an egress grant launches with no session and no boot 
 
     const board = &harness.board;
     try board.expectNoFailure();
-    try testing.expectEqual(@as(usize, 1), board.attaches);
+    // No gateway is asked for anything on its account, so a node of such
+    // definitions never spawns one.
+    try testing.expectEqual(@as(usize, 0), board.attaches);
     try testing.expectEqual(@as(usize, 0), board.sessions_len);
     try testing.expect(egress_token.isNone(&board.init_boot_egress_token));
     try testing.expect(!board.init_carried_egress);
+    try testing.expect(!board.init_carried_wake);
     const published = &board.published[0];
     try testing.expectEqual(@as(u64, 0), published.worker.egress_generation);
     try testing.expectEqual(@as(u64, 0), published.worker.egress_session_id);
+    try testing.expect(!published.worker.egress_wake_set.isValid());
     try testing.expectEqual(@as(usize, 0), board.boot_ended_len);
     try testing.expect(!published.egress_attach_queued);
 }
@@ -1212,8 +1223,6 @@ test "a WorkerReady that arrives while a gateway spawn holds the launcher past t
 fn failureFor(comptime error_name: []const u8) LaunchFailure {
     const rows = .{
         .{ "WorkerCgroupNotPrepared", LaunchFailure.worker_cgroup_not_prepared },
-        .{ "InvalidWorkerTmpRootMode", LaunchFailure.invalid_worker_tmp_root_mode },
-        .{ "InvalidWorkerTmpRootOwner", LaunchFailure.invalid_worker_tmp_root_owner },
         .{ "InvalidBootOptions", LaunchFailure.invalid_boot_options },
         .{ "EgressWakeUnavailable", LaunchFailure.egress_wake_set },
         .{ "WorkerInitTimeout", LaunchFailure.child_window_expired },
@@ -1306,6 +1315,9 @@ const InitSeen = struct {
     init_deadline_ns: u64,
     /// WorkerInit carried the worker's half of an egress session.
     carried_egress: bool,
+    /// WorkerInit carried the worker's egress wake descriptors
+    /// (`WorkerInit.flag_egress`), with or without a session.
+    carried_wake: bool,
 };
 
 const InitRoutes = struct {
@@ -1431,8 +1443,9 @@ const Board = struct {
     fail_attach_at: usize = 0,
     /// Definitions whose attach the gateway refuses, as a nack does.
     attach_refused: [fixture.definition_names.len]bool = @splat(false),
-    /// Definitions without an egress grant, whose attach answers null.
-    no_grant: [fixture.definition_names.len]bool = @splat(false),
+    /// Each definition's boot policy from the fixture's routes, which the
+    /// stand-in attach puts in the boot grant.
+    boot_policies: [fixture.definition_names.len]u16 = @splat(0),
     attaches: usize = 0,
     attach_ns: [attach_stamps_max]u64 = @splat(0),
     /// The session id the last attach handed out.
@@ -1481,6 +1494,7 @@ const Board = struct {
     /// The child window's end as WorkerInit carried it.
     init_deadline_ns: u64 = 0,
     init_carried_egress: bool = false,
+    init_carried_wake: bool = false,
     /// Lets the held step of a `.reply_on_release` or `.ready_on_release`
     /// answer go out.
     released: bool = false,
@@ -1545,12 +1559,6 @@ const Board = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.attach_refused[definition] = true;
-    }
-
-    fn withholdGrant(self: *Board, definition: DefinitionIndex) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        self.no_grant[definition] = true;
     }
 
     fn loseGatewayAtAttach(self: *Board, attach: usize) void {
@@ -1873,6 +1881,7 @@ const Board = struct {
         self.init_boot_egress_token = seen.boot_egress_token;
         self.init_deadline_ns = seen.init_deadline_ns;
         self.init_carried_egress = seen.carried_egress;
+        self.init_carried_wake = seen.carried_wake;
         self.inits_received += 1;
         self.condition.broadcast();
     }
@@ -1945,8 +1954,6 @@ fn attachEgress(
     if (board.attaches < board.attach_ns.len)
         board.attach_ns[board.attaches] = process.monotonicNowNsOrZero();
     board.attaches += 1;
-    if (board.no_grant[definition])
-        return null;
     if (board.attach_refused[definition])
         return error.EgressGatewayAttachRejected;
     if (board.attaches == board.fail_attach_at) {
@@ -1980,7 +1987,7 @@ fn attachEgress(
         .boot = if (!key_known) null else .{
             .key = keyOf(generation),
             .session_id = board.attached_session_id,
-            .policy_id = egress_policy.public_https_id,
+            .policy_id = board.boot_policies[definition],
             .budget = @intCast(egress_policy.production.max_fetches_per_boot),
         },
     };
@@ -2252,16 +2259,17 @@ fn takeAttachPackets(fd: std.posix.fd_t, log: *AttachLog) !void {
     }
 }
 
-/// A launcher over a stand-in zygote, its routes, a worker cgroup root and
-/// the board its dependencies report to. Initialized in place, since the
-/// launcher, the stand-in thread and the board hold pointers into it.
-/// `deinit` releases whatever `init` got to, in reverse, and plays the
-/// reaper for every failed launch's leftovers.
+/// A launcher over a stand-in zygote, its routes, a worker cgroup root, a
+/// tmpfs mount point and the board its dependencies report to. Initialized
+/// in place, since the launcher, the stand-in thread and the board hold
+/// pointers into it. `deinit` releases whatever `init` got to, in reverse,
+/// and plays the reaper for every failed launch's leftovers.
 const Harness = struct {
     routes: ?*fixture.OwnedRoutes,
     /// The directory a root over a plain directory sits in; null otherwise.
     plain_parent: ?std.testing.TmpDir,
     root: ?host.WorkerCgroupRoot,
+    tmp_mount_point: ?host.TmpMountPoint,
     board: Board,
     /// The process whose pidfd stands for the zygote's.
     zygote_process: ?StandInChild,
@@ -2300,6 +2308,7 @@ const Harness = struct {
             .routes = null,
             .plain_parent = null,
             .root = null,
+            .tmp_mount_point = null,
             .board = .{ .pool = options.pool },
             .zygote_process = null,
             .spawned = .{
@@ -2327,7 +2336,14 @@ const Harness = struct {
                 self.root = try host.WorkerCgroupRoot.claimHostDir(testing.allocator, self.plain_parent.?.dir.fd);
             },
         }
+        var tmp_mount_point: host.TmpMountPoint = undefined;
+        try tmp_mount_point.init(host.tmp_mount.default_parent_dir);
+        self.tmp_mount_point = tmp_mount_point;
         self.routes = try fixture.OwnedRoutes.createWith(testing.allocator, options.limits);
+        // The stand-in attach stamps each definition's boot policy, as
+        // `worker_factory.attachLaunchEgress` does.
+        for (&self.board.boot_policies, 0..) |*policy, index|
+            policy.* = self.routes.?.routes.network.bootPolicy(@intCast(index));
         self.zygote_process = try cloneIdleChild(null, null);
         const control = try fd_mod.socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
         self.spawned.control_fd = control[0];
@@ -2342,7 +2358,7 @@ const Harness = struct {
             .deps = self.board.deps(),
             .zygote_process = &self.spawned,
             .routes = &self.routes.?.routes,
-            .worker_cgroup_root = &self.root.?,
+            .worker_host = .{ .cgroup_root = &self.root.?, .tmp_mount_point = &self.tmp_mount_point.? },
             .boot = ipc.WorkerRuntimeBootOptions.default(),
             .tmpfs_size_bytes = null,
             .launches_per_definition_max = launches_per_definition_max,
@@ -2405,6 +2421,10 @@ const Harness = struct {
         if (self.spawned.control_fd) |control_fd| {
             std.posix.close(control_fd);
             self.spawned.control_fd = null;
+        }
+        if (self.tmp_mount_point) |*tmp_mount_point| {
+            tmp_mount_point.deinit();
+            self.tmp_mount_point = null;
         }
         if (self.root) |*root| {
             root.deinit(testing.allocator);
@@ -2590,6 +2610,7 @@ fn awaitWorkerInit(harness: *Harness, worker_end: std.posix.fd_t) !InitOutcome {
                     .boot_egress_token = init.message.boot_egress_token,
                     .init_deadline_ns = init.message.init_deadline_mono_ns,
                     .carried_egress = init.egress_shared_fds.isValid(),
+                    .carried_wake = init.message.hasEgress(),
                 });
                 return .received;
             },
@@ -2637,7 +2658,10 @@ fn pollReadiness(fd: std.posix.fd_t, timeout_ms: i32) !Readiness {
 /// `keep_fd`, which the child holds until it dies.
 fn cloneIdleChild(cgroup_dir_fd: ?std.posix.fd_t, keep_fd: ?std.posix.fd_t) !StandInChild {
     var pidfd: std.posix.fd_t = -1;
-    const pid = try process.cloneForkWithPidFd(cgroup_dir_fd, &pidfd);
+    const pid = try process.cloneForkWithPidFd(.{
+        .cgroup_dir_fd = cgroup_dir_fd,
+        .thread_id_word = try process.callingThreadIdWord(),
+    }, &pidfd);
     if (pid == 0)
         idleUntilKilled(keep_fd);
     return .{ .pid = pid, .pidfd = fd_mod.OwnedFd.fromRaw(pidfd) };

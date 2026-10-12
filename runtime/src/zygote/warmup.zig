@@ -46,14 +46,20 @@ pub fn runCorpus(vm: *bindings.Vm) !void {
     defer entry.deinit();
 
     var exec_ctx = bindings.ExecCtx.init(warmup_request_id);
+    // The turn takes an owner token keyed by this stack slot's address, and
+    // every worker inherits the zygote's owner table, which holds exactly the
+    // owners one worker can have (`COLLO_OWNER_SLOT_COUNT` in `abi.h`), so
+    // the slot is freed before the frame goes.
+    defer vm.releaseExecCtx(&exec_ctx) catch |err|
+        std.log.warn("failed to release the warmup exec ctx: {s}", .{@errorName(err)});
     try vm.turnEnter(&exec_ctx);
-    const invoke_result = vm.invoke(boot_allocator, &exec_ctx, &entry, null, &.{});
+    const invoke_result = realm.invoke(boot_allocator, &exec_ctx, &entry, null, &.{});
     const exit_result = vm.turnExitResult();
 
     var digest = try finishWarmupTurn(invoke_result, exit_result);
     defer digest.deinit();
 
-    var digest_text = switch (try vm.valueToUtf8Copy(&digest)) {
+    var digest_text = switch (try realm.valueToUtf8Copy(&digest)) {
         .success => |text| text,
         .exception => |exception| return failWithException(exception),
     };

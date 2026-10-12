@@ -67,11 +67,7 @@ template <typename Visitor> void JSColloPerformanceObserver::visitChildrenImpl(J
     Base::visitChildren(this_object, visitor);
     visitor.append(this_object->m_performance);
     visitor.append(this_object->m_callback);
-    for (unsigned index = this_object->m_entries_to_deliver_head; index < this_object->m_entries_to_deliver.size();
-        index++) {
-        auto& entry = this_object->m_entries_to_deliver[index];
-        visitor.append(entry);
-    }
+    this_object->m_entries_to_deliver.visit(this_object, visitor);
 }
 
 DEFINE_VISIT_CHILDREN(JSColloPerformanceObserver);
@@ -101,9 +97,17 @@ static JSC::JSObject* frozenSupportedEntryTypes(JSC::JSGlobalObject* global_obje
 {
     auto& vm = global_object->vm();
     auto* result = JSC::constructEmptyArray(global_object, nullptr, 3);
+    RETURN_IF_EXCEPTION(scope, nullptr);
+    if (!result) {
+        JSC::throwOutOfMemoryError(global_object, scope);
+        return nullptr;
+    }
     result->putDirectIndex(global_object, 0, JSC::jsString(vm, WTF::String("mark"_s)));
+    RETURN_IF_EXCEPTION(scope, nullptr);
     result->putDirectIndex(global_object, 1, JSC::jsString(vm, WTF::String("measure"_s)));
+    RETURN_IF_EXCEPTION(scope, nullptr);
     result->putDirectIndex(global_object, 2, JSC::jsString(vm, WTF::String("resource"_s)));
+    RETURN_IF_EXCEPTION(scope, nullptr);
     JSC::objectConstructorFreeze(global_object, result);
     RETURN_IF_EXCEPTION(scope, nullptr);
     return result;
@@ -210,13 +214,15 @@ void JSColloPerformanceObserver::observe(
 
     // FIXME: the Performance Timeline's observe() replaces an entryTypes observer's types on each call, but the mask
     // keeps the types of earlier calls.
-    m_type_mask |= mask;
-    m_is_type_observer = is_type_observer;
     if (!m_registered) {
-        if (auto* performance = m_performance.get())
-            performance->registerObserver(vm, this);
+        if (auto* performance = m_performance.get(); performance && !performance->registerObserver(vm, this)) {
+            JSC::throwOutOfMemoryError(global_object, scope);
+            return;
+        }
         m_registered = true;
     }
+    m_type_mask |= mask;
+    m_is_type_observer = is_type_observer;
 
     if (buffered && is_type_observer) {
         if (auto* performance = m_performance.get()) {
@@ -238,28 +244,45 @@ void JSColloPerformanceObserver::disconnect()
     clearPendingEntries();
 }
 
-WTF::Vector<JSColloPerformanceEntry*> JSColloPerformanceObserver::pendingRecordsVector()
+void JSColloPerformanceObserver::pendingRecords(PerformanceEntryRoots& out)
 {
-    WTF::Vector<JSColloPerformanceEntry*> entries;
-    entries.reserveInitialCapacity(pendingEntryCount());
-    for (unsigned index = m_entries_to_deliver_head; index < m_entries_to_deliver.size(); index++) {
-        auto& barrier = m_entries_to_deliver[index];
-        if (auto* entry = barrier.get())
-            entries.append(entry);
+    for (auto& slot : m_entries_to_deliver) {
+        if (auto* entry = slot.entry.get())
+            out.append(entry);
     }
-    return entries;
+}
+
+JSC::JSObject* performanceEntriesArray(JSC::JSGlobalObject* global_object, PerformanceEntryRoots& entries)
+{
+    auto scope = DECLARE_THROW_SCOPE(global_object->vm());
+    if (entries.hasOverflowed()) {
+        JSC::throwOutOfMemoryError(global_object, scope);
+        return nullptr;
+    }
+    std::stable_sort(
+        entries.begin(), entries.end(), [](auto* left, auto* right) { return left->startTime() < right->startTime(); });
+    auto* result = JSC::constructEmptyArray(global_object, nullptr, entries.size());
+    RETURN_IF_EXCEPTION(scope, nullptr);
+    if (!result) {
+        JSC::throwOutOfMemoryError(global_object, scope);
+        return nullptr;
+    }
+    for (unsigned index = 0; index < entries.size(); index++) {
+        result->putDirectIndex(global_object, index, entries[index]);
+        RETURN_IF_EXCEPTION(scope, nullptr);
+    }
+    return result;
 }
 
 JSC::JSObject* JSColloPerformanceObserver::takeRecordsArray(JSC::JSGlobalObject* global_object)
 {
-    auto entries = pendingRecordsVector();
-    std::stable_sort(
-        entries.begin(), entries.end(), [](auto* left, auto* right) { return left->startTime() < right->startTime(); });
-    auto* result = JSC::constructEmptyArray(global_object, nullptr, entries.size());
-    for (unsigned index = 0; index < entries.size(); index++)
-        result->putDirectIndex(global_object, index, entries[index]);
-    clearPendingEntries();
-    return result;
+    PerformanceEntryRoots entries;
+    pendingRecords(entries);
+    auto* records = performanceEntriesArray(global_object, entries);
+    // The records leave the queue only once their array is complete, so a failure keeps them for the next delivery.
+    if (records)
+        clearPendingEntries();
+    return records;
 }
 
 static JSC::JSFunction* observerMicrotaskFunction(JSC::JSGlobalObject* global_object, JSC::VM& vm,
@@ -315,10 +338,13 @@ JSC::EncodedJSValue JSColloPerformanceObserver::deliver(JSC::JSGlobalObject* glo
     if (!performance)
         return JSValue::encode(JSC::jsUndefined());
 
-    auto entries = pendingRecordsVector();
-    auto* list = JSColloPerformanceObserverEntryList::create(
-        global_object->vm(), performance->observerEntryListStructure(), WTF::move(entries));
+    PerformanceEntryRoots entries;
+    pendingRecords(entries);
     clearPendingEntries();
+    if (entries.hasOverflowed())
+        return JSValue::encode(JSC::throwOutOfMemoryError(global_object, scope));
+    auto* list = JSColloPerformanceObserverEntryList::create(
+        global_object->vm(), performance->observerEntryListStructure(), entries.span());
     auto* callback = m_callback.get();
     auto call_data = JSC::getCallData(callback);
     if (call_data.type == JSC::CallData::Type::None)

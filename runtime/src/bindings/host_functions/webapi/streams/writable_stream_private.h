@@ -2,11 +2,11 @@
 // They run on the VM thread; their visitChildren, in writable_stream_objects.cpp,
 // runs on collector threads at the same time.
 //
-// The cells reference each other, the sink and the sink's methods only through
-// WriteBarrier fields. Each ColloPromiseDeferred a cell holds, including every
-// WriteRequest's, is owned by that cell: settleDeferred settles and releases it,
-// and the destructor releases one that never settled. m_write_queue's buffer
-// changes only under cellLock(), which the marker takes while it walks the queue.
+// The cells reference each other, the sink, the sink's methods and every promise
+// they will settle only through WriteBarrier fields, and settle those promises
+// with Collo::settlePromise. The write queue is a Collo::CellEdgeList, which owns
+// the lock and barrier protocol (jsc/runtime/cell_edges.h); the active write sits
+// in plain fields of the stream, written with their barriers.
 #pragma once
 
 #include "host_functions/webapi/streams/stream_common_private.h"
@@ -132,19 +132,19 @@ private:
 class JSColloWritableStream final : public JSC::JSDestructibleObject {
     using Base = JSC::JSDestructibleObject;
 
-    // One queued write; its deferred settles the promise write() returned.
-    // FIXME: copying a WriteRequest copies its WriteBarrier fields without a
-    // barrier. dequeueWriteRequest copies one into m_active_write without
-    // cellLock(), and appendWriteRequest fires the barrier before the request
-    // reaches the queue, so a concurrent marker can find the chunk in neither
-    // place and the collector can free it while the stream still holds it.
+    // One queued write: the chunk, and the promise write() returned, which
+    // settles when the sink finishes the chunk.
     struct WriteRequest {
         JSC::WriteBarrier<JSC::Unknown> value;
-        JSC::WriteBarrier<JSC::Unknown> promise;
-        // Can keep the stream alive until VM teardown: see the FIXME in stream_common_private.h.
-        ColloPromiseDeferred* deferred { nullptr };
+        JSC::WriteBarrier<JSC::JSPromise> promise;
         double size { 0 };
         size_t memory_cost { 0 };
+
+        template <typename Visitor> void visitEdges(Visitor& visitor) const
+        {
+            visitor.append(value);
+            visitor.append(promise);
+        }
     };
 
 public:
@@ -184,8 +184,8 @@ public:
     // errors the stream with its exception instead. A chunk that costs no
     // bytes, such as an empty string or a view of an empty buffer, passes the
     // byte limit even when it is reached, so only the count limit bounds a run
-    // of them. Each queued write holds a promise, a ColloPromiseDeferred and a
-    // queue slot, so an unbounded run grows memory the byte limit never counts.
+    // of them. Each queued write holds a promise and a queue slot, so an
+    // unbounded run grows memory the byte limit never counts.
     void setQueueMemoryCostLimit(size_t value) { m_queue_memory_cost_limit = value; }
     void setQueuePendingCountLimit(size_t value) { m_write_queue_pending_limit = value; }
     void setQueueMemoryLimitExceededCallback(JSC::VM& vm, JSValue callback)
@@ -234,22 +234,26 @@ private:
     {
     }
 
-    ~JSColloWritableStream();
-    bool finishCreation(JSC::VM& vm, JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope);
-    bool appendWriteRequest(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSValue chunk, double size,
-        size_t memory_cost, JSValue promise, ColloPromiseDeferred* deferred);
+    ~JSColloWritableStream() = default;
+    void finishCreation(JSC::VM& vm);
     bool queueMemoryCostWouldExceed(size_t memory_cost) const;
     bool queuePendingCountWouldExceed() const;
-    void subtractQueueMemoryCost(size_t memory_cost);
+    void subtractQueueSize(double size, size_t memory_cost);
     bool notifyQueueMemoryLimitExceeded(JSC::JSGlobalObject*, JSC::ThrowScope&, JSValue reason);
-    bool dequeueWriteRequest(WriteRequest& out);
-    void compactWriteQueueIfNeeded();
-    void settleWriteRequest(
-        JSC::JSGlobalObject* global_object, WriteRequest& request, JSValue value, bool is_rejection);
-    bool ensureReadyPending(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope);
+    // Moves the first queued write into the active write's fields.
+    void activateFirstWrite(JSC::VM&);
+    // Settles the active write's promise and empties its fields. Returns false
+    // when a termination is pending.
+    bool settleActiveWrite(JSC::JSGlobalObject* global_object, JSValue value, bool is_rejection);
     void resolveReadyIfNeeded(JSC::JSGlobalObject* global_object);
-    void clearWriteQueue(JSC::JSGlobalObject* global_object, JSValue error);
-    void settleClosed(JSC::JSGlobalObject* global_object, JSValue value, bool is_rejection);
+    // Rejects the active and every queued write with `error`. Returns false
+    // when a termination is pending.
+    bool clearWriteQueue(JSC::JSGlobalObject* global_object, JSValue error);
+    bool settleClosed(JSC::JSGlobalObject* global_object, JSValue value, bool is_rejection);
+    // The end of WritableStreamFinishErroring: settles the abort request with
+    // `value` and rejects the closed promise of the current writer, which may
+    // have been acquired while the sink's abort method ran.
+    void finishErroring(JSC::JSGlobalObject* global_object, JSValue value, bool is_rejection);
     // Runs once the stream can no longer call its sink: it is closed or
     // errored, or abort has taken the sink's abort method.
     void clearAlgorithms()
@@ -262,8 +266,10 @@ private:
     JSC::WriteBarrier<JSC::Unknown> m_stored_error;
     JSC::WriteBarrier<JSColloWritableStreamDefaultWriter> m_writer;
     JSC::WriteBarrier<JSColloWritableStreamDefaultController> m_controller;
-    JSC::WriteBarrier<JSC::Unknown> m_close_promise;
-    JSC::WriteBarrier<JSC::Unknown> m_abort_promise;
+    // The promises of a pending close and a pending abort request, empty once
+    // the request settles.
+    JSC::WriteBarrier<JSC::JSPromise> m_close_promise;
+    JSC::WriteBarrier<JSC::JSPromise> m_abort_promise;
     JSC::WriteBarrier<JSC::JSFunction> m_write_fulfilled;
     JSC::WriteBarrier<JSC::JSFunction> m_write_rejected;
     JSC::WriteBarrier<JSC::JSFunction> m_close_fulfilled;
@@ -271,21 +277,23 @@ private:
     JSC::WriteBarrier<JSC::JSFunction> m_abort_fulfilled;
     JSC::WriteBarrier<JSC::JSFunction> m_abort_rejected;
     JSC::WriteBarrier<JSC::Unknown> m_queue_memory_limit_exceeded;
-    WTF::Vector<WriteRequest> m_write_queue;
-    size_t m_write_queue_pending_limit { 0 };
+    Collo::CellEdgeList<WriteRequest> m_write_queue;
+    // The write the sink holds or is about to receive, out of the queue. Its
+    // barriers name this stream as their owner.
     WriteRequest m_active_write;
-    size_t m_write_queue_start { 0 };
+    size_t m_write_queue_pending_limit { 0 };
     size_t m_queue_memory_cost { 0 };
     size_t m_queue_memory_cost_limit { 0 };
     double m_queue_total_size { 0 };
     double m_high_water_mark { 1 };
-    // Both can keep this cell alive until VM teardown: see the FIXME in stream_common_private.h.
-    ColloPromiseDeferred* m_close_deferred { nullptr };
-    ColloPromiseDeferred* m_abort_deferred { nullptr };
     bool m_starting { false };
+    // Set from WritableStreamMarkFirstWriteRequestInFlight, before the sink's
+    // write runs, until the write settles, so a write the sink issues through
+    // the stream's own writer queues instead of reaching the sink again.
     bool m_write_in_flight { false };
     bool m_has_active_write { false };
     bool m_close_requested { false };
+    // Set before the sink's close runs, for the same reason.
     bool m_close_in_flight { false };
     bool m_abort_in_flight { false };
 };
@@ -305,6 +313,8 @@ public:
             vm, global_object, prototype, JSC::TypeInfo(JSC::ObjectType, StructureFlags), info());
     }
 
+    // Returns null with the exception pending when settling the writer's
+    // first promises meets a termination.
     static JSColloWritableStreamDefaultWriter* create(
         JSC::VM& vm, JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSColloWritableStream* stream);
     static void destroy(JSCell* cell)
@@ -318,10 +328,15 @@ public:
     JSColloWritableStream* stream() const { return m_stream.get(); }
     JSValue readyPromise() const { return m_ready_promise.get(); }
     JSValue closedPromise() const { return m_closed_promise.get(); }
-    bool ensureReadyPending(JSC::JSGlobalObject*, JSC::ThrowScope&);
+    // WritableStreamUpdateBackpressure with backpressure: a settled ready
+    // promise is replaced by a pending one.
+    void ensureReadyPending(JSC::JSGlobalObject*);
     void resolveReadyIfNeeded(JSC::JSGlobalObject*, JSColloWritableStream*);
-    void settleReady(JSC::JSGlobalObject*, JSValue, bool);
-    void settleClosed(JSC::JSGlobalObject*, JSValue, bool);
+    // Each returns false when a termination is pending.
+    bool settleReady(JSC::JSGlobalObject*, JSValue, bool is_rejection);
+    bool settleClosed(JSC::JSGlobalObject*, JSValue, bool is_rejection);
+    // WritableStreamDefaultWriterRelease: both promises end rejected with a
+    // TypeError and handled, a pending one rejected in place.
     void release(JSC::JSGlobalObject* global_object);
 
 private:
@@ -330,15 +345,12 @@ private:
     {
     }
 
-    ~JSColloWritableStreamDefaultWriter();
-    bool finishCreation(JSC::VM&, JSC::JSGlobalObject*, JSC::ThrowScope&, JSColloWritableStream*);
+    ~JSColloWritableStreamDefaultWriter() = default;
+    bool finishCreation(JSC::VM&, JSC::JSGlobalObject*, JSColloWritableStream*);
 
     JSC::WriteBarrier<JSColloWritableStream> m_stream;
-    JSC::WriteBarrier<JSC::Unknown> m_ready_promise;
-    JSC::WriteBarrier<JSC::Unknown> m_closed_promise;
-    // Both can keep this cell alive until VM teardown: see the FIXME in stream_common_private.h.
-    ColloPromiseDeferred* m_ready_deferred { nullptr };
-    ColloPromiseDeferred* m_closed_deferred { nullptr };
+    JSC::WriteBarrier<JSC::JSPromise> m_ready_promise;
+    JSC::WriteBarrier<JSC::JSPromise> m_closed_promise;
 };
 
 } // namespace Collo::HostFunctions

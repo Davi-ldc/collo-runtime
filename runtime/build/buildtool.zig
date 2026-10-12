@@ -1,18 +1,27 @@
 //! Single Collo build host tool. `main` dispatches on argv[1]:
-//!   webkit-provision      clone oven-sh/WebKit at the pin into runtime/deps/WebKit
+//!   deps-provision        fetch each named pinned tree (pins.zig) at its pin into runtime/deps
+//!   deps-verify           refuse a pinned tree the build reads in place unless it is pristine at its pin
+//!   icu-build             build ICU with its data into runtime/deps/icu-build, or admit it by its stamp
+//!   boringssl-build       build patched BoringSSL into runtime/deps/boringssl-build, or admit it by its stamp
 //!   jsc-build             build the pinned, patched WebKit/JSC into runtime/deps/jsc-build
 //!   jsc-validate-prebuilt admit an existing engine build by its provenance, never build
 //!   webkit-authoring      create the patch-authoring worktree with the series applied
 //!   webkit-export         regenerate runtime/patches/webkit from the authoring branch
 //!   apply-patches         apply a <dep>/*.patch series to a private copy of a dep
 //!
-//! Every engine directory lives under the project's `runtime/deps`, so the tool
-//! never deletes anything outside that tree. Only the Zig std library is used;
-//! external programs (git, cmake, ninja, patch) are spawned via
-//! std.process.Child with explicit argv arrays, never a shell, and every spawn
-//! has its exit status checked. Builds are serialized by rule, not by lock:
-//! two invocations on one engine directory clobber each other.
+//! Every directory the tool creates or removes lies under the project's
+//! `runtime/deps`, and a pristine tree there is input it never removes. Only
+//! the Zig std library is used; external programs (git, cmake, ninja, make,
+//! patch, ICU's configure) are spawned via std.process.Child with explicit
+//! argv arrays, never a shell, and every spawn has its exit status checked.
+//! Builds are serialized by rule, not by lock: two invocations on one build
+//! directory clobber each other, so the build graph creates one step per
+//! directory.
 const std = @import("std");
+/// Public so the build-tool suites reach the version-file parser through
+/// this module; a second module rooted at pins.zig would put the file in two
+/// modules of one test binary, which Zig refuses.
+pub const pins = @import("pins.zig");
 
 fn pathContainsTraversal(path: []const u8) bool {
     var components = std.mem.splitScalar(u8, path, std.fs.path.sep);
@@ -190,9 +199,30 @@ pub fn main() !void {
         };
         return;
     }
-    if (std.mem.eql(u8, sub, "webkit-provision")) {
-        webkit_ops.provision(gpa, sub_argv) catch |err| {
-            printErr("collo webkit-provision: unexpected error: {s}\n", .{@errorName(err)});
+    if (std.mem.eql(u8, sub, "deps-provision")) {
+        pinned_trees.provision(gpa, sub_argv) catch |err| {
+            printErr("collo deps-provision: unexpected error: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        return;
+    }
+    if (std.mem.eql(u8, sub, "deps-verify")) {
+        pinned_trees.verify(gpa, sub_argv) catch |err| {
+            printErr("collo deps-verify: unexpected error: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        return;
+    }
+    if (std.mem.eql(u8, sub, "icu-build")) {
+        icu_build.run(gpa, sub_argv) catch |err| {
+            printErr("collo icu-build: unexpected error: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        return;
+    }
+    if (std.mem.eql(u8, sub, "boringssl-build")) {
+        boringssl_build.run(gpa, sub_argv) catch |err| {
+            printErr("collo boringssl-build: unexpected error: {s}\n", .{@errorName(err)});
             std.process.exit(1);
         };
         return;
@@ -218,7 +248,8 @@ pub fn main() !void {
     std.process.exit(64);
 }
 
-const subcommand_list = "webkit-provision|jsc-build|jsc-validate-prebuilt|webkit-authoring|webkit-export|apply-patches";
+const subcommand_list = "deps-provision|deps-verify|icu-build|boringssl-build|jsc-build|" ++
+    "jsc-validate-prebuilt|webkit-authoring|webkit-export|apply-patches";
 
 /// printErr writes a diagnostic to stderr (buffered, then flushed). Shared by
 /// main and jsc_build.fail.
@@ -277,12 +308,13 @@ const jsc_build = struct {
     const arg_expected_commit = 7;
     const arg_mcpu = 8;
     const arg_tool_identity = 9;
-    const arg_count_required = 10;
+    const arg_icu_prefix = 10;
+    const arg_count_required = 11;
 
-    const stamp_schema = "collo-jsc-stamp-v3";
-    const attestation_schema = "collo-jsc-attestation-v2";
+    const stamp_schema = "collo-jsc-stamp-v4";
+    const attestation_schema = "collo-jsc-attestation-v3";
     const stamp_filename = ".collo-jsc.stamp";
-    const attestation_filename = ".collo-jsc.attestation.v2";
+    const attestation_filename = ".collo-jsc.attestation.v3";
 
     const BuildAttestationInputs = struct {
         expected_commit: []const u8,
@@ -294,6 +326,13 @@ const jsc_build = struct {
         mcpu: []const u8,
         compiler_version: []const u8,
         tool_identity: []const u8,
+        /// The install prefix of the pinned ICU build (`icu_build`) that
+        /// CMake's FindICU is pointed at.
+        icu_prefix: []const u8,
+        /// The digest of that prefix's `include/` tree. The engine's archives
+        /// hold no ICU code, only code compiled against these headers, so
+        /// the headers are the whole of ICU the engine depends on.
+        icu_headers_sha256: []const u8,
     };
 
     // Maximum bytes for files we read fully into memory (patches, overlay
@@ -315,7 +354,7 @@ const jsc_build = struct {
         if (argv.len != arg_count_required) {
             fail(argv, 1, "usage: {s} <jsc_build_dir> <webkit_worktree> <target_triple> " ++
                 "<target_arch> <cmake_build_type> <cxx_sysroot> <expected_commit> " ++
-                "<mcpu> <tool_identity>\n", .{argv[0]});
+                "<mcpu> <tool_identity> <icu_prefix>\n", .{argv[0]});
         }
 
         const target_triple = argv[arg_target_triple];
@@ -364,6 +403,19 @@ const jsc_build = struct {
         defer gpa.free(patch_hash);
         const compiler_version = try clangVersionFirstLine(gpa, argv);
         defer gpa.free(compiler_version);
+
+        // The ICU step runs before this one and fails unless its prefix holds
+        // the build its stamp describes, so the headers read here are the ones
+        // that stamp admitted.
+        const icu_prefix = try absolutize(gpa, repo_root, argv[arg_icu_prefix]);
+        defer gpa.free(icu_prefix);
+        icu_build.validatePrefix(gpa, repo_root, icu_prefix) catch |err|
+            fail(argv, 1, "invalid ICU prefix {s}: {s}\n", .{ icu_prefix, @errorName(err) });
+        const icu_include = try std.fs.path.join(gpa, &.{ icu_prefix, "include" });
+        defer gpa.free(icu_include);
+        const icu_headers = native_build.digestTree(gpa, icu_include) catch |err|
+            fail(argv, 1, "cannot digest the ICU headers in {s}: {s}\n", .{ icu_include, @errorName(err) });
+
         const attestation_inputs = BuildAttestationInputs{
             .expected_commit = expected_commit,
             .patch_hash = patch_hash,
@@ -374,6 +426,8 @@ const jsc_build = struct {
             .mcpu = mcpu,
             .compiler_version = compiler_version,
             .tool_identity = tool_identity,
+            .icu_prefix = icu_prefix,
+            .icu_headers_sha256 = &icu_headers.sha256,
         };
 
         if (validate_prebuilt_only) {
@@ -415,6 +469,7 @@ const jsc_build = struct {
             .target_triple = target_triple,
             .cxx_sysroot = cxx_sysroot,
             .mcpu = mcpu,
+            .icu_prefix = icu_prefix,
         });
         try requireWebkitBuildSource(argv, webkit_worktree);
         validateCmakeConfiguration(gpa, jsc_build_dir, webkit_worktree, attestation_inputs) catch |err|
@@ -520,54 +575,20 @@ const jsc_build = struct {
         return false;
     }
 
-    /// The runtime source must be a standalone checkout whose HEAD is the pinned commit.
+    /// The engine's source must be the pinned WebKit checkout, standalone and
+    /// with HEAD at the pin. Its working tree may hold edits: the build reads
+    /// a worktree of the commit, so uncommitted changes never reach it.
     fn checkWebkitCheckout(
         gpa: std.mem.Allocator,
         argv: [][:0]u8,
         webkit_repo: []const u8,
         expected_commit: []const u8,
     ) !void {
-        const jsc_source = try std.fs.path.join(gpa, &.{ webkit_repo, "Source/JavaScriptCore" });
-        defer gpa.free(jsc_source);
-        std.fs.cwd().access(jsc_source, .{}) catch
-            fail(argv, 1, "missing runtime WebKit source: {s}\n", .{webkit_repo});
-        const git_directory = try std.fs.path.join(gpa, &.{ webkit_repo, ".git" });
-        defer gpa.free(git_directory);
-        var metadata = std.fs.cwd().openDir(git_directory, .{ .no_follow = true }) catch
-            fail(argv, 1, "runtime WebKit must own its git directory: {s}\n", .{webkit_repo});
-        defer metadata.close();
-        const common_directory = gitCapture(gpa, &.{
-            "git", "-C", webkit_repo, "rev-parse", "--path-format=absolute", "--git-common-dir",
-        }) catch null;
-        defer if (common_directory) |value| gpa.free(value);
-        const common_text = if (common_directory) |value|
-            std.mem.trim(u8, value, " \t\r\n")
-        else
-            "<unknown>";
-        if (!std.mem.eql(u8, common_text, git_directory))
-            fail(argv, 1, "runtime WebKit shares git metadata with another checkout: {s}\n", .{webkit_repo});
-
-        // Compare the checkout root literally to reject symlink aliases.
-        const toplevel = gitCapture(gpa, &.{
-            "git", "-C", webkit_repo, "rev-parse", "--show-toplevel",
-        }) catch null;
-        const toplevel_ok = if (toplevel) |value| blk: {
-            defer gpa.free(value);
-            const trimmed = std.mem.trim(u8, value, " \t\r\n");
-            break :blk std.mem.eql(u8, trimmed, webkit_repo);
-        } else false;
-        if (!toplevel_ok) {
-            fail(argv, 1, "runtime WebKit is not a standalone git checkout: {s}\n", .{webkit_repo});
-        }
-
-        // HEAD must equal the pin, not merely contain it. Worktrees materialize committed objects,
-        // so uncommitted source edits cannot reach the build.
-        const head = gitCapture(gpa, &.{ "git", "-C", webkit_repo, "rev-parse", "HEAD" }) catch null;
-        defer if (head) |value| gpa.free(value);
-        const head_text = if (head) |value| std.mem.trim(u8, value, " \t\r\n") else "<unknown>";
-        if (!std.mem.eql(u8, head_text, expected_commit)) {
-            fail(argv, 1, "runtime WebKit checkout {s} is not at the pinned commit {s}; " ++
-                "current HEAD is {s}\n", .{ webkit_repo, expected_commit, head_text });
+        const webkit = pins.spec(.webkit);
+        const problem = try pinned_trees.checkoutProblem(gpa, webkit_repo, expected_commit, webkit.marker, false);
+        if (problem) |text| {
+            defer gpa.free(text);
+            fail(argv, 1, "runtime WebKit {s}: {s}\n", .{ webkit_repo, text });
         }
     }
 
@@ -918,6 +939,11 @@ const jsc_build = struct {
         try requireCmakeCacheValue(cache, "CMAKE_BUILD_TYPE", inputs.cmake_build_type);
         try requireCmakeCacheValue(cache, "CMAKE_HOME_DIRECTORY", webkit_worktree);
         try requireCmakeCacheValue(cache, "CMAKE_GENERATOR", "Ninja");
+        for (icu_build.cmake_cache_entries) |entry| {
+            const expected = try std.mem.concat(gpa, u8, &.{ inputs.icu_prefix, entry.prefix_suffix });
+            defer gpa.free(expected);
+            try requireCmakeCacheValue(cache, entry.key, expected);
+        }
 
         const expected_c = try resolveCommandPath(gpa, "clang-19");
         defer gpa.free(expected_c);
@@ -1152,6 +1178,8 @@ const jsc_build = struct {
             "mcpu={s}\n" ++
             "compiler={s}\n" ++
             "script_sha={s}\n" ++
+            "icu_prefix={s}\n" ++
+            "icu_headers_sha256={s}\n" ++
             "attestation_sha256={s}", .{
             stamp_schema,
             inputs.expected_commit,
@@ -1163,6 +1191,8 @@ const jsc_build = struct {
             inputs.mcpu,
             inputs.compiler_version,
             inputs.tool_identity,
+            inputs.icu_prefix,
+            inputs.icu_headers_sha256,
             attestation_sha256,
         });
     }
@@ -1214,6 +1244,7 @@ const jsc_build = struct {
             "commit={s}\npatch_hash={s}\n" ++
             "target_triple={s}\ntarget_arch={s}\ncmake_build_type={s}\n" ++
             "cxx_sysroot={s}\nmcpu={s}\ncompiler={s}\nscript_sha={s}\n" ++
+            "icu_prefix={s}\nicu_headers_sha256={s}\n" ++
             "webkit_worktree={s}\n", .{
             attestation_schema,
             inputs.expected_commit,
@@ -1225,6 +1256,8 @@ const jsc_build = struct {
             inputs.mcpu,
             inputs.compiler_version,
             inputs.tool_identity,
+            inputs.icu_prefix,
+            inputs.icu_headers_sha256,
             webkit_worktree,
         });
         try attestation_writer.print("cmake_cache_sha256={s}\ncmake_cache_size={d}\n" ++
@@ -1287,6 +1320,8 @@ const jsc_build = struct {
             inputs.mcpu,
             inputs.compiler_version,
             inputs.tool_identity,
+            inputs.icu_prefix,
+            inputs.icu_headers_sha256,
         }) |value| try validateCanonicalField(value);
     }
 
@@ -1451,6 +1486,7 @@ const jsc_build = struct {
         target_triple: []const u8,
         cxx_sysroot: []const u8,
         mcpu: []const u8,
+        icu_prefix: []const u8,
     };
 
     /// The sparse source omits Tools; extract its pinned header-map script into the build directory.
@@ -1511,6 +1547,22 @@ const jsc_build = struct {
         });
         try args.appendSlice(gpa, &jsc_cmake_profile_args);
 
+        // Every FindICU result is given, never searched for: a search can
+        // settle on the machine's ICU, and the engine would then compile
+        // against headers the binary does not link.
+        var icu_args: [icu_build.cmake_cache_entries.len][]const u8 = undefined;
+        var icu_args_count: usize = 0;
+        defer for (icu_args[0..icu_args_count]) |arg| gpa.free(arg);
+        for (icu_build.cmake_cache_entries) |entry| {
+            icu_args[icu_args_count] = try std.fmt.allocPrint(gpa, "-D{s}={s}{s}", .{
+                entry.key,
+                spec.icu_prefix,
+                entry.prefix_suffix,
+            });
+            icu_args_count += 1;
+        }
+        try args.appendSlice(gpa, icu_args[0..icu_args_count]);
+
         var c_flags_arg: ?[]u8 = null;
         var cxx_flags_arg: ?[]u8 = null;
         defer if (c_flags_arg) |arg| gpa.free(arg);
@@ -1551,8 +1603,19 @@ const jsc_build = struct {
             });
         }
 
-        try spawnMustSucceed(gpa, argv, args.items);
+        // WebKit's JSCOnly options copy ICU_ROOT and ICU_INCLUDE_DIRS from the
+        // environment into the cache over the values given above.
+        var environment = try native_build.environmentWithout(gpa, &engine_scrubbed_variables);
+        defer environment.deinit();
+        native_build.spawnMust(gpa, argv, args.items, .{ .env_map = &environment });
     }
+
+    /// The caller's variables the engine's CMake must not see. The rest of
+    /// the environment reaches it, because WebKit's generator scripts depend
+    /// on the caller's locale; the profile and compiler checks of
+    /// `validateCmakeConfigurationContents` catch the flags a variable could
+    /// otherwise smuggle in.
+    const engine_scrubbed_variables = [_][]const u8{ "ICU_ROOT", "ICU_INCLUDE_DIRS" };
 
     /// JSC's unified sources can consume multiple GiB each, so the default job count is memory-aware.
     /// API tests are configured on Linux but do not belong to the archive target's dependencies.
@@ -1784,23 +1847,12 @@ const jsc_build = struct {
 };
 
 // =============================================================================
-// webkit-provision / webkit-authoring / webkit-export: the pinned clone and
-// the patch series around it.
+// webkit-authoring / webkit-export: the patch series around the pinned clone,
+// which deps-provision fetches.
 // =============================================================================
 
 const webkit_ops = struct {
-    const origin_url = "https://github.com/oven-sh/WebKit.git";
     const authoring_branch = "collo-patches";
-
-    /// The directories a JSCOnly build and its readers open; everything else in WebKit stays
-    /// out of the checkout. `Tools/Scripts` holds the header-map tool the build extracts and
-    /// the style checkers, which resolve their paths only from inside a checkout.
-    const cone = [_][]const u8{
-        "Source/cmake",               "Source/JavaScriptCore",
-        "Source/WTF",                 "Source/bmalloc",
-        "Source/ThirdParty/capstone", "Source/ThirdParty/unifdef",
-        "Source/ThirdParty/gtest",    "Tools/Scripts",
-    };
 
     const Paths = struct {
         repo_root: []u8,
@@ -1847,45 +1899,8 @@ const webkit_ops = struct {
         var args: std.ArrayList([]const u8) = .empty;
         defer args.deinit(gpa);
         try args.appendSlice(gpa, &.{ "git", "-C", checkout, "sparse-checkout", "set", "--cone" });
-        try args.appendSlice(gpa, &cone);
+        try args.appendSlice(gpa, &pins.webkit_cone);
         try jsc_build.gitMustSucceed(gpa, argv, args.items);
-    }
-
-    /// A shallow, blob-less fetch of exactly the pinned commit, checked out through the cone:
-    /// around a hundred megabytes of objects plus the readable JSC tree, with blobs outside
-    /// the cone fetched by git on demand. An existing clone is accepted only at the pin; the
-    /// tool never removes one, because it is input, not output.
-    pub fn provision(gpa: std.mem.Allocator, argv: [][:0]u8) !void {
-        const commit = expectedCommit(argv);
-        var paths = try Paths.resolve(gpa, argv);
-        defer paths.deinit(gpa);
-        requireGit(gpa, argv);
-
-        if (try jsc_build.pathEntryExists(paths.repository)) {
-            const head = jsc_build.gitCapture(gpa, &.{ "git", "-C", paths.repository, "rev-parse", "HEAD" }) catch null;
-            defer if (head) |value| gpa.free(value);
-            const head_text = if (head) |value| std.mem.trim(u8, value, " \t\r\n") else "<not a git checkout>";
-            if (std.mem.eql(u8, head_text, commit)) {
-                try jsc_build.checkWebkitCheckout(gpa, argv, paths.repository, commit);
-                try jsc_build.stdoutPrint(argv, "WebKit already provisioned at {s}: {s}\n", .{ commit, paths.repository });
-                return;
-            }
-            jsc_build.fail(argv, 1, "{s} exists with HEAD {s}, not the pin {s}; remove it to provision again\n", .{
-                paths.repository, head_text, commit,
-            });
-        }
-
-        std.fs.cwd().makePath(paths.repository) catch |err|
-            jsc_build.fail(argv, 1, "cannot create {s}: {s}\n", .{ paths.repository, @errorName(err) });
-        try jsc_build.gitMustSucceed(gpa, argv, &.{ "git", "init", "--quiet", paths.repository });
-        try jsc_build.gitMustSucceed(gpa, argv, &.{ "git", "-C", paths.repository, "remote", "add", "origin", origin_url });
-        try jsc_build.gitMustSucceed(gpa, argv, &.{
-            "git", "-C", paths.repository, "fetch", "--depth=1", "--filter=blob:none", "origin", commit,
-        });
-        try setSparseCone(gpa, argv, paths.repository);
-        try jsc_build.gitMustSucceed(gpa, argv, &.{ "git", "-C", paths.repository, "checkout", "--quiet", "--detach", commit });
-        try jsc_build.checkWebkitCheckout(gpa, argv, paths.repository, commit);
-        try jsc_build.stdoutPrint(argv, "WebKit provisioned at {s}: {s}\n", .{ commit, paths.repository });
     }
 
     /// The authoring worktree is where patches are written: a branch off the pin with the
@@ -2158,6 +2173,10 @@ const apply_patches = struct {
         defer walker.deinit();
 
         while (try walker.next()) |entry| {
+            // A pinned tree is a git checkout; its metadata is not source, and
+            // copying it would make the output depend on git's own bookkeeping.
+            if (hasGitMetadataComponent(entry.path))
+                continue;
             // Resolve `.unknown` (filesystems that do not return a dirent type) via
             // statFile so behavior matches `cp -R`/`find`, which always stat.
             const kind = try resolveEntryKind(source_dir, entry);
@@ -2185,6 +2204,17 @@ const apply_patches = struct {
                 else => return error.UnexpectedDirEntryKind,
             }
         }
+    }
+
+    /// Whether a walked path is, or lies inside, a `.git` entry: the metadata
+    /// directory of a checkout or the `.git` file of a submodule.
+    fn hasGitMetadataComponent(path: []const u8) bool {
+        var components = std.mem.splitScalar(u8, path, std.fs.path.sep);
+        while (components.next()) |component| {
+            if (std.mem.eql(u8, component, ".git"))
+                return true;
+        }
+        return false;
     }
 
     /// Resolves the kind of a walked directory entry. Most filesystems report the
@@ -2358,6 +2388,1091 @@ const apply_patches = struct {
         for (list.items) |string|
             gpa.free(string);
         list.deinit(gpa);
+    }
+};
+
+// =============================================================================
+// deps-provision / deps-verify: the pristine trees runtime/build/pins.zig
+// lists, fetched once at their pins and never edited or removed.
+// =============================================================================
+
+const pinned_trees = struct {
+    /// How much of `git status` a problem quotes; its first lines name the
+    /// files that differ.
+    const status_listing_bytes_max: usize = 2048;
+
+    /// Fetches each named dependency (a `pins.Dependency` tag name) at its
+    /// pin. A tree that already exists is accepted only when
+    /// `checkoutProblem` finds nothing wrong with it, and never replaced:
+    /// it is input, and a tool that removed it could remove someone's work.
+    pub fn provision(gpa: std.mem.Allocator, argv: [][:0]u8) !void {
+        if (argv.len < 2)
+            jsc_build.fail(argv, 64, "usage: {s} <dependency>...\n", .{argv[0]});
+        const repo_root = try jsc_build.resolveRepoRoot(gpa, argv);
+        defer gpa.free(repo_root);
+        if (!jsc_build.commandExists(gpa, "git"))
+            jsc_build.fail(argv, 1, "missing required command: git\n", .{});
+        for (argv[1..]) |name|
+            try provisionOne(gpa, argv, repo_root, parseDependency(argv, name));
+    }
+
+    /// Fails unless each named tree is at its pin and, when the build reads
+    /// the tree in place (`pins.Spec.read_in_place`), holds exactly the
+    /// pinned commit's files. The build runs this before compiling any of
+    /// them, so an edited or stale tree stops the build instead of reaching
+    /// the binary.
+    pub fn verify(gpa: std.mem.Allocator, argv: [][:0]u8) !void {
+        if (argv.len < 2)
+            jsc_build.fail(argv, 64, "usage: {s} <dependency>...\n", .{argv[0]});
+        const repo_root = try jsc_build.resolveRepoRoot(gpa, argv);
+        defer gpa.free(repo_root);
+        for (argv[1..]) |name| {
+            const dependency = parseDependency(argv, name);
+            const spec = pins.spec(dependency);
+            var loaded = loadPin(gpa, argv, repo_root, dependency);
+            defer loaded.deinit(gpa);
+            const tree = try treePath(gpa, repo_root, spec);
+            defer gpa.free(tree);
+            const problem = try checkoutProblem(gpa, tree, loaded.pin.commit, spec.marker, spec.read_in_place);
+            if (problem) |text| {
+                defer gpa.free(text);
+                jsc_build.fail(argv, 1, "{s}: {s}\n`zig build deps-provision` fetches a missing tree at its pin; " ++
+                    "it never replaces one that exists, so move this one aside first\n", .{ tree, text });
+            }
+        }
+    }
+
+    fn parseDependency(argv: [][:0]u8, name: []const u8) pins.Dependency {
+        return std.meta.stringToEnum(pins.Dependency, name) orelse
+            jsc_build.fail(argv, 64, "unknown dependency '{s}'\n", .{name});
+    }
+
+    /// The pin of `dependency`; a missing or malformed version file ends the
+    /// tool.
+    fn loadPin(
+        gpa: std.mem.Allocator,
+        argv: [][:0]u8,
+        repo_root: []const u8,
+        dependency: pins.Dependency,
+    ) pins.Loaded {
+        var root = std.fs.cwd().openDir(repo_root, .{}) catch |err|
+            jsc_build.fail(argv, 1, "cannot open the repository root {s}: {s}\n", .{ repo_root, @errorName(err) });
+        defer root.close();
+        return pins.load(gpa, root, dependency) catch |err|
+            jsc_build.fail(argv, 1, "cannot read the pin {s}/{s}: {s}\n", .{
+                pins.deps_relative,
+                pins.spec(dependency).version_file,
+                @errorName(err),
+            });
+    }
+
+    fn treePath(gpa: std.mem.Allocator, repo_root: []const u8, spec: pins.Spec) ![]u8 {
+        return std.fs.path.join(gpa, &.{ repo_root, pins.deps_relative, spec.tree });
+    }
+
+    fn provisionOne(
+        gpa: std.mem.Allocator,
+        argv: [][:0]u8,
+        repo_root: []const u8,
+        dependency: pins.Dependency,
+    ) !void {
+        const spec = pins.spec(dependency);
+        var loaded = loadPin(gpa, argv, repo_root, dependency);
+        defer loaded.deinit(gpa);
+        const pin = loaded.pin;
+        const tree = try treePath(gpa, repo_root, spec);
+        defer gpa.free(tree);
+
+        if (try jsc_build.pathEntryExists(tree)) {
+            const problem = try checkoutProblem(gpa, tree, pin.commit, spec.marker, spec.read_in_place);
+            if (problem) |text| {
+                defer gpa.free(text);
+                jsc_build.fail(argv, 1, "{s}: {s}\nThe tool never replaces an existing tree; " ++
+                    "move it aside and provision again\n", .{ tree, text });
+            }
+            try jsc_build.stdoutPrint(argv, "{s} already provisioned at {s}: {s}\n", .{ spec.tree, pin.commit, tree });
+            return;
+        }
+
+        fetch(gpa, tree, spec, pin) catch |err| {
+            // The tree did not exist before this call, so it holds nothing but
+            // the failed fetch; leaving it would make every later run refuse
+            // it as a tree off the pin.
+            std.fs.cwd().deleteTree(tree) catch |delete_err|
+                jsc_build.fail(argv, 1, "provisioning {s} failed ({s}), and removing the partial tree " ++
+                    "{s} failed too ({s})\n", .{ spec.tree, @errorName(err), tree, @errorName(delete_err) });
+            jsc_build.fail(argv, 1, "provisioning {s} at {s} failed: {s}\n", .{ spec.tree, pin.commit, @errorName(err) });
+        };
+        const problem = try checkoutProblem(gpa, tree, pin.commit, spec.marker, spec.read_in_place);
+        if (problem) |text| {
+            defer gpa.free(text);
+            jsc_build.fail(argv, 1, "{s} was fetched, yet {s}\n", .{ tree, text });
+        }
+        try jsc_build.stdoutPrint(argv, "{s} provisioned at {s}: {s}\n", .{ spec.tree, pin.commit, tree });
+    }
+
+    /// A shallow fetch of exactly the pinned commit. A pin with a tag is
+    /// fetched by its tag, which every server serves, while not every server
+    /// serves an arbitrary commit; the commit the tag resolves to must then
+    /// be the pin, so a moved tag fails instead of provisioning other code.
+    fn fetch(gpa: std.mem.Allocator, tree: []const u8, spec: pins.Spec, pin: pins.Pin) !void {
+        try std.fs.cwd().makePath(tree);
+        try native_build.spawnChecked(gpa, &.{ "git", "init", "--quiet", tree }, .{});
+        try native_build.spawnChecked(gpa, &.{ "git", "-C", tree, "remote", "add", "origin", pin.source }, .{});
+
+        const ref = if (pin.tag) |tag|
+            try std.fmt.allocPrint(gpa, "refs/tags/{s}", .{tag})
+        else
+            try gpa.dupe(u8, pin.commit);
+        defer gpa.free(ref);
+        var args: std.ArrayList([]const u8) = .empty;
+        defer args.deinit(gpa);
+        try args.appendSlice(gpa, &.{ "git", "-C", tree, "fetch", "--depth=1" });
+        if (spec.blobless)
+            try args.append(gpa, "--filter=blob:none");
+        try args.appendSlice(gpa, &.{ "origin", ref });
+        try native_build.spawnChecked(gpa, args.items, .{});
+
+        const fetched = try jsc_build.gitCapture(gpa, &.{ "git", "-C", tree, "rev-parse", "FETCH_HEAD^{commit}" });
+        defer gpa.free(fetched);
+        const fetched_commit = std.mem.trim(u8, fetched, " \t\r\n");
+        if (!std.mem.eql(u8, fetched_commit, pin.commit)) {
+            printErr("{s} resolves to {s}, not the pinned commit {s}\n", .{ ref, fetched_commit, pin.commit });
+            return error.TagNotAtPin;
+        }
+
+        if (spec.sparse_cone.len != 0) {
+            args.clearRetainingCapacity();
+            try args.appendSlice(gpa, &.{ "git", "-C", tree, "sparse-checkout", "set", "--cone" });
+            try args.appendSlice(gpa, spec.sparse_cone);
+            try native_build.spawnChecked(gpa, args.items, .{});
+        }
+        try native_build.spawnChecked(gpa, &.{ "git", "-C", tree, "checkout", "--quiet", "--detach", pin.commit }, .{});
+    }
+
+    /// Null when `tree` is the pinned checkout; otherwise the first problem
+    /// found, owned by `gpa`. The tree must hold `marker`, own its git
+    /// metadata, be the top of its own checkout (a symlink or a directory
+    /// inside another repository is refused) and have HEAD at `commit`. With
+    /// `require_clean` its working tree must also match that commit exactly,
+    /// with no untracked file, ignored or not.
+    pub fn checkoutProblem(
+        gpa: std.mem.Allocator,
+        tree: []const u8,
+        commit: []const u8,
+        marker: []const u8,
+        require_clean: bool,
+    ) !?[]u8 {
+        const marker_path = try std.fs.path.join(gpa, &.{ tree, marker });
+        defer gpa.free(marker_path);
+        std.fs.cwd().access(marker_path, .{}) catch
+            return try std.fmt.allocPrint(gpa, "it holds no {s}, so it is not this dependency", .{marker});
+
+        const git_directory = try std.fs.path.join(gpa, &.{ tree, ".git" });
+        defer gpa.free(git_directory);
+        var metadata = std.fs.cwd().openDir(git_directory, .{ .no_follow = true }) catch
+            return try gpa.dupe(u8, "it does not own a .git directory, so its commit cannot be checked");
+        metadata.close();
+        if (!try gitOutputEquals(gpa, &.{ "git", "-C", tree, "rev-parse", "--path-format=absolute", "--git-common-dir" }, git_directory))
+            return try gpa.dupe(u8, "it shares git metadata with another checkout");
+        // The checkout root is compared literally, which refuses a symlink alias.
+        if (!try gitOutputEquals(gpa, &.{ "git", "-C", tree, "rev-parse", "--show-toplevel" }, tree))
+            return try gpa.dupe(u8, "it is not the top of a standalone git checkout");
+
+        // HEAD must equal the pin, not merely contain it.
+        const head = jsc_build.gitCapture(gpa, &.{ "git", "-C", tree, "rev-parse", "HEAD" }) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return try gpa.dupe(u8, "git cannot read its HEAD"),
+        };
+        defer gpa.free(head);
+        const head_commit = std.mem.trim(u8, head, " \t\r\n");
+        if (!std.mem.eql(u8, head_commit, commit))
+            return try std.fmt.allocPrint(gpa, "its HEAD is {s}, not the pinned commit {s}", .{ head_commit, commit });
+
+        if (!require_clean)
+            return null;
+        // `--ignored` too: an include path or a copy of the tree reads a file
+        // whatever ignore rule hides it from git.
+        const status = jsc_build.gitCapture(gpa, &.{ "git", "-C", tree, "status", "--porcelain", "--untracked-files=all", "--ignored" }) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return try gpa.dupe(u8, "git cannot read its status"),
+        };
+        defer gpa.free(status);
+        const changes = std.mem.trim(u8, status, " \t\r\n");
+        if (changes.len == 0)
+            return null;
+        return try std.fmt.allocPrint(gpa, "its files differ from the pinned commit:\n{s}", .{
+            changes[0..@min(changes.len, status_listing_bytes_max)],
+        });
+    }
+
+    fn gitOutputEquals(gpa: std.mem.Allocator, child_argv: []const []const u8, expected: []const u8) !bool {
+        const output = jsc_build.gitCapture(gpa, child_argv) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return false,
+        };
+        defer gpa.free(output);
+        return std.mem.eql(u8, std.mem.trim(u8, output, " \t\r\n"), expected);
+    }
+};
+
+// =============================================================================
+// icu-build / boringssl-build: the native libraries built outside Zig's
+// cache, each into one directory per target under runtime/deps and admitted
+// afterwards by a stamp that names its inputs and digests its outputs.
+// =============================================================================
+
+pub const icu_generated_relative = "runtime/deps/icu-build";
+pub const boringssl_generated_relative = "runtime/deps/boringssl-build";
+
+/// The directory one native build owns under its generated root: the target
+/// triple, plus `-<mcpu>` when the build pins a CPU model, so builds for two
+/// CPU models never share a directory. The build script derives the same
+/// name for the paths it hands to compilations and links.
+pub fn nativeBuildKey(allocator: std.mem.Allocator, target_triple: []const u8, mcpu: []const u8) ![]u8 {
+    if (mcpu.len == 0)
+        return allocator.dupe(u8, target_triple);
+    return std.fmt.allocPrint(allocator, "{s}-{s}", .{ target_triple, mcpu });
+}
+
+const native_build = struct {
+    /// A tree of installed headers holds a few hundred files; ten thousand
+    /// means the digest is walking something it should not.
+    const tree_file_count_max: usize = 10_000;
+
+    /// Variables a configure script, make, CMake or WebKit's CMake reads as
+    /// compiler, linker, install or dependency input. The tool sets each one
+    /// a build needs explicitly, so none of the caller's shell leaks into a
+    /// build its stamp does not describe.
+    const caller_build_variables = [_][]const u8{
+        // Compilers, tools and their flags.
+        "CC",                        "CXX",                         "CPP",
+        "CXXCPP",                    "CFLAGS",                      "CXXFLAGS",
+        "CPPFLAGS",                  "LDFLAGS",                     "LIBS",
+        "AR",                        "RANLIB",                      "NM",
+        "LD",                        "STRIP",                       "OBJCOPY",
+        "ASM",                       "ASMFLAGS",                    "PYTHON",
+        "PYTHONPATH",
+        // make: jobs and where `make install` writes.
+                       "MAKEFLAGS",                   "MFLAGS",
+        "MAKELEVEL",                 "GNUMAKEFLAGS",                "DESTDIR",
+        // ICU's data build.
+        "ICU_DATA_FILTER_FILE",      "ICU_DATA_BUILDTOOL_OPTS",
+        // CMake, and the ICU location WebKit's JSCOnly options copy from the
+        // environment into the cache over the pinned one.
+            "CMAKE_TOOLCHAIN_FILE",
+        "CMAKE_PREFIX_PATH",         "CMAKE_GENERATOR",             "CMAKE_BUILD_TYPE",
+        "CMAKE_C_COMPILER_LAUNCHER", "CMAKE_CXX_COMPILER_LAUNCHER", "ICU_ROOT",
+        "ICU_INCLUDE_DIRS",
+    };
+
+    pub const TreeDigest = struct {
+        sha256: [jsc_build.Sha256.digest_length * 2]u8,
+        file_count: usize,
+    };
+
+    /// A digest of every regular file under `root`, an absolute canonical
+    /// directory: the SHA-256 of one `<file sha256>  <relative path>\n` line
+    /// per file in byte-wise path order, so it depends on each file's path
+    /// and bytes and on nothing else. A symlink or special file is an error,
+    /// because a tree that points outside itself would let bytes the digest
+    /// never read reach a compilation.
+    pub fn digestTree(gpa: std.mem.Allocator, root: []const u8) !TreeDigest {
+        var dir = try std.fs.cwd().openDir(root, .{ .iterate = true, .no_follow = true });
+        defer dir.close();
+        var paths: std.ArrayList([]u8) = .empty;
+        defer {
+            for (paths.items) |path| gpa.free(path);
+            paths.deinit(gpa);
+        }
+        var walker = try dir.walk(gpa);
+        defer walker.deinit();
+        while (try walker.next()) |entry| {
+            const kind = if (entry.kind == .unknown) blk: {
+                const metadata = try std.posix.fstatat(dir.fd, entry.path, std.posix.AT.SYMLINK_NOFOLLOW);
+                if (std.posix.S.ISDIR(metadata.mode)) break :blk std.fs.File.Kind.directory;
+                if (std.posix.S.ISREG(metadata.mode)) break :blk std.fs.File.Kind.file;
+                return error.UnsupportedTreeEntry;
+            } else entry.kind;
+            switch (kind) {
+                .directory => continue,
+                .file => {},
+                else => return error.UnsupportedTreeEntry,
+            }
+            if (paths.items.len == tree_file_count_max)
+                return error.TreeTooLarge;
+            const path = try gpa.dupe(u8, entry.path);
+            errdefer gpa.free(path);
+            try paths.append(gpa, path);
+        }
+        if (paths.items.len == 0)
+            return error.EmptyTree;
+        std.mem.sort([]u8, paths.items, {}, jsc_build.lessThanBytes);
+
+        var outer = jsc_build.Sha256.init(.{});
+        for (paths.items) |relative| {
+            const full = try std.fs.path.join(gpa, &.{ root, relative });
+            defer gpa.free(full);
+            const file = try jsc_build.digestRegularFile(full);
+            outer.update(&file.sha256);
+            outer.update("  ");
+            outer.update(relative);
+            outer.update("\n");
+        }
+        var digest: [jsc_build.Sha256.digest_length]u8 = undefined;
+        outer.final(&digest);
+        return .{
+            .sha256 = std.fmt.bytesToHex(digest, .lower),
+            .file_count = paths.items.len,
+        };
+    }
+
+    pub const Field = struct {
+        key: []const u8,
+        value: []const u8,
+    };
+
+    /// One `key=value` line per field, in order, with no final newline:
+    /// `writeTextAtomic` adds it and `canonicalTextMatches` expects it. A
+    /// value holding a line break or NUL is refused, since it could forge a
+    /// field of its own.
+    pub fn recordText(gpa: std.mem.Allocator, fields: []const Field) ![]u8 {
+        var output: std.Io.Writer.Allocating = .init(gpa);
+        errdefer output.deinit();
+        for (fields, 0..) |field, index| {
+            try jsc_build.validateCanonicalField(field.key);
+            try jsc_build.validateCanonicalField(field.value);
+            if (std.mem.indexOfScalar(u8, field.key, '=') != null)
+                return error.InvalidCanonicalField;
+            if (index != 0)
+                try output.writer.writeByte('\n');
+            try output.writer.print("{s}={s}", .{ field.key, field.value });
+        }
+        return output.toOwnedSlice();
+    }
+
+    /// Output fields for each archive under `directory`, in the order given:
+    /// `<stem>_sha256` and `<stem>_size`, the stem being the file name
+    /// without `lib` and `.a`. Fails when an archive is missing or targets
+    /// another machine than `target_arch`, which an up-to-date check reads as
+    /// "rebuild".
+    pub fn appendArchiveFields(
+        gpa: std.mem.Allocator,
+        fields: *std.ArrayList(Field),
+        owned: *std.ArrayList([]u8),
+        directory: []const u8,
+        archives: []const []const u8,
+        target_arch: []const u8,
+    ) !void {
+        for (archives) |relative| {
+            const path = try std.fs.path.join(gpa, &.{ directory, relative });
+            defer gpa.free(path);
+            if (!try archiveMatchesArch(gpa, path, target_arch))
+                return error.ArchiveTargetsAnotherMachine;
+            const digest = try jsc_build.digestRegularFile(path);
+            const name = std.fs.path.basename(relative);
+            if (!std.mem.startsWith(u8, name, "lib") or !std.mem.endsWith(u8, name, ".a") or name.len <= "lib.a".len)
+                return error.UnexpectedArchiveName;
+            const stem = name["lib".len .. name.len - ".a".len];
+            const sha_key = try ownedText(gpa, owned, try std.fmt.allocPrint(gpa, "{s}_sha256", .{stem}));
+            const sha_value = try ownedText(gpa, owned, try gpa.dupe(u8, &digest.sha256));
+            const size_key = try ownedText(gpa, owned, try std.fmt.allocPrint(gpa, "{s}_size", .{stem}));
+            const size_value = try ownedText(gpa, owned, try std.fmt.allocPrint(gpa, "{d}", .{digest.size}));
+            try fields.appendSlice(gpa, &.{
+                .{ .key = sha_key, .value = sha_value },
+                .{ .key = size_key, .value = size_value },
+            });
+        }
+    }
+
+    /// Records `text` in `owned`, which frees it with the record, and
+    /// returns it.
+    pub fn ownedText(gpa: std.mem.Allocator, owned: *std.ArrayList([]u8), text: []u8) ![]u8 {
+        errdefer gpa.free(text);
+        try owned.append(gpa, text);
+        return text;
+    }
+
+    pub fn freeOwned(gpa: std.mem.Allocator, owned: *std.ArrayList([]u8)) void {
+        for (owned.items) |text| gpa.free(text);
+        owned.deinit(gpa);
+    }
+
+    /// `<repo_root>/<generated_relative>/<key>`, refused unless it lies
+    /// strictly under the generated root with canonical ancestors: the tool
+    /// deletes directories inside it, so no key may name anything else.
+    pub fn keyDirectory(
+        gpa: std.mem.Allocator,
+        argv: [][:0]u8,
+        repo_root: []const u8,
+        generated_relative: []const u8,
+        key: []const u8,
+    ) ![]u8 {
+        const key_ok = key.len != 0 and
+            std.mem.indexOfAny(u8, key, "/\x00\r\n") == null and
+            !std.mem.eql(u8, key, ".") and
+            !std.mem.eql(u8, key, "..");
+        if (!key_ok)
+            jsc_build.fail(argv, 1, "invalid native build directory name '{s}'\n", .{key});
+        const generated_root = try std.fs.path.join(gpa, &.{ repo_root, generated_relative });
+        defer gpa.free(generated_root);
+        const directory = try std.fs.path.join(gpa, &.{ generated_root, key });
+        errdefer gpa.free(directory);
+        requireCanonicalDirectoryAncestors(directory) catch |err|
+            jsc_build.fail(argv, 1, "invalid native build directory {s}: {s}\n", .{ directory, @errorName(err) });
+        if (std.mem.eql(u8, directory, generated_root) or !pathIsWithin(directory, generated_root))
+            jsc_build.fail(argv, 1, "native build directory {s} is outside {s}\n", .{ directory, generated_root });
+        return directory;
+    }
+
+    /// The caller's environment without `caller_build_variables`, in the
+    /// UTF-8 C locale (byte-wise collation, and UTF-8 for the scripts that
+    /// read ICU's data sources), with Python told to write no bytecode next
+    /// to the sources it runs.
+    pub fn buildEnvironment(gpa: std.mem.Allocator) !std.process.EnvMap {
+        var environment = try environmentWithout(gpa, &caller_build_variables);
+        errdefer environment.deinit();
+        try environment.put("LC_ALL", "C.UTF-8");
+        try environment.put("LANG", "C.UTF-8");
+        try environment.put("PYTHONDONTWRITEBYTECODE", "1");
+        return environment;
+    }
+
+    /// The caller's environment without `names`.
+    pub fn environmentWithout(gpa: std.mem.Allocator, names: []const []const u8) !std.process.EnvMap {
+        var environment = try std.process.getEnvMap(gpa);
+        errdefer environment.deinit();
+        for (names) |name|
+            environment.remove(name);
+        return environment;
+    }
+
+    pub const SpawnOptions = struct {
+        cwd: ?[]const u8 = null,
+        env_map: ?*const std.process.EnvMap = null,
+    };
+
+    /// Runs `child_argv` with stdout and stderr inherited and fails with
+    /// `error.ChildFailed` unless it exits 0.
+    pub fn spawnChecked(gpa: std.mem.Allocator, child_argv: []const []const u8, options: SpawnOptions) !void {
+        var child = std.process.Child.init(child_argv, gpa);
+        child.stdin_behavior = .Ignore;
+        child.stdout_behavior = .Inherit;
+        child.stderr_behavior = .Inherit;
+        child.cwd = options.cwd;
+        child.env_map = options.env_map;
+        const term = try child.spawnAndWait();
+        switch (term) {
+            .Exited => |code| if (code != 0) {
+                printErr("{s} exited with status {d}\n", .{ child_argv[0], code });
+                return error.ChildFailed;
+            },
+            .Signal => |signal| {
+                printErr("{s} terminated by signal {d}\n", .{ child_argv[0], signal });
+                return error.ChildFailed;
+            },
+            .Stopped, .Unknown => {
+                printErr("{s} terminated abnormally\n", .{child_argv[0]});
+                return error.ChildFailed;
+            },
+        }
+    }
+
+    /// `spawnChecked`, with a failure ending the tool. A native build leaves
+    /// no stamp until it finishes, so the next run rebuilds from scratch.
+    pub fn spawnMust(
+        gpa: std.mem.Allocator,
+        argv: [][:0]u8,
+        child_argv: []const []const u8,
+        options: SpawnOptions,
+    ) void {
+        spawnChecked(gpa, child_argv, options) catch |err|
+            jsc_build.fail(argv, 1, "{s} failed: {s}\n", .{ child_argv[0], @errorName(err) });
+    }
+
+    pub fn requireCommands(gpa: std.mem.Allocator, argv: [][:0]u8, commands: []const []const u8) void {
+        for (commands) |command| {
+            if (!jsc_build.commandExists(gpa, command))
+                jsc_build.fail(argv, 1, "missing required command: {s}\n", .{command});
+        }
+    }
+
+    /// The architecture this tool runs on, spelled as the build passes a
+    /// target's (`toolchain.compilerRtArchName`).
+    pub fn hostArch() []const u8 {
+        return @tagName(@import("builtin").target.cpu.arch);
+    }
+
+    /// Removes the stamp first, so a build that stops halfway leaves a
+    /// directory every later run treats as stale.
+    pub fn removeStamp(argv: [][:0]u8, stamp_path: []const u8) void {
+        std.fs.cwd().deleteFile(stamp_path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => jsc_build.fail(argv, 1, "cannot remove the stamp {s}: {s}\n", .{ stamp_path, @errorName(err) }),
+        };
+    }
+
+    pub fn removeTree(argv: [][:0]u8, path: []const u8) void {
+        std.fs.cwd().deleteTree(path) catch |err|
+            jsc_build.fail(argv, 1, "cannot remove {s}: {s}\n", .{ path, @errorName(err) });
+    }
+
+    /// Replaces `worktree` with a fresh detached worktree of `commit` from
+    /// `repository`. Only committed objects reach it, so an edit in the
+    /// pristine tree never enters a build.
+    pub fn recreateWorktree(
+        gpa: std.mem.Allocator,
+        argv: [][:0]u8,
+        repository: []const u8,
+        worktree: []const u8,
+        commit: []const u8,
+    ) !void {
+        if (std.fs.path.dirname(worktree)) |parent|
+            std.fs.cwd().makePath(parent) catch |err|
+                jsc_build.fail(argv, 1, "cannot create {s}: {s}\n", .{ parent, @errorName(err) });
+        // Pruning and removal are best effort: a registration whose directory
+        // is gone, or a directory git no longer knows, is cleared below.
+        _ = jsc_build.gitSucceeds(gpa, &.{ "git", "-C", repository, "worktree", "prune" });
+        const removed = jsc_build.gitSucceeds(gpa, &.{
+            "git", "-C", repository, "worktree", "remove", "--force", "--force", worktree,
+        });
+        if (!removed and try jsc_build.pathEntryExists(worktree))
+            removeTree(argv, worktree);
+        _ = jsc_build.gitSucceeds(gpa, &.{ "git", "-C", repository, "worktree", "prune" });
+        try jsc_build.gitMustSucceed(gpa, argv, &.{
+            "git", "-C", repository, "worktree", "add", "--force", "--force", "--detach", worktree, commit,
+        });
+    }
+};
+
+/// ICU4C with its data, built by ICU's own configure and make out of the
+/// pinned tree into `<icu_generated_relative>/<key>/{build,install}`. A cross
+/// build runs the host build's tools to generate the data, so it names that
+/// build's key and digests its stamp as an input.
+pub const icu_build = struct {
+    // Positions are relative to sub_argv[0].
+    const arg_mode = 1;
+    const arg_target_triple = 2;
+    const arg_target_arch = 3;
+    const arg_cxx_sysroot = 4;
+    const arg_mcpu = 5;
+    const arg_host_key = 6;
+    const arg_tool_identity = 7;
+    const arg_count_required = 8;
+
+    const stamp_schema = "collo-icu-stamp-v1";
+    const stamp_filename = ".collo-icu.stamp";
+
+    /// The archives under the install prefix, in the order a link names
+    /// them: each one's undefined symbols resolve in the ones after it.
+    pub const archives = [_][]const u8{
+        "lib/libicui18n.a",
+        "lib/libicuuc.a",
+        "lib/libicudata.a",
+    };
+
+    const CmakeCacheEntry = struct {
+        key: []const u8,
+        /// Appended to the install prefix.
+        prefix_suffix: []const u8,
+    };
+
+    /// What the engine's CMake receives for FindICU, each value the install
+    /// prefix plus a suffix, and what `jsc_build` requires its cache to hold.
+    pub const cmake_cache_entries = [_]CmakeCacheEntry{
+        .{ .key = "ICU_ROOT", .prefix_suffix = "" },
+        .{ .key = "ICU_INCLUDE_DIR", .prefix_suffix = "/include" },
+        .{ .key = "ICU_I18N_LIBRARY_RELEASE", .prefix_suffix = "/lib/libicui18n.a" },
+        .{ .key = "ICU_UC_LIBRARY_RELEASE", .prefix_suffix = "/lib/libicuuc.a" },
+        .{ .key = "ICU_DATA_LIBRARY_RELEASE", .prefix_suffix = "/lib/libicudata.a" },
+    };
+
+    /// Static libraries with the data compiled into `libicudata.a`. Dynamic
+    /// loading stays off, so ICU never calls dlopen. The libraries nothing in
+    /// Collo calls (icuio, layoutex and the extras), the tests and the
+    /// samples are not built; the tools are, because the data build runs
+    /// them.
+    const configure_options = [_][]const u8{
+        "--enable-static",
+        "--disable-shared",
+        "--with-data-packaging=static",
+        "--disable-dyload",
+        "--disable-icu-config",
+        "--disable-icuio",
+        "--disable-layoutex",
+        "--disable-extras",
+        "--disable-tests",
+        "--disable-samples",
+    };
+
+    /// Position-independent so the archives link into any executable.
+    const base_flags = "-O2 -fPIC";
+
+    /// ICU otherwise takes a data directory from the `ICU_DATA` variable and
+    /// reads files there before the data linked into `libicudata.a`, so a
+    /// process's environment could replace the data Collo was built with.
+    const preprocessor_flags = "-DICU_NO_USER_DATA_OVERRIDE";
+
+    const Mode = enum {
+        /// Build when the stamp does not match.
+        build,
+        /// Fail when the stamp does not match (`-Djsc-prebuilt`).
+        admit,
+    };
+
+    pub fn run(gpa: std.mem.Allocator, argv: [][:0]u8) !void {
+        if (argv.len != arg_count_required)
+            jsc_build.fail(argv, 64, "usage: {s} <build|admit> <target_triple> <target_arch> <cxx_sysroot> " ++
+                "<mcpu> <host_key> <tool_identity>\n", .{argv[0]});
+        const mode = std.meta.stringToEnum(Mode, argv[arg_mode]) orelse
+            jsc_build.fail(argv, 64, "unknown mode '{s}'; expected build or admit\n", .{argv[arg_mode]});
+        const target_triple = argv[arg_target_triple];
+        const target_arch = argv[arg_target_arch];
+        const cxx_sysroot = argv[arg_cxx_sysroot];
+        const mcpu = argv[arg_mcpu];
+        const host_key = argv[arg_host_key];
+        const tool_identity = argv[arg_tool_identity];
+
+        const cross = !std.mem.eql(u8, target_arch, native_build.hostArch());
+        if (cross and host_key.len == 0)
+            jsc_build.fail(argv, 1, "a {s} ICU on a {s} host needs the host build's tools; no host build was named\n", .{
+                target_arch,
+                native_build.hostArch(),
+            });
+        if (cross and cxx_sysroot.len == 0)
+            jsc_build.fail(argv, 1, "cross-compiling ICU for {s} requires COLLO_CXX_SYSROOT=<sysroot>\n", .{target_arch});
+        if (!cross and host_key.len != 0)
+            jsc_build.fail(argv, 1, "a native ICU build takes no host build, got '{s}'\n", .{host_key});
+
+        const repo_root = try jsc_build.resolveRepoRoot(gpa, argv);
+        defer gpa.free(repo_root);
+        const key = try nativeBuildKey(gpa, target_triple, mcpu);
+        defer gpa.free(key);
+        const root = try native_build.keyDirectory(gpa, argv, repo_root, icu_generated_relative, key);
+        defer gpa.free(root);
+        const build_dir = try std.fs.path.join(gpa, &.{ root, "build" });
+        defer gpa.free(build_dir);
+        const install_dir = try std.fs.path.join(gpa, &.{ root, "install" });
+        defer gpa.free(install_dir);
+        const stamp_path = try std.fs.path.join(gpa, &.{ root, stamp_filename });
+        defer gpa.free(stamp_path);
+
+        native_build.requireCommands(gpa, argv, &.{ "git", "make", "python3", "clang-19", "clang++-19" });
+        const spec = pins.spec(.icu);
+        var loaded = pinned_trees.loadPin(gpa, argv, repo_root, .icu);
+        defer loaded.deinit(gpa);
+        const commit = loaded.pin.commit;
+        const tree = try pinned_trees.treePath(gpa, repo_root, spec);
+        defer gpa.free(tree);
+        try requirePristineTree(gpa, argv, tree, commit);
+        const source_dir = try std.fs.path.join(gpa, &.{ tree, "icu4c/source" });
+        defer gpa.free(source_dir);
+
+        var host_build_dir: ?[]u8 = null;
+        defer if (host_build_dir) |path| gpa.free(path);
+        var host_stamp_sha256: []const u8 = "";
+        var host_stamp_digest: jsc_build.FileDigest = undefined;
+        if (cross) {
+            const host_root = try native_build.keyDirectory(gpa, argv, repo_root, icu_generated_relative, host_key);
+            defer gpa.free(host_root);
+            host_build_dir = try std.fs.path.join(gpa, &.{ host_root, "build" });
+            const host_stamp_path = try std.fs.path.join(gpa, &.{ host_root, stamp_filename });
+            defer gpa.free(host_stamp_path);
+            host_stamp_digest = jsc_build.digestRegularFile(host_stamp_path) catch |err|
+                jsc_build.fail(argv, 1, "the cross build needs the host ICU build at {s}, whose stamp is unreadable: {s}\n", .{
+                    host_root,
+                    @errorName(err),
+                });
+            host_stamp_sha256 = &host_stamp_digest.sha256;
+        }
+
+        const compiler_version = try jsc_build.clangVersionFirstLine(gpa, argv);
+        defer gpa.free(compiler_version);
+        const flags = if (mcpu.len == 0)
+            try gpa.dupe(u8, base_flags)
+        else
+            try std.fmt.allocPrint(gpa, "{s} -mcpu={s}", .{ base_flags, mcpu });
+        defer gpa.free(flags);
+
+        var configure_args: std.ArrayList([]const u8) = .empty;
+        defer configure_args.deinit(gpa);
+        var configure_owned: std.ArrayList([]u8) = .empty;
+        defer native_build.freeOwned(gpa, &configure_owned);
+        try configure_args.append(gpa, try native_build.ownedText(gpa, &configure_owned, try std.fs.path.join(gpa, &.{ source_dir, "configure" })));
+        try configure_args.appendSlice(gpa, &configure_options);
+        try configure_args.append(gpa, try native_build.ownedText(gpa, &configure_owned, try std.fmt.allocPrint(gpa, "--prefix={s}", .{install_dir})));
+        if (host_build_dir) |host_build| {
+            try configure_args.append(gpa, try native_build.ownedText(gpa, &configure_owned, try std.fmt.allocPrint(gpa, "--host={s}", .{target_triple})));
+            try configure_args.append(gpa, try native_build.ownedText(gpa, &configure_owned, try std.fmt.allocPrint(gpa, "--with-cross-build={s}", .{host_build})));
+        }
+        const configure_line = try std.mem.join(gpa, " ", configure_args.items);
+        defer gpa.free(configure_line);
+
+        const c_compiler = if (cross)
+            try std.fmt.allocPrint(gpa, "clang-19 --target={s} --sysroot={s}", .{ target_triple, cxx_sysroot })
+        else
+            try gpa.dupe(u8, "clang-19");
+        defer gpa.free(c_compiler);
+        const cxx_compiler = if (cross)
+            try std.fmt.allocPrint(gpa, "clang++-19 --target={s} --sysroot={s}", .{ target_triple, cxx_sysroot })
+        else
+            try gpa.dupe(u8, "clang++-19");
+        defer gpa.free(cxx_compiler);
+        // The host GNU ld only carries the host's emulations; lld links any
+        // target, as the engine's cross build also requires.
+        const linker_flags = if (cross) "-fuse-ld=lld" else "";
+
+        const inputs = [_]native_build.Field{
+            .{ .key = "schema", .value = stamp_schema },
+            .{ .key = "commit", .value = commit },
+            .{ .key = "target_triple", .value = target_triple },
+            .{ .key = "target_arch", .value = target_arch },
+            .{ .key = "cxx_sysroot", .value = cxx_sysroot },
+            .{ .key = "mcpu", .value = mcpu },
+            .{ .key = "compiler", .value = compiler_version },
+            .{ .key = "cc", .value = c_compiler },
+            .{ .key = "cxx", .value = cxx_compiler },
+            .{ .key = "flags", .value = flags },
+            .{ .key = "cppflags", .value = preprocessor_flags },
+            .{ .key = "ldflags", .value = linker_flags },
+            .{ .key = "configure", .value = configure_line },
+            .{ .key = "host_stamp_sha256", .value = host_stamp_sha256 },
+            .{ .key = "script_sha", .value = tool_identity },
+        };
+
+        const outputs: Outputs = .{
+            .build_dir = build_dir,
+            .install_dir = install_dir,
+            .target_arch = target_arch,
+            .can_host_cross_builds = !cross,
+        };
+        if (try upToDate(gpa, &inputs, outputs, stamp_path)) {
+            try jsc_build.stdoutPrint(argv, "ICU up to date: {s}\n", .{root});
+            return;
+        }
+        if (mode == .admit)
+            jsc_build.fail(argv, 1, "the ICU build {s} is stale or missing; build it without -Djsc-prebuilt " ++
+                "(`zig build icu`)\n", .{root});
+
+        native_build.removeStamp(argv, stamp_path);
+        native_build.removeTree(argv, build_dir);
+        native_build.removeTree(argv, install_dir);
+        std.fs.cwd().makePath(build_dir) catch |err|
+            jsc_build.fail(argv, 1, "cannot create {s}: {s}\n", .{ build_dir, @errorName(err) });
+
+        var environment = try native_build.buildEnvironment(gpa);
+        defer environment.deinit();
+        try environment.put("CC", c_compiler);
+        try environment.put("CXX", cxx_compiler);
+        try environment.put("CFLAGS", flags);
+        try environment.put("CXXFLAGS", flags);
+        try environment.put("CPPFLAGS", preprocessor_flags);
+        try environment.put("LDFLAGS", linker_flags);
+        const in_build: native_build.SpawnOptions = .{ .cwd = build_dir, .env_map = &environment };
+
+        native_build.spawnMust(gpa, argv, configure_args.items, in_build);
+        const jobs_arg = try std.fmt.allocPrint(gpa, "-j{d}", .{jsc_build.buildJobCount(gpa)});
+        defer gpa.free(jobs_arg);
+        native_build.spawnMust(gpa, argv, &.{ "make", jobs_arg }, in_build);
+        native_build.spawnMust(gpa, argv, &.{ "make", "install" }, in_build);
+
+        // An out-of-tree build must leave its source untouched; a build that
+        // wrote there would make the next run's tree check fail anyway, so
+        // it fails here, naming the cause.
+        try requirePristineTree(gpa, argv, tree, commit);
+
+        const stamp_text = recordWithOutputs(gpa, &inputs, outputs) catch |err|
+            jsc_build.fail(argv, 1, "the ICU build in {s} produced no valid output: {s}\n", .{ root, @errorName(err) });
+        defer gpa.free(stamp_text);
+        try jsc_build.writeTextAtomic(gpa, argv, stamp_path, stamp_text);
+        try jsc_build.stdoutPrint(argv, "ICU built: {s}\n", .{root});
+    }
+
+    const Outputs = struct {
+        build_dir: []const u8,
+        install_dir: []const u8,
+        target_arch: []const u8,
+        /// A native build is also the host build a cross build runs
+        /// configure against (`--with-cross-build`), which reads the build
+        /// directory rather than the install prefix.
+        can_host_cross_builds: bool,
+    };
+
+    /// What a cross build reads from its host build: the configuration
+    /// fragment ICU's configure refuses to cross-compile without, written by
+    /// the host's make next to the tools it ran.
+    const cross_build_fragment = "config/icucross.mk";
+
+    fn requirePristineTree(gpa: std.mem.Allocator, argv: [][:0]u8, tree: []const u8, commit: []const u8) !void {
+        const spec = pins.spec(.icu);
+        const problem = try pinned_trees.checkoutProblem(gpa, tree, commit, spec.marker, spec.read_in_place);
+        if (problem) |text| {
+            defer gpa.free(text);
+            jsc_build.fail(argv, 1, "{s}: {s}\n", .{ tree, text });
+        }
+    }
+
+    /// The stamp: the inputs, then what the build holds now: the installed
+    /// headers' digest, each archive's digest and size, and for a build that
+    /// can host a cross build the digest of `cross_build_fragment`, so a
+    /// cleaned build directory makes the host stale instead of failing the
+    /// cross build's configure.
+    fn recordWithOutputs(
+        gpa: std.mem.Allocator,
+        inputs: []const native_build.Field,
+        outputs: Outputs,
+    ) ![]u8 {
+        var fields: std.ArrayList(native_build.Field) = .empty;
+        defer fields.deinit(gpa);
+        var owned: std.ArrayList([]u8) = .empty;
+        defer native_build.freeOwned(gpa, &owned);
+        try fields.appendSlice(gpa, inputs);
+        const include_dir = try std.fs.path.join(gpa, &.{ outputs.install_dir, "include" });
+        defer gpa.free(include_dir);
+        const headers = try native_build.digestTree(gpa, include_dir);
+        try fields.append(gpa, .{
+            .key = "headers_sha256",
+            .value = try native_build.ownedText(gpa, &owned, try gpa.dupe(u8, &headers.sha256)),
+        });
+        try native_build.appendArchiveFields(gpa, &fields, &owned, outputs.install_dir, &archives, outputs.target_arch);
+        if (outputs.can_host_cross_builds) {
+            const fragment_path = try std.fs.path.join(gpa, &.{ outputs.build_dir, cross_build_fragment });
+            defer gpa.free(fragment_path);
+            const fragment = try jsc_build.digestRegularFile(fragment_path);
+            try fields.append(gpa, .{
+                .key = "cross_build_fragment_sha256",
+                .value = try native_build.ownedText(gpa, &owned, try gpa.dupe(u8, &fragment.sha256)),
+            });
+        }
+        return native_build.recordText(gpa, fields.items);
+    }
+
+    /// Whether the stamp is exactly the record the current inputs and the
+    /// current build produce. Any output that is missing, changed or built
+    /// for another machine reads as stale.
+    fn upToDate(
+        gpa: std.mem.Allocator,
+        inputs: []const native_build.Field,
+        outputs: Outputs,
+        stamp_path: []const u8,
+    ) !bool {
+        const expected = recordWithOutputs(gpa, inputs, outputs) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return false,
+        };
+        defer gpa.free(expected);
+        return jsc_build.canonicalTextMatches(gpa, stamp_path, expected);
+    }
+
+    /// Refuses an ICU prefix the engine build was handed unless it is the
+    /// `install` directory of a build under `icu_generated_relative`.
+    pub fn validatePrefix(gpa: std.mem.Allocator, repo_root: []const u8, prefix: []const u8) !void {
+        try requireCanonicalDirectoryAncestors(prefix);
+        const generated_root = try std.fs.path.join(gpa, &.{ repo_root, icu_generated_relative });
+        defer gpa.free(generated_root);
+        if (!std.mem.eql(u8, std.fs.path.basename(prefix), "install"))
+            return error.IcuPrefixIsNotAnInstallDirectory;
+        const key_directory = std.fs.path.dirname(prefix) orelse return error.IcuPrefixOutsideGeneratedRoot;
+        if (std.mem.eql(u8, key_directory, generated_root) or !pathIsWithin(key_directory, generated_root))
+            return error.IcuPrefixOutsideGeneratedRoot;
+        if (!std.mem.eql(u8, std.fs.path.dirname(key_directory) orelse "", generated_root))
+            return error.IcuPrefixOutsideGeneratedRoot;
+    }
+};
+
+/// BoringSSL with Collo's series applied to a worktree of the pinned commit
+/// in `<boringssl_generated_relative>/<key>/src`, built with CMake into
+/// `<key>/build`. Consumers compile against `src/include`, which holds the
+/// series' header changes, and link `build/libssl.a` and `build/libcrypto.a`.
+pub const boringssl_build = struct {
+    // Positions are relative to sub_argv[0].
+    const arg_target_triple = 1;
+    const arg_target_arch = 2;
+    const arg_cxx_sysroot = 3;
+    const arg_mcpu = 4;
+    const arg_tool_identity = 5;
+    const arg_count_required = 6;
+
+    const stamp_schema = "collo-boringssl-stamp-v1";
+    const stamp_filename = ".collo-boringssl.stamp";
+
+    /// Under the build directory, in the order a link names them.
+    pub const archives = [_][]const u8{ "libssl.a", "libcrypto.a" };
+
+    pub fn run(gpa: std.mem.Allocator, argv: [][:0]u8) !void {
+        if (argv.len != arg_count_required)
+            jsc_build.fail(argv, 64, "usage: {s} <target_triple> <target_arch> <cxx_sysroot> <mcpu> <tool_identity>\n", .{argv[0]});
+        const target_triple = argv[arg_target_triple];
+        const target_arch = argv[arg_target_arch];
+        const cxx_sysroot = argv[arg_cxx_sysroot];
+        const mcpu = argv[arg_mcpu];
+        const tool_identity = argv[arg_tool_identity];
+        const cross = !std.mem.eql(u8, target_arch, native_build.hostArch());
+        if (cross and cxx_sysroot.len == 0)
+            jsc_build.fail(argv, 1, "cross-compiling BoringSSL for {s} requires COLLO_CXX_SYSROOT=<sysroot>\n", .{target_arch});
+        if (!cross and cxx_sysroot.len != 0)
+            jsc_build.fail(argv, 1, "a native BoringSSL build takes no sysroot, got '{s}'\n", .{cxx_sysroot});
+
+        const repo_root = try jsc_build.resolveRepoRoot(gpa, argv);
+        defer gpa.free(repo_root);
+        const key = try nativeBuildKey(gpa, target_triple, mcpu);
+        defer gpa.free(key);
+        const root = try native_build.keyDirectory(gpa, argv, repo_root, boringssl_generated_relative, key);
+        defer gpa.free(root);
+        const source_dir = try std.fs.path.join(gpa, &.{ root, "src" });
+        defer gpa.free(source_dir);
+        const build_dir = try std.fs.path.join(gpa, &.{ root, "build" });
+        defer gpa.free(build_dir);
+        const stamp_path = try std.fs.path.join(gpa, &.{ root, stamp_filename });
+        defer gpa.free(stamp_path);
+
+        native_build.requireCommands(gpa, argv, &.{ "git", "cmake", "ninja", "clang-19", "clang++-19" });
+        const spec = pins.spec(.boringssl);
+        var loaded = pinned_trees.loadPin(gpa, argv, repo_root, .boringssl);
+        defer loaded.deinit(gpa);
+        const commit = loaded.pin.commit;
+        const tree = try pinned_trees.treePath(gpa, repo_root, spec);
+        defer gpa.free(tree);
+        const problem = try pinned_trees.checkoutProblem(gpa, tree, commit, spec.marker, spec.read_in_place);
+        if (problem) |text| {
+            defer gpa.free(text);
+            jsc_build.fail(argv, 1, "{s}: {s}\n", .{ tree, text });
+        }
+
+        const patch_dir = if (loaded.pin.patches) |patches|
+            try std.fs.path.join(gpa, &.{ repo_root, "runtime", patches })
+        else
+            try gpa.dupe(u8, "");
+        defer gpa.free(patch_dir);
+        const series = if (patch_dir.len == 0)
+            try gpa.alloc([]u8, 0)
+        else
+            try jsc_build.sortedPatchFiles(gpa, argv, patch_dir);
+        defer {
+            for (series) |path| gpa.free(path);
+            gpa.free(series);
+        }
+        const patch_hash = try jsc_build.hashPatchSeries(gpa, argv, repo_root, series);
+        defer gpa.free(patch_hash);
+        const compiler_version = try jsc_build.clangVersionFirstLine(gpa, argv);
+        defer gpa.free(compiler_version);
+
+        var cmake_args: std.ArrayList([]const u8) = .empty;
+        defer cmake_args.deinit(gpa);
+        var cmake_owned: std.ArrayList([]u8) = .empty;
+        defer native_build.freeOwned(gpa, &cmake_owned);
+        try cmake_args.appendSlice(gpa, &.{
+            "cmake",                           "-S",                                   source_dir,
+            "-B",                              build_dir,                              "-G",
+            "Ninja",                           "-DCMAKE_BUILD_TYPE=Release",           "-DCMAKE_C_COMPILER=clang-19",
+            "-DCMAKE_CXX_COMPILER=clang++-19", "-DCMAKE_POSITION_INDEPENDENT_CODE=ON", "-DBUILD_SHARED_LIBS=OFF",
+            // Testing needs Go and builds test binaries nothing links.
+            "-DBUILD_TESTING=OFF",
+        });
+        if (mcpu.len != 0) {
+            try cmake_args.append(gpa, try native_build.ownedText(gpa, &cmake_owned, try std.fmt.allocPrint(gpa, "-DCMAKE_C_FLAGS=-mcpu={s}", .{mcpu})));
+            try cmake_args.append(gpa, try native_build.ownedText(gpa, &cmake_owned, try std.fmt.allocPrint(gpa, "-DCMAKE_CXX_FLAGS=-mcpu={s}", .{mcpu})));
+        }
+        if (cross) {
+            try cmake_args.appendSlice(gpa, &.{
+                "-DCMAKE_SYSTEM_NAME=Linux",
+                try native_build.ownedText(gpa, &cmake_owned, try std.fmt.allocPrint(gpa, "-DCMAKE_SYSTEM_PROCESSOR={s}", .{target_arch})),
+                try native_build.ownedText(gpa, &cmake_owned, try std.fmt.allocPrint(gpa, "-DCMAKE_SYSROOT={s}", .{cxx_sysroot})),
+                try native_build.ownedText(gpa, &cmake_owned, try std.fmt.allocPrint(gpa, "-DCMAKE_C_COMPILER_TARGET={s}", .{target_triple})),
+                try native_build.ownedText(gpa, &cmake_owned, try std.fmt.allocPrint(gpa, "-DCMAKE_CXX_COMPILER_TARGET={s}", .{target_triple})),
+                // BoringSSL's hand-written assembly is compiled as CMake's ASM
+                // language, which takes its own target; without it the `.S`
+                // files assemble for the host and the archive mixes machines.
+                try native_build.ownedText(gpa, &cmake_owned, try std.fmt.allocPrint(gpa, "-DCMAKE_ASM_COMPILER_TARGET={s}", .{target_triple})),
+                // The host GNU ld only carries the host's emulations; lld
+                // links any target, CMake's try_compile probes included.
+                "-DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld",
+                "-DCMAKE_SHARED_LINKER_FLAGS=-fuse-ld=lld",
+                "-DCMAKE_MODULE_LINKER_FLAGS=-fuse-ld=lld",
+            });
+        }
+        const cmake_line = try std.mem.join(gpa, " ", cmake_args.items);
+        defer gpa.free(cmake_line);
+
+        const inputs = [_]native_build.Field{
+            .{ .key = "schema", .value = stamp_schema },
+            .{ .key = "commit", .value = commit },
+            .{ .key = "patch_hash", .value = patch_hash },
+            .{ .key = "target_triple", .value = target_triple },
+            .{ .key = "target_arch", .value = target_arch },
+            .{ .key = "cxx_sysroot", .value = cxx_sysroot },
+            .{ .key = "mcpu", .value = mcpu },
+            .{ .key = "compiler", .value = compiler_version },
+            .{ .key = "cmake", .value = cmake_line },
+            .{ .key = "script_sha", .value = tool_identity },
+        };
+
+        if (try upToDate(gpa, &inputs, source_dir, build_dir, stamp_path, target_arch)) {
+            try jsc_build.stdoutPrint(argv, "BoringSSL up to date: {s}\n", .{root});
+            return;
+        }
+
+        native_build.removeStamp(argv, stamp_path);
+        try native_build.recreateWorktree(gpa, argv, tree, source_dir, commit);
+        native_build.removeTree(argv, build_dir);
+        try jsc_build.applyPatchSeries(gpa, argv, source_dir, series);
+
+        var environment = try native_build.buildEnvironment(gpa);
+        defer environment.deinit();
+        const with_environment: native_build.SpawnOptions = .{ .env_map = &environment };
+        native_build.spawnMust(gpa, argv, cmake_args.items, with_environment);
+        const jobs_arg = try std.fmt.allocPrint(gpa, "{d}", .{jsc_build.buildJobCount(gpa)});
+        defer gpa.free(jobs_arg);
+        native_build.spawnMust(gpa, argv, &.{
+            "cmake", "--build", build_dir, "--target", "ssl", "crypto", "--parallel", jobs_arg,
+        }, with_environment);
+
+        const stamp_text = recordWithOutputs(gpa, &inputs, source_dir, build_dir, target_arch) catch |err|
+            jsc_build.fail(argv, 1, "the BoringSSL build in {s} produced no valid output: {s}\n", .{ root, @errorName(err) });
+        defer gpa.free(stamp_text);
+        try jsc_build.writeTextAtomic(gpa, argv, stamp_path, stamp_text);
+        try jsc_build.stdoutPrint(argv, "BoringSSL built: {s}\n", .{root});
+    }
+
+    /// The stamp: the inputs, then the patched headers' digest and each
+    /// archive's digest and size.
+    fn recordWithOutputs(
+        gpa: std.mem.Allocator,
+        inputs: []const native_build.Field,
+        source_dir: []const u8,
+        build_dir: []const u8,
+        target_arch: []const u8,
+    ) ![]u8 {
+        var fields: std.ArrayList(native_build.Field) = .empty;
+        defer fields.deinit(gpa);
+        var owned: std.ArrayList([]u8) = .empty;
+        defer native_build.freeOwned(gpa, &owned);
+        try fields.appendSlice(gpa, inputs);
+        const include_dir = try std.fs.path.join(gpa, &.{ source_dir, "include" });
+        defer gpa.free(include_dir);
+        const headers = try native_build.digestTree(gpa, include_dir);
+        try fields.append(gpa, .{
+            .key = "headers_sha256",
+            .value = try native_build.ownedText(gpa, &owned, try gpa.dupe(u8, &headers.sha256)),
+        });
+        try native_build.appendArchiveFields(gpa, &fields, &owned, build_dir, &archives, target_arch);
+        return native_build.recordText(gpa, fields.items);
+    }
+
+    fn upToDate(
+        gpa: std.mem.Allocator,
+        inputs: []const native_build.Field,
+        source_dir: []const u8,
+        build_dir: []const u8,
+        stamp_path: []const u8,
+        target_arch: []const u8,
+    ) !bool {
+        const expected = recordWithOutputs(gpa, inputs, source_dir, build_dir, target_arch) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return false,
+        };
+        defer gpa.free(expected);
+        return jsc_build.canonicalTextMatches(gpa, stamp_path, expected);
     }
 };
 
@@ -2611,7 +3726,10 @@ fn validateArchiveObjectName(name: []const u8) !void {
         return error.ArchiveMemberNameInvalid;
     if (std.mem.indexOfAny(u8, name, "/\\\r\n\x00") != null)
         return error.ArchiveMemberNameInvalid;
-    if (!std.mem.endsWith(u8, name, ".o"))
+    // ICU's build names the objects of its static libraries `.ao`, to keep
+    // them apart from the objects of its shared ones; every member is still
+    // an ELF object whose machine the walk checks.
+    if (!std.mem.endsWith(u8, name, ".o") and !std.mem.endsWith(u8, name, ".ao"))
         return error.ArchiveMemberNameInvalid;
 }
 
@@ -2688,7 +3806,7 @@ fn readU32(bytes: []const u8, offset: usize) u32 {
     return std.mem.readInt(u32, bytes[offset..][0..4], .little);
 }
 
-test "JSC build stamp v3 has one exact canonical field order" {
+test "JSC build stamp v4 has one exact canonical field order" {
     const allocator = std.testing.allocator;
     const attestation_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const text = try jsc_build.buildStampText(allocator, .{
@@ -2701,11 +3819,13 @@ test "JSC build stamp v3 has one exact canonical field order" {
         .mcpu = "baseline",
         .compiler_version = "clang version 19.1.7",
         .tool_identity = "tool-sha",
+        .icu_prefix = "/repo/runtime/deps/icu-build/x86_64-linux-gnu/install",
+        .icu_headers_sha256 = "icu-headers-sha",
     }, attestation_sha);
     defer allocator.free(text);
 
     try std.testing.expectEqualStrings(
-        "schema=collo-jsc-stamp-v3\n" ++
+        "schema=collo-jsc-stamp-v4\n" ++
             "commit=0123456789abcdef0123456789abcdef01234567\n" ++
             "patch_hash=patch-sha\n" ++
             "target_triple=x86_64-linux-gnu\n" ++
@@ -2715,6 +3835,8 @@ test "JSC build stamp v3 has one exact canonical field order" {
             "mcpu=baseline\n" ++
             "compiler=clang version 19.1.7\n" ++
             "script_sha=tool-sha\n" ++
+            "icu_prefix=/repo/runtime/deps/icu-build/x86_64-linux-gnu/install\n" ++
+            "icu_headers_sha256=icu-headers-sha\n" ++
             "attestation_sha256=" ++ attestation_sha,
         text,
     );
@@ -2742,6 +3864,8 @@ test "JSC canonical records reject field delimiter injection" {
         .mcpu = "baseline",
         .compiler_version = "clang version 19.1.7",
         .tool_identity = "tool-sha",
+        .icu_prefix = "/repo/runtime/deps/icu-build/x86_64-linux-gnu/install",
+        .icu_headers_sha256 = "icu-headers-sha",
     };
     try std.testing.expectError(
         error.InvalidCanonicalField,
@@ -2846,7 +3970,12 @@ test "JSC semantic CMake and Ninja configuration is fail closed" {
         "CMAKE_C_COMPILER:FILEPATH={s}\n" ++
         "CMAKE_CXX_COMPILER:FILEPATH={s}\n" ++
         "CMAKE_C_FLAGS:STRING=-mcpu=baseline\n" ++
-        "CMAKE_CXX_FLAGS:STRING=-mcpu=baseline\n", .{ source, c_compiler, cxx_compiler });
+        "CMAKE_CXX_FLAGS:STRING=-mcpu=baseline\n" ++
+        "ICU_ROOT:UNINITIALIZED=/icu/install\n" ++
+        "ICU_INCLUDE_DIR:PATH=/icu/install/include\n" ++
+        "ICU_I18N_LIBRARY_RELEASE:FILEPATH=/icu/install/lib/libicui18n.a\n" ++
+        "ICU_UC_LIBRARY_RELEASE:FILEPATH=/icu/install/lib/libicuuc.a\n" ++
+        "ICU_DATA_LIBRARY_RELEASE:FILEPATH=/icu/install/lib/libicudata.a\n", .{ source, c_compiler, cxx_compiler });
     defer allocator.free(cache);
     {
         var build_dir = try tmp.dir.openDir("jsc", .{});
@@ -2868,6 +3997,8 @@ test "JSC semantic CMake and Ninja configuration is fail closed" {
         .mcpu = "baseline",
         .compiler_version = "clang version",
         .tool_identity = "tool",
+        .icu_prefix = "/icu/install",
+        .icu_headers_sha256 = "icu-headers",
     };
     try jsc_build.validateCmakeConfiguration(allocator, build, source, inputs);
     try jsc_build.validateBuildNinja(allocator, build, "Release");

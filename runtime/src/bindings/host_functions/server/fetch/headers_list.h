@@ -13,6 +13,7 @@
 
 #include "host_functions/server/fetch/headers.h"
 
+#include <JavaScriptCore/ArgList.h>
 #include <JavaScriptCore/Error.h>
 #include <JavaScriptCore/IteratorOperations.h>
 #include <JavaScriptCore/JSCInlines.h>
@@ -34,7 +35,6 @@ namespace Collo::HostFunctions::FetchHeadersInternal {
 using JSC::EncodedJSValue;
 using JSC::JSValue;
 using WTF::String;
-using namespace JSC;
 
 // The header names an entry records as this enum alone, with no name bytes in storage; Unknown marks an entry whose
 // name is in storage. Set-Cookie values live in set_cookie_values, so no entry holds SetCookie.
@@ -439,8 +439,8 @@ struct HeadersList {
         return String::fromUTF8(bytes(slice));
     }
 
-    // Appends `value` to storage and returns its slice, or nullopt when storage would pass UINT32_MAX bytes. A failed
-    // allocation crashes, since Vector::grow does not report it.
+    // Appends `value` to storage and returns its slice, or nullopt when storage would pass UINT32_MAX bytes or cannot
+    // grow.
     std::optional<HeaderSlice> appendBytes(std::span<const uint8_t> value)
     {
         if (value.size() > std::numeric_limits<uint32_t>::max())
@@ -456,7 +456,8 @@ struct HeadersList {
             return slice;
 
         size_t old_size = storage.size();
-        storage.grow(old_size + value.size());
+        if (!storage.tryGrow(old_size + value.size()))
+            return std::nullopt;
         std::memcpy(storage.mutableSpan().data() + old_size, value.data(), value.size());
         return slice;
     }
@@ -615,7 +616,10 @@ struct HeadersList {
             JSC::throwOutOfMemoryError(global_object, scope);
             return false;
         }
-        set_cookie_values.append(*slice);
+        if (!set_cookie_values.tryAppend(*slice)) {
+            JSC::throwOutOfMemoryError(global_object, scope);
+            return false;
+        }
         update_counter++;
         return true;
     }
@@ -644,7 +648,10 @@ struct HeadersList {
             JSC::throwOutOfMemoryError(global_object, scope);
             return false;
         }
-        entries.append({ *name_slice, *value_slice, known });
+        if (!entries.tryAppend(HeaderEntry { *name_slice, *value_slice, known })) {
+            JSC::throwOutOfMemoryError(global_object, scope);
+            return false;
+        }
         update_counter++;
         return true;
     }
@@ -842,7 +849,8 @@ static HeadersList cloneHeadersList(const HeadersList& source, HeaderGuard guard
         if (entry.known == KnownHeader::Unknown)
             name_slice = list.appendBytes(source.bytes(entry.name));
         auto value_slice = list.appendBytes(source.bytes(entry.value));
-        // appendBytes fails only past UINT32_MAX bytes, and the kept bytes are a subset of the source's, which fit.
+        // The kept bytes are a subset of the source's, which fit within UINT32_MAX, and reserveStorage reserved room
+        // for all of them, so appendBytes neither passes the limit nor grows the buffer here.
         ASSERT(name_slice && value_slice);
         if (!name_slice || !value_slice)
             continue;
@@ -870,7 +878,8 @@ static bool appendNormalizedPair(
 static bool appendIterableHeaderPair(
     JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, HeadersList& list, JSValue pair_value)
 {
-    WTF::Vector<JSValue, 2> values;
+    // The iterator runs script, which can collect, so the items wait in a buffer the collector marks.
+    JSC::MarkedArgumentBuffer values;
     bool too_many = false;
 
     JSC::forEachInIterable(global_object, pair_value, [&](JSC::VM&, JSC::JSGlobalObject*, JSValue next_value) {
@@ -881,13 +890,17 @@ static bool appendIterableHeaderPair(
         values.append(next_value);
     });
     RETURN_IF_EXCEPTION(scope, false);
+    if (values.hasOverflowed()) {
+        JSC::throwOutOfMemoryError(global_object, scope);
+        return false;
+    }
 
     if (too_many || values.size() != 2) {
         JSC::throwVMTypeError(global_object, scope, "Headers init pair must contain exactly two items"_s);
         return false;
     }
 
-    auto normalized = normalizeHeaderPair(global_object, scope, values[0], values[1]);
+    auto normalized = normalizeHeaderPair(global_object, scope, values.at(0), values.at(1));
     RETURN_IF_EXCEPTION(scope, false);
     if (!normalized)
         return false;

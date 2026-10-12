@@ -1,0 +1,9 @@
+Source: https://github.com/facebook/zstd.git
+Tag: v1.5.7
+Commit: f8745da6ff1ad1e7bab384bd1f9d742439278e99
+Patches: none
+
+Zstandard's single-threaded library, consumed as a shallow checkout of this
+commit (`zig build deps-provision`). `runtime/build/codecs.zig` compiles
+`lib/common`, `lib/compress` and `lib/decompress` into a static library for
+each target, without legacy formats or multithreading.

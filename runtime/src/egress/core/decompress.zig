@@ -1,14 +1,15 @@
 //! Content decoding for fetch response bodies: gzip and deflate through zlib,
-//! br through the brotli decoder. `load` opens both libraries with dlopen once
-//! per process, and a library that does not load makes only its codings
-//! unsupported. A process whose sandbox hides the host's library directories
-//! calls `load` before entering it, because its root holds no library files.
+//! br through the brotli decoder, both compiled into the binary from their
+//! pinned trees (`collo_zlib`, `collo_brotli`). Every coding is therefore
+//! always available: the transport advertises one constant Accept-Encoding,
+//! and no process loads anything to decode, inside its sandbox or before it.
 //! The gateway's HTTP/1 pump decodes on the engine owner thread and the worker
 //! decodes forwarded HTTP/2 bodies on its event loop. A `StreamDecoder` has no
-//! synchronization and serves one response; the loaded symbol tables are
-//! process-wide and safe to share across threads.
+//! synchronization and serves one response.
 
 const std = @import("std");
+const brotli = @import("collo_brotli");
+const zlib = @import("collo_zlib");
 
 pub const Encoding = enum {
     identity,
@@ -17,46 +18,9 @@ pub const Encoding = enum {
     br,
 };
 
-/// The codings beyond identity this process decodes, as `load` found them.
-pub const Support = struct {
-    /// gzip and deflate.
-    zlib: bool,
-    /// br.
-    brotli: bool,
-};
-
-/// Loads zlib and the brotli decoder and returns which loaded. Only a
-/// process's first call opens the libraries; later calls, the decoders and
-/// `defaultAcceptEncoding` reuse its answer without the dynamic loader. A
-/// process that never calls it loads at its first decoder or Accept-Encoding.
-///
-/// The first call must come while the libraries can still be found: a process
-/// whose sandbox hides the host's library directories calls this before
-/// entering it. A failed load is never retried, because inside such a sandbox
-/// a retry cannot succeed, and it would take the dynamic loader's lock on
-/// every request.
-pub fn load() Support {
-    libraries_once.call();
-    return .{ .zlib = zlib_api != null, .brotli = brotli_api != null };
-}
-
-/// The Accept-Encoding the transport sends: gzip and deflate when zlib loaded
-/// in this process, br as well when brotli also loaded, and identity alone
-/// when zlib did not load, whether or not brotli did.
-pub fn defaultAcceptEncoding() []const u8 {
-    const support = load();
-    if (!support.zlib)
-        return "identity";
-    return if (support.brotli) "gzip, deflate, br" else "gzip, deflate";
-}
-
-pub fn supportsZlib() bool {
-    return load().zlib;
-}
-
-pub fn supportsBrotli() bool {
-    return load().brotli;
-}
+/// The Accept-Encoding the transport sends: every coding `StreamDecoder`
+/// decodes.
+pub const default_accept_encoding = "gzip, deflate, br";
 
 /// The decoder for a response's Content-Encoding headers. `x-gzip` is an
 /// alias of gzip (RFC 9110 §8.4.1.3), and empty or `identity` entries are
@@ -295,139 +259,12 @@ pub const StreamDecoder = struct {
 };
 
 const ZlibMode = enum { gzip, deflate };
-const ZlibVersionFn = *const fn () callconv(.c) [*:0]const u8;
-const ZlibInflateInit2Fn = *const fn (*ZStream, c_int, [*:0]const u8, c_int) callconv(.c) c_int;
-const ZlibInflateFn = *const fn (*ZStream, c_int) callconv(.c) c_int;
-const ZlibInflateEndFn = *const fn (*ZStream) callconv(.c) c_int;
-const ZlibInflateResetFn = *const fn (*ZStream) callconv(.c) c_int;
-
-const DynamicLib = struct {
-    handle: *anyopaque,
-
-    fn openAny(names: []const [:0]const u8) !DynamicLib {
-        for (names) |name| {
-            if (std.c.dlopen(name.ptr, .{ .LAZY = true })) |handle|
-                return .{ .handle = handle };
-        }
-        return error.FileNotFound;
-    }
-
-    fn close(self: *DynamicLib) void {
-        _ = std.c.dlclose(self.handle);
-        self.* = undefined;
-    }
-
-    fn lookup(self: *DynamicLib, comptime T: type, name: [:0]const u8) !T {
-        const symbol = @call(.never_tail, std.c.dlsym, .{ self.handle, name.ptr }) orelse
-            return error.SymbolNotFound;
-        return @as(T, @ptrCast(@alignCast(symbol)));
-    }
-};
-
-/// The zlib symbols `load` resolved. The library handle is never closed, so
-/// the pointers stay valid for the life of the process.
-const ZlibApi = struct {
-    version_fn: ZlibVersionFn,
-    inflate_init_fn: ZlibInflateInit2Fn,
-    inflate_fn: ZlibInflateFn,
-    inflate_end_fn: ZlibInflateEndFn,
-    inflate_reset_fn: ZlibInflateResetFn,
-};
-
-/// The brotli decoder's symbols, kept like `ZlibApi`. Only the decoder state
-/// is per response (`BrotliDecoderCreateInstance`).
-const BrotliApi = struct {
-    create: BrotliCreateFn,
-    destroy: BrotliDestroyFn,
-    stream_fn: BrotliStreamFn,
-};
-
-/// Written only by `loadLibraries`, which `libraries_once` runs once and whose
-/// writes it publishes to every thread that calls it afterwards.
-var zlib_api: ?ZlibApi = null;
-var brotli_api: ?BrotliApi = null;
-var libraries_once = std.once(loadLibraries);
-
-fn loadLibraries() void {
-    zlib_api = loadZlibApi();
-    brotli_api = loadBrotliApi();
-}
-
-fn loadZlibApi() ?ZlibApi {
-    var lib = DynamicLib.openAny(&.{ "libz.so.1", "libz.so" }) catch return null;
-    return zlibSymbols(&lib) catch {
-        lib.close();
-        return null;
-    };
-}
-
-fn zlibSymbols(lib: *DynamicLib) !ZlibApi {
-    return .{
-        .version_fn = try lib.lookup(ZlibVersionFn, "zlibVersion"),
-        .inflate_init_fn = try lib.lookup(ZlibInflateInit2Fn, "inflateInit2_"),
-        .inflate_fn = try lib.lookup(ZlibInflateFn, "inflate"),
-        .inflate_end_fn = try lib.lookup(ZlibInflateEndFn, "inflateEnd"),
-        .inflate_reset_fn = try lib.lookup(ZlibInflateResetFn, "inflateReset"),
-    };
-}
-
-fn loadBrotliApi() ?BrotliApi {
-    var lib = DynamicLib.openAny(&.{"libbrotlidec.so.1"}) catch return null;
-    return brotliSymbols(&lib) catch {
-        lib.close();
-        return null;
-    };
-}
-
-fn brotliSymbols(lib: *DynamicLib) !BrotliApi {
-    return .{
-        .create = try lib.lookup(BrotliCreateFn, "BrotliDecoderCreateInstance"),
-        .destroy = try lib.lookup(BrotliDestroyFn, "BrotliDecoderDestroyInstance"),
-        .stream_fn = try lib.lookup(BrotliStreamFn, "BrotliDecoderDecompressStream"),
-    };
-}
-
-fn zlibApi() ?*const ZlibApi {
-    libraries_once.call();
-    return if (zlib_api) |*api| api else null;
-}
-
-fn brotliApi() ?*const BrotliApi {
-    libraries_once.call();
-    return if (brotli_api) |*api| api else null;
-}
-
-const z_ok = 0;
-const z_stream_end = 1;
-const z_need_dict = 2;
-const z_stream_error = -2;
-const z_data_error = -3;
-const z_mem_error = -4;
-const z_buf_error = -5;
-const z_no_flush = 0;
-const z_finish = 4;
-
-const ZStream = extern struct {
-    next_in: ?[*]const u8 = null,
-    avail_in: c_uint = 0,
-    total_in: c_ulong = 0,
-    next_out: ?[*]u8 = null,
-    avail_out: c_uint = 0,
-    total_out: c_ulong = 0,
-    msg: ?[*:0]const u8 = null,
-    state: ?*anyopaque = null,
-    zalloc: ?*const fn (?*anyopaque, c_uint, c_uint) callconv(.c) ?*anyopaque = null,
-    zfree: ?*const fn (?*anyopaque, ?*anyopaque) callconv(.c) void = null,
-    opaque_ctx: ?*anyopaque = null,
-    data_type: c_int = 0,
-    adler: c_ulong = 0,
-    reserved: c_ulong = 0,
-};
 
 const ZlibStream = struct {
     mode: ZlibMode,
-    api: *const ZlibApi,
-    stream: *ZStream,
+    /// On the C heap because zlib's state points back at the stream, which
+    /// therefore must not move while this value is copied around.
+    stream: *zlib.Stream,
     initialized: bool = false,
     /// `Content-Encoding: deflate` is served both zlib-wrapped (RFC 1950)
     /// and raw (RFC 1951) in the wild; browsers and curl sniff the first two
@@ -447,14 +284,13 @@ const ZlibStream = struct {
     };
 
     fn init(mode: ZlibMode) !ZlibStream {
-        const api = zlibApi() orelse return error.UnsupportedCompressionMethod;
-        const stream = try std.heap.c_allocator.create(ZStream);
+        const stream = try std.heap.c_allocator.create(zlib.Stream);
         errdefer std.heap.c_allocator.destroy(stream);
-        stream.* = .{};
+        // Null allocator fields make zlib allocate with malloc.
+        stream.* = std.mem.zeroes(zlib.Stream);
 
         var out = ZlibStream{
             .mode = mode,
-            .api = api,
             .stream = stream,
         };
         switch (mode) {
@@ -465,9 +301,9 @@ const ZlibStream = struct {
     }
 
     fn initWindowBits(self: *ZlibStream, window_bits: c_int) !void {
-        switch (self.api.inflate_init_fn(self.stream, window_bits, self.api.version_fn(), @sizeOf(ZStream))) {
-            z_ok => self.initialized = true,
-            z_mem_error => return error.OutOfMemory,
+        switch (zlib.inflateInit2(self.stream, window_bits)) {
+            zlib.ok => self.initialized = true,
+            zlib.mem_error => return error.OutOfMemory,
             else => return error.UnsupportedCompressionMethod,
         }
     }
@@ -484,8 +320,10 @@ const ZlibStream = struct {
     }
 
     fn deinit(self: *ZlibStream) void {
+        // inflateEnd only frees here; its one failure, a stream it does not
+        // recognize, cannot occur for a stream inflateInit2 initialized.
         if (self.initialized and (!self.finished or self.stream.state != null))
-            _ = self.api.inflate_end_fn(self.stream);
+            _ = zlib.inflateEnd(self.stream);
         std.heap.c_allocator.destroy(self.stream);
         self.* = undefined;
     }
@@ -533,10 +371,10 @@ const ZlibStream = struct {
         // A held first byte was consumed by an earlier call; inflate it ahead
         // of the current chunk (it is not part of `consumed` below).
         if (self.held_first_byte) |held| {
-            var held_buf = [1]u8{held};
+            const held_buf = [1]u8{held};
             self.stream.next_in = &held_buf;
             self.stream.avail_in = 1;
-            const held_result = try self.drainLimited(allocator, out, max_body_bytes, max_output_bytes, z_no_flush);
+            const held_result = try self.drainLimited(allocator, out, max_body_bytes, max_output_bytes, zlib.no_flush);
             const held_remaining = self.stream.avail_in;
             self.stream.next_in = null;
             self.stream.avail_in = 0;
@@ -550,7 +388,7 @@ const ZlibStream = struct {
 
         self.stream.next_in = if (bytes.len == 0) null else bytes.ptr;
         self.stream.avail_in = @intCast(bytes.len);
-        const result = try self.drainLimited(allocator, out, max_body_bytes, max_output_bytes, z_no_flush);
+        const result = try self.drainLimited(allocator, out, max_body_bytes, max_output_bytes, zlib.no_flush);
         const consumed = bytes.len - @as(usize, @intCast(self.stream.avail_in));
         self.stream.next_in = null;
         self.stream.avail_in = 0;
@@ -583,7 +421,7 @@ const ZlibStream = struct {
             return .{ .consumed = 0, .finished = false, .needs_output = true };
         self.stream.next_in = null;
         self.stream.avail_in = 0;
-        return try self.drainLimited(allocator, out, max_body_bytes, max_output_bytes, z_finish);
+        return try self.drainLimited(allocator, out, max_body_bytes, max_output_bytes, zlib.finish);
     }
 
     // Inflate writes straight into the unused capacity of `out`, so decoded
@@ -616,7 +454,7 @@ const ZlibStream = struct {
             const dst_len: usize = @min(@min(dst_full.len, output_remaining), std.math.maxInt(c_uint));
             self.stream.next_out = dst_full.ptr;
             self.stream.avail_out = @intCast(dst_len);
-            const status = self.api.inflate_fn(self.stream, flush);
+            const status = zlib.inflate(self.stream, flush);
             const produced = dst_len - @as(usize, @intCast(self.stream.avail_out));
             self.stream.next_out = null;
             self.stream.avail_out = 0;
@@ -626,34 +464,34 @@ const ZlibStream = struct {
                     return error.FetchResponseTooLarge;
                 out.items.len += produced;
             }
-            if (out.items.len >= max_output_bytes and status != z_stream_end)
+            if (out.items.len >= max_output_bytes and status != zlib.stream_end)
                 return .{ .consumed = 0, .finished = false, .needs_output = true };
             switch (status) {
-                z_ok => {
+                zlib.ok => {
                     if (self.stream.avail_in == 0 and produced < dst_len)
                         return .{ .consumed = 0, .finished = false, .needs_output = false };
                     continue;
                 },
-                z_stream_end => {
+                zlib.stream_end => {
                     if (self.mode == .gzip and self.stream.avail_in != 0) {
                         try self.resetForNextGzipMember();
                         continue;
                     }
-                    if (self.mode == .gzip and flush == z_no_flush) {
+                    if (self.mode == .gzip and flush == zlib.no_flush) {
                         self.member_ended = true;
                         return .{ .consumed = 0, .finished = false, .needs_output = false };
                     }
                     self.finished = true;
                     return .{ .consumed = 0, .finished = true, .needs_output = false };
                 },
-                z_buf_error => {
-                    if (flush == z_no_flush and self.stream.avail_in == 0)
+                zlib.buf_error => {
+                    if (flush == zlib.no_flush and self.stream.avail_in == 0)
                         return .{ .consumed = 0, .finished = false, .needs_output = false };
                     return error.FetchResponseTruncated;
                 },
-                z_need_dict, z_data_error => return error.InvalidCompressedResponse,
-                z_mem_error => return error.OutOfMemory,
-                z_stream_error => return error.InvalidCompressedResponse,
+                zlib.need_dict, zlib.data_error => return error.InvalidCompressedResponse,
+                zlib.mem_error => return error.OutOfMemory,
+                zlib.stream_error => return error.InvalidCompressedResponse,
                 else => return error.InvalidCompressedResponse,
             }
         }
@@ -662,27 +500,16 @@ const ZlibStream = struct {
     fn resetForNextGzipMember(self: *ZlibStream) !void {
         if (self.mode != .gzip)
             return error.InvalidCompressedResponse;
-        switch (self.api.inflate_reset_fn(self.stream)) {
-            z_ok => self.member_ended = false,
-            z_mem_error => return error.OutOfMemory,
+        switch (zlib.inflateReset(self.stream)) {
+            zlib.ok => self.member_ended = false,
+            zlib.mem_error => return error.OutOfMemory,
             else => return error.InvalidCompressedResponse,
         }
     }
 };
 
-const BrotliState = opaque {};
-const BrotliCreateFn = *const fn (?*const anyopaque, ?*const anyopaque, ?*anyopaque) callconv(.c) ?*BrotliState;
-const BrotliDestroyFn = *const fn (*BrotliState) callconv(.c) void;
-const BrotliStreamFn = *const fn (*BrotliState, *usize, *[*]const u8, *usize, *[*]u8, ?*usize) callconv(.c) c_int;
-
-const brotli_error = 0;
-const brotli_success = 1;
-const brotli_needs_more_input = 2;
-const brotli_needs_more_output = 3;
-
 const BrotliStream = struct {
-    api: *const BrotliApi,
-    state: *BrotliState,
+    state: *brotli.DecoderState,
     finished: bool = false,
 
     const LimitedResult = struct {
@@ -692,16 +519,12 @@ const BrotliStream = struct {
     };
 
     fn init() !BrotliStream {
-        const api = brotliApi() orelse return error.UnsupportedCompressionMethod;
-        const state = api.create(null, null, null) orelse return error.OutOfMemory;
-        return .{
-            .api = api,
-            .state = state,
-        };
+        const state = brotli.decoderCreate() orelse return error.OutOfMemory;
+        return .{ .state = state };
     }
 
     fn deinit(self: *BrotliStream) void {
-        self.api.destroy(self.state);
+        brotli.decoderDestroy(self.state);
         self.* = undefined;
     }
 
@@ -721,7 +544,7 @@ const BrotliStream = struct {
         if (max_output_bytes == 0)
             return .{ .consumed = 0, .finished = false, .needs_output = true };
         var available_in: usize = bytes.len;
-        var next_in: [*]const u8 = if (bytes.len == 0) undefined else bytes.ptr;
+        var next_in: [*c]const u8 = if (bytes.len == 0) null else bytes.ptr;
         const result = try self.drainLimited(allocator, &available_in, &next_in, out, max_body_bytes, max_output_bytes);
         return .{
             .consumed = bytes.len - available_in,
@@ -742,7 +565,7 @@ const BrotliStream = struct {
         if (max_output_bytes == 0)
             return .{ .consumed = 0, .finished = false, .needs_output = true };
         var available_in: usize = 0;
-        var next_in: [*]const u8 = undefined;
+        var next_in: [*c]const u8 = null;
         return try self.drainLimited(allocator, &available_in, &next_in, out, max_body_bytes, max_output_bytes);
     }
 
@@ -752,7 +575,7 @@ const BrotliStream = struct {
         self: *BrotliStream,
         allocator: std.mem.Allocator,
         available_in: *usize,
-        next_in: *[*]const u8,
+        next_in: *[*c]const u8,
         out: *std.array_list.Aligned(u8, null),
         max_body_bytes: usize,
         max_output_bytes: usize,
@@ -768,8 +591,8 @@ const BrotliStream = struct {
             const dst_full = out.unusedCapacitySlice();
             const dst_len: usize = @min(dst_full.len, output_remaining);
             var available_out: usize = dst_len;
-            var next_out: [*]u8 = dst_full.ptr;
-            const result = self.api.stream_fn(self.state, available_in, next_in, &available_out, &next_out, null);
+            var next_out: [*c]u8 = dst_full.ptr;
+            const result = brotli.decompressStream(self.state, available_in, next_in, &available_out, &next_out);
             const produced = dst_len - available_out;
             if (produced != 0) {
                 const body_remaining = max_body_bytes -| out.items.len;
@@ -778,18 +601,18 @@ const BrotliStream = struct {
                 out.items.len += produced;
             }
             switch (result) {
-                brotli_success => {
+                .success => {
                     self.finished = true;
                     return .{ .consumed = 0, .finished = true, .needs_output = false };
                 },
-                brotli_needs_more_output => {
+                .needs_more_output => {
                     if (out.items.len >= max_output_bytes)
                         return .{ .consumed = 0, .finished = false, .needs_output = true };
                     continue;
                 },
-                brotli_needs_more_input => return .{ .consumed = 0, .finished = false, .needs_output = false },
-                brotli_error => return error.InvalidCompressedResponse,
-                else => return error.InvalidCompressedResponse,
+                .needs_more_input => return .{ .consumed = 0, .finished = false, .needs_output = false },
+                .failure => return error.InvalidCompressedResponse,
+                _ => return error.InvalidCompressedResponse,
             }
         }
     }

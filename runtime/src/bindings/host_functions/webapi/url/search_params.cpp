@@ -221,7 +221,10 @@ namespace {
         RETURN_IF_EXCEPTION(scope, false);
         auto value = valueToURLSearchParamsString(global_object, scope, values.at(1));
         RETURN_IF_EXCEPTION(scope, false);
-        pairs.append({ WTF::move(key), WTF::move(value) });
+        if (!pairs.tryAppend(WTF::URLParser::URLEncodedForm::ValueType { WTF::move(key), WTF::move(value) })) {
+            JSC::throwOutOfMemoryError(global_object, scope);
+            return false;
+        }
         return true;
     }
 
@@ -278,7 +281,10 @@ namespace {
                 }
                 if (searchParamsPairCapExceeded(global_object, scope, pairs.size() + 1))
                     return {};
-                pairs.append({ WTF::move(key), WTF::move(value) });
+                if (!pairs.tryAppend(WTF::URLParser::URLEncodedForm::ValueType { WTF::move(key), WTF::move(value) })) {
+                    JSC::throwOutOfMemoryError(global_object, scope);
+                    return {};
+                }
             }
             return pairs;
         }
@@ -355,8 +361,10 @@ namespace {
 
         if (searchParamsPairCapExceeded(global_object, scope, params->pairs().size() + 1))
             return {};
-        params->pairs().append({ WTF::move(key), WTF::move(value) });
-        params->refreshGCReportedCost();
+        if (!params->tryAppendPair(WTF::move(key), WTF::move(value))) {
+            JSC::throwOutOfMemoryError(global_object, scope);
+            return {};
+        }
         params->syncAssociatedURL();
         return JSValue::encode(JSC::jsUndefined());
     }
@@ -497,7 +505,12 @@ namespace {
         if (!found) {
             if (searchParamsPairCapExceeded(global_object, scope, pairs.size() + 1))
                 return {};
-            pairs.append({ WTF::move(key), WTF::move(value) });
+            // No pair had the name, so the pass above removed nothing and a failed append leaves the pairs as they
+            // were.
+            if (!pairs.tryAppend(WTF::URLParser::URLEncodedForm::ValueType { WTF::move(key), WTF::move(value) })) {
+                JSC::throwOutOfMemoryError(global_object, scope);
+                return {};
+            }
         }
         params->refreshGCReportedCost();
         params->syncAssociatedURL();
@@ -613,10 +626,16 @@ namespace {
             auto add_result = group_indices.add(pair.key, groups.size());
             auto* group = add_result.isNewEntry ? nullptr : &groups[add_result.iterator->value];
             if (add_result.isNewEntry) {
-                groups.append({ pair.key, {} });
+                if (!groups.tryAppend(SearchParamsJSONGroup { pair.key, {} })) {
+                    JSC::throwOutOfMemoryError(global_object, scope);
+                    return {};
+                }
                 group = &groups.last();
             }
-            group->values.append(pair.value);
+            if (!group->values.tryAppend(pair.value)) {
+                JSC::throwOutOfMemoryError(global_object, scope);
+                return {};
+            }
         }
 
         auto* output = JSC::constructEmptyObject(global_object, global_object->objectPrototype(), groups.size());
@@ -695,6 +714,22 @@ size_t JSColloURLSearchParams::memoryCost() const
         cost = saturatingAdd(cost, stringMemoryCost(pair.value));
     }
     return cost;
+}
+
+bool JSColloURLSearchParams::tryAppendPair(WTF::String key, WTF::String value)
+{
+    using Pair = WTF::URLParser::URLEncodedForm::ValueType;
+
+    const size_t old_capacity = m_pairs.capacity();
+    if (!m_pairs.tryAppend(Pair { WTF::move(key), WTF::move(value) }))
+        return false;
+    const auto& pair = m_pairs.last();
+    size_t added = saturatingAdd(stringMemoryCost(pair.key), stringMemoryCost(pair.value));
+    if (m_pairs.capacity() > old_capacity)
+        added = saturatingAdd(added, saturatingMultiply(m_pairs.capacity() - old_capacity, sizeof(Pair)));
+    m_gc_reported_cost.store(saturatingAdd(gcReportedCost(), added), std::memory_order_relaxed);
+    vm().heap.reportExtraMemoryAllocated(this, added);
+    return true;
 }
 
 void JSColloURLSearchParams::reportInitialGCCost(JSC::VM& vm)

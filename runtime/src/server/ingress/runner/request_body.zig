@@ -262,7 +262,7 @@ pub fn Methods(comptime Self: type) type {
             const stream_state = runtime.h2StreamState(stream_id) orelse return;
             switch (stream_state) {
                 .preparing => {
-                    try Admission.writeH2ServerResponse(self, runtime, stream_id, response_id);
+                    _ = try Admission.writeH2ServerResponse(self, runtime, stream_id, response_id);
                     if (preparingRequestSlot(self, runtime, stream_id)) |request_slot| {
                         try RequestFinish.finishRequest(self, request_slot, .{ .rejected = response_id });
                         return;
@@ -270,8 +270,16 @@ pub fn Methods(comptime Self: type) type {
                     Admission.finishH2LocalResponse(self, runtime, stream_id);
                 },
                 .active => {
-                    try Admission.writeH2ServerResponse(self, runtime, stream_id, response_id);
-                    try cancelActiveH2RequestForLocalResponse(self, runtime, stream_id, @intFromEnum(http_common.http2.ErrorCode.cancel));
+                    // A stream whose response head went out takes no answer
+                    // of the lane's, and its record keeps the worker's.
+                    const answered = try Admission.writeH2ServerResponse(self, runtime, stream_id, response_id);
+                    try cancelActiveH2RequestForLocalResponse(
+                        self,
+                        runtime,
+                        stream_id,
+                        @intFromEnum(http_common.http2.ErrorCode.cancel),
+                        if (answered) response_id else null,
+                    );
                 },
                 .vacant, .draining_response => {},
             }
@@ -298,13 +306,24 @@ pub fn Methods(comptime Self: type) type {
             return true;
         }
 
-        fn cancelActiveH2RequestForLocalResponse(self: *Self, runtime: *ConnectionSlot, stream_id: u32, error_code: u32) StreamError!void {
+        /// Takes the dispatched request off `stream_id`, which the lane has
+        /// just answered `local_answer` itself (null when the stream took no
+        /// answer), and cancels it toward its worker; its access record then
+        /// reports the lane's answer (`RequestSlot.local_answer`).
+        fn cancelActiveH2RequestForLocalResponse(
+            self: *Self,
+            runtime: *ConnectionSlot,
+            stream_id: u32,
+            error_code: u32,
+            local_answer: ?server_responses.Id,
+        ) StreamError!void {
             const request_key = runtime.h2DetachActiveRequestForLocalResponse(self.service.allocator, stream_id) orelse return;
             const request_slot = Admission.findRequestSlot(self, request_key) orelse return;
             const slot = &self.requests.entries[request_slot];
             if (!slot.dispatched() or slot.h2_client_reset)
                 return;
             slot.h2_client_reset = true;
+            slot.local_answer = local_answer;
             if (try RequestFinish.finishParkedCompletion(self, request_slot))
                 return;
             try Dispatch.cancelRequestToWorker(self, request_slot, error_code);

@@ -395,7 +395,8 @@ JSC_DEFINE_HOST_FUNCTION(performanceMark, (JSC::JSGlobalObject * global_object, 
     RETURN_IF_EXCEPTION(scope, {});
     auto* mark = JSColloPerformanceMark::create(
         vm, performance->markStructure(), WTF::move(name), options->start_time, options->detail);
-    performance->appendEntry(global_object, vm, mark);
+    if (!performance->appendEntry(global_object, scope, vm, mark))
+        return {};
     return JSValue::encode(mark);
 }
 
@@ -420,7 +421,8 @@ JSC_DEFINE_HOST_FUNCTION(performanceMeasure, (JSC::JSGlobalObject * global_objec
     RETURN_IF_EXCEPTION(scope, {});
     auto* measure = JSColloPerformanceMeasure::create(
         vm, performance->measureStructure(), WTF::move(name), options->start_time, options->duration, options->detail);
-    performance->appendEntry(global_object, vm, measure);
+    if (!performance->appendEntry(global_object, scope, vm, measure))
+        return {};
     return JSValue::encode(measure);
 }
 

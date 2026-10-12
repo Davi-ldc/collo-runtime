@@ -156,7 +156,9 @@ JSC::EncodedJSValue parseBodyJsonTextToPromise(JSC::JSGlobalObject* global_objec
     JSC::JSValue parsed = JSC::JSONParse(global_object, stripLeadingUtf8Bom(text));
     if (scope.exception()) {
         auto exception = scope.exception()->value();
-        scope.clearExceptionExceptTermination();
+        // A termination stays pending and ends the request; nothing may be settled while it unwinds.
+        if (!scope.clearExceptionExceptTermination())
+            return {};
         if (!exception)
             exception = JSC::createSyntaxError(global_object, "Invalid JSON"_s);
         return rejectedPromise(global_object, exception);

@@ -26,7 +26,8 @@ pub const RejectReason = enum {
 };
 
 /// Closes `fd`, which the caller owns until this call, and counts the
-/// refusal under `reason`.
+/// refusal under `reason` and nowhere else: a refused socket is no queue
+/// overflow.
 pub fn closeRejectedAcceptedFd(fd: std.posix.fd_t, counters: *lane.CounterSnapshot, reason: RejectReason) void {
     switch (reason) {
         .connection_slab_exhaustion => counters.accepted_connection_slab_exhaustion += 1,
@@ -35,6 +36,5 @@ pub fn closeRejectedAcceptedFd(fd: std.posix.fd_t, counters: *lane.CounterSnapsh
         // Its own counter keeps a shutdown from reading as slab exhaustion.
         .shutting_down => counters.accepted_during_shutdown += 1,
     }
-    counters.silent_queue_overflows += 1;
     std.posix.close(fd);
 }

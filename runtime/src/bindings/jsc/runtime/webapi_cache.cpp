@@ -301,5 +301,4 @@ void ColloWebApiCache::clear()
     compression_stream_state_identifier = {};
     text_encoder_stream_state_identifier = {};
     text_decoder_stream_state_identifier = {};
-    byte_length_identifier = {};
 }

@@ -1,5 +1,6 @@
 //! The server's TLS layer (`server/tls/root.zig` and `server/tls/ktls.zig`): a
-//! BoringSSL context that refuses missing certificate files, ALPN that must
+//! BoringSSL context that loads a private key file without freeing a copy of
+//! the key unwiped and refuses missing certificate files, ALPN that must
 //! settle on h2, the handshakes the restricted TLS 1.3 policies still
 //! complete, the negotiation policy the kernel's kTLS ciphers select, the
 //! classes of negotiated cipher suites, when a worker may write to a client
@@ -35,6 +36,78 @@ const collo_test_tls_policy_end_to_end = tls_shim.collo_test_tls_policy_end_to_e
 const collo_test_tls_last_error = tls_shim.collo_test_tls_last_error;
 const collo_test_h2_request_header_block = tls_shim.collo_test_h2_request_header_block;
 
+/// Hands every allocation to `std.testing.allocator` but refuses to resize or move one, so a
+/// buffer that grows or shrinks goes through a new allocation and a free, and looks in every
+/// freed buffer for the marker a PEM private key carries.
+const KeyScanningAllocator = struct {
+    found_key_in_freed_memory: bool = false,
+
+    fn allocator(self: *KeyScanningAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = alloc,
+            .resize = resize,
+            .remap = remap,
+            .free = free,
+        } };
+    }
+
+    fn alloc(context: *anyopaque, len: usize, alignment: std.mem.Alignment, return_address: usize) ?[*]u8 {
+        _ = context;
+        return std.testing.allocator.rawAlloc(len, alignment, return_address);
+    }
+
+    fn resize(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, return_address: usize) bool {
+        _ = context;
+        _ = memory;
+        _ = alignment;
+        _ = new_len;
+        _ = return_address;
+        return false;
+    }
+
+    fn remap(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, return_address: usize) ?[*]u8 {
+        _ = context;
+        _ = memory;
+        _ = alignment;
+        _ = new_len;
+        _ = return_address;
+        return null;
+    }
+
+    fn free(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, return_address: usize) void {
+        const self: *KeyScanningAllocator = @ptrCast(@alignCast(context));
+        if (std.mem.indexOf(u8, memory, "PRIVATE KEY") != null)
+            self.found_key_in_freed_memory = true;
+        std.testing.allocator.rawFree(memory, alignment, return_address);
+    }
+};
+
+test "loading a private key from a file leaves no key bytes in freed memory" {
+    var certificate: tls.self_signed.SelfSignedCertificate = undefined;
+    try certificate.generate(try std.net.Address.parseIp("127.0.0.1", 8443), 1_760_000_000);
+    defer certificate.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, certificate.keyPem(), "PRIVATE KEY") != null);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "cert.pem", .data = certificate.certPem() });
+    try tmp.dir.writeFile(.{ .sub_path = "key.pem", .data = certificate.keyPem() });
+    var directory_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const directory = try tmp.dir.realpath(".", &directory_buffer);
+    const cert_path = try std.fs.path.join(std.testing.allocator, &.{ directory, "cert.pem" });
+    defer std.testing.allocator.free(cert_path);
+    const key_path = try std.fs.path.join(std.testing.allocator, &.{ directory, "key.pem" });
+    defer std.testing.allocator.free(key_path);
+
+    var scanning: KeyScanningAllocator = .{};
+    var context = try tls.BoringSslContext.init(scanning.allocator(), .{
+        .cert_chain = .{ .path = cert_path },
+        .private_key = .{ .path = key_path },
+    });
+    context.deinit();
+    try std.testing.expect(!scanning.found_key_in_freed_memory);
+}
+
 test "BoringSSL C context rejects missing certificate files when linked" {
     var handle: ?*BoringSslContextHandle = null;
     try std.testing.expect(boring.collo_boringssl_ctx_new(
@@ -59,7 +132,7 @@ fn expectClientRequestPathDecodes(path: [:0]const u8) !void {
     defer decoder.deinit();
     var decoded = try decoder.decodeBlock(std.testing.allocator, block[0..@intCast(block_len)], h2_request.max_header_count, 16 * 1024);
     defer decoded.deinit(std.testing.allocator);
-    const parsed = try h2_request.parse(decoded.headers, true);
+    const parsed = try h2_request.parse(decoded.headers, true, 0);
     try std.testing.expectEqualStrings(path, parsed.path);
 }
 

@@ -1,15 +1,20 @@
 //! The production stack the local-e2e suites of this directory drive, and
 //! what they drive it with. `Harness` is one stack per test: TLS material, a
-//! zygote that forks fully sandboxed workers, the delegated cgroup root, an
-//! analytics directory, and a server on a thread of the test process serving
-//! the routes of `fixtures/local_e2e/collo.json` on one lane or two. Requests
+//! zygote that forks fully sandboxed workers, the delegated cgroup root and
+//! the directory its workers mount their tmpfs over, an analytics directory,
+//! and a server on a thread of the test process serving the routes of
+//! `fixtures/local_e2e/collo.json`, or of a configuration a test writes, on
+//! one lane or two. The gateway enforces exactly the
+//! configuration's `network` grants, as under `collo serve`. Requests
 //! go out through the h2 client of the TLS test shim
 //! (`runtime/tests/support/tls/`), one GET per connection (`h2Get`) or on a
 //! connection held across requests (`Client`), placed on a chosen lane when
 //! the server runs two (`openClientOnLane`). What the server leaves behind
 //! is read back here too: the analytics records, the live workers of a pool
-//! and the launches that made them, and the egress gateway it runs, whose
-//! process a test can kill as it kills a worker.
+//! and the pool's own counts, the launches that made them and the reaper's
+//! count of the workers it retired, and the egress gateway it runs, whose
+//! process a test can kill as it kills a worker. A test can also lift a live
+//! worker's `memory.high`.
 //!
 //! Everything here runs on the test thread, or on a client thread a test
 //! starts; the zygote, its workers and the gateway are processes of their
@@ -50,9 +55,17 @@ pub const HarnessOptions = struct {
     /// The configuration to serve; a relative path resolves against the
     /// repository root, where the lane runs.
     config_path: []const u8 = fixture_config_path,
-    /// Spawns the gateway before traffic. Spawning it lazily would put its
-    /// exec, shard threads, Landlock and seccomp, milliseconds in all, inside
-    /// the first launch, where the benchmarks would measure them.
+    /// Configuration text to serve in place of `config_path`, for a test
+    /// that names something known only at run time, such as an origin's
+    /// address in a `network` grant. It is parsed as if it were the static
+    /// fixture, so its relative entries resolve against the fixture's
+    /// directory, and no file is written.
+    config_source: ?[]const u8 = null,
+    /// Spawns the gateway before traffic when the configuration grants some
+    /// route network access; without a grant the server never runs one.
+    /// Spawning it lazily would put its exec, shard threads, Landlock and
+    /// seccomp, milliseconds in all, inside the first launch, where the
+    /// benchmarks would measure them.
     prewarm_gateway: bool = true,
     /// Ingress lanes the server runs. One keeps every connection on the same
     /// lane; two let a test place connections on different lanes
@@ -71,11 +84,14 @@ pub const Harness = struct {
     spawned: zygote_support.zygote.host_client.SpawnedZygote,
     cgroup_environment: CgroupEnvironment,
     /// The analytics directory the server appends `usage.jsonl`,
-    /// `access.jsonl` and `logs.jsonl` to.
+    /// `access.jsonl`, `logs.jsonl` and `workers.jsonl` to.
     analytics_root: []const u8,
     /// Every worker is born inside a leaf of this subtree. The server borrows
     /// it, as it does under `collo serve`.
     worker_cgroup_root: host.WorkerCgroupRoot,
+    /// The directory every worker mounts its private tmpfs over, which the
+    /// server borrows beside the cgroup root.
+    tmp_mount_point: host.TmpMountPoint,
     /// Owns the routes built from the configuration (`Server.routes`).
     runtime_server: server_main.Server,
     server_thread: std.Thread,
@@ -117,9 +133,11 @@ pub const Harness = struct {
             else => return err,
         };
         errdefer self.worker_cgroup_root.deinit(std.testing.allocator);
+        try self.tmp_mount_point.init(host.tmp_mount.default_parent_dir);
+        errdefer self.tmp_mount_point.deinit();
 
         var diagnostic: config.Diagnostic = .{};
-        const loaded = config.load(std.testing.allocator, options.config_path, &diagnostic) catch |err| {
+        const loaded = loadConfiguration(options, &diagnostic) catch |err| {
             std.debug.print("configuration rejected: {s}\n", .{diagnostic.message()});
             return err;
         };
@@ -131,7 +149,10 @@ pub const Harness = struct {
 
         // `Server.init` owns the routes from here on, failure included.
         self.runtime_server = server_main.Server.init(std.testing.allocator, &self.spawned, .{
-            .worker_cgroup_root = &self.worker_cgroup_root,
+            .worker_host = .{
+                .cgroup_root = &self.worker_cgroup_root,
+                .tmp_mount_point = &self.tmp_mount_point,
+            },
             .routes = routes,
             .analytics_directory = self.analytics_root,
             // The lanes the test asks for, whatever the host, so the
@@ -142,18 +163,11 @@ pub const Harness = struct {
                 .cert_chain = .{ .path = nulTerminatedPath(self.tls_material.server_cert[0..]) },
                 .private_key = .{ .path = nulTerminatedPath(self.tls_material.server_key[0..]) },
             },
-            .egress_gateway = .{
-                .executable_path = local_server_options.egress_gateway_executable_path,
-                // The test origin is plain HTTP on this host's private
-                // address (`GzipOrigin` in `e2e.zig`), so every gateway's one
-                // policy admits both. Loopback stays denied whatever the
-                // flags say.
-                .network_policy = .{
-                    .kind = .any_host,
-                    .allow_private_networks = true,
-                    .allow_http = true,
-                },
-            },
+            // Only `collo`'s `main` starts the gateway by its `arg0`, which
+            // this test binary cannot, so the gateway runs from the installed
+            // `collo`, whose path `runtime/build/tests.zig` passes in
+            // `local_server_options`.
+            .egress_gateway_executable_path = local_server_options.egress_gateway_executable_path,
         }) catch |err| switch (err) {
             error.NoUsableKtlsCipher => return error.SkipZigTest,
             else => return err,
@@ -179,7 +193,8 @@ pub const Harness = struct {
         if (!self.server_thread_joined)
             stopServerThread(&self.runtime_server, self.server_thread);
         self.runtime_server.deinit();
-        // After the server, which borrows it.
+        // After the server, which borrows both.
+        self.tmp_mount_point.deinit();
         self.worker_cgroup_root.deinit(std.testing.allocator);
         self.cgroup_environment.deinit(std.testing.allocator);
         self.spawned.deinit();
@@ -241,6 +256,16 @@ pub fn countLaunches(traces: []const LaunchTrace, definition: config.DefinitionI
         }
     }
     return count;
+}
+
+/// The configuration `options` names: its text, parsed as if it were the
+/// static fixture, or the file at its path.
+fn loadConfiguration(options: HarnessOptions, diagnostic: *config.Diagnostic) !config.Config {
+    const source = options.config_source orelse
+        return config.load(std.testing.allocator, options.config_path, diagnostic);
+    const anchor = try std.fs.cwd().realpathAlloc(std.testing.allocator, fixture_config_path);
+    defer std.testing.allocator.free(anchor);
+    return config.parse(std.testing.allocator, source, anchor, diagnostic);
 }
 
 fn runServerThread(runtime_server: *server_main.Server) void {
@@ -519,6 +544,35 @@ pub const Client = struct {
         return stream_id;
     }
 
+    /// Sends the HEADERS of a bodiless `method` request of `path` with
+    /// `fields` after its pseudo-header fields on the next stream, and
+    /// returns that stream. The head must fit one HEADERS frame.
+    pub fn sendRequestWithFields(
+        self: *Client,
+        method: [:0]const u8,
+        path: []const u8,
+        fields: []const tls_shim.H2Field,
+    ) !u32 {
+        var path_buffer: [512]u8 = undefined;
+        const path_z = try std.fmt.bufPrintZ(&path_buffer, "{s}", .{path});
+        const stream_id = self.next_stream_id;
+        if (tls_shim.collo_test_h2_client_send_request_fields(
+            self.handle,
+            stream_id,
+            method.ptr,
+            path_z.ptr,
+            -1,
+            1,
+            fields.ptr,
+            @intCast(fields.len),
+        ) != 0) {
+            printShimError("send an HTTP/2 request with fields");
+            return error.H2ClientSendFailed;
+        }
+        self.next_stream_id += 2;
+        return stream_id;
+    }
+
     /// Sends `bytes` body bytes on `stream_id` in DATA frames of at most
     /// `frame_bytes`, ending the stream after the last one when `end_stream`,
     /// and returns the bytes sent: fewer than `bytes` only when the stream's
@@ -555,6 +609,26 @@ pub const Client = struct {
         return response;
     }
 
+    /// Reads the server's frames until `stream_id` has received at least
+    /// `body_bytes_min` body bytes or has ended, and keeps the stream for
+    /// `readResponse` or `resetStream`.
+    pub fn readBodyAtLeast(self: *Client, stream_id: u32, body_bytes_min: u64) !void {
+        if (tls_shim.collo_test_h2_client_read_body_at_least(self.handle, stream_id, body_bytes_min) != 0) {
+            printShimError("read an HTTP/2 response body");
+            return error.H2ClientReadFailed;
+        }
+    }
+
+    /// Sends RST_STREAM with `error_code` on `stream_id`, which has not
+    /// ended; `readResponse` then returns what arrived before, with
+    /// `raw.reset` 1 and `raw.reset_code` the code sent.
+    pub fn resetStream(self: *Client, stream_id: u32, error_code: u32) !void {
+        if (tls_shim.collo_test_h2_client_reset_stream(self.handle, stream_id, error_code) != 0) {
+            printShimError("reset an HTTP/2 stream");
+            return error.H2ClientResetFailed;
+        }
+    }
+
     /// One GET of `path` and its response.
     pub fn get(self: *Client, path: []const u8) !Response {
         return self.readResponse(try self.sendGet(path));
@@ -573,6 +647,19 @@ pub const Response = struct {
         return self.raw.body[0..@intCast(@min(self.raw.body_len, self.raw.body.len))];
     }
 };
+
+/// Fails unless `response` has `status`, printing how it ended otherwise.
+pub fn expectStatus(response: *const Response, status: u16) !void {
+    if (response.status == status) return;
+    std.debug.print("expected status {d}, got {d} (reset {d}, code {d}): {s}\n", .{
+        status,
+        response.status,
+        response.raw.reset,
+        response.raw.reset_code,
+        response.body(),
+    });
+    return error.UnexpectedResponseStatus;
+}
 
 /// The token `api/token.js` and `api/upload.js` draw once per worker process:
 /// two responses carry the same token exactly when one worker answered both.
@@ -742,6 +829,114 @@ pub fn killWorker(worker: LiveWorker) !void {
     try process.pidFdSendSignal(worker.record.handle.pidfd, std.posix.SIG.KILL);
 }
 
+/// Writes `max` to `worker`'s `memory.high`, which lifts the mark its
+/// sentinel watches: a growing worker then meets only `memory.max`, where the
+/// kernel's OOM kill ends it and counts `oom_kill` in its leaf. The leaf lies
+/// in the delegated subtree this process owns, and the worker checks its
+/// limits only at boot, so it keeps serving.
+pub fn liftMemoryHigh(worker: LiveWorker) !void {
+    var leaf = try std.fs.openDirAbsolute(worker.record.handle.cgroup_dir, .{});
+    defer leaf.close();
+    const memory_high = try leaf.openFile("memory.high", .{ .mode = .write_only });
+    defer memory_high.close();
+    try memory_high.writeAll("max");
+}
+
+/// Whether the live `worker`'s cgroup leaf has the interface file
+/// `file_name`, which depends on the kernel's version and the leaf's
+/// controllers.
+pub fn leafHasFile(worker: LiveWorker, file_name: []const u8) bool {
+    var leaf = std.fs.openDirAbsolute(worker.record.handle.cgroup_dir, .{}) catch return false;
+    defer leaf.close();
+    leaf.access(file_name, .{}) catch return false;
+    return true;
+}
+
+/// Interval between two looks at a pool, a pool entry or the reaper's
+/// counters.
+const service_poll_interval_ms: u64 = 10;
+/// Looks `waitForRecycledRetirements` and `waitForPoolEmpty` take before
+/// they give up.
+const reaper_polls_max: usize = 500;
+
+/// Waits up to `wait_ms` until `worker` is out of service: its pool took it
+/// out, for a retirement or a death, or its record already holds a later
+/// worker. Fails with `error.WorkerStillInService` when it is still live
+/// then.
+pub fn waitForWorkerOutOfService(harness: *Harness, worker: LiveWorker, wait_ms: u64) !void {
+    const polls: usize = @intCast(@divFloor(wait_ms, service_poll_interval_ms) + 1);
+    for (0..polls) |_| {
+        if (!workerInService(harness, worker)) return;
+        std.Thread.sleep(service_poll_interval_ms * std.time.ns_per_ms);
+    }
+    return error.WorkerStillInService;
+}
+
+/// Whether `worker` is still the live worker of its record. The pool shows
+/// the entry's state under its mutex (`Pool.visitWorker`), and a record's
+/// key is written only while its entry launches, so the key of a live entry
+/// names the worker it holds.
+fn workerInService(harness: *Harness, worker: LiveWorker) bool {
+    const worker_pool = harness.runtime_server.supervisor.poolFor(worker.record.definition_index);
+    var visitor: InServiceVisitor = .{ .key = worker.key };
+    if (!worker_pool.visitWorker(worker.record, &visitor))
+        return false;
+    return visitor.in_service;
+}
+
+const InServiceVisitor = struct {
+    key: WorkerKey,
+    in_service: bool = false,
+
+    pub fn visit(self: *InServiceVisitor, record: *WorkerRecord, state: supervision.pool.EntryState) void {
+        if (state != .live) return;
+        self.in_service = record.key().eql(self.key);
+    }
+};
+
+/// The reaper's counters (`Reaper.countersSnapshot`). The service sets its
+/// reaper up before it starts the lanes and tears it down before its `run`
+/// returns, so a test reads them only between its first response and
+/// `Harness.deinit`. Fails with `error.NoActiveService` when no service runs.
+pub fn reaperCounters(harness: *Harness) !supervision.reaper.Counters {
+    const runtime_server = &harness.runtime_server;
+    runtime_server.active_service_mutex.lock();
+    defer runtime_server.active_service_mutex.unlock();
+    const service = runtime_server.active_service orelse return error.NoActiveService;
+    return service.reaper.countersSnapshot();
+}
+
+/// Waits until the reaper has retired at least `minimum` workers as
+/// recycled, each after its `worker_retiring` notice and its last request,
+/// and returns its counters. The reaper tears a worker down on its own
+/// thread, some time after its pool took it out of service.
+pub fn waitForRecycledRetirements(harness: *Harness, minimum: u64) !supervision.reaper.Counters {
+    for (0..reaper_polls_max) |_| {
+        const counters = try reaperCounters(harness);
+        if (counters.retired_recycled >= minimum) return counters;
+        std.Thread.sleep(service_poll_interval_ms * std.time.ns_per_ms);
+    }
+    return error.RecycledRetirementsNotObserved;
+}
+
+/// Waits until `definition`'s pool holds no worker in any state and no
+/// launch, and returns the snapshot that saw it, whose counters then cover
+/// every launch the pool started. Every worker it published has been torn
+/// down by then, since the reaper removes a worker from its pool only after
+/// the teardown, but the reaper counts the retirement just after the removal
+/// (`Reaper.retire`), so its counters may still trail. Fails with
+/// `error.PoolNotEmpty` when the pool still holds a worker or a launch then.
+pub fn waitForPoolEmpty(harness: *Harness, definition: config.DefinitionIndex) !supervision.pool.Snapshot {
+    const worker_pool = harness.runtime_server.supervisor.poolFor(definition);
+    for (0..reaper_polls_max) |_| {
+        const snapshot = worker_pool.snapshot();
+        const held = snapshot.workers_live + snapshot.workers_retiring + snapshot.workers_dead + snapshot.launching;
+        if (held == 0) return snapshot;
+        std.Thread.sleep(service_poll_interval_ms * std.time.ns_per_ms);
+    }
+    return error.PoolNotEmpty;
+}
+
 /// The egress gateway process the server runs, held through a pidfd of the
 /// test's own, so no signal can reach a process that took its pid later.
 pub const GatewayProcess = struct {
@@ -855,21 +1050,43 @@ pub const UsageLine = struct {
     origin: []const u8,
     request_id: u64,
     error_code: []const u8,
-    wall_time_ns: u64,
+    wall_ns: u64,
+    cpu_ns: u64,
+    worker_fault: []const u8,
 };
 
 /// The fields of an `access.jsonl` record the suites check.
 pub const AccessLine = struct {
     request_id: u64,
+    route: []const u8,
     worker_id: u64,
     worker_generation: u64,
     status: u16,
+    error_code: []const u8,
+    worker_fault: []const u8,
     client_ip: []const u8,
+    duration_ms: u64,
+};
+
+/// A `workers.jsonl` line, which the server writes for each worker it tears
+/// down, the ones its shutdown stops included. A figure the leaf could not
+/// give is null.
+pub const WorkerLine = struct {
+    ts: u64,
+    worker: []const u8,
+    worker_id: u64,
+    worker_generation: u64,
+    started_ts: u64,
+    life_ns: u64,
+    worker_cpu_ns: ?u64,
+    memory_peak_bytes: ?u64,
+    ending: []const u8,
 };
 
 /// The fields of an `access.jsonl` record of a request the server answered
 /// itself.
 pub const LocalAccessLine = struct {
+    request_id: u64,
     status: u16,
     answered_by: []const u8,
     worker: []const u8,

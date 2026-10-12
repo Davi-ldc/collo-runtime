@@ -1,7 +1,7 @@
-//! Calls a timer or immediate callback as a turn of the request that
-//! scheduled it, under that request's exec context, on the worker's VM
-//! thread. A callback whose request is no longer active is skipped, never
-//! run under another identity.
+//! Calls a timer or immediate callback as a turn of the owner that scheduled
+//! it, a request or an evaluation, under that owner's exec context and in
+//! its route's realm, on the worker's VM thread. A callback whose owner is no
+//! longer active is skipped, never run under another identity.
 
 const std = @import("std");
 const bindings = @import("collo_bindings");
@@ -40,6 +40,7 @@ pub fn invokeDiscard(
 
     try turn.invokeDiscard(
         runtime.core.vm,
+        runtime.realmOfRoute(request.dispatch_work.route_index),
         request.requestAllocator(),
         &request.exec,
         callback.ptr(),

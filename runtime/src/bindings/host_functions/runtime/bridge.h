@@ -2,7 +2,8 @@
 // behind a global, the host runtime attached to it, the execution context of the current call, and promise deferreds
 // for the runtime to settle. The host runtime pointer is borrowed: Zig sets and clears it on the VM thread and keeps it
 // alive while a host function runs, so nothing stores it beyond its own call. A VM without a worker runtime, such as
-// the zygote's, has no host runtime, and code outside both a turn and the boot context has no execution context.
+// the zygote's, has no host runtime, and code with no owner (Collo::ownerExecCtx in jsc/runtime/state.h) has no
+// execution context.
 
 #pragma once
 
@@ -56,7 +57,8 @@ ActiveRequestRuntimeResult requireActiveRequestRuntime(JSC::JSGlobalObject*, JSC
 VmOwnerResult requireVmOwner(JSC::JSGlobalObject*, JSC::ThrowScope&);
 // The attached host runtime, or null.
 void* hostRuntime(ColloVm&);
-// The current turn's execution context, else the worker's boot context, else null.
+// The owner of the running JavaScript, Collo::ownerExecCtx: the current turn's or restored continuation's context,
+// else the turnless context, else null.
 ColloExecCtx* activeExecContext(ColloVm&);
 // Fills `out` and returns true when the global is a Collo global with both a host runtime and an execution context;
 // throws nothing.

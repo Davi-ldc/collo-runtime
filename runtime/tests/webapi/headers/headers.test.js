@@ -246,7 +246,7 @@ describe("Headers", () => {
       object.delete(name);
     });
     assert.deepEqual(seen, ["a:1", "b:2", "c:3"]);
-    assert.equal(headers.count(), 0);
+    assert.equal(headers.count, 0);
   });
 
   test("iterators expose expected sorted entries", () => {

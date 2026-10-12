@@ -1,3 +1,8 @@
+// The leak-test harness: a fixture's `leakTest(name, setup, check)` entries,
+// set up in one request and checked in the next, after the runner's full
+// collections. It runs in one script after `support/harness.js`
+// (`runLeakSuite` in `runtime/tests/webapi/support.zig`), whose
+// `__colloWithTimeout` bounds every setup and check.
 const __colloWebApiLeakTests = [];
 let __colloWebApiLeakPrefix = "";
 let __colloWebApiLeakRecord = null;
@@ -105,7 +110,7 @@ async function __colloRunWebApiLeakSetup(index) {
   }
 
   try {
-    const state = await entry.setup();
+    const state = await __colloWithTimeout(`${entry.name} (setup)`, entry.setup);
     await __colloLeakSettleBeforeCheckpoint();
     __colloWebApiLeakRecord = { name: entry.name, check: entry.check, state };
   } catch (err) {
@@ -133,7 +138,7 @@ async function __colloRunWebApiLeakChecks() {
     failures.push({ name: "leak checkpoint", message: "missing leak setup record" });
   } else {
     try {
-      await entry.check(entry.state);
+      await __colloWithTimeout(`${entry.name} (check)`, () => entry.check(entry.state));
     } catch (err) {
       failures.push({
         name: entry.name,

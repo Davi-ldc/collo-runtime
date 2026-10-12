@@ -1,10 +1,15 @@
 //! cgroup v2 primitives for a worker's cgroup: writing and checking its
-//! memory, CPU and pids limits, reading its events and CPU usage, and finding
-//! a process's cgroup. Most operations take the directory either by path or
-//! as an fd (the `At` forms); the `At` writers never allocate. The worker's
-//! memory limit is its `memory.high`, and `memory.max` and the threshold at
-//! which the engine requests a collection are derived from it here.
-//! Stateless, so any thread may call it.
+//! memory, swap, CPU and pids limits, reading its events and CPU usage, and
+//! finding a process's cgroup. A leaf is written and checked through its
+//! directory fd, and neither the writers nor the checks allocate, so the
+//! zygote's child can check its own leaf before it has a heap of its own;
+//! only the readers a host calls on a leaf it holds by path
+//! (`memory.readEventsLocal`, `cpu.readStatUsageUsec`) and the lookups in
+//! `path` allocate. The worker's memory limit is its `memory.high`, and
+//! `memory.max` and the threshold at which the engine requests a collection
+//! are derived from it here; `memory.swap.max` is 0, so `memory.max` bounds
+//! the worker's memory on a node with swap too. Stateless, so any thread may
+//! call it.
 
 const std = @import("std");
 
@@ -13,7 +18,7 @@ pub const memory = struct {
     /// (`gcHeapLimitBytes`): the worker sets it as the engine's
     /// `gcMaxHeapSize` override (`zygote/child_boot.zig`), and the engine
     /// requests a collection once the bytes allocated since the last one pass
-    /// it (`runtime/patches/webkit/0002-gc-max-heap-size-override.patch`). It
+    /// it (`runtime/patches/webkit/0002-embedder-memory-budget.patch`). It
     /// caps no heap and fails no allocation.
     pub const GC_HEAP_RATIO_NUM: u64 = 9;
     pub const GC_HEAP_RATIO_DEN: u64 = 10;
@@ -21,6 +26,11 @@ pub const memory = struct {
     /// the memory limit (`maxBytes`).
     pub const MAX_RATIO_NUM: u64 = 115;
     pub const MAX_RATIO_DEN: u64 = 100;
+    /// `memory.swap.max` of a worker leaf: none of its memory may go to swap,
+    /// so `memory.max` is the hard bound whether or not the node has swap.
+    /// A swap charge the limit refuses also keeps the page from zswap, so
+    /// `memory.zswap.max` needs nothing.
+    pub const SWAP_MAX_BYTES: u64 = 0;
 
     pub const Events = struct {
         low: u64 = 0,
@@ -29,22 +39,11 @@ pub const memory = struct {
         oom: u64 = 0,
         oom_kill: u64 = 0,
 
-        pub fn highPressureField(self: Events) ?[]const u8 {
-            if (self.high != 0)
-                return "high";
-            return null;
-        }
-
         pub fn highPressureFieldSince(self: Events, baseline: Events) ?[]const u8 {
             if (self.high > baseline.high)
                 return "high";
             return null;
         }
-    };
-
-    pub const LimitValidationMode = enum {
-        require_configured,
-        allow_unconfigured,
     };
 
     pub fn gcHeapLimitBytes(memory_limit_bytes: u64) u64 {
@@ -88,30 +87,23 @@ pub const memory = struct {
         return parseEvents(contents);
     }
 
-    /// Writes `memory.max`, `memory.high` and `memory.oom.group=1` under
-    /// `cgroup_dir`. With `memory.oom.group` set, a kernel OOM in the cgroup
-    /// kills every task in it together instead of choosing one. The file has
-    /// existed next to `memory.max` since Linux 4.19, so `FileNotFound` is
-    /// tolerated only for test fixtures that are plain directories.
-    pub fn configureWorkerLimits(
-        allocator: std.mem.Allocator,
-        cgroup_dir: []const u8,
-        memory_limit_bytes: u64,
-    ) !void {
-        try writeScalarLimitFile(allocator, cgroup_dir, "memory.max", maxBytes(memory_limit_bytes));
-        try writeScalarLimitFile(allocator, cgroup_dir, "memory.high", memory_limit_bytes);
-        writeScalarLimitFile(allocator, cgroup_dir, "memory.oom.group", 1) catch |err| switch (err) {
-            error.FileNotFound => {},
-            else => return err,
-        };
-    }
-
-    /// `configureWorkerLimits` for a directory fd, without allocating.
+    /// Writes `memory.max`, `memory.swap.max` (`SWAP_MAX_BYTES`),
+    /// `memory.high` and `memory.oom.group=1` in the leaf `cgroup_dir_fd`.
+    /// With `memory.oom.group` set, a kernel OOM in the cgroup kills every
+    /// task in it together instead of choosing one. `memory.oom.group` has
+    /// existed next to `memory.max` since Linux 4.19, so its `FileNotFound`
+    /// is tolerated only for test fixtures that are plain directories;
+    /// `memory.swap.max` is missing on a kernel booted without swap
+    /// accounting too, where no worker memory can be charged to swap.
     pub fn configureWorkerLimitsAt(
         cgroup_dir_fd: std.posix.fd_t,
         memory_limit_bytes: u64,
     ) !void {
         try writeScalarLimitFileAt(cgroup_dir_fd, "memory.max", maxBytes(memory_limit_bytes));
+        writeScalarLimitFileAt(cgroup_dir_fd, "memory.swap.max", SWAP_MAX_BYTES) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
         try writeScalarLimitFileAt(cgroup_dir_fd, "memory.high", memory_limit_bytes);
         writeScalarLimitFileAt(cgroup_dir_fd, "memory.oom.group", 1) catch |err| switch (err) {
             error.FileNotFound => {},
@@ -119,42 +111,27 @@ pub const memory = struct {
         };
     }
 
-    pub fn validateWorkerLimits(
-        allocator: std.mem.Allocator,
-        cgroup_dir: []const u8,
-        memory_limit_bytes: u64,
-        mode: LimitValidationMode,
-    ) !void {
-        const high = try readScalarLimitFile(allocator, cgroup_dir, "memory.high");
-        const max = try readScalarLimitFile(allocator, cgroup_dir, "memory.max");
-        if (high == null or max == null) {
-            if (mode == .allow_unconfigured)
-                return;
+    /// Fails unless the leaf holds the limits `configureWorkerLimitsAt`
+    /// writes for `memory_limit_bytes`: `memory.high` and `memory.max`, and
+    /// `memory.swap.max` at `SWAP_MAX_BYTES` wherever the file exists.
+    pub fn validateWorkerLimitsAt(cgroup_dir_fd: std.posix.fd_t, memory_limit_bytes: u64) !void {
+        try validateLimitBytes(memory_limit_bytes);
+        const high = try readScalarLimitAt(cgroup_dir_fd, "memory.high");
+        const max = try readScalarLimitAt(cgroup_dir_fd, "memory.max");
+        if (high == null or max == null)
             return error.WorkerCgroupMemoryLimitNotConfigured;
-        }
         if (high.? != memory_limit_bytes)
             return error.WorkerCgroupMemoryHighMismatch;
         if (max.? != maxBytes(memory_limit_bytes))
             return error.WorkerCgroupMemoryMaxMismatch;
-    }
-
-    pub fn validateWorkerLimitsAt(
-        allocator: std.mem.Allocator,
-        cgroup_dir_fd: std.posix.fd_t,
-        memory_limit_bytes: u64,
-        mode: LimitValidationMode,
-    ) !void {
-        const high = try readScalarLimitFileAt(allocator, cgroup_dir_fd, "memory.high");
-        const max = try readScalarLimitFileAt(allocator, cgroup_dir_fd, "memory.max");
-        if (high == null or max == null) {
-            if (mode == .allow_unconfigured)
-                return;
-            return error.WorkerCgroupMemoryLimitNotConfigured;
-        }
-        if (high.? != memory_limit_bytes)
-            return error.WorkerCgroupMemoryHighMismatch;
-        if (max.? != maxBytes(memory_limit_bytes))
-            return error.WorkerCgroupMemoryMaxMismatch;
+        const swap_max = readScalarLimitAt(cgroup_dir_fd, "memory.swap.max") catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        if (swap_max == null)
+            return error.WorkerCgroupSwapMismatch;
+        if (swap_max.? != SWAP_MAX_BYTES)
+            return error.WorkerCgroupSwapMismatch;
     }
 
     fn parseEvents(contents: []const u8) !Events {
@@ -213,18 +190,6 @@ pub const cpu = struct {
             return error.CpuQuotaOverflow;
     }
 
-    pub fn configureWorkerLimit(
-        allocator: std.mem.Allocator,
-        cgroup_dir: []const u8,
-        max_cores: u32,
-        period_us: u64,
-    ) !void {
-        try validateConfig(max_cores, period_us);
-        var buffer: [64]u8 = undefined;
-        const bytes = std.fmt.bufPrint(&buffer, "{d} {d}", .{ quotaForCores(max_cores, period_us), period_us }) catch unreachable;
-        try writeTextLimitFile(allocator, cgroup_dir, "cpu.max", bytes);
-    }
-
     pub fn configureWorkerLimitAt(
         cgroup_dir_fd: std.posix.fd_t,
         max_cores: u32,
@@ -236,61 +201,22 @@ pub const cpu = struct {
         try writeTextLimitFileAt(cgroup_dir_fd, "cpu.max", bytes);
     }
 
-    pub fn validateWorkerLimit(
-        allocator: std.mem.Allocator,
-        cgroup_dir: []const u8,
-        max_cores: u32,
-        period_us: u64,
-        mode: memory.LimitValidationMode,
-    ) !void {
-        try validateConfig(max_cores, period_us);
-        const configured = try readMax(allocator, cgroup_dir, "cpu.max");
-        if (configured.quota_us == null) {
-            if (mode == .allow_unconfigured)
-                return;
-            return error.WorkerCgroupCpuLimitNotConfigured;
-        }
-        if (configured.quota_us.? != quotaForCores(max_cores, period_us))
-            return error.WorkerCgroupCpuQuotaMismatch;
-        if (configured.period_us != period_us)
-            return error.WorkerCgroupCpuPeriodMismatch;
+    /// The leaf's `cpu.max`, read without allocating.
+    pub fn readMaxAt(cgroup_dir_fd: std.posix.fd_t) !Max {
+        var buffer: [64]u8 = undefined;
+        return parseMax(try readLimitFileAtBounded(cgroup_dir_fd, "cpu.max", &buffer));
     }
 
-    pub fn readMax(
-        allocator: std.mem.Allocator,
-        cgroup_dir: []const u8,
-        file_name: []const u8,
-    ) !Max {
-        const contents = try readLimitFileAlloc(allocator, cgroup_dir, file_name, 64);
-        defer allocator.free(contents);
-        return parseMax(contents);
-    }
-
-    pub fn readMaxAt(
-        allocator: std.mem.Allocator,
-        cgroup_dir_fd: std.posix.fd_t,
-        file_name: []const u8,
-    ) !Max {
-        const contents = try readLimitFileAtAlloc(allocator, cgroup_dir_fd, file_name, 64);
-        defer allocator.free(contents);
-        return parseMax(contents);
-    }
-
+    /// Fails unless the leaf's `cpu.max` is `max_cores` over `period_us`.
     pub fn validateWorkerLimitAt(
-        allocator: std.mem.Allocator,
         cgroup_dir_fd: std.posix.fd_t,
         max_cores: u32,
         period_us: u64,
-        mode: memory.LimitValidationMode,
     ) !void {
         try validateConfig(max_cores, period_us);
-        const configured = try readMaxAt(allocator, cgroup_dir_fd, "cpu.max");
-        if (configured.quota_us == null) {
-            if (mode == .allow_unconfigured)
-                return;
-            return error.WorkerCgroupCpuLimitNotConfigured;
-        }
-        if (configured.quota_us.? != quotaForCores(max_cores, period_us))
+        const configured = try readMaxAt(cgroup_dir_fd);
+        const quota_us = configured.quota_us orelse return error.WorkerCgroupCpuLimitNotConfigured;
+        if (quota_us != quotaForCores(max_cores, period_us))
             return error.WorkerCgroupCpuQuotaMismatch;
         if (configured.period_us != period_us)
             return error.WorkerCgroupCpuPeriodMismatch;
@@ -347,51 +273,17 @@ pub const pids = struct {
             return error.ZeroPidsMax;
     }
 
-    pub fn configureWorkerLimit(
-        allocator: std.mem.Allocator,
-        cgroup_dir: []const u8,
-        max_pids: u64,
-    ) !void {
-        try validateLimit(max_pids);
-        try writeScalarLimitFile(allocator, cgroup_dir, "pids.max", max_pids);
-    }
-
     pub fn configureWorkerLimitAt(cgroup_dir_fd: std.posix.fd_t, max_pids: u64) !void {
         try validateLimit(max_pids);
         try writeScalarLimitFileAt(cgroup_dir_fd, "pids.max", max_pids);
     }
 
-    pub fn validateWorkerLimit(
-        allocator: std.mem.Allocator,
-        cgroup_dir: []const u8,
-        max_pids: u64,
-        mode: memory.LimitValidationMode,
-    ) !void {
+    /// Fails unless the leaf's `pids.max` is `max_pids`.
+    pub fn validateWorkerLimitAt(cgroup_dir_fd: std.posix.fd_t, max_pids: u64) !void {
         try validateLimit(max_pids);
-        const configured = try readScalarLimitFile(allocator, cgroup_dir, "pids.max");
-        if (configured == null) {
-            if (mode == .allow_unconfigured)
-                return;
+        const configured = try readScalarLimitAt(cgroup_dir_fd, "pids.max") orelse
             return error.WorkerCgroupPidsLimitNotConfigured;
-        }
-        if (configured.? != max_pids)
-            return error.WorkerCgroupPidsMaxMismatch;
-    }
-
-    pub fn validateWorkerLimitAt(
-        allocator: std.mem.Allocator,
-        cgroup_dir_fd: std.posix.fd_t,
-        max_pids: u64,
-        mode: memory.LimitValidationMode,
-    ) !void {
-        try validateLimit(max_pids);
-        const configured = try readScalarLimitFileAt(allocator, cgroup_dir_fd, "pids.max");
-        if (configured == null) {
-            if (mode == .allow_unconfigured)
-                return;
-            return error.WorkerCgroupPidsLimitNotConfigured;
-        }
-        if (configured.? != max_pids)
+        if (configured != max_pids)
             return error.WorkerCgroupPidsMaxMismatch;
     }
 };
@@ -514,32 +406,6 @@ pub const worker = struct {
     /// Fails unless every file the worker's limits and events use exists. A
     /// limit file exists only when its controller is enabled in the parent's
     /// `cgroup.subtree_control`, so this catches a missing controller.
-    pub fn ensureSurface(allocator: std.mem.Allocator, cgroup_dir: []const u8) !void {
-        const cgroup_procs_path = try path.file(allocator, cgroup_dir, "cgroup.procs");
-        defer allocator.free(cgroup_procs_path);
-        try std.fs.accessAbsolute(cgroup_procs_path, .{});
-
-        const memory_high_path = try path.file(allocator, cgroup_dir, "memory.high");
-        defer allocator.free(memory_high_path);
-        try std.fs.accessAbsolute(memory_high_path, .{});
-
-        const memory_max_path = try path.file(allocator, cgroup_dir, "memory.max");
-        defer allocator.free(memory_max_path);
-        try std.fs.accessAbsolute(memory_max_path, .{});
-
-        const memory_events_path = try path.file(allocator, cgroup_dir, "memory.events.local");
-        defer allocator.free(memory_events_path);
-        try std.fs.accessAbsolute(memory_events_path, .{});
-
-        const cpu_max_path = try path.file(allocator, cgroup_dir, "cpu.max");
-        defer allocator.free(cpu_max_path);
-        try std.fs.accessAbsolute(cpu_max_path, .{});
-
-        const pids_max_path = try path.file(allocator, cgroup_dir, "pids.max");
-        defer allocator.free(pids_max_path);
-        try std.fs.accessAbsolute(pids_max_path, .{});
-    }
-
     pub fn ensureSurfaceAt(cgroup_dir_fd: std.posix.fd_t) !void {
         inline for (surface_file_names) |file_name| {
             const fd = try openReadOnlyAt(cgroup_dir_fd, file_name);
@@ -553,31 +419,8 @@ pub const worker = struct {
         try pids.validateLimit(limits.pids_max);
     }
 
-    pub fn configureLimits(
-        allocator: std.mem.Allocator,
-        cgroup_dir: []const u8,
-        limits: Limits,
-    ) !void {
-        try validateLimitsConfig(limits);
-        try memory.configureWorkerLimits(allocator, cgroup_dir, limits.memory_limit_bytes);
-        try cpu.configureWorkerLimit(allocator, cgroup_dir, limits.cpu_max_cores, limits.cpu_period_us);
-        try pids.configureWorkerLimit(allocator, cgroup_dir, limits.pids_max);
-    }
-
-    pub fn validateLimits(
-        allocator: std.mem.Allocator,
-        cgroup_dir: []const u8,
-        limits: Limits,
-        mode: memory.LimitValidationMode,
-    ) !void {
-        try validateLimitsConfig(limits);
-        if (mode == .allow_unconfigured)
-            return;
-        try memory.validateWorkerLimits(allocator, cgroup_dir, limits.memory_limit_bytes, mode);
-        try cpu.validateWorkerLimit(allocator, cgroup_dir, limits.cpu_max_cores, limits.cpu_period_us, mode);
-        try pids.validateWorkerLimit(allocator, cgroup_dir, limits.pids_max, mode);
-    }
-
+    /// Writes every limit of `limits` in the leaf `cgroup_dir_fd`. The host
+    /// calls it on a leaf it just created, before any process is born in it.
     pub fn configureLimitsAt(cgroup_dir_fd: std.posix.fd_t, limits: Limits) !void {
         try validateLimitsConfig(limits);
         try memory.configureWorkerLimitsAt(cgroup_dir_fd, limits.memory_limit_bytes);
@@ -585,60 +428,29 @@ pub const worker = struct {
         try pids.configureWorkerLimitAt(cgroup_dir_fd, limits.pids_max);
     }
 
-    pub fn validateLimitsAt(
-        allocator: std.mem.Allocator,
-        cgroup_dir_fd: std.posix.fd_t,
-        limits: Limits,
-        mode: memory.LimitValidationMode,
-    ) !void {
+    /// Fails unless the leaf holds every limit `configureLimitsAt` writes for
+    /// `limits`, naming the first that differs.
+    pub fn validateLimitsAt(cgroup_dir_fd: std.posix.fd_t, limits: Limits) !void {
         try validateLimitsConfig(limits);
-        if (mode == .allow_unconfigured)
-            return;
-        try memory.validateWorkerLimitsAt(
-            allocator,
-            cgroup_dir_fd,
-            limits.memory_limit_bytes,
-            mode,
-        );
-        try cpu.validateWorkerLimitAt(
-            allocator,
-            cgroup_dir_fd,
-            limits.cpu_max_cores,
-            limits.cpu_period_us,
-            mode,
-        );
-        try pids.validateWorkerLimitAt(allocator, cgroup_dir_fd, limits.pids_max, mode);
+        try memory.validateWorkerLimitsAt(cgroup_dir_fd, limits.memory_limit_bytes);
+        try cpu.validateWorkerLimitAt(cgroup_dir_fd, limits.cpu_max_cores, limits.cpu_period_us);
+        try pids.validateWorkerLimitAt(cgroup_dir_fd, limits.pids_max);
     }
 };
 
 pub const membership = struct {
     pub const Result = struct {
+        /// How many processes the leaf holds.
+        member_count: usize,
         contains_expected: bool,
         only_expected: bool,
     };
 
-    pub fn read(allocator: std.mem.Allocator, file_path: []const u8, expected_pid: u32) !Result {
-        var file_handle = try std.fs.openFileAbsolute(file_path, .{});
-        defer file_handle.close();
-
-        const contents = try file_handle.readToEndAlloc(allocator, 4096);
-        defer allocator.free(contents);
-
-        return parse(contents, expected_pid);
-    }
-
-    pub fn readAt(
-        allocator: std.mem.Allocator,
-        cgroup_dir_fd: std.posix.fd_t,
-        expected_pid: u32,
-    ) !Result {
-        const contents = try readLimitFileAtAlloc(allocator, cgroup_dir_fd, "cgroup.procs", 4096);
-        defer allocator.free(contents);
-
-        return parse(contents, expected_pid);
-    }
-
-    fn parse(contents: []const u8, expected_pid: u32) !Result {
+    /// Reads the leaf's `cgroup.procs` without allocating; a list longer than
+    /// the buffer fails with `error.CgroupFileTooLarge`.
+    pub fn readAt(cgroup_dir_fd: std.posix.fd_t, expected_pid: u32) !Result {
+        var buffer: [4096]u8 = undefined;
+        const contents = try readLimitFileAtBounded(cgroup_dir_fd, "cgroup.procs", &buffer);
         var non_empty_count: usize = 0;
         var contains_expected = false;
         var lines = std.mem.splitScalar(u8, contents, '\n');
@@ -651,8 +463,8 @@ pub const membership = struct {
             if (parsed == expected_pid)
                 contains_expected = true;
         }
-
         return .{
+            .member_count = non_empty_count,
             .contains_expected = contains_expected,
             .only_expected = contains_expected and non_empty_count == 1,
         };
@@ -663,6 +475,7 @@ const surface_file_names = [_][]const u8{
     "cgroup.procs",
     "memory.high",
     "memory.max",
+    "memory.current",
     "memory.events.local",
     "cpu.max",
     "pids.max",
@@ -694,37 +507,6 @@ fn writeAllRaw(fd: std.posix.fd_t, bytes: []const u8) !void {
     }
 }
 
-fn writeScalarLimitFile(
-    allocator: std.mem.Allocator,
-    cgroup_dir: []const u8,
-    file_name: []const u8,
-    value: u64,
-) !void {
-    var buffer: [32]u8 = undefined;
-    const bytes = std.fmt.bufPrint(&buffer, "{d}", .{value}) catch unreachable;
-    try writeTextLimitFile(allocator, cgroup_dir, file_name, bytes);
-}
-
-fn writeTextLimitFile(
-    allocator: std.mem.Allocator,
-    cgroup_dir: []const u8,
-    file_name: []const u8,
-    bytes: []const u8,
-) !void {
-    const file_path = try path.file(allocator, cgroup_dir, file_name);
-    defer allocator.free(file_path);
-
-    const fd = try std.posix.open(file_path, .{
-        .ACCMODE = .WRONLY,
-        .CLOEXEC = true,
-    }, 0);
-    defer std.posix.close(fd);
-
-    try writeAllRaw(fd, bytes);
-}
-
-// The fd-relative writers do not allocate, so the fork path can configure a
-// worker cgroup without a heap.
 fn writeScalarLimitFileAt(
     cgroup_dir_fd: std.posix.fd_t,
     file_name: []const u8,
@@ -745,30 +527,31 @@ fn writeTextLimitFileAt(
     try writeAllRaw(fd, bytes);
 }
 
-fn readScalarLimitFile(
-    allocator: std.mem.Allocator,
-    cgroup_dir: []const u8,
-    file_name: []const u8,
-) !?u64 {
-    const contents = try readLimitFileAlloc(allocator, cgroup_dir, file_name, 64);
-    defer allocator.free(contents);
+/// A limit file holding one decimal or `max`, which reads as null.
+fn readScalarLimitAt(cgroup_dir_fd: std.posix.fd_t, file_name: []const u8) !?u64 {
+    var buffer: [64]u8 = undefined;
+    const contents = try readLimitFileAtBounded(cgroup_dir_fd, file_name, &buffer);
     const trimmed = std.mem.trim(u8, contents, &std.ascii.whitespace);
     if (std.mem.eql(u8, trimmed, "max"))
         return null;
     return try std.fmt.parseUnsigned(u64, trimmed, 10);
 }
 
-fn readScalarLimitFileAt(
-    allocator: std.mem.Allocator,
+/// One read of a cgroup file into `buffer`. Every file read here is a few
+/// bytes, and the kernel fills a cgroup file's read in one call, so a read
+/// that fills the buffer means a file this module does not know and fails
+/// with `error.CgroupFileTooLarge`.
+fn readLimitFileAtBounded(
     cgroup_dir_fd: std.posix.fd_t,
     file_name: []const u8,
-) !?u64 {
-    const contents = try readLimitFileAtAlloc(allocator, cgroup_dir_fd, file_name, 64);
-    defer allocator.free(contents);
-    const trimmed = std.mem.trim(u8, contents, &std.ascii.whitespace);
-    if (std.mem.eql(u8, trimmed, "max"))
-        return null;
-    return try std.fmt.parseUnsigned(u64, trimmed, 10);
+    buffer: []u8,
+) ![]const u8 {
+    const fd = try openReadOnlyAt(cgroup_dir_fd, file_name);
+    defer std.posix.close(fd);
+    const read_len = try std.posix.read(fd, buffer);
+    if (read_len == buffer.len)
+        return error.CgroupFileTooLarge;
+    return buffer[0..read_len];
 }
 
 fn readLimitFileAlloc(
@@ -781,19 +564,6 @@ fn readLimitFileAlloc(
     defer allocator.free(file_path);
 
     var file_handle = try std.fs.openFileAbsolute(file_path, .{});
-    defer file_handle.close();
-
-    return file_handle.readToEndAlloc(allocator, max_bytes);
-}
-
-fn readLimitFileAtAlloc(
-    allocator: std.mem.Allocator,
-    cgroup_dir_fd: std.posix.fd_t,
-    file_name: []const u8,
-    max_bytes: usize,
-) ![]u8 {
-    const fd = try openReadOnlyAt(cgroup_dir_fd, file_name);
-    var file_handle = std.fs.File{ .handle = fd };
     defer file_handle.close();
 
     return file_handle.readToEndAlloc(allocator, max_bytes);

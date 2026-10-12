@@ -27,14 +27,12 @@
 //! them, and each is closed by the domain that created or received it.
 //!
 //! What each `collo_runtime_*` function does with the handles it receives is
-//! stated in `abi.h`, or for the fs fault exports, which `fs.cpp` declares
-//! itself, in `host/fs_fault.zig`: promise deferreds and values are consumed
-//! on every call, while a crypto job passes to Zig only on success. Every
-//! crypto job, fetch, fetch body and timer carries the id of the request that
-//! started it, and the end of that request cancels or releases each one
-//! (`cleanupRequestSubresources` in
-//! `serve/response_finish.zig`, and `Runtime.closeBootContext` for the boot
-//! context).
+//! stated in `abi.h`: promise deferreds and values are consumed on every
+//! call, while a crypto job passes to Zig only on success. Every crypto job,
+//! fetch, fetch body and timer carries the id of the owner that started it,
+//! a request or an evaluation, and that owner's end cancels or releases each
+//! one (`cleanupRequestSubresources` in `serve/response_finish.zig`, and
+//! `Runtime.closeEvaluation` in `runtime/evaluations.zig`).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -50,11 +48,12 @@ const host_fetch = @import("host/fetch.zig");
 const host_fs_fault = @import("host/fs_fault.zig");
 const host_module_settlement = @import("host/module_settlement.zig");
 const host_request_body = @import("host/request_body.zig");
+const host_response_body_stream = @import("host/response_body_stream.zig");
 const host_timers = @import("host/timers.zig");
 
 /// The node:fs view of the worker's read-only file tree. The zygote's worker
 /// child initializes it between the chroot and seccomp, and the C++ fs
-/// binding calls it through the `collo_worker_fs_*` functions referenced
+/// binding calls it through the `collo_runtime_fs_*` functions referenced
 /// below.
 pub const fs = @import("fs/index.zig");
 
@@ -79,8 +78,9 @@ pub const testing = if (builtin.is_test) struct {
     pub const module_routes = @import("modules/routes.zig");
     pub const response_finish = @import("serve/response_finish.zig");
     pub const response_payload_writer = @import("serve/response_payload_writer.zig");
-    pub const process_cpu = @import("serve/process_cpu.zig");
     pub const sentinel = @import("runtime/sentinel.zig");
+    pub const turn = @import("collo_worker_js").turn;
+    pub const crypto_jobs = @import("js/crypto/jobs.zig");
 
     pub const scheduler = struct {
         pub const loop = @import("scheduler/loop.zig");
@@ -119,12 +119,14 @@ comptime {
     _ = host_request_body.collo_runtime_request_bytes;
     _ = host_request_body.collo_runtime_request_blob;
     _ = host_request_body.collo_runtime_request_form_data;
+    _ = host_response_body_stream.collo_runtime_response_body_stream_settled;
     _ = host_timers.collo_runtime_set_timer;
     _ = host_timers.collo_runtime_clear_timeout;
     _ = host_timers.collo_runtime_set_immediate;
     _ = host_timers.collo_runtime_clear_immediate;
-    _ = fs.collo_worker_fs_route;
-    _ = fs.collo_worker_fs_readdir_next;
+    _ = fs.collo_runtime_fs_route;
+    _ = fs.collo_runtime_fs_readdir_next;
+    _ = fs.collo_runtime_fs_materialized_path;
 }
 
 /// Builds the runtime of one worker; `Runtime.init` says what it takes and

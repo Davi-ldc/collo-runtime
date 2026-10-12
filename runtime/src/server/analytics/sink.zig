@@ -18,7 +18,9 @@
 //! files under `flush_mutex`: the ingress metrics thread calls it every tick,
 //! and a usage drain on a thread that may block (the metrics, reaper and
 //! exiting threads) calls it whenever a batch finds the usage stream full
-//! (`drainWorkerFlushing` in `server/supervisor/usage_drain.zig`).
+//! (`drainWorkerFlushing` in `server/supervisor/usage_drain.zig`), as a
+//! worker teardown does when its line finds the workers stream full
+//! (`writeWorkerRecord` in `server/supervisor/worker_registry.zig`).
 //! `flushConsole` writes stderr under `console_flush_mutex`, from the ingress
 //! service's console thread. `close` runs both last. A console write holds
 //! the process stderr lock for one batch of whole lines at a time, so
@@ -48,9 +50,10 @@
 //! - A stream that refuses a record (`append`, `appendKeepingFree`) or drops
 //!   one (`appendLossy`) is full (`full`, one atomic any thread reads without
 //!   the stream's lock) until its flusher has made room again for the
-//!   largest record it refused. A full usage stream is logged once at `err`
-//!   when it begins: usage records are the server's account of what each
-//!   request used, and one the stream refuses is lost for good. A producer
+//!   largest record it refused. A full usage or workers stream is logged once
+//!   at `err` when it begins: usage records and worker lines are the server's
+//!   account of what each request and each worker used, and one the stream
+//!   refuses is lost for good. A producer
 //!   that keeps a record the stream has no room for, and offers it again once
 //!   the stream is written out, asks with `tryAppendKeepingFree`, whose
 //!   refusal loses nothing and so marks nothing.
@@ -60,12 +63,13 @@
 const std = @import("std");
 const fd_mod = @import("collo_os").fd;
 
-/// Where a record goes. `logs`, `access` and `usage` are files in the
-/// analytics directory; `console` is stderr.
+/// Where a record goes. `logs`, `access`, `usage` and `workers` are files in
+/// the analytics directory; `console` is stderr.
 pub const Stream = enum {
     logs,
     access,
     usage,
+    workers,
     console,
 };
 
@@ -74,13 +78,16 @@ const stream_count = @typeInfo(Stream).@"enum".fields.len;
 /// Ring capacity of each stream. The ingress metrics thread flushes once per
 /// `metrics_drain_interval_ns` (`server/ingress/service_observability.zig`),
 /// and a ring holds many intervals of ordinary traffic: about five thousand
-/// access or usage records of a few hundred bytes, and console lines at the
+/// access or usage records of a few hundred bytes, console lines at the
 /// message cap number about a thousand in `logs` and two hundred and fifty
-/// in `console`. A stream that outruns its ring loses records, counted,
-/// instead of growing.
+/// in `console`, and about a thousand worker lines in `workers`, whose
+/// producer writes the stream out and offers its line again when it finds no
+/// room (`writeWorkerRecord` in `server/supervisor/worker_registry.zig`). A
+/// stream that outruns its ring loses records, counted, instead of growing.
 pub const logs_buffer_bytes_max: usize = 4 * 1024 * 1024;
 pub const access_buffer_bytes_max: usize = 2 * 1024 * 1024;
 pub const usage_buffer_bytes_max: usize = 2 * 1024 * 1024;
+pub const workers_buffer_bytes_max: usize = 256 * 1024;
 pub const console_buffer_bytes_max: usize = 1024 * 1024;
 
 /// Longest a written record may wait for fdatasync. Bounds what a crash of
@@ -105,6 +112,7 @@ pub fn bufferBytesMax(stream: Stream) usize {
         .logs => logs_buffer_bytes_max,
         .access => access_buffer_bytes_max,
         .usage => usage_buffer_bytes_max,
+        .workers => workers_buffer_bytes_max,
         .console => console_buffer_bytes_max,
     };
 }
@@ -116,6 +124,7 @@ pub fn fileName(stream: Stream) ?[]const u8 {
         .logs => "logs.jsonl",
         .access => "access.jsonl",
         .usage => "usage.jsonl",
+        .workers => "workers.jsonl",
         .console => null,
     };
 }
@@ -166,7 +175,7 @@ pub const Sink = struct {
     /// `flush_mutex`.
     reported: [stream_count]Stats = @splat(.{}),
 
-    /// Opens every stream: with a directory, creates or opens its three record
+    /// Opens every stream: with a directory, creates or opens its record
     /// files for appending; without one, only the console stream buffers.
     /// Fails with `error.FileNotFound` when the directory does not exist, and
     /// on any failure leaves nothing open.
@@ -537,7 +546,7 @@ fn openChannel(
 ) !Channel {
     const destination: Destination = switch (stream) {
         .console => .{ .console = console_fd },
-        .logs, .access, .usage => if (directory) |dir|
+        .logs, .access, .usage, .workers => if (directory) |dir|
             .{ .file = try openRecordFile(dir, fileName(stream).?) }
         else
             .none,
@@ -606,12 +615,13 @@ fn clearFullIfRoomLocked(target: *Channel) void {
     target.full.store(false, .release);
 }
 
-/// The start of a stream's full episode. Only a full usage stream is
-/// logged here, at `err`; the other streams' losses are left to the counts
-/// `reportLosses` logs.
+/// The start of a stream's full episode. Only a full usage or workers
+/// stream is logged here, at `err`; the other streams' losses are left to
+/// the counts `reportLosses` logs.
 fn reportFullBegan(stream: Stream) void {
     switch (stream) {
         .usage => std.log.err("analytics usage: the stream is full, so the usage records it refuses are lost until it has room again", .{}),
+        .workers => std.log.err("analytics workers: the stream is full, so the worker lines it refuses are lost until it has room again", .{}),
         .logs, .access, .console => {},
     }
 }

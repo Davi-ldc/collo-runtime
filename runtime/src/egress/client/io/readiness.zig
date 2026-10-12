@@ -377,8 +377,15 @@ const UringDriver = struct {
     }
 };
 
+/// Fails with `error.UnsupportedKernel` or `error.PermissionDenied` when this
+/// kernel or its policy offers no usable ring
+/// (`restricted_uring.initRingParams`).
 fn initRestrictedReadinessRing() !linux.IoUring {
-    var ring = try linux.IoUring.init(ring_entries, linux.IORING_SETUP_R_DISABLED);
+    var params = std.mem.zeroInit(linux.io_uring_params, .{
+        .flags = linux.IORING_SETUP_R_DISABLED,
+        .sq_thread_idle = 1000,
+    });
+    var ring = try restricted_uring.initRingParams(ring_entries, &params);
     errdefer ring.deinit();
     var restrictions = [_]restricted_uring.Restriction{
         restricted_uring.registerRestriction(.REGISTER_ENABLE_RINGS),

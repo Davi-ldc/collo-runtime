@@ -166,7 +166,7 @@ test "redispatch resubmit rebuilds the request and rolls back on an unavailable 
     defer fresh.deinit();
     try std.testing.expectError(
         error.EgressEngineUnavailable,
-        fresh.resubmitReplayFetch(replay.items[0], .{}, gateway.policy.public_https),
+        fresh.resubmitReplayFetch(replay.items[0], .{}, egress.network.public_https),
     );
     try std.testing.expectEqual(@as(usize, 0), engine_test.activeFetchCount(&fresh));
 }

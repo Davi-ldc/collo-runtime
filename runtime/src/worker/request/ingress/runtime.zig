@@ -14,6 +14,7 @@ const ipc = @import("collo_ipc");
 const common_worker_metrics_state = @import("collo_worker_state").metrics;
 const request_context = @import("../context.zig");
 const h2_ingress = @import("../http2/ingress.zig");
+const response_stream = @import("../response_stream.zig");
 
 /// Applies one received packet and takes `received` on every path. A packet
 /// for a request that is no longer active is dropped, and one whose identity
@@ -52,8 +53,7 @@ fn enqueueRequestBegin(runtime: anytype, received: *ipc.ingress_channel.Received
         .request_generation = dispatch_work.request_generation,
         .worker_id = dispatch_work.worker_id,
         .worker_generation = dispatch_work.worker_generation,
-        .billing_sequence = dispatch_work.request_id,
-    }, started);
+    });
     errdefer freeLiveSlotBestEffort(&runtime.observability.worker_metrics_state, live_slot_index);
 
     const request_id = dispatch_work.request_id;
@@ -68,6 +68,10 @@ fn enqueueRequestBegin(runtime: anytype, received: *ipc.ingress_channel.Received
     );
     dispatch_moved = true;
     errdefer request_ctx.deinit();
+    // The budget is the definition's, the same for every request the worker
+    // serves (`runtime/owner.zig`).
+    request_ctx.cpu_budget_ns = runtime.owners.request_cpu_budget_ns;
+    request_ctx.arrived_retiring = runtime.retirement.reason != null;
 
     try request_ctx.body.initFromIngressFraming(
         request_ctx.requestAllocator(),
@@ -133,8 +137,9 @@ fn enqueueReset(runtime: anytype, received: *ipc.ingress_channel.Received) !void
 
 /// After a full ready queue asked for a rescan, queues what each active
 /// request still waits for: the cancel of a reset request, a dispatch that
-/// has not started, or a body read that can settle. It stops at the first
-/// item that still finds no room, which asks for the rescan again.
+/// has not started, a body read that can settle, or a response body stream
+/// with a result to send or a read to start. It stops at the first item that
+/// still finds no room, which asks for the rescan again.
 pub fn collectReadyRequests(runtime: anytype) void {
     if (!runtime.scheduler.ingress_rescan_needed)
         return;
@@ -158,16 +163,21 @@ pub fn collectReadyRequests(runtime: anytype) void {
             if (!queueBodyReady(runtime, request_ctx))
                 return;
         }
+        if (response_stream.wantsAdvance(&request_ctx.response_stream)) {
+            if (!response_stream.queueAdvance(runtime, request_ctx.exec.request_id, &request_ctx.response_stream))
+                return;
+        }
     }
 }
 
 /// Queues the request's `request_body_ready` work item unless one is
 /// already queued. Returns false when the ready queue and its backlog are
-/// full; the item then waits for `collectReadyRequests`.
+/// full; the item then waits for `collectReadyRequests`, keeping the instant
+/// it first became ready (`queueStamped`).
 pub fn queueBodyReady(runtime: anytype, request_ctx: *request_context.RequestContext) bool {
     if (request_ctx.body_ready_queued)
         return true;
-    if (!runtime.tryQueueReadyWork(.{ .request_body_ready = request_ctx.exec.request_id }))
+    if (!queueStamped(runtime, request_ctx.exec.request_id, .body_ready, &request_ctx.body_ready_since_ns))
         return false;
     request_ctx.body_ready_queued = true;
     return true;
@@ -176,7 +186,7 @@ pub fn queueBodyReady(runtime: anytype, request_ctx: *request_context.RequestCon
 fn queueDispatch(runtime: anytype, request_ctx: *request_context.RequestContext) bool {
     if (request_ctx.dispatch_queued or request_ctx.dispatch_started)
         return true;
-    if (!runtime.tryQueueReadyWork(.{ .request = request_ctx.exec.request_id }))
+    if (!queueStamped(runtime, request_ctx.exec.request_id, .dispatch, &request_ctx.dispatch_ready_since_ns))
         return false;
     request_ctx.dispatch_queued = true;
     return true;
@@ -185,9 +195,30 @@ fn queueDispatch(runtime: anytype, request_ctx: *request_context.RequestContext)
 fn queueCancel(runtime: anytype, request_ctx: *request_context.RequestContext) bool {
     if (request_ctx.cancel_queued)
         return true;
-    if (!runtime.tryQueueReadyWork(.{ .request_cancelled = request_ctx.exec.request_id }))
+    if (!queueStamped(runtime, request_ctx.exec.request_id, .cancel, &request_ctx.cancel_ready_since_ns))
         return false;
     request_ctx.cancel_queued = true;
+    return true;
+}
+
+const ReadyKind = enum { dispatch, body_ready, cancel };
+
+/// Queues the `kind` item of request `request_id` with the instant it first
+/// became ready, `ready_since_ns`, which the first attempt stamps and every
+/// retry after a full queue keeps, so the wait for queue room counts as the
+/// request's waiting, as it does for every source that keeps its own stamp;
+/// a queued item clears it.
+fn queueStamped(runtime: anytype, request_id: u64, comptime kind: ReadyKind, ready_since_ns: *u64) bool {
+    if (ready_since_ns.* == 0)
+        ready_since_ns.* = runtime.nowMonoNs();
+    const queued = switch (kind) {
+        .dispatch => runtime.tryQueueReadyWorkReadySince(.{ .request = request_id }, ready_since_ns.*),
+        .body_ready => runtime.tryQueueReadyWorkReadySince(.{ .request_body_ready = request_id }, ready_since_ns.*),
+        .cancel => runtime.tryQueueReadyWorkReadySince(.{ .request_cancelled = request_id }, ready_since_ns.*),
+    };
+    if (!queued)
+        return false;
+    ready_since_ns.* = 0;
     return true;
 }
 

@@ -9,15 +9,14 @@
 
 namespace Collo::HostFunctions::WebCrypto {
 
-static bool clearOutputAndFail(WTF::Vector<uint8_t>& out)
+static bool clearOutputAndFail(SecretBytes& out)
 {
-    secureZeroVector(out);
     out.clear();
     return false;
 }
 
 bool derivePbkdf2BitsNative(std::span<const uint8_t> material, std::span<const uint8_t> salt, uint32_t iterations,
-    WebCryptoHash hash, size_t length_bits, WTF::Vector<uint8_t>& out)
+    WebCryptoHash hash, size_t length_bits, SecretBytes& out)
 {
     if (!iterations)
         return false;
@@ -31,18 +30,17 @@ bool derivePbkdf2BitsNative(std::span<const uint8_t> material, std::span<const u
     auto* evp = hashEvp(hashSpec(hash));
     if (!evp)
         return false;
-    if (!out.tryReserveInitialCapacity(byte_length))
+    if (!out.tryGrow(byte_length))
         return false;
-    out.grow(byte_length);
     if (PKCS5_PBKDF2_HMAC(reinterpret_cast<const char*>(material.data()), material.size(), salt.data(), salt.size(),
-            iterations, evp, out.size(), out.mutableSpan().data())
+            iterations, evp, out.size(), out.data())
         != 1)
         return clearOutputAndFail(out);
     return true;
 }
 
 bool deriveHkdfBitsNative(std::span<const uint8_t> material, std::span<const uint8_t> salt,
-    std::span<const uint8_t> info, WebCryptoHash hash, size_t length_bits, WTF::Vector<uint8_t>& out)
+    std::span<const uint8_t> info, WebCryptoHash hash, size_t length_bits, SecretBytes& out)
 {
     // As in derivePbkdf2BitsNative, a length that is not a multiple of 8 fails instead of truncating.
     if (length_bits % 8)
@@ -53,11 +51,10 @@ bool deriveHkdfBitsNative(std::span<const uint8_t> material, std::span<const uin
     auto* evp = hashEvp(hashSpec(hash));
     if (!evp)
         return false;
-    if (!out.tryReserveInitialCapacity(byte_length))
+    if (!out.tryGrow(byte_length))
         return false;
-    out.grow(byte_length);
-    if (HKDF(out.mutableSpan().data(), out.size(), evp, material.data(), material.size(), salt.data(), salt.size(),
-            info.data(), info.size())
+    if (HKDF(out.data(), out.size(), evp, material.data(), material.size(), salt.data(), salt.size(), info.data(),
+            info.size())
         != 1)
         return clearOutputAndFail(out);
     return true;

@@ -1,5 +1,5 @@
-//! Helpers the benches share: knob lists read from the environment,
-//! nearest-rank percentiles and CLOCK_MONOTONIC deadlines. Every function
+//! Helpers the benches share: knob lists and on/off switches read from the
+//! environment, nearest-rank percentiles and CLOCK_MONOTONIC deadlines. Every function
 //! runs on its caller's thread and keeps no state.
 
 const std = @import("std");
@@ -34,6 +34,25 @@ pub fn parseCommaSeparatedUsizeList(
     if (values.items.len == 0)
         return error.InvalidUsizeList;
     return values.toOwnedSlice(allocator);
+}
+
+/// Reads `env_name` as an on/off switch: unset reads as off, and a set value
+/// goes through `parseSwitch`, so a misspelled switch stops the bench instead
+/// of reading as off.
+pub fn envSwitch(env_name: []const u8) error{InvalidEnvironmentSwitch}!bool {
+    const raw = std.posix.getenv(env_name) orelse return false;
+    return parseSwitch(raw);
+}
+
+/// "1" is on, and "0" or the empty string is off, as the test runner reads
+/// COLLO_TEST_STRICT_SKIPS (`skip_allowlist.zig:parseStrictness`). Anything
+/// else fails with `error.InvalidEnvironmentSwitch`.
+pub fn parseSwitch(raw: []const u8) error{InvalidEnvironmentSwitch}!bool {
+    if (std.mem.eql(u8, raw, "1"))
+        return true;
+    if (raw.len == 0 or std.mem.eql(u8, raw, "0"))
+        return false;
+    return error.InvalidEnvironmentSwitch;
 }
 
 /// The nearest-rank `percentile` (1 to 100) of `sorted_values`, which the

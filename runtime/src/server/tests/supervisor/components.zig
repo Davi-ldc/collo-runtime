@@ -45,15 +45,13 @@ test "a record matches only the attempts of the worker whose ring held it" {
         .worker_id = 4,
         .worker_generation = 5,
     };
-    // The record names the identity's worker, but another worker's ring held
-    // it; the key comes from the ring, never from the record.
+    // The record names the identity's request, but another worker's ring
+    // held it; the worker key comes from the ring, never from the record.
     const record = std.mem.zeroInit(worker_shared_page.CompletedRecord, .{
         .request_id = 7,
         .request_lane_id = 1,
         .request_slot = 2,
         .request_generation = 3,
-        .worker_id = 4,
-        .worker_generation = 5,
     });
     const other_worker = lifecycle.WorkerKey{ .worker_id = 8, .worker_generation = 1 };
     try std.testing.expect(!supervision.accounting.usage.recordMatchesLifecycle(record, other_worker, identity));
@@ -152,7 +150,8 @@ test "boot fault drain stops at the per-drain packet cap and resumes on the next
         .trace_write_fd = null,
         .next_fork_job_id = 1,
     };
-    // The drain sends no WorkerInit, so the launch's wake set is never read.
+    // The drain sends no WorkerInit, so the launch's wake set and tmpfs mount
+    // point are never read.
     const no_wake_set: ipc.egress_shared.WakeSet = .{};
     var machine = host.launch.Machine{
         .allocator = allocator,
@@ -160,6 +159,7 @@ test "boot fault drain stops at the per-drain packet cap and resumes on the next
         .memory_limit_bytes = 0,
         .options = .{
             .egress = .{ .detached = &no_wake_set },
+            .tmp_mount_point_fd = -1,
             .fault_serve = .{ .serve = .{ .serve = answerNotFound } },
         },
         .fs_fault_server_fd = server_end,

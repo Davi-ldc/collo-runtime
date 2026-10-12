@@ -22,9 +22,8 @@
 
 namespace Collo::HostFunctions::WebCrypto {
 
-static bool clearOutputAndFail(WTF::Vector<uint8_t>& out)
+static bool clearOutputAndFail(SecretBytes& out)
 {
-    secureZeroVector(out);
     out.clear();
     return false;
 }
@@ -240,8 +239,8 @@ WTF::ASCIILiteral aesJwkAlgorithm(CryptoKeyAlgorithm algorithm, size_t byte_leng
     RELEASE_ASSERT_NOT_REACHED();
 }
 
-bool aesGcmEncrypt(std::span<const uint8_t> key, const AesGcmParams& params, std::span<const uint8_t> plaintext,
-    WTF::Vector<uint8_t>& out)
+bool aesGcmEncrypt(
+    std::span<const uint8_t> key, const AesGcmParams& params, std::span<const uint8_t> plaintext, SecretBytes& out)
 {
     const EVP_CIPHER* cipher = aesCipherForKey(CryptoKeyAlgorithm::AesGcm, key.size());
     if (!cipher)
@@ -257,9 +256,8 @@ bool aesGcmEncrypt(std::span<const uint8_t> key, const AesGcmParams& params, std
     if (!isValidCipherInputBytes(plaintext.size()) || !isValidCipherInputBytes(additional_data.size()))
         return false;
 
-    if (!out.tryReserveInitialCapacity(plaintext.size() + params.tag_bytes))
+    if (!out.tryGrow(plaintext.size() + params.tag_bytes))
         return false;
-    out.grow(plaintext.size() + params.tag_bytes);
     auto fail = [&]() -> bool { return clearOutputAndFail(out); };
 
     bssl::ScopedEVP_CIPHER_CTX ctx;
@@ -296,7 +294,7 @@ bool aesGcmEncrypt(std::span<const uint8_t> key, const AesGcmParams& params, std
 }
 
 bool aesGcmDecrypt(std::span<const uint8_t> key, const AesGcmParams& params,
-    std::span<const uint8_t> ciphertext_and_tag, WTF::Vector<uint8_t>& out)
+    std::span<const uint8_t> ciphertext_and_tag, SecretBytes& out)
 {
     const EVP_CIPHER* cipher = aesCipherForKey(CryptoKeyAlgorithm::AesGcm, key.size());
     if (!cipher || ciphertext_and_tag.size() < params.tag_bytes)
@@ -314,9 +312,8 @@ bool aesGcmDecrypt(std::span<const uint8_t> key, const AesGcmParams& params,
     auto ciphertext = ciphertext_and_tag.subspan(0, ciphertext_len);
     auto tag = ciphertext_and_tag.subspan(ciphertext_len, params.tag_bytes);
 
-    if (!out.tryReserveInitialCapacity(ciphertext_len))
+    if (!out.tryGrow(ciphertext_len))
         return false;
-    out.grow(ciphertext_len);
     auto fail = [&]() -> bool { return clearOutputAndFail(out); };
 
     bssl::ScopedEVP_CIPHER_CTX ctx;
@@ -352,8 +349,8 @@ bool aesGcmDecrypt(std::span<const uint8_t> key, const AesGcmParams& params,
     return true;
 }
 
-bool aesCbcEncrypt(std::span<const uint8_t> key, const AesCbcParams& params, std::span<const uint8_t> plaintext,
-    WTF::Vector<uint8_t>& out)
+bool aesCbcEncrypt(
+    std::span<const uint8_t> key, const AesCbcParams& params, std::span<const uint8_t> plaintext, SecretBytes& out)
 {
     const EVP_CIPHER* cipher = aesCipherForKey(CryptoKeyAlgorithm::AesCbc, key.size());
     auto iv = params.iv.span();
@@ -362,9 +359,8 @@ bool aesCbcEncrypt(std::span<const uint8_t> key, const AesCbcParams& params, std
     if (!isValidCipherInputBytes(plaintext.size()))
         return false;
 
-    if (!out.tryReserveInitialCapacity(plaintext.size() + 16))
+    if (!out.tryGrow(plaintext.size() + 16))
         return false;
-    out.grow(plaintext.size() + 16);
     auto fail = [&]() -> bool { return clearOutputAndFail(out); };
 
     bssl::ScopedEVP_CIPHER_CTX ctx;
@@ -385,8 +381,8 @@ bool aesCbcEncrypt(std::span<const uint8_t> key, const AesCbcParams& params, std
     return true;
 }
 
-bool aesCbcDecrypt(std::span<const uint8_t> key, const AesCbcParams& params, std::span<const uint8_t> ciphertext,
-    WTF::Vector<uint8_t>& out)
+bool aesCbcDecrypt(
+    std::span<const uint8_t> key, const AesCbcParams& params, std::span<const uint8_t> ciphertext, SecretBytes& out)
 {
     const EVP_CIPHER* cipher = aesCipherForKey(CryptoKeyAlgorithm::AesCbc, key.size());
     auto iv = params.iv.span();
@@ -395,9 +391,8 @@ bool aesCbcDecrypt(std::span<const uint8_t> key, const AesCbcParams& params, std
     if (!isValidCipherInputBytes(ciphertext.size()))
         return false;
 
-    if (!out.tryReserveInitialCapacity(ciphertext.size()))
+    if (!out.tryGrow(ciphertext.size()))
         return false;
-    out.grow(ciphertext.size());
     auto fail = [&]() -> bool { return clearOutputAndFail(out); };
 
     bssl::ScopedEVP_CIPHER_CTX ctx;
@@ -422,15 +417,14 @@ bool aesCbcDecrypt(std::span<const uint8_t> key, const AesCbcParams& params, std
 // feedback bytes, and the ciphertext byte joins the feedback. shift_register holds that window at offset `shift`;
 // each new byte lands at 16 + shift, and after 16 of them the newer half moves to the front.
 static bool aesCfb8Transform(std::span<const uint8_t> key, const AesCfbParams& params, std::span<const uint8_t> input,
-    bool encrypt, WTF::Vector<uint8_t>& out)
+    bool encrypt, SecretBytes& out)
 {
     auto iv = params.iv.span();
     if (!isValidAesKeyLength(key.size()) || iv.size() != 16)
         return false;
 
-    if (!out.tryReserveInitialCapacity(input.size()))
+    if (!out.tryGrow(input.size()))
         return false;
-    out.grow(input.size());
     auto fail = [&]() -> bool { return clearOutputAndFail(out); };
 
     AES_KEY aes_key;
@@ -462,14 +456,14 @@ static bool aesCfb8Transform(std::span<const uint8_t> key, const AesCfbParams& p
     return true;
 }
 
-bool aesCfb8Encrypt(std::span<const uint8_t> key, const AesCfbParams& params, std::span<const uint8_t> plaintext,
-    WTF::Vector<uint8_t>& out)
+bool aesCfb8Encrypt(
+    std::span<const uint8_t> key, const AesCfbParams& params, std::span<const uint8_t> plaintext, SecretBytes& out)
 {
     return aesCfb8Transform(key, params, plaintext, true, out);
 }
 
-bool aesCfb8Decrypt(std::span<const uint8_t> key, const AesCfbParams& params, std::span<const uint8_t> ciphertext,
-    WTF::Vector<uint8_t>& out)
+bool aesCfb8Decrypt(
+    std::span<const uint8_t> key, const AesCfbParams& params, std::span<const uint8_t> ciphertext, SecretBytes& out)
 {
     return aesCfb8Transform(key, params, ciphertext, false, out);
 }
@@ -489,8 +483,8 @@ static void incrementAesCtrCounter(std::array<uint8_t, 16>& counter, uint8_t len
     }
 }
 
-static bool aesCtrTransformFullCounter(std::span<const uint8_t> key, std::span<const uint8_t> counter,
-    std::span<const uint8_t> input, WTF::Vector<uint8_t>& out)
+static bool aesCtrTransformFullCounter(
+    std::span<const uint8_t> key, std::span<const uint8_t> counter, std::span<const uint8_t> input, SecretBytes& out)
 {
     const EVP_CIPHER* cipher = aesCipherForKey(CryptoKeyAlgorithm::AesCtr, key.size());
     if (!cipher || counter.size() != 16)
@@ -500,9 +494,8 @@ static bool aesCtrTransformFullCounter(std::span<const uint8_t> key, std::span<c
     if (!isValidCipherInputBytes(input.size()))
         return false;
 
-    if (!out.tryReserveInitialCapacity(input.size()))
+    if (!out.tryGrow(input.size()))
         return false;
-    out.grow(input.size());
 
     auto fail = [&]() -> bool { return clearOutputAndFail(out); };
 
@@ -528,7 +521,7 @@ static bool aesCtrTransformFullCounter(std::span<const uint8_t> key, std::span<c
 }
 
 bool aesCtrTransform(
-    std::span<const uint8_t> key, const AesCtrParams& params, std::span<const uint8_t> input, WTF::Vector<uint8_t>& out)
+    std::span<const uint8_t> key, const AesCtrParams& params, std::span<const uint8_t> input, SecretBytes& out)
 {
     auto counter_span = params.counter.span();
     if (!isValidAesKeyLength(key.size()) || counter_span.size() != 16 || !params.length || params.length > 128)
@@ -542,9 +535,8 @@ bool aesCtrTransform(
     if (params.length == 128)
         return aesCtrTransformFullCounter(key, counter_span, input, out);
 
-    if (!out.tryReserveInitialCapacity(input.size()))
+    if (!out.tryGrow(input.size()))
         return false;
-    out.grow(input.size());
     auto fail = [&]() -> bool { return clearOutputAndFail(out); };
 
     AES_KEY aes_key;
@@ -570,15 +562,14 @@ bool aesCtrTransform(
     return true;
 }
 
-bool aesKwWrap(std::span<const uint8_t> key, std::span<const uint8_t> plaintext, WTF::Vector<uint8_t>& out)
+bool aesKwWrap(std::span<const uint8_t> key, std::span<const uint8_t> plaintext, SecretBytes& out)
 {
     if (!isValidAesKeyLength(key.size()) || plaintext.empty() || (plaintext.size() % 8)
         || plaintext.size() > static_cast<size_t>(std::numeric_limits<int>::max() - 8))
         return false;
 
-    if (!out.tryReserveInitialCapacity(plaintext.size() + 8))
+    if (!out.tryGrow(plaintext.size() + 8))
         return false;
-    out.grow(plaintext.size() + 8);
     auto fail = [&]() -> bool { return clearOutputAndFail(out); };
 
     AES_KEY aes_key;
@@ -594,15 +585,14 @@ bool aesKwWrap(std::span<const uint8_t> key, std::span<const uint8_t> plaintext,
     return true;
 }
 
-bool aesKwUnwrap(std::span<const uint8_t> key, std::span<const uint8_t> ciphertext, WTF::Vector<uint8_t>& out)
+bool aesKwUnwrap(std::span<const uint8_t> key, std::span<const uint8_t> ciphertext, SecretBytes& out)
 {
     if (!isValidAesKeyLength(key.size()) || ciphertext.size() < 16 || (ciphertext.size() % 8)
         || ciphertext.size() > static_cast<size_t>(std::numeric_limits<int>::max()))
         return false;
 
-    if (!out.tryReserveInitialCapacity(ciphertext.size() - 8))
+    if (!out.tryGrow(ciphertext.size() - 8))
         return false;
-    out.grow(ciphertext.size() - 8);
     auto fail = [&]() -> bool { return clearOutputAndFail(out); };
 
     AES_KEY aes_key;
@@ -618,7 +608,7 @@ bool aesKwUnwrap(std::span<const uint8_t> key, std::span<const uint8_t> cipherte
     return true;
 }
 
-bool digestBytes(const HashSpec& hash, std::span<const uint8_t> data, WTF::Vector<uint8_t>& out)
+bool digestBytes(const HashSpec& hash, std::span<const uint8_t> data, SecretBytes& out)
 {
     if (isSha3Hash(hash.id))
         return sha3DigestBytes(hash, data, out);
@@ -631,10 +621,7 @@ bool digestBytes(const HashSpec& hash, std::span<const uint8_t> data, WTF::Vecto
     if (EVP_Digest(data.data(), data.size(), digest.data(), &digest_len, evp, nullptr) != 1
         || digest_len != hash.digest_bytes)
         return false;
-    if (!out.tryReserveInitialCapacity(digest_len))
-        return false;
-    out.append(std::span<const uint8_t> { digest.data(), digest_len });
-    return true;
+    return out.tryAppend(std::span<const uint8_t> { digest.data(), digest_len });
 }
 
 } // namespace Collo::HostFunctions::WebCrypto

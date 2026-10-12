@@ -57,7 +57,6 @@ pub const EgressMeters = struct {
     billed_sent: u64 = 0,
     billed_received: u64 = 0,
     cost: u64 = 0,
-
 };
 
 pub const Body = struct {

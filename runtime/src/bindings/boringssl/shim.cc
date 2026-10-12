@@ -10,7 +10,8 @@
 //
 // An exported function reports failure through `collo_boringssl_last_error`, a buffer of the calling thread, so a
 // caller reads the message on the thread that got the failing status. Out-parameters are cleared once the arguments
-// pass validation, so a caller initializes its own. Private key bytes the shim copies live in BoringSSL's allocations,
+// pass validation, so a caller initializes its own, and a failed kTLS key export cleanses its out-parameter and every
+// intermediate key buffer before it returns. Private key bytes the shim copies live in BoringSSL's allocations,
 // which BoringSSL zeroes before freeing, except the stdio buffer a key read from a file passes through. A server
 // context keeps its key until `collo_boringssl_ctx_free`, and a failed generation cleanses the caller's key buffer.
 
@@ -1629,6 +1630,27 @@ extern "C" void collo_boringssl_client_shutdown_best_effort(struct collo_borings
     }
 }
 
+namespace {
+
+// Cleanses a buffer of secret bytes when the scope ends, so an early return cannot leave key material behind.
+class CleanseOnExit {
+public:
+    CleanseOnExit(void* bytes, size_t length)
+        : m_bytes(bytes)
+        , m_length(length)
+    {
+    }
+    ~CleanseOnExit() { OPENSSL_cleanse(m_bytes, m_length); }
+    CleanseOnExit(const CleanseOnExit&) = delete;
+    CleanseOnExit& operator=(const CleanseOnExit&) = delete;
+
+private:
+    void* m_bytes;
+    size_t m_length;
+};
+
+} // namespace
+
 static int collo_boringssl_export_tls12_key_material(struct collo_boringssl_conn* conn, uint16_t tls_version,
     uint32_t cipher_id, struct collo_boringssl_ktls_key_material* out)
 {
@@ -1647,6 +1669,8 @@ static int collo_boringssl_export_tls12_key_material(struct collo_boringssl_conn
     // implicit nonces (RFC 5288 §3). This end is the server, so the client's half is what it reads.
     uint8_t key_block[72];
     memset(key_block, 0, sizeof(key_block));
+    // A failed derivation may leave part of the block written.
+    CleanseOnExit cleanse_key_block(key_block, sizeof(key_block));
     if (SSL_generate_key_block(conn->ssl, key_block, key_block_len) != 1) {
         return collo_boringssl_fail("export TLS 1.2 key block");
     }
@@ -1675,8 +1699,6 @@ static int collo_boringssl_export_tls12_key_material(struct collo_boringssl_conn
     // `ktlsKeyMaterialToInitialState` in `server/tls/root.zig` maps.
     memcpy(out->rx_iv, read_seq, sizeof(read_seq));
     memcpy(out->tx_iv, write_seq, sizeof(write_seq));
-
-    OPENSSL_cleanse(key_block, sizeof(key_block));
     return 0;
 }
 
@@ -1729,10 +1751,14 @@ extern "C" int collo_boringssl_export_ktls_key_material(
     }
     uint32_t cipher_id = SSL_CIPHER_get_protocol_id(cipher);
 
-    if (tls_version == 0x0303) {
-        return collo_boringssl_export_tls12_key_material(conn, tls_version, cipher_id, out);
+    const int status = tls_version == 0x0303
+        ? collo_boringssl_export_tls12_key_material(conn, tls_version, cipher_id, out)
+        : collo_boringssl_export_tls13_key_material(conn, tls_version, cipher_id, out);
+    // A failure hands back no key material, whatever the export had written before it failed.
+    if (status != 0) {
+        OPENSSL_cleanse(out, sizeof(*out));
     }
-    return collo_boringssl_export_tls13_key_material(conn, tls_version, cipher_id, out);
+    return status;
 }
 
 extern "C" void collo_boringssl_zeroize_key_material(struct collo_boringssl_ktls_key_material* material)

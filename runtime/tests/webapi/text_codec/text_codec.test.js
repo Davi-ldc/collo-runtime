@@ -467,6 +467,56 @@ describe("TextDecoder", () => {
     assert.equal(new TextDecoder("koi8-u").decode(new Uint8Array([0xf0, 0xd2, 0xc9, 0xd7, 0xa6, 0xd4])), "Привіт");
   });
 
+  test("single-byte encodings decode every byte through their own index", () => {
+    // An even-length input that is also well-formed UTF-16LE must not decode as UTF-16LE: "Hi" is 48 69.
+    for (const label of [
+      "koi8-r", "windows-1250", "windows-1251", "windows-1252", "latin1", "ascii", "us-ascii", "iso-8859-1",
+      "windows-1254", "iso-8859-9", "windows-1256", "windows-1257", "windows-1258", "ibm866", "iso-8859-2",
+      "iso-8859-16", "macintosh", "x-mac-cyrillic",
+    ]) {
+      assert.equal(new TextDecoder(label).decode(Uint8Array.of(0x48, 0x69)), "Hi", label);
+    }
+
+    // Single-byte encodings have no BOM: FF FE are two characters, not a UTF-16LE byte order mark.
+    assert.equal(new TextDecoder("windows-1252").decode(Uint8Array.of(0xff, 0xfe)), "ÿþ");
+    assert.equal(new TextDecoder("windows-1252").decode(Uint8Array.of(0xef, 0xbb, 0xbf)), "ï»¿");
+
+    // One byte per index, each read from the Encoding Standard's index file for that encoding.
+    const samples = [
+      ["windows-1252", [0x80, 0x81, 0x8d, 0x9f], "€\u0081\u008dŸ"],
+      ["koi8-r", [0xc1, 0xe1], "аА"],
+      ["windows-1250", [0x8c, 0xa5], "ŚĄ"],
+      ["windows-1251", [0xc0, 0x80], "АЂ"],
+      ["windows-1256", [0x81, 0xff], "پے"],
+      ["windows-1258", [0xcc, 0xfe], "̀₫"],
+      ["iso-8859-2", [0xa1], "Ą"],
+      ["iso-8859-16", [0xa4, 0xaa], "€Ș"],
+      ["macintosh", [0x80, 0xf0], "Ä"],
+      ["x-mac-cyrillic", [0x80, 0xff], "А€"],
+    ];
+    for (const [label, input, expected] of samples) {
+      assert.equal(new TextDecoder(label).decode(Uint8Array.from(input)), expected, label);
+    }
+
+    // A byte the index leaves unmapped is U+FFFD, or a TypeError in fatal mode.
+    assert.equal(new TextDecoder("windows-1257").decode(Uint8Array.of(0x41, 0xa1)), "A�");
+    assert.equal(new TextDecoder("iso-8859-8").decode(Uint8Array.of(0xa1)), "�");
+    assert.throws(() => new TextDecoder("windows-1257", { fatal: true }).decode(Uint8Array.of(0xa1)), TypeError);
+    assert.equal(new TextDecoder("windows-1257", { fatal: true }).decode(Uint8Array.of(0xa2)), "¢");
+
+    // A streaming decode carries no state, so splitting the input anywhere gives the whole-buffer result.
+    const decoder = new TextDecoder("windows-1251");
+    assert.equal(decoder.decode(Uint8Array.of(0xcf), { stream: true }) + decoder.decode(Uint8Array.of(0xf0)), "Пр");
+  });
+
+  test("UTF-8 input longer than the string limit throws instead of ending the worker", () => {
+    // 32769 wasm pages are 2 GiB and 64 KiB, past WTF::String::MaxLength. The memory is committed lazily and the
+    // decoder refuses the length before it reads a byte.
+    const huge = new Uint8Array(new WebAssembly.Memory({ initial: 32769 }).buffer);
+    assert.throws(() => new TextDecoder().decode(huge), Error);
+    assert.throws(() => new TextDecoder("utf-8", { fatal: true }).decode(huge), Error);
+  });
+
   test("CJK encodings decode Bun fixture bytes", () => {
     assert.equal(new TextDecoder("shift_jis").decode(new Uint8Array([0x82, 0xb1, 0x82, 0xf1, 0x82, 0xc9, 0x82, 0xbf, 0x82, 0xcd])), "こんにちは");
     assert.equal(new TextDecoder("euc-jp").decode(new Uint8Array([0xc6, 0xfc, 0xcb, 0xdc, 0xb8, 0xec])), "日本語");
@@ -484,8 +534,10 @@ describe("TextDecoder", () => {
 
   test("UTF-16 and x-user-defined edge behavior", () => {
     assert.equal(new TextDecoder("utf-16").decode(new Uint8Array([0x41, 0x00])), "A");
-    assert.equal(new TextDecoder("utf-16").decode(new Uint8Array([0xfe, 0xff, 0x00, 0x41])), "A");
-    assert.equal(new TextDecoder("utf-16", { ignoreBOM: true }).decode(new Uint8Array([0xfe, 0xff, 0x00, 0x41])), "\ufeffA");
+    // "utf-16" is UTF-16LE with no BOM sniffing, so FE FF is U+FFFE and 00 41 is U+4100.
+    assert.equal(new TextDecoder("utf-16").decode(new Uint8Array([0xfe, 0xff, 0x00, 0x41])), "\ufffe\u4100");
+    assert.equal(new TextDecoder("utf-16", { ignoreBOM: true }).decode(new Uint8Array([0xfe, 0xff, 0x00, 0x41])), "\ufffe\u4100");
+    assert.equal(new TextDecoder("utf-16").decode(new Uint8Array([0xff, 0xfe, 0x41, 0x00])), "A");
     assert.equal(new TextDecoder("utf-16le").decode(new Uint8Array([0xff, 0xfe, 0x61, 0x00, 0x62, 0x00])), "ab");
     assert.equal(new TextDecoder("utf-16le", { ignoreBOM: true }).decode(new Uint8Array([0xff, 0xfe, 0x61, 0x00])), "\ufeffa");
     assert.equal(new TextDecoder("utf-16be").decode(new Uint8Array([0xfe, 0xff, 0x00, 0x61, 0x00, 0x62])), "ab");
@@ -510,6 +562,12 @@ describe("TextDecoder", () => {
     assert.equal(new TextDecoder("utf-16le").decode(big), "A".repeat(1024));
     const backing = new Uint8Array([0x00, 0x61, 0x00, 0x62, 0x00]); // misaligned payload at offset 1
     assert.equal(new TextDecoder("utf-16le").decode(new Uint8Array(backing.buffer, 1, 4)), "ab");
+    // Validation must read aligned units; a sanitizer build with -fsanitize=alignment traps on a misaligned read.
+    assert.equal(new TextDecoder("utf-16le").decode(new Uint8Array(new ArrayBuffer(4), 1, 2)), "\u0000");
+    const oddSurrogate = new Uint8Array([0x00, 0x00, 0xd8, 0x41, 0x00]); // lone surrogate at offset 1
+    assert.equal(new TextDecoder("utf-16le").decode(new Uint8Array(oddSurrogate.buffer, 1, 4)), "�A");
+    // A BOM ahead of input the fast path declines is still dropped once, by the ICU path.
+    assert.equal(new TextDecoder("utf-16le").decode(new Uint8Array([0xff, 0xfe, 0x00, 0xd8, 0x41, 0x00])), "�A");
 
     const streaming = new TextDecoder("utf-16le");
     assert.equal(streaming.decode(new Uint8Array([0x61]), { stream: true }), "");
@@ -521,9 +579,9 @@ describe("TextDecoder", () => {
     assert.throws(() => fatalUtf16AfterStreaming.decode(new Uint8Array([0x00])), TypeError);
     assert.equal(fatalUtf16AfterStreaming.decode(new Uint8Array([0xff, 0xfe, 0x42, 0x00])), "B");
 
-    const sniffing = new TextDecoder("utf-16");
-    assert.equal(sniffing.decode(new Uint8Array([0xfe]), { stream: true }), "");
-    assert.equal(sniffing.decode(new Uint8Array([0xff, 0x00, 0x62])), "b");
+    const littleEndian = new TextDecoder("utf-16");
+    assert.equal(littleEndian.decode(new Uint8Array([0xfe]), { stream: true }), "");
+    assert.equal(littleEndian.decode(new Uint8Array([0xff, 0x00, 0x62])), "￾戀");
 
     assert.equal(new TextDecoder("x-user-defined").decode(new Uint8Array([0x41, 0x80, 0x81, 0xff])), "A\uf780\uf781\uf7ff");
     // The replacement encoding is not constructible: the TextDecoder

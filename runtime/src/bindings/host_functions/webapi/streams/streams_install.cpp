@@ -250,9 +250,12 @@ namespace {
         RETURN_IF_EXCEPTION(scope, {});
         auto* destination = requireWritableStream(global_object, scope, call_frame->argument(0));
         RETURN_IF_EXCEPTION(scope, {});
-        return startReadablePipeTo(global_object, scope, source, destination, call_frame->argument(1), true);
+        return startReadablePipeTo(
+            global_object, scope, source, destination, call_frame->argument(1), PipeToErrors::Reject);
     }
 
+    // Web IDL converts the ReadableWritablePair members in lexicographic order, readable before writable, then the
+    // options; a locked source or destination throws, unlike pipeTo, whose promise rejects.
     JSC_DEFINE_HOST_FUNCTION(
         readableStreamPipeThrough, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
     {
@@ -266,27 +269,22 @@ namespace {
             return {};
         }
         auto* transform_object = transform.getObject();
-        JSValue writable_value
-            = transform_object->getIfPropertyExists(global_object, JSC::Identifier::fromString(vm, "writable"_s));
-        RETURN_IF_EXCEPTION(scope, {});
         JSValue readable_value
             = transform_object->getIfPropertyExists(global_object, JSC::Identifier::fromString(vm, "readable"_s));
         RETURN_IF_EXCEPTION(scope, {});
-        auto* writable = requireWritableStream(global_object, scope, writable_value);
-        RETURN_IF_EXCEPTION(scope, {});
         auto* readable = requireReadableStream(global_object, scope, readable_value);
         RETURN_IF_EXCEPTION(scope, {});
-        JSValue pipe_promise = JSValue::decode(
-            startReadablePipeTo(global_object, scope, source, writable, call_frame->argument(1), false));
+        JSValue writable_value
+            = transform_object->getIfPropertyExists(global_object, JSC::Identifier::fromString(vm, "writable"_s));
         RETURN_IF_EXCEPTION(scope, {});
-        // pipeThrough marks the pipe's promise as handled; this no-op rejection
-        // handler does that, so a failed pipe reports no unhandled rejection.
-        if (auto* promise = dynamicDowncast<JSC::JSPromise>(pipe_promise)) {
-            auto* rejected = JSC::JSFunction::create(vm, global_object, 1, "ReadableStream pipeThrough rejected"_s,
-                resolveUndefinedCallback, JSC::ImplementationVisibility::Public);
-            promise->performPromiseThen(vm, global_object, JSC::jsUndefined(), rejected, JSC::jsUndefined());
-            RETURN_IF_EXCEPTION(scope, {});
-        }
+        auto* writable = requireWritableStream(global_object, scope, writable_value);
+        RETURN_IF_EXCEPTION(scope, {});
+        JSValue pipe_promise = JSValue::decode(startReadablePipeTo(
+            global_object, scope, source, writable, call_frame->argument(1), PipeToErrors::Throw));
+        RETURN_IF_EXCEPTION(scope, {});
+        // A failed pipe reports no unhandled rejection.
+        if (auto* promise = dynamicDowncast<JSC::JSPromise>(pipe_promise))
+            promise->markAsHandled();
         return JSValue::encode(readable);
     }
 
@@ -351,7 +349,9 @@ namespace {
             startDefaultTeePump(global_object, tee_state);
         }
 
+        RETURN_IF_EXCEPTION(scope, {});
         auto* array = JSC::constructEmptyArray(global_object, nullptr, 2);
+        RETURN_IF_EXCEPTION(scope, {});
         array->putDirectIndex(global_object, 0, branch_a);
         array->putDirectIndex(global_object, 1, branch_b);
         return JSValue::encode(array);
@@ -757,11 +757,6 @@ JSC::JSObject* createReadableStreamFromBytes(
 
 void installWebApiReadableStream(Collo::GlobalObject* global_object, JSC::VM& vm)
 {
-    // Loads zlib and Brotli during installation, which for a worker's VM runs
-    // in the zygote, so no worker needs dlopen (sharedZlibLibrary in
-    // compression_stream.cpp).
-    preloadCompressionLibraries();
-
     auto* stream_prototype = JSC::constructEmptyObject(global_object);
     putWebApiFunction(global_object, stream_prototype, vm, "getReader"_s, 0, readableStreamGetReader,
         static_cast<unsigned>(JSC::PropertyAttribute::None));

@@ -1859,4 +1859,85 @@ describe("crypto", () => {
       crypto.subtle.decrypt({ name: "AES-GCM", iv, additionalData: new TextEncoder().encode("AAD") }, key, ciphertext),
       "OperationError");
   });
+
+  test("JWK base64url members decode alike in importKey and unwrapKey", async () => {
+    // Both front ends decode a secret member straight into its key buffer, and accept what WTF's base64url decoder
+    // accepts: the URL alphabet, then nothing but '=' padding of any count. An HMAC key takes any length, so each
+    // rejection here comes from the decoder itself.
+    const kekBytes = new Uint8Array(16).fill(4);
+    const iv = new Uint8Array(12).fill(6);
+    const encryptKey = await crypto.subtle.importKey("raw", kekBytes, { name: "AES-GCM" }, false, ["encrypt"]);
+    const unwrapKeyHandle = await crypto.subtle.importKey("raw", kekBytes, { name: "AES-GCM" }, false, ["unwrapKey"]);
+    const algorithm = { name: "HMAC", hash: "SHA-256" };
+    const jwkFor = k => ({ kty: "oct", k, ext: true, key_ops: ["sign"] });
+    // Handles each result at once, so a rejection waiting for the other front end is never unhandled.
+    const outcome = promise => promise.then(key => ({ key }), error => ({ error }));
+
+    async function importBoth(k) {
+      const imported = outcome(crypto.subtle.importKey("jwk", jwkFor(k), algorithm, true, ["sign"]));
+      const json = new TextEncoder().encode(JSON.stringify(jwkFor(k)));
+      const ciphertext = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, encryptKey, json);
+      const unwrapped = outcome(crypto.subtle.unwrapKey("jwk", ciphertext, unwrapKeyHandle, { name: "AES-GCM", iv },
+        algorithm, true, ["sign"]));
+      return Promise.all([imported, unwrapped]);
+    }
+
+    const accepted = [
+      ["AAECAwQFBgcICQoLDA0ODw", "000102030405060708090a0b0c0d0e0f"],
+      ["AAECAwQFBgcICQoLDA0ODw==", "000102030405060708090a0b0c0d0e0f"],
+      ["AAECAwQFBgcICQoLDA0ODw=", "000102030405060708090a0b0c0d0e0f"],
+      ["-_-_", "fbffbf"],
+      // The low bits of the last character that make up no whole byte are ignored.
+      ["AB", "00"],
+    ];
+    for (const [k, expected] of accepted) {
+      for (const result of await importBoth(k)) {
+        assert.equal(result.error, undefined, `k ${k} should import`);
+        assert.equal(hex(await crypto.subtle.exportKey("raw", result.key)), expected, `k ${k}`);
+      }
+    }
+
+    const rejected = [
+      "AAECAwQFBgcICQoLDA0ODw+",
+      "AAECAwQFBgcICQoLDA0O/w",
+      "AAECAwQFBgcI CQoLDA0ODw",
+      "=AAECAwQFBgcICQoLDA0ODw",
+      "AAECAwQFBgcICQoLDA0O=Dw",
+      // 21 characters leave one that encodes no whole byte.
+      "AAECAwQFBgcICQoLDA0OD",
+      "==",
+      "",
+    ];
+    for (const k of rejected) {
+      for (const result of await importBoth(k)) {
+        assert(result.error, `k ${k} should be rejected`);
+        assert.equal(result.error.name, "DataError", `k ${k}`);
+      }
+    }
+  });
+
+  test("a wrapped RSA private JWK carries exactly the members exportKey returns", async () => {
+    // wrapKey measures the JSON of a private key before writing it, so the text lands in one buffer of its exact
+    // length; the decrypted text must parse to the same JWK exportKey builds, CRT members included.
+    const pair = await crypto.subtle.generateKey(
+      { name: "RSA-PSS", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" },
+      true,
+      ["sign", "verify"]);
+    const kek = await crypto.subtle.importKey("raw", new Uint8Array(32).fill(8), { name: "AES-GCM" }, false,
+      ["wrapKey", "unwrapKey", "decrypt"]);
+    const iv = new Uint8Array(12).fill(2);
+
+    const wrapped = await crypto.subtle.wrapKey("jwk", pair.privateKey, kek, { name: "AES-GCM", iv });
+    const text = new TextDecoder().decode(await crypto.subtle.decrypt({ name: "AES-GCM", iv }, kek, wrapped));
+    const exported = await crypto.subtle.exportKey("jwk", pair.privateKey);
+    assert.deepEqual(JSON.parse(text), exported);
+    for (const member of ["d", "p", "q", "dp", "dq", "qi"])
+      assert.equal(typeof exported[member], "string", `member ${member}`);
+
+    const unwrapped = await crypto.subtle.unwrapKey("jwk", wrapped, kek, { name: "AES-GCM", iv },
+      { name: "RSA-PSS", hash: "SHA-256" }, true, ["sign"]);
+    const data = new TextEncoder().encode("wrapped key");
+    const signature = await crypto.subtle.sign({ name: "RSA-PSS", saltLength: 32 }, unwrapped, data);
+    assert.equal(await crypto.subtle.verify({ name: "RSA-PSS", saltLength: 32 }, pair.publicKey, signature, data), true);
+  });
 });

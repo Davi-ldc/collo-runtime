@@ -33,13 +33,14 @@ JSC::JSValue domExceptionValue(JSC::JSGlobalObject*, DOMExceptionCode, WTF::Stri
 JSC::EncodedJSValue rejectedDOMException(JSC::JSGlobalObject*, DOMExceptionCode, WTF::String message = {});
 
 // Moves the pending exception of `scope` into `out_error` and returns true, or returns false when nothing is pending.
-// A termination stays pending so the VM keeps unwinding.
+// A termination stays pending so the VM keeps unwinding, and every settlement and dispatch the caller attempts
+// afterwards refuses while it is.
 template <typename Scope> bool takePendingException(Scope& scope, JSC::JSValue& out_error)
 {
     if (!scope.exception())
         return false;
     out_error = scope.exception()->value();
-    scope.clearExceptionExceptTermination();
+    (void)scope.clearExceptionExceptTermination();
     return true;
 }
 

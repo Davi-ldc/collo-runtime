@@ -7,10 +7,9 @@
 //! backpressure), `upload_flow.zig` (pooled request bodies), `shard_flow.zig` (shard collection
 //! and supervision) and `body_release_flow.zig` (body-pool releases).
 //!
-//! Boot order is fixed. The sizing plan is computed and the decoder libraries load before the
-//! sandbox hides /proc and every library file; the trust store loads before any engine thread
-//! exists; the shards' threads and the readiness ring exist before seccomp, which forbids
-//! creating either; and gateway-ready is the last step.
+//! Boot order is fixed. The sizing plan is computed before the sandbox hides /proc; the trust
+//! store loads before any engine thread exists; the shards' threads and the readiness ring exist
+//! before seccomp, which forbids creating either; and gateway-ready is the last step.
 //!
 //! Dependencies run one way: the loop routes worker commands to shards, a shard owns an engine,
 //! and only the engine calls the outbound transport. The gateway holds the network capability,
@@ -24,9 +23,11 @@
 const std = @import("std");
 const egress_client = @import("collo_egress_client");
 const ipc = @import("collo_ipc");
+const os_process = @import("collo_os").process;
 
 const active_fetch = @import("../active_fetch.zig");
 const control = @import("../control.zig");
+const counting_allocator = @import("../counting_allocator.zig");
 const engine_mod = @import("../engine.zig");
 const limit_tracker = @import("../limit_tracker.zig");
 const policy_mod = @import("../policy.zig");
@@ -50,13 +51,10 @@ const PendingControlPackets = control_flow.PendingControlPackets;
 /// (`launch.zig`), and runs its loop until the server shuts it down. The gateway owns
 /// `control_fd` from the call on and closes it when it stops.
 pub fn run(allocator: std.mem.Allocator, control_fd: std.posix.fd_t) !void {
-    // The plan reads the cgroup's CPU quota through /proc, which the sandbox hides, and the
-    // server computes the same plan from the same environment (`sizing.zig`).
+    // The plan reads the cgroup's CPU quota and `vm.max_map_count` through /proc, which the
+    // sandbox hides, and the sandbox applies its limits (`sizing.zig`).
     const plan = try sizing.Plan.compute();
-    // The decoders' libraries load before the sandbox, whose root holds no library files
-    // (`sandbox.zig`); a coding whose library does not load here is never advertised or decoded.
-    warnMissingDecoders(egress_client.decompress.load());
-    try sandbox.applyProcessBaseline();
+    try sandbox.applyProcessBaseline(plan);
     // The trust store loads now, before any engine thread exists and before seccomp, so no
     // verified fetch reads the filesystem and the first one does not pay for the load.
     try egress_client.tls.preloadVerifiedContext();
@@ -65,18 +63,7 @@ pub fn run(allocator: std.mem.Allocator, control_fd: std.posix.fd_t) !void {
     try gateway.run();
 }
 
-/// A gateway without zlib or the brotli decoder still boots: it advertises only the codings it
-/// decodes (`decompress.defaultAcceptEncoding`), and a response in another coding fails its fetch
-/// with `error.UnsupportedCompressionMethod`.
-fn warnMissingDecoders(support: egress_client.decompress.Support) void {
-    if (!support.zlib) {
-        std.log.warn("egress gateway: zlib did not load; fetches advertise only the identity coding", .{});
-    } else if (!support.brotli) {
-        std.log.warn("egress gateway: the brotli decoder did not load; fetches do not advertise br", .{});
-    }
-}
-
-const Gateway = struct {
+pub const Gateway = struct {
     allocator: std.mem.Allocator,
     control_fd: std.posix.fd_t,
     workers: worker_registry.Registry = .{},
@@ -84,11 +71,13 @@ const Gateway = struct {
     limits: limit_tracker.Tracker = .{},
     router: router_mod.Router = .{},
     completed_fetches: std.array_list.Aligned(active_fetch.WorkerScopedFetch, null) = .empty,
-    max_workers: usize,
+    /// Sessions the gateway holds at once (`sizing.Plan.sessions_max`); an attach past it is
+    /// refused.
+    max_sessions: usize,
     /// The limits every fetch runs under, `policy.production`.
     policy: policy_mod.Policy,
-    /// The token key, the network policy table and each entry's isolation id, which only the
-    /// server's hello writes (`control_flow.zig`).
+    /// The token key, the decoded network policies and each policy's isolation id, which only
+    /// the server's hello writes (`control_flow.zig`).
     hello: control_flow.HelloState = .{},
     scratch: []u8,
     /// Scratch for decoding worker commands, used only on the loop thread. It lives on the heap:
@@ -98,6 +87,11 @@ const Gateway = struct {
     pending_control_packets: PendingControlPackets = .{},
     /// Admitted body-pooled fetches whose request bodies are still arriving (`upload_flow.zig`).
     pending_uploads: upload_flow.PendingUploads = .{},
+    /// The allocator of every pooled upload's assembly buffer, budgeted at
+    /// `supervisor_limits.upload_memory`. Tasks on engine threads copy its `std.mem.Allocator`
+    /// and free through it, so the cell lives on the heap and never moves, and it outlives the
+    /// shards whose tasks hold its buffers.
+    upload_memory: *counting_allocator.CountingAllocator,
     /// True while a shard-ready collection pass runs, so that completion-eventfd writes wait
     /// for the end of the pass and each worker gets one instead of one per packet.
     coalesce_completion_notifies: bool = false,
@@ -128,6 +122,7 @@ const Gateway = struct {
     pub const redispatchReplayFetch = ShardFlow.redispatchReplayFetch;
 
     pub const registerPendingUpload = UploadFlow.registerPendingUpload;
+    pub const expirePendingUploads = UploadFlow.expirePendingUploads;
     pub const handleUploadChunkBatch = UploadFlow.handleUploadChunkBatch;
     pub const applyUploadChunk = UploadFlow.applyUploadChunk;
     pub const submitAssembledUpload = UploadFlow.submitAssembledUpload;
@@ -164,7 +159,10 @@ const Gateway = struct {
     pub const incrementSecurityCellFetchCount = WorkerFlow.incrementSecurityCellFetchCount;
     pub const decrementSecurityCellFetchCount = WorkerFlow.decrementSecurityCellFetchCount;
 
-    fn init(
+    /// Builds the gateway's loop state and its shards on `control_fd`, which it owns from the call
+    /// on and closes on failure. Fails with `error.OutOfMemory` or what the shards' setup fails
+    /// with, freeing everything it took.
+    pub fn init(
         allocator: std.mem.Allocator,
         control_fd: std.posix.fd_t,
         plan: sizing.Plan,
@@ -174,21 +172,29 @@ const Gateway = struct {
 
         const shard_memory_budget_bytes = supervisor_limits.shard_memory.budget_bytes;
         // Once both buffers are gateway fields, `errdefer gateway.deinit()`
-        // frees them, so they take no errdefer of their own, which would free
-        // them a second time on the shard-init error path.
-        // FIXME: a failed `decode_scratch` allocation leaks `scratch`.
+        // frees them, so `scratch` is freed on its own only until then.
         const scratch = try allocator.alloc(u8, scratch_len);
+        var scratch_owned = true;
+        errdefer if (scratch_owned) allocator.free(scratch);
         const decode_scratch = try allocator.create(ipc.GatewayEgressDecodeScratch);
+        var decode_scratch_owned = true;
+        errdefer if (decode_scratch_owned) allocator.destroy(decode_scratch);
         decode_scratch.* = .{};
+        const upload_memory = try allocator.create(counting_allocator.CountingAllocator);
+        upload_memory.* = .{ .child = allocator };
+        upload_memory.setBudget(supervisor_limits.upload_memory.budget_bytes);
         var gateway = Gateway{
             .allocator = allocator,
             .control_fd = control_fd,
-            .max_workers = plan.workers_max,
+            .max_sessions = plan.sessions_max,
             .policy = policy_mod.production,
             .scratch = scratch,
             .decode_scratch = decode_scratch,
+            .upload_memory = upload_memory,
         };
         control_fd_owned = false;
+        scratch_owned = false;
+        decode_scratch_owned = false;
         errdefer gateway.deinit();
 
         gateway.shards = try shard_set.Set.init(allocator, plan.shard_count, .{
@@ -198,17 +204,20 @@ const Gateway = struct {
         return gateway;
     }
 
-    fn deinit(self: *Gateway) void {
+    pub fn deinit(self: *Gateway) void {
         self.shards.deinit(self.allocator);
         self.workers.deinit(self.allocator);
         self.deinitPendingUploads();
         self.limits.deinit(self.allocator);
         self.router.deinit(self.allocator);
         self.completed_fetches.deinit(self.allocator);
+        self.hello.deinit(self.allocator);
         if (self.scratch.len != 0) {
             self.allocator.free(self.scratch);
         }
         self.allocator.destroy(self.decode_scratch);
+        // The shards' tasks and the pending uploads, which held its buffers, are gone.
+        self.allocator.destroy(self.upload_memory);
         std.posix.close(self.control_fd);
         self.* = undefined;
     }
@@ -221,7 +230,7 @@ const Gateway = struct {
             workerPressureProbeCallback,
             workerFaultReporterCallback,
         );
-        var readiness = try readiness_mod.Backend.init(self.allocator, self.shards.len(), self.max_workers);
+        var readiness = try readiness_mod.Backend.init(self.allocator, self.shards.len(), self.max_sessions);
         defer readiness.deinit();
         try sandbox.applySeccompAfterThreadsStarted();
         // Gateway-ready must be the last boot step: the server's spawn waits
@@ -301,6 +310,7 @@ const Gateway = struct {
                     },
                 }
             }
+            self.expirePendingUploads(os_process.monotonicNowNsOrZero());
             try self.drainPendingWorkerDrops();
             self.refreshAllWorkerBackpressure();
         }

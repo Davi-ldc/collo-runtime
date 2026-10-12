@@ -3,20 +3,31 @@
 //! pinned via COLLO_RELEASE_MCPU (pending the lscpu reading from the Ampere A4
 //! VM; null builds generic baseline). `release-x86` is the x86_64 variant.
 const std = @import("std");
+const codecs_mod = @import("codecs.zig");
+const deps_mod = @import("deps.zig");
 const options_mod = @import("options.zig");
 const toolchain_mod = @import("toolchain.zig");
 const shims = @import("shims.zig");
 const jsc_mod = @import("jsc.zig");
 const modules_mod = @import("modules.zig");
 const link_mod = @import("link.zig");
-const zstd_mod = @import("zstd.zig");
+const tool_mod = @import("tool.zig");
+
+/// What every release step shares with the dev graph: the build tool, the
+/// native builds (so a directory the dev graph also uses keeps one step) and
+/// the patched ls-hpack source, which no target changes.
+pub const Shared = struct {
+    tool: *const tool_mod.Tool,
+    native: *deps_mod.Native,
+    patched_ls_hpack: std.Build.LazyPath,
+};
 
 pub fn addReleaseSteps(
     b: *std.Build,
     opts: *const options_mod.Options,
-    patched_ls_hpack: std.Build.LazyPath,
+    shared: Shared,
 ) void {
-    addReleaseStep(b, opts, patched_ls_hpack, .{
+    addReleaseStep(b, opts, shared, .{
         .step_name = "release",
         .description = "Build the production collo binary (aarch64 + ReleaseFast)",
         .arch_os_abi = "aarch64-linux-gnu",
@@ -24,7 +35,7 @@ pub fn addReleaseSteps(
         .mcpu = opts.release_mcpu,
         .artifact_name = "collo-aarch64",
     });
-    addReleaseStep(b, opts, patched_ls_hpack, .{
+    addReleaseStep(b, opts, shared, .{
         .step_name = "release-x86",
         .description = "Build the production collo binary for x86_64 (ReleaseFast)",
         .arch_os_abi = "x86_64-linux-gnu",
@@ -46,7 +57,7 @@ const ReleaseSpec = struct {
 fn addReleaseStep(
     b: *std.Build,
     opts: *const options_mod.Options,
-    patched_ls_hpack: std.Build.LazyPath,
+    shared: Shared,
     spec: ReleaseSpec,
 ) void {
     const step = b.step(spec.step_name, spec.description);
@@ -87,19 +98,20 @@ fn addReleaseStep(
     const toolchain_ptr = b.allocator.create(toolchain_mod.ToolchainPaths) catch @panic("OOM");
     toolchain_ptr.* = toolchain;
 
-    // Resolved against THIS step's toolchain, not the dev one. `-Dzstd-link`
-    // defaults to `auto`, and `auto` is a question about a specific target's
-    // sysroot — asking it of the host answers for the wrong machine, and
-    // reading the raw choice answers "not static" for every default build.
-    if (zstd_mod.resolveChoice(b, toolchain_ptr, opts.zstd_link) != .static) {
-        step.dependOn(&b.addFail(b.fmt(
-            "{s}: production release requires a static zstd for {s}; none found and -Dzstd-link did not force one",
-            .{ spec.step_name, spec.arch_os_abi },
-        )).step);
-        return;
-    }
-
     const libc_file = toolchain_mod.createLibcConfig(b, toolchain_ptr);
+
+    // Every library the product links is built here for its architecture
+    // and CPU from a pinned tree; an aarch64 ICU also builds the host's,
+    // whose tools generate its data.
+    const native_target: deps_mod.Target = .{
+        .target = target,
+        .cxx_sysroot = opts.cxx_sysroot,
+        .mcpu = toolchain_ptr.target_mcpu,
+    };
+    const icu = shared.native.icu(native_target);
+    const boringssl = shared.native.boringssl(native_target);
+    const codecs = b.allocator.create(codecs_mod.Codecs) catch @panic("OOM");
+    codecs.* = codecs_mod.build(b, target, &shared.native.verifyCompiledTrees().step);
 
     const triple = target.result.linuxTriple(b.allocator) catch @panic("OOM");
     // One derivation, shared with options.zig. A second copy here is how a tree ends up with dev builds
@@ -110,23 +122,22 @@ fn addReleaseStep(
         .cmake_build_type = jsc_cmake_build_type,
         .build_dir = engine.jsc,
         .webkit_source_dir = engine.webkit_src,
-        .step = jsc_mod.addBuildStep(
-            b,
-            target,
-            jsc_cmake_build_type,
-            engine.jsc,
-            engine.webkit_src,
-            opts.cxx_sysroot,
-            toolchain_ptr.target_mcpu,
-        ),
+        .step = jsc_mod.addBuildStep(b, shared.tool, .{
+            .target = target,
+            .cmake_build_type = jsc_cmake_build_type,
+            .jsc_build_dir = engine.jsc,
+            .webkit_source_dir = engine.webkit_src,
+            .cxx_sysroot = opts.cxx_sysroot,
+            .mcpu = toolchain_ptr.target_mcpu,
+            .icu = icu,
+        }),
     };
 
     const set = modules_mod.buildModuleGraph(b, .{
         .target = target,
         .optimize = .ReleaseFast,
         .bindings = .jsc,
-        .toolchain = toolchain_ptr,
-        .zstd_link = .static, // guarded above: release refuses any other choice
+        .codecs = codecs,
     });
     const bridge_module = b.createModule(.{
         .target = target,
@@ -149,6 +160,7 @@ fn addReleaseStep(
         jsc.cmake_build_type,
         jsc.build_dir,
         jsc.webkit_source_dir,
+        .{ .icu = icu.headers(b), .boringssl = boringssl.headers(), .codecs = codecs },
         .{},
     );
 
@@ -157,19 +169,16 @@ fn addReleaseStep(
         .root_module = set.get(.main),
     });
     shims.configureBindingsTestObject(collo_object, libc_file);
-    shims.configureBoringSslShim(b, collo_object, toolchain_ptr, .{});
-    shims.configureHpackShim(b, collo_object, patched_ls_hpack);
+    shims.configureBoringSslShim(b, collo_object, toolchain_ptr, boringssl.headers(), .{});
+    shims.configureHpackShim(b, collo_object, shared.patched_ls_hpack);
 
     const linked = link_mod.addJscLink(b, .{
         .toolchain = toolchain_ptr,
         .jsc_build_dir = jsc.build_dir,
         .jsc_step = jsc.step,
-        // Per target, not per host: an explicit -Dboringssl-build-dir wins,
-        // otherwise each release step takes the archives built for the
-        // architecture it is producing.
-        .boringssl_build_dir = opts.boringssl_build_dir_override orelse
-            options_mod.defaultBoringSslBuildDir(spec.arch),
-        .zstd_link = .static, // guarded above: release refuses any other choice
+        .icu = icu,
+        .boringssl = boringssl,
+        .codecs = codecs,
         .link_quadmath = spec.arch == .x86_64,
         .compiler_rt_carrier = link_mod.addCompilerRtCarrier(b, target, .ReleaseFast),
     }, .{

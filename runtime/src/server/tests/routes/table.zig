@@ -15,7 +15,7 @@ fn single(comptime name: []const u8, comptime route_pattern: []const u8) config.
     return .{
         .name = name,
         .settings = config.default_settings,
-        .routes = &.{.{ .pattern = route_pattern, .entry_path = "/srv/" ++ name ++ ".js", .bindings = &.{} }},
+        .routes = &.{.{ .pattern = route_pattern, .entry_path = "/srv/" ++ name ++ ".js", .bindings = &.{}, .network = null }},
     };
 }
 
@@ -41,7 +41,7 @@ const Generated = struct {
         for (definitions, route_list, patterns, 0..) |*definition, *route, *route_pattern, index| {
             route_pattern.* = try std.fmt.allocPrint(allocator, "/route/{d}", .{index});
             initialized += 1;
-            route.* = .{ .pattern = route_pattern.*, .entry_path = "/srv/app.js", .bindings = &.{} };
+            route.* = .{ .pattern = route_pattern.*, .entry_path = "/srv/app.js", .bindings = &.{}, .network = null };
             definition.* = .{
                 .name = "generated",
                 .settings = config.default_settings,

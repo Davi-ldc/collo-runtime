@@ -133,13 +133,13 @@ pub const DispatchWork = struct {
         };
     }
 
-    /// The identity of a worker's boot context, which module top-level code
-    /// of every route runs under for its fetches and timers. `request_id` is
-    /// the boot context's id inside the worker (`boot_request_id` in
+    /// The identity of an evaluation, which one route's module top-level code
+    /// runs under for its fetches and timers. `request_id` is the
+    /// evaluation's id inside the worker (`isEvaluationId` in
     /// `worker/request/context.zig`). It carries nothing a real dispatch reads
-    /// from the wire: the boot context never dispatches and names no route,
-    /// and its fetches present `boot_egress_token`, WorkerInit's boot token,
-    /// whose request id and generation are 0.
+    /// from the wire: an evaluation never dispatches, and its fetches present
+    /// `boot_egress_token`, WorkerInit's boot token, whose request id and
+    /// generation are 0.
     pub fn initBoot(
         allocator: std.mem.Allocator,
         request_id: u64,

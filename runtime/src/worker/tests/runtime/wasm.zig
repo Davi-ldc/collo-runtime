@@ -83,18 +83,13 @@ fn runWasmRouteAndReadBody(
 ) ![]u8 {
     try enqueueWasmRoute(runtime, source, request_id, specifier, default_request_deadline_ns);
 
-    var host_pump_exec_ctx = support.makeExecCtx(0);
     var pending_imminent = false;
     var attempts: usize = 0;
     while (runtime.requests.active.contains(request_id)) : (attempts += 1) {
         if (attempts > 1000)
             return error.RequestDidNotComplete;
         try collectPass(runtime);
-        pending_imminent = worker.testing.scheduler.loop.pumpDeferredWork(
-            runtime,
-            &host_pump_exec_ctx,
-            pending_imminent,
-        );
+        pending_imminent = worker.testing.scheduler.loop.pumpDeferredWork(runtime, pending_imminent);
         if (runtime.scheduler.ready_queue.pop()) |item| {
             try worker.testing.executeWorkItem(runtime, item);
             continue;
@@ -184,17 +179,15 @@ test "WebAssembly.compile then instantiate settles both promises through the pum
     try expectBodyContains(body, "\"sum\":42");
 }
 
-test "boot fire-and-forget instantiate settles posthumously in a host window, not on a live request" {
-    // A WebAssembly ticket has no request owner. `closeBootContext` sweeps
-    // only what is registered under the boot id, so the boot context's close
-    // does not cancel it, and JSC never does either, because the global
-    // object reports its script execution status as always running. An
-    // instantiate that module top-level code starts therefore settles later
-    // through the pump. With no boot context, that settle must run as
-    // a request-less turn with owner 0 even when an unrelated request is the
-    // only live one, instead of spending that request's turn, deadline and
-    // CPU. The case where the boot context still exists and owns the settle
-    // is not covered here.
+test "a top-level fire-and-forget instantiate settles posthumously under the worker owner, not on a live request" {
+    // A WebAssembly ticket has no owner. An evaluation's close sweeps only
+    // what is registered under its id, so it does not cancel the ticket, and
+    // JSC never does either, because the global object reports its script
+    // execution status as always running. An instantiate that module
+    // top-level code starts therefore settles later through the pump, which
+    // runs every settle under the worker owner (`runtime/owner.zig`) even
+    // when an unrelated request is the only live one, instead of spending
+    // that request's turn, deadline and CPU.
     var vm = try support.createVm();
     defer vm.deinit();
 
@@ -212,11 +205,6 @@ test "boot fire-and-forget instantiate settles posthumously in a host window, no
     defer runtime.deinit();
     try runtime.attachHostRuntime();
 
-    // The wakeup gate is installed reporting work once
-    // (`collo_vm_deferred_work_scheduled` in `bindings/jsc/runtime/vm.cpp`).
-    // Consuming that report here makes the wait below see a real schedule.
-    _ = runtime.core.vm.deferredWorkScheduled();
-
     // Top-level code starts the instantiate without awaiting it, so the
     // module settles at once and the wasm promise is still in flight while
     // requests run.
@@ -224,7 +212,11 @@ test "boot fire-and-forget instantiate settles posthumously in a host window, no
         \\const bytes = {s};
         \\globalThis.bootWasm = "pending";
         \\WebAssembly.instantiate(bytes).then(
-        \\    () => {{ globalThis.bootWasm = "settled"; }},
+        \\    () => {{
+        \\        const end = Date.now() + 50;
+        \\        while (Date.now() < end) {{}}
+        \\        globalThis.bootWasm = "settled";
+        \\    }},
         \\    () => {{ globalThis.bootWasm = "rejected"; }},
         \\);
         \\export default async function handle() {{
@@ -280,8 +272,9 @@ test "boot fire-and-forget instantiate settles posthumously in a host window, no
     const reader_ctx = runtime.requests.active.get(23) orelse return error.ReaderNotParked;
 
     // Wait for the worklist thread's schedule notification. The settle is
-    // ready once `scheduleWorkSoon` has run, and with the install report
-    // consumed above, a true here means a real schedule.
+    // ready once `scheduleWorkSoon` has run, and a fresh VM's wakeup gate
+    // reports nothing (`collo_vm_deferred_work_scheduled` in `abi.h`), so a
+    // true here means a real schedule.
     attempts = 0;
     while (!runtime.core.vm.deferredWorkScheduled()) : (attempts += 1) {
         if (attempts > 5000)
@@ -293,26 +286,26 @@ test "boot fire-and-forget instantiate settles posthumously in a host window, no
     // live request. The wait above consumed the gate, so the first pass is
     // told work is imminent; otherwise the pump would find the gate clear
     // and skip.
-    const reader_cpu_before = reader_ctx.exec.cpu_used_ns_total;
-    var host_pump_exec_ctx = support.makeExecCtx(0);
+    const reader_cpu_before = reader_ctx.cpu_ns;
+    const worker_cpu_before = runtime.owners.worker_cpu_ns;
     var pending_imminent = true;
     attempts = 0;
     while (pending_imminent) : (attempts += 1) {
         if (attempts > 1000)
             return error.BootWasmSettleDidNotDrain;
-        pending_imminent = worker.testing.scheduler.loop.pumpDeferredWork(
-            &runtime,
-            &host_pump_exec_ctx,
-            pending_imminent,
-        );
+        pending_imminent = worker.testing.scheduler.loop.pumpDeferredWork(&runtime, pending_imminent);
         if (pending_imminent)
             std.Thread.sleep(std.time.ns_per_ms);
     }
 
-    // The settle's CPU went to the request-less host context, and the
-    // parked request gained none.
-    try std.testing.expect(host_pump_exec_ctx.cpu_used_ns_total > 0);
-    try std.testing.expectEqual(reader_cpu_before, reader_ctx.exec.cpu_used_ns_total);
+    // The settle's CPU went to the worker owner, and the parked request
+    // gained none. Every pump pass with work imminent opens a worker window,
+    // so the worker owner gains a few microseconds even from a pass that runs
+    // nothing; only the continuation's 50 ms spin, however little of it a
+    // loaded machine schedules, carries it past the floor.
+    const settle_cpu_floor_ns = 5 * std.time.ns_per_ms;
+    try std.testing.expect(runtime.owners.worker_cpu_ns - worker_cpu_before >= settle_cpu_floor_ns);
+    try std.testing.expectEqual(reader_cpu_before, reader_ctx.cpu_ns);
 
     // The clock moves past the parked request's timer, so the request
     // finishes and reads the global the settle's continuation set:
@@ -323,11 +316,7 @@ test "boot fire-and-forget instantiate settles posthumously in a host window, no
         if (attempts > 1000)
             return error.RequestDidNotComplete;
         try collectPass(&runtime);
-        pending_imminent = worker.testing.scheduler.loop.pumpDeferredWork(
-            &runtime,
-            &host_pump_exec_ctx,
-            pending_imminent,
-        );
+        pending_imminent = worker.testing.scheduler.loop.pumpDeferredWork(&runtime, pending_imminent);
         if (runtime.scheduler.ready_queue.pop()) |item| {
             try worker.testing.executeWorkItem(&runtime, item);
             continue;

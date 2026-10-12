@@ -22,7 +22,6 @@ pub const transport = @import("collo_egress_transport");
 
 const Header = http.Header;
 const DnsCache = transport.DnsCache;
-const EgressPolicy = transport.EgressPolicy;
 const HttpConnection = transport.HttpConnection;
 const IoInterest = transport.IoInterest;
 const PoolIsolationId = transport.PoolIsolationId;
@@ -586,11 +585,7 @@ pub const Entry = struct {
     ) !BioConnectOutcome {
         if (plan.target.protocol != .tls)
             return error.Http2UnsupportedScheme;
-        const policy = EgressPolicy{
-            .allow_plain_http = config.allow_plain_http,
-            .allow_private_networks = config.allow_private_networks,
-        };
-        var target = try policy.resolveRequestTargetUntil(
+        var target = try transport.resolveRequestTargetUntil(
             allocator,
             dns_cache,
             plan.target,
@@ -879,7 +874,7 @@ pub const Key = struct {
             .authority_host_lower = host,
             .port = plan.target.port,
             .insecure_tls = config.insecure_tls,
-            .allow_private_networks = config.allow_private_networks,
+            .allow_private_networks = plan.target.admission.allow_private_networks,
             .h2_limits = h2_limits,
             .max_outgoing_buffer_bytes = config.http2_max_outgoing_buffer_bytes,
             .tls_ciphertext_buffer_bytes = config.tls_ciphertext_buffer_bytes,
@@ -897,7 +892,7 @@ pub const Key = struct {
         const h2_limits = config.http2Limits().normalized() catch return false;
         return self.port == plan.target.port and
             self.insecure_tls == config.insecure_tls and
-            self.allow_private_networks == config.allow_private_networks and
+            self.allow_private_networks == plan.target.admission.allow_private_networks and
             limitsEqual(self.h2_limits, h2_limits) and
             self.max_outgoing_buffer_bytes == config.http2_max_outgoing_buffer_bytes and
             self.tls_ciphertext_buffer_bytes == config.tls_ciphertext_buffer_bytes and

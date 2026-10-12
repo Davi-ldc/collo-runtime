@@ -8,30 +8,30 @@
 const bindings = @import("collo_bindings");
 const host_adapter = @import("adapter.zig");
 
-// The `ColloStatus` values of abi.h.
-const status_ok: c_int = 0;
-const status_error: c_int = 1;
-const status_invalid_argument: c_int = 2;
-
 pub export fn collo_runtime_crypto_job_enqueue(
     runtime_ptr: ?*anyopaque,
     request_id: u64,
     job: ?*bindings.RawCryptoJob,
-) c_int {
-    const runtime = host_adapter.fromOpaque(runtime_ptr) orelse return status_invalid_argument;
+) bindings.RawStatus {
+    const runtime = host_adapter.fromOpaque(runtime_ptr) orelse return bindings.status_invalid_argument;
     if (request_id == 0 or job == null)
-        return status_invalid_argument;
+        return bindings.status_invalid_argument;
 
-    // The bridge rejects an invalid argument as a call outside an active
-    // request turn, and any other failure as a full job queue.
+    // Each status names one cause, which the bridge turns into its own
+    // rejection message (`enqueueCryptoJobPromise` in `jobs.cpp`): an owner
+    // that accepts no work is a call outside an active request turn, a full
+    // in-flight bound is too many operations, and a pool that never started
+    // or is stopping is a pool that is not running.
     runtime.scheduleCryptoJob(request_id, job.?) catch |err| switch (err) {
-        error.CryptoJobOutsideActiveRequest => return status_invalid_argument,
+        error.CryptoJobOutsideActiveRequest,
         error.InvalidCryptoJob,
-        error.CryptoJobPoolUnavailable,
-        error.CryptoJobPoolStopping,
+        => return bindings.status_invalid_argument,
         error.CryptoJobRequestQueueFull,
         error.CryptoJobWorkerQueueFull,
-        => return status_error,
+        => return bindings.status_error,
+        error.CryptoJobPoolUnavailable,
+        error.CryptoJobPoolStopping,
+        => return bindings.status_unsupported,
     };
-    return status_ok;
+    return bindings.status_ok;
 }

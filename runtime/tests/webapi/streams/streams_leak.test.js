@@ -276,4 +276,34 @@ describeLeaks("Streams retention and leak coverage", () => {
     },
     expectLeakRecordsCollected,
   );
+
+  leakTest(
+    "compression streams abandoned with a write pending are collectable",
+    async () => {
+      function createAbandonedCompressionRefs() {
+        const stream = new CompressionStream("gzip");
+        const writer = stream.writable.getWriter();
+        // No read ever comes, so the readable side wants no output and the
+        // write stays pending inside the stream, holding its promise.
+        writer.write(new TextEncoder().encode("hello")).catch(() => {});
+        return [
+          new WeakRef(stream),
+          new WeakRef(stream.readable),
+          new WeakRef(stream.writable),
+        ];
+      }
+
+      const refs = [];
+      for (let index = 0; index < 24; index++) {
+        refs.push(...createAbandonedCompressionRefs());
+      }
+      // Each writable starts and hands its write to the stream a few
+      // microtasks after the write call.
+      for (let tick = 0; tick < 8; tick++) await Promise.resolve();
+      return [
+        weakRecord("abandoned CompressionStream", refs, 8),
+      ];
+    },
+    expectLeakRecordsCollected,
+  );
 });

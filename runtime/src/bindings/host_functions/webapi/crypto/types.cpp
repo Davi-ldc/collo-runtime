@@ -1,5 +1,5 @@
-// The hash table, the zeroing containers and the numeric range checks declared in `types.h`. The table is constant
-// data and nothing here touches JSC, so any thread may call these functions.
+// The hash table and the numeric range checks declared in `types.h`. The table is constant data and nothing here
+// touches JSC, so any thread may call these functions.
 
 #include "host_functions/webapi/crypto/types.h"
 
@@ -28,79 +28,6 @@ namespace {
     };
 
 } // namespace
-
-void secureZeroVector(WTF::Vector<uint8_t>& bytes)
-{
-    if (!bytes.isEmpty())
-        WTF::secureZeroSpan(bytes.mutableSpan());
-}
-
-SecureBytes::SecureBytes(WTF::Vector<uint8_t>&& bytes)
-    : m_bytes(WTF::move(bytes))
-{
-}
-
-SecureBytes::SecureBytes(SecureBytes&& other)
-    : m_bytes(WTF::move(other.m_bytes))
-{
-}
-
-SecureBytes& SecureBytes::operator=(SecureBytes&& other)
-{
-    if (this == &other)
-        return *this;
-    secureZeroVector(m_bytes);
-    m_bytes = WTF::move(other.m_bytes);
-    return *this;
-}
-
-SecureBytes::~SecureBytes() { secureZeroVector(m_bytes); }
-
-bool SecureBytes::tryAppend(std::span<const uint8_t> bytes) { return m_bytes.tryAppend(bytes); }
-
-std::span<const uint8_t> SecureBytes::span() const { return m_bytes.span(); }
-
-bool SecureBytes::isEmpty() const { return m_bytes.isEmpty(); }
-
-WTF::Vector<uint8_t>& SecureBytes::vector() { return m_bytes; }
-
-WTF::Vector<uint8_t>&& SecureBytes::release() { return WTF::move(m_bytes); }
-
-void SecureBytes::clear()
-{
-    secureZeroVector(m_bytes);
-    m_bytes.clear();
-}
-
-SecureVectorGuard::SecureVectorGuard(WTF::Vector<uint8_t>& vector)
-    : m_vector(&vector)
-{
-}
-
-SecureVectorGuard::SecureVectorGuard(SecureVectorGuard&& other)
-    : m_vector(other.m_vector)
-{
-    other.m_vector = nullptr;
-}
-
-SecureVectorGuard& SecureVectorGuard::operator=(SecureVectorGuard&& other)
-{
-    if (this == &other)
-        return *this;
-    if (m_vector)
-        secureZeroVector(*m_vector);
-    m_vector = other.m_vector;
-    other.m_vector = nullptr;
-    return *this;
-}
-
-SecureVectorGuard::~SecureVectorGuard()
-{
-    if (m_vector)
-        secureZeroVector(*m_vector);
-}
-
-void SecureVectorGuard::dismiss() { m_vector = nullptr; }
 
 bool checkedIntegerInRange(double number, double min, double max)
 {
@@ -158,13 +85,9 @@ const EVP_MD* hashEvp(const HashSpec& hash)
 
 bool hashHasOpenSslEvp(const HashSpec& hash) { return !!hashEvp(hash); }
 
-static_assert(!std::is_copy_constructible_v<SecureBytes>);
-static_assert(!std::is_copy_assignable_v<SecureBytes>);
-static_assert(std::is_move_constructible_v<SecureBytes>);
-static_assert(std::is_move_assignable_v<SecureBytes>);
-static_assert(!std::is_copy_constructible_v<SecureVectorGuard>);
-static_assert(!std::is_copy_assignable_v<SecureVectorGuard>);
-static_assert(std::is_move_constructible_v<SecureVectorGuard>);
-static_assert(std::is_move_assignable_v<SecureVectorGuard>);
+static_assert(!std::is_copy_constructible_v<SecretBytes>);
+static_assert(!std::is_copy_assignable_v<SecretBytes>);
+static_assert(std::is_nothrow_move_constructible_v<SecretBytes>);
+static_assert(std::is_nothrow_move_assignable_v<SecretBytes>);
 
 }

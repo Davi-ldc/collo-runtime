@@ -356,11 +356,14 @@ pub fn Types(comptime Command: type) type {
             }
         };
 
+        /// The origin a connect group dials, scoped like a pooled connection
+        /// (`transport/h2/pool.zig:Key`). It is built before any plan, so it
+        /// names the network policy by `pool_policy_id` alone: one policy's
+        /// admission of an origin never changes.
         pub const ConnectKey = struct {
             authority_host_lower: []u8,
             port: u16,
             insecure_tls: bool,
-            allow_private_networks: bool,
             h2_limits: http2.Limits,
             max_outgoing_buffer_bytes: usize,
             tls_ciphertext_buffer_bytes: usize,
@@ -377,7 +380,6 @@ pub fn Types(comptime Command: type) type {
                     .authority_host_lower = host,
                     .port = origin.port,
                     .insecure_tls = command.config.insecure_tls,
-                    .allow_private_networks = command.config.allow_private_networks,
                     .h2_limits = h2_limits,
                     .max_outgoing_buffer_bytes = command.config.http2_max_outgoing_buffer_bytes,
                     .tls_ciphertext_buffer_bytes = command.config.tls_ciphertext_buffer_bytes,
@@ -396,7 +398,6 @@ pub fn Types(comptime Command: type) type {
                 const h2_limits = command.config.http2Limits().normalized() catch return false;
                 return self.port == origin.port and
                     self.insecure_tls == command.config.insecure_tls and
-                    self.allow_private_networks == command.config.allow_private_networks and
                     limitsEqual(self.h2_limits, h2_limits) and
                     self.max_outgoing_buffer_bytes == command.config.http2_max_outgoing_buffer_bytes and
                     self.tls_ciphertext_buffer_bytes == command.config.tls_ciphertext_buffer_bytes and

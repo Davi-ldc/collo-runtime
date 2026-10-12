@@ -117,6 +117,49 @@ test("structuredClone arrays preserve holes and named properties", () => {
   assert.equal(cloned.extra, "value");
 });
 
+test("structuredClone of a sparse array keeps its length and holes without presizing", () => {
+  // The largest length for which creating an array allocates a contiguous vector, so a clone created with this length
+  // commits about 1 GiB, while the source, whose length is set after creation, stays a sparse map.
+  const length = 2 ** 27 - 1;
+  const input = [];
+  input.length = length;
+  input[5] = "five";
+  input[length - 1] = "last";
+  const cloned = structuredClone(input);
+  assert(Array.isArray(cloned));
+  assert.equal(cloned.length, length);
+  assert.deepEqual(Object.keys(cloned), ["5", String(length - 1)]);
+  assert.equal(cloned[5], "five");
+  assert.equal(cloned[length - 1], "last");
+  assert.equal(0 in cloned, false);
+  assert.equal(length - 2 in cloned, false);
+});
+
+test("structuredClone of an array keeps trailing holes in its length", () => {
+  const input = [, "one", , , "four", , ,];
+  const cloned = structuredClone(input);
+  assert.equal(cloned.length, 7);
+  assert.deepEqual(Object.keys(cloned), ["1", "4"]);
+  assert.equal(0 in cloned, false);
+  assert.equal(6 in cloned, false);
+  assert.deepEqual(structuredClone([]), []);
+});
+
+test("structuredClone reads an array's length before its getters run", () => {
+  const input = [1, 2];
+  Object.defineProperty(input, "grow", {
+    enumerable: true,
+    get() {
+      input.push(3, 4);
+      return "grew";
+    },
+  });
+  const cloned = structuredClone(input);
+  assert.equal(cloned.length, 2);
+  assert.equal(cloned.grow, "grew");
+  assert.equal(2 in cloned, false);
+});
+
 test("structuredClone normalizes custom prototypes", () => {
   class CustomArray extends Array {}
   const array = new CustomArray(1, 2, 3);

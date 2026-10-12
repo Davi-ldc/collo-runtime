@@ -102,7 +102,7 @@ pub fn main() !void {
 
 fn runZygote(allocator: std.mem.Allocator, mode: Mode, counts: []const usize) !void {
     try bindings.setHelperThreadsTimeoutOverrideNs(fork_helper_timeout_ns);
-    defer bindings.clearHelperThreadsTimeoutOverride();
+    defer bindings.clearHelperThreadsOverrides();
     try bindings.prepareProcessForFork();
 
     var zygote = try zygote_mod.state.Zygote.init(null, .{ .vm_options = bindings.VmOptions.init() });
@@ -275,7 +275,7 @@ fn serveRoute(vm: *bindings.Vm, realm: bindings.Realm, index: usize) !void {
     var exec_ctx = bindings.ExecCtx.init(1000 + index);
     defer vm.releaseExecCtx(&exec_ctx) catch {};
     try vm.turnEnter(&exec_ctx);
-    const invoke_result = vm.invoke(std.heap.c_allocator, &exec_ctx, &handler, null, &.{&url});
+    const invoke_result = realm.invoke(std.heap.c_allocator, &exec_ctx, &handler, null, &.{&url});
     const exit_result = vm.turnExitResult();
     const called = releaseValueResult(invoke_result);
     const drained = releaseVoidResult(exit_result);

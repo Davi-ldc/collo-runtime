@@ -4,7 +4,9 @@
 //! calling test's thread against a VM that thread owns, and allocates from
 //! `std.testing.allocator`; outside test compilations only the WebAPI bench
 //! uses it, for `createVm`. The bindings smokes import nothing else, so this
-//! module also pulls in the worker exports their binaries link against.
+//! module also pulls in the worker exports their binaries link against. It
+//! also declares the export of the SecretBytes test shim, which only the
+//! aggregate links.
 
 const std = @import("std");
 const ipc = @import("collo_ipc");
@@ -126,11 +128,12 @@ pub fn getExportInRealmOk(realm: bindings.Realm, specifier: []const u8, export_n
     };
 }
 
-/// Calls `callable` with `args` and no receiver under `exec_ctx` and returns
-/// the result, which the caller owns. A thrown exception is released and fails
-/// with `error.UnexpectedJsException`.
+/// Calls `callable` with `args` and no receiver under `exec_ctx`, with the
+/// main realm serving a callable that has none, and returns the result, which
+/// the caller owns. A thrown exception is released and fails with
+/// `error.UnexpectedJsException`.
 pub fn invokeOk(vm: *bindings.Vm, exec_ctx: *const bindings.ExecCtx, callable: *const bindings.Value, args: []const *const bindings.Value) !bindings.Value {
-    return switch (try vm.invoke(std.testing.allocator, exec_ctx, callable, null, args)) {
+    return switch (try vm.mainRealm().invoke(std.testing.allocator, exec_ctx, callable, null, args)) {
         .success => |value| value,
         .exception => |exception| {
             var owned = exception;
@@ -144,7 +147,7 @@ pub fn invokeOk(vm: *bindings.Vm, exec_ctx: *const bindings.ExecCtx, callable: *
 /// the caller owns. A normal return releases the result and fails with
 /// `error.UnexpectedJsException`.
 pub fn invokeException(vm: *bindings.Vm, exec_ctx: *const bindings.ExecCtx, callable: *const bindings.Value, args: []const *const bindings.Value) !bindings.Value {
-    return switch (try vm.invoke(std.testing.allocator, exec_ctx, callable, null, args)) {
+    return switch (try vm.mainRealm().invoke(std.testing.allocator, exec_ctx, callable, null, args)) {
         .success => |value| {
             var owned = value;
             defer owned.deinit();
@@ -154,19 +157,26 @@ pub fn invokeException(vm: *bindings.Vm, exec_ctx: *const bindings.ExecCtx, call
     };
 }
 
+/// The string conversion of `value`, run in the main realm for a value with
+/// no realm of its own, must equal `expected`.
 pub fn expectValueString(vm: *bindings.Vm, value: *const bindings.Value, expected: []const u8) !void {
-    switch (try vm.valueToUtf8Copy(value)) {
-        .success => |text| {
-            var owned = text;
-            defer owned.deinit();
-            try std.testing.expectEqualStrings(expected, owned.slice());
-        },
+    var text = try valueString(vm.mainRealm(), value);
+    defer text.deinit();
+    try std.testing.expectEqualStrings(expected, text.slice());
+}
+
+/// The string conversion of `value`, run in `realm` for a value with no realm
+/// of its own, which the caller owns. A thrown exception is released and fails
+/// with `error.UnexpectedJsException`.
+pub fn valueString(realm: bindings.Realm, value: *const bindings.Value) !bindings.OwnedString {
+    return switch (try realm.valueToUtf8Copy(value)) {
+        .success => |text| text,
         .exception => |exception| {
             var owned = exception;
             defer owned.deinit();
             return error.UnexpectedJsException;
         },
-    }
+    };
 }
 
 pub fn expectExceptionContains(vm: *bindings.Vm, exception: *const bindings.Value, needle: []const u8) !void {
@@ -204,12 +214,35 @@ pub fn sampleRandomWithSeeds(seeds: bindings.RandomSeeds) !bindings.OwnedString 
     var result = try invokeOk(&vm, &exec_ctx, &entry, &.{});
     defer result.deinit();
 
-    return switch (try vm.valueToUtf8Copy(&result)) {
-        .success => |text| text,
-        .exception => |exception| {
-            var owned = exception;
-            defer owned.deinit();
-            return error.UnexpectedJsException;
-        },
-    };
+    return valueString(vm.mainRealm(), &result);
+}
+
+/// What one run of the SecretBytes scenarios saw, mirroring
+/// `collo_test_secret_bytes_report` in `secret_bytes_shim.cc`: buffers
+/// allocated and freed, frees of a buffer holding a nonzero byte or at
+/// another size than allocated, and failed checks with the shim's line of
+/// the first.
+pub const SecretBytesReport = extern struct {
+    allocations: u64,
+    frees: u64,
+    nonzero_frees: u64,
+    mismatched_frees: u64,
+    failed_checks: u64,
+    first_failed_line: u64,
+};
+
+comptime {
+    if (@sizeOf(SecretBytesReport) != 48) @compileError("SecretBytesReport must mirror collo_test_secret_bytes_report");
+}
+
+extern fn collo_test_secret_bytes_run(out: *SecretBytesReport) void;
+
+/// Runs every SecretBytes scenario of the C++ test shim
+/// (`secret_bytes_shim.cc`, linked by `shims.configureSecretBytesTestShim`)
+/// on the calling thread. Calls must not overlap: the shim's recorder is
+/// process-wide and reset by each run.
+pub fn runSecretBytesScenarios() SecretBytesReport {
+    var report: SecretBytesReport = undefined;
+    collo_test_secret_bytes_run(&report);
+    return report;
 }

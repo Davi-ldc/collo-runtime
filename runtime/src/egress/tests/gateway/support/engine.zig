@@ -42,7 +42,7 @@ pub const InjectRequestOptions = struct {
 
 /// `injectActive` with a caller-shaped request: teardown tests control the
 /// method and body, which decide replay safety, and the admission deadline
-/// and request a redispatch must carry. The policy entry a redispatch runs
+/// and request a redispatch must carry. The network policy a redispatch runs
 /// under comes from the fetch's route, which the test records.
 pub fn injectActiveRequest(
     engine: *engine_mod.Engine,

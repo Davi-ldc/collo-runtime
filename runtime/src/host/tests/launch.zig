@@ -1,13 +1,14 @@
 //! The launch machine without a zygote: the await-ready transition table with
 //! synthetic outcomes and the cause it records for a child whose init failed
 //! (`InitFailure`), the WorkerInit `sendInit` sends, attached with its
-//! session and boot token or detached with the worker's wake descriptors
-//! alone, the wake set a reattach's session shares with the launch's, what
-//! `start` takes from the forked worker and refuses without a cgroup leaf,
-//! what `abandon` hands back, and `AbandonedChild.reap` on a real child
-//! process. Socket pairs exercise the real typed WorkerReady receiver and
-//! WorkerInit sender; sandbox and zygote behavior remain in the integration
-//! lane.
+//! session and boot token, detached with the worker's wake descriptors alone
+//! or without any egress descriptor for a definition with no grant, with the
+//! definition's time limits and the host's one tmpfs mount point, the wake
+//! set a reattach's session shares with the launch's, what `start` takes from
+//! the forked worker and refuses without a cgroup leaf, what `abandon` hands
+//! back, and `AbandonedChild.reap` on a real child process. Socket pairs
+//! exercise the real typed WorkerReady receiver and WorkerInit sender;
+//! sandbox and zygote behavior remain in the integration lane.
 
 const std = @import("std");
 const ipc = @import("collo_ipc");
@@ -46,7 +47,7 @@ fn posed(phase: LaunchPhase, serve_faults: bool) Machine {
         .allocator = std.testing.allocator,
         .zygote_process = &quiet_zygote,
         .memory_limit_bytes = 0,
-        .options = .{ .egress = .{ .detached = &unsent_wake_set } },
+        .options = .{ .egress = .{ .detached = &unsent_wake_set }, .tmp_mount_point_fd = -1 },
         .phase = phase,
         .serve_faults = serve_faults,
     };
@@ -119,8 +120,9 @@ const boot_egress: launch.BootEgress = .{
     .budget = 16,
 };
 
-/// Whether a launch sends a session or the worker's wake descriptors alone.
-const Egress = enum { detached, attached };
+/// Whether a launch sends a session, the worker's wake descriptors alone, or
+/// no egress descriptor at all.
+const Egress = enum { none, detached, attached };
 
 /// The routes of an `InitSend` launch: a one-route table, and whether each
 /// route runs in a realm of its own.
@@ -168,6 +170,7 @@ const InitSend = struct {
         self.machine = posed(.idle, false);
         self.machine.memory_limit_bytes = 64 * 1024 * 1024;
         self.machine.options.egress = switch (egress) {
+            .none => .none,
             .detached => .{ .detached = &self.wake_set },
             .attached => .{ .attached = .{ .shared_fds = self.session.rawForWorker(), .boot = boot_egress } },
         };
@@ -186,7 +189,7 @@ const InitSend = struct {
         self.machine.completion_eventfd = self.stand_in_fd;
         self.machine.ingress_payload_fd = self.stand_in_fd;
         self.machine.ingress_payload_credit_eventfd = self.stand_in_fd;
-        self.machine.tmp_root_dir_fd = self.stand_in_fd;
+        self.machine.options.tmp_mount_point_fd = self.stand_in_fd;
         self.machine.cgroup_dir_fd = self.stand_in_fd;
         self.machine.placeholder_fs_index_fd = self.stand_in_fd;
         self.machine.route_table_memfd = try eventFd();
@@ -284,7 +287,83 @@ test "an attached launch sends the session's half beside a boot token that expir
     try std.testing.expectEqual(received.message.init_deadline_mono_ns, fields.deadline_monotonic_ns);
 }
 
-test "a launch without a grant carries the wake set and no regions" {
+test "a launch for a definition without a network grant sends no egress descriptor and leaves flag_egress clear" {
+    var send: InitSend = undefined;
+    try send.init(null, .none);
+    defer send.deinit();
+
+    try expectEffects(send.machine.sendInit(), &.{ .arm_init_poll, .arm_pidfd_poll });
+
+    var received = try ipc.recvWorkerInit(send.pair[1]);
+    defer received.deinit();
+    try received.message.validate();
+    try std.testing.expect(!received.message.hasEgress());
+    try std.testing.expect(ipc.egress_token.isNone(&received.message.boot_egress_token));
+    try std.testing.expect(received.egress_shared_fds.isEmpty());
+}
+
+test "a launch sends the definition's request CPU budget and its limit on JavaScript no request owns" {
+    var send: InitSend = undefined;
+    try send.init(null, .attached);
+    defer send.deinit();
+    send.machine.options.request_cpu_budget_ns = 50 * std.time.ns_per_ms;
+    send.machine.options.unowned_time_limit_ns = 1 * std.time.ns_per_s;
+
+    try expectEffects(send.machine.sendInit(), &.{ .arm_init_poll, .arm_pidfd_poll });
+
+    var received = try ipc.recvWorkerInit(send.pair[1]);
+    defer received.deinit();
+    try received.message.validate();
+    try std.testing.expectEqual(@as(u64, 50 * std.time.ns_per_ms), received.message.request_cpu_budget_ns);
+    try std.testing.expectEqual(@as(u64, 1 * std.time.ns_per_s), received.message.unowned_time_limit_ns);
+}
+
+test "two launches of one host send the host's one mount point as their tmp root" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const parent = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(parent);
+    var mount_point: host.TmpMountPoint = undefined;
+    try mount_point.init(parent);
+    defer mount_point.deinit();
+    // A plain directory stands in for the leaf; it already holds the limits
+    // the launch passes, so adopting it reads and writes nothing else.
+    var leaf = std.testing.tmpDir(.{});
+    defer leaf.cleanup();
+    try leaf.dir.writeFile(.{ .sub_path = "memory.high", .data = "67108864\n" });
+    try leaf.dir.writeFile(.{ .sub_path = "cpu.max", .data = "100000 100000\n" });
+
+    // Each launch runs its local steps in `start`, where a per-launch tmp
+    // root would be made, and sends WorkerInit.
+    var identities: [2][2]u64 = undefined;
+    for (&identities) |*identity| {
+        const pair = try fd_mod.socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
+        defer std.posix.close(pair[1]);
+        var forked = zygote.host_client.ForkedWorker{
+            .pid = 0,
+            .worker_init_fd = pair[0],
+            .pidfd = try eventFd(),
+            .cgroup_dir_fd = try std.posix.dup(leaf.dir.fd),
+        };
+        var machine = Machine.init(std.testing.allocator, &quiet_zygote, 64 * 1024 * 1024, .{
+            .egress = .none,
+            .tmp_mount_point_fd = mount_point.fd(),
+        });
+        try expectEffects(machine.start(&forked), &.{ .arm_init_poll, .arm_pidfd_poll });
+        var received = try ipc.recvWorkerInit(pair[1]);
+        defer received.deinit();
+        identity.* = try fileIdentity(received.tmp_root_fd);
+        var child = machine.abandon();
+        child.pidfd.deinit();
+        child.cgroup_dir.deinit();
+        // The launch borrowed the mount point, which stays the host's.
+        try expectOpen(mount_point.fd());
+    }
+    try std.testing.expectEqual(identities[0], identities[1]);
+    try std.testing.expectEqual(try fileIdentity(mount_point.fd()), identities[0]);
+}
+
+test "a detached launch carries the wake set and no regions" {
     var send: InitSend = undefined;
     try send.init(null, .detached);
     defer send.deinit();
@@ -365,15 +444,16 @@ test "a launch without its cgroup leaf fails before any local step and empties t
     };
     var machine = Machine.init(std.testing.allocator, &quiet_zygote, 64 * 1024 * 1024, .{
         .egress = .{ .detached = &unsent_wake_set },
+        .tmp_mount_point_fd = -1,
     });
 
     try expectEffects(machine.start(&forked), &.{.report_failed});
     try std.testing.expectEqual(@as(?launch.LaunchError, error.WorkerCgroupNotPrepared), machine.fail_reason);
     // The machine took every descriptor, so the caller has nothing left to
-    // close twice, and no tmp root was created for a launch that cannot run.
+    // close twice, and made nothing for a launch that cannot run.
     try std.testing.expect(forked.worker_init_fd == null);
     try std.testing.expect(forked.pidfd == null);
-    try std.testing.expect(machine.tmp_root == null);
+    try std.testing.expectEqual(@as(std.posix.fd_t, -1), machine.route_table_memfd);
 
     var child = machine.abandon();
     defer child.pidfd.deinit();
@@ -383,20 +463,11 @@ test "a launch without its cgroup leaf fails before any local step and empties t
 }
 
 test "abandon hands back the pidfd and the cgroup leaf and releases everything else" {
-    var tmp_path_buffer: [96]u8 = undefined;
-    const tmp_path = try std.fmt.bufPrint(&tmp_path_buffer, "/tmp/collo-test-abandon-{d}-{d}", .{
-        std.os.linux.getpid(),
-        process.monotonicNowNsOrZero(),
-    });
-    try std.fs.makeDirAbsolute(tmp_path);
-    errdefer std.fs.deleteTreeAbsolute(tmp_path) catch {};
-
     var machine = posed(.failed, false);
     machine.pid = 4242;
     machine.pidfd = try eventFd();
     machine.cgroup_dir_fd = try eventFd();
     machine.cgroup_dir = try std.testing.allocator.dupe(u8, "/sys/fs/cgroup/never-touched");
-    machine.tmp_root = try std.testing.allocator.dupe(u8, tmp_path);
     const released = [_]std.posix.fd_t{
         try eventFd(), try eventFd(), try eventFd(), try eventFd(),
         try eventFd(), try eventFd(), try eventFd(), try eventFd(),
@@ -408,7 +479,7 @@ test "abandon hands back the pidfd and the cgroup leaf and releases everything e
     machine.ingress_payload_fd = released[4];
     machine.ingress_payload_credit_eventfd = released[5];
     machine.fs_fault_server_fd = released[6];
-    machine.tmp_root_dir_fd = released[7];
+    machine.fs_fault_worker_fd = released[7];
     const pidfd = machine.pidfd;
     const leaf_fd = machine.cgroup_dir_fd;
 
@@ -423,10 +494,8 @@ test "abandon hands back the pidfd and the cgroup leaf and releases everything e
     try expectOpen(leaf_fd);
     for (released) |fd|
         try expectClosed(fd);
-    // The tmp root goes with the machine; the cgroup path is only freed,
-    // since the leaf belongs to whoever reaps the child.
-    try std.testing.expectError(error.FileNotFound, std.fs.accessAbsolute(tmp_path, .{}));
-    try std.testing.expect(machine.tmp_root == null);
+    // The cgroup path is only freed, since the leaf belongs to whoever reaps
+    // the child.
     try std.testing.expect(machine.cgroup_dir == null);
     try std.testing.expectEqual(@as(std.posix.fd_t, -1), machine.pidfd);
     try std.testing.expectEqual(@as(std.posix.fd_t, -1), machine.cgroup_dir_fd);
@@ -527,7 +596,7 @@ test "a child that ended for memory before ready fails its launch with memory as
         const page_fd = try worker_shared_page.createMemfd("collo-test-ended-for-memory");
         defer std.posix.close(page_fd);
         var page = try worker_shared_page.mapReadWrite(page_fd);
-        page.initializeCrashDefault(4242, 64 * 1024 * 1024, 1);
+        page.initializeCrashDefault();
         page.setState(.dead, .memory);
         const pair = try fd_mod.socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
         std.posix.close(pair[1]);

@@ -429,6 +429,44 @@ test "worker_died answers 502 the request a lane holds on a worker another lane 
     try harness.expectFaulted(scene.stub, .exited);
 }
 
+test "worker_died for an owner the worker overran answers its request past its deadline 504 and its other request 502, both naming the fault" {
+    var scene: lane_harness.OneWorker = undefined;
+    // A deadline the test waits past for the first request, and long enough
+    // that the second, admitted after that wait, is still within its own.
+    try scene.init(.{ .concurrency = 2, .timeout_ms = 200 });
+    defer scene.deinit();
+    const harness = &scene.harness;
+    const late = try scene.get(1);
+    try lane_harness.waitUntilClockPasses(late.deadline_monotonic_ns);
+    _ = try scene.get(3);
+
+    // What the metrics thread does on finding the worker's page past its
+    // owner's deadline and the grace (`ingress/analytics_drain.zig`): the
+    // worker leaves service, and each lane the death names hears of it.
+    const death = harness.poolOf(scene.stub).markDead(scene.stub.record, scene.stub.key) orelse
+        return error.TestExpectedDeath;
+    try std.testing.expectEqual(@as(usize, 1), death.slice().len);
+    try std.testing.expect(try harness.service.postToLane(0, .{ .worker_died = .{
+        .worker_key = scene.stub.key,
+        .reason = .owner_overran,
+    } }));
+    try harness.handleCommands(0);
+
+    try scene.expectStatus(1, 504);
+    try scene.expectStatus(3, 502);
+    var statuses_seen: [2]u16 = undefined;
+    for (&statuses_seen) |*status| {
+        const record = harness.takeAccessRecord(0) orelse return error.AccessRecordMissing;
+        try std.testing.expectEqual(lane_harness.page.CompletedStatus.deadline, record.facts.error_code);
+        try std.testing.expectEqualStrings("owner_overran", record.facts.worker_fault);
+        status.* = record.status;
+    }
+    std.mem.sort(u16, &statuses_seen, {}, std.sort.asc(u16));
+    try std.testing.expectEqualSlices(u16, &.{ 502, 504 }, &statuses_seen);
+    try harness.expectLanesRunning();
+    try harness.expectFaulted(scene.stub, .owner_overran);
+}
+
 test "a death reaches a lane whose reserve is full through an ordinary place, which a worker's output never takes" {
     var scene: TwoLanes = undefined;
     try scene.init(.{});

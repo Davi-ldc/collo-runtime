@@ -18,7 +18,6 @@ namespace Collo::HostFunctions::FetchRequestInternal {
 
 using JSC::EncodedJSValue;
 using WTF::String;
-using namespace JSC;
 
 // A Request's options, initialized to the Request constructor's defaults. Enum options hold their IDL string values.
 struct RequestOptions {
@@ -33,16 +32,16 @@ struct RequestOptions {
     bool keepalive { false };
 };
 
-static JSValue propertyOrUndefined(
-    JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSObject* object, WTF::ASCIILiteral name)
+static JSC::JSValue propertyOrUndefined(
+    JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSC::JSObject* object, WTF::ASCIILiteral name)
 {
     auto value = object->get(global_object, JSC::Identifier::fromString(global_object->vm(), name));
     RETURN_IF_EXCEPTION(scope, {});
     return value;
 }
 
-static bool stringValueIfPresent(
-    JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSObject* object, WTF::ASCIILiteral name, String& out)
+static bool stringValueIfPresent(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSC::JSObject* object,
+    WTF::ASCIILiteral name, String& out)
 {
     auto value = propertyOrUndefined(global_object, scope, object, name);
     RETURN_IF_EXCEPTION(scope, false);
@@ -53,7 +52,8 @@ static bool stringValueIfPresent(
     return true;
 }
 
-static bool validateRequestWindowIfPresent(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSObject* object)
+static bool validateRequestWindowIfPresent(
+    JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSC::JSObject* object)
 {
     auto value = propertyOrUndefined(global_object, scope, object, "window"_s);
     RETURN_IF_EXCEPTION(scope, false);
@@ -63,8 +63,8 @@ static bool validateRequestWindowIfPresent(JSC::JSGlobalObject* global_object, J
     return false;
 }
 
-static bool boolValueIfPresent(
-    JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSObject* object, WTF::ASCIILiteral name, bool& out)
+static bool boolValueIfPresent(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSC::JSObject* object,
+    WTF::ASCIILiteral name, bool& out)
 {
     auto value = propertyOrUndefined(global_object, scope, object, name);
     RETURN_IF_EXCEPTION(scope, false);
@@ -104,7 +104,7 @@ static bool isValidRequestReferrerPolicy(const String& policy)
         || policy == "unsafe-url"_s;
 }
 
-static bool stringEnumValueIfPresent(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSObject* object,
+static bool stringEnumValueIfPresent(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSC::JSObject* object,
     WTF::ASCIILiteral name, String& out, bool (*is_valid)(const String&), WTF::ASCIILiteral message)
 {
     auto value = propertyOrUndefined(global_object, scope, object, name);
@@ -123,7 +123,7 @@ static bool stringEnumValueIfPresent(JSC::JSGlobalObject* global_object, JSC::Th
 }
 
 static bool referrerValueIfPresent(
-    JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSObject* object, String& out)
+    JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSC::JSObject* object, String& out)
 {
     auto value = propertyOrUndefined(global_object, scope, object, "referrer"_s);
     RETURN_IF_EXCEPTION(scope, false);
@@ -147,7 +147,7 @@ static bool referrerValueIfPresent(
 }
 
 static bool parseRequestOptionsIfPresent(
-    JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSObject* object, RequestOptions& options)
+    JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSC::JSObject* object, RequestOptions& options)
 {
     return validateRequestWindowIfPresent(global_object, scope, object)
         && referrerValueIfPresent(global_object, scope, object, options.referrer)

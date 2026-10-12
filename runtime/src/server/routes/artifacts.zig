@@ -26,12 +26,16 @@
 //!
 //! The pack holds each module some route reaches exactly once: route 0's
 //! entry and what it reaches first, breadth first, then whatever each later
-//! route adds, in route order. It is built with the host's graph pack builder
-//! (`createModulePackGraphFd` in `host/dispatch.zig`) with route 0's entry as
-//! its entry. The route table is built with `ipc.route_table`, one section
-//! per route with one entry per text binding. The filesystem index is the
-//! empty placeholder every definition shares until filesystem bindings
-//! exist; `Routes` owns it.
+//! route adds, in route order. It is encoded with `ipc.module_pack` with
+//! route 0's entry as its entry, then sealed (`sealed.zig`). The route table
+//! is built with `ipc.route_table`, one section per route with one entry per
+//! text binding. The filesystem index is the empty placeholder every
+//! definition shares until filesystem bindings exist; `Routes` owns it.
+//!
+//! A failure is either the configuration's, `error.RoutesInvalid` (a module
+//! that cannot be read or packed, a pack over its bound), or the server's,
+//! `error.RouteResourcesUnavailable` (a memfd, a descriptor quota, an I/O
+//! error), and every callee's errors are assigned to one of the two here.
 //!
 //! The memfds are sealed read-only, so any thread may duplicate them or pass
 //! them over SCM_RIGHTS while the server runs; nobody reads them through the
@@ -39,11 +43,11 @@
 
 const std = @import("std");
 const config = @import("collo_server_config");
-const host = @import("collo_host");
 const ipc = @import("collo_ipc");
 const fd_mod = @import("collo_os").fd;
 const server_limits = @import("collo_limits").server;
 const module_graph = @import("module_graph.zig");
+const sealed = @import("sealed.zig");
 
 const module_pack = ipc.module_pack;
 const route_bindings = ipc.route_bindings;
@@ -80,9 +84,9 @@ pub const BuildContext = struct {
     diagnostic: *Diagnostic,
 };
 
-/// Builds the artifact of `definition`. On `error.RouteBuildFailed` the
-/// diagnostic names the worker, and the route or module at fault when one
-/// is.
+/// Builds the artifact of `definition`. On `error.RoutesInvalid` and
+/// `error.RouteResourcesUnavailable` the diagnostic names the worker, and
+/// the route or module at fault when one is.
 pub fn buildDefinition(
     context: BuildContext,
     definition: *const config.WorkerDefinition,
@@ -107,7 +111,7 @@ pub fn buildDefinition(
                 definition.name,
                 module.path,
             });
-            return error.RouteBuildFailed;
+            return error.RoutesInvalid;
         };
     }
 
@@ -167,19 +171,18 @@ fn buildPack(
         };
     }
 
-    const raw_pack = host.dispatch.createModulePackGraphFd(context.gpa, modules, 0) catch |err| switch (err) {
+    const encoded = module_pack.buildAlloc(context.gpa, modules, 0) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.ModulePackTooLarge => return failWorker(context.diagnostic, definition, "the module pack exceeds {d} bytes", .{module_pack.max_pack_bytes}),
-        else => return failWorker(context.diagnostic, definition, "cannot build the module pack: {s}", .{@errorName(err)}),
+        error.ModulePackTooLarge, error.Overflow => return failWorker(context.diagnostic, definition, "the module pack exceeds {d} bytes", .{module_pack.max_pack_bytes}),
+        error.InvalidModulePack => return failWorker(context.diagnostic, definition, "cannot build the module pack: {s}", .{@errorName(err)}),
     };
-    var pack = fd_mod.OwnedFd.fromRaw(raw_pack);
-    errdefer pack.deinit();
-    const pack_stat = std.posix.fstat(pack.fd()) catch |err|
-        return failWorker(context.diagnostic, definition, "cannot read the module pack size: {s}", .{@errorName(err)});
-    const pack_bytes: u64 = @intCast(pack_stat.size);
+    defer context.gpa.free(encoded);
+    const pack_bytes: u64 = encoded.len;
     context.pack_bytes_total.* += pack_bytes;
     if (context.pack_bytes_total.* > server_limits.pack_bytes_total_max)
         return failWorker(context.diagnostic, definition, "the module packs of all workers exceed {d} bytes", .{server_limits.pack_bytes_total_max});
+    const pack = sealed.sealBytes("collo-route-pack-graph", encoded) catch |err|
+        return unavailable(context.diagnostic, definition, "cannot seal the module pack: {s}", .{@errorName(err)});
     return .{ .fd = pack, .bytes = pack_bytes, .module_count = @intCast(order.items.len) };
 }
 
@@ -209,7 +212,11 @@ fn buildRouteTable(
     }
     return route_table.buildSealed(context.gpa, inputs) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return failWorker(context.diagnostic, definition, "cannot build the route table: {s}", .{@errorName(err)}),
+        error.InvalidRouteTable => return failWorker(context.diagnostic, definition, "cannot build the route table: {s}", .{@errorName(err)}),
+        // `InvalidRouteTable` is the only error `buildSealed` derives from
+        // its input; the rest come from creating, writing and sealing the
+        // memfd.
+        else => return unavailable(context.diagnostic, definition, "cannot seal the route table: {s}", .{@errorName(err)}),
     };
 }
 
@@ -223,10 +230,15 @@ fn moduleKey(allocator: std.mem.Allocator, worker: []const u8, root: []const u8,
 
 fn failWorker(diagnostic: *Diagnostic, definition: *const config.WorkerDefinition, comptime format: []const u8, args: anytype) Error {
     diagnostic.set("worker '{s}': " ++ format, .{definition.name} ++ args);
-    return error.RouteBuildFailed;
+    return error.RoutesInvalid;
 }
 
 fn failRoute(diagnostic: *Diagnostic, label: module_graph.Label, comptime format: []const u8, args: anytype) Error {
     diagnostic.set("worker '{s}' route '{s}': " ++ format, .{ label.worker, label.pattern } ++ args);
-    return error.RouteBuildFailed;
+    return error.RoutesInvalid;
+}
+
+fn unavailable(diagnostic: *Diagnostic, definition: *const config.WorkerDefinition, comptime format: []const u8, args: anytype) Error {
+    diagnostic.set("worker '{s}': " ++ format, .{definition.name} ++ args);
+    return error.RouteResourcesUnavailable;
 }

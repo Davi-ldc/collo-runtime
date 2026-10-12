@@ -1,11 +1,14 @@
 //! Worker console lines (`server/analytics/logs.zig`): frame decoding, the
 //! `logs.jsonl` record and the stderr line for hostile message bytes, and
 //! draining a real log ring (a memfd page, as a worker maps it) into a sink
-//! in a temporary directory: line and drop-marker output, the line budget, a
-//! faulted ring, and console-only output without a directory. The sink's own
-//! buffering is covered in `sink.zig`, the ring's framing in
+//! in a temporary directory: line and drop-marker output, each line's request
+//! id kept only when the worker's requests confirm it, the lookup of a
+//! request's route through a request table, the line budget, a faulted ring,
+//! and console-only output without a directory. The sink's own buffering is
+//! covered in `sink.zig`, the ring's framing in
 //! `common/tests/worker_state/page.zig`, and the order the metrics tick
-//! drains worker rings in by `server/tests/ingress/analytics_drain.zig`.
+//! drains worker rings in, against a real request table, by
+//! `server/tests/ingress/analytics_drain.zig`.
 
 const std = @import("std");
 const analytics = @import("collo_server_analytics");
@@ -26,6 +29,52 @@ const identity = Identity{
     .worker_id = 7,
     .worker_generation = 3,
 };
+
+/// The identity a drain writes lines under: the worker's, with no route.
+const worker_identity = Identity{
+    .worker = "api.example.test",
+    .route = "",
+    .worker_id = 7,
+    .worker_generation = 3,
+};
+
+/// The requests a drain checks line ids against, as `logs.WorkerRequests`
+/// answers for a worker's request table: each known id with its route.
+const KnownRequests = struct {
+    known: []const Known = &.{},
+    lookups: usize = 0,
+
+    const Known = struct { request_id: u64, route: []const u8 };
+
+    pub fn routeOf(self: *KnownRequests, request_id: u64) ?[]const u8 {
+        self.lookups += 1;
+        for (self.known) |known| {
+            if (known.request_id == request_id)
+                return known.route;
+        }
+        return null;
+    }
+};
+
+/// A request table that holds requests 11 and 12, in its definition's routes
+/// 0 and 1, and counts the lookups it answers.
+const FakeTable = struct {
+    lookups: usize = 0,
+
+    pub fn routeOfRecent(self: *FakeTable, request_id: u64) ?u16 {
+        self.lookups += 1;
+        return switch (request_id) {
+            11 => 0,
+            12 => 1,
+            // A route index past the definition's routes, which only a
+            // broken table would hold.
+            13 => 9,
+            else => null,
+        };
+    }
+};
+
+const FakeRoute = struct { pattern: []const u8 };
 
 fn encodeJson(buffer: []u8, line: logs.Line) ![]const u8 {
     var writer: std.Io.Writer = .fixed(buffer);
@@ -78,6 +127,7 @@ test "a console line encodes as one valid JSON record whatever bytes the worker 
         .message = hostile,
         .truncated = true,
         .exception = false,
+        .runtime = false,
     });
     try std.testing.expect(std.mem.indexOfScalar(u8, json, '\n') == null);
     try std.testing.expect(std.mem.indexOfScalar(u8, json, 0xff) == null);
@@ -140,7 +190,7 @@ const RingHarness = struct {
         const fd = try page.createMemfd(name);
         errdefer std.posix.close(fd);
         target.* = .{ .fd = fd, .view = try page.mapReadWrite(fd) };
-        target.view.initializeCrashDefault(1, 4096, 1);
+        target.view.initializeCrashDefault();
     }
 
     fn deinit(self: *RingHarness) void {
@@ -195,12 +245,15 @@ test "a ring drain writes each line to logs.jsonl and stderr and reports drops o
     ring.view.countBudgetDroppedLogLine();
 
     var drop_reported: u64 = 0;
-    const drained = try logs.drainRing(&ring.view, identity, &drop_reported, &output.sink, clock, 100);
-    try std.testing.expectEqual(@as(usize, 3), drained);
+    var requests = KnownRequests{ .known = &.{.{ .request_id = 11, .route = "/users/:id" }} };
+    const drained = try logs.drainRing(&ring.view, &requests, worker_identity, &drop_reported, &output.sink, clock, 100);
+    try std.testing.expectEqual(@as(usize, 3), drained.lines);
+    try std.testing.expectEqual(@as(u64, 0), drained.ids_refused);
     try std.testing.expectEqual(@as(u64, 2), drop_reported);
 
     // A drain with nothing new writes nothing, not even a marker.
-    try std.testing.expectEqual(@as(usize, 0), try logs.drainRing(&ring.view, identity, &drop_reported, &output.sink, clock, 100));
+    const again = try logs.drainRing(&ring.view, &requests, worker_identity, &drop_reported, &output.sink, clock, 100);
+    try std.testing.expectEqual(@as(usize, 0), again.lines);
 
     const records = try output.readLines("logs.jsonl");
     defer std.testing.allocator.free(records);
@@ -222,14 +275,114 @@ test "a ring drain writes each line to logs.jsonl and stderr and reports drops o
 
     const console = try output.readLines("console.txt");
     defer std.testing.allocator.free(console);
+    // The third line was written under no request, so it names no route, and
+    // neither does the drop marker.
     try std.testing.expectEqualStrings(
         "[api.example.test /users/:id] first\n" ++
             "[api.example.test /users/:id] second\n" ++
-            "[api.example.test /users/:id] Error: boom\n" ++
+            "[api.example.test] Error: boom\n" ++
             "      at handler\n" ++
-            "[api.example.test /users/:id] collo: 2 console lines dropped\n",
+            "[api.example.test] collo: 2 console lines dropped\n",
         console,
     );
+}
+
+test "a line keeps its request id only when the worker's requests confirm it, and takes that request's route" {
+    var ring: RingHarness = undefined;
+    try ring.init("analytics-logs-request-ids");
+    defer ring.deinit();
+    var output: SinkHarness = undefined;
+    try output.init(true);
+    defer output.deinit();
+
+    // Request 11 is the worker's; request 12 is not, such as another
+    // tenant's request whose id the worker guessed.
+    ring.view.publishLogLine(.info, 0, 11, 4_000_000_000, "mine");
+    ring.view.publishLogLine(.warn, 0, 12, 4_000_000_000, "forged");
+    ring.view.publishLogLine(.info, 0, 0, 4_000_000_000, "top level");
+
+    var drop_reported: u64 = 0;
+    var requests = KnownRequests{ .known = &.{.{ .request_id = 11, .route = "/users/:id" }} };
+    const drained = try logs.drainRing(&ring.view, &requests, worker_identity, &drop_reported, &output.sink, clock, 100);
+    try std.testing.expectEqual(@as(usize, 3), drained.lines);
+    // A line under no request asks nothing and counts as nothing.
+    try std.testing.expectEqual(@as(u64, 1), drained.ids_refused);
+    try std.testing.expectEqual(@as(usize, 2), requests.lookups);
+
+    const records = try output.readLines("logs.jsonl");
+    defer std.testing.allocator.free(records);
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, records, "\n"), '\n');
+    const expected = [_]struct { request_id: i64, route: []const u8, message: []const u8 }{
+        .{ .request_id = 11, .route = "/users/:id", .message = "mine" },
+        .{ .request_id = 0, .route = "", .message = "forged" },
+        .{ .request_id = 0, .route = "", .message = "top level" },
+    };
+    for (expected) |line_expected| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, lines.next().?, .{});
+        defer parsed.deinit();
+        const object = parsed.value.object;
+        try std.testing.expectEqual(line_expected.request_id, object.get("request_id").?.integer);
+        try std.testing.expectEqualStrings(line_expected.route, object.get("route").?.string);
+        try std.testing.expectEqualStrings(line_expected.message, object.get("message").?.string);
+    }
+    try std.testing.expect(lines.next() == null);
+
+    const console = try output.readLines("console.txt");
+    defer std.testing.allocator.free(console);
+    try std.testing.expectEqualStrings(
+        "[api.example.test /users/:id] mine\n" ++
+            "[api.example.test] forged\n" ++
+            "[api.example.test] top level\n",
+        console,
+    );
+}
+
+test "a runtime line reaches stderr under the worker's runtime prefix and never the tenant's log" {
+    var ring: RingHarness = undefined;
+    try ring.init("analytics-logs-runtime");
+    defer ring.deinit();
+    var output: SinkHarness = undefined;
+    try output.init(true);
+    defer output.deinit();
+
+    ring.view.publishLogLine(.warn, page.LogLineFlags.runtime, 0, 4_000_000_000, "response extraction failed");
+    ring.view.publishLogLine(.info, 0, 0, 4_000_000_000, "tenant");
+
+    var drop_reported: u64 = 0;
+    var requests = KnownRequests{};
+    const drained = try logs.drainRing(&ring.view, &requests, worker_identity, &drop_reported, &output.sink, clock, 100);
+    try std.testing.expectEqual(@as(usize, 2), drained.lines);
+    try std.testing.expectEqual(@as(u64, 1), output.sink.stats(.logs).appended);
+
+    const records = try output.readLines("logs.jsonl");
+    defer std.testing.allocator.free(records);
+    try std.testing.expect(std.mem.indexOf(u8, records, "response extraction failed") == null);
+    const console = try output.readLines("console.txt");
+    defer std.testing.allocator.free(console);
+    try std.testing.expectEqualStrings(
+        "[api.example.test runtime] response extraction failed\n" ++
+            "[api.example.test] tenant\n",
+        console,
+    );
+}
+
+test "a worker's request table answers a line's route through its definition's routes, once per run of lines" {
+    var table = FakeTable{};
+    const routes = [_]FakeRoute{ .{ .pattern = "/a" }, .{ .pattern = "/b/:id" } };
+    var requests: logs.WorkerRequests(FakeTable, FakeRoute) = .{ .table = &table, .routes = &routes };
+
+    try std.testing.expectEqualStrings("/a", requests.routeOf(11).?);
+    try std.testing.expectEqualStrings("/a", requests.routeOf(11).?);
+    // The second line of a run asked the table nothing.
+    try std.testing.expectEqual(@as(usize, 1), table.lookups);
+    try std.testing.expectEqualStrings("/b/:id", requests.routeOf(12).?);
+    try std.testing.expectEqual(@as(usize, 2), table.lookups);
+    try std.testing.expect(requests.routeOf(99) == null);
+    // An index past the definition's routes names no route.
+    try std.testing.expect(requests.routeOf(13) == null);
+    // A refused id leaves the last answer in place.
+    try std.testing.expectEqualStrings("/b/:id", requests.routeOf(12).?);
+    try std.testing.expectEqual(@as(usize, 4), table.lookups);
 }
 
 test "a ring drain stops at its line budget and leaves the rest for the next one" {
@@ -245,8 +398,11 @@ test "a ring drain stops at its line budget and leaves the rest for the next one
         ring.view.publishLogLine(.info, 0, index, 4_000_000_000, "line");
 
     var drop_reported: u64 = 0;
-    try std.testing.expectEqual(@as(usize, 2), try logs.drainRing(&ring.view, identity, &drop_reported, &output.sink, clock, 2));
-    try std.testing.expectEqual(@as(usize, 3), try logs.drainRing(&ring.view, identity, &drop_reported, &output.sink, clock, 100));
+    var requests = KnownRequests{};
+    const first = try logs.drainRing(&ring.view, &requests, worker_identity, &drop_reported, &output.sink, clock, 2);
+    try std.testing.expectEqual(@as(usize, 2), first.lines);
+    const rest = try logs.drainRing(&ring.view, &requests, worker_identity, &drop_reported, &output.sink, clock, 100);
+    try std.testing.expectEqual(@as(usize, 3), rest.lines);
     try std.testing.expectEqual(@as(u64, 5), output.sink.stats(.logs).appended);
     try std.testing.expectEqual(@as(u64, 5), output.sink.stats(.console).appended);
 }
@@ -264,9 +420,10 @@ test "a faulted ring fails the drain and gets no drop marker" {
     @atomicStore(u32, &ring.view.log_header.fatal, 1, .release);
 
     var drop_reported: u64 = 0;
+    var requests = KnownRequests{};
     try std.testing.expectError(
         error.LogRingFatal,
-        logs.drainRing(&ring.view, identity, &drop_reported, &output.sink, clock, 100),
+        logs.drainRing(&ring.view, &requests, worker_identity, &drop_reported, &output.sink, clock, 100),
     );
     try std.testing.expectEqual(@as(u64, 0), drop_reported);
     try std.testing.expectEqual(@as(u64, 0), output.sink.stats(.logs).appended);
@@ -274,7 +431,7 @@ test "a faulted ring fails the drain and gets no drop marker" {
 
     // Teardown's drain of the same ring writes none of its lines to the sink;
     // `drainDyingRing` only logs that they are lost.
-    logs.drainDyingRing(&ring.view, identity, &drop_reported, &output.sink);
+    try std.testing.expectEqual(@as(u64, 0), logs.drainDyingRing(&ring.view, &requests, worker_identity, &drop_reported, &output.sink));
     try std.testing.expectEqual(@as(u64, 0), output.sink.stats(.console).appended);
 }
 
@@ -288,7 +445,8 @@ test "without a directory console lines still reach stderr and their records are
 
     ring.view.publishLogLine(.info, 0, 1, 4_000_000_000, "only stderr");
     var drop_reported: u64 = 0;
-    logs.drainDyingRing(&ring.view, identity, &drop_reported, &output.sink);
+    var requests = KnownRequests{ .known = &.{.{ .request_id = 1, .route = "/users/:id" }} };
+    try std.testing.expectEqual(@as(u64, 0), logs.drainDyingRing(&ring.view, &requests, worker_identity, &drop_reported, &output.sink));
 
     try std.testing.expectEqual(@as(u64, 1), output.sink.stats(.logs).discarded);
     const console = try output.readLines("console.txt");

@@ -1,6 +1,6 @@
 // Cell implementations for `Crypto`, `SubtleCrypto` and `CryptoKey`, the CryptoKey getters, and the interface
-// constructors that refuse every call. Runs on the VM thread. Destructors zero the secret bytes a cell holds, the
-// entropy cache included, and free the asymmetric key it owns.
+// constructors that refuse every call. Runs on the VM thread. Destroying a cell zeroes the secret bytes it holds: a
+// key's material through `SecretBytes`, the entropy cache by hand. It also frees the asymmetric key the cell owns.
 
 #include "jsc/runtime/state.h"
 
@@ -143,7 +143,7 @@ JSC::Structure* JSColloCryptoKey::createStructure(
 }
 
 JSColloCryptoKey* JSColloCryptoKey::create(JSC::VM& vm, JSC::Structure* structure, CryptoKeyAlgorithm algorithm,
-    WebCryptoHash hash, WTF::Vector<uint8_t>&& material, bool extractable, uint8_t usages, size_t hmac_length_bits)
+    WebCryptoHash hash, SecretBytes&& material, bool extractable, uint8_t usages, size_t hmac_length_bits)
 {
     auto* object = new (NotNull, JSC::allocateCell<JSColloCryptoKey>(vm))
         JSColloCryptoKey(vm, structure, algorithm, hash, WTF::move(material), extractable, usages, hmac_length_bits);
@@ -182,7 +182,7 @@ JSColloCryptoKey* JSColloCryptoKey::createOkp(JSC::VM& vm, JSC::Structure* struc
 void JSColloCryptoKey::destroy(JSC::JSCell* cell) { static_cast<JSColloCryptoKey*>(cell)->~JSColloCryptoKey(); }
 
 JSColloCryptoKey::JSColloCryptoKey(JSC::VM& vm, JSC::Structure* structure, CryptoKeyAlgorithm algorithm,
-    WebCryptoHash hash, WTF::Vector<uint8_t>&& material, bool extractable, uint8_t usages, size_t hmac_length_bits)
+    WebCryptoHash hash, SecretBytes&& material, bool extractable, uint8_t usages, size_t hmac_length_bits)
     : Base(vm, structure)
     , m_algorithm(algorithm)
     , m_type(CryptoKeyType::Secret)
@@ -225,12 +225,6 @@ JSColloCryptoKey::JSColloCryptoKey(JSC::VM& vm, JSC::Structure* structure, Crypt
 
 JSColloCryptoKey::~JSColloCryptoKey()
 {
-    if (!m_material.isEmpty()) {
-        WTF::secureZeroSpan(std::span<uint8_t> {
-            m_material.mutableSpan().data(),
-            m_material.size(),
-        });
-    }
     if (m_rsa_key)
         EVP_PKEY_free(m_rsa_key);
 }

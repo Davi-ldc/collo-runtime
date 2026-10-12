@@ -19,11 +19,13 @@ const supervision = @import("collo_server_supervisor");
 /// defaults.
 pub const Config = struct {
     lane_id: u16 = 0,
-    /// The worker definitions the lane serves, which size its command
-    /// queue's reserve (`obligationReserve`). It has no default: a reserve
-    /// smaller than the configuration needs refuses worker output the
-    /// forwarding window promised a place to.
+    /// The worker definitions the lane serves and every definition's
+    /// `concurrency` added up (`Routes.slotsPerWorkerTotal`), which size its
+    /// command queue's reserve (`obligationReserve`). Neither has a default:
+    /// a reserve smaller than the configuration needs refuses worker output
+    /// the forwarding window promised a place to.
     definition_count: usize,
+    slots_per_worker_total: usize,
     /// Deadline wheel entries: one per request the lane can hold.
     max_requests: usize = limits.ingress.requests_per_lane_max,
     deadline_wheel_slots: usize = timer_wheel.minimum_slots,
@@ -31,13 +33,15 @@ pub const Config = struct {
 };
 
 /// The command places a lane reserves for `definition_count` worker
-/// definitions: for each entry of each pool's worker table, one death, one
-/// reader grant, one forwarded completion per slot, and the forwarding
-/// window of the entry's output (`commands.zig` says why that bounds them).
-pub fn obligationReserve(definition_count: usize) usize {
-    const per_entry = 2 + @as(usize, supervision.pool.slots_per_worker_max) +
-        limits.ingress.forwarded_commands_per_worker_max;
-    return per_entry * definition_count * supervision.scheduler_limits.capacity.pool_workers_max;
+/// definitions whose `concurrency` adds up to `slots_per_worker_total`: for
+/// each entry of each pool's worker table, one death, one reader grant, one
+/// forwarded completion per slot of its own definition's `concurrency`, and
+/// the forwarding window of the entry's output (`commands.zig` says why that
+/// bounds them).
+pub fn obligationReserve(definition_count: usize, slots_per_worker_total: usize) usize {
+    std.debug.assert(slots_per_worker_total <= definition_count * supervision.pool.slots_per_worker_max);
+    const per_definition = 2 + limits.ingress.forwarded_commands_per_worker_max;
+    return (definition_count * per_definition + slots_per_worker_total) * limits.pool.pool_workers_max;
 }
 
 /// Monotonic counters of one lane. `Service.countersSnapshot` sums them over
@@ -57,6 +61,10 @@ pub const CounterSnapshot = struct {
     ring_enters: u64 = 0,
     /// Streams whose path matched a route in the route table.
     route_matches: u64 = 0,
+    /// New streams refused with REFUSED_STREAM, which the client may retry:
+    /// the connection held its most streams, or the lane's stream or request
+    /// slab was full.
+    streams_refused: u64 = 0,
     /// Requests that took a worker slot at admission (`Pool.acquire` answered
     /// `.acquired`).
     worker_pool_ready_picks: u64 = 0,
@@ -79,6 +87,9 @@ pub const CounterSnapshot = struct {
     /// `release_worker` posts a full reader's queue refused; the reader
     /// keeps its role.
     release_worker_refusals: u64 = 0,
+    /// Notices this lane read, as a worker's reader, of a worker asking to be
+    /// retired (`worker_control.zig`).
+    retirement_notices: u64 = 0,
     /// Workers this lane faulted because a request outlived its deadline by
     /// the hard-timeout grace.
     deadline_grace_faults: u64 = 0,
@@ -187,7 +198,7 @@ pub const IngressLane = struct {
         errdefer wheel.deinit();
         var queue = try commands.Queue.init(
             config.command_queue_capacity,
-            obligationReserve(config.definition_count),
+            obligationReserve(config.definition_count, config.slots_per_worker_total),
         );
         errdefer queue.deinit();
         return .{

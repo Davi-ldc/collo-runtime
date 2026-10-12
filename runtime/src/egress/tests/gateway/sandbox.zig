@@ -1,8 +1,8 @@
 //! Tests of the gateway's sandbox (`egress/gateway/sandbox.zig`): the Landlock write mask
 //! for each kernel version, the private root a forked child builds and enters, the syscall
 //! filter's refusal of Unix sockets, and, in a real gateway spawned from the installed binary,
-//! the decoder libraries its boot loads before that root hides every library. The children apply
-//! the real sandbox. A host that lacks a CA bundle or zlib, or on which a separate probe child
+//! that no codec or ICU shared object is mapped, since the binary links them. The children apply
+//! the real sandbox. A host that lacks a CA bundle, or on which a separate probe child
 //! cannot enter unprivileged user and mount namespaces or install a seccomp filter, skips them,
 //! saying which; once the probe passes, any error the sandbox returns fails the test with its
 //! name. The whole boot of a sandboxed gateway behind the server is covered by local-e2e. Lane:
@@ -10,9 +10,12 @@
 
 const std = @import("std");
 const gateway = @import("collo_egress_gateway");
+const os = @import("collo_os");
 const server_gateway = @import("collo_server_gateway");
-const decompress = @import("collo_egress_client").decompress;
 const process_options = @import("collo_process_options");
+
+const policy_image = @import("support/policy_image.zig");
+
 const sandbox = gateway.sandbox;
 const linux = std.os.linux;
 
@@ -22,6 +25,10 @@ const probe_missing: u8 = 1;
 
 /// Bound on a `/proc/<pid>/maps` read; a gateway's maps are a few hundred lines.
 const maps_bytes_max: usize = 4 * 1024 * 1024;
+
+/// File-name prefixes of the shared objects for libraries the binary links statically: zlib,
+/// brotli, zstd and ICU.
+const linked_library_prefixes = [_][]const u8{ "libz.so", "libbrotli", "libzstd", "libicu" };
 
 test "egress gateway Landlock mask tracks supported write-deny rights" {
     const v1 = sandbox.readOnlyLandlockAccessMaskForAbi(1);
@@ -55,7 +62,12 @@ test "a sandboxed gateway sees a read-only root holding the host's trust store a
     };
     if (pid == 0) {
         std.posix.close(pipe[0]);
-        sandbox.applyProcessBaseline() catch |err| {
+        // The gateway's own order (`runtime/root.zig:run`): the plan reads what the sandbox hides.
+        const plan = gateway.sizing.Plan.compute() catch |err| {
+            writeReport(pipe[1], .{ .failed = @intFromError(err) });
+            childExit(0);
+        };
+        sandbox.applyProcessBaseline(plan) catch |err| {
             writeReport(pipe[1], .{ .failed = @intFromError(err) });
             childExit(0);
         };
@@ -74,12 +86,7 @@ test "a sandboxed gateway sees a read-only root holding the host's trust store a
     try std.testing.expectEqual(@as(u16, 0b1_1111), checks);
 }
 
-test "a sandboxed gateway holds every decoder library the host provides when it reports ready" {
-    const host_decoders = decompress.load();
-    if (!host_decoders.zlib) {
-        std.debug.print("skipped: zlib does not load on this host\n", .{});
-        return error.SkipZigTest;
-    }
+test "a sandboxed gateway maps no zlib, brotli, zstd or ICU shared object" {
     if (!hostHasTrustStore()) {
         std.debug.print("skipped: no CA bundle on this host\n", .{});
         return error.SkipZigTest;
@@ -93,24 +100,31 @@ test "a sandboxed gateway holds every decoder library the host provides when it 
         return error.SkipZigTest;
     }
 
-    // An exec'd gateway, unlike a fork of this process, starts without the libraries this
-    // process has loaded, so only its own boot can have mapped them.
-    const table = gateway.policy.PolicyTable.single(gateway.policy.public_https);
+    // An exec'd gateway, unlike a fork of this process, maps only what its own binary and boot
+    // load.
+    const image = try policy_image.standard(std.testing.allocator);
+    defer std.testing.allocator.free(image);
+    var memfd = try policy_image.memfdHolding(image, os.fd.memfd_readonly_seals);
+    defer memfd.deinit();
     var spawned = try server_gateway.process.spawn(std.testing.allocator, .{
         .executable_path = process_options.collo_executable_path,
         .key = .{ .bytes = @splat(0x5a) },
-        .table = &table,
+        .policy_image = .{ .fd = memfd.borrow(), .bytes = @intCast(image.len) },
     });
     defer spawned.deinit();
 
-    // Ready comes after the sandbox, whose root holds no library, so what the gateway maps now is
-    // every decoder it will ever have.
+    // Ready comes after the sandbox, whose root holds no shared object, so what the gateway maps
+    // now is every library it will ever map.
     var path_buffer: [32]u8 = undefined;
     const maps_path = try std.fmt.bufPrint(&path_buffer, "/proc/{d}/maps", .{spawned.pid});
     const maps = try std.fs.cwd().readFileAlloc(std.testing.allocator, maps_path, maps_bytes_max);
     defer std.testing.allocator.free(maps);
-    try std.testing.expect(mapsFileStartingWith(maps, "libz.so"));
-    try std.testing.expectEqual(host_decoders.brotli, mapsFileStartingWith(maps, "libbrotlidec.so"));
+    for (linked_library_prefixes) |prefix| {
+        if (mapsFileStartingWith(maps, prefix)) {
+            std.debug.print("the gateway maps a shared object starting with {s}\n", .{prefix});
+            return error.TestUnexpectedResult;
+        }
+    }
 }
 
 test "the gateway's syscall filter refuses Unix sockets and allows network sockets" {
@@ -150,9 +164,9 @@ test "the gateway's syscall filter refuses Unix sockets and allows network socke
     try std.testing.expectEqual(@as(u16, 0b1111), checks);
 }
 
-/// What a sandboxed child sends back: the bits of the checks that held, or the error the
-/// sandbox returned. The child is a fork of this binary, so the error's integer names the same
-/// error here.
+/// What a sandboxed child sends back: the bits of the checks that held, or the error the sandbox
+/// or the sizing plan before it returned. The child is a fork of this binary, so the error's
+/// integer names the same error here.
 const Report = union(enum) {
     checks: u16,
     failed: u16,

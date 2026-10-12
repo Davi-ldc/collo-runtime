@@ -20,13 +20,14 @@
 #include <JavaScriptCore/JSFunction.h>
 #include <JavaScriptCore/JSObject.h>
 #include <JavaScriptCore/JSString.h>
+#include <JavaScriptCore/MarkedVector.h>
 #include <JavaScriptCore/SlotVisitorMacros.h>
-#include <wtf/HashSet.h>
-#include <wtf/Locker.h>
 #include <wtf/Scope.h>
 #include <wtf/Vector.h>
 #include <wtf/text/WTFString.h>
 
+#include <algorithm>
+#include <functional>
 #include <limits>
 #include <optional>
 
@@ -45,11 +46,7 @@ template <typename Visitor> void JSColloEventTarget::visitChildrenImpl(JSC::JSCe
     auto* this_object = static_cast<JSColloEventTarget*>(cell);
     ASSERT_GC_OBJECT_INHERITS(this_object, info());
     Base::visitChildren(this_object, visitor);
-    // The cell lock keeps the listener vector buffer stable while the
-    // concurrent marker walks it; mutators take the same lock around
-    // buffer-moving operations (see listenerOwnerCell call sites).
-    WTF::Locker locker { this_object->cellLock() };
-    this_object->m_event_target.visitChildren(visitor);
+    this_object->m_event_target.visit(this_object, visitor);
 }
 
 DEFINE_VISIT_CHILDREN(JSColloEventTarget);
@@ -146,17 +143,10 @@ static bool isValidListener(JSValue listener)
 
 static bool sameCallback(JSValue left, JSValue right) { return JSC::JSValue::strictEqual(nullptr, left, right); }
 
-// The cell whose visitChildren walks this handle's listener vector; its
-// cellLock() guards the vector buffer against the concurrent marker.
-static JSC::JSCell* listenerOwnerCell(const WebApiEventTargetHandle& target)
-{
-    return target.listener_owner ? target.listener_owner : target.object;
-}
-
+// What a dispatch remembers of each matching listener. Its callback sits at the same index in a MarkedArgumentBuffer
+// beside the snapshots, which roots it while the listeners run.
 struct EventListenerDispatchSnapshot {
     String type;
-    // Strong: past eight entries the snapshot buffer is on the heap, out of the conservative stack scan's reach.
-    JSC::Strong<JSC::Unknown> callback;
     uint64_t order { 0 };
     bool once { false };
     bool passive { false };
@@ -176,9 +166,9 @@ static void unlinkAbortCleanupForListener(
 static void removeMatchingListener(
     const WebApiEventTargetHandle& target, const String& type, JSValue callback, bool capture)
 {
-    auto& listeners = target.data->listeners();
-    for (unsigned index = 0; index < listeners.size(); index++) {
-        auto& listener = listeners[index];
+    const auto& listeners = target.data->listeners();
+    for (size_t index = 0; index < listeners.size(); index++) {
+        const auto& listener = listeners.at(index);
         if (listener.removed)
             continue;
         if (listener.attribute_handler)
@@ -189,10 +179,7 @@ static void removeMatchingListener(
             break;
         }
     }
-    {
-        WTF::Locker locker { listenerOwnerCell(target)->cellLock() };
-        target.data->compactRemovedIfIdle();
-    }
+    target.data->compactRemovedIfIdle(target.owner());
 }
 
 static EncodedJSValue callListener(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSC::JSObject* target,
@@ -292,33 +279,29 @@ static EncodedJSValue addEventListenerToTarget(JSC::JSGlobalObject* global_objec
             && listener.type == type && sameCallback(listener.callback.get(), listener_value))
             return JSValue::encode(JSC::jsUndefined());
     }
-    if (target.data->activeListenerCount() >= WebApiEventTargetMaxListeners) {
-        auto* exception = createDOMException(
-            global_object, DOMExceptionCode::QuotaExceededError, "EventTarget listener limit exceeded"_s);
-        return JSValue::encode(JSC::throwException(global_object, scope, exception));
-    }
 
     WebApiEventListenerRecord record;
     record.type = type;
-    record.callback.set(vm, target.listener_owner ? target.listener_owner : target.object, listener_value);
+    record.callback.setWithoutWriteBarrier(listener_value);
     record.order = target.data->allocateListenerOrder();
     record.capture = options->capture;
     record.once = options->once;
     record.passive = options->passive;
     if (signal) {
-        record.signal.set(vm, target.listener_owner ? target.listener_owner : target.object, signal);
+        record.signal.setWithoutWriteBarrier(signal);
         record.has_signal = true;
     }
-    bool listener_appended = false;
-    {
-        // The append may move the buffer the concurrent marker walks.
-        WTF::Locker locker { listenerOwnerCell(target)->cellLock() };
-        listener_appended = target.data->listeners().tryAppend(WTF::move(record));
-        if (listener_appended)
-            target.data->noteListenerAppended();
+    switch (target.data->appendListener(vm, target.owner(), WTF::move(record))) {
+    case WebApiEventTargetData::AppendResult::Appended:
+        break;
+    case WebApiEventTargetData::AppendResult::LimitReached: {
+        auto* exception = createDOMException(
+            global_object, DOMExceptionCode::QuotaExceededError, "EventTarget listener limit exceeded"_s);
+        return JSValue::encode(JSC::throwException(global_object, scope, exception));
     }
-    if (!listener_appended)
+    case WebApiEventTargetData::AppendResult::OutOfMemory:
         return JSValue::encode(JSC::throwOutOfMemoryError(global_object, scope));
+    }
     webApiMessagePortDidAddListener(target, type);
     if (signal && !signal->addEventTargetCleanup(vm, target.object, type, listener_value, options->capture)) {
         // Without its cleanup record the signal's abort could not remove the listener, so the listener is removed
@@ -531,19 +514,34 @@ void clearWebApiEventTargetListeners(WebApiEventTargetHandle target)
     if (!target.data)
         return;
 
-    WTF::HashSet<JSColloAbortSignal*> signals;
-    for (auto& listener : target.data->listeners()) {
+    // A signal drops every record of this target in one call, so each signal is called once: the signals are gathered,
+    // sorted and deduplicated first. When that list cannot grow, each listener's signal is called instead, which
+    // repeats the call for a shared signal but drops the same records.
+    auto signal_of = [](const WebApiEventListenerRecord& listener) -> JSColloAbortSignal* {
         if (listener.removed || !listener.has_signal)
-            continue;
-        auto* signal = webApiAbortSignalFromValue(listener.signal.get());
-        if (!signal)
-            continue;
-        auto add_result = signals.add(signal);
-        if (add_result.isNewEntry)
-            signal->removeEventTargetCleanupsForTarget(target.object);
+            return nullptr;
+        return webApiAbortSignalFromValue(listener.signal.get());
+    };
+    JSC::MarkedVector<JSColloAbortSignal*, 8, WTF::RecordOverflow> signals;
+    for (auto& listener : target.data->listeners()) {
+        if (auto* signal = signal_of(listener))
+            signals.append(signal);
     }
-    WTF::Locker locker { listenerOwnerCell(target)->cellLock() };
-    target.data->clearListeners();
+    if (signals.hasOverflowed()) {
+        for (auto& listener : target.data->listeners()) {
+            if (auto* signal = signal_of(listener))
+                signal->removeEventTargetCleanupsForTarget(target.object);
+        }
+    } else {
+        std::sort(signals.begin(), signals.end(), std::less<JSColloAbortSignal*>());
+        JSColloAbortSignal* previous = nullptr;
+        for (auto* signal : signals) {
+            if (signal != previous)
+                signal->removeEventTargetCleanupsForTarget(target.object);
+            previous = signal;
+        }
+    }
+    target.data->clearListeners(target.owner());
 }
 
 static JSValue globalEventHandler(JSC::JSGlobalObject* global_object, const String& event_type)
@@ -595,6 +593,9 @@ JSC::EncodedJSValue dispatchWebApiEventWithAttributeHandler(JSC::JSGlobalObject*
     WTF::String attribute_event_type)
 {
     auto& vm = global_object->vm();
+    // A termination an earlier call left must not enter a listener.
+    if (scope.exception())
+        return {};
     auto* event = dynamicDowncast<JSColloEvent>(event_value);
     if (!event)
         return JSC::throwVMTypeError(global_object, scope, "EventTarget.dispatchEvent requires an Event"_s);
@@ -612,9 +613,7 @@ JSC::EncodedJSValue dispatchWebApiEventWithAttributeHandler(JSC::JSGlobalObject*
     target.data->enterDispatch();
     auto leave_dispatch = WTF::makeScopeExit([&] {
         event->finishDispatch();
-        // leaveDispatch may compact the buffer the concurrent marker walks.
-        WTF::Locker locker { listenerOwnerCell(target)->cellLock() };
-        target.data->leaveDispatch();
+        target.data->leaveDispatch(target.owner());
     });
 
     bool attribute_called = attribute_handler.isUndefinedOrNull();
@@ -649,45 +648,43 @@ JSC::EncodedJSValue dispatchWebApiEventWithAttributeHandler(JSC::JSGlobalObject*
     }
 
     WTF::Vector<EventListenerDispatchSnapshot, 8> listeners;
-    auto& live_listeners = target.data->listeners();
-    listeners.reserveInitialCapacity(live_listeners.size());
-    for (unsigned index = 0; index < live_listeners.size(); index++) {
-        auto& listener = live_listeners[index];
+    JSC::MarkedArgumentBuffer callbacks;
+    const auto& live_listeners = target.data->listeners();
+    if (!listeners.tryReserveInitialCapacity(live_listeners.size()))
+        return JSValue::encode(JSC::throwOutOfMemoryError(global_object, scope));
+    for (auto& listener : live_listeners) {
         if (listener.removed || listener.type != event->type())
             continue;
-        EventListenerDispatchSnapshot snapshot;
-        snapshot.type = listener.type;
-        snapshot.callback.set(vm, listener.callback.get());
-        snapshot.order = listener.order;
-        snapshot.once = listener.once;
-        snapshot.passive = listener.passive;
-        listeners.append(WTF::move(snapshot));
+        listeners.append(EventListenerDispatchSnapshot { listener.type, listener.order, listener.once, listener.passive });
+        callbacks.append(listener.callback.get());
     }
+    if (callbacks.hasOverflowed())
+        return JSValue::encode(JSC::throwOutOfMemoryError(global_object, scope));
 
     // Finds a snapshot's live record by its `order`, which no other record of the target shares, rather than by a
     // captured index, so a listener added or removed by script cannot make a snapshot alias another record. Returns
     // the live index, or npos when the record was removed or no longer matches the snapshot's type and callback.
     //
-    // The live vector and the snapshot are both in ascending order: a new record gets a higher order than any before
-    // it and lands at the tail, and compaction keeps the order. A forward cursor that advances with the loop therefore
+    // The live list and the snapshot are both in ascending order: a new record gets a higher order than any before it
+    // and lands at the tail, and compaction keeps the order. A forward cursor that advances with the loop therefore
     // finds most records in O(1), and a record added during the dispatch sits after every snapshot, so the wrapping
     // scan still reaches each live snapshot with a higher order.
-    constexpr unsigned npos = std::numeric_limits<unsigned>::max();
-    unsigned live_cursor = 0;
-    auto findLiveSnapshotListener = [&target, &live_cursor](const EventListenerDispatchSnapshot& snapshot) -> unsigned {
-        auto& current_listeners = target.data->listeners();
-        const unsigned size = current_listeners.size();
+    constexpr size_t npos = std::numeric_limits<size_t>::max();
+    size_t live_cursor = 0;
+    auto findLiveSnapshotListener
+        = [&target, &live_cursor](const EventListenerDispatchSnapshot& snapshot, JSValue callback) -> size_t {
+        const auto& current_listeners = target.data->listeners();
+        const size_t size = current_listeners.size();
         if (live_cursor > size)
             live_cursor = 0;
-        for (unsigned step = 0; step < size; step++) {
-            unsigned index = live_cursor + step;
+        for (size_t step = 0; step < size; step++) {
+            size_t index = live_cursor + step;
             if (index >= size)
                 index -= size;
-            auto& listener = current_listeners[index];
+            const auto& listener = current_listeners.at(index);
             if (listener.order != snapshot.order)
                 continue;
-            if (listener.removed || listener.type != snapshot.type
-                || !sameCallback(listener.callback.get(), snapshot.callback.get()))
+            if (listener.removed || listener.type != snapshot.type || !sameCallback(listener.callback.get(), callback))
                 return npos;
             live_cursor = index + 1;
             return index;
@@ -695,10 +692,12 @@ JSC::EncodedJSValue dispatchWebApiEventWithAttributeHandler(JSC::JSGlobalObject*
         return npos;
     };
 
-    for (auto& snapshot : listeners) {
+    for (size_t snapshot_index = 0; snapshot_index < listeners.size(); snapshot_index++) {
+        const auto& snapshot = listeners[snapshot_index];
+        JSValue callback = callbacks.at(snapshot_index);
         // Between resolving live_index and using it, the only script that can run is the attribute handler, so the
         // index is resolved again only after that handler ran.
-        unsigned live_index = findLiveSnapshotListener(snapshot);
+        size_t live_index = findLiveSnapshotListener(snapshot, callback);
         if (live_index == npos)
             continue;
         if (!attribute_called && attribute_order < snapshot.order) {
@@ -706,17 +705,17 @@ JSC::EncodedJSValue dispatchWebApiEventWithAttributeHandler(JSC::JSGlobalObject*
                 return {};
             if (event->immediatePropagationStopped())
                 break;
-            live_index = findLiveSnapshotListener(snapshot);
+            live_index = findLiveSnapshotListener(snapshot, callback);
             if (live_index == npos)
                 continue;
         }
         if (snapshot.once) {
-            auto& listener = target.data->listeners()[live_index];
+            const auto& listener = target.data->listeners().at(live_index);
             unlinkAbortCleanupForListener(target.object, listener.type, listener);
             target.data->markRemoved(live_index);
         }
         event->setPassive(snapshot.passive);
-        callListener(global_object, scope, target.object, snapshot.callback.get(), event_value);
+        callListener(global_object, scope, target.object, callback, event_value);
         event->setPassive(false);
         if (scope.exception()) {
             // As for the attribute handler above: the remaining listeners still run, and only a termination stops

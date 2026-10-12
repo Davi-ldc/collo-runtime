@@ -3,14 +3,15 @@
 //! this file; the HTTP/1, HTTP/2 and pool suites sit in their directories.
 //!
 //! Most tests here run a real `Engine`, with its owner and connector
-//! threads, against loopback origins: `LocalHttp1Origin` from
-//! http1/support.zig, a `HeldOrigin` that accepts and never answers, and a
-//! silent origin that holds TLS handshakes open. They check fairness between
-//! fetches on the owner loop, billing meters on failure and cancel paths,
-//! connector-queue pressure, settlement on stop and on owner faults, and
-//! that no fd watch outlives its fetch. Results are read from the task, its
-//! body meters, `H2Stats` snapshots and the owner data driver's live
-//! armed-watch count.
+//! threads, against origins on this host's routable address:
+//! `LocalHttp1Origin` from http1/support.zig, a `HeldOrigin` that accepts
+//! and never answers, and a silent origin that holds TLS handshakes open.
+//! Each fetch's network policy names the origins it reaches
+//! (`network_policy.zig`). The tests check fairness between fetches on the
+//! owner loop, billing meters on failure and cancel paths, connector-queue
+//! pressure, settlement on stop and on owner faults, and that no fd watch
+//! outlives its fetch. Results are read from the task, its body meters,
+//! `H2Stats` snapshots and the owner data driver's live armed-watch count.
 
 const std = @import("std");
 const bindings = @import("collo_bindings");
@@ -20,6 +21,7 @@ const fetch_body = egress_client.fetch_body;
 const task_model = egress_client.task;
 const http1_support = @import("http1/support.zig");
 const local_address = @import("collo_test_net");
+const network_policy = @import("network_policy.zig");
 
 comptime {
     _ = @import("task.zig");
@@ -62,8 +64,7 @@ test "egress engine HTTP1 slow bodies do not starve other fetches" {
     defer releaseTaskBodyCredits(&engine, &first);
     var wake = WakeState{ .count = std.atomic.Value(usize).init(0) };
     const config = egress_client.Config{
-        .allow_plain_http = true,
-        .allow_private_networks = true,
+        .network = origin.policy(),
         .enable_http2 = false,
         .max_response_body_bytes = 1024,
         .max_encoded_response_bytes = 1024,
@@ -116,9 +117,11 @@ test "egress engine HTTP1 large fast body yields the owner loop to other fetches
     defer releaseTaskBodyCredits(&engine, &small);
     defer releaseTaskBodyCredits(&engine, &big);
     var wake = WakeState{ .count = std.atomic.Value(usize).init(0) };
+    // Both origins serve on this host's routable address.
+    var origins: network_policy.Origins = .{};
+    try origins.init(big_origin.host(), &.{ big_origin.port, small_origin.port });
     const config = egress_client.Config{
-        .allow_plain_http = true,
-        .allow_private_networks = true,
+        .network = origins.policy(),
         .enable_http2 = false,
         .max_response_body_bytes = @intCast(big_len * 2),
         .max_encoded_response_bytes = @intCast(big_len * 2),
@@ -169,8 +172,7 @@ test "egress engine HTTP1 pre-head failure bills the uploaded request" {
     defer releaseTaskBodyCredits(&engine, &task);
     var wake = WakeState{ .count = std.atomic.Value(usize).init(0) };
     const config = egress_client.Config{
-        .allow_plain_http = true,
-        .allow_private_networks = true,
+        .network = origin.policy(),
         .enable_http2 = false,
         .max_response_body_bytes = 1024,
         .max_encoded_response_bytes = 1024,
@@ -218,8 +220,7 @@ test "egress engine HTTP1 stalled upload failure bills only the written prefix" 
     defer releaseTaskBodyCredits(&engine, &task);
     var wake = WakeState{ .count = std.atomic.Value(usize).init(0) };
     const config = egress_client.Config{
-        .allow_plain_http = true,
-        .allow_private_networks = true,
+        .network = origin.policy(),
         .enable_http2 = false,
         .max_response_body_bytes = 1024,
         .max_encoded_response_bytes = 1024,
@@ -265,8 +266,7 @@ test "egress engine HTTP1 cancel mid-upload bills only the written prefix" {
     defer releaseTaskBodyCredits(&engine, &task);
     var wake = WakeState{ .count = std.atomic.Value(usize).init(0) };
     const config = egress_client.Config{
-        .allow_plain_http = true,
-        .allow_private_networks = true,
+        .network = origin.policy(),
         .enable_http2 = false,
         .max_response_body_bytes = 1024,
         .max_encoded_response_bytes = 1024,
@@ -308,8 +308,7 @@ test "egress engine HTTP1 interim 1xx heads are not billed" {
     defer releaseTaskBodyCredits(&engine, &task);
     var wake = WakeState{ .count = std.atomic.Value(usize).init(0) };
     const config = egress_client.Config{
-        .allow_plain_http = true,
-        .allow_private_networks = true,
+        .network = origin.policy(),
         .enable_http2 = false,
         .max_response_body_bytes = 1024,
         .max_encoded_response_bytes = 1024,
@@ -351,8 +350,7 @@ test "egress engine HTTP1 interim flood failure bills no interim head" {
     defer releaseTaskBodyCredits(&engine, &task);
     var wake = WakeState{ .count = std.atomic.Value(usize).init(0) };
     const config = egress_client.Config{
-        .allow_plain_http = true,
-        .allow_private_networks = true,
+        .network = origin.policy(),
         .enable_http2 = false,
         .max_response_body_bytes = 1024,
         .max_encoded_response_bytes = 1024,
@@ -422,15 +420,20 @@ test "egress engine h1 dial survives a full connector queue" {
     defer engine.deinit();
     defer releaseTaskBodyCredits(&engine, &h1_task);
     var wake = WakeState{ .count = std.atomic.Value(usize).init(0) };
+    var silent_origins: network_policy.Origins = .{};
+    try silent_origins.init(host, &.{
+        server_a.listen_address.getPort(),
+        server_b.listen_address.getPort(),
+        server_c.listen_address.getPort(),
+    });
     const h2_config = egress_client.Config{
-        .allow_private_networks = true,
+        .network = silent_origins.policy(),
         .enable_http2 = true,
         .insecure_tls = true,
         .socket_timeout_ms = 1_000,
     };
     const h1_config = egress_client.Config{
-        .allow_plain_http = true,
-        .allow_private_networks = true,
+        .network = fast_origin.policy(),
         .enable_http2 = false,
         .max_response_body_bytes = 1024,
         .max_encoded_response_bytes = 1024,
@@ -493,8 +496,7 @@ test "egress engine HTTP1 paused body resumes from body credit" {
     defer releaseTaskBodyCredits(&engine, &task);
     var wake = WakeState{ .count = std.atomic.Value(usize).init(0) };
     const config = egress_client.Config{
-        .allow_plain_http = true,
-        .allow_private_networks = true,
+        .network = origin.policy(),
         .enable_http2 = false,
         .max_response_body_bytes = 1024,
         .max_encoded_response_bytes = 1024,
@@ -529,7 +531,10 @@ test "egress engine HTTP1 paused body resumes from body credit" {
 test "egress h2 pool waiter deadline is fixed at first park" {
     var task = try initEngineFetchTask(std.testing.allocator, 90, "https://example.test/", 90);
     defer task.deinit();
-    var command = egress_engine.Command{ .task = &task, .config = .{} };
+    var command = egress_engine.Command{
+        .task = &task,
+        .config = .{ .network = network_policy.public_https },
+    };
     try std.testing.expectEqual(@as(u64, 1_000), command.h2PoolParkDeadline(1_000));
     // A re-park under sustained pool saturation must not renew the deadline,
     // or a command without a request deadline would never expire.
@@ -564,8 +569,10 @@ test "egress engine stop fails h2 fetches coalesced in connect groups" {
     var engine_alive = true;
     errdefer if (engine_alive) engine.deinit();
     var wake = WakeState{ .count = std.atomic.Value(usize).init(0) };
+    var origins: network_policy.Origins = .{};
+    try origins.init(host, &.{ server_a.listen_address.getPort(), server_b.listen_address.getPort() });
     const config = egress_client.Config{
-        .allow_private_networks = true,
+        .network = origins.policy(),
         .enable_http2 = true,
         .insecure_tls = true,
         .socket_timeout_ms = 2_000,
@@ -621,8 +628,10 @@ test "egress engine canceled h2 connect keeps the origin usable" {
     var engine = try egress_engine.Engine.init(std.testing.allocator, 8, .{ .connector_count = 1 });
     defer engine.deinit();
     var wake = WakeState{ .count = std.atomic.Value(usize).init(0) };
+    var origins: network_policy.Origins = .{};
+    try origins.init(host, &.{ server_a.listen_address.getPort(), server_b.listen_address.getPort() });
     const config = egress_client.Config{
-        .allow_private_networks = true,
+        .network = origins.policy(),
         .enable_http2 = true,
         .insecure_tls = true,
         .socket_timeout_ms = 300,
@@ -646,6 +655,48 @@ test "egress engine canceled h2 connect keeps the origin usable" {
     // joins the orphaned group and never gets a connector dispatch.
     try engine.submit(.{ .task = &task_c, .config = config }, &wake, wakeEngineTest);
     try waitTaskDone(&task_c, 3_000);
+}
+
+test "egress engine h2 fetch that joins a connect in progress frees its connect key" {
+    var host_buffer: [64]u8 = undefined;
+    const host = try local_address.routableLocalIpv4(&host_buffer);
+    const bind_address = try std.net.Address.parseIp4(host, 0);
+
+    var state = SilentOriginState{};
+    var server = try bind_address.listen(.{ .reuse_address = true });
+    const thread = try std.Thread.spawn(.{}, silentOriginMain, .{ &server, &state });
+    defer stopSilentOrigin(&server, &state, thread);
+
+    const url = try std.fmt.allocPrint(std.testing.allocator, "https://{s}:{d}/", .{ host, server.listen_address.getPort() });
+    defer std.testing.allocator.free(url);
+
+    var task_a = try initEngineFetchTask(std.testing.allocator, 51, url, 51);
+    defer task_a.deinit();
+    var task_b = try initEngineFetchTask(std.testing.allocator, 52, url, 52);
+    defer task_b.deinit();
+
+    var engine = try egress_engine.Engine.init(std.testing.allocator, 8, .{ .connector_count = 1 });
+    defer engine.deinit();
+    var wake = WakeState{ .count = std.atomic.Value(usize).init(0) };
+    var origins: network_policy.Origins = .{};
+    try origins.init(host, &.{server.listen_address.getPort()});
+    const config = egress_client.Config{
+        .network = origins.policy(),
+        .enable_http2 = true,
+        .insecure_tls = true,
+        .socket_timeout_ms = 300,
+    };
+
+    // A's connect holds the one connector in a handshake the origin never
+    // answers, so B, to the same origin, joins A's connect group. Both fail
+    // at the socket timeout; `std.testing.allocator` then reports any key
+    // the join built and left behind.
+    try engine.submit(.{ .task = &task_a, .config = config }, &wake, wakeEngineTest);
+    try waitForAcceptedConnection(&state, 2_000);
+    try engine.submit(.{ .task = &task_b, .config = config }, &wake, wakeEngineTest);
+
+    try waitTaskDone(&task_a, 3_000);
+    try waitTaskDone(&task_b, 3_000);
 }
 
 // The per-turn h1 drive budget admits at most `max_pendings` drives and
@@ -704,9 +755,10 @@ test "egress engine holds 130 io-parked HTTP1 fetches without spin or mass-fail"
     defer releaseTaskBodyCredits(&engine, &fast);
 
     var wake = WakeState{ .count = std.atomic.Value(usize).init(0) };
+    var origins: network_policy.Origins = .{};
+    try origins.init(origin.host(), &.{ origin.port, fast_origin.port });
     const config = egress_client.Config{
-        .allow_plain_http = true,
-        .allow_private_networks = true,
+        .network = origins.policy(),
         .enable_http2 = false,
         .max_response_body_bytes = 1024,
         .max_encoded_response_bytes = 1024,
@@ -782,9 +834,10 @@ test "egress engine idle transition disarms the poll of a canceled parked fetch"
     defer releaseTaskBodyCredits(&engine, &second);
 
     var wake = WakeState{ .count = std.atomic.Value(usize).init(0) };
+    var origins: network_policy.Origins = .{};
+    try origins.init(origin.host(), &.{ origin.port, fast_origin.port });
     const config = egress_client.Config{
-        .allow_plain_http = true,
-        .allow_private_networks = true,
+        .network = origins.policy(),
         .enable_http2 = false,
         .max_response_body_bytes = 1024,
         .max_encoded_response_bytes = 1024,
@@ -831,8 +884,7 @@ test "egress engine credit-parked h1 body disarms its poll and expires at the to
     defer releaseTaskBodyCredits(&engine, &task);
     var wake = WakeState{ .count = std.atomic.Value(usize).init(0) };
     const config = egress_client.Config{
-        .allow_plain_http = true,
-        .allow_private_networks = true,
+        .network = origin.policy(),
         .enable_http2 = false,
         .max_response_body_bytes = 1024,
         .max_encoded_response_bytes = 1024,
@@ -911,9 +963,9 @@ test "egress engine drive budget interleaves concurrent large bodies with new fe
     defer releaseTaskBodyCredits(&engine, &small);
 
     var wake = WakeState{ .count = std.atomic.Value(usize).init(0) };
+    // Each fetch adds the policy of the origin it reaches (`withNetwork`).
     const config = egress_client.Config{
-        .allow_plain_http = true,
-        .allow_private_networks = true,
+        .network = egress_client.network.deny_all,
         .enable_http2 = false,
         .max_response_body_bytes = @intCast(big_len * 2),
         .max_encoded_response_bytes = @intCast(big_len * 2),
@@ -924,11 +976,13 @@ test "egress engine drive budget interleaves concurrent large bodies with new fe
     for (&bigs, 0..) |*slot, index| {
         const id: u64 = 4_300 + @as(u64, index);
         slot.* = try initEngineFetchTaskShaped(std.testing.allocator, id, big_urls[index].?, id, "GET", "", big_len * 2);
-        try engine.submit(.{ .task = &slot.*.?, .config = config }, &wake, wakeEngineTest);
+        const big_config = withNetwork(config, big_origins[index].?.policy());
+        try engine.submit(.{ .task = &slot.*.?, .config = big_config }, &wake, wakeEngineTest);
     }
     // Submitted while the bodies stream, so the turn budget and drive quanta
     // must give the newcomer its share of the owner promptly.
-    try engine.submit(.{ .task = &small, .config = config }, &wake, wakeEngineTest);
+    const small_config = withNetwork(config, small_origin.policy());
+    try engine.submit(.{ .task = &small, .config = small_config }, &wake, wakeEngineTest);
     try waitTaskDone(&small, 10_000);
     try expectTaskStatus(&small, 200);
     try waitBodyComplete(small.response_body, 5_000);
@@ -999,9 +1053,9 @@ test "egress engine turn budget exhaustion still services the tail pending" {
     defer releaseTaskBodyCredits(&engine, &tail);
 
     var wake = WakeState{ .count = std.atomic.Value(usize).init(0) };
+    // Each fetch adds the policy of the origin it reaches (`withNetwork`).
     const config = egress_client.Config{
-        .allow_plain_http = true,
-        .allow_private_networks = true,
+        .network = egress_client.network.deny_all,
         .enable_http2 = false,
         // The bodies are endless and close-delimited, so the cumulative caps
         // are set high enough never to fire during the test, and memory is
@@ -1020,7 +1074,8 @@ test "egress engine turn budget exhaustion still services the tail pending" {
         const id: u64 = 4_900 + @as(u64, index);
         heads[index] = try initEngineFetchTaskShaped(std.testing.allocator, id, head_urls[index].?, id, "GET", "", 1024 * 1024);
         initialized += 1;
-        try engine.submit(.{ .task = &heads[index], .config = config }, &wake, wakeEngineTest);
+        const head_config = withNetwork(config, head_origins[index].?.policy());
+        try engine.submit(.{ .task = &heads[index], .config = head_config }, &wake, wakeEngineTest);
     }
     // Once every head is published, the burst is streaming.
     for (heads[0..initialized]) |*task| {
@@ -1048,7 +1103,8 @@ test "egress engine turn budget exhaustion still services the tail pending" {
 
     // Submitted behind the burst, the tail must get the owner within a few
     // turn budgets, well inside the timeout.
-    try engine.submit(.{ .task = &tail, .config = config }, &wake, wakeEngineTest);
+    const tail_config = withNetwork(config, tail_origin.policy());
+    try engine.submit(.{ .task = &tail, .config = tail_config }, &wake, wakeEngineTest);
     try waitTaskDone(&tail, 10_000);
     try expectTaskStatus(&tail, 200);
     try waitBodyComplete(tail.response_body, 5_000);
@@ -1105,9 +1161,9 @@ test "egress engine drive pass grants each runnable at most one quantum" {
     defer for (heads[0..initialized]) |*task| releaseTaskBodyCredits(&engine, task);
 
     var wake = WakeState{ .count = std.atomic.Value(usize).init(0) };
+    // Each fetch adds the policy of the origin it reaches (`withNetwork`).
     const config = egress_client.Config{
-        .allow_plain_http = true,
-        .allow_private_networks = true,
+        .network = egress_client.network.deny_all,
         .enable_http2 = false,
         .max_response_body_bytes = 1 << 40,
         .max_encoded_response_bytes = 1 << 40,
@@ -1123,7 +1179,8 @@ test "egress engine drive pass grants each runnable at most one quantum" {
         const id: u64 = 6_000 + @as(u64, index);
         heads[index] = try initEngineFetchTaskShaped(std.testing.allocator, id, head_urls[index].?, id, "GET", "", 1024 * 1024);
         initialized += 1;
-        try engine.submit(.{ .task = &heads[index], .config = config }, &wake, wakeEngineTest);
+        const head_config = withNetwork(config, head_origins[index].?.policy());
+        try engine.submit(.{ .task = &heads[index], .config = head_config }, &wake, wakeEngineTest);
     }
     for (heads[0..initialized]) |*task| {
         try waitTaskDone(task, 10_000);
@@ -1207,15 +1264,16 @@ test "egress engine owner escape leaves the connector-held connect command to th
     // whole 5 s stage timeout, far longer than the owner fault below takes
     // to latch, so the connector is still executing the command when the
     // owner escapes.
+    var silent_origins: network_policy.Origins = .{};
+    try silent_origins.init(host, &.{server.listen_address.getPort()});
     const config = egress_client.Config{
-        .allow_private_networks = true,
+        .network = silent_origins.policy(),
         .enable_http2 = true,
         .insecure_tls = true,
         .socket_timeout_ms = 5_000,
     };
     const h1_config = egress_client.Config{
-        .allow_plain_http = true,
-        .allow_private_networks = true,
+        .network = held_origin.policy(),
         .enable_http2 = false,
         .max_response_body_bytes = 1024,
         .max_encoded_response_bytes = 1024,
@@ -1308,15 +1366,16 @@ test "egress engine owner escape leaves the connector-held h1 dial to the connec
     // silent origin holds that handshake for the whole 5 s stage timeout,
     // far longer than the owner fault below takes to latch, so the connector
     // is still executing the command when the owner escapes.
+    var silent_origins: network_policy.Origins = .{};
+    try silent_origins.init(host, &.{server.listen_address.getPort()});
     const config = egress_client.Config{
-        .allow_private_networks = true,
+        .network = silent_origins.policy(),
         .enable_http2 = false,
         .insecure_tls = true,
         .socket_timeout_ms = 5_000,
     };
     const h1_config = egress_client.Config{
-        .allow_plain_http = true,
-        .allow_private_networks = true,
+        .network = held_origin.policy(),
         .enable_http2 = false,
         .max_response_body_bytes = 1024,
         .max_encoded_response_bytes = 1024,
@@ -1413,9 +1472,10 @@ test "egress engine data wait failure fails both pending lists and parks" {
     defer releaseTaskBodyCredits(&engine, &after);
 
     var wake = WakeState{ .count = std.atomic.Value(usize).init(0) };
+    var origins: network_policy.Origins = .{};
+    try origins.init(origin.host(), &.{ origin.port, fast_origin.port });
     const config = egress_client.Config{
-        .allow_plain_http = true,
-        .allow_private_networks = true,
+        .network = origins.policy(),
         .enable_http2 = false,
         .max_response_body_bytes = 1024,
         .max_encoded_response_bytes = 1024,
@@ -1470,8 +1530,7 @@ test "egress engine watch build failure settles pendings and latches the owner f
 
     var wake = WakeState{ .count = std.atomic.Value(usize).init(0) };
     const config = egress_client.Config{
-        .allow_plain_http = true,
-        .allow_private_networks = true,
+        .network = origin.policy(),
         .enable_http2 = false,
         .max_response_body_bytes = 1024,
         .max_encoded_response_bytes = 1024,
@@ -1531,9 +1590,10 @@ test "egress engine serves again after an owner escape, stop and start" {
     defer releaseTaskBodyCredits(&engine, &after);
 
     var wake = WakeState{ .count = std.atomic.Value(usize).init(0) };
+    var origins: network_policy.Origins = .{};
+    try origins.init(origin.host(), &.{ origin.port, fast_origin.port });
     const config = egress_client.Config{
-        .allow_plain_http = true,
-        .allow_private_networks = true,
+        .network = origins.policy(),
         .enable_http2 = false,
         .max_response_body_bytes = 1024,
         .max_encoded_response_bytes = 1024,
@@ -1588,8 +1648,7 @@ test "egress engine sync failure settles pendings and latches the owner fault" {
 
     var wake = WakeState{ .count = std.atomic.Value(usize).init(0) };
     const config = egress_client.Config{
-        .allow_plain_http = true,
-        .allow_private_networks = true,
+        .network = origin.policy(),
         .enable_http2 = false,
         .max_response_body_bytes = 1024,
         .max_encoded_response_bytes = 1024,
@@ -1691,6 +1750,9 @@ const HeldOrigin = struct {
     held_len: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     accepted: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     stopping: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Backs `policy`, which points into it; the origin's heap address keeps
+    /// it in place.
+    origins: network_policy.Origins = .{},
 
     fn start(allocator: std.mem.Allocator, capacity: usize) !*HeldOrigin {
         var host_buffer: [64]u8 = undefined;
@@ -1710,12 +1772,19 @@ const HeldOrigin = struct {
             .host_len = host_text.len,
             .port = server.listen_address.getPort(),
         };
+        try origin.origins.init(origin.host(), &.{origin.port});
         origin.thread = try std.Thread.spawn(.{}, HeldOrigin.threadMain, .{origin});
         return origin;
     }
 
     fn host(self: *const HeldOrigin) []const u8 {
         return self.host_buffer[0..self.host_len];
+    }
+
+    /// Plain HTTP and HTTPS to this origin's address and port, and nowhere
+    /// else. Valid until `stop`.
+    fn policy(self: *const HeldOrigin) egress_client.network.Policy {
+        return self.origins.policy();
     }
 
     fn url(self: *const HeldOrigin, allocator: std.mem.Allocator) ![]u8 {
@@ -1830,8 +1899,9 @@ fn waitBodyComplete(body: *fetch_body.Body, timeout_ms: u64) !void {
     }
 }
 
-/// Failed fetches publish "fetch failed: <ErrorName>"; this matches the
-/// error name at the end of the message.
+/// A fetch that fails other than by a network denial publishes
+/// "fetch failed: <ErrorName>"; this matches the error name at the end of
+/// the message.
 fn expectTaskFailureMessage(task: *task_model.Task, expected_error_name: []const u8) !void {
     task.mutex.lock();
     defer task.mutex.unlock();
@@ -1866,6 +1936,14 @@ fn releaseTaskBodyCredits(engine: *egress_engine.Engine, task: *task_model.Task)
         &release_context,
         releaseCreditToEngine,
     );
+}
+
+/// `config` with `policy` as its network policy, for a test whose fetches
+/// share every other setting and each reach their own origin.
+fn withNetwork(config: egress_client.Config, policy: egress_client.network.Policy) egress_client.Config {
+    var named = config;
+    named.network = policy;
+    return named;
 }
 
 fn wakeEngineTest(ctx: ?*anyopaque, event: egress_engine.WakeEvent) void {

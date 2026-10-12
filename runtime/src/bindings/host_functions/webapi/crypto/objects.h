@@ -1,7 +1,8 @@
 // The JSC cells behind the Web Cryptography API objects: `Crypto`, which keeps an entropy cache, the stateless
 // `SubtleCrypto`, and `CryptoKey`. The cells are created and used on the VM thread and destroyed when the collector
-// sweeps them. A CryptoKey never changes after creation: a secret key keeps its bytes in a vector the destructor
-// zeroes, and an asymmetric key owns an `EVP_PKEY` that crypto jobs read concurrently from pool threads.
+// sweeps them. A CryptoKey never changes after creation: a secret key keeps its bytes in `SecretBytes`, which zeroes
+// them when the cell is destroyed, and an asymmetric key owns an `EVP_PKEY` that crypto jobs read concurrently from
+// pool threads.
 
 #pragma once
 
@@ -91,7 +92,7 @@ public:
     // from `material`. `createRsa`, `createEc` and `createOkp` take ownership of the `EVP_PKEY`, which the cell frees
     // when it is destroyed. Callers go through the validating factories in `keys.h`.
     static JSColloCryptoKey* create(JSC::VM&, JSC::Structure*, CryptoKeyAlgorithm, WebCryptoHash,
-        WTF::Vector<uint8_t>&& material, bool extractable, uint8_t usages, size_t hmac_length_bits = 0);
+        SecretBytes&& material, bool extractable, uint8_t usages, size_t hmac_length_bits = 0);
     static JSColloCryptoKey* createRsa(JSC::VM&, JSC::Structure*, CryptoKeyAlgorithm, WebCryptoHash, CryptoKeyType,
         EVP_PKEY*, size_t modulus_bits, WTF::Vector<uint8_t>&& public_exponent, bool extractable, uint8_t usages);
     static JSColloCryptoKey* createEc(JSC::VM&, JSC::Structure*, CryptoKeyAlgorithm, CryptoKeyNamedCurve, CryptoKeyType,
@@ -121,7 +122,7 @@ public:
     size_t hmacLengthBits() const { return m_hmac_length_bits ? m_hmac_length_bits : m_material.size() * 8; }
 
 private:
-    JSColloCryptoKey(JSC::VM&, JSC::Structure*, CryptoKeyAlgorithm, WebCryptoHash, WTF::Vector<uint8_t>&& material,
+    JSColloCryptoKey(JSC::VM&, JSC::Structure*, CryptoKeyAlgorithm, WebCryptoHash, SecretBytes&& material,
         bool extractable, uint8_t usages, size_t hmac_length_bits);
     JSColloCryptoKey(JSC::VM&, JSC::Structure*, CryptoKeyAlgorithm, WebCryptoHash, CryptoKeyType, EVP_PKEY*,
         size_t modulus_bits, WTF::Vector<uint8_t>&& public_exponent, bool extractable, uint8_t usages);
@@ -135,7 +136,7 @@ private:
     CryptoKeyType m_type { CryptoKeyType::Secret };
     CryptoKeyNamedCurve m_named_curve { CryptoKeyNamedCurve::None };
     WebCryptoHash m_hash { WebCryptoHash::SHA256 };
-    WTF::Vector<uint8_t> m_material;
+    SecretBytes m_material;
     size_t m_hmac_length_bits { 0 };
     // Owned, and freed by the destructor. Despite the name it holds the key of every asymmetric algorithm: RSA, EC
     // and OKP. Crypto jobs share it with pool threads through `retainSharedPkey`, and BoringSSL allows concurrent use

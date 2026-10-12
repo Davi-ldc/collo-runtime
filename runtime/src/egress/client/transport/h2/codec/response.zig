@@ -1,7 +1,8 @@
 //! Validates an outbound fetch's HTTP/2 response: the head, the trailers and
 //! the body against its declared length and the caller's size cap. Malformed
-//! content is a stream error, so one bad response never fails the connection
-//! that other fetches share.
+//! content, a connection-specific field such as `te` included, is a stream
+//! error, so one bad response never fails the connection that other fetches
+//! share.
 
 const std = @import("std");
 const hpack = @import("collo_hpack");
@@ -186,11 +187,8 @@ fn validateRegularHeader(header: hpack.Header) !void {
         if (byte >= 'A' and byte <= 'Z')
             return error.InvalidHttp2ResponseHeader;
     }
-    if (std.mem.eql(u8, header.name, "transfer-encoding") or
-        std.mem.eql(u8, header.name, "connection") or
-        std.mem.eql(u8, header.name, "keep-alive") or
-        std.mem.eql(u8, header.name, "proxy-connection") or
-        std.mem.eql(u8, header.name, "upgrade"))
+    // `te` is among them: RFC 9113 §8.2.2 admits it only in a request.
+    if (http.headers.isConnectionSpecificField(header.name, header.value, .response))
         return error.Http2MalformedResponse;
 }
 

@@ -1,19 +1,22 @@
 //! Shared wiring context assembled once in build.zig and consumed by the
 //! test and bench step builders.
 const std = @import("std");
+const codecs_mod = @import("codecs.zig");
+const deps_mod = @import("deps.zig");
 const options_mod = @import("options.zig");
 const toolchain_mod = @import("toolchain.zig");
 const jsc_mod = @import("jsc.zig");
 const link_mod = @import("link.zig");
 const modules_mod = @import("modules.zig");
-const zstd_mod = @import("zstd.zig");
 
 pub const Context = struct {
     opts: *const options_mod.Options,
-    /// opts.zstd_link with `auto` already collapsed against the toolchain.
-    zstd_link: zstd_mod.LinkMode,
     toolchain: *const toolchain_mod.ToolchainPaths,
     libc_file: std.Build.LazyPath,
+    /// The codecs for `opts.target`.
+    codecs: *const codecs_mod.Codecs,
+    /// BoringSSL for `opts.target`.
+    boringssl: deps_mod.BoringSsl,
     jsc: jsc_mod.JscBuild,
     link_ctx: link_mod.LinkContext,
     bridge: *std.Build.Step.Compile,
@@ -26,7 +29,6 @@ pub const Context = struct {
     bindings_support_module: *std.Build.Module,
     /// runtime/tests/support/zygote/root.zig (needs real bindings + collo binary path).
     zygote_support_module: *std.Build.Module,
-    test_build_options_module: *std.Build.Module,
     process_options_module: *std.Build.Module,
     collo_bin: std.Build.LazyPath,
     /// Install of the linked `collo` binary. Every Run step whose tests spawn a
@@ -38,7 +40,7 @@ pub const Context = struct {
     /// `*Step.Compile` here and nothing hangs a link or a run, so a root that
     /// only a gated lane builds cannot rot unnoticed.
     check_step: *std.Build.Step,
-    /// Run step of the WebAPI test/bench contract validation tool.
+    /// Run step of the WebAPI fixture check (runtime/build/validate_webapi_tool.zig).
     webapi_contract_step: *std.Build.Step,
     git_or_deploy_hash: []const u8,
 };

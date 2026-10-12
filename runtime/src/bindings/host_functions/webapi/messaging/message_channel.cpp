@@ -1,11 +1,11 @@
 // MessageChannel and MessagePort: the two cells, delivery, transfer, and the constructors and methods. Runs on the
 // VM thread, except visitChildren, which marking threads run concurrently.
 //
-// Each port holds its peer, its queued messages and its handlers through WriteBarrier fields owned by the port.
-// visitChildren walks the queue and the listener vector under the port's cellLock(), so every change to either takes
-// that lock, and nothing allocates a cell under it. A started port with queued messages has one delivery microtask
-// pending at a time, and each task dispatches one message. Closing a port drops its queue, listeners and handlers;
-// transferring one moves its queue to the new port and drops the rest.
+// Each port holds its peer, its queued messages and its handlers through WriteBarrier fields owned by the port. The
+// queue and the listener list are Collo::CellEdgeList (jsc/runtime/cell_edges.h), which owns the lock and barrier
+// protocol visitChildren relies on. A started port with queued messages has one delivery microtask pending at a time,
+// and each task dispatches one message. Closing a port drops its queue, listeners and handlers; transferring one moves
+// its queue to the new port and drops the rest.
 
 #include "host_functions/webapi/messaging/message_channel.h"
 
@@ -24,12 +24,11 @@
 #include <JavaScriptCore/JSArray.h>
 #include <JavaScriptCore/JSDestructibleObject.h>
 #include <JavaScriptCore/JSFunction.h>
-#include <JavaScriptCore/Strong.h>
-#include <JavaScriptCore/StrongInlines.h>
+#include <JavaScriptCore/MarkedVector.h>
 #include <JavaScriptCore/ObjectConstructor.h>
 #include <JavaScriptCore/SlotVisitorMacros.h>
-#include <wtf/Locker.h>
 #include <wtf/Scope.h>
+#include <wtf/ScopedLambda.h>
 #include <wtf/Vector.h>
 #include <wtf/text/MakeString.h>
 #include <wtf/text/WTFString.h>
@@ -51,6 +50,12 @@ namespace {
     struct QueuedPortMessage {
         JSC::WriteBarrier<JSC::Unknown> data;
         JSC::WriteBarrier<JSC::JSObject> ports;
+
+        template <typename Visitor> void visitEdges(Visitor& visitor) const
+        {
+            visitor.append(data);
+            visitor.append(ports);
+        }
     };
 
     class JSColloMessagePort final : public JSC::JSDestructibleObject {
@@ -89,15 +94,9 @@ namespace {
         JSValue onmessageerror() const { return m_on_message_error.get() ? m_on_message_error.get() : JSC::jsNull(); }
         uint64_t onmessageOrder() const { return m_on_message_order; }
         bool hasRef() const { return m_refed; }
-        unsigned pendingMessageCount() const
-        {
-            WTF::Locker locker { cellLock() };
-            return pendingMessageCountLocked();
-        }
         bool hasPendingMessageCapacity() const
         {
-            WTF::Locker locker { cellLock() };
-            return hasPendingMessageCapacityLocked();
+            return m_detached || m_closed || m_queue.size() < WebApiMessagePortPendingMessagesMax;
         }
 
         void entangle(JSC::VM& vm, JSColloMessagePort* peer) { m_peer.set(vm, this, peer); }
@@ -139,7 +138,7 @@ namespace {
             m_closed = true;
             m_started = false;
             m_delivery_scheduled = false;
-            clearQueue();
+            m_queue.clear(this);
             clearWebApiEventTargetListeners({ this, this, &m_event_target });
             m_on_message.clear();
             m_on_message_error.clear();
@@ -151,29 +150,40 @@ namespace {
             m_peer.clear();
         }
 
+        // Checks the queue's bound and makes room for one message, so that an enqueue that follows with no other
+        // change to this queue cannot fail. Throws a QuotaExceededError or an OutOfMemoryError and returns false
+        // otherwise.
+        bool reserveMessage(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope)
+        {
+            if (!hasPendingMessageCapacity()) {
+                auto* exception = createDOMException(
+                    global_object, DOMExceptionCode::QuotaExceededError, "MessagePort queue limit exceeded"_s);
+                throwException(global_object, scope, exception);
+                return false;
+            }
+            if (!m_queue.tryReserveAdditional(this, 1)) {
+                throwOutOfMemoryError(global_object, scope);
+                return false;
+            }
+            return true;
+        }
+
         bool enqueue(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSValue data, JSC::JSObject* ports)
         {
             if (m_detached || m_closed)
                 return true;
-            auto& vm = global_object->vm();
-            QueuedPortMessage message;
-            message.data.set(vm, this, data);
-            if (ports)
-                message.ports.set(vm, this, ports);
-
-            bool queue_full = false;
-            {
-                WTF::Locker locker { cellLock() };
-                if (!hasPendingMessageCapacityLocked()) {
-                    queue_full = true;
-                } else {
-                    m_queue.append(WTF::move(message));
-                }
-            }
-            if (queue_full) {
+            if (!hasPendingMessageCapacity()) {
                 auto* exception = createDOMException(
                     global_object, DOMExceptionCode::QuotaExceededError, "MessagePort queue limit exceeded"_s);
                 throwException(global_object, scope, exception);
+                return false;
+            }
+            QueuedPortMessage message;
+            message.data.setWithoutWriteBarrier(data);
+            if (ports)
+                message.ports.setWithoutWriteBarrier(ports);
+            if (!m_queue.tryAppend(global_object->vm(), this, WTF::move(message))) {
+                throwOutOfMemoryError(global_object, scope);
                 return false;
             }
 
@@ -193,15 +203,10 @@ namespace {
             auto& vm = global_object->vm();
             auto* peer = m_peer.get();
 
-            {
-                // FIXME: The queue moves into `clone` without a write barrier on `clone` and without `clone`'s cell
-                // lock. If a marking thread already visited `clone`, or `clone` is in the old generation, the moved
-                // messages may never be marked, and a concurrent visit of `clone` can read the vector mid-move.
-                WTF::Locker locker { cellLock() };
-                compactQueueLocked();
-                clone->m_queue = WTF::move(m_queue);
-                clone->m_queue_head = 0;
-                clearQueueLocked();
+            // The clone is new and its queue empty, so the queue moves without allocating.
+            if (!clone->m_queue.tryAdoptAllFrom(vm, clone, m_queue, this)) {
+                throwOutOfMemoryError(global_object, scope);
+                return false;
             }
 
             clone->m_peer.set(vm, clone, peer);
@@ -247,27 +252,12 @@ namespace {
 
         EncodedJSValue deliverOne(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope)
         {
-            auto& vm = global_object->vm();
             m_delivery_scheduled = false;
-            if (!m_started || queueIsEmpty() || m_detached || m_closed)
+            if (!m_started || m_queue.isEmpty() || m_detached || m_closed)
                 return JSValue::encode(JSC::jsUndefined());
 
-            JSC::Strong<JSC::Unknown> protected_data;
-            JSC::Strong<JSC::Unknown> protected_ports;
-            {
-                WTF::Locker locker { cellLock() };
-                if (queueIsEmptyLocked())
-                    return JSValue::encode(JSC::jsUndefined());
-                auto& message = m_queue[m_queue_head];
-                protected_data.set(vm, message.data.get());
-                if (auto* queued_ports = message.ports.get())
-                    protected_ports.set(vm, queued_ports);
-                m_queue_head++;
-                compactQueueIfNeededLocked();
-            }
-
-            auto* ports = protected_ports ? uncheckedDowncast<JSC::JSObject>(protected_ports.get()) : nullptr;
-            auto* event = createWebApiMessageEvent(global_object, protected_data.get(), ports);
+            auto message = m_queue.takeFirst(this);
+            auto* event = createWebApiMessageEvent(global_object, message.data.get(), message.ports.get());
             if (!event)
                 return {};
 
@@ -306,79 +296,11 @@ namespace {
             return value;
         }
 
-        bool queueIsEmpty() const
-        {
-            WTF::Locker locker { cellLock() };
-            return queueIsEmptyLocked();
-        }
-
-        bool queueIsEmptyLocked() const { return m_queue_head >= m_queue.size(); }
-
-        void clearQueue()
-        {
-            WTF::Locker locker { cellLock() };
-            clearQueueLocked();
-        }
-
-        void clearQueueLocked()
-        {
-            m_queue.clear();
-            m_queue_head = 0;
-        }
-
-        void compactQueue()
-        {
-            WTF::Locker locker { cellLock() };
-            compactQueueLocked();
-        }
-
-        void compactQueueLocked()
-        {
-            if (!m_queue_head)
-                return;
-            if (m_queue_head >= m_queue.size()) {
-                clearQueueLocked();
-                return;
-            }
-
-            unsigned write = 0;
-            for (unsigned read = m_queue_head; read < m_queue.size(); read++) {
-                if (write != read)
-                    m_queue[write] = WTF::move(m_queue[read]);
-                write++;
-            }
-            m_queue.shrink(write);
-            m_queue_head = 0;
-        }
-
-        void compactQueueIfNeeded()
-        {
-            WTF::Locker locker { cellLock() };
-            compactQueueIfNeededLocked();
-        }
-
-        // Clears the queue once every slot is delivered, and compacts it once delivered slots are at least 64 and half
-        // the vector, which keeps delivery amortized constant time without moving the queue on every message.
-        void compactQueueIfNeededLocked()
-        {
-            if (!m_queue_head)
-                return;
-            if (m_queue_head >= m_queue.size() || (m_queue_head >= 64 && m_queue_head * 2 >= m_queue.size()))
-                compactQueueLocked();
-        }
-
-        unsigned pendingMessageCountLocked() const { return m_queue.size() - m_queue_head; }
-
-        bool hasPendingMessageCapacityLocked() const
-        {
-            return m_detached || m_closed || pendingMessageCountLocked() < WebApiMessagePortPendingMessagesMax;
-        }
+        bool queueIsEmpty() const { return m_queue.isEmpty(); }
 
         WebApiEventTargetData m_event_target;
         JSC::WriteBarrier<JSColloMessagePort> m_peer;
-        // Changed only under cellLock(). Entries before m_queue_head are delivered and wait for compaction.
-        WTF::Vector<QueuedPortMessage> m_queue;
-        unsigned m_queue_head { 0 };
+        Collo::CellEdgeList<QueuedPortMessage> m_queue;
         JSC::WriteBarrier<JSC::Unknown> m_on_message;
         JSC::WriteBarrier<JSC::Unknown> m_on_message_error;
         uint64_t m_on_message_order { WebApiEventAttributeHandlerBeforeListeners };
@@ -455,18 +377,11 @@ namespace {
         auto* this_object = static_cast<JSColloMessagePort*>(cell);
         ASSERT_GC_OBJECT_INHERITS(this_object, info());
         Base::visitChildren(this_object, visitor);
-        // The lock keeps the queue and listener buffers in place while this marking thread walks them. The queue's
-        // mutators are above; event_target.cpp takes the port's lock around every listener change.
-        WTF::Locker locker { this_object->cellLock() };
         visitor.append(this_object->m_peer);
-        for (unsigned index = this_object->m_queue_head; index < this_object->m_queue.size(); index++) {
-            auto& message = this_object->m_queue[index];
-            appendWebApiUnknown(visitor, message.data);
-            visitor.append(message.ports);
-        }
         appendWebApiUnknown(visitor, this_object->m_on_message);
         appendWebApiUnknown(visitor, this_object->m_on_message_error);
-        this_object->m_event_target.visitChildren(visitor);
+        this_object->m_queue.visit(this_object, visitor);
+        this_object->m_event_target.visit(this_object, visitor);
     }
 
     DEFINE_VISIT_CHILDREN(JSColloMessagePort);
@@ -673,33 +588,21 @@ namespace {
             return JSValue::encode(JSC::throwException(global_object, scope, exception));
         }
 
+        // The clone ran script (getters, the transfer iterator) that may have closed this port or filled the peer's
+        // queue, so the peer is read again and its slot reserved before the commits: they detach their sources for
+        // good, so enqueue must not fail after them.
+        auto reserve_peer = [&] {
+            peer = port->peer();
+            return peer && peer->reserveMessage(global_object, scope);
+        };
         JSC::JSValue cloned;
         JSC::JSObject* transferred_ports = nullptr;
-        WTF::Vector<JSC::ArrayBuffer*> array_buffer_transfers;
-        WTF::Vector<WebApiMessagePortTransfer> port_transfers;
-        if (!structuredCloneForWebApiMessage(global_object, scope, call_frame->argument(0), transfer_value, port,
-                cloned, transferred_ports, array_buffer_transfers, port_transfers))
-            return {};
-        RETURN_IF_EXCEPTION(scope, {});
-
-        // The clone ran script (getters, the transfer iterator) that may have closed this port or filled the peer's
-        // queue. Check again before committing: the commits detach their sources for good, so enqueue must not fail
-        // after them.
-        peer = port->peer();
-        if (!peer)
+        if (!structuredCloneAndCommitForWebApiMessage(global_object, scope, call_frame->argument(0), transfer_value,
+                port, reserve_peer, cloned, transferred_ports)) {
+            RETURN_IF_EXCEPTION(scope, {});
+            // The port lost its peer while the message was cloned, so the message goes nowhere.
             return JSValue::encode(JSC::jsUndefined());
-        if (!peer->hasPendingMessageCapacity()) {
-            auto* exception = createDOMException(
-                global_object, DOMExceptionCode::QuotaExceededError, "MessagePort queue limit exceeded"_s);
-            return JSValue::encode(JSC::throwException(global_object, scope, exception));
         }
-
-        if (!webApiCommitArrayBufferTransfers(global_object, scope, array_buffer_transfers))
-            return {};
-        RETURN_IF_EXCEPTION(scope, {});
-
-        if (!webApiCommitMessagePortTransfers(global_object, scope, port_transfers))
-            return {};
         RETURN_IF_EXCEPTION(scope, {});
 
         if (!peer->enqueue(global_object, scope, cloned, transferred_ports))
@@ -794,6 +697,11 @@ JSC::JSObject* webApiNormalizeMessagePortsArray(
 {
     if (ports_value.isUndefined()) {
         auto* empty = JSC::constructEmptyArray(global_object, nullptr);
+        RETURN_IF_EXCEPTION(scope, nullptr);
+        if (!empty) {
+            JSC::throwOutOfMemoryError(global_object, scope);
+            return nullptr;
+        }
         JSC::objectConstructorFreeze(global_object, empty);
         RETURN_IF_EXCEPTION(scope, nullptr);
         return empty;
@@ -807,9 +715,9 @@ JSC::JSObject* webApiNormalizeMessagePortsArray(
         return nullptr;
     }
 
-    // FIXME: `ports` holds raw cell pointers while the iterable runs script, so a port that a generator yields and
-    // nothing else references can be collected before the array below is built.
-    WTF::Vector<JSColloMessagePort*> ports;
+    // The iterable runs script that can trigger a collection, so the ports it yields are rooted here until the array
+    // holds them.
+    JSC::MarkedVector<JSColloMessagePort*, 8, WTF::RecordOverflow> ports;
     JSC::forEachInIterable(global_object, ports_value, [&](JSC::VM&, JSC::JSGlobalObject*, JSValue value) {
         if (scope.exception())
             return;
@@ -819,13 +727,28 @@ JSC::JSObject* webApiNormalizeMessagePortsArray(
                 "MessageEvent constructor: Expected every item of eventInitDict.ports to be an instance of MessagePort."_s);
             return;
         }
+        if (ports.size() >= WebApiMessageEventPortsMax) {
+            JSC::throwException(global_object, scope,
+                createDOMException(
+                    global_object, DOMExceptionCode::QuotaExceededError, "MessageEvent ports limit exceeded"_s));
+            return;
+        }
         ports.append(port);
+        if (ports.hasOverflowed())
+            JSC::throwOutOfMemoryError(global_object, scope);
     });
     RETURN_IF_EXCEPTION(scope, nullptr);
 
     auto* array = JSC::constructEmptyArray(global_object, nullptr, ports.size());
-    for (unsigned index = 0; index < ports.size(); index++)
+    RETURN_IF_EXCEPTION(scope, nullptr);
+    if (!array) {
+        JSC::throwOutOfMemoryError(global_object, scope);
+        return nullptr;
+    }
+    for (unsigned index = 0; index < ports.size(); index++) {
         array->putDirectIndex(global_object, index, ports[index]);
+        RETURN_IF_EXCEPTION(scope, nullptr);
+    }
     JSC::objectConstructorFreeze(global_object, array);
     RETURN_IF_EXCEPTION(scope, nullptr);
     return array;

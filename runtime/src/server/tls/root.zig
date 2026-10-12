@@ -5,8 +5,11 @@
 //!
 //! `Server.init` builds the context once. The ingress lanes then start connections from it
 //! concurrently, and each connection belongs to the lane that accepted it until its keys move to
-//! the kernel. The context copies the certificate and key it loads, and zeroes its copy of the
-//! key, so a caller's PEM buffers need to live only until `BoringSslContext.init` returns.
+//! the kernel. BoringSSL keeps its own copy of the certificate and key, so a caller's inline PEM
+//! text, which the context borrows without copying, needs to live only until
+//! `BoringSslContext.init` returns. A PEM file is read into one buffer of the file's exact size,
+//! never grown, and the context zeroes that buffer before it frees it on every path, so no copy
+//! of a private key is ever freed with the key in it.
 
 const std = @import("std");
 const ktls = @import("ktls.zig");
@@ -73,22 +76,22 @@ pub const BoringSslContext = struct {
             certificate.cert_chain,
             max_cert_chain_pem_bytes,
         );
-        defer allocator.free(cert_chain_pem);
+        defer cert_chain_pem.release(allocator);
         const private_key_pem = try loadPemSource(
             allocator,
             certificate.private_key,
             max_private_key_pem_bytes,
         );
-        defer secureFree(allocator, private_key_pem);
+        defer private_key_pem.release(allocator);
         const tls12_cipher_list = try allocator.dupeZ(u8, policy.tls12_cipher_list);
         defer allocator.free(tls12_cipher_list);
 
         var handle: ?*BoringSslContextHandle = null;
         if (boring.collo_boringssl_ctx_new_pem_ex(
-            cert_chain_pem.ptr,
-            cert_chain_pem.len,
-            private_key_pem.ptr,
-            private_key_pem.len,
+            cert_chain_pem.bytes.ptr,
+            cert_chain_pem.bytes.len,
+            private_key_pem.bytes.ptr,
+            private_key_pem.bytes.len,
             tls12_cipher_list.ptr,
             @intFromEnum(policy.tls13_policy),
             &handle,
@@ -125,36 +128,64 @@ pub const BoringSslContext = struct {
     }
 };
 
+/// PEM text for the context: a caller's inline text, borrowed, or a file's, in a buffer this
+/// file allocated and `release` zeroes and frees.
+const LoadedPem = struct {
+    bytes: []const u8,
+    owned: ?[]u8,
+
+    fn release(self: LoadedPem, allocator: std.mem.Allocator) void {
+        if (self.owned) |buffer|
+            wipeAndFree(allocator, buffer);
+    }
+};
+
 fn loadPemSource(
     allocator: std.mem.Allocator,
     source: PemSource,
     max_bytes: usize,
-) ![]u8 {
-    const pem = switch (source) {
-        .path => |path| try readFileAbsolute(allocator, path, max_bytes),
-        .inline_pem => |inline_pem| try allocator.dupe(u8, inline_pem),
-    };
-    errdefer allocator.free(pem);
-    if (pem.len == 0)
-        return error.EmptyPemMaterial;
-    if (pem.len > max_bytes)
-        return error.PemMaterialTooLarge;
-    return pem;
+) !LoadedPem {
+    switch (source) {
+        .inline_pem => |text| {
+            if (text.len == 0)
+                return error.EmptyPemMaterial;
+            if (text.len > max_bytes)
+                return error.PemMaterialTooLarge;
+            return .{ .bytes = text, .owned = null };
+        },
+        .path => |path| {
+            const buffer = try readPemFile(allocator, path, max_bytes);
+            if (buffer.len == 0) {
+                allocator.free(buffer);
+                return error.EmptyPemMaterial;
+            }
+            return .{ .bytes = buffer, .owned = buffer };
+        },
+    }
 }
 
-fn readFileAbsolute(
-    allocator: std.mem.Allocator,
-    path: []const u8,
-    max_bytes: usize,
-) ![]u8 {
+/// The whole file at `path` in one buffer of exactly its size, read in place, so no partial or
+/// grown copy of it is ever freed. Fails with `error.FileTooBig` past `max_bytes`, and with
+/// `error.PemFileChanged` when the file's length moved while it was read.
+fn readPemFile(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
     var file = try std.fs.openFileAbsolute(path, .{ .mode = .read_only });
     defer file.close();
-    return file.readToEndAlloc(allocator, max_bytes);
+    const stat = try file.stat();
+    if (stat.size > max_bytes)
+        return error.FileTooBig;
+    const buffer = try allocator.alloc(u8, @intCast(stat.size));
+    errdefer wipeAndFree(allocator, buffer);
+    if (try file.readAll(buffer) != buffer.len)
+        return error.PemFileChanged;
+    var probe: [1]u8 = undefined;
+    if (try file.read(&probe) != 0)
+        return error.PemFileChanged;
+    return buffer;
 }
 
-fn secureFree(allocator: std.mem.Allocator, secret: []u8) void {
-    std.crypto.secureZero(u8, secret);
-    allocator.free(secret);
+fn wipeAndFree(allocator: std.mem.Allocator, buffer: []u8) void {
+    std.crypto.secureZero(u8, buffer);
+    allocator.free(buffer);
 }
 
 /// The ciphers the context offers, narrowed to the ones the kernel can take over, so a handshake

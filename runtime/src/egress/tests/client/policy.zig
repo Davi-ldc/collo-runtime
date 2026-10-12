@@ -1,22 +1,106 @@
-//! Tests of the gateway's outbound policy and transport rules: URL, protocol
-//! and destination checks, DNS answer selection, the DNS cache's coalescing,
-//! negative caching, invalidation and deadlines, connect racing, body and
-//! window limits, and the stall, request and HTTP/1 park deadlines. The DNS
-//! cache cases swap in test resolvers wherever they need a lookup to fail,
-//! block or stall.
+//! Tests of the gateway's outbound transport rules: how `parseTarget` reads
+//! a hop's URL and decides it under a network policy, the check of every DNS
+//! answer against the hop's admission, the DNS cache's coalescing, negative
+//! caching, invalidation and deadlines, connect racing, body and window
+//! limits, and the stall, request and HTTP/1 park deadlines. The address
+//! classes and the grant matching beneath `parseTarget` are tested in
+//! `common/tests/network/`. The DNS cache cases swap in test resolvers
+//! wherever they need a lookup to fail, block or stall.
 
 const std = @import("std");
 const gateway_egress = @import("collo_egress_client");
+const network_policy = @import("network_policy.zig");
 const dns_cache = gateway_egress.dns_cache;
 const egress_transport = gateway_egress.transport;
+const network = gateway_egress.network;
 const readiness = gateway_egress.readiness;
+
+/// `api.example.com` and `[2606:4700::1111]`, over HTTPS on port 443.
+const listed_grant: network.Grant = .{
+    .allow_http = false,
+    .allow_private_networks = false,
+    .any = false,
+    .names = &.{.{ .host = .{ .name = "api.example.com" }, .port = 0 }},
+    .suffixes = &.{},
+    .ipv4 = &.{},
+    .ipv6 = &.{.{ .host = .{ .ipv6 = ipv6Bytes(.{ 0x2606, 0x4700, 0, 0, 0, 0, 0, 0x1111 }) }, .port = 0 }},
+};
+const listed_policy: network.Policy = .{ .grants = &.{&listed_grant} };
+
+/// A setting with allowPrivateNetworks that lists `db.internal` and
+/// `10.0.0.5`.
+const internal_grant: network.Grant = .{
+    .allow_http = false,
+    .allow_private_networks = true,
+    .any = false,
+    .names = &.{.{ .host = .{ .name = "db.internal" }, .port = 0 }},
+    .suffixes = &.{},
+    .ipv4 = &.{.{ .host = .{ .ipv4 = .{ 10, 0, 0, 5 } }, .port = 0 }},
+    .ipv6 = &.{},
+};
+
+/// `10.0.0.6` in a setting without allowPrivateNetworks. The configuration
+/// parser refuses such a setting, so the transport's own refusal is what
+/// this grant tests.
+const unflagged_private_grant: network.Grant = .{
+    .allow_http = false,
+    .allow_private_networks = false,
+    .any = false,
+    .names = &.{},
+    .suffixes = &.{},
+    .ipv4 = &.{.{ .host = .{ .ipv4 = .{ 10, 0, 0, 6 } }, .port = 0 }},
+    .ipv6 = &.{},
+};
+const private_policy: network.Policy = .{ .grants = &.{ &internal_grant, &unflagged_private_grant } };
+
+/// `*` beside a setting that allows private networks for its own entries.
+const public_and_internal_policy: network.Policy = .{
+    .grants = &.{ network.public_https.grants[0], &internal_grant },
+};
+
+/// Two metadata addresses named by a setting with allowHttp and
+/// allowPrivateNetworks. The configuration parser refuses both entries, so
+/// the transport's own refusal is what this grant tests.
+const metadata_named_grant: network.Grant = .{
+    .allow_http = true,
+    .allow_private_networks = true,
+    .any = false,
+    .names = &.{},
+    .suffixes = &.{},
+    .ipv4 = &.{.{ .host = .{ .ipv4 = .{ 169, 254, 169, 254 } }, .port = 0 }},
+    .ipv6 = &.{.{ .host = .{ .ipv6 = ipv6Bytes(.{ 0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254 }) }, .port = 0 }},
+};
+const metadata_named_policy: network.Policy = .{ .grants = &.{&metadata_named_grant} };
+
+/// `[2606:2800:220:1:248:1893:25c8:1946]:8443` over HTTPS.
+const ipv6_8443_grant: network.Grant = .{
+    .allow_http = false,
+    .allow_private_networks = false,
+    .any = false,
+    .names = &.{},
+    .suffixes = &.{},
+    .ipv4 = &.{},
+    .ipv6 = &.{.{
+        .host = .{ .ipv6 = ipv6Bytes(.{ 0x2606, 0x2800, 0x220, 0x1, 0x248, 0x1893, 0x25c8, 0x1946 }) },
+        .port = 8443,
+    }},
+};
+const ipv6_8443_policy: network.Policy = .{ .grants = &.{&ipv6_8443_grant} };
+
+/// The network-order bytes of an IPv6 address written as eight groups.
+fn ipv6Bytes(groups: [8]u16) [16]u8 {
+    var bytes: [16]u8 = undefined;
+    for (groups, 0..) |group, index|
+        std.mem.writeInt(u16, bytes[index * 2 ..][0..2], group, .big);
+    return bytes;
+}
 
 test "egress stall deadline is an idle timeout: resets on progress, bounded by the total" {
     const ms = std.time.ns_per_ms;
 
     // The socket timeout is a stall clock: with no request deadline, the
     // deadline is exactly `socket_timeout_ms` from now.
-    const idle_only = egress_transport.Config{ .socket_timeout_ms = 5_000 };
+    const idle_only = egress_transport.Config{ .network = network.public_https, .socket_timeout_ms = 5_000 };
     try std.testing.expectEqual(@as(u64, 1_000_000 + 5_000 * ms), idle_only.stallDeadlineFromNow(1_000_000));
 
     // A later refresh, as when a chunk arrives, pushes the deadline forward
@@ -29,6 +113,7 @@ test "egress stall deadline is an idle timeout: resets on progress, bounded by t
     // The request deadline caps every refresh, so the stall clock never
     // pushes the fetch past its total bound.
     const capped = egress_transport.Config{
+        .network = network.public_https,
         .socket_timeout_ms = 5_000,
         .request_deadline_mono_ns = 1_000_000 + 2_000 * ms,
     };
@@ -43,93 +128,198 @@ test "egress stall deadline is an idle timeout: resets on progress, bounded by t
     );
 }
 
-test "fetch protocol validation is explicit" {
-    try egress_transport.validateProtocol("https://example.com/", false);
-    try std.testing.expectError(error.PlainHttpFetchDisabled, egress_transport.validateProtocol("http://example.com/", false));
-    try egress_transport.validateProtocol("http://example.com/", true);
-    try std.testing.expectError(error.UnsupportedFetchProtocol, egress_transport.validateProtocol("file:///tmp/x", true));
+test "egress target reads http and https only, and plain HTTP needs a grant with allowHttp" {
+    _ = try egress_transport.parseTarget(network.public_https, "https://example.com/");
+    try std.testing.expectError(
+        error.EgressSchemeDenied,
+        egress_transport.parseTarget(network.public_https, "http://example.com/"),
+    );
+    _ = try egress_transport.parseTarget(network_policy.public_http_and_https, "http://example.com/");
+    try std.testing.expectError(
+        error.UnsupportedFetchProtocol,
+        egress_transport.parseTarget(network_policy.public_http_and_https, "file:///tmp/x"),
+    );
 }
 
-test "egress policy rejects private and metadata destinations" {
-    const policy = egress_transport.EgressPolicy{};
-    try std.testing.expectError(error.EgressDenied, policy.validateResolvedAddress(try std.net.Address.parseIp4("0.0.0.0", 443)));
-    try std.testing.expectError(error.EgressDenied, policy.validateResolvedAddress(try std.net.Address.parseIp4("0.1.2.3", 443)));
-    try std.testing.expectError(error.EgressDenied, policy.validateResolvedAddress(try std.net.Address.parseIp4("127.0.0.1", 443)));
-    try std.testing.expectError(error.EgressDenied, policy.validateResolvedAddress(try std.net.Address.parseIp4("10.0.0.1", 443)));
-    try std.testing.expectError(error.EgressDenied, policy.validateResolvedAddress(try std.net.Address.parseIp4("100.64.0.1", 443)));
-    try std.testing.expectError(error.EgressDenied, policy.validateResolvedAddress(try std.net.Address.parseIp4("169.254.169.254", 80)));
-    try std.testing.expectError(error.EgressDenied, policy.validateResolvedAddress(try std.net.Address.parseIp4("172.16.0.1", 443)));
-    try std.testing.expectError(error.EgressDenied, policy.validateResolvedAddress(try std.net.Address.parseIp4("172.31.255.255", 443)));
-    try std.testing.expectError(error.EgressDenied, policy.validateResolvedAddress(try std.net.Address.parseIp4("192.168.1.1", 443)));
-    try std.testing.expectError(error.EgressDenied, policy.validateResolvedAddress(try std.net.Address.parseIp4("198.18.0.1", 443)));
-    try std.testing.expectError(error.EgressDenied, policy.validateResolvedAddress(try std.net.Address.parseIp4("224.0.0.1", 443)));
-    try std.testing.expectError(error.EgressDenied, policy.validateResolvedAddress(try std.net.Address.parseIp4("240.0.0.1", 443)));
-    try std.testing.expectError(error.EgressDenied, policy.validateResolvedAddress(try std.net.Address.parseIp4("255.255.255.255", 443)));
-    try std.testing.expectError(error.EgressDenied, policy.validateResolvedAddress(try std.net.Address.parseIp6("::1", 443)));
-    try std.testing.expectError(error.EgressDenied, policy.validateResolvedAddress(try std.net.Address.parseIp6("::", 443)));
-    try std.testing.expectError(error.EgressDenied, policy.validateResolvedAddress(try std.net.Address.parseIp6("fd00::1", 443)));
-    try std.testing.expectError(error.EgressDenied, policy.validateResolvedAddress(try std.net.Address.parseIp6("fe80::1", 443)));
-    try std.testing.expectError(error.EgressDenied, policy.validateResolvedAddress(try std.net.Address.parseIp6("ff02::fb", 5353)));
-    try std.testing.expectError(error.EgressDenied, policy.validateResolvedAddress(try std.net.Address.parseIp6("::ffff:127.0.0.1", 443)));
-    try policy.validateResolvedAddress(try std.net.Address.parseIp4("93.184.216.34", 443));
-    try policy.validateResolvedAddress(try std.net.Address.parseIp6("2606:2800:220:1:248:1893:25c8:1946", 443));
-    try std.testing.expectError(error.EgressDenied, policy.validateUrl("https://localhost/"));
+test "egress target admits a listed name in any letter case and with a trailing dot" {
+    const urls = [_][]const u8{
+        "https://api.example.com/v1",
+        "https://API.Example.COM/v1",
+        "https://api.example.com./v1",
+        "https://Api.Example.Com.:443/v1",
+    };
+    for (urls) |url| {
+        const target = try egress_transport.parseTarget(listed_policy, url);
+        try std.testing.expectEqual(@as(u16, 443), target.port);
+        try std.testing.expect(!target.admission.allow_private_networks);
+    }
 }
 
-test "egress policy normalizes parser edge cases before DNS" {
-    const policy = egress_transport.EgressPolicy{};
-    try std.testing.expectError(error.EgressDenied, policy.validateUrl("https://localhost./"));
-    try std.testing.expectError(error.EgressDenied, policy.validateUrl("https://demo.localhost./"));
-    try std.testing.expectError(error.EgressDenied, policy.validateUrl("https://user:pass@localhost./"));
-    try std.testing.expectError(error.InvalidFetchUrl, policy.validateUrl("https://exämple.com/"));
-    try std.testing.expectError(error.InvalidFetchUrl, policy.validateUrl("https://%6cocalhost/"));
-    try std.testing.expectError(error.InvalidFetchUrl, policy.validateUrl("https://0177.0.0.1/"));
-    try std.testing.expectError(error.InvalidFetchUrl, policy.validateUrl("https://127.1/"));
-
-    const dotted = try policy.parseTarget("https://example.com./data");
-    try std.testing.expectEqualStrings("example.com", dotted.tls_server_name);
+test "egress target refuses a name the policy does not list with EgressHostDenied" {
+    const urls = [_][]const u8{
+        "https://evil.example.com/",
+        "https://api.example.com.evil.net/",
+    };
+    for (urls) |url|
+        try std.testing.expectError(error.EgressHostDenied, egress_transport.parseTarget(listed_policy, url));
 }
 
-test "egress private opt-in still blocks local infrastructure addresses" {
-    const policy = egress_transport.EgressPolicy{ .allow_private_networks = true };
-    try policy.validateResolvedAddress(try std.net.Address.parseIp4("10.0.0.1", 443));
-    try policy.validateResolvedAddress(try std.net.Address.parseIp4("172.16.0.1", 443));
-    try policy.validateResolvedAddress(try std.net.Address.parseIp4("192.168.1.1", 443));
-    try policy.validateResolvedAddress(try std.net.Address.parseIp6("fd00::1", 443));
-
-    try std.testing.expectError(error.EgressDenied, policy.validateResolvedAddress(try std.net.Address.parseIp4("127.0.0.1", 443)));
-    try std.testing.expectError(error.EgressDenied, policy.validateResolvedAddress(try std.net.Address.parseIp6("::1", 443)));
-    try std.testing.expectError(error.EgressDenied, policy.validateResolvedAddress(try std.net.Address.parseIp6("::ffff:127.0.0.1", 443)));
-    try std.testing.expectError(error.EgressDenied, policy.validateResolvedAddress(try std.net.Address.parseIp4("169.254.169.254", 80)));
+test "egress target refuses a listed name on a port its entry does not name with EgressPortDenied" {
+    try std.testing.expectError(
+        error.EgressPortDenied,
+        egress_transport.parseTarget(listed_policy, "https://api.example.com:8443/"),
+    );
 }
 
-test "egress policy blocks well-known NAT64 translation prefixes" {
-    const default_policy = egress_transport.EgressPolicy{};
-    try std.testing.expectError(error.EgressDenied, default_policy.validateResolvedAddress(try std.net.Address.parseIp6("64:ff9b::7f00:1", 443)));
-    try std.testing.expectError(error.EgressDenied, default_policy.validateResolvedAddress(try std.net.Address.parseIp6("64:ff9b::5db8:d822", 443)));
-    try std.testing.expectError(error.EgressDenied, default_policy.validateResolvedAddress(try std.net.Address.parseIp6("64:ff9b:1::7f00:1", 443)));
-
-    const private_policy = egress_transport.EgressPolicy{ .allow_private_networks = true };
-    try std.testing.expectError(error.EgressDenied, private_policy.validateResolvedAddress(try std.net.Address.parseIp6("64:ff9b::0a00:1", 443)));
+test "egress target refuses plain HTTP to a listed name with EgressSchemeDenied when its grant lacks allowHttp" {
+    try std.testing.expectError(
+        error.EgressSchemeDenied,
+        egress_transport.parseTarget(listed_policy, "http://api.example.com/"),
+    );
 }
 
-test "egress DNS policy rejects mixed safe and blocked answers" {
-    const policy = egress_transport.EgressPolicy{};
+test "egress target admits an IPv6 address only when listed, in any spelling" {
+    _ = try egress_transport.parseTarget(listed_policy, "https://[2606:4700::1111]/");
+    _ = try egress_transport.parseTarget(listed_policy, "https://[2606:4700:0:0:0:0:0:1111]/");
+    try std.testing.expectError(
+        error.EgressHostDenied,
+        egress_transport.parseTarget(listed_policy, "https://[2606:4700::1112]/"),
+    );
+}
+
+test "egress target admits a private address literal only through an entry whose setting allows private networks" {
+    const flagged = try egress_transport.parseTarget(private_policy, "https://10.0.0.5/");
+    try std.testing.expect(flagged.admission.allow_private_networks);
+    try std.testing.expectError(
+        error.EgressPrivateAddressDenied,
+        egress_transport.parseTarget(private_policy, "https://10.0.0.6/"),
+    );
+    try std.testing.expectError(
+        error.EgressHostDenied,
+        egress_transport.parseTarget(private_policy, "https://10.0.0.7/"),
+    );
+}
+
+test "egress answer check refuses a private answer for a name * admits, even beside a grant that allows private networks" {
+    const private_answer = [_]std.net.Address{try std.net.Address.parseIp4("10.0.0.1", 443)};
+
+    const public_only = try egress_transport.parseTarget(network.public_https, "https://api.example.com/");
+    try std.testing.expect(!public_only.admission.allow_private_networks);
+    try std.testing.expectError(
+        error.EgressPrivateAddressDenied,
+        egress_transport.selectResolvedAddress(public_only.admission, &private_answer),
+    );
+
+    const beside = try egress_transport.parseTarget(public_and_internal_policy, "https://api.example.com/");
+    try std.testing.expect(!beside.admission.allow_private_networks);
+    try std.testing.expectError(
+        error.EgressPrivateAddressDenied,
+        egress_transport.selectResolvedAddress(beside.admission, &private_answer),
+    );
+
+    // The flag follows the entry that names the host.
+    const internal = try egress_transport.parseTarget(public_and_internal_policy, "https://db.internal/");
+    try std.testing.expect(internal.admission.allow_private_networks);
+    const selected = try egress_transport.selectResolvedAddress(internal.admission, &private_answer);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 10, 0, 0, 1 }, &egress_transport.ipv4Bytes(selected));
+}
+
+test "egress answer check refuses an answer mixing a public and a loopback address whole with EgressReservedAddressDenied" {
+    const target = try egress_transport.parseTarget(network.public_https, "https://api.example.com/");
     const answers = [_]std.net.Address{
         try std.net.Address.parseIp4("93.184.216.34", 443),
         try std.net.Address.parseIp4("127.0.0.1", 443),
     };
-    try std.testing.expectError(error.EgressDenied, policy.selectResolvedAddress(&answers));
+    try std.testing.expectError(
+        error.EgressReservedAddressDenied,
+        egress_transport.selectResolvedAddress(target.admission, &answers),
+    );
+    try std.testing.expectError(
+        error.EgressReservedAddressDenied,
+        egress_transport.selectResolvedAddress(.{ .allow_private_networks = true }, &answers),
+    );
 }
 
-test "egress DNS policy returns first answer only after validating all answers" {
-    const policy = egress_transport.EgressPolicy{};
+test "egress answer check returns the first answer once every answer passes" {
+    const target = try egress_transport.parseTarget(network.public_https, "https://api.example.com/");
     const answers = [_]std.net.Address{
         try std.net.Address.parseIp4("93.184.216.34", 443),
         try std.net.Address.parseIp6("2606:2800:220:1:248:1893:25c8:1946", 443),
     };
-    const selected = try policy.selectResolvedAddress(&answers);
+    const selected = try egress_transport.selectResolvedAddress(target.admission, &answers);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 93, 184, 216, 34 }, &egress_transport.ipv4Bytes(selected));
+}
+
+test "egress target and answer check refuse metadata addresses under every policy and admission" {
+    const policies = [_]network.Policy{
+        network.public_https,
+        network_policy.public_http_and_https,
+        private_policy,
+        metadata_named_policy,
+    };
+    const urls = [_][]const u8{
+        "https://169.254.169.254/",
+        "http://169.254.169.254/latest/meta-data/",
+        "https://[fd00:ec2::254]/",
+        "http://[fd00:ec2::254]/",
+    };
+    for (policies) |hop_policy| {
+        for (urls) |url|
+            try std.testing.expectError(error.EgressReservedAddressDenied, egress_transport.parseTarget(hop_policy, url));
+    }
+
+    const answers = [_]std.net.Address{
+        try std.net.Address.parseIp4("169.254.169.254", 80),
+        try std.net.Address.parseIp6("fd00:ec2::254", 80),
+    };
+    for ([_]bool{ false, true }) |allow_private_networks| {
+        for (answers) |answer| {
+            const single = [_]std.net.Address{answer};
+            try std.testing.expectError(
+                error.EgressReservedAddressDenied,
+                egress_transport.selectResolvedAddress(.{ .allow_private_networks = allow_private_networks }, &single),
+            );
+        }
+    }
+}
+
+test "egress target refuses every hop under a policy without grants with EgressNotGranted, before any other check" {
+    const urls = [_][]const u8{
+        "https://api.example.com/",
+        "https://93.184.216.34/",
+        "https://localhost/",
+        "https://169.254.169.254/",
+    };
+    for (urls) |url|
+        try std.testing.expectError(error.EgressNotGranted, egress_transport.parseTarget(network.deny_all, url));
+}
+
+test "egress target refuses localhost in any spelling with EgressReservedAddressDenied" {
+    const policies = [_]network.Policy{ network.public_https, listed_policy, private_policy };
+    const urls = [_][]const u8{
+        "https://localhost/",
+        "https://LOCALHOST./",
+        "https://demo.localhost./",
+        "https://user:pass@localhost./",
+    };
+    for (policies) |hop_policy| {
+        for (urls) |url|
+            try std.testing.expectError(error.EgressReservedAddressDenied, egress_transport.parseTarget(hop_policy, url));
+    }
+}
+
+test "egress target refuses hosts a URL parser could read another way as invalid before the policy sees them" {
+    const urls = [_][]const u8{
+        "https://exämple.com/",
+        "https://%6cocalhost/",
+        "https://0177.0.0.1/",
+        "https://127.1/",
+    };
+    for (urls) |url|
+        try std.testing.expectError(error.InvalidFetchUrl, egress_transport.parseTarget(network.public_https, url));
+
+    const dotted = try egress_transport.parseTarget(network.public_https, "https://example.com./data");
+    try std.testing.expectEqualStrings("example.com", dotted.tls_server_name);
 }
 
 test "egress DNS cache coalesces completed lookups and invalidates entries" {
@@ -303,11 +493,10 @@ test "ipv4 policy reads network-order address bytes" {
 }
 
 test "egress target uses validated numeric connect host" {
-    const policy = egress_transport.EgressPolicy{};
     var cache = egress_transport.DnsCache.init(std.testing.allocator, .{});
     defer cache.deinit();
-    const request_target = try policy.parseTarget("https://93.184.216.34/");
-    var target = try policy.resolveRequestTarget(std.testing.allocator, &cache, request_target);
+    const request_target = try egress_transport.parseTarget(network.public_https, "https://93.184.216.34/");
+    var target = try egress_transport.resolveRequestTargetUntil(std.testing.allocator, &cache, request_target, 0);
     defer target.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("93.184.216.34", target.authority_host);
     try std.testing.expectEqualStrings("93.184.216.34", target.tls_server_name);
@@ -316,11 +505,13 @@ test "egress target uses validated numeric connect host" {
 }
 
 test "egress target keeps ipv6 authority separate from tls server name" {
-    const policy = egress_transport.EgressPolicy{};
     var cache = egress_transport.DnsCache.init(std.testing.allocator, .{});
     defer cache.deinit();
-    const request_target = try policy.parseTarget("https://[2606:2800:220:1:248:1893:25c8:1946]:8443/");
-    var target = try policy.resolveRequestTarget(std.testing.allocator, &cache, request_target);
+    const request_target = try egress_transport.parseTarget(
+        ipv6_8443_policy,
+        "https://[2606:2800:220:1:248:1893:25c8:1946]:8443/",
+    );
+    var target = try egress_transport.resolveRequestTargetUntil(std.testing.allocator, &cache, request_target, 0);
     defer target.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("[2606:2800:220:1:248:1893:25c8:1946]", target.authority_host);
     try std.testing.expectEqualStrings("2606:2800:220:1:248:1893:25c8:1946", target.tls_server_name);
@@ -329,8 +520,10 @@ test "egress target keeps ipv6 authority separate from tls server name" {
 }
 
 test "egress target rejects bracketed non-ipv6 hosts" {
-    const policy = egress_transport.EgressPolicy{};
-    try std.testing.expectError(error.InvalidFetchUrl, policy.validateUrl("https://[example.com]/"));
+    try std.testing.expectError(
+        error.InvalidFetchUrl,
+        egress_transport.parseTarget(network.public_https, "https://[example.com]/"),
+    );
 }
 
 test "binary fetch headers clone to http1 headers" {
@@ -356,6 +549,7 @@ test "response body buffering enforces maximum" {
 
 test "compressed stream pump keeps decoded queue watermark separate from body cap" {
     const config = egress_transport.Config{
+        .network = network.public_https,
         .max_response_body_bytes = 4 * 1024 * 1024,
         .max_encoded_response_bytes = 512 * 1024,
         .max_pending_decoded_body_bytes = 256 * 1024,
@@ -372,6 +566,7 @@ test "compressed stream pump keeps decoded queue watermark separate from body ca
 
 test "http2 advertised receive window respects encoded budget" {
     const config = egress_transport.Config{
+        .network = network.public_https,
         .max_response_body_bytes = 4 * 1024 * 1024,
         .max_encoded_response_bytes = 32 * 1024,
         .max_pending_decoded_body_bytes = 256 * 1024,
@@ -435,7 +630,7 @@ test "h1 owner-loop pending deadlines follow the two-clock model" {
     var pending = engine.H1Pending{
         .command = .{
             .task = undefined,
-            .config = .{ .socket_timeout_ms = 5_000 },
+            .config = .{ .network = network.public_https, .socket_timeout_ms = 5_000 },
         },
         .body_pipe = undefined,
         .source_id = 1,

@@ -4,12 +4,15 @@
 //! (`protocol.zig`).
 //!
 //! The daemon writes a configuration with one worker definition per sampler
-//! route, builds the routes from it at boot as the server's boot does, and
-//! serves them through the production server: ingress, the launcher, the
-//! pools and the reaper. `wsl-config run` places this process in the trial's
-//! `main` cgroup before exec, so the trial accounts for every pack, channel
-//! and child the daemon creates. Boot fails unless the zygote and the gateway
-//! sit in that same cgroup and the worker root is its `workers` sibling.
+//! route from the knobs the controller hands it (`node.zig`), builds the
+//! routes from it at boot as the server's boot does, and serves them through
+//! the production server: ingress, the launcher, the pools and the reaper.
+//! `wsl-config run` places this process in the trial's `main` cgroup before
+//! exec, so the trial accounts for every pack, channel and child the daemon
+//! creates. Boot fails unless the zygote and the gateway sit in that same
+//! cgroup and the worker root is its `workers` sibling. With the `network`
+//! knob at `none` no definition is granted, so no gateway exists and no
+//! worker has an egress session, and boot and every prepare check that.
 //!
 //! A prepare publishes a worker without dispatching to its handler. A launch
 //! starts only for a waiting request (`Pool.launchStarted`), so the daemon
@@ -30,9 +33,9 @@
 //! the client's send, which holds because the controller sends one request
 //! at a time into an empty pool.
 //!
-//! Sampler route `i` is worker definition `i` (`writeConfig`), whose single
-//! route is `/sandbox/<i>`, so every identity the daemon reports carries the
-//! definition index as the route.
+//! Sampler route `i` is worker definition `i` (`writeConfig` in `node.zig`),
+//! whose single route is `/sandbox/<i>`, so every identity the daemon
+//! reports carries the definition index as the route.
 //!
 //! The main thread runs each command to completion before it reads the next.
 //! A server thread runs `Server.run`, and a trace thread drains the zygote's
@@ -51,7 +54,10 @@ const server_main = @import("collo_server_main");
 const config = @import("collo_server_config");
 const routes_mod = @import("collo_server_routes");
 const supervision = @import("collo_server_supervisor");
+const collo_network = @import("collo_network");
+const server_limits = @import("collo_limits").server;
 const protocol = @import("protocol.zig");
+const node = @import("node.zig");
 const Workload = @import("workload.zig").Workload;
 
 const WorkerRecord = supervision.worker_table.Record;
@@ -61,10 +67,6 @@ const LaunchTrace = supervision.launcher.LaunchTrace;
 const timeout_ns: u64 = 5 * std.time.ns_per_s;
 /// The interval between checks while one of those waits runs.
 const poll_ns: u64 = std.time.ns_per_ms;
-/// The global limits of the generated configuration: every worker's memory
-/// and every request's deadline.
-const worker_memory_mib: u32 = 512;
-const request_timeout_ms: u32 = 5_000;
 /// The lane a prepare's placeholder waiter names: the daemon's server runs
 /// one lane.
 const placeholder_lane: supervision.pool.LaneId = 0;
@@ -77,6 +79,11 @@ const placeholder_waiter = supervision.pool.RequestKey{
     .slot = 0,
     .generation = 0,
 };
+
+comptime {
+    // The concurrency knob's range is the configuration's.
+    std.debug.assert(node.concurrency_max == server_limits.worker_concurrency_max);
+}
 
 pub fn run(allocator: std.mem.Allocator) !void {
     var daemon: Daemon = undefined;
@@ -119,6 +126,8 @@ const Daemon = struct {
     paths: Paths = undefined,
     main_cgroup: []u8 = undefined,
     worker_root: host.WorkerCgroupRoot = undefined,
+    /// The one directory every worker of this node mounts its tmpfs over.
+    tmp_mount_point: host.TmpMountPoint = undefined,
     spawned: zygote.host_client.SpawnedZygote = undefined,
     /// Owns the routes built from the configuration (`Server.routes`).
     runtime: server_main.Server = undefined,
@@ -138,12 +147,23 @@ const Daemon = struct {
         const worker_parent = std.posix.getenv("COLLO_BENCH_CGROUP_ROOT") orelse
             return error.BenchmarkCgroupRootRequired;
         const workload = try Workload.fromEnvironment();
+        const network = try node.Network.fromEnvironment();
+        const concurrency = try node.concurrencyFromEnvironment();
+        const origin = try node.Origin.fromEnvironment();
+        // The controller starts an origin exactly for a workload that
+        // fetches.
+        if (workload.needsOrigin() != (origin != null)) return error.OriginMismatch;
         self.main_cgroup = try validatePlacement(allocator, worker_parent);
         errdefer allocator.free(self.main_cgroup);
         self.paths = try Paths.init(allocator);
         errdefer self.paths.deinit(allocator) catch |err|
             std.log.warn("benchmark files cleanup failed: {s}", .{@errorName(err)});
-        try writeConfig(self.paths, workload);
+        try writeConfig(self.paths, workload, .{
+            .network = network,
+            .concurrency = concurrency,
+            .origin = origin,
+            .origin_private = if (origin) |value| try originPrivate(value.address) else false,
+        });
 
         // Every pack is built before any child exists, as the server's boot
         // builds its routes before it spawns the zygote.
@@ -166,6 +186,8 @@ const Daemon = struct {
             .{ .env_root = worker_parent },
         );
         errdefer self.worker_root.deinit(allocator);
+        try self.tmp_mount_point.init(host.tmp_mount.default_parent_dir);
+        errdefer self.tmp_mount_point.deinit();
         const executable = try std.fs.selfExePathAlloc(allocator);
         defer allocator.free(executable);
         self.spawned = try zygote.host_client.spawnZygote(.{
@@ -181,7 +203,10 @@ const Daemon = struct {
         // `Server.init` owns the routes from here on, failure included.
         routes_owned = false;
         self.runtime = try server_main.Server.init(allocator, &self.spawned, .{
-            .worker_cgroup_root = &self.worker_root,
+            .worker_host = .{
+                .cgroup_root = &self.worker_root,
+                .tmp_mount_point = &self.tmp_mount_point,
+            },
             .routes = routes,
             // One lane on any machine, so the node's fixed memory and the
             // sampled cold starts never depend on how many CPUs or receive
@@ -191,38 +216,44 @@ const Daemon = struct {
                 .cert_chain = .{ .inline_pem = server_certificate },
                 .private_key = .{ .inline_pem = server_key },
             },
-            .egress_gateway = .{ .executable_path = executable },
+            .egress_gateway_executable_path = executable,
         });
         errdefer self.runtime.deinit();
         // The gateway starts now rather than at the first worker attach, so it
         // is part of every trial's idle baseline instead of the first
         // prepare's delta, and its pid can be checked against the trial's
-        // cgroup.
+        // cgroup. With no grant the server starts none.
         try self.runtime.prewarmEgressGateway();
-        const manager = self.runtime.egress_gateways;
-        manager.mutex.lock();
-        const gateway = manager.current orelse {
-            manager.mutex.unlock();
-            return error.GatewayNotReady;
-        };
-        const gateway_pid = gateway.process.pid;
-        self.gateway_watch = os.fd.OwnedFd.dupCloexec(gateway.process.pidfd) catch |err| {
-            manager.mutex.unlock();
-            return err;
-        };
-        manager.mutex.unlock();
+        const gateway_pid = try self.watchGateway(network);
         errdefer self.gateway_watch.deinit();
-        try requireProcessPlacement(allocator, gateway_pid, self.main_cgroup);
+        if (gateway_pid) |pid| try requireProcessPlacement(allocator, pid, self.main_cgroup);
         self.ready = .{
             .port = self.runtime.port(),
             .zygote_pid = self.spawned.pid,
             .gateway_pid = gateway_pid,
             .workload = workload,
+            .network = network,
+            .concurrency = concurrency,
         };
         self.server_thread = try std.Thread.spawn(.{}, serverMain, .{self});
         errdefer self.stopServer();
         try self.waitForService();
         if ((try self.snapshot()).len != 0) return error.WorkerBornBeforeReady;
+    }
+
+    /// Watches the gateway the prewarm started and returns its pid, or
+    /// returns null when `network` is `none`, which requires that none runs.
+    fn watchGateway(self: *Daemon, network: node.Network) !?u32 {
+        const manager = self.runtime.egress_gateways;
+        manager.mutex.lock();
+        defer manager.mutex.unlock();
+        const gateway = manager.current orelse {
+            if (network == .granted) return error.GatewayNotReady;
+            return null;
+        };
+        if (network == .none) return error.GatewayWithoutGrant;
+        self.gateway_watch = try os.fd.OwnedFd.dupCloexec(gateway.process.pidfd);
+        return gateway.process.pid;
     }
 
     fn command(self: *Daemon, request: protocol.Command) !void {
@@ -305,7 +336,10 @@ const Daemon = struct {
 
         const launch = try self.awaitLaunch(definition, 0, deadline_ns);
         const record = try self.awaitIdleWorker(definition, launch, deadline_ns);
-        if (record.egress_gateway_session_id == 0) return error.WorkerGatewayMissing;
+        switch (self.ready.network) {
+            .granted => if (record.egress_gateway_session_id == 0) return error.WorkerGatewayMissing,
+            .none => if (record.egress_gateway_session_id != 0) return error.EgressSessionWithoutGrant,
+        }
         if (record.handle.metrics) |*metrics| {
             if (metrics.loadBenchHandler() != null) return error.HandlerRanDuringPrepare;
         } else return error.WorkerMetricsMissing;
@@ -509,7 +543,8 @@ const Daemon = struct {
         if (self.server_failed.load(.acquire)) return error.ServerFailed;
         if (self.trace_failed.load(.acquire)) return error.TraceDrainFailed;
         if (os.process.pidFdHasExited(self.zygote_watch.fd())) return error.ZygoteDied;
-        if (os.process.pidFdHasExited(self.gateway_watch.fd())) return error.GatewayDied;
+        if (self.gateway_watch.isValid() and os.process.pidFdHasExited(self.gateway_watch.fd()))
+            return error.GatewayDied;
     }
 
     fn waitForService(self: *Daemon) !void {
@@ -546,11 +581,14 @@ const Daemon = struct {
         @memcpy(worker_path_buffer[0..path_len], self.worker_root.workers_dir_path);
         self.stopServer();
         self.runtime.deinit();
+        self.tmp_mount_point.deinit();
         self.worker_root.deinit(self.allocator);
         self.stopTrace();
         self.spawned.deinit();
-        const children_exited = os.process.pidFdHasExited(self.gateway_watch.fd()) and
-            os.process.pidFdHasExited(self.zygote_watch.fd());
+        // Without a grant no gateway ever ran.
+        const gateway_exited = !self.gateway_watch.isValid() or
+            os.process.pidFdHasExited(self.gateway_watch.fd());
+        const children_exited = gateway_exited and os.process.pidFdHasExited(self.zygote_watch.fd());
         const workers_removed = pathMissing(worker_path_buffer[0..path_len]) catch false;
         self.gateway_watch.deinit();
         self.zygote_watch.deinit();
@@ -745,32 +783,30 @@ const Paths = struct {
     }
 };
 
-/// Writes the workload's entry module and a configuration with
-/// `route_count_max` worker definitions, `sandbox-<i>`, each with the one
-/// route `/sandbox/<i>` on that entry. Pools are keyed by definition, so
-/// every route gets a pool and a pack of its own while all packs hold the
-/// same source under different specifiers.
-fn writeConfig(paths: Paths, workload: Workload) !void {
+/// Writes the workload's entry module and the configuration `node.zig`
+/// describes beside it.
+fn writeConfig(paths: Paths, workload: Workload, options: node.ConfigOptions) !void {
     try std.fs.makeDirAbsolute(paths.routes);
     var dir = try std.fs.openDirAbsolute(paths.routes, .{});
     defer dir.close();
-    try dir.writeFile(.{ .sub_path = "sandbox.js", .data = workload.entrySource() });
+    try dir.writeFile(.{ .sub_path = node.entry_file_name, .data = workload.entrySource() });
 
-    var buffer: [16 * 1024]u8 = undefined;
+    var buffer: [node.config_bytes_max]u8 = undefined;
     var output: std.Io.Writer = .fixed(&buffer);
-    try output.print(
-        "{{\"globalSettings\":{{\"limits\":{{\"memoryMiB\":{d},\"timeoutMs\":{d}}}}},\"workers\":{{",
-        .{ worker_memory_mib, request_timeout_ms },
-    );
-    for (0..protocol.route_count_max) |index| {
-        if (index != 0) try output.writeByte(',');
-        try output.print(
-            "\"sandbox-{d}\":{{\"routes\":{{\"" ++ protocol.route_prefix ++ "{d}\":{{\"entry\":\"./sandbox.js\"}}}}}}",
-            .{ index, index },
-        );
-    }
-    try output.writeAll("}}\n");
+    try node.writeConfig(&output, options);
     try dir.writeFile(.{ .sub_path = "collo.json", .data = output.buffered() });
+}
+
+/// Whether the origin's address is private, which its grant must say. The
+/// controller took it from the default route (`routableLocalIpv4` in
+/// `runtime/bench/local_origin.zig`), which yields only an address some
+/// grant can reach.
+fn originPrivate(address: [4]u8) !bool {
+    return switch (collo_network.address.classifyIpv4(address)) {
+        .public => false,
+        .private_routable => true,
+        else => error.OriginAddressNotGrantable,
+    };
 }
 
 const server_certificate =

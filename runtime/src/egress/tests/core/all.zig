@@ -1,6 +1,6 @@
 //! The egress core suite, driven without a transport: the fetch body's
-//! reads, settlement, tees and meters (`body.zig`), the decoder libraries'
-//! loading (`decompress.zig`), the worker's encoded-body decoder
+//! reads, settlement, tees and meters (`body.zig`), the codings the transport
+//! advertises and decodes (`decompress.zig`), the worker's encoded-body decoder
 //! (`encoded_body.zig`), and the stream pump with its HTTP/2 sink
 //! (`stream_pump.zig`). It runs as the `egress-core` suite of
 //! `egress-fast-test` and inside `egress-test`. The HTTP/1 continuation that

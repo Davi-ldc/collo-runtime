@@ -1,12 +1,13 @@
-//! A promise reaction runs under the request that registered it, not the one that settles the
-//! promise. Each test drives two turns over one VM, request A registering and request B
-//! settling, and reads the owner back from the console sink, which stamps every line with the
-//! request in `current_exec_ctx` when the line was produced. Host APIs resolve their caller
-//! through the same field (`activeExecContext` in `host_functions/runtime/bridge.cpp`). The
-//! thread-CPU slice moves with the owner too (`ColloRestoredTurnScope` in
-//! `jsc/runtime/vm.cpp`), but these tests check only the stamp. Lane: `bindings-test`.
-//! Attribution across two live requests in a worker is covered in `worker-test`
-//! (`worker/tests/runtime/multiplexing.zig`).
+//! A promise reaction runs under the owner that registered it, not the one that settles the
+//! promise: a request, or the turnless context module evaluation runs under, and a reaction
+//! whose owner was released runs with none. Most tests drive two turns over one VM, request A
+//! registering and request B settling, and read the owner back from the console sink, which
+//! stamps every line with the owner `Collo::ownerExecCtx` (`jsc/runtime/state.h`) names when
+//! the line was produced. Host APIs resolve their caller the same way (`activeExecContext` in
+//! `host_functions/runtime/bridge.cpp`), and the owner transition hook hears each hand-over,
+//! which `collo_vm_owner_crossings` counts.
+//! Lane: `bindings-test`. Attribution across two live requests in a worker is covered in
+//! `worker-test` (`worker/tests/runtime/multiplexing.zig`).
 
 const std = @import("std");
 const support = @import("bindings_support");
@@ -259,6 +260,41 @@ test "a reaction of the draining turn is not re-tagged by a restored continuatio
     try std.testing.expectEqual(@as(usize, 0), capture.a_lines);
 }
 
+test "only a reaction restored over another owner counts as an owner crossing" {
+    var vm = try support.createVm();
+    defer vm.deinit();
+
+    // The scenario above: A's continuation, restored over B, settles a promise B registered on,
+    // so B's reaction is enqueued under B and later restored to B while B itself drains. That
+    // second restore changes no owner, so only A's counts.
+    const source =
+        \\let settleA = null;
+        \\let settleB = null;
+        \\
+        \\export function armA() {
+        \\    const pendingA = new Promise((resolve) => { settleA = resolve; });
+        \\    pendingA.then(() => { settleB(1); });
+        \\}
+        \\
+        \\export function armAndFireB() {
+        \\    const pendingB = new Promise((resolve) => { settleB = resolve; });
+        \\    pendingB.then(() => {});
+        \\    settleA(1);
+        \\}
+    ;
+    try support.registerModule(&vm, "/crossings.js", source);
+    try support.evaluateOk(&vm, "/crossings.js");
+
+    var requests = TwoRequests.init();
+    defer requests.deinit(&vm);
+
+    const before = vm.ownerCrossings();
+    try runTurn(&vm, "/crossings.js", "armA", &requests.a);
+    try std.testing.expectEqual(before, vm.ownerCrossings());
+    try runTurn(&vm, "/crossings.js", "armAndFireB", &requests.b);
+    try std.testing.expectEqual(before + 1, vm.ownerCrossings());
+}
+
 test "a hot then site keeps the owner once the JIT compiles it" {
     var vm = try support.createVm();
     defer vm.deinit();
@@ -305,4 +341,207 @@ test "a hot then site keeps the owner once the JIT compiles it" {
     try std.testing.expectEqual(@as(usize, 4000), capture.a_lines);
     try std.testing.expectEqual(@as(usize, 0), capture.b_lines);
     try std.testing.expectEqual(@as(usize, 0), capture.other_lines);
+}
+
+// Ids above `bindings.request_id_max`, as a worker gives its module evaluations.
+const evaluation_first: u64 = bindings.request_id_max + 1;
+const evaluation_second: u64 = bindings.request_id_max + 2;
+
+/// Records the owner transition hook's calls as (leaving, entering) request ids, 0 for no owner.
+const TransitionCapture = struct {
+    const max_kept = 8;
+    pairs: [max_kept][2]u64 = undefined,
+    count: usize = 0,
+
+    fn hook(ctx: ?*anyopaque, leaving: ?*bindings.ExecCtx, entering: ?*bindings.ExecCtx) callconv(.c) void {
+        const self: *TransitionCapture = @ptrCast(@alignCast(ctx orelse return));
+        if (self.count == max_kept) return;
+        self.pairs[self.count] = .{
+            if (leaving) |exec_ctx| exec_ctx.request_id else 0,
+            if (entering) |exec_ctx| exec_ctx.request_id else 0,
+        };
+        self.count += 1;
+    }
+
+    fn expectPairs(self: *const TransitionCapture, expected: []const [2]u64) !void {
+        try std.testing.expectEqual(expected.len, self.count);
+        for (expected, self.pairs[0..self.count]) |want, got|
+            try std.testing.expectEqual(want, got);
+    }
+};
+
+test "a reaction turnless code registers runs under the turnless context that registered it" {
+    var vm = try support.createVm();
+    defer vm.deinit();
+
+    var capture = OwnerCapture{};
+    try capture.install(&vm, 64);
+    defer vm.setConsoleSink(null, null, 4096, 64, 1 << 20) catch {};
+    var transitions = TransitionCapture{};
+    try vm.setOwnerTransitionHook(TransitionCapture.hook, &transitions);
+    defer vm.setOwnerTransitionHook(null, null) catch {};
+
+    // Two module evaluations, each under a turnless context of its own as a worker installs one
+    // per evaluation, leave a reaction on a promise that request B settles later.
+    try support.registerModule(&vm, "/first.js",
+        \\new Promise((resolve) => { globalThis.settleFirst = resolve; })
+        \\    .then(() => { console.log("first-evaluation"); });
+    );
+    try support.registerModule(&vm, "/second.js",
+        \\new Promise((resolve) => { globalThis.settleSecond = resolve; })
+        \\    .then(() => { console.log("second-evaluation"); });
+    );
+    try support.registerModule(&vm, "/fire.js",
+        \\export function fire() { globalThis.settleFirst(1); globalThis.settleSecond(1); }
+    );
+
+    var first = support.makeExecCtx(evaluation_first);
+    defer vm.releaseExecCtx(&first) catch {};
+    var second = support.makeExecCtx(evaluation_second);
+    defer vm.releaseExecCtx(&second) catch {};
+    var requests = TwoRequests.init();
+    defer requests.deinit(&vm);
+
+    try vm.setTurnlessExecCtx(&first);
+    try support.evaluateOk(&vm, "/first.js");
+    try vm.setTurnlessExecCtx(&second);
+    try support.evaluateOk(&vm, "/second.js");
+    try vm.setTurnlessExecCtx(null);
+    try support.evaluateOk(&vm, "/fire.js");
+    // Each evaluation's own reactions drained inside it, under the owner that registered them,
+    // so the hook heard no hand-over.
+    try transitions.expectPairs(&.{});
+
+    try runTurn(&vm, "/fire.js", "fire", &requests.b);
+
+    try std.testing.expectEqual(@as(?u64, evaluation_first), capture.ownerOf("first-evaluation"));
+    try std.testing.expectEqual(@as(?u64, evaluation_second), capture.ownerOf("second-evaluation"));
+    try transitions.expectPairs(&.{
+        .{ request_b, evaluation_first },
+        .{ evaluation_first, request_b },
+        .{ request_b, evaluation_second },
+        .{ evaluation_second, request_b },
+    });
+}
+
+test "a reaction whose owner was released runs with no owner, never under the turnless context" {
+    var vm = try support.createVm();
+    defer vm.deinit();
+
+    var capture = OwnerCapture{};
+    try capture.install(&vm, 64);
+    defer vm.setConsoleSink(null, null, 4096, 64, 1 << 20) catch {};
+    var transitions = TransitionCapture{};
+    try vm.setOwnerTransitionHook(TransitionCapture.hook, &transitions);
+    defer vm.setOwnerTransitionHook(null, null) catch {};
+
+    try support.registerModule(&vm, "/released.js",
+        \\export function arm() {
+        \\    new Promise((resolve) => { globalThis.settleReleased = resolve; })
+        \\        .then(() => { console.log("continuation-of-released"); });
+        \\}
+    );
+    // Settled from module top-level code, so the continuation runs in the evaluation's own drain,
+    // outside any turn, where the turnless context owns everything not restored.
+    try support.registerModule(&vm, "/settle-turnless.js",
+        \\globalThis.settleReleased(1);
+        \\console.log("evaluation-line");
+    );
+    try support.evaluateOk(&vm, "/released.js");
+
+    var requests = TwoRequests.init();
+    defer requests.deinit(&vm);
+    var evaluation = support.makeExecCtx(evaluation_first);
+    defer vm.releaseExecCtx(&evaluation) catch {};
+
+    try runTurn(&vm, "/released.js", "arm", &requests.a);
+    try vm.releaseExecCtx(&requests.a);
+
+    try vm.setTurnlessExecCtx(&evaluation);
+    try support.evaluateOk(&vm, "/settle-turnless.js");
+    try vm.setTurnlessExecCtx(null);
+
+    try std.testing.expectEqual(@as(?u64, evaluation_first), capture.ownerOf("evaluation-line"));
+    try std.testing.expectEqual(@as(?u64, 0), capture.ownerOf("continuation-of-released"));
+    try transitions.expectPairs(&.{
+        .{ evaluation_first, 0 },
+        .{ 0, evaluation_first },
+    });
+}
+
+/// Counts console lines `owner-<n>` by whether the owner that logged them is `base + n`.
+const TagCapture = struct {
+    base: u64,
+    matches: usize = 0,
+    mismatches: usize = 0,
+
+    fn sink(
+        ctx: ?*anyopaque,
+        level: u8,
+        flags: u8,
+        request_id: u64,
+        bytes: ?[*]const u8,
+        len: usize,
+    ) callconv(.c) void {
+        _ = level;
+        _ = flags;
+        const self: *TagCapture = @ptrCast(@alignCast(ctx orelse return));
+        const line: []const u8 = if (bytes) |ptr| ptr[0..len] else "";
+        const prefix = "owner-";
+        if (!std.mem.startsWith(u8, line, prefix)) {
+            self.mismatches += 1;
+            return;
+        }
+        const tag = std.fmt.parseInt(u64, line[prefix.len..], 10) catch {
+            self.mismatches += 1;
+            return;
+        };
+        if (request_id == self.base + tag) self.matches += 1 else self.mismatches += 1;
+    }
+};
+
+test "every owner the table holds at once keeps its own continuations" {
+    var vm = try support.createVm();
+    defer vm.deinit();
+
+    const base_request_id: u64 = 1000;
+    var capture = TagCapture{ .base = base_request_id };
+    try vm.setConsoleSink(TagCapture.sink, &capture, 4096, 64, 1 << 20);
+    defer vm.setConsoleSink(null, null, 4096, 64, 1 << 20) catch {};
+
+    try support.registerModule(&vm, "/many.js",
+        \\const settles = [];
+        \\export function arm(tag) {
+        \\    new Promise((resolve) => { settles.push(resolve); }).then(() => { console.log(`owner-${tag}`); });
+        \\}
+        \\export function fire() { for (const settle of settles) settle(1); }
+    );
+    try support.evaluateOk(&vm, "/many.js");
+    var arm = try support.getExportOk(&vm, "/many.js", "arm");
+    defer arm.deinit();
+    var fire = try support.getExportOk(&vm, "/many.js", "fire");
+    defer fire.deinit();
+
+    // As many owners as a worker can hold tokens for at once: its requests, its evaluations and
+    // its worker owner. The first also drains everyone's continuations.
+    var contexts: [bindings.owner_slot_count]bindings.ExecCtx = undefined;
+    for (&contexts, 0..) |*exec_ctx, index|
+        exec_ctx.* = support.makeExecCtx(base_request_id + @as(u64, @intCast(index)));
+    defer for (&contexts) |*exec_ctx| vm.releaseExecCtx(exec_ctx) catch {};
+
+    for (&contexts, 0..) |*exec_ctx, index| {
+        var tag = try vm.numberValue(@floatFromInt(index));
+        defer tag.deinit();
+        try vm.turnEnter(exec_ctx);
+        var result = try support.invokeOk(&vm, exec_ctx, &arm, &.{&tag});
+        result.deinit();
+        try vm.turnExit();
+    }
+    try vm.turnEnter(&contexts[0]);
+    var fired = try support.invokeOk(&vm, &contexts[0], &fire, &.{});
+    fired.deinit();
+    try vm.turnExit();
+
+    try std.testing.expectEqual(contexts.len, capture.matches);
+    try std.testing.expectEqual(@as(usize, 0), capture.mismatches);
 }

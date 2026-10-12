@@ -33,12 +33,13 @@ void resetExtractedResponse(ColloExtractedResponse* response)
 void resetExtractedResponseBody(ColloExtractedResponseBody& out)
 {
     out.kind = COLLO_EXTRACTED_RESPONSE_BODY_EMPTY;
-    out.flags = 0;
+    out.reserved0 = 0;
     out.total_len = 0;
     out.segments = nullptr;
     out.segments_len = 0;
     out.owner = nullptr;
     out.stream_identity = {};
+    out.body_stream = nullptr;
 }
 
 bool publishOwnedByteSegment(
@@ -149,7 +150,6 @@ ColloStatus copyHeadersToExtracted(
                 static_cast<uint32_t>(name.value().length()),
                 value_offset,
                 static_cast<uint32_t>(value.value().length()),
-                0,
             })) {
             delete owner;
             return COLLO_STATUS_OUT_OF_MEMORY;
@@ -174,6 +174,8 @@ extern "C" void collo_response_extract_free(ColloExtractedResponse* response)
         return;
     if (response->body.owner)
         collo_owned_byte_segments_destroy(response->body.owner);
+    if (response->body.body_stream)
+        collo_response_body_stream_destroy(response->body.body_stream);
     if (response->headers.owner)
         collo_owned_header_block_destroy(response->headers.owner);
     Collo::HostFunctions::resetExtractedResponse(response);

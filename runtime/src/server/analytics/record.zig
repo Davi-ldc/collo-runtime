@@ -28,8 +28,9 @@ pub const Identity = struct {
     /// The identity of a supervisor worker record (`server/supervisor/worker_table.zig`
     /// `Record`): its definition's name, which the record borrows from the
     /// route table, and no route. A worker process belongs to a definition,
-    /// and any route of that definition may run on it, so no single pattern
-    /// names every line the worker writes.
+    /// and any route of that definition may run on it, so the console drain
+    /// gives each line the route of the request the line names, once the
+    /// worker's request table confirms it (`logs.drainRing`).
     pub fn ofWorker(worker: anytype) Identity {
         return .{
             .worker = worker.name,

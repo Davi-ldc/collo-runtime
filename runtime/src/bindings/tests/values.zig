@@ -96,7 +96,7 @@ test "empty string object property key is valid" {
     var value = try vm.stringValueUtf8("blank-key");
     defer value.deinit();
 
-    switch (try vm.objectSetUtf8(&object, "", &value)) {
+    switch (try vm.mainRealm().objectSetUtf8(&object, "", &value)) {
         .success => {},
         .exception => |exception| {
             var owned_exception = exception;
@@ -105,7 +105,7 @@ test "empty string object property key is valid" {
         },
     }
 
-    var actual = switch (try vm.objectGetUtf8(&object, "")) {
+    var actual = switch (try vm.mainRealm().objectGetUtf8(&object, "")) {
         .success => |result| result,
         .exception => |exception| {
             var owned_exception = exception;
@@ -141,7 +141,7 @@ test "object getter exception is cleared before returning over ABI" {
     var exec_ctx = support.makeExecCtx(51);
     try vm.turnEnter(&exec_ctx);
 
-    var exception = switch (try vm.objectGetUtf8(&object, "boom")) {
+    var exception = switch (try vm.mainRealm().objectGetUtf8(&object, "boom")) {
         .success => |value| {
             var owned = value;
             defer owned.deinit();
@@ -180,7 +180,7 @@ test "object setter exception is cleared before returning over ABI" {
     var exec_ctx = support.makeExecCtx(52);
     try vm.turnEnter(&exec_ctx);
 
-    var exception = switch (try vm.objectSetUtf8(&object, "boom", &value)) {
+    var exception = switch (try vm.mainRealm().objectSetUtf8(&object, "boom", &value)) {
         .success => return error.ExpectedJsException,
         .exception => |exception_value| exception_value,
     };
@@ -211,7 +211,7 @@ test "string conversion exception is cleared before returning over ABI" {
     var exec_ctx = support.makeExecCtx(53);
     try vm.turnEnter(&exec_ctx);
 
-    var exception = switch (try vm.valueToUtf8Copy(&value)) {
+    var exception = switch (try vm.mainRealm().valueToUtf8Copy(&value)) {
         .success => |text| {
             var owned = text;
             defer owned.deinit();

@@ -1,7 +1,8 @@
 // Named maximums for state the Web API bridge keeps for tenant code in a worker's VM: message and observer queues,
-// structured clone traversal, text codec stream buffering, materialized and cloned bodies, form and URL parameter
-// parsing, and the fetch request fields the bridge checks before a request crosses the ABI. Each call site decides
-// how an excess fails. WebApiNavigatorHardwareConcurrencyMax is the exception: it caps a reported value.
+// the ports of a MessageEvent and the links of a dependent AbortSignal, structured clone traversal, text codec stream
+// buffering and compression output, materialized and cloned bodies, form and URL parameter parsing, and the fetch
+// request fields the bridge checks before a request crosses the ABI. Each call site decides how an excess fails.
+// WebApiNavigatorHardwareConcurrencyMax is the exception: it caps a reported value.
 
 #pragma once
 
@@ -13,6 +14,13 @@ constexpr unsigned WebApiMessagePortPendingMessagesMax = 1024;
 constexpr unsigned WebApiStructuredCloneDepthMax = 512;
 constexpr unsigned WebApiStructuredCloneEntriesMax = 100000;
 constexpr unsigned WebApiPerformanceObserverPendingEntriesMax = 1024;
+// Ports one MessageEvent may carry when script builds it (the constructor's and initMessageEvent's ports); a message a
+// port delivers carries only what its transfer list held, which the structured clone bounds.
+constexpr unsigned WebApiMessageEventPortsMax = 1024;
+// Signals one dependent AbortSignal may be linked to: AbortSignal.any's inputs, counted with repeats, and the sources a
+// dependent input contributes. createDependentAbortSignal (events/abort.cpp) checks each link against the links made
+// so far, so the bound keeps that check below a million comparisons; a handler combines two or three signals.
+constexpr unsigned WebApiAbortSignalAnySourcesMax = 1024;
 constexpr unsigned WebApiNavigatorHardwareConcurrencyMax = 8;
 // Bytes a TextEncoderStream or TextDecoderStream may hold queued on its writable side (input) and on its readable
 // side (output). text_codec.cpp also rejects a single chunk whose input or decoded output exceeds them.
@@ -23,6 +31,9 @@ constexpr size_t WebApiCodecStreamPendingOutputBytesMax = 4 * 1024 * 1024;
 // This count bounds that overhead near 1 MiB and stays far above the number of writes a caller legitimately leaves
 // unawaited.
 constexpr size_t WebApiCodecStreamPendingWritesMax = 4096;
+// The most output a CompressionStream or DecompressionStream produces before it delivers it: the size of the
+// largest chunk its readable side receives, and of the output it holds while it waits for a read.
+constexpr size_t WebApiCompressionStreamOutputChunkBytes = 64 * 1024;
 // Mirrors MATERIALIZED_BODY_BYTES_MAX in common/limits/http_body.zig, which says what it bounds; no build step
 // compares the two.
 constexpr size_t WebApiMaterializedBodyBytesMax = 4 * 1024 * 1024;

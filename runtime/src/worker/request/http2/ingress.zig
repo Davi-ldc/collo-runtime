@@ -5,6 +5,7 @@
 //! later packet of the request must repeat.
 
 const ipc = @import("collo_ipc");
+const request_context = @import("../context.zig");
 
 /// Fails with `error.InvalidH2WorkerInboundDescriptor` for a descriptor that
 /// is not a request begin with its payload inline, with
@@ -25,9 +26,13 @@ pub fn validateStreamBeginDescriptor(
     if (descriptor.stream_id == 0 or descriptor.stream_id % 2 == 0)
         return error.InvalidH2StreamIdentity;
     // The request runs under the host's id and generation, so both must be
-    // assigned: 0 means no request, and generation 0 marks the boot context
-    // (`RequestContext.request_generation`).
+    // assigned: 0 means no request, generation 0 marks an evaluation
+    // (`RequestContext.request_generation`), and an id above
+    // `request_id_max` would take the active-map entry of an evaluation or
+    // the worker owner's place.
     if (dispatch_work.request_id == 0 or dispatch_work.request_generation == 0)
+        return error.InvalidH2StreamIdentity;
+    if (request_context.isReservedId(dispatch_work.request_id))
         return error.InvalidH2StreamIdentity;
     if (descriptor.request_id != dispatch_work.request_id or
         descriptor.request_generation != dispatch_work.request_generation or

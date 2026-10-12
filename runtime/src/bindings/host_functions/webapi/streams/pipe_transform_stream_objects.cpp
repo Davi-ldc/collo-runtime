@@ -47,8 +47,6 @@ template <typename Visitor> void JSColloPipeToState::visitChildrenImpl(JSCell* c
     visitor.append(this_object->m_reader);
     visitor.append(this_object->m_writer);
     visitor.append(this_object->m_promise);
-    visitor.append(this_object->m_resolve);
-    visitor.append(this_object->m_reject);
     visitor.append(this_object->m_signal);
     visitor.append(this_object->m_read_fulfilled);
     visitor.append(this_object->m_read_rejected);

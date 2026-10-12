@@ -1,20 +1,27 @@
-//! Covers the boot context, under which module top-level code may fetch and
-//! set timers: its install with WorkerInit's boot token, which every fetch of
-//! module top-level code presents, the evaluation budget, the close when the
-//! route's evaluation settles, the refusal of anything under its id afterwards
-//! or when it was never installed, and the refusal of fetch alone, with a
-//! TypeError and before anything leaves the worker, when the boot token is
-//! `none`. A top-level `import()` loads from the registered pack and sends
-//! nothing to the server. Each test boots one route; a table of several, and
-//! the context held open until the last of them settles, are covered in
-//! `routes.zig`. Runs in `worker-test`.
+//! Covers the evaluations that own route modules' top-level code
+//! (`worker/runtime/evaluations.zig`): each copies WorkerInit's boot token,
+//! which every fetch of its top-level code presents, and together they
+//! start no more fetches than that one token admits; each gets its route's
+//! evaluation budget once its synchronous part ends, and closes with its
+//! route's evaluation, after which nothing runs or is scheduled under its
+//! id; with the `none` boot token fetch alone is refused, with a TypeError
+//! and before anything leaves the worker, and in a worker without a network
+//! grant it gets the network setting's denial, logged under request id 0. Each route's top-level timers end
+//! with its own evaluation, and one route's top-level code cannot clear
+//! another's timers. A top-level `import()` loads from the registered pack
+//! and sends nothing to the server. A worker whose only route failed on an
+//! await sends one `worker_retiring` notice and keeps answering, a begin
+//! after the notice with 503 and no JavaScript. Most tests boot one route; a table of
+//! several, with routes that share a module instance and so an evaluation,
+//! is covered in `routes.zig`. Runs in `worker-test`.
 //!
-//! These tests drive the worker side end to end (install, evaluate, settle,
-//! serve). The `LocalEgressGateway` harness submits straight to the engine
-//! and runs no admission. The gateway's admission of a boot token, refused
-//! past the child window and after its `request_ended`, is covered in
-//! `egress/tests/gateway/worker_flow.zig`; the recorded FetchStart tokens join
-//! the two, since what the worker puts on the wire is what that test admits.
+//! These tests drive the worker side end to end (evaluate, settle, serve).
+//! The `LocalEgressGateway` harness submits straight to the engine and runs
+//! no admission. The gateway's admission of a boot token, refused past the
+//! child window and after its `request_ended`, is covered in
+//! `egress/tests/gateway/worker_flow.zig`; the recorded FetchStart tokens
+//! join the two, since what the worker puts on the wire is what that test
+//! admits.
 
 const std = @import("std");
 const support = @import("bindings_support");
@@ -22,6 +29,9 @@ const ipc = @import("collo_ipc");
 const worker = @import("collo_worker");
 const rt = @import("collo_test_harness");
 const local_address = @import("collo_test_net");
+const request_context = @import("collo_worker_request").context;
+const worker_shared_page = @import("collo_worker_state").page;
+const retirement_notice = @import("retirement_notice.zig");
 
 const fakeNow = rt.fakeNow;
 const socketPairType = rt.socketPairType;
@@ -30,8 +40,10 @@ const executeNextReady = rt.executeNextReady;
 const executeUntilRequestDone = rt.executeUntilRequestDone;
 const LocalOrigin = rt.LocalOrigin;
 
-const boot_request_id = @import("collo_worker_request").context.boot_request_id;
 const module_eval_budget_ns = worker.testing.module_routes.module_eval_budget_ns;
+
+/// The evaluation of the route at index 0, the only route most tests boot.
+const first_evaluation_id = request_context.evaluationId(0);
 
 /// The end of the child window the boot tokens below carry. The worker
 /// copies a token without reading it, so any instant on the fake clock
@@ -107,6 +119,27 @@ fn enqueueRoute(
     try rt.enqueueIngressRoute(runtime, &dispatch, 1, .{ .path = path });
 }
 
+/// Runs one request for the route at `specifier` to its end and returns its
+/// body, which the caller frees. Its deadline lies an hour out on the fake
+/// clock, so a test may move the clock before it.
+fn serveLate(
+    runtime: *worker.Runtime,
+    server_control_fd: std.posix.fd_t,
+    request_id: u64,
+    specifier: []const u8,
+) ![]u8 {
+    var dispatch = try rt.initDispatchWork(std.testing.allocator, .{
+        .request_id = request_id,
+        .route_index = rt.routeIndex(runtime, specifier) orelse return error.TestRouteMissing,
+        .deadline_monotonic_ns = std.time.ns_per_hour,
+    });
+    defer dispatch.deinit();
+    try rt.enqueueIngressRoute(runtime, &dispatch, 1, .{});
+    try executeNextReady(runtime);
+    try executeUntilRequestDone(runtime, request_id);
+    return rt.readIngressResponseBody(runtime, server_control_fd, request_id);
+}
+
 test "a top-level await fetch at boot presents WorkerInit's boot token" {
     var origin = try LocalOrigin.start(std.testing.allocator);
     defer origin.stop(std.testing.allocator);
@@ -126,12 +159,14 @@ test "a top-level await fetch at boot presents WorkerInit's boot token" {
     var now_mono_ns: u64 = 0;
     var completion_fixture = try rt.CompletionFixture.init();
     defer completion_fixture.deinit();
+    const boot_token = rt.bootEgressToken(boot_window_end_ns);
     var runtime = try worker.Runtime.init(std.testing.allocator, &vm, control_pair[0], &completion_fixture.view, try rt.createCompletionEventfd(), worker.RuntimeOptions{
         .clock = .{
             .ctx = &now_mono_ns,
             .now_fn = fakeNow,
         },
         .egress_shared_fds = &egress_shared_fds,
+        .boot_egress_token = boot_token,
     });
     defer runtime.deinit();
     try runtime.attachHostRuntime();
@@ -152,31 +187,27 @@ test "a top-level await fetch at boot presents WorkerInit's boot token" {
     const route_fd = try createModulePackFd(specifier, source);
     defer std.posix.close(route_fd);
 
-    const boot_token = rt.bootEgressToken(boot_window_end_ns);
-    try runtime.installBootContext(&boot_token);
-    const boot_ctx = runtime.bootContext() orelse return error.MissingBootContext;
+    try bootEvaluate(&runtime, route_fd, specifier);
+    const evaluation = runtime.requests.active.get(first_evaluation_id) orelse
+        return error.MissingEvaluation;
 
     // These fields differ from a dispatched request's, each for the reason
-    // `RequestContext.initBoot` gives. The context keeps its own copy of the
-    // boot token.
-    try std.testing.expectEqual(boot_request_id, boot_ctx.exec.request_id);
-    try std.testing.expectEqual(@as(u64, 0), boot_ctx.request_generation);
-    try std.testing.expect(boot_ctx.dispatch_started);
-    try std.testing.expect(boot_ctx.live_slot_released);
-    try std.testing.expectEqual(@as(u64, 0), boot_ctx.exec.deadline_monotonic_ns);
-    try std.testing.expectEqualSlices(u8, &boot_token, &boot_ctx.dispatch_work.egress_token);
-
-    try bootEvaluate(&runtime, route_fd, specifier);
-    // A top-level await is in flight, so the evaluation budget is armed.
-    try std.testing.expect(boot_ctx.deadline_armed);
-    try std.testing.expectEqual(now_mono_ns + module_eval_budget_ns, boot_ctx.exec.deadline_monotonic_ns);
+    // `RequestContext.initEvaluation` gives. The evaluation keeps its own
+    // copy of the boot token.
+    try std.testing.expectEqual(first_evaluation_id, evaluation.exec.request_id);
+    try std.testing.expectEqual(@as(u64, 0), evaluation.request_generation);
+    try std.testing.expect(evaluation.dispatch_started);
+    try std.testing.expect(evaluation.live_slot_released);
+    try std.testing.expectEqualSlices(u8, &boot_token, &evaluation.dispatch_work.egress_token);
+    // A top-level await is in flight, so the route's budget is armed.
+    try std.testing.expect(evaluation.deadline_armed);
+    try std.testing.expectEqual(now_mono_ns + module_eval_budget_ns, evaluation.exec.deadline_monotonic_ns);
 
     try pumpUntilRouteReady(&runtime, specifier);
 
-    // The settlement destroyed the boot context, so no deadline, identity or
+    // The settlement closed the evaluation, so no deadline, identity or
     // byte count of it outlives the close.
-    try std.testing.expect(runtime.boot_ctx == .closed);
-    try std.testing.expect(runtime.bootContext() == null);
+    try std.testing.expect(!runtime.requests.active.contains(first_evaluation_id));
 
     // Exactly one FetchStart crossed the wire, carrying the boot token byte
     // for byte: kind boot, request id and generation 0.
@@ -193,12 +224,179 @@ test "a top-level await fetch at boot presents WorkerInit's boot token" {
     const body = try rt.runRegisteredRouteAndReadBody(&runtime, control_pair[1], 41, specifier, .{});
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.containsAtLeast(u8, body, 1, "post ok"));
-
-    // Nothing under the boot id remains in the active map after the close.
-    try std.testing.expect(!runtime.requests.active.contains(boot_request_id));
 }
 
-test "boot top-level timer is canceled when the root entry settles" {
+test "the evaluations of two routes start no more fetches together than the one boot token admits" {
+    var gateway = try rt.LocalEgressGateway.start(std.testing.allocator, .{});
+    defer gateway.deinit();
+    var egress_shared_fds = gateway.takeWorkerSharedFds();
+    defer egress_shared_fds.close();
+
+    var vm = try support.createVm();
+    defer vm.deinit();
+
+    const control_pair = try socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
+    defer std.posix.close(control_pair[0]);
+    defer std.posix.close(control_pair[1]);
+    var now_mono_ns: u64 = 0;
+    var completion_fixture = try rt.CompletionFixture.init();
+    defer completion_fixture.deinit();
+    var runtime = try worker.Runtime.init(std.testing.allocator, &vm, control_pair[0], &completion_fixture.view, try rt.createCompletionEventfd(), worker.RuntimeOptions{
+        .clock = .{
+            .ctx = &now_mono_ns,
+            .now_fn = fakeNow,
+        },
+        .egress_shared_fds = &egress_shared_fds,
+        .boot_egress_token = rt.bootEgressToken(boot_window_end_ns),
+    });
+    defer runtime.deinit();
+    try runtime.attachHostRuntime();
+
+    // Each route tries a whole token's worth of fetches, one after another,
+    // so the two together try twice what the boot token admits and the
+    // worker must refuse half of them, whichever route's turn they fall in.
+    // The gateway refuses plain HTTP, so a started fetch fails without an
+    // origin.
+    const limit: usize = comptime @intCast(ipc.WorkerRuntimeBootOptions.default().max_fetches_per_request);
+    const source = try std.fmt.allocPrint(std.testing.allocator,
+        \\let refused = 0;
+        \\for (let i = 0; i < {d}; i += 1) {{
+        \\    try {{
+        \\        await fetch("http://127.0.0.1:1/nope");
+        \\    }} catch (err) {{
+        \\        if (String(err).includes("Failed to schedule fetch")) refused += 1;
+        \\    }}
+        \\}}
+        \\export default function handle() {{
+        \\    return String(refused);
+        \\}}
+    , .{limit});
+    defer std.testing.allocator.free(source);
+    const first_entry = "/__collo_route/demo/boot-fetches-first.js";
+    const second_entry = "/__collo_route/demo/boot-fetches-second.js";
+    const pack_fd = try rt.createModulePackGraphFd(&.{
+        .{ .specifier = first_entry, .source = source },
+        .{ .specifier = second_entry, .source = source },
+    }, 0);
+    defer std.posix.close(pack_fd);
+    _ = try rt.addRoute(&runtime, first_entry);
+    _ = try rt.addRoute(&runtime, second_entry);
+    try runtime.evaluateBootRoutes(pack_fd, 0, null);
+    try pumpUntilRouteReady(&runtime, first_entry);
+    try pumpUntilRouteReady(&runtime, second_entry);
+
+    var starts: [2 * limit]rt.FetchStartIdentity = undefined;
+    try std.testing.expectEqual(limit, gateway.recordedFetchStarts(&starts));
+
+    const first_body = try serveLate(&runtime, control_pair[1], 91, first_entry);
+    defer std.testing.allocator.free(first_body);
+    const second_body = try serveLate(&runtime, control_pair[1], 92, second_entry);
+    defer std.testing.allocator.free(second_body);
+    const refused = try std.fmt.parseInt(usize, first_body, 10) + try std.fmt.parseInt(usize, second_body, 10);
+    try std.testing.expectEqual(limit, refused);
+}
+
+// The worker writes all sixteen starts before the gateway reads any, and
+// signals the command eventfd only for the first: a consumer must read the
+// ring to empty after each wake (`notifyAfterPacketWrite` in
+// `common/ipc/egress_shared/wake.zig`). A consumer that read one packet per
+// wake would strand the other fifteen, and the evaluation would never
+// settle.
+test "sixteen concurrent top-level fetches all reach the gateway and settle" {
+    var gateway = try rt.LocalEgressGateway.start(std.testing.allocator, .{});
+    defer gateway.deinit();
+    var egress_shared_fds = gateway.takeWorkerSharedFds();
+    defer egress_shared_fds.close();
+
+    var vm = try support.createVm();
+    defer vm.deinit();
+
+    const control_pair = try socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
+    defer std.posix.close(control_pair[0]);
+    defer std.posix.close(control_pair[1]);
+    var now_mono_ns: u64 = 0;
+    var completion_fixture = try rt.CompletionFixture.init();
+    defer completion_fixture.deinit();
+    var runtime = try worker.Runtime.init(std.testing.allocator, &vm, control_pair[0], &completion_fixture.view, try rt.createCompletionEventfd(), worker.RuntimeOptions{
+        .clock = .{
+            .ctx = &now_mono_ns,
+            .now_fn = fakeNow,
+        },
+        .egress_shared_fds = &egress_shared_fds,
+        .boot_egress_token = rt.bootEgressToken(boot_window_end_ns),
+    });
+    defer runtime.deinit();
+    try runtime.attachHostRuntime();
+
+    // The gateway refuses plain HTTP, so each fetch settles without an
+    // origin.
+    const specifier = "/__collo_route/demo/boot-concurrent-fetches.js";
+    const route_fd = try createModulePackFd(specifier,
+        \\const settled = await Promise.allSettled(
+        \\    Array.from({ length: 16 }, () => fetch("http://127.0.0.1:1/nope")));
+        \\export default function handle() {
+        \\    return String(settled.filter((outcome) => outcome.status === "rejected").length);
+        \\}
+    );
+    defer std.posix.close(route_fd);
+    try bootEvaluate(&runtime, route_fd, specifier);
+    try pumpUntilRouteReady(&runtime, specifier);
+
+    var starts: [16]rt.FetchStartIdentity = undefined;
+    try std.testing.expectEqual(@as(usize, 16), gateway.recordedFetchStarts(&starts));
+    const body = try serveLate(&runtime, control_pair[1], 93, specifier);
+    defer std.testing.allocator.free(body);
+    try std.testing.expectEqualStrings("16", body);
+}
+
+test "a top-level timer is canceled when its evaluation settles" {
+    var vm = try support.createVm();
+    defer vm.deinit();
+
+    const control_pair = try socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
+    defer std.posix.close(control_pair[0]);
+    defer std.posix.close(control_pair[1]);
+    var now_mono_ns: u64 = 0;
+    var completion_fixture = try rt.CompletionFixture.init();
+    defer completion_fixture.deinit();
+    var runtime = try worker.Runtime.init(std.testing.allocator, &vm, control_pair[0], &completion_fixture.view, try rt.createCompletionEventfd(), worker.RuntimeOptions{
+        .clock = .{
+            .ctx = &now_mono_ns,
+            .now_fn = fakeNow,
+        },
+        .boot_egress_token = rt.bootEgressToken(boot_window_end_ns),
+    });
+    defer runtime.deinit();
+    try runtime.attachHostRuntime();
+
+    const specifier = "/__collo_route/demo/boot-timer.js";
+    const route_fd = try createModulePackFd(specifier,
+        \\globalThis.__boot_timer = "pending";
+        \\setTimeout(() => { globalThis.__boot_timer = "fired"; }, 0);
+        \\export default function handle() {
+        \\    return globalThis.__boot_timer;
+        \\}
+    );
+    defer std.posix.close(route_fd);
+
+    try bootEvaluate(&runtime, route_fd, specifier);
+    try pumpUntilRouteReady(&runtime, specifier);
+
+    // The entry settled within its synchronous part, so its evaluation
+    // closed then, and the close canceled the timer the evaluation set: no
+    // later pass fires it.
+    try std.testing.expect(!runtime.requests.active.contains(first_evaluation_id));
+    var pass: usize = 0;
+    while (pass < 5) : (pass += 1)
+        try pumpOnce(&runtime);
+
+    const body = try rt.runRegisteredRouteAndReadBody(&runtime, control_pair[1], 51, specifier, .{});
+    defer std.testing.allocator.free(body);
+    try std.testing.expect(std.mem.containsAtLeast(u8, body, 1, "pending"));
+    try std.testing.expect(!std.mem.containsAtLeast(u8, body, 1, "fired"));
+}
+
+test "a route's top-level interval ends with its own evaluation while another route's await is pending" {
     var vm = try support.createVm();
     defer vm.deinit();
 
@@ -217,37 +415,118 @@ test "boot top-level timer is canceled when the root entry settles" {
     defer runtime.deinit();
     try runtime.attachHostRuntime();
 
-    const specifier = "/__collo_route/demo/boot-timer.js";
-    const route_fd = try createModulePackFd(specifier,
-        \\globalThis.__boot_timer = "pending";
-        \\setTimeout(() => { globalThis.__boot_timer = "fired"; }, 0);
-        \\export default function handle() {
-        \\    return globalThis.__boot_timer;
-        \\}
-    );
-    defer std.posix.close(route_fd);
+    const ticking_entry = "/__collo_route/demo/boot-ticking.js";
+    const pending_entry = "/__collo_route/demo/boot-pending.js";
+    const pack_fd = try rt.createModulePackGraphFd(&.{
+        .{
+            .specifier = ticking_entry,
+            .source =
+            \\globalThis.__ticks = 0;
+            \\setInterval(() => { globalThis.__ticks += 1; }, 1);
+            \\export default function handle() {
+            \\    return String(globalThis.__ticks);
+            \\}
+            ,
+        },
+        .{
+            .specifier = pending_entry,
+            .source =
+            \\await new Promise(() => {});
+            \\export default function handle() {
+            \\    return "never";
+            \\}
+            ,
+        },
+    }, 0);
+    defer std.posix.close(pack_fd);
+    _ = try rt.addRoute(&runtime, ticking_entry);
+    _ = try rt.addRoute(&runtime, pending_entry);
+    try runtime.evaluateBootRoutes(pack_fd, 0, null);
 
-    const boot_token = rt.bootEgressToken(boot_window_end_ns);
-    try runtime.installBootContext(&boot_token);
-    try bootEvaluate(&runtime, route_fd, specifier);
-    try pumpUntilRouteReady(&runtime, specifier);
-    try std.testing.expect(runtime.boot_ctx == .closed);
+    // Route 0 settled within its synchronous part, so its evaluation closed
+    // and took the interval with it; route 1's evaluation stays open.
+    try std.testing.expect(try routeRecord(&runtime, ticking_entry) == .ready);
+    try std.testing.expect(try routeRecord(&runtime, pending_entry) == .evaluating);
+    try std.testing.expect(!runtime.requests.active.contains(request_context.evaluationId(0)));
+    try std.testing.expect(runtime.requests.active.contains(request_context.evaluationId(1)));
 
-    // The synchronous settlement closed the boot context, and its sweep
-    // canceled the timer set during evaluation, so no later pass fires it.
+    // Time passes well within route 1's budget. A live interval would be due
+    // on every pass.
     var pass: usize = 0;
-    while (pass < 5) : (pass += 1)
+    while (pass < 5) : (pass += 1) {
+        now_mono_ns += 2 * std.time.ns_per_ms;
         try pumpOnce(&runtime);
+    }
+    try std.testing.expect(try routeRecord(&runtime, pending_entry) == .evaluating);
 
-    const body = try rt.runRegisteredRouteAndReadBody(&runtime, control_pair[1], 51, specifier, .{});
+    const body = try serveLate(&runtime, control_pair[1], 91, ticking_entry);
     defer std.testing.allocator.free(body);
-    try std.testing.expect(std.mem.containsAtLeast(u8, body, 1, "pending"));
-    try std.testing.expect(!std.mem.containsAtLeast(u8, body, 1, "fired"));
-    // The close destroyed the context itself.
-    try std.testing.expect(!runtime.requests.active.contains(boot_request_id));
+    try std.testing.expectEqualStrings("0", body);
 }
 
-test "boot fire-and-forget fetch is canceled when the root entry settles" {
+test "one route's top-level code cannot clear another route's top-level timer" {
+    var vm = try support.createVm();
+    defer vm.deinit();
+
+    const control_pair = try socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
+    defer std.posix.close(control_pair[0]);
+    defer std.posix.close(control_pair[1]);
+    var now_mono_ns: u64 = 0;
+    var completion_fixture = try rt.CompletionFixture.init();
+    defer completion_fixture.deinit();
+    var runtime = try worker.Runtime.init(std.testing.allocator, &vm, control_pair[0], &completion_fixture.view, try rt.createCompletionEventfd(), worker.RuntimeOptions{
+        .clock = .{
+            .ctx = &now_mono_ns,
+            .now_fn = fakeNow,
+        },
+    });
+    defer runtime.deinit();
+    try runtime.attachHostRuntime();
+
+    // Both routes run in the main realm, so route 1 sees the id route 0
+    // stored on the shared global.
+    const owner_entry = "/__collo_route/demo/boot-timer-owner.js";
+    const clearer_entry = "/__collo_route/demo/boot-timer-clearer.js";
+    const pack_fd = try rt.createModulePackGraphFd(&.{
+        .{
+            .specifier = owner_entry,
+            .source =
+            \\globalThis.__fired = "no";
+            \\globalThis.__route0Timer = setTimeout(() => { globalThis.__fired = "yes"; }, 5);
+            \\await new Promise((resolve) => setTimeout(resolve, 10));
+            \\export default function handle() {
+            \\    return globalThis.__fired;
+            \\}
+            ,
+        },
+        .{
+            .specifier = clearer_entry,
+            .source =
+            \\clearTimeout(globalThis.__route0Timer);
+            \\export default function handle() {
+            \\    return "cleared";
+            \\}
+            ,
+        },
+    }, 0);
+    defer std.posix.close(pack_fd);
+    _ = try rt.addRoute(&runtime, owner_entry);
+    _ = try rt.addRoute(&runtime, clearer_entry);
+    try runtime.evaluateBootRoutes(pack_fd, 0, null);
+    try std.testing.expect(try routeRecord(&runtime, owner_entry) == .evaluating);
+    try std.testing.expect(try routeRecord(&runtime, clearer_entry) == .ready);
+
+    // Both of route 0's timers come due; its await settles after the first
+    // timer ran.
+    now_mono_ns = 20 * std.time.ns_per_ms;
+    try pumpUntilRouteReady(&runtime, owner_entry);
+
+    const body = try serveLate(&runtime, control_pair[1], 92, owner_entry);
+    defer std.testing.allocator.free(body);
+    try std.testing.expectEqualStrings("yes", body);
+}
+
+test "a fire-and-forget top-level fetch is canceled when its evaluation settles" {
     var origin = try LocalOrigin.start(std.testing.allocator);
     defer origin.stop(std.testing.allocator);
     var gateway = try rt.LocalEgressGateway.start(std.testing.allocator, .{
@@ -272,6 +551,7 @@ test "boot fire-and-forget fetch is canceled when the root entry settles" {
             .now_fn = fakeNow,
         },
         .egress_shared_fds = &egress_shared_fds,
+        .boot_egress_token = rt.bootEgressToken(boot_window_end_ns),
     });
     defer runtime.deinit();
     try runtime.attachHostRuntime();
@@ -296,16 +576,14 @@ test "boot fire-and-forget fetch is canceled when the root entry settles" {
     const route_fd = try createModulePackFd(specifier, source);
     defer std.posix.close(route_fd);
 
-    const boot_token = rt.bootEgressToken(boot_window_end_ns);
-    try runtime.installBootContext(&boot_token);
     try bootEvaluate(&runtime, route_fd, specifier);
 
     // Without a top-level await the module settles synchronously, and the
-    // close reaps the fetch started during evaluation while it is in flight,
-    // telling the gateway to drop it.
+    // evaluation's close reaps the fetch started during it while it is in
+    // flight, telling the gateway to drop it.
     const record = try routeRecord(&runtime, specifier);
     try std.testing.expect(record == .ready);
-    try std.testing.expect(runtime.boot_ctx == .closed);
+    try std.testing.expect(!runtime.requests.active.contains(first_evaluation_id));
 
     // With the task reaped, a gateway packet that still arrives for the fetch
     // finds no task and is dropped natively; not even an abort rejection
@@ -336,10 +614,9 @@ test "boot fire-and-forget fetch is canceled when the root entry settles" {
         return error.CanceledBootFetchDelivered;
     try std.testing.expect(std.mem.containsAtLeast(u8, body, 1, "pending"));
     try std.testing.expect(!std.mem.containsAtLeast(u8, body, 1, "error:"));
-    try std.testing.expect(!runtime.requests.active.contains(boot_request_id));
 }
 
-test "top-level fetch without an installed boot context stays denied" {
+test "an evaluation under the none boot token gives top-level code timers and refuses fetch with a TypeError in the worker" {
     var gateway = try rt.LocalEgressGateway.start(std.testing.allocator, .{
         .network = rt.local_origin_network,
     });
@@ -356,61 +633,9 @@ test "top-level fetch without an installed boot context stays denied" {
     var now_mono_ns: u64 = 0;
     var completion_fixture = try rt.CompletionFixture.init();
     defer completion_fixture.deinit();
-    var runtime = try worker.Runtime.init(std.testing.allocator, &vm, control_pair[0], &completion_fixture.view, try rt.createCompletionEventfd(), worker.RuntimeOptions{
-        .clock = .{
-            .ctx = &now_mono_ns,
-            .now_fn = fakeNow,
-        },
-        .egress_shared_fds = &egress_shared_fds,
-    });
-    defer runtime.deinit();
-    try runtime.attachHostRuntime();
-
-    const specifier = "/__collo_route/demo/boot-denied.js";
-    const route_fd = try createModulePackFd(specifier,
-        \\globalThis.__boot_fetch_err = "none";
-        \\try {
-        \\    fetch("https://example.test/");
-        \\} catch (err) {
-        \\    globalThis.__boot_fetch_err = String(err);
-        \\}
-        \\export default function handle() {
-        \\    return globalThis.__boot_fetch_err;
-        \\}
-    );
-    defer std.posix.close(route_fd);
-
-    // No boot context was installed, as for a launch that does not serve
-    // routes, so the VM refuses top-level host calls.
-    try std.testing.expect(runtime.bootContext() == null);
-    try bootEvaluate(&runtime, route_fd, specifier);
-
-    const body = try rt.runRegisteredRouteAndReadBody(&runtime, control_pair[1], 61, specifier, .{});
-    defer std.testing.allocator.free(body);
-    try std.testing.expect(std.mem.containsAtLeast(u8, body, 1, "active request turn"));
-
-    // Nothing crossed the egress wire.
-    var starts: [1]rt.FetchStartIdentity = undefined;
-    try std.testing.expectEqual(@as(usize, 0), gateway.recordedFetchStarts(&starts));
-}
-
-test "a boot context with the none boot token gives top-level code timers and refuses fetch with a TypeError in the worker" {
-    var gateway = try rt.LocalEgressGateway.start(std.testing.allocator, .{
-        .network = rt.local_origin_network,
-    });
-    defer gateway.deinit();
-    var egress_shared_fds = gateway.takeWorkerSharedFds();
-    defer egress_shared_fds.close();
-
-    var vm = try support.createVm();
-    defer vm.deinit();
-
-    const control_pair = try socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
-    defer std.posix.close(control_pair[0]);
-    defer std.posix.close(control_pair[1]);
-    var now_mono_ns: u64 = 0;
-    var completion_fixture = try rt.CompletionFixture.init();
-    defer completion_fixture.deinit();
+    // A granted launch whose worker got no session sends its wake
+    // descriptors with the none boot token (`LaunchEgress.detached` in
+    // `host/launch.zig`), which `RuntimeOptions` defaults to.
     var runtime = try worker.Runtime.init(std.testing.allocator, &vm, control_pair[0], &completion_fixture.view, try rt.createCompletionEventfd(), worker.RuntimeOptions{
         .clock = .{
             .ctx = &now_mono_ns,
@@ -440,12 +665,11 @@ test "a boot context with the none boot token gives top-level code timers and re
     );
     defer std.posix.close(route_fd);
 
-    // A launch without an egress grant sends WorkerInit with the none boot
-    // token (`host/launch.zig`). The context still exists, for timers.
-    try runtime.installBootContext(&ipc.egress_token.none);
-    const boot_ctx = runtime.bootContext() orelse return error.MissingBootContext;
-    try std.testing.expect(ipc.egress_token.isNone(&boot_ctx.dispatch_work.egress_token));
     try bootEvaluate(&runtime, route_fd, specifier);
+    // The evaluation still exists, for timers.
+    const evaluation = runtime.requests.active.get(first_evaluation_id) orelse
+        return error.MissingEvaluation;
+    try std.testing.expect(ipc.egress_token.isNone(&evaluation.dispatch_work.egress_token));
     try pumpUntilRouteReady(&runtime, specifier);
 
     const body = try rt.runRegisteredRouteAndReadBody(&runtime, control_pair[1], 62, specifier, .{});
@@ -464,7 +688,64 @@ test "a boot context with the none boot token gives top-level code timers and re
     try std.testing.expectEqual(@as(usize, 0), gateway.recordedFetchStarts(&starts));
 }
 
-test "a hung top-level await in a worker's only route fails it at the eval budget and recycles the worker after the drain" {
+// A worker whose definition grants no network access gets no egress
+// descriptor, and top-level code is no exception: its fetch gets the same
+// denial a handler's does, and the line names no request, since an
+// evaluation's reserved id names nothing the server knows.
+test "top-level code of a worker without a network grant gets the network setting's denial, logged once under request id 0" {
+    var vm = try support.createVm();
+    defer vm.deinit();
+
+    const control_pair = try socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
+    defer std.posix.close(control_pair[0]);
+    defer std.posix.close(control_pair[1]);
+    var now_mono_ns: u64 = 0;
+    var completion_fixture = try rt.CompletionFixture.init();
+    defer completion_fixture.deinit();
+    var no_egress: ipc.egress_shared.RawFds = .{};
+    var runtime = try worker.Runtime.init(std.testing.allocator, &vm, control_pair[0], &completion_fixture.view, try rt.createCompletionEventfd(), worker.RuntimeOptions{
+        .clock = .{
+            .ctx = &now_mono_ns,
+            .now_fn = fakeNow,
+        },
+        .egress_shared_fds = &no_egress,
+    });
+    defer runtime.deinit();
+    try runtime.attachHostRuntime();
+
+    const specifier = "/__collo_route/demo/boot-no-grant.js";
+    const route_fd = try createModulePackFd(specifier,
+        \\let outcome = "unset";
+        \\try {
+        \\    await fetch("https://example.test/");
+        \\    outcome = "fetched";
+        \\} catch (err) {
+        \\    outcome = (err instanceof TypeError ? "TypeError: " : "other: ") + err.message;
+        \\}
+        \\export default function handle() {
+        \\    return outcome;
+        \\}
+    );
+    defer std.posix.close(route_fd);
+
+    try bootEvaluate(&runtime, route_fd, specifier);
+    try pumpUntilRouteReady(&runtime, specifier);
+
+    const denial = "fetch to https://example.test denied by the network setting: no network setting grants access to this route";
+    const body = try rt.runRegisteredRouteAndReadBody(&runtime, control_pair[1], 63, specifier, .{});
+    defer std.testing.allocator.free(body);
+    try std.testing.expect(std.mem.containsAtLeast(u8, body, 1, "TypeError: " ++ denial));
+
+    var scratch: [4 * worker_shared_page.LOG_LINE_BYTES_MAX]u8 = undefined;
+    var lines: [4]worker_shared_page.DrainedLogLine = undefined;
+    const count = try completion_fixture.view.drainLogLinesChecked(&scratch, &lines);
+    try std.testing.expectEqual(@as(usize, 1), count);
+    try std.testing.expectEqual(@intFromEnum(worker_shared_page.LogLevel.warn), lines[0].header.level);
+    try std.testing.expectEqual(@as(u64, 0), lines[0].header.request_id);
+    try std.testing.expectEqualStrings(denial, lines[0].payload);
+}
+
+test "a worker whose only route failed on an await sends worker_retiring once and goes on serving until its control socket closes" {
     var vm = try support.createVm();
     defer vm.deinit();
 
@@ -479,6 +760,7 @@ test "a hung top-level await in a worker's only route fails it at the eval budge
             .ctx = &now_mono_ns,
             .now_fn = fakeNow,
         },
+        .boot_egress_token = rt.bootEgressToken(boot_window_end_ns),
     });
     defer runtime.deinit();
     try runtime.attachHostRuntime();
@@ -492,35 +774,46 @@ test "a hung top-level await in a worker's only route fails it at the eval budge
     );
     defer std.posix.close(route_fd);
 
-    const boot_token = rt.bootEgressToken(boot_window_end_ns);
-    try runtime.installBootContext(&boot_token);
-    const boot_ctx = runtime.bootContext() orelse return error.MissingBootContext;
     try bootEvaluate(&runtime, route_fd, specifier);
-    try std.testing.expect(boot_ctx.deadline_armed);
+    const evaluation = runtime.requests.active.get(first_evaluation_id) orelse
+        return error.MissingEvaluation;
+    try std.testing.expect(evaluation.deadline_armed);
 
-    // With no request waiting, the boot context's armed budget is the one
-    // wake guaranteed to notice the evaluation that never settles.
+    // With no request waiting, the evaluation's armed budget is the one wake
+    // guaranteed to notice the await that never settles.
     now_mono_ns = module_eval_budget_ns + std.time.ns_per_ms;
     try pumpOnce(&runtime);
 
-    // The route is pinned failed, and with no evaluation left the boot
-    // context closed instead of reaching the response path.
+    // The route is pinned failed, and its evaluation closed instead of
+    // reaching the response path.
     const record = try routeRecord(&runtime, specifier);
     try std.testing.expect(record == .failed);
-    try std.testing.expect(runtime.boot_ctx == .closed);
-    try std.testing.expect(!runtime.requests.active.contains(boot_request_id));
-    // No frame was sent for the boot id.
+    try std.testing.expect(!runtime.requests.active.contains(first_evaluation_id));
+    // No frame was sent for the evaluation.
     try expectControlSilent(control_pair[1], 25);
 
     // The worker's only route can no longer serve, and a fresh worker might
-    // get past the await, so the loop stops it once nothing is left to drain.
-    try std.testing.expect(runtime.modules.state.recycle_after_drain);
+    // get past the await, so the loop's check asks the server to retire it,
+    // once. Before, the loop stopped itself and the worker exited.
+    try std.testing.expect(runtime.modules.state.fresh_worker_may_serve);
+    try runtime.checkRetirement();
+    try std.testing.expectEqual(ipc.WorkerRetiringReason.routes_failed, try retirement_notice.read(control_pair[1]));
+    try runtime.checkRetirement();
+    try retirement_notice.expectNone(control_pair[1]);
     try std.testing.expect(runtime.core.running);
-    runtime.maybeRecycleAfterFailedEvaluation();
-    try std.testing.expect(!runtime.core.running);
+
+    // The worker keeps reading begins and answers one that arrives after
+    // the notice with 503, without running the route.
+    try enqueueRoute(&runtime, 72, specifier, "/after-notice");
+    try executeUntilRequestDone(&runtime, 72);
+    var response = try rt.readIngressResponse(&runtime, control_pair[1], 72);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 503), response.status);
+    try std.testing.expectEqual(ipc.RequestDoneStatus.worker_retiring, response.doneStatus());
+    try std.testing.expect(runtime.core.running);
 }
 
-test "eval-budget deadline after settlement is a no-op" {
+test "an evaluation's budget deadline after its settlement is a no-op" {
     var vm = try support.createVm();
     defer vm.deinit();
 
@@ -535,6 +828,7 @@ test "eval-budget deadline after settlement is a no-op" {
             .ctx = &now_mono_ns,
             .now_fn = fakeNow,
         },
+        .boot_egress_token = rt.bootEgressToken(boot_window_end_ns),
     });
     defer runtime.deinit();
     try runtime.attachHostRuntime();
@@ -549,11 +843,10 @@ test "eval-budget deadline after settlement is a no-op" {
     );
     defer std.posix.close(route_fd);
 
-    const boot_token = rt.bootEgressToken(boot_window_end_ns);
-    try runtime.installBootContext(&boot_token);
-    const boot_ctx = runtime.bootContext() orelse return error.MissingBootContext;
     try bootEvaluate(&runtime, route_fd, specifier);
-    try std.testing.expect(boot_ctx.deadline_armed);
+    const evaluation = runtime.requests.active.get(first_evaluation_id) orelse
+        return error.MissingEvaluation;
+    try std.testing.expect(evaluation.deadline_armed);
 
     try support.registerModule(&vm, "/boot-gate-resolve.js",
         \\globalThis.__resolveBootGate();
@@ -565,19 +858,17 @@ test "eval-budget deadline after settlement is a no-op" {
     const record = try routeRecord(&runtime, specifier);
     try std.testing.expect(record == .ready);
     // The settlement's close disarmed the budget and destroyed the context,
-    // so the deadline entry already queued finds no request and does nothing.
-    try std.testing.expect(runtime.boot_ctx == .closed);
-    try std.testing.expect(runtime.bootContext() == null);
+    // so the deadline entry already queued finds no owner and does nothing.
+    try std.testing.expect(!runtime.requests.active.contains(first_evaluation_id));
 
     // The instant the budget was armed for passes, and nothing happens.
     now_mono_ns = module_eval_budget_ns + std.time.ns_per_ms;
     try pumpOnce(&runtime);
     try std.testing.expect(runtime.core.running);
-    try std.testing.expect(!runtime.requests.active.contains(boot_request_id));
     try expectControlSilent(control_pair[1], 25);
 }
 
-test "failed boot evaluation drains waiters with worker-side 500 then recycles" {
+test "a failed boot evaluation answers its waiters with the worker's 500, then the worker asks to retire" {
     var vm = try support.createVm();
     defer vm.deinit();
 
@@ -592,6 +883,7 @@ test "failed boot evaluation drains waiters with worker-side 500 then recycles" 
             .ctx = &now_mono_ns,
             .now_fn = fakeNow,
         },
+        .boot_egress_token = rt.bootEgressToken(boot_window_end_ns),
     });
     defer runtime.deinit();
     try runtime.attachHostRuntime();
@@ -606,10 +898,8 @@ test "failed boot evaluation drains waiters with worker-side 500 then recycles" 
     );
     defer std.posix.close(route_fd);
 
-    const boot_token = rt.bootEgressToken(boot_window_end_ns);
-    try runtime.installBootContext(&boot_token);
-    try std.testing.expect(runtime.bootContext() != null);
     try bootEvaluate(&runtime, route_fd, specifier);
+    try std.testing.expect(runtime.requests.active.contains(first_evaluation_id));
 
     // A request that arrives during evaluation waits on it.
     try enqueueRoute(&runtime, 71, specifier, "/boot-fail");
@@ -623,30 +913,26 @@ test "failed boot evaluation drains waiters with worker-side 500 then recycles" 
     try support.evaluateOk(&vm, "/boot-gate-reject.js");
     runtime.collectModuleSettlements();
 
-    // The failure stays with the module and the recycle after the drain is
-    // armed; the failed settlement also closed and destroyed the boot
-    // context.
+    // The failure stays with the module, and a fresh worker may serve; the
+    // failed settlement also closed and destroyed the evaluation.
     const record = try routeRecord(&runtime, specifier);
     try std.testing.expect(record == .failed);
-    try std.testing.expect(runtime.modules.state.recycle_after_drain);
-    try std.testing.expect(runtime.boot_ctx == .closed);
-    try std.testing.expect(runtime.bootContext() == null);
+    try std.testing.expect(runtime.modules.state.fresh_worker_may_serve);
+    try std.testing.expect(!runtime.requests.active.contains(first_evaluation_id));
 
-    // The waiter gets its own 500 from the worker: the failed record refuses
-    // it with `error.RouteModuleEvaluationFailed`, which ends it as an
-    // internal error. Recycling before the drain would have left the request
-    // to a record the server synthesizes
-    // (`server/supervisor/usage_drain.zig`).
+    // The waiter, whose begin came before any notice, gets its own 500 from
+    // the worker: the failed record refuses it with
+    // `error.RouteModuleEvaluationFailed`, which ends it as an internal
+    // error.
     try executeUntilRequestDone(&runtime, 71);
     var response = try rt.readIngressResponse(&runtime, control_pair[1], 71);
     defer response.deinit();
     try std.testing.expectEqual(@as(u16, 500), response.status);
 
-    // The loop recycles the worker only after the drain; the boot id already
-    // left the active map with the close.
-    runtime.maybeRecycleAfterFailedEvaluation();
-    try std.testing.expect(!runtime.core.running);
-    try std.testing.expect(!runtime.requests.active.contains(boot_request_id));
+    // The worker asks to retire and stays in its loop; the server retires it.
+    try runtime.checkRetirement();
+    try std.testing.expectEqual(ipc.WorkerRetiringReason.routes_failed, try retirement_notice.read(control_pair[1]));
+    try std.testing.expect(runtime.core.running);
 }
 
 test "a top-level import() at boot loads a packed module and refuses a missing one without a packet" {
@@ -664,6 +950,7 @@ test "a top-level import() at boot loads a packed module and refuses a missing o
             .ctx = &now_mono_ns,
             .now_fn = fakeNow,
         },
+        .boot_egress_token = rt.bootEgressToken(boot_window_end_ns),
     });
     defer runtime.deinit();
     try runtime.attachHostRuntime();
@@ -690,8 +977,6 @@ test "a top-level import() at boot loads a packed module and refuses a missing o
     }, 0);
     defer std.posix.close(route_fd);
 
-    const boot_token = rt.bootEgressToken(boot_window_end_ns);
-    try runtime.installBootContext(&boot_token);
     try bootEvaluate(&runtime, route_fd, specifier);
     try pumpUntilRouteReady(&runtime, specifier);
 
@@ -702,11 +987,11 @@ test "a top-level import() at boot loads a packed module and refuses a missing o
     const body = try rt.runRegisteredRouteAndReadBody(&runtime, control_pair[1], 81, specifier, .{});
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.containsAtLeast(u8, body, 1, "packed|denied"));
-    // The settlement's close destroyed the boot context.
-    try std.testing.expect(!runtime.requests.active.contains(boot_request_id));
+    // The settlement closed the evaluation.
+    try std.testing.expect(!runtime.requests.active.contains(first_evaluation_id));
 }
 
-test "chokepoint guards drop response-path work for the boot context" {
+test "chokepoint guards drop response-path work for an evaluation" {
     var vm = try support.createVm();
     defer vm.deinit();
 
@@ -721,34 +1006,47 @@ test "chokepoint guards drop response-path work for the boot context" {
             .ctx = &now_mono_ns,
             .now_fn = fakeNow,
         },
+        .boot_egress_token = rt.bootEgressToken(boot_window_end_ns),
     });
     defer runtime.deinit();
     try runtime.attachHostRuntime();
 
-    const boot_token = rt.bootEgressToken(boot_window_end_ns);
-    try runtime.installBootContext(&boot_token);
-    const boot_ctx = runtime.bootContext() orelse return error.MissingBootContext;
+    // An await that never settles keeps the route's evaluation open.
+    const specifier = "/__collo_route/demo/boot-chokepoint.js";
+    const route_fd = try createModulePackFd(specifier,
+        \\await new Promise(() => {});
+        \\export default function handle() {
+        \\    return "unreachable";
+        \\}
+    );
+    defer std.posix.close(route_fd);
+    try bootEvaluate(&runtime, route_fd, specifier);
+    const evaluation = runtime.requests.active.get(first_evaluation_id) orelse
+        return error.MissingEvaluation;
 
-    // A failure of boot work, which `requestFailureCallback` can report (for
-    // example when building a fetch response runs out of memory), is dropped:
-    // no frame is sent, no record published and the boot context survives.
-    worker.testing.request_dispatch.handleLocalFailure(&runtime, boot_request_id, error.TestChokepointFailure);
-    try std.testing.expect(runtime.requests.active.contains(boot_request_id));
-    try std.testing.expect(!boot_ctx.finish_started);
+    // A failure of the evaluation's work, which `requestFailureCallback` can
+    // report (for example when building a fetch response runs out of
+    // memory), is dropped: no frame is sent, no record published and the
+    // evaluation survives.
+    worker.testing.request_dispatch.handleLocalFailure(&runtime, first_evaluation_id, error.TestChokepointFailure);
+    try std.testing.expect(runtime.requests.active.contains(first_evaluation_id));
+    try std.testing.expect(!evaluation.finish_started);
     try std.testing.expect(runtime.core.running);
 
-    // `finishRequest` refuses the boot context outright.
+    // `finishRequest` refuses an evaluation outright.
     try std.testing.expectError(
         error.InvalidArgument,
-        worker.testing.response_finish.finishRequest(&runtime, boot_ctx, .internal_error, 500),
+        worker.testing.response_finish.finishRequest(&runtime, evaluation, .internal_error, 500),
     );
-    try std.testing.expect(!boot_ctx.finish_started);
-    try std.testing.expect(runtime.requests.active.contains(boot_request_id));
+    try std.testing.expect(!evaluation.finish_started);
+    try std.testing.expect(runtime.requests.active.contains(first_evaluation_id));
 
-    // An unarmed deadline call for the boot id is a no-op.
-    try worker.testing.request_dispatch.deadlineTimeout(&runtime, boot_request_id);
+    // A deadline call before the evaluation's budget expires nothing and
+    // leaves it open and armed.
+    try worker.testing.request_dispatch.deadlineTimeout(&runtime, first_evaluation_id);
     try std.testing.expect(runtime.core.running);
-    try std.testing.expect(runtime.requests.active.contains(boot_request_id));
+    try std.testing.expect(runtime.requests.active.contains(first_evaluation_id));
+    try std.testing.expect(evaluation.deadline_armed);
 
     // Nothing is left on the control socket.
     try expectControlSilent(control_pair[1], 25);
@@ -780,12 +1078,14 @@ test "teardown with an in-flight boot fetch reaps cleanly" {
     var now_mono_ns: u64 = 0;
     var completion_fixture = try rt.CompletionFixture.init();
     defer completion_fixture.deinit();
+    const boot_token = rt.bootEgressToken(boot_window_end_ns);
     var runtime = try worker.Runtime.init(std.testing.allocator, &vm, control_pair[0], &completion_fixture.view, try rt.createCompletionEventfd(), worker.RuntimeOptions{
         .clock = .{
             .ctx = &now_mono_ns,
             .now_fn = fakeNow,
         },
         .egress_shared_fds = &egress_shared_fds,
+        .boot_egress_token = boot_token,
     });
     defer runtime.deinit();
     try runtime.attachHostRuntime();
@@ -801,8 +1101,6 @@ test "teardown with an in-flight boot fetch reaps cleanly" {
     const route_fd = try createModulePackFd(specifier, source);
     defer std.posix.close(route_fd);
 
-    const boot_token = rt.bootEgressToken(boot_window_end_ns);
-    try runtime.installBootContext(&boot_token);
     try bootEvaluate(&runtime, route_fd, specifier);
     const record = try routeRecord(&runtime, specifier);
     try std.testing.expect(record == .ready);
@@ -819,15 +1117,15 @@ test "teardown with an in-flight boot fetch reaps cleanly" {
     }
     try std.testing.expectEqualSlices(u8, &boot_token, &starts[0].egress_token);
 
-    // The synchronous close destroyed the boot context and reaped its fetch
+    // The synchronous close destroyed the evaluation and reaped its fetch
     // task, so the worker holds nothing of the fetch while the gateway may
     // still be serving it. Teardown runs in that state, and the gateway
     // reaps the session on detach or deinit. The allocator's leak check and
     // the gateway thread's panic on error are the assertions.
-    try std.testing.expect(!runtime.requests.active.contains(boot_request_id));
+    try std.testing.expect(!runtime.requests.active.contains(first_evaluation_id));
 }
 
-test "closed boot context denies surviving-reference scheduling and the boot token" {
+test "a closed evaluation runs none of its JavaScript again and presents the boot token no more" {
     var origin = try LocalOrigin.start(std.testing.allocator);
     defer origin.stop(std.testing.allocator);
     var gateway = try rt.LocalEgressGateway.start(std.testing.allocator, .{
@@ -846,18 +1144,20 @@ test "closed boot context denies surviving-reference scheduling and the boot tok
     var now_mono_ns: u64 = 0;
     var completion_fixture = try rt.CompletionFixture.init();
     defer completion_fixture.deinit();
+    const boot_token = rt.bootEgressToken(boot_window_end_ns);
     var runtime = try worker.Runtime.init(std.testing.allocator, &vm, control_pair[0], &completion_fixture.view, try rt.createCompletionEventfd(), worker.RuntimeOptions{
         .clock = .{
             .ctx = &now_mono_ns,
             .now_fn = fakeNow,
         },
         .egress_shared_fds = &egress_shared_fds,
+        .boot_egress_token = boot_token,
     });
     defer runtime.deinit();
     try runtime.attachHostRuntime();
 
-    // A rejection of the boot fetch is the only JavaScript that could still
-    // run under the boot id after the close. The `.catch` below tries a
+    // A rejection of the boot fetch is the only JavaScript of the evaluation
+    // that could still run after its close. The `.catch` below tries a
     // timer, a fetch and an import, so the probes show whether it ever got a
     // turn.
     const specifier = "/__collo_route/demo/boot-close-deny.js";
@@ -904,17 +1204,13 @@ test "closed boot context denies surviving-reference scheduling and the boot tok
     const route_fd = try createModulePackFd(specifier, source);
     defer std.posix.close(route_fd);
 
-    const boot_token = rt.bootEgressToken(boot_window_end_ns);
-    try runtime.installBootContext(&boot_token);
     try bootEvaluate(&runtime, route_fd, specifier);
     const record = try routeRecord(&runtime, specifier);
     try std.testing.expect(record == .ready);
-    // The settlement was synchronous: the state is closed and the context
-    // destroyed, so the worker's copy of the boot token is gone and nothing
-    // under the boot id remains in the active map.
-    try std.testing.expect(runtime.boot_ctx == .closed);
-    try std.testing.expect(!runtime.requests.active.contains(boot_request_id));
-    try std.testing.expect(runtime.bootContext() == null);
+    // The settlement was synchronous: the evaluation is closed and its
+    // context destroyed, so its copy of the boot token is gone and nothing
+    // under its id remains in the active map.
+    try std.testing.expect(!runtime.requests.active.contains(first_evaluation_id));
 
     // The close reaped the fetch task, so a gateway packet for it is dropped
     // natively: the `.then` never runs and neither does the `.catch` with
@@ -939,8 +1235,8 @@ test "closed boot context denies surviving-reference scheduling and the boot tok
     defer std.testing.allocator.free(body);
     if (std.mem.containsAtLeast(u8, body, 1, "delivered"))
         return error.CanceledBootFetchDelivered;
-    // All four probes are unset: no boot JavaScript ran after the close,
-    // refused or otherwise.
+    // All four probes are unset: none of the evaluation's JavaScript ran
+    // after the close, refused or otherwise.
     try std.testing.expect(std.mem.containsAtLeast(u8, body, 4, "unset"));
     try std.testing.expect(!std.mem.containsAtLeast(u8, body, 1, "swept"));
     try std.testing.expect(!std.mem.containsAtLeast(u8, body, 1, "scheduled"));
@@ -949,8 +1245,7 @@ test "closed boot context denies surviving-reference scheduling and the boot tok
     try std.testing.expect(!std.mem.containsAtLeast(u8, body, 1, "fired"));
 
     // Only the FetchStart from before the close crossed the wire, under the
-    // boot token; the worker holds no boot token any more, so nothing new
-    // followed.
+    // boot token; the evaluation's copy is gone, so nothing new followed.
     var starts: [4]rt.FetchStartIdentity = undefined;
     try std.testing.expectEqual(@as(usize, 1), gateway.recordedFetchStarts(&starts));
     try std.testing.expectEqualSlices(u8, &boot_token, &starts[0].egress_token);

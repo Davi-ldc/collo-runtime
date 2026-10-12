@@ -1,22 +1,17 @@
 //! Linux descriptor, process and memory primitives shared by every process of
 //! the runtime, grouped as `fd`, `process`, `socket`, `cmsg`, `linux` and
-//! `memory`. Nothing here keeps state. The calls the zygote's fork loop makes
-//! (`cloneForkWithPidFd`, `writeOomScoreAdj`, `assertSingleThreadedSelf`) do
-//! not allocate.
+//! `memory`, and the libc calls the standard library lacks. Nothing here
+//! keeps state. The calls the zygote's fork loop makes (`cloneForkWithPidFd`,
+//! `writeOomScoreAdj`, `assertSingleThreadedSelf`) do not allocate. Every
+//! socket option the runtime sets or reads goes through `socket`, one helper
+//! per option.
 
 const std = @import("std");
 const c = @cImport({
-    // `posix_spawn_file_actions_addclosefrom_np` (and the rest of the _np
-    // surface) sits behind `__USE_MISC` in glibc's spawn.h, which only turns
-    // on with _GNU_SOURCE/_DEFAULT_SOURCE. Without this the @hasDecl below
-    // silently answers false and every spawn fails with
-    // SpawnCloseFromUnavailable when the toolchain does not define it.
-    @cDefine("_GNU_SOURCE", "1");
     @cInclude("fcntl.h");
-    @cInclude("signal.h");
-    @cInclude("spawn.h");
-    @cInclude("sys/types.h");
 });
+
+extern "c" fn pthread_getcpuclockid(thread: std.c.pthread_t, clock_id: *c_int) c_int;
 
 pub const fd = struct {
     const f_dupfd_cloexec = if (@hasDecl(std.posix.F, "DUPFD_CLOEXEC"))
@@ -302,58 +297,154 @@ pub const process = struct {
         fd_map: []const SpawnFdMap,
     };
 
-    /// posix_spawn of a runtime binary. Each `fd_map` source is dup2'd onto
-    /// its target, every fd above the highest target is closed, and the child
-    /// starts with an empty signal mask in a session of its own. Targets must
-    /// be 3 or above, and no source may equal any mapping's target.
-    pub fn spawnInternal(options: SpawnInternalOptions) !u32 {
+    /// A process `spawnInternal` started.
+    pub const SpawnedProcess = struct {
+        pid: u32,
+        /// Created by the clone that created the child (CLONE_PIDFD), so the
+        /// child never exists without a handle that can signal it and wait
+        /// for it, and a pid the kernel reuses after its exit is never
+        /// mistaken for it.
+        pidfd: fd.OwnedFd,
+    };
+
+    /// The stack the spawned child runs on until its exec. The child calls
+    /// only raw system calls, each a frame of a few hundred bytes, so this is
+    /// far more than it uses.
+    const spawn_child_stack_bytes: usize = 64 * 1024;
+    /// The exit status of a spawned child whose setup or exec failed. The
+    /// parent reports the failure from the errno the child leaves in
+    /// `SpawnChild.errno`, never from this status.
+    const spawn_child_failure_status: u8 = 127;
+    /// The kernel's `SIG_DFL` and `SIG_IGN` handler values.
+    const signal_handler_default: usize = 0;
+    const signal_handler_ignore: usize = 1;
+
+    /// What the parent hands its spawned child: both live in memory the two
+    /// share until the child's exec (CLONE_VM).
+    const SpawnChild = struct {
+        options: *const SpawnInternalOptions,
+        /// The errno of the step that failed, written by the child before it
+        /// exits; 0 while every step succeeded.
+        errno: u16 = 0,
+    };
+
+    /// Starts a runtime binary and returns it with its pidfd. Each `fd_map`
+    /// source is dup2'd onto its target and every other descriptor from 3 up
+    /// is closed, close-on-exec or not; the child starts with an empty signal
+    /// mask in a session of its own, with the standard descriptors of the
+    /// caller. Targets must be 3 or above, and no source may equal any
+    /// mapping's target. A child whose setup or exec fails is reaped before
+    /// this returns that failure's error.
+    ///
+    /// The child is a vfork-style clone (CLONE_VM | CLONE_VFORK) on a stack
+    /// of its own, as glibc's posix_spawn makes it: no page table is copied
+    /// and nothing is charged against overcommit, whatever the caller's size,
+    /// and the calling thread waits until the child has exec'd or exited.
+    /// Until then the child shares the caller's memory, so it runs only raw
+    /// system calls and touches nothing but its stack and `SpawnChild`.
+    pub fn spawnInternal(options: SpawnInternalOptions) !SpawnedProcess {
         std.debug.assert(options.fd_map.len != 0);
         for (options.fd_map) |mapping| {
+            std.debug.assert(mapping.source_fd >= 0);
+            std.debug.assert(mapping.target_fd >= 3);
             for (options.fd_map) |reserved| {
                 std.debug.assert(mapping.source_fd != reserved.target_fd);
             }
         }
+        const sys = std.os.linux;
 
-        var actions: c.posix_spawn_file_actions_t = undefined;
-        try posixSpawnCheck(c.posix_spawn_file_actions_init(&actions));
+        const stack = try std.posix.mmap(
+            null,
+            spawn_child_stack_bytes,
+            std.posix.PROT.READ | std.posix.PROT.WRITE,
+            .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .STACK = true },
+            -1,
+            0,
+        );
+        defer std.posix.munmap(stack);
+
+        // Every signal stays blocked from the clone until the child has
+        // replaced each handler of the caller's with the default: a handler
+        // that ran in the child before that would run on memory the child
+        // shares with the caller.
+        const all_signals = sys.sigfillset();
+        var previous_mask: sys.sigset_t = undefined;
+        switch (linux.syscallErrno(sys.sigprocmask(sys.SIG.SETMASK, &all_signals, &previous_mask))) {
+            .SUCCESS => {},
+            else => |errno| return std.posix.unexpectedErrno(errno),
+        }
         defer {
-            const rc = c.posix_spawn_file_actions_destroy(&actions);
-            std.debug.assert(rc == 0);
+            const rc = sys.sigprocmask(sys.SIG.SETMASK, &previous_mask, null);
+            // Restoring a mask the kernel just returned cannot fail.
+            std.debug.assert(linux.syscallErrno(rc) == .SUCCESS);
         }
 
-        var close_from: std.posix.fd_t = 3;
-        for (options.fd_map) |mapping| {
-            std.debug.assert(mapping.source_fd >= 0);
-            std.debug.assert(mapping.target_fd >= 3);
-            try posixSpawnCheck(c.posix_spawn_file_actions_adddup2(
-                &actions,
-                mapping.source_fd,
-                mapping.target_fd,
-            ));
-            if (mapping.source_fd != mapping.target_fd) {
-                try posixSpawnCheck(c.posix_spawn_file_actions_addclose(
-                    &actions,
-                    mapping.source_fd,
-                ));
-            }
-            close_from = @max(close_from, mapping.target_fd + 1);
+        var child: SpawnChild = .{ .options = &options };
+        var pidfd: i32 = -1;
+        const rc = sys.clone(
+            spawnChildMain,
+            @intFromPtr(stack.ptr) + stack.len,
+            sys.CLONE.VM | sys.CLONE.VFORK | sys.CLONE.PIDFD | sys.SIG.CHLD,
+            @intFromPtr(&child),
+            &pidfd,
+            0,
+            null,
+        );
+        switch (linux.syscallErrno(rc)) {
+            .SUCCESS => {},
+            else => |errno| return spawnCloneError(errno),
+        }
+        // CLONE_VFORK resumed this thread only once the child exec'd or
+        // exited, so its errno is final.
+        var owned_pidfd = fd.OwnedFd.fromRaw(pidfd);
+        const child_errno = @atomicLoad(u16, &child.errno, .acquire);
+        if (child_errno != 0) {
+            reapExitedChild(owned_pidfd.fd());
+            owned_pidfd.deinit();
+            return spawnChildError(@enumFromInt(child_errno));
+        }
+        return .{ .pid = @intCast(rc), .pidfd = owned_pidfd };
+    }
+
+    /// The spawned child's entry, on its own stack (`spawnInternal`). It
+    /// returns only when a step failed, and its return value is its exit
+    /// status.
+    fn spawnChildMain(arg: usize) callconv(.c) u8 {
+        const child: *SpawnChild = @ptrFromInt(arg);
+        const errno = spawnChildExec(child.options);
+        @atomicStore(u16, &child.errno, @intFromEnum(errno), .release);
+        return spawn_child_failure_status;
+    }
+
+    /// The child's steps up to its exec, each a raw system call. Returns the
+    /// errno of the step that failed; on success the exec never returns.
+    fn spawnChildExec(options: *const SpawnInternalOptions) std.posix.E {
+        const sys = std.os.linux;
+        var signal: u8 = 1;
+        while (signal < sys.NSIG) : (signal += 1) {
+            if (signal == sys.SIG.KILL or signal == sys.SIG.STOP)
+                continue;
+            var current: sys.Sigaction = undefined;
+            const read_errno = linux.syscallErrno(sys.sigaction(signal, null, &current));
+            if (read_errno != .SUCCESS)
+                return read_errno;
+            const handler: usize = if (current.handler.handler) |function|
+                @intFromPtr(function)
+            else
+                signal_handler_default;
+            if (handler == signal_handler_default or handler == signal_handler_ignore)
+                continue;
+            const default_action: sys.Sigaction = .{
+                .handler = .{ .handler = sys.SIG.DFL },
+                .mask = sys.sigemptyset(),
+                .flags = 0,
+            };
+            const reset_errno = linux.syscallErrno(sys.sigaction(signal, &default_action, null));
+            if (reset_errno != .SUCCESS)
+                return reset_errno;
         }
 
-        if (@hasDecl(c, "posix_spawn_file_actions_addclosefrom_np")) {
-            try posixSpawnCheck(c.posix_spawn_file_actions_addclosefrom_np(
-                &actions,
-                close_from,
-            ));
-        } else {
-            return error.SpawnCloseFromUnavailable;
-        }
-
-        // A blocked signal mask survives exec, so a child spawned by a thread
-        // that blocks SIGINT or SIGTERM, as a thread reading them from a
-        // signalfd does, would ignore direct termination signals. The child
-        // therefore starts with an empty mask whatever the caller's is.
-        //
-        // The child also leads a new session with no controlling terminal. A
+        // The child leads a new session with no controlling terminal. A
         // terminal sends Ctrl-C, Ctrl-Z and hangup to its whole foreground
         // process group, and a child left in the caller's group would die
         // alongside the caller instead of being stopped by it once the
@@ -361,31 +452,129 @@ pub const process = struct {
         // and everything it forks cannot be stopped by job control either, nor
         // push input into the terminal with TIOCSTI, which requires the
         // terminal to be the caller's controlling one.
-        var attributes: c.posix_spawnattr_t = undefined;
-        try posixSpawnCheck(c.posix_spawnattr_init(&attributes));
-        defer {
-            const rc = c.posix_spawnattr_destroy(&attributes);
-            std.debug.assert(rc == 0);
-        }
-        var empty_signal_set: c.sigset_t = undefined;
-        if (c.sigemptyset(&empty_signal_set) != 0)
-            return error.SpawnSignalMaskUnavailable;
-        try posixSpawnCheck(c.posix_spawnattr_setsigmask(&attributes, &empty_signal_set));
-        try posixSpawnCheck(c.posix_spawnattr_setflags(
-            &attributes,
-            c.POSIX_SPAWN_SETSIGMASK | c.POSIX_SPAWN_SETSID,
-        ));
+        const session_errno = linux.syscallErrno(sys.syscall0(.setsid));
+        if (session_errno != .SUCCESS)
+            return session_errno;
 
-        var pid: c.pid_t = 0;
-        try posixSpawnCheck(c.posix_spawn(
-            &pid,
-            options.exe_path_z,
-            &actions,
-            &attributes,
-            @ptrCast(@constCast(options.argv)),
-            @ptrCast(@constCast(options.envp)),
-        ));
-        return @intCast(pid);
+        for (options.fd_map) |mapping| {
+            // dup2 leaves the target without close-on-exec, so it survives
+            // the exec; the source closes below or at the exec.
+            const dup_errno = linux.syscallErrno(sys.dup2(mapping.source_fd, mapping.target_fd));
+            if (dup_errno != .SUCCESS)
+                return dup_errno;
+        }
+        const close_errno = closeEveryDescriptorButTargets(options.fd_map);
+        if (close_errno != .SUCCESS)
+            return close_errno;
+
+        // A blocked signal mask survives exec, so a child spawned by a thread
+        // that blocks SIGINT or SIGTERM, as a thread reading them from a
+        // signalfd does, would ignore direct termination signals. The child
+        // therefore starts with an empty mask whatever the caller's is.
+        const empty_signals = sys.sigemptyset();
+        const mask_errno = linux.syscallErrno(sys.sigprocmask(sys.SIG.SETMASK, &empty_signals, null));
+        if (mask_errno != .SUCCESS)
+            return mask_errno;
+
+        return linux.syscallErrno(sys.execve(options.exe_path_z, options.argv, options.envp));
+    }
+
+    /// Closes every descriptor from 3 up that is not one of `fd_map`'s
+    /// targets, in at most one close_range per gap between targets.
+    fn closeEveryDescriptorButTargets(fd_map: []const SpawnFdMap) std.posix.E {
+        const sys = std.os.linux;
+        var first: u32 = 3;
+        // Each pass finds the lowest target at or above `first`, so the loop
+        // ends after one pass per target and a last one.
+        var passes: usize = 0;
+        while (passes <= fd_map.len) : (passes += 1) {
+            var next_target: ?u32 = null;
+            for (fd_map) |mapping| {
+                const target: u32 = @intCast(mapping.target_fd);
+                if (target < first)
+                    continue;
+                if (next_target == null or target < next_target.?)
+                    next_target = target;
+            }
+            const gap_end: u32 = if (next_target) |target| target else std.math.maxInt(u32);
+            if (next_target == null or gap_end > first) {
+                const last: u32 = if (next_target != null) gap_end - 1 else gap_end;
+                const errno = linux.syscallErrno(sys.syscall3(.close_range, first, last, 0));
+                if (errno != .SUCCESS)
+                    return errno;
+            }
+            const target = next_target orelse return .SUCCESS;
+            first = target + 1;
+        }
+        return .SUCCESS;
+    }
+
+    /// Collects a spawned child that exited before its exec, through its
+    /// pidfd. It has exited already (CLONE_VFORK), so the wait returns at
+    /// once.
+    fn reapExitedChild(pidfd: std.posix.fd_t) void {
+        const sys = std.os.linux;
+        var info: sys.siginfo_t = undefined;
+        while (true) {
+            const rc = sys.waitid(.PIDFD, pidfd, &info, sys.W.EXITED);
+            switch (linux.syscallErrno(rc)) {
+                .SUCCESS => return,
+                .INTR => continue,
+                // Only a caller that reaps every child behind its back, which
+                // no runtime process does, leaves nothing to collect.
+                else => |errno| {
+                    std.log.warn("a spawned child that failed before its exec could not be reaped: {s}", .{
+                        @tagName(errno),
+                    });
+                    return;
+                },
+            }
+        }
+    }
+
+    fn spawnCloneError(errno: std.posix.E) error{
+        SystemResources,
+        ProcessFdQuotaExceeded,
+        SystemFdQuotaExceeded,
+        PermissionDenied,
+        Unexpected,
+    } {
+        return switch (errno) {
+            .AGAIN, .NOMEM => error.SystemResources,
+            // CLONE_PIDFD takes a descriptor slot in the caller.
+            .MFILE => error.ProcessFdQuotaExceeded,
+            .NFILE => error.SystemFdQuotaExceeded,
+            .PERM => error.PermissionDenied,
+            else => std.posix.unexpectedErrno(errno),
+        };
+    }
+
+    fn spawnChildError(errno: std.posix.E) error{
+        FileNotFound,
+        PermissionDenied,
+        InvalidExe,
+        NotDir,
+        NameTooLong,
+        SymLinkLoop,
+        SystemResources,
+        ProcessFdQuotaExceeded,
+        SystemFdQuotaExceeded,
+        InvalidHandle,
+        Unexpected,
+    } {
+        return switch (errno) {
+            .NOENT => error.FileNotFound,
+            .ACCES, .PERM => error.PermissionDenied,
+            .NOEXEC, .ISDIR, .LIBBAD => error.InvalidExe,
+            .NOTDIR => error.NotDir,
+            .NAMETOOLONG => error.NameTooLong,
+            .LOOP => error.SymLinkLoop,
+            .@"2BIG", .NOMEM, .AGAIN => error.SystemResources,
+            .MFILE => error.ProcessFdQuotaExceeded,
+            .NFILE => error.SystemFdQuotaExceeded,
+            .BADF => error.InvalidHandle,
+            else => std.posix.unexpectedErrno(errno),
+        };
     }
 
     pub fn monotonicNowNs() !u64 {
@@ -424,6 +613,81 @@ pub const process = struct {
     pub fn assertSingleThreadedSelf() !void {
         if (try countSelfTasks() != 1)
             return error.ProcessNotSingleThreaded;
+    }
+
+    /// The id the kernel gives a thread's CPU clock: what glibc's
+    /// `pthread_getcpuclockid` builds from the thread id it caches, and what
+    /// the kernel's `MAKE_THREAD_CPUCLOCK` names, `~tid << 3` with the
+    /// per-thread bit and `CPUCLOCK_SCHED`. A clock of another thread of the
+    /// caller's own thread group reads that thread's CPU time; the kernel
+    /// refuses one of another process with EINVAL.
+    pub fn threadCpuClockId(tid: std.os.linux.pid_t) std.os.linux.clockid_t {
+        std.debug.assert(tid > 0);
+        const cpuclock_perthread_mask: u32 = 4;
+        const cpuclock_sched: u32 = 2;
+        const negated_tid: u32 = ~@as(u32, @bitCast(tid));
+        return @enumFromInt((negated_tid << 3) | cpuclock_perthread_mask | cpuclock_sched);
+    }
+
+    /// The CPU time `clock_id` reads, in nanoseconds. A clock the kernel
+    /// refuses, such as the clock of a thread that is gone or of another
+    /// process's thread, fails with `error.InvalidClock`. A thread CPU clock
+    /// is not served by the vDSO, so each read is a system call.
+    pub fn threadCpuNs(clock_id: std.os.linux.clockid_t) error{ InvalidClock, Unexpected }!u64 {
+        var now: std.os.linux.timespec = undefined;
+        const rc = std.os.linux.clock_gettime(clock_id, &now);
+        return switch (linux.syscallErrno(rc)) {
+            .SUCCESS => @as(u64, @intCast(now.sec)) * std.time.ns_per_s + @as(u64, @intCast(now.nsec)),
+            .INVAL => error.InvalidClock,
+            else => |errno| std.posix.unexpectedErrno(errno),
+        };
+    }
+
+    /// The CPU clock id glibc gives the calling thread
+    /// (`pthread_getcpuclockid(pthread_self())`), computed from the thread id
+    /// glibc keeps in the thread's descriptor; no system call. It equals
+    /// `threadCpuClockId(std.os.linux.gettid())` exactly when that cached id
+    /// is the thread's own, which a raw clone keeps only by setting it
+    /// (`CloneForkOptions.thread_id_word`).
+    pub fn libcThreadCpuClockId() error{Unexpected}!std.os.linux.clockid_t {
+        var clock_id: c_int = 0;
+        const rc = pthread_getcpuclockid(std.c.pthread_self(), &clock_id);
+        if (rc != 0)
+            return std.posix.unexpectedErrno(@enumFromInt(@as(u16, @intCast(rc))));
+        return @enumFromInt(@as(u32, @bitCast(clock_id)));
+    }
+
+    /// The calling thread's thread-id word: where glibc keeps the thread's id
+    /// in the thread's descriptor, which it registers as the thread's
+    /// `clear_child_tid` (`set_tid_address` at startup, CLONE_CHILD_CLEARTID
+    /// for a thread it creates), so `PR_GET_TID_ADDRESS` returns it. The word
+    /// is checked to hold the thread's id from the raw `gettid`, so a libc
+    /// that keeps something else there fails here. The kernel answers
+    /// `PR_GET_TID_ADDRESS` only when built with CONFIG_CHECKPOINT_RESTORE,
+    /// and fails with `error.CheckpointRestoreUnavailable` otherwise.
+    pub fn callingThreadIdWord() error{
+        CheckpointRestoreUnavailable,
+        ThreadIdWordUnset,
+        ThreadIdWordMismatch,
+        Unexpected,
+    }!*std.os.linux.pid_t {
+        const sys = std.os.linux;
+        var address: usize = 0;
+        const rc = sys.prctl(@intFromEnum(sys.PR.GET_TID_ADDRESS), @intFromPtr(&address), 0, 0, 0);
+        switch (linux.syscallErrno(rc)) {
+            .SUCCESS => {},
+            .INVAL => return error.CheckpointRestoreUnavailable,
+            else => |errno| return std.posix.unexpectedErrno(errno),
+        }
+        if (address == 0)
+            return error.ThreadIdWordUnset;
+        if (address % @alignOf(sys.pid_t) != 0)
+            return error.ThreadIdWordMismatch;
+        const word: *sys.pid_t = @ptrFromInt(address);
+        const volatile_word: *const volatile sys.pid_t = word;
+        if (volatile_word.* != sys.gettid())
+            return error.ThreadIdWordMismatch;
+        return word;
     }
 
     /// Undoes `MADV_DONTFORK` on every mapping of the calling process so a
@@ -612,28 +876,51 @@ pub const process = struct {
         Unexpected,
     };
 
+    pub const CloneForkOptions = struct {
+        /// The cgroup v2 directory the child is born inside
+        /// (CLONE_INTO_CGROUP); null keeps the caller's cgroup.
+        cgroup_dir_fd: ?std.posix.fd_t,
+        /// The calling thread's thread-id word (`callingThreadIdWord`). The
+        /// kernel writes the child's id into the child's copy of it before
+        /// the child runs (CLONE_CHILD_SETTID) and clears it at the child's
+        /// exit (CLONE_CHILD_CLEARTID), the two flags glibc's fork passes;
+        /// the rest of what glibc's fork redoes in its child, such as
+        /// registering the robust-futex list again, this clone does not.
+        /// Without the word the child's glibc would keep the caller's id:
+        /// `pthread_getcpuclockid`
+        /// would name a thread of another process, and the owner of an
+        /// error-checking, recursive or robust mutex the child locks would be
+        /// the caller.
+        thread_id_word: *std.os.linux.pid_t,
+    };
+
     /// fork()-like clone3: returns 0 in the child and the child pid in the
     /// parent. The parent also receives an owned pidfd through `pidfd_out`
     /// (CLONE_PIDFD), so no racy post-fork pidfd_open is needed; in the child
     /// `pidfd_out` is left untouched and no pidfd exists in its fd table.
-    /// When `cgroup_dir_fd` is non-null the child is born inside that cgroup
-    /// v2 directory (CLONE_INTO_CGROUP). Fails as `cloneForkError` says.
+    /// The child gets its own thread id in glibc
+    /// (`CloneForkOptions.thread_id_word`) and is born inside
+    /// `options.cgroup_dir_fd` when it is set. Fails as `cloneForkError`
+    /// says.
     ///
     /// Unlike libc fork(), raw clone3 runs no pthread_atfork handlers. That
     /// is safe only because the caller, the zygote's fork loop, checks that
     /// it is single-threaded and leaves the allocator and the VM untouched
     /// before forking.
     pub fn cloneForkWithPidFd(
-        cgroup_dir_fd: ?std.posix.fd_t,
+        options: CloneForkOptions,
         pidfd_out: *std.posix.fd_t,
     ) CloneForkError!std.posix.pid_t {
         var pidfd_result: std.posix.fd_t = -1;
         var args = CloneArgs{
-            .flags = std.os.linux.CLONE.PIDFD,
+            .flags = std.os.linux.CLONE.PIDFD |
+                std.os.linux.CLONE.CHILD_SETTID |
+                std.os.linux.CLONE.CHILD_CLEARTID,
             .pidfd = @intFromPtr(&pidfd_result),
+            .child_tid = @intFromPtr(options.thread_id_word),
             .exit_signal = std.posix.SIG.CHLD,
         };
-        if (cgroup_dir_fd) |dir_fd| {
+        if (options.cgroup_dir_fd) |dir_fd| {
             std.debug.assert(dir_fd >= 0);
             args.flags |= std.os.linux.CLONE.INTO_CGROUP;
             args.cgroup = @intCast(dir_fd);
@@ -708,25 +995,6 @@ pub const process = struct {
         const ready = try std.posix.poll(&pollfds, timeout_ms);
         return ready > 0 and (pollfds[0].revents & (std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR)) != 0;
     }
-
-    fn posixSpawnCheck(code: c_int) !void {
-        if (code == 0)
-            return;
-        const err: std.posix.E = @enumFromInt(@as(u16, @intCast(code)));
-        return switch (err) {
-            .SUCCESS => {},
-            .PERM => error.PermissionDenied,
-            .NOENT => error.FileNotFound,
-            .ACCES => error.PermissionDenied,
-            .@"2BIG" => error.SystemResources,
-            .NOMEM => error.SystemResources,
-            .MFILE => error.ProcessFdQuotaExceeded,
-            .NFILE => error.SystemFdQuotaExceeded,
-            .BADF => error.InvalidHandle,
-            .INVAL => error.InvalidArgument,
-            else => std.posix.unexpectedErrno(err),
-        };
-    }
 };
 
 pub const socket = struct {
@@ -786,6 +1054,151 @@ pub const socket = struct {
             std.posix.SO.INCOMING_CPU,
             std.mem.asBytes(&cpu_id_c),
         );
+    }
+
+    /// SO_ATTACH_REUSEPORT_EBPF: the eBPF program behind `program_fd` picks
+    /// which socket of the listener's reuseport group takes each new
+    /// connection. Fails with `error.ReusePortBpfUnavailable` on a target
+    /// whose headers lack the option.
+    pub fn attachReuseportProgram(listener_fd: std.posix.fd_t, program_fd: std.posix.fd_t) !void {
+        if (!@hasDecl(std.posix.SO, "ATTACH_REUSEPORT_EBPF"))
+            return error.ReusePortBpfUnavailable;
+        const program_fd_c: c_int = program_fd;
+        try std.posix.setsockopt(
+            listener_fd,
+            std.posix.SOL.SOCKET,
+            std.posix.SO.ATTACH_REUSEPORT_EBPF,
+            std.mem.asBytes(&program_fd_c),
+        );
+    }
+
+    /// TCP_ULP "tls": attaches the kernel's TLS upper-layer protocol to a
+    /// connected TCP socket, which `setTlsCryptoInfo` then keys. A kernel
+    /// without the `tls` module, or a socket that cannot take it, fails with
+    /// `error.OperationNotSupported`.
+    pub fn attachTlsUlp(raw_fd: std.posix.fd_t) error{
+        InvalidHandle,
+        OperationNotSupported,
+        InvalidProtocolOption,
+        Unexpected,
+    }!void {
+        const value = "tls";
+        while (true) {
+            const rc = std.os.linux.setsockopt(
+                raw_fd,
+                std.posix.IPPROTO.TCP,
+                std.os.linux.TCP.ULP,
+                value.ptr,
+                value.len,
+            );
+            switch (linux.syscallErrno(rc)) {
+                .SUCCESS => return,
+                .INTR => continue,
+                .BADF, .NOTSOCK => return error.InvalidHandle,
+                .NOENT, .NOPROTOOPT, .NODEV, .OPNOTSUPP => return error.OperationNotSupported,
+                .INVAL => return error.InvalidProtocolOption,
+                else => |errno| return std.posix.unexpectedErrno(errno),
+            }
+        }
+    }
+
+    /// Whether a TCP socket already carries an upper-layer protocol
+    /// (TCP_ULP). A socket whose option cannot be read answers false, and
+    /// `attachTlsUlp` then reports what is wrong with it.
+    pub fn tlsUlpAttached(raw_fd: std.posix.fd_t) bool {
+        var name: [32]u8 = @splat(0);
+        var name_len: std.os.linux.socklen_t = name.len;
+        const rc = std.os.linux.getsockopt(
+            raw_fd,
+            std.posix.IPPROTO.TCP,
+            std.os.linux.TCP.ULP,
+            &name,
+            &name_len,
+        );
+        return switch (linux.syscallErrno(rc)) {
+            .SUCCESS => name_len != 0 and name[0] != 0,
+            else => false,
+        };
+    }
+
+    /// The direction a kTLS key serves: the kernel's TLS_TX and TLS_RX.
+    pub const TlsDirection = enum(u32) {
+        tx = 1,
+        rx = 2,
+    };
+
+    /// SOL_TLS TLS_TX or TLS_RX: hands the kernel the key material of one
+    /// direction. `crypto_info` is the kernel's `tls12_crypto_info_*` struct
+    /// for the cipher, whose layout belongs to the caller. A cipher the
+    /// kernel lacks fails with `error.OperationNotSupported`.
+    pub fn setTlsCryptoInfo(raw_fd: std.posix.fd_t, direction: TlsDirection, crypto_info: []const u8) error{
+        InvalidHandle,
+        OperationNotSupported,
+        InvalidKernelCryptoInfo,
+        SystemResources,
+        Unexpected,
+    }!void {
+        while (true) {
+            const rc = std.os.linux.setsockopt(
+                raw_fd,
+                std.os.linux.SOL.TLS,
+                @intFromEnum(direction),
+                crypto_info.ptr,
+                @intCast(crypto_info.len),
+            );
+            switch (linux.syscallErrno(rc)) {
+                .SUCCESS => return,
+                .INTR => continue,
+                .BADF, .NOTSOCK => return error.InvalidHandle,
+                // Linux reports ENOENT when the requested cipher or its
+                // provider is missing even though the TLS ULP itself exists.
+                .NOENT, .NOPROTOOPT, .NODEV, .OPNOTSUPP => return error.OperationNotSupported,
+                .INVAL => return error.InvalidKernelCryptoInfo,
+                .NOMEM, .NOBUFS => return error.SystemResources,
+                else => |errno| return std.posix.unexpectedErrno(errno),
+            }
+        }
+    }
+
+    /// SO_TYPE: the socket's type, such as `SOCK.SEQPACKET`.
+    pub fn socketType(raw_fd: std.posix.fd_t) SocketIntError!u32 {
+        return @bitCast(try readSocketInt(raw_fd, std.os.linux.SO.TYPE));
+    }
+
+    /// SO_DOMAIN: the socket's address family, such as `AF.UNIX`.
+    pub fn socketDomain(raw_fd: std.posix.fd_t) SocketIntError!u32 {
+        return @bitCast(try readSocketInt(raw_fd, std.os.linux.SO.DOMAIN));
+    }
+
+    /// SO_ERROR: the outcome of a nonblocking connect once the socket polls
+    /// writable. Reading it clears it.
+    pub fn connectResult(raw_fd: std.posix.fd_t) std.posix.ConnectError!void {
+        return std.posix.getsockoptError(raw_fd);
+    }
+
+    pub const SocketIntError = error{ InvalidHandle, InvalidSocketOption, Unexpected };
+
+    /// A socket-level option that holds a C `int`. Reads only, so it works in
+    /// a worker after its filter, which admits getsockopt.
+    fn readSocketInt(raw_fd: std.posix.fd_t, option: u32) SocketIntError!c_int {
+        var value: c_int = 0;
+        var value_len: std.os.linux.socklen_t = @sizeOf(c_int);
+        const rc = std.os.linux.getsockopt(
+            raw_fd,
+            std.posix.SOL.SOCKET,
+            option,
+            std.mem.asBytes(&value).ptr,
+            &value_len,
+        );
+        switch (linux.syscallErrno(rc)) {
+            .SUCCESS => {},
+            .BADF, .NOTSOCK => return error.InvalidHandle,
+            .NOPROTOOPT, .INVAL => return error.InvalidSocketOption,
+            else => |errno| return std.posix.unexpectedErrno(errno),
+        }
+        if (value_len != @sizeOf(c_int))
+            return error.InvalidSocketOption;
+        return value;
     }
 
     fn enableSocketOption(raw_fd: std.posix.fd_t, option: u32) !void {

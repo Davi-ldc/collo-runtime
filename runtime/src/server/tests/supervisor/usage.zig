@@ -1,20 +1,21 @@
 //! The usage path from a worker's usage record ring into `usage.jsonl`: what
-//! a drain writes, whose identity it puts on each record and which rings it
-//! leaves alone (an unmapped page, a head moved behind the server's tail),
-//! the route pattern every record carries, which worker records the request
-//! table lets through and which it refuses, how an ended request settles in
-//! that table and what its floor carries, the live slot's start and CPU
-//! included, the record format and its bound, what a full usage stream
-//! drops, counts and settles, at a settle and at a death too, and the
-//! exactly-once rules between a drain and synthesis, including a floor the
-//! index cannot grow for.
+//! a drain writes, whose identity, times and cold start it puts on each
+//! record (the server's dispatch and the lane's end, never the worker's
+//! claims), which rings it leaves alone (an unmapped page, a head moved
+//! behind the server's tail), the route pattern every record carries, which
+//! worker records the request table lets through, holds back until the
+//! request ends or its floor is written, skips or refuses, how an ended
+//! request settles and parks in that table and what its floor carries (the
+//! live slot's CPU, or the running window the sentinel saw), the table's ring
+//! of ended requests, the record format and its bound, what a full usage
+//! stream drops, counts and settles, at a settle and at a death too, and the
+//! exactly-once rules between a drain and synthesis, which allocate nothing.
 //! Supervisor-level lifecycles that end in these drains, and a full usage
 //! stream seen from the supervisor, are covered in `supervisor.zig` and
 //! `reaper/retirement.zig`; the sink's own buffering, writes and files in
 //! `server/tests/analytics/sink.zig`. Lane `server-supervisor-test`.
 
 const std = @import("std");
-const process = @import("collo_os").process;
 const analytics = @import("collo_server_analytics");
 const config = @import("collo_server_config");
 const supervision = @import("collo_server_supervisor");
@@ -26,7 +27,6 @@ const Supervisor = supervision.Supervisor;
 const usage_drain = supervision.usage_drain;
 const usage_log = supervision.usage_log;
 const request_table = supervision.request_table;
-const usage_key = supervision.accounting.usage;
 const WorkerRecord = supervision.worker_table.Record;
 
 /// A supervisor with a sink of its own, whose usage drain the tests run over
@@ -87,7 +87,7 @@ const Page = struct {
         self.fd = try worker_shared_page.createMemfd(name);
         errdefer std.posix.close(self.fd);
         self.view = try worker_shared_page.mapReadWrite(self.fd);
-        self.view.initializeCrashDefault(1, 0, 0);
+        self.view.initializeCrashDefault();
     }
 
     fn deinit(self: *Page) void {
@@ -123,9 +123,7 @@ fn stackWorkerOf(page: *Page, id: u64, generation: u64, definition: config.Defin
 fn completedRecord(request_id: u64) worker_shared_page.CompletedRecord {
     return std.mem.zeroInit(worker_shared_page.CompletedRecord, .{
         .request_id = request_id,
-        .started_mono_ns = 1,
-        .finished_mono_ns = 2,
-        .cpu_time_ns = 3,
+        .cpu_ns = 3,
         .status = @intFromEnum(worker_shared_page.CompletedStatus.done),
     });
 }
@@ -156,7 +154,18 @@ fn completedRecordFor(identity: worker_shared_page.LifecycleIdentity) worker_sha
     return record;
 }
 
-test "a drain stamps the server's identity on the record, never the one the worker wrote" {
+/// Notes the lane's end of request `request_id` on `worker`, a millisecond
+/// after its dispatch at 1 ns, which a drain needs before it writes the
+/// worker's record.
+fn endRequest(worker: *WorkerRecord, request_id: u64) void {
+    worker.requests.noteEnded(request_id, ended_ns);
+}
+
+/// The lane's end the tests note, `ended_ns - 1` after `dispatchedAs` and
+/// `fixture.dispatchedRequest` start their requests.
+const ended_ns: u64 = 1 + std.time.ns_per_ms;
+
+test "a drain stamps the server's identity, times and cold start on the record, never what the worker wrote" {
     var harness: Harness = undefined;
     try harness.init();
     defer harness.deinit();
@@ -164,22 +173,30 @@ test "a drain stamps the server's identity on the record, never the one the work
     try page.init("usage-identity-stamp");
     defer page.deinit();
     var worker = stackWorker(&page, 7, 3);
-    try worker.requests.record(fixture.dispatchedRequest(42));
+    // A cold start's request, which the server dispatched at t and ended at
+    // t + 5 ms, while the worker's record speaks of ten seconds.
+    const dispatched_ns: u64 = 1_000_000_000;
+    const lane_end_ns: u64 = dispatched_ns + 5 * std.time.ns_per_ms;
+    var dispatched = fixture.dispatchedRequest(42);
+    dispatched.accounting_flags = worker_shared_page.AccountingFlags.cold_start;
+    dispatched.started_mono_ns = dispatched_ns;
+    try worker.requests.record(dispatched);
 
-    // The worker claims to be another worker.
     var record = completedRecord(42);
-    record.worker_id = 99;
-    record.worker_generation = 99;
     record.client_served_bytes = 100;
-    record.fetch_billed_sent_bytes = 20;
-    record.fetch_billed_received_bytes = 3;
-    record.fetch_cost_bytes = 77;
-    record.io_time_ns = 9;
+    record.fetch_sent_bytes = 20;
+    record.fetch_received_bytes = 3;
+    record.fetch_wire_bytes = 77;
+    record.exec_ns = 10 * std.time.ns_per_s;
+    record.io_ns = 9;
     record.waiting_ns = 4;
-    record.finished_mono_ns = 11;
-    record.flags = worker_shared_page.CompletedRecordFlags.cold_start;
     try page.append(record);
 
+    // The record waits in the ring until the lane ends the request.
+    try std.testing.expectEqual(@as(usize, 0), usage_drain.drainWorker(harness.drain(), &worker));
+    try std.testing.expectEqual(@as(u64, 1), page.pending());
+    worker.requests.noteEnded(42, lane_end_ns);
+    const clock = analytics.Clock.capture();
     try std.testing.expectEqual(@as(usize, 1), usage_drain.drainWorker(harness.drain(), &worker));
     try std.testing.expectEqual(@as(u64, 0), page.pending());
 
@@ -194,10 +211,18 @@ test "a drain stamps the server's identity on the record, never the one the work
     try std.testing.expectEqualStrings("worker", line.origin);
     try std.testing.expectEqual(@as(u64, 42), line.request_id);
     try std.testing.expectEqualStrings("done", line.error_code);
+    // The cold start, the wall time and `ts` are the server's: its
+    // dispatch's flags, its dispatch to the lane's end, and that end on the
+    // wall clock.
     try std.testing.expect(line.cold_start);
-    try std.testing.expectEqual(@as(u64, 10), line.wall_time_ns);
-    try std.testing.expectEqual(@as(u64, 3), line.cpu_time_ns);
-    try std.testing.expectEqual(@as(u64, 9), line.io_time_ns);
+    try std.testing.expectEqual(5 * std.time.ns_per_ms, line.wall_ns);
+    // The drain captured both clocks a moment after this test did.
+    const expected_ts = clock.wallMs(lane_end_ns);
+    try std.testing.expect(line.ts >= expected_ts);
+    try std.testing.expect(line.ts <= expected_ts + 2);
+    try std.testing.expectEqual(10 * std.time.ns_per_s, line.exec_ns);
+    try std.testing.expectEqual(@as(u64, 3), line.cpu_ns);
+    try std.testing.expectEqual(@as(u64, 9), line.io_ns);
     try std.testing.expectEqual(@as(u64, 4), line.waiting_ns);
     try std.testing.expectEqual(@as(u64, 100), line.client_served_bytes);
     try std.testing.expectEqual(@as(u64, 20), line.fetch_sent_bytes);
@@ -219,9 +244,10 @@ test "a usage record carries the pattern of the route its request was dispatched
     // for another it ended itself.
     try worker.requests.record(fixture.dispatchedRequest(10));
     try page.append(completedRecord(10));
+    endRequest(&worker, 10);
     try std.testing.expectEqual(@as(usize, 1), usage_drain.drainWorker(harness.drain(), &worker));
     try worker.requests.record(fixture.dispatchedRequest(11));
-    usage_drain.settleRequest(harness.drain(), &worker, 11, .{ .floor = .{ .status = .crash } });
+    usage_drain.settleRequest(harness.drain(), &worker, 11, .{ .floor = .{ .status = .crash } }, ended_ns);
 
     var lines = try harness.lines();
     defer lines.deinit();
@@ -248,6 +274,7 @@ test "a status outside the enum is recorded as internal_error" {
     var record = completedRecord(5);
     record.status = 0xffff;
     try page.append(record);
+    endRequest(&worker, 5);
 
     _ = usage_drain.drainWorker(harness.drain(), &worker);
     var lines = try harness.lines();
@@ -266,6 +293,7 @@ test "a record leaves the ring once the sink holds it, and reaches the file when
     var worker = stackWorker(&page, 7, 3);
     try worker.requests.record(fixture.dispatchedRequest(42));
     try page.append(completedRecord(42));
+    endRequest(&worker, 42);
 
     try std.testing.expectEqual(@as(usize, 1), usage_drain.drainWorker(harness.drain(), &worker));
     try std.testing.expectEqual(@as(u64, 0), page.pending());
@@ -290,10 +318,17 @@ test "a full usage stream drops and counts batches, keeps the reserve for floors
 
     const clock: analytics.Clock = .{ .wall_now_ms = 1_000_000, .mono_now_ns = 10 };
     const identity: analytics.Identity = .{ .worker = "demo", .route = "/demo/*", .worker_id = 7, .worker_generation = 3 };
-    const record = analytics.usage.fromCompleted(identity, .worker, completedRecord(1), clock);
+    const record = analytics.usage.fromCompleted(
+        identity,
+        .worker,
+        completedRecord(1),
+        .{ .started_mono_ns = 1, .accounting_flags = 0 },
+        clock.mono_now_ns,
+        clock,
+    );
 
     // Room for floors only: a batch must leave the synthesis reserve free.
-    try fixture.fillUsageStream(std.testing.allocator, harness.sink(), usage_log.synthesis_reserve_bytes);
+    try fixture.fillStream(std.testing.allocator, harness.sink(), .usage, usage_log.synthesis_reserve_bytes);
     try std.testing.expectEqual(usage_log.AppendOutcome.dropped, harness.log().append(&.{record}, .drop));
     try std.testing.expectEqual(@as(u64, 1), harness.sink().stats(.usage).dropped);
     try std.testing.expect(harness.sink().full(.usage));
@@ -325,10 +360,11 @@ test "a worst-case record stays within its encoded bound" {
         .origin = .worker,
         .request_id = std.math.maxInt(u64),
         .ts_ms = std.math.maxInt(u64),
-        .wall_time_ns = std.math.maxInt(u64),
-        .cpu_time_ns = std.math.maxInt(u64),
-        .io_time_ns = std.math.maxInt(u64),
+        .wall_ns = std.math.maxInt(u64),
+        .exec_ns = std.math.maxInt(u64),
         .waiting_ns = std.math.maxInt(u64),
+        .io_ns = std.math.maxInt(u64),
+        .cpu_ns = std.math.maxInt(u64),
         .client_served_bytes = std.math.maxInt(u64),
         .fetch_sent_bytes = std.math.maxInt(u64),
         .fetch_received_bytes = std.math.maxInt(u64),
@@ -354,6 +390,7 @@ test "without an analytics directory records are counted and dropped and the rin
     var worker = stackWorker(&page, 7, 3);
     try worker.requests.record(fixture.dispatchedRequest(1));
     try page.append(completedRecord(1));
+    endRequest(&worker, 1);
 
     try std.testing.expectEqual(@as(usize, 1), usage_drain.drainWorker(harness.drain(), &worker));
     try std.testing.expectEqual(@as(u64, 0), page.pending());
@@ -372,6 +409,7 @@ test "no drain reads a worker whose page is marked unmapped" {
     var worker = stackWorker(&page, 7, 3);
     try worker.requests.record(fixture.dispatchedRequest(40));
     try page.append(completedRecord(40));
+    endRequest(&worker, 40);
 
     // The final drain marks the page unmapped before the teardown unmaps it,
     // and from then on a lane's drain and the drain of every record leave
@@ -398,6 +436,7 @@ test "a head moved back behind the server's tail fails the ring for good, and a 
     for ([_]u64{ 840, 841 }) |request_id| {
         try worker.requests.record(fixture.dispatchedRequest(request_id));
         try page.append(completedRecord(request_id));
+        endRequest(&worker, request_id);
     }
     try std.testing.expectEqual(@as(usize, 2), usage_drain.drainWorker(harness.drain(), &worker));
 
@@ -416,7 +455,7 @@ test "a head moved back behind the server's tail fails the ring for good, and a 
     usage_drain.settleRequest(harness.drain(), &worker, 842, .{ .floor = .{
         .status = .crash,
         .worker_fault = "usage_record_protocol",
-    } });
+    } }, ended_ns);
     try std.testing.expectEqual(@as(usize, 0), usage_drain.drainWorker(harness.drain(), &worker));
     try std.testing.expectEqual(@as(u64, 2), worker.handle.metrics.?.host_cursors.records.tail);
 
@@ -440,6 +479,7 @@ test "a drain refuses a record for a request the worker was never dispatched" {
     try worker.requests.record(fixture.dispatchedRequest(10));
     try page.append(completedRecord(11));
     try page.append(completedRecord(10));
+    endRequest(&worker, 10);
 
     // The refused record is dropped, so the ring moves past it and the record
     // behind it is still written.
@@ -462,6 +502,7 @@ test "a request's record is written once and every duplicate is refused" {
     defer page.deinit();
     var worker = stackWorker(&page, 7, 3);
     try worker.requests.record(fixture.dispatchedRequest(20));
+    endRequest(&worker, 20);
 
     // A duplicate in the same batch, then one in a later drain.
     try page.append(completedRecord(20));
@@ -477,38 +518,104 @@ test "a request's record is written once and every duplicate is refused" {
     try std.testing.expectEqual(@as(usize, 1), lines.items.len);
 }
 
-test "a drain waits behind a reserved synthesis and skips a written one" {
+test "a drain waits behind a request the server has not ended or whose floor it writes, and skips without a count the record of one whose floor it wrote" {
     var harness: Harness = undefined;
     try harness.init();
     defer harness.deinit();
     var page: Page = undefined;
-    try page.init("usage-reserved-synthesis");
+    try page.init("usage-waiting-record");
     defer page.deinit();
     var worker = stackWorker(&page, 7, 3);
     try worker.requests.record(fixture.dispatchedRequest(77));
+    try worker.requests.record(fixture.dispatchedRequest(78));
+    try page.append(completedRecord(77));
+    try page.append(completedRecord(78));
 
-    var record = completedRecord(77);
-    record.request_generation = 5;
-    record.request_slot = 6;
-    record.request_lane_id = 2;
-    try page.append(record);
-
-    const key = usage_key.keyFromRecord(record, .{ .worker_id = 7, .worker_generation = 3 });
-    try harness.log().synthesized.put(std.testing.allocator, key, .reserved);
+    // Request 77 runs on as far as the server knows, so its record waits and
+    // holds back 78's behind it, ended or not.
+    endRequest(&worker, 78);
     try std.testing.expectEqual(@as(usize, 0), usage_drain.drainWorker(harness.drain(), &worker));
-    try std.testing.expectEqual(@as(u64, 1), page.pending());
+    try std.testing.expectEqual(@as(u64, 2), page.pending());
 
-    try harness.log().synthesized.put(std.testing.allocator, key, .written);
+    // Ended, but its floor being written: still waiting.
+    endRequest(&worker, 77);
+    worker.requests.beginSynthesis(77);
     try std.testing.expectEqual(@as(usize, 0), usage_drain.drainWorker(harness.drain(), &worker));
+    try std.testing.expectEqual(@as(u64, 2), page.pending());
+
+    // Its floor written, 77's record is skipped, not refused, and 78's
+    // written.
+    worker.requests.finishSynthesis(77, true);
+    try std.testing.expectEqual(@as(usize, 1), usage_drain.drainWorker(harness.drain(), &worker));
     try std.testing.expectEqual(@as(u64, 0), page.pending());
-    try std.testing.expect(!harness.log().synthesized.contains(key));
-    // A record for an attempt whose floor the server already wrote is
-    // skipped, not refused.
     try std.testing.expectEqual(@as(u64, 0), harness.rejected());
+    // A second record for the same request is the worker breaking the rules.
+    try page.append(completedRecord(77));
+    try std.testing.expectEqual(@as(usize, 0), usage_drain.drainWorker(harness.drain(), &worker));
+    try std.testing.expectEqual(@as(u64, 1), harness.rejected());
 
     var lines = try harness.lines();
     defer lines.deinit();
-    try std.testing.expectEqual(@as(usize, 0), lines.items.len);
+    try std.testing.expectEqual(@as(usize, 1), lines.items.len);
+    try std.testing.expectEqual(@as(u64, 78), lines.items[0].request_id);
+}
+
+test "a floor stays parked after its slot is released, so the dying worker's record for it is skipped without a count and frees it" {
+    var harness: Harness = undefined;
+    try harness.init();
+    defer harness.deinit();
+    var page: Page = undefined;
+    try page.init("usage-parked-floor");
+    defer page.deinit();
+    var worker = stackWorker(&page, 7, 3);
+    try worker.requests.record(fixture.dispatchedRequest(90));
+
+    usage_drain.settleRequest(harness.drain(), &worker, 90, .{ .floor = .{ .status = .crash } }, ended_ns);
+    try std.testing.expect(worker.requests.dispatchedFor(90) != null);
+    try std.testing.expectEqual(@as(usize, 1), worker.requests.parked_count);
+
+    try page.append(completedRecord(90));
+    try std.testing.expectEqual(@as(usize, 0), usage_drain.drainWorker(harness.drain(), &worker));
+    try std.testing.expectEqual(@as(u64, 0), page.pending());
+    try std.testing.expectEqual(@as(u64, 0), harness.rejected());
+    try std.testing.expect(worker.requests.dispatchedFor(90) == null);
+    try std.testing.expectEqual(@as(usize, 0), worker.requests.parked_count);
+
+    var lines = try harness.lines();
+    defer lines.deinit();
+    try std.testing.expectEqual(@as(usize, 1), lines.items.len);
+    try std.testing.expectEqualStrings("server", lines.items[0].origin);
+}
+
+test "a floor is written and the worker's later record for its request is skipped, with an allocator that fails every allocation" {
+    var harness: Harness = undefined;
+    try harness.init();
+    defer harness.deinit();
+    var page: Page = undefined;
+    try page.init("usage-floor-no-allocation");
+    defer page.deinit();
+    var worker = stackWorker(&page, 9, 2);
+
+    // From here on every allocation the supervisor's usage path could make
+    // fails: writing a floor needs none.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    harness.supervisor.allocator = failing.allocator();
+    harness.log().allocator = failing.allocator();
+    defer harness.supervisor.allocator = std.testing.allocator;
+    defer harness.log().allocator = std.testing.allocator;
+
+    try worker.requests.record(fixture.dispatchedRequest(810));
+    usage_drain.settleRequest(harness.drain(), &worker, 810, .{ .floor = .{ .status = .crash } }, ended_ns);
+    try page.append(completedRecord(810));
+    try std.testing.expectEqual(@as(usize, 0), usage_drain.drainWorker(harness.drain(), &worker));
+    try std.testing.expectEqual(@as(u64, 0), harness.rejected());
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+
+    var lines = try harness.lines();
+    defer lines.deinit();
+    try std.testing.expectEqual(@as(usize, 1), lines.items.len);
+    try std.testing.expectEqualStrings("server", lines.items[0].origin);
+    try std.testing.expectEqual(@as(u64, 810), lines.items[0].request_id);
 }
 
 test "synthesis writes nothing for a request whose worker record a drain already wrote" {
@@ -530,6 +637,7 @@ test "synthesis writes nothing for a request whose worker record a drain already
     };
     try worker.requests.record(dispatchedAs(identity));
     try page.append(completedRecordFor(identity));
+    endRequest(&worker, identity.external_request_id);
 
     // The periodic drain gets there first and empties the ring; then the
     // worker dies and the lane asks for a floor for the same request. Nothing
@@ -539,7 +647,7 @@ test "synthesis writes nothing for a request whose worker record a drain already
     try std.testing.expect(worker.requests.usageRecorded(identity.external_request_id));
     try std.testing.expectEqual(
         usage_drain.SynthesisOutcome.settled,
-        try usage_drain.synthesizeFinalAccountingForLifecycle(harness.drain(), &worker, identity.external_request_id, .{ .status = .crash }),
+        usage_drain.synthesizeFinalAccountingForLifecycle(harness.drain(), &worker, identity.external_request_id, .{ .status = .crash }, ended_ns),
     );
 
     var lines = try harness.lines();
@@ -547,7 +655,38 @@ test "synthesis writes nothing for a request whose worker record a drain already
     try std.testing.expectEqual(@as(usize, 1), lines.items.len);
     try std.testing.expectEqualStrings("worker", lines.items[0].origin);
     try std.testing.expectEqualStrings("done", lines.items[0].error_code);
-    try std.testing.expectEqual(@as(usize, 0), harness.log().synthesized.count());
+}
+
+test "a claim's own drain writes the record a worker appended for a request the server just ended, and no floor follows" {
+    var harness: Harness = undefined;
+    try harness.init();
+    defer harness.deinit();
+    var page: Page = undefined;
+    try page.init("usage-claim-drains");
+    defer page.deinit();
+    var worker = stackWorker(&page, 9, 2);
+
+    const identity = worker_shared_page.LifecycleIdentity{
+        .external_request_id = 610,
+        .request_lane_id = 1,
+        .request_slot = 2,
+        .request_generation = 5,
+        .worker_id = 9,
+        .worker_generation = 2,
+    };
+    try worker.requests.record(dispatchedAs(identity));
+    try page.append(completedRecordFor(identity));
+
+    try std.testing.expectEqual(
+        usage_drain.SynthesisOutcome.settled,
+        usage_drain.synthesizeFinalAccountingForLifecycle(harness.drain(), &worker, identity.external_request_id, .{ .status = .crash }, ended_ns),
+    );
+    try std.testing.expect(worker.requests.usageRecorded(identity.external_request_id));
+    var lines = try harness.lines();
+    defer lines.deinit();
+    try std.testing.expectEqual(@as(usize, 1), lines.items.len);
+    try std.testing.expectEqualStrings("worker", lines.items[0].origin);
+    try std.testing.expectEqual(ended_ns - 1, lines.items[0].wall_ns);
 }
 
 test "a worker's record for another worker's request is refused, and the victim keeps its floor" {
@@ -574,10 +713,7 @@ test "a worker's record for another worker's request is refused, and the victim 
     try victim.requests.record(dispatchedAs(identity));
     // The hostile worker writes a record that copies the victim's request in
     // every field it controls.
-    var forged = completedRecordFor(identity);
-    forged.worker_id = identity.worker_id;
-    forged.worker_generation = identity.worker_generation;
-    try hostile_page.append(forged);
+    try hostile_page.append(completedRecordFor(identity));
 
     // The hostile worker's table holds no such request, so its record is
     // refused and marks nothing on the victim's table.
@@ -587,7 +723,7 @@ test "a worker's record for another worker's request is refused, and the victim 
     try std.testing.expect(!victim.requests.usageRecorded(identity.external_request_id));
     try std.testing.expectEqual(
         usage_drain.SynthesisOutcome.settled,
-        try usage_drain.synthesizeFinalAccountingForLifecycle(harness.drain(), &victim, identity.external_request_id, .{ .status = .crash }),
+        usage_drain.synthesizeFinalAccountingForLifecycle(harness.drain(), &victim, identity.external_request_id, .{ .status = .crash }, ended_ns),
     );
 
     var lines = try harness.lines();
@@ -598,7 +734,7 @@ test "a worker's record for another worker's request is refused, and the victim 
     try std.testing.expectEqualStrings("crash", lines.items[0].error_code);
 }
 
-test "a worker record that arrives while its request's floor is written is refused" {
+test "a worker record that arrives while its request's floor is written waits, and is kept when the floor is dropped" {
     var harness: Harness = undefined;
     try harness.init();
     defer harness.deinit();
@@ -616,68 +752,22 @@ test "a worker record that arrives while its request's floor is written is refus
         .worker_generation = 2,
     };
     try worker.requests.record(dispatchedAs(identity));
-    const claim = try usage_drain.claimSynthesisForLifecycle(harness.drain(), &worker, identity);
-    try std.testing.expect(claim.reservation.active);
+    endRequest(&worker, identity.external_request_id);
+    const claim = usage_drain.claimSynthesisForLifecycle(harness.drain(), &worker, identity);
     try std.testing.expect(!claim.worker_authored);
 
-    // A record with a request key of its own choosing misses the synthesis
-    // index, so only the request table stands between it and a second record
-    // for the request.
+    // The request table holds the record back whatever request key it
+    // carries: the request id alone names it.
     var late = completedRecord(identity.external_request_id);
     late.request_generation = identity.request_generation + 1;
     try page.append(late);
     try std.testing.expectEqual(@as(usize, 0), usage_drain.drainWorker(harness.drain(), &worker));
-    try std.testing.expectEqual(@as(u64, 1), harness.rejected());
-
-    // Had the floor been lost, a worker record would be the one to keep. The
-    // steps run in the order synthesis takes them for a dropped floor.
-    worker.requests.finishSynthesis(identity.external_request_id, false);
-    harness.log().rollbackSynthesis(claim.reservation);
-    try page.append(late);
-    try std.testing.expectEqual(@as(usize, 1), usage_drain.drainWorker(harness.drain(), &worker));
-}
-
-test "a dropped floor leaves synthesis before its reservation goes, so a drain between the two keeps the worker's record" {
-    var harness: Harness = undefined;
-    try harness.init();
-    defer harness.deinit();
-    var page: Page = undefined;
-    try page.init("usage-dropped-floor-order");
-    defer page.deinit();
-    var worker = stackWorker(&page, 9, 2);
-
-    const identity = worker_shared_page.LifecycleIdentity{
-        .external_request_id = 760,
-        .request_lane_id = 1,
-        .request_slot = 2,
-        .request_generation = 5,
-        .worker_id = 9,
-        .worker_generation = 2,
-    };
-    try worker.requests.record(dispatchedAs(identity));
-    const claim = try usage_drain.claimSynthesisForLifecycle(harness.drain(), &worker, identity);
-    try std.testing.expect(claim.reservation.active);
-    try std.testing.expect(!claim.worker_authored);
-
-    // The worker's own record for the attempt shows up while the floor is
-    // written, and the floor is then dropped
-    // (`synthesizeFinalAccountingForLifecycle`). Its entry leaves
-    // `synthesizing` first.
-    try page.append(completedRecordFor(identity));
-    worker.requests.finishSynthesis(identity.external_request_id, false);
-
-    // A drain before the reservation goes stops at the reserved record: it
-    // stays in the ring and is not refused. In the other order the drain
-    // would refuse it as a record for a request whose floor is being
-    // written, and the request would end with no record at all.
-    try std.testing.expectEqual(@as(usize, 0), usage_drain.drainWorker(harness.drain(), &worker));
     try std.testing.expectEqual(@as(u64, 1), page.pending());
     try std.testing.expectEqual(@as(u64, 0), harness.rejected());
 
-    // Once the reservation goes, the next drain writes the worker's record.
-    harness.log().rollbackSynthesis(claim.reservation);
+    // Had the floor been lost, the worker's record is the one to keep.
+    worker.requests.finishSynthesis(identity.external_request_id, false);
     try std.testing.expectEqual(@as(usize, 1), usage_drain.drainWorker(harness.drain(), &worker));
-    try std.testing.expectEqual(@as(u64, 0), page.pending());
     try std.testing.expect(worker.requests.usageRecorded(identity.external_request_id));
 
     var lines = try harness.lines();
@@ -687,7 +777,7 @@ test "a dropped floor leaves synthesis before its reservation goes, so a drain b
     try std.testing.expectEqual(identity.external_request_id, lines.items[0].request_id);
 }
 
-test "a floor carries its dispatch's flags and start, and its settle frees the request's entry" {
+test "a floor carries its dispatch's flags and runs from the dispatch to the lane's end, and its settle parks the request's entry" {
     var harness: Harness = undefined;
     try harness.init();
     defer harness.deinit();
@@ -696,17 +786,16 @@ test "a floor carries its dispatch's flags and start, and its settle frees the r
     defer page.deinit();
     var worker = stackWorker(&page, 9, 2);
 
-    // A cold start's request, dispatched a millisecond before this reading
-    // and ended by the server with no completion from the worker.
-    const dispatch_age_ns: u64 = std.time.ns_per_ms;
-    const before_ns = process.monotonicNowNsOrZero();
+    // A cold start's request, which the server dispatched and ended 3 ms
+    // later with no completion from the worker.
     var dispatched = fixture.dispatchedRequest(800);
-    dispatched.accounting_flags = worker_shared_page.CompletedRecordFlags.cold_start;
-    dispatched.started_mono_ns = before_ns - dispatch_age_ns;
+    dispatched.accounting_flags = worker_shared_page.AccountingFlags.cold_start;
+    dispatched.started_mono_ns = 1_000_000;
     try worker.requests.record(dispatched);
-    usage_drain.settleRequest(harness.drain(), &worker, 800, .{ .floor = .{ .status = .deadline } });
-    const after_ns = process.monotonicNowNsOrZero();
-    try std.testing.expect(worker.requests.dispatchedFor(800) == null);
+    usage_drain.settleRequest(harness.drain(), &worker, 800, .{ .floor = .{ .status = .deadline } }, 4_000_000);
+    // Parked, for the record a dying worker may still have written.
+    try std.testing.expect(worker.requests.dispatchedFor(800) != null);
+    try std.testing.expect(worker.requests.verdict(800) == .skip);
 
     var lines = try harness.lines();
     defer lines.deinit();
@@ -716,10 +805,9 @@ test "a floor carries its dispatch's flags and start, and its settle frees the r
     try std.testing.expectEqual(@as(u64, 800), line.request_id);
     try std.testing.expectEqualStrings("deadline", line.error_code);
     try std.testing.expect(line.cold_start);
-    // The wall time runs from the dispatch to the settle.
-    try std.testing.expect(line.wall_time_ns >= dispatch_age_ns);
-    try std.testing.expect(line.wall_time_ns <= dispatch_age_ns + (after_ns - before_ns));
-    try std.testing.expectEqual(@as(u64, 0), line.cpu_time_ns);
+    try std.testing.expectEqual(3 * std.time.ns_per_ms, line.wall_ns);
+    try std.testing.expectEqual(@as(u64, 0), line.cpu_ns);
+    try std.testing.expectEqual(@as(u64, 0), line.exec_ns);
 }
 
 test "a floor names the worker fault that ended its request, and a record the worker wrote names none" {
@@ -735,12 +823,13 @@ test "a floor names the worker fault that ended its request, and a record the wo
     // server ended when the worker's process exited.
     try worker.requests.record(fixture.dispatchedRequest(820));
     try page.append(completedRecord(820));
+    endRequest(&worker, 820);
     try std.testing.expectEqual(@as(usize, 1), usage_drain.drainWorker(harness.drain(), &worker));
     try worker.requests.record(fixture.dispatchedRequest(821));
     usage_drain.settleRequest(harness.drain(), &worker, 821, .{ .floor = .{
         .status = .crash,
         .worker_fault = "exited",
-    } });
+    } }, ended_ns);
 
     var lines = try harness.lines();
     defer lines.deinit();
@@ -754,7 +843,7 @@ test "a floor names the worker fault that ended its request, and a record the wo
     try std.testing.expectEqualStrings("exited", lines.items[1].worker_fault);
 }
 
-test "a floor takes the start and CPU its request's live slot measured, and a slot in a state the enum does not name gives none" {
+test "a floor starts at its dispatch and takes the CPU its request's live slot measured, and a slot in a state the enum does not name gives none" {
     var harness: Harness = undefined;
     try harness.init();
     defer harness.deinit();
@@ -775,27 +864,19 @@ test "a floor takes the start and CPU its request's live slot measured, and a sl
     unreadable.external_request_id = 831;
     unreadable.request_slot = 4;
 
-    // The server dispatched both requests a millisecond before this reading;
-    // the worker claimed a live slot for each a second before it and flushed
-    // CPU into both, then wrote a state no claim stores into the second.
-    const dispatch_age_ns: u64 = std.time.ns_per_ms;
-    const slot_age_ns: u64 = std.time.ns_per_s;
-    const before_ns = process.monotonicNowNsOrZero();
-    for ([_]worker_shared_page.LifecycleIdentity{ measured, unreadable }) |identity| {
-        var dispatched = dispatchedAs(identity);
-        dispatched.started_mono_ns = before_ns - dispatch_age_ns;
-        try worker.requests.record(dispatched);
-    }
+    // The worker claimed a live slot for each request and flushed CPU into
+    // both, then wrote a state no claim stores into the second.
+    for ([_]worker_shared_page.LifecycleIdentity{ measured, unreadable }) |identity|
+        try worker.requests.record(dispatchedAs(identity));
     var state = worker_metrics_state.WorkState.init(&page.view);
-    const measured_slot = try state.allocateLiveSlot(measured, before_ns - slot_age_ns);
+    const measured_slot = try state.allocateLiveSlot(measured);
     try state.updateLiveSlotCpu(measured_slot, 40);
-    const unreadable_slot = try state.allocateLiveSlot(unreadable, before_ns - slot_age_ns);
+    const unreadable_slot = try state.allocateLiveSlot(unreadable);
     try state.updateLiveSlotCpu(unreadable_slot, 50);
     @atomicStore(u32, &page.view.live_slots[unreadable_slot.index].state, 2, .release);
 
-    usage_drain.settleRequest(harness.drain(), &worker, 830, .{ .floor = .{ .status = .crash } });
-    usage_drain.settleRequest(harness.drain(), &worker, 831, .{ .floor = .{ .status = .crash } });
-    const elapsed_ns = process.monotonicNowNsOrZero() - before_ns;
+    usage_drain.settleRequest(harness.drain(), &worker, 830, .{ .floor = .{ .status = .crash } }, ended_ns);
+    usage_drain.settleRequest(harness.drain(), &worker, 831, .{ .floor = .{ .status = .crash } }, ended_ns);
 
     var lines = try harness.lines();
     defer lines.deinit();
@@ -803,48 +884,56 @@ test "a floor takes the start and CPU its request's live slot measured, and a sl
     const from_slot = lines.items[0];
     try std.testing.expectEqual(@as(u64, 830), from_slot.request_id);
     try std.testing.expectEqualStrings("server", from_slot.origin);
-    try std.testing.expectEqual(@as(u64, 40), from_slot.cpu_time_ns);
-    try std.testing.expect(from_slot.wall_time_ns >= slot_age_ns);
-    try std.testing.expect(from_slot.wall_time_ns <= slot_age_ns + elapsed_ns);
+    try std.testing.expectEqual(@as(u64, 40), from_slot.cpu_ns);
+    try std.testing.expectEqual(ended_ns - 1, from_slot.wall_ns);
     const from_dispatch = lines.items[1];
     try std.testing.expectEqual(@as(u64, 831), from_dispatch.request_id);
     try std.testing.expectEqualStrings("server", from_dispatch.origin);
-    try std.testing.expectEqual(@as(u64, 0), from_dispatch.cpu_time_ns);
-    try std.testing.expect(from_dispatch.wall_time_ns >= dispatch_age_ns);
-    try std.testing.expect(from_dispatch.wall_time_ns <= dispatch_age_ns + elapsed_ns);
+    try std.testing.expectEqual(@as(u64, 0), from_dispatch.cpu_ns);
+    try std.testing.expectEqual(ended_ns - 1, from_dispatch.wall_ns);
 }
 
-test "a floor the exactly-once index cannot grow for is counted, and the request keeps expecting the worker's record" {
+test "a floor takes the larger of its live slot's CPU and the window its sentinel saw running, and only for the request that window names" {
     var harness: Harness = undefined;
     try harness.init();
     defer harness.deinit();
     var page: Page = undefined;
-    try page.init("usage-floor-unindexed");
+    try page.init("usage-floor-running-owner");
     defer page.deinit();
     var worker = stackWorker(&page, 9, 2);
 
-    // A usage log over the harness's sink whose encode buffer is its only
-    // allocation that succeeds, so the floor's reservation cannot grow the
-    // index.
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
-    var log = try usage_log.UsageLog.init(failing.allocator(), harness.sink());
-    defer log.deinit();
-    var drain = harness.drain();
-    drain.usage = &log;
+    const running = worker_shared_page.LifecycleIdentity{
+        .external_request_id = 832,
+        .request_lane_id = 0,
+        .request_slot = 3,
+        .request_generation = 1,
+        .worker_id = 9,
+        .worker_generation = 2,
+    };
+    var other = running;
+    other.external_request_id = 833;
+    other.request_slot = 4;
+    for ([_]worker_shared_page.LifecycleIdentity{ running, other }) |identity|
+        try worker.requests.record(dispatchedAs(identity));
+    // Both live slots last flushed 10 ms; the sentinel saw request 832 at
+    // 40 ms when the worker died in its window.
+    var state = worker_metrics_state.WorkState.init(&page.view);
+    for ([_]worker_shared_page.LifecycleIdentity{ running, other }) |identity| {
+        const slot = try state.allocateLiveSlot(identity);
+        try state.updateLiveSlotCpu(slot, 10 * std.time.ns_per_ms);
+    }
+    page.view.publishRunningOwnerCpu(running.external_request_id, 40 * std.time.ns_per_ms);
 
-    try worker.requests.record(fixture.dispatchedRequest(810));
-    usage_drain.settleRequest(drain, &worker, 810, .{ .floor = .{ .status = .crash } });
-    try std.testing.expectEqual(@as(u64, 1), drain.counters.floors_unindexed.load(.monotonic));
-    try std.testing.expect(worker.requests.expected(810) != null);
+    usage_drain.settleRequest(harness.drain(), &worker, 832, .{ .floor = .{ .status = .crash } }, ended_ns);
+    usage_drain.settleRequest(harness.drain(), &worker, 833, .{ .floor = .{ .status = .crash } }, ended_ns);
 
-    // The worker's own record is the request's only one from then on, and a
-    // drain keeps it.
-    try page.append(completedRecord(810));
-    try std.testing.expectEqual(@as(usize, 1), usage_drain.drainWorker(drain, &worker));
     var lines = try harness.lines();
     defer lines.deinit();
-    try std.testing.expectEqual(@as(usize, 1), lines.items.len);
-    try std.testing.expectEqualStrings("worker", lines.items[0].origin);
+    try std.testing.expectEqual(@as(usize, 2), lines.items.len);
+    try std.testing.expectEqual(@as(u64, 832), lines.items[0].request_id);
+    try std.testing.expectEqual(40 * std.time.ns_per_ms, lines.items[0].cpu_ns);
+    try std.testing.expectEqual(@as(u64, 833), lines.items[1].request_id);
+    try std.testing.expectEqual(10 * std.time.ns_per_ms, lines.items[1].cpu_ns);
 }
 
 test "a completed request keeps its entry for the worker's record, and an abandoned one frees it and refuses that record" {
@@ -861,7 +950,7 @@ test "a completed request keeps its entry for the worker's record, and an abando
     // periodic drain comes later.
     try worker.requests.record(fixture.dispatchedRequest(30));
     try page.append(completedRecord(30));
-    usage_drain.settleRequest(harness.drain(), &worker, 30, .completed);
+    usage_drain.settleRequest(harness.drain(), &worker, 30, .completed, ended_ns);
     try std.testing.expect(worker.requests.dispatchedFor(30) != null);
     try std.testing.expectEqual(@as(u64, 1), page.pending());
 
@@ -871,7 +960,7 @@ test "a completed request keeps its entry for the worker's record, and an abando
     // A dispatch whose request never reached the worker gets no record: its
     // entry goes, and a record the worker writes for it anyway is refused.
     try worker.requests.record(fixture.dispatchedRequest(31));
-    usage_drain.settleRequest(harness.drain(), &worker, 31, .abandoned);
+    usage_drain.settleRequest(harness.drain(), &worker, 31, .abandoned, ended_ns);
     try std.testing.expect(worker.requests.dispatchedFor(31) == null);
     try page.append(completedRecord(31));
     try std.testing.expectEqual(@as(usize, 0), usage_drain.drainWorker(harness.drain(), &worker));
@@ -883,7 +972,7 @@ test "a completed request keeps its entry for the worker's record, and an abando
     try std.testing.expectEqual(@as(u64, 30), lines.items[0].request_id);
 }
 
-test "settling past the awaiting bound drains the worker first, so no honest record is lost" {
+test "settling past the parked bound drains the worker first, so no honest record is lost" {
     var harness: Harness = undefined;
     try harness.init();
     defer harness.deinit();
@@ -892,12 +981,12 @@ test "settling past the awaiting bound drains the worker first, so no honest rec
     defer page.deinit();
     var worker = stackWorker(&page, 7, 3);
 
-    const total: u64 = request_table.awaiting_record_max + 1;
+    const total: u64 = request_table.parked_max + 1;
     var request_id: u64 = 1;
     while (request_id <= total) : (request_id += 1) {
         try worker.requests.record(fixture.dispatchedRequest(request_id));
         try page.append(completedRecord(request_id));
-        usage_drain.settleRequest(harness.drain(), &worker, request_id, .completed);
+        usage_drain.settleRequest(harness.drain(), &worker, request_id, .completed, ended_ns);
     }
     // The last settle found the table full and drained the ring itself.
     try std.testing.expectEqual(@as(u64, 0), page.pending());
@@ -919,13 +1008,13 @@ test "an entry whose record never arrives is evicted once the table is full, and
 
     // Completions published without records fill the table.
     var request_id: u64 = 1;
-    while (request_id <= request_table.awaiting_record_max + 1) : (request_id += 1) {
+    while (request_id <= request_table.parked_max + 1) : (request_id += 1) {
         try worker.requests.record(fixture.dispatchedRequest(request_id));
-        usage_drain.settleRequest(harness.drain(), &worker, request_id, .completed);
+        usage_drain.settleRequest(harness.drain(), &worker, request_id, .completed, ended_ns);
     }
     // The oldest waiting entry made room for the newest.
     try std.testing.expect(worker.requests.dispatchedFor(1) == null);
-    try std.testing.expect(worker.requests.dispatchedFor(request_table.awaiting_record_max + 1) != null);
+    try std.testing.expect(worker.requests.dispatchedFor(request_table.parked_max + 1) != null);
 
     try page.append(completedRecord(1));
     try std.testing.expectEqual(@as(usize, 0), usage_drain.drainWorker(harness.drain(), &worker));
@@ -942,17 +1031,17 @@ test "settling past the bound with the usage stream full drops and counts the wa
     try page.init("usage-settle-stream-full");
     defer page.deinit();
     var worker = stackWorker(&page, 7, 3);
-    try fixture.fillUsageStream(std.testing.allocator, harness.sink(), usage_log.synthesis_reserve_bytes);
+    try fixture.fillStream(std.testing.allocator, harness.sink(), .usage, usage_log.synthesis_reserve_bytes);
 
     // The last settle finds the table full and drains the worker. The stream
     // drops the batch, and that settles every request in it, so the table
     // has room again without evicting anyone and nothing is left waiting.
-    const total: u64 = request_table.awaiting_record_max + 1;
+    const total: u64 = request_table.parked_max + 1;
     var request_id: u64 = 1;
     while (request_id <= total) : (request_id += 1) {
         try worker.requests.record(fixture.dispatchedRequest(request_id));
         try page.append(completedRecord(request_id));
-        usage_drain.settleRequest(harness.drain(), &worker, request_id, .completed);
+        usage_drain.settleRequest(harness.drain(), &worker, request_id, .completed, ended_ns);
     }
     try std.testing.expectEqual(@as(u64, 0), page.pending());
     try std.testing.expectEqual(total, harness.sink().stats(.usage).dropped);
@@ -991,11 +1080,10 @@ test "a worker record a full usage stream drops at a death settles its request, 
     // completion, while the usage stream had room only for floors: the claim
     // finds the record, so no floor is written, and the drain after it drops
     // the record and settles the request.
-    try fixture.fillUsageStream(std.testing.allocator, harness.sink(), usage_log.synthesis_reserve_bytes);
-    usage_drain.settleRequest(harness.drain(), &worker, identity.external_request_id, .{ .floor = .{ .status = .crash } });
+    try fixture.fillStream(std.testing.allocator, harness.sink(), .usage, usage_log.synthesis_reserve_bytes);
+    usage_drain.settleRequest(harness.drain(), &worker, identity.external_request_id, .{ .floor = .{ .status = .crash } }, ended_ns);
     try std.testing.expectEqual(@as(u64, 0), page.pending());
     try std.testing.expectEqual(@as(u64, 1), harness.sink().stats(.usage).dropped);
-    try std.testing.expectEqual(@as(usize, 0), harness.log().synthesized.count());
     try std.testing.expect(worker.requests.dispatchedFor(identity.external_request_id) == null);
     try std.testing.expectEqual(@as(u64, 0), harness.rejected());
 
@@ -1015,6 +1103,7 @@ test "a drain counts both the records it refused and the batch a full usage stre
     defer page.deinit();
     var worker = stackWorker(&page, 7, 3);
     try worker.requests.record(fixture.dispatchedRequest(1000));
+    endRequest(&worker, 1000);
 
     // A first batch of records for requests the worker was never dispatched,
     // which the ring advances past without the stream, then the record of
@@ -1023,7 +1112,7 @@ test "a drain counts both the records it refused and the batch a full usage stre
     while (request_id <= usage_log.batch_records_max) : (request_id += 1)
         try page.append(completedRecord(request_id));
     try page.append(completedRecord(1000));
-    try fixture.fillUsageStream(std.testing.allocator, harness.sink(), usage_log.synthesis_reserve_bytes);
+    try fixture.fillStream(std.testing.allocator, harness.sink(), .usage, usage_log.synthesis_reserve_bytes);
 
     try std.testing.expectEqual(@as(usize, 0), usage_drain.drainWorker(harness.drain(), &worker));
     try std.testing.expectEqual(@as(u64, usage_log.batch_records_max), harness.rejected());
@@ -1032,29 +1121,46 @@ test "a drain counts both the records it refused and the batch a full usage stre
     try std.testing.expect(worker.requests.usageRecorded(1000));
 }
 
-test "a worker's request table moves an entry through synthesis and settling" {
+test "a worker's request table moves an entry through its end, synthesis and settling" {
     var table = request_table.RequestTable{};
     try table.record(fixture.dispatchedRequest(1));
-    try std.testing.expectEqual(@as(u64, 1), table.expected(1).?.request_id);
-    try std.testing.expect(table.expected(2) == null);
+    try std.testing.expect(table.verdict(2) == .refuse);
+    // A record waits until the lane ends the request, then is written with
+    // the dispatch and that end.
+    try std.testing.expect(table.verdict(1) == .wait);
+    table.noteEnded(1, 9);
+    switch (table.verdict(1)) {
+        .write => |ended| {
+            try std.testing.expectEqual(@as(u64, 1), ended.dispatched.request_id);
+            try std.testing.expectEqual(@as(u64, 9), ended.ended_mono_ns);
+        },
+        .wait, .skip, .refuse => return error.TestExpectedWrite,
+    }
+    // A second end changes nothing.
+    table.noteEnded(1, 11);
+    try std.testing.expectEqual(@as(u64, 9), table.verdict(1).write.ended_mono_ns);
 
-    // While the floor is written, worker records are refused; a lost floor
-    // lets them in again, and a written one closes the request.
+    // While the floor is written, worker records wait; a lost floor lets
+    // them in again, and a written one settles the request, after which the
+    // worker's record is skipped once and any other refused.
     table.beginSynthesis(1);
-    try std.testing.expect(table.expected(1) == null);
+    try std.testing.expect(table.verdict(1) == .wait);
     table.finishSynthesis(1, false);
-    try std.testing.expectEqual(@as(u64, 1), table.expected(1).?.request_id);
+    try std.testing.expect(table.verdict(1) == .write);
     table.beginSynthesis(1);
     table.finishSynthesis(1, true);
     try std.testing.expect(table.usageRecorded(1));
-    try std.testing.expect(table.expected(1) == null);
-    try std.testing.expectEqual(request_table.Settled.freed, table.settle(1, true));
+    try std.testing.expect(table.verdict(1) == .skip);
+    table.skipFloors(&.{1});
+    try std.testing.expect(table.verdict(1) == .refuse);
+    try std.testing.expectEqual(request_table.Settled.freed, table.settle(1, false));
 
     // A completed request waits for its record, and the mark that settles
     // it, written or dropped, frees the entry.
     try table.record(fixture.dispatchedRequest(2));
-    try std.testing.expectEqual(request_table.Settled.awaiting_record, table.settle(2, true));
-    try std.testing.expectEqual(@as(u64, 2), table.expected(2).?.request_id);
+    table.noteEnded(2, 9);
+    try std.testing.expectEqual(request_table.Settled.parked, table.settle(2, true));
+    try std.testing.expect(table.verdict(2) == .write);
     table.markUsageRecorded(&.{2});
     try std.testing.expect(table.dispatchedFor(2) == null);
 
@@ -1062,7 +1168,58 @@ test "a worker's request table moves an entry through synthesis and settling" {
     try table.record(fixture.dispatchedRequest(3));
     _ = table.settle(3, true);
     table.remove(3);
-    try std.testing.expect(table.expected(3) == null);
+    try std.testing.expect(table.verdict(3) == .refuse);
+}
+
+test "a request table names the route of a request it holds or that left it recently, and of no other" {
+    var table = request_table.RequestTable{};
+    var routed = fixture.dispatchedRequest(5);
+    routed.route = 3;
+    try table.record(routed);
+    try std.testing.expectEqual(@as(?config.RouteIndex, 3), table.routeOfRecent(5));
+    try std.testing.expectEqual(@as(?config.RouteIndex, null), table.routeOfRecent(0));
+    try std.testing.expectEqual(@as(?config.RouteIndex, null), table.routeOfRecent(6));
+
+    // Every way out but `remove` leaves the route behind.
+    try std.testing.expectEqual(request_table.Settled.freed, table.settle(5, false));
+    try std.testing.expectEqual(@as(?config.RouteIndex, 3), table.routeOfRecent(5));
+    try table.record(fixture.dispatchedRequest(7));
+    table.remove(7);
+    try std.testing.expectEqual(@as(?config.RouteIndex, null), table.routeOfRecent(7));
+
+    // The ring keeps the last `ended_requests_max` requests.
+    var request_id: u64 = 100;
+    while (request_id < 100 + request_table.ended_requests_max) : (request_id += 1) {
+        try table.record(fixture.dispatchedRequest(request_id));
+        _ = table.settle(request_id, false);
+    }
+    try std.testing.expectEqual(@as(?config.RouteIndex, null), table.routeOfRecent(5));
+    try std.testing.expectEqual(@as(?config.RouteIndex, 0), table.routeOfRecent(100));
+    try std.testing.expectEqual(@as(?config.RouteIndex, 0), table.routeOfRecent(99 + request_table.ended_requests_max));
+}
+
+test "a kept floor gives way first when a completed request needs room to wait for its record" {
+    var table = request_table.RequestTable{};
+    // Every parked place taken by floors the server wrote.
+    var request_id: u64 = 1;
+    while (request_id <= request_table.parked_max) : (request_id += 1) {
+        try table.record(fixture.dispatchedRequest(request_id));
+        table.noteEnded(request_id, 9);
+        table.beginSynthesis(request_id);
+        table.finishSynthesis(request_id, true);
+        try std.testing.expectEqual(request_table.Settled.parked, table.settle(request_id, false));
+    }
+    try std.testing.expectEqual(request_table.parked_max, table.parked_count);
+
+    // A completed request takes the place of the oldest floor, which only
+    // loses its silent skip.
+    try table.record(fixture.dispatchedRequest(500));
+    table.noteEnded(500, 9);
+    try std.testing.expectEqual(request_table.Settled.parked, table.settle(500, true));
+    try std.testing.expect(table.verdict(1) == .refuse);
+    try std.testing.expect(table.verdict(2) == .skip);
+    try std.testing.expect(table.verdict(500) == .write);
+    try std.testing.expectEqual(request_table.parked_max, table.parked_count);
 }
 
 test "lifecycle search reaches records past the first peeked batch" {
@@ -1073,16 +1230,12 @@ test "lifecycle search reaches records past the first peeked batch" {
     try page.init("usage-deep-scan");
     defer page.deinit();
 
-    // A blocked record at the head stops consumption at position 0, so the
-    // target far behind it is only reachable by a search that keeps looking.
+    // A record at the head that must wait, its request not ended, stops
+    // consumption at position 0, so the target far behind it is only
+    // reachable by a search that keeps looking.
     var blocker = completedRecord(1);
     blocker.request_generation = 1;
     try page.append(blocker);
-    try harness.log().synthesized.put(
-        std.testing.allocator,
-        usage_key.keyFromRecord(blocker, .{ .worker_id = 7, .worker_generation = 3 }),
-        .reserved,
-    );
 
     const target_slot: u32 = 300;
     var index: u32 = 1;
@@ -1093,6 +1246,7 @@ test "lifecycle search reaches records past the first peeked batch" {
         try page.append(filler);
     }
     var worker = stackWorker(&page, 7, 3);
+    try worker.requests.record(fixture.dispatchedRequest(1));
 
     const identity = worker_shared_page.LifecycleIdentity{
         .external_request_id = target_slot + 1,
@@ -1105,13 +1259,14 @@ test "lifecycle search reaches records past the first peeked batch" {
     try worker.requests.record(dispatchedAs(identity));
     // A false here makes the server write a floor that then suppresses this
     // very record, the one carrying measured CPU.
-    const claim = try usage_drain.claimSynthesisForLifecycle(harness.drain(), &worker, identity);
+    const claim = usage_drain.claimSynthesisForLifecycle(harness.drain(), &worker, identity);
     try std.testing.expect(claim.worker_authored);
+    try std.testing.expect(claim.deep_scanned);
 }
 
-/// Builds a ring of `total + 1` records for worker 7/generation 3, marks the
-/// one at `blocker_slot` as a reserved synthesis, and asks whether the worker
-/// authored the record at `target_slot`.
+/// Builds a ring of `total + 1` records for worker 7/generation 3, makes the
+/// one at `blocker_slot` wait (its request is in the table and not ended),
+/// and asks whether the worker authored the record at `target_slot`.
 ///
 /// The blocker's position is the whole point. With it at slot 0 the consume
 /// pass advances nothing, which is the single point in the space where a
@@ -1134,14 +1289,9 @@ fn workerAuthoredAcrossBlocker(blocker_slot: u32, target_slot: u32, total: u32) 
         record.request_generation = 1;
         record.request_slot = index;
         try page.append(record);
-        if (index == blocker_slot)
-            try harness.log().synthesized.put(
-                std.testing.allocator,
-                usage_key.keyFromRecord(record, .{ .worker_id = 7, .worker_generation = 3 }),
-                .reserved,
-            );
     }
     var worker = stackWorker(&page, 7, 3);
+    try worker.requests.record(fixture.dispatchedRequest(blocker_slot + 1));
 
     const identity = worker_shared_page.LifecycleIdentity{
         .external_request_id = target_slot + 1,
@@ -1152,7 +1302,7 @@ fn workerAuthoredAcrossBlocker(blocker_slot: u32, target_slot: u32, total: u32) 
         .worker_generation = 3,
     };
     try worker.requests.record(dispatchedAs(identity));
-    const claim = try usage_drain.claimSynthesisForLifecycle(harness.drain(), &worker, identity);
+    const claim = usage_drain.claimSynthesisForLifecycle(harness.drain(), &worker, identity);
     return claim.worker_authored;
 }
 

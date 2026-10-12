@@ -1,7 +1,7 @@
 // JWK import and export under the contract in key_io.h. Import reads members through property gets, which can run
 // script, so it keeps only copied values across reads. Export builds the JWK object exportKey returns for RSA, EC and
-// OKP keys, or the JSON text wrapKey encrypts. Secret members pass through buffers that are zeroed before they are
-// freed, among them the component structs below and secretBase64UrlJsString; a FIXME marks each buffer that is not.
+// OKP keys, or the JSON text wrapKey encrypts. Every buffer a secret member passes through, decoded or encoded, is a
+// `SecretBytes`, and base64url text decodes straight into one sized before the decode.
 
 #include "jsc/runtime/state.h"
 
@@ -37,57 +37,120 @@ using JSC::JSValue;
 using WTF::String;
 using namespace Collo::JscSupport;
 
-JSC::JSString* secretBase64UrlJsString(JSC::VM& vm, std::span<const uint8_t> bytes)
+// The base64url alphabet's value of `character`, or -1 for a character outside it.
+static int base64UrlValue(char32_t character)
 {
-    WTF::Vector<uint8_t> encoded = WTF::base64URLEncodeToVector(bytes);
-    // String copies the ASCII bytes into its own StringImpl, so zeroing `encoded` afterwards leaves the result intact.
-    auto* result = JSC::jsString(vm,
-        String { std::span<const Latin1Character> {
-            reinterpret_cast<const Latin1Character*>(encoded.span().data()), encoded.size() } });
-    secureZeroVector(encoded);
-    return result;
+    if (character >= 'A' && character <= 'Z')
+        return static_cast<int>(character - 'A');
+    if (character >= 'a' && character <= 'z')
+        return static_cast<int>(character - 'a') + 26;
+    if (character >= '0' && character <= '9')
+        return static_cast<int>(character - '0') + 52;
+    if (character == '-')
+        return 62;
+    if (character == '_')
+        return 63;
+    return -1;
 }
 
-static bool appendAscii(WTF::Vector<uint8_t>& out, const char* text)
+// Accepts the same text as WTF's base64url decoder, so importKey and the unwrapKey parser agree with each other and
+// with the rest of the engine: alphabet characters, then nothing but '=' padding, of any count, and no whitespace. A
+// count of alphabet characters that leaves 1 mod 4 cannot encode whole bytes. The unused low bits of the last
+// character are ignored, as WTF ignores them. A first pass counts, so `out` is allocated once at the decoded length,
+// and the second writes each byte straight into it.
+template <typename CharacterType>
+static bool decodeSecretBase64UrlText(
+    std::span<const CharacterType> text, SecretBytes& out, bool& out_allocation_failed)
 {
-    auto bytes = std::span<const uint8_t> { reinterpret_cast<const uint8_t*>(text), std::strlen(text) };
-    return out.tryAppend(bytes);
+    out_allocation_failed = false;
+    ASSERT(out.isEmpty());
+
+    size_t sextet_count = 0;
+    bool padded = false;
+    for (auto character : text) {
+        if (character == '=') {
+            padded = true;
+            continue;
+        }
+        if (padded || base64UrlValue(character) < 0)
+            return false;
+        ++sextet_count;
+    }
+    if (!sextet_count)
+        return !padded;
+    if (sextet_count % 4 == 1)
+        return false;
+
+    const size_t decoded_length = sextet_count - (sextet_count + 3) / 4;
+    if (!out.tryGrow(decoded_length)) {
+        out_allocation_failed = true;
+        return false;
+    }
+    uint8_t* destination = out.data();
+    size_t written = 0;
+    uint32_t pending_bits = 0;
+    unsigned pending_bit_count = 0;
+    for (auto character : text) {
+        if (character == '=')
+            break;
+        pending_bits = (pending_bits << 6) | static_cast<uint32_t>(base64UrlValue(character));
+        pending_bit_count += 6;
+        if (pending_bit_count >= 8) {
+            pending_bit_count -= 8;
+            destination[written++] = static_cast<uint8_t>(pending_bits >> pending_bit_count);
+            pending_bits &= (1u << pending_bit_count) - 1;
+        }
+    }
+    pending_bits = 0;
+    ASSERT(written == decoded_length);
+    return true;
 }
 
-template <size_t N> static bool appendAscii(WTF::Vector<uint8_t>& out, const char (&text)[N])
+bool decodeSecretBase64Url(const String& text, SecretBytes& out, bool& out_allocation_failed)
 {
-    auto bytes = std::span<const uint8_t> { reinterpret_cast<const uint8_t*>(text), N - 1 };
-    return out.tryAppend(bytes);
+    if (text.is8Bit())
+        return decodeSecretBase64UrlText(text.span8(), out, out_allocation_failed);
+    return decodeSecretBase64UrlText(text.span16(), out, out_allocation_failed);
 }
 
-static bool appendAscii(WTF::Vector<uint8_t>& out, WTF::ASCIILiteral text)
+bool decodeSecretBase64Url(std::span<const uint8_t> text, SecretBytes& out, bool& out_allocation_failed)
 {
-    auto span = text.span8();
-    auto bytes = std::span<const uint8_t> { reinterpret_cast<const uint8_t*>(span.data()), span.size() };
-    return out.tryAppend(bytes);
+    return decodeSecretBase64UrlText(text, out, out_allocation_failed);
 }
 
-static bool appendBase64Url(WTF::Vector<uint8_t>& out, std::span<const uint8_t> bytes)
+// The unpadded base64url length of `byte_length` bytes; false when it does not fit in a size_t.
+static bool base64UrlEncodedLength(size_t byte_length, size_t& out)
+{
+    const size_t full_groups = byte_length / 3;
+    const size_t remainder = byte_length % 3;
+    if (full_groups > std::numeric_limits<size_t>::max() / 4)
+        return false;
+    out = full_groups * 4;
+    if (remainder) {
+        if (out > std::numeric_limits<size_t>::max() - (remainder + 1))
+            return false;
+        out += remainder + 1;
+    }
+    return true;
+}
+
+// Appends the unpadded base64url text of `bytes` to `out`, which reallocates only when the caller reserved too little.
+static bool encodeBase64UrlInto(SecretBytes& out, std::span<const uint8_t> bytes)
 {
     static constexpr char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
     const size_t full_groups = bytes.size() / 3;
     const size_t remainder = bytes.size() % 3;
-    if (full_groups > std::numeric_limits<size_t>::max() / 4)
+    size_t encoded_length = 0;
+    if (!base64UrlEncodedLength(bytes.size(), encoded_length))
         return false;
-    size_t encoded_length = full_groups * 4;
-    if (remainder) {
-        if (encoded_length > std::numeric_limits<size_t>::max() - (remainder + 1))
-            return false;
-        encoded_length += remainder + 1;
-    }
     if (out.size() > std::numeric_limits<size_t>::max() - encoded_length)
         return false;
 
     const size_t old_size = out.size();
     if (!out.tryGrow(old_size + encoded_length))
         return false;
-    auto* dst = out.mutableSpan().data() + old_size;
+    auto* dst = out.data() + old_size;
     size_t dst_index = 0;
     size_t src_index = 0;
 
@@ -117,7 +180,70 @@ static bool appendBase64Url(WTF::Vector<uint8_t>& out, std::span<const uint8_t> 
     return true;
 }
 
-static bool appendUsageJson(WTF::Vector<uint8_t>& out, WTF::ASCIILiteral usage, bool& first)
+JSC::JSString* secretBase64UrlJsString(JSC::VM& vm, std::span<const uint8_t> bytes)
+{
+    size_t encoded_length = 0;
+    SecretBytes encoded;
+    if (!base64UrlEncodedLength(bytes.size(), encoded_length) || !encoded.tryReserveCapacity(encoded_length)
+        || !encodeBase64UrlInto(encoded, bytes))
+        return nullptr;
+    // String copies the ASCII bytes into its own StringImpl, so `encoded` zeroing its buffer leaves the result intact.
+    return JSC::jsString(vm,
+        String { std::span<const Latin1Character> {
+            reinterpret_cast<const Latin1Character*>(encoded.data()), encoded.size() } });
+}
+
+// Where a JWK's JSON text goes. A sink without a buffer only counts the bytes, so one pass measures the text and a
+// second writes it into a buffer reserved at exactly that length, which then never reallocates.
+class JwkJsonSink {
+public:
+    explicit JwkJsonSink(SecretBytes* out)
+        : m_out(out)
+    {
+    }
+
+    size_t length() const { return m_length; }
+
+    bool append(std::span<const uint8_t> bytes)
+    {
+        if (bytes.size() > std::numeric_limits<size_t>::max() - m_length)
+            return false;
+        m_length += bytes.size();
+        return !m_out || m_out->tryAppend(bytes);
+    }
+
+    bool appendBase64Url(std::span<const uint8_t> bytes)
+    {
+        size_t encoded_length = 0;
+        if (!base64UrlEncodedLength(bytes.size(), encoded_length)
+            || encoded_length > std::numeric_limits<size_t>::max() - m_length)
+            return false;
+        m_length += encoded_length;
+        return !m_out || encodeBase64UrlInto(*m_out, bytes);
+    }
+
+private:
+    SecretBytes* m_out { nullptr };
+    size_t m_length { 0 };
+};
+
+static bool appendAscii(JwkJsonSink& out, const char* text)
+{
+    return out.append(std::span<const uint8_t> { reinterpret_cast<const uint8_t*>(text), std::strlen(text) });
+}
+
+template <size_t N> static bool appendAscii(JwkJsonSink& out, const char (&text)[N])
+{
+    return out.append(std::span<const uint8_t> { reinterpret_cast<const uint8_t*>(text), N - 1 });
+}
+
+static bool appendAscii(JwkJsonSink& out, WTF::ASCIILiteral text)
+{
+    auto span = text.span8();
+    return out.append(std::span<const uint8_t> { reinterpret_cast<const uint8_t*>(span.data()), span.size() });
+}
+
+static bool appendUsageJson(JwkJsonSink& out, WTF::ASCIILiteral usage, bool& first)
 {
     if (!first && !appendAscii(out, ","))
         return false;
@@ -125,25 +251,16 @@ static bool appendUsageJson(WTF::Vector<uint8_t>& out, WTF::ASCIILiteral usage, 
     return appendAscii(out, "\"") && appendAscii(out, usage) && appendAscii(out, "\"");
 }
 
+// The public members are plain vectors; every private one is a SecretBytes.
 struct RsaComponents {
-    ~RsaComponents()
-    {
-        secureZeroVector(d);
-        secureZeroVector(p);
-        secureZeroVector(q);
-        secureZeroVector(dp);
-        secureZeroVector(dq);
-        secureZeroVector(qi);
-    }
-
     WTF::Vector<uint8_t> n;
     WTF::Vector<uint8_t> e;
-    WTF::Vector<uint8_t> d;
-    WTF::Vector<uint8_t> p;
-    WTF::Vector<uint8_t> q;
-    WTF::Vector<uint8_t> dp;
-    WTF::Vector<uint8_t> dq;
-    WTF::Vector<uint8_t> qi;
+    SecretBytes d;
+    SecretBytes p;
+    SecretBytes q;
+    SecretBytes dp;
+    SecretBytes dq;
+    SecretBytes qi;
     bool is_private { false };
 };
 
@@ -167,7 +284,7 @@ private:
     bssl::UniquePtr<BIGNUM>* m_value { nullptr };
 };
 
-static bool bnModPrimeMinusOne(const BIGNUM* prime, const BIGNUM* d, BN_CTX* context, WTF::Vector<uint8_t>& out)
+static bool bnModPrimeMinusOne(const BIGNUM* prime, const BIGNUM* d, BN_CTX* context, SecretBytes& out)
 {
     bssl::UniquePtr<BIGNUM> minus_one(BN_dup(prime));
     bssl::UniquePtr<BIGNUM> result(BN_new());
@@ -240,13 +357,13 @@ static bool exportRsaComponents(JSColloCryptoKey* key, RsaComponents& out)
     return !out.dp.isEmpty() && !out.dq.isEmpty() && !out.qi.isEmpty();
 }
 
-static bool appendJsonBase64UrlField(WTF::Vector<uint8_t>& out, const char* name, std::span<const uint8_t> bytes)
+static bool appendJsonBase64UrlField(JwkJsonSink& out, const char* name, std::span<const uint8_t> bytes)
 {
-    return appendAscii(out, ",\"") && appendAscii(out, name) && appendAscii(out, "\":\"") && appendBase64Url(out, bytes)
+    return appendAscii(out, ",\"") && appendAscii(out, name) && appendAscii(out, "\":\"") && out.appendBase64Url(bytes)
         && appendAscii(out, "\"");
 }
 
-static bool appendJwkUsagesJson(WTF::Vector<uint8_t>& out, uint8_t usages)
+static bool appendJwkUsagesJson(JwkJsonSink& out, uint8_t usages)
 {
     bool first = true;
     for (const auto& usage : orderedCryptoKeyUsages) {
@@ -256,22 +373,19 @@ static bool appendJwkUsagesJson(WTF::Vector<uint8_t>& out, uint8_t usages)
     return true;
 }
 
-static bool bnToFixedBytes(const BIGNUM* bn, size_t byte_length, WTF::Vector<uint8_t>& out)
+// Writes `bn` big-endian, left-padded with zeros to `byte_length` bytes, into `out`, which must be empty: a
+// WTF::Vector for a public coordinate, a SecretBytes for a private scalar.
+template <typename Bytes> static bool bnToFixedBytes(const BIGNUM* bn, size_t byte_length, Bytes& out)
 {
-    if (!bn || BN_num_bytes(bn) > static_cast<int>(byte_length) || !out.tryReserveInitialCapacity(byte_length))
+    if (!bn || BN_num_bytes(bn) > byte_length || !out.tryGrow(byte_length))
         return false;
-    out.grow(byte_length);
-    std::memset(out.mutableSpan().data(), 0, byte_length);
-    BN_bn2bin(bn, out.mutableSpan().data() + byte_length - BN_num_bytes(bn));
-    return true;
+    return BN_bn2bin_padded(out.mutableSpan().data(), byte_length, bn) == 1;
 }
 
 struct EcComponents {
-    ~EcComponents() { secureZeroVector(d); }
-
     WTF::Vector<uint8_t> x;
     WTF::Vector<uint8_t> y;
-    WTF::Vector<uint8_t> d;
+    SecretBytes d;
     bool is_private { false };
 };
 
@@ -306,20 +420,17 @@ static bool exportEcComponents(JSColloCryptoKey* key, EcComponents& out)
 }
 
 struct OkpComponents {
-    ~OkpComponents() { secureZeroVector(d); }
-
     WTF::Vector<uint8_t> x;
-    WTF::Vector<uint8_t> d;
+    SecretBytes d;
     bool is_private { false };
 };
 
-static bool evpGetRawPrivate(EVP_PKEY* pkey, WTF::Vector<uint8_t>& out)
+static bool evpGetRawPrivate(EVP_PKEY* pkey, SecretBytes& out)
 {
     size_t length = 0;
-    if (EVP_PKEY_get_raw_private_key(pkey, nullptr, &length) != 1 || !length || !out.tryReserveInitialCapacity(length))
+    if (EVP_PKEY_get_raw_private_key(pkey, nullptr, &length) != 1 || !length || !out.tryGrow(length))
         return false;
-    out.grow(length);
-    return EVP_PKEY_get_raw_private_key(pkey, out.mutableSpan().data(), &length) == 1 && length == out.size();
+    return EVP_PKEY_get_raw_private_key(pkey, out.data(), &length) == 1 && length == out.size();
 }
 
 static bool exportOkpComponents(JSColloCryptoKey* key, OkpComponents& out)
@@ -335,12 +446,8 @@ static bool exportOkpComponents(JSColloCryptoKey* key, OkpComponents& out)
     return evpGetRawPrivate(key->asymmetricKey(), out.d) && out.d.size() == 32;
 }
 
-static bool appendRsaJwkJson(WTF::Vector<uint8_t>& out, JSColloCryptoKey* key)
+static bool appendRsaJwkJson(JwkJsonSink& out, JSColloCryptoKey* key, const RsaComponents& components)
 {
-    RsaComponents components;
-    if (!exportRsaComponents(key, components))
-        return false;
-
     if (!appendAscii(out, "{\"kty\":\"RSA\""))
         return false;
     if (!appendJsonBase64UrlField(out, "n", components.n.span()))
@@ -381,12 +488,8 @@ static bool appendRsaJwkJson(WTF::Vector<uint8_t>& out, JSColloCryptoKey* key)
     return appendAscii(out, "]}");
 }
 
-static bool appendEcJwkJson(WTF::Vector<uint8_t>& out, JSColloCryptoKey* key)
+static bool appendEcJwkJson(JwkJsonSink& out, JSColloCryptoKey* key, const EcComponents& components)
 {
-    EcComponents components;
-    if (!exportEcComponents(key, components))
-        return false;
-
     if (!appendAscii(out, "{\"kty\":\"EC\",\"crv\":\""))
         return false;
     if (!appendAscii(out, namedCurveName(key->namedCurve())))
@@ -410,12 +513,8 @@ static bool appendEcJwkJson(WTF::Vector<uint8_t>& out, JSColloCryptoKey* key)
     return appendAscii(out, "]}");
 }
 
-static bool appendOkpJwkJson(WTF::Vector<uint8_t>& out, JSColloCryptoKey* key)
+static bool appendOkpJwkJson(JwkJsonSink& out, JSColloCryptoKey* key, const OkpComponents& components)
 {
-    OkpComponents components;
-    if (!exportOkpComponents(key, components))
-        return false;
-
     if (!appendAscii(out, "{\"kty\":\"OKP\",\"crv\":\""))
         return false;
     if (!appendAscii(out, namedCurveName(key->namedCurve())))
@@ -437,18 +536,11 @@ static bool appendOkpJwkJson(WTF::Vector<uint8_t>& out, JSColloCryptoKey* key)
     return appendAscii(out, "]}");
 }
 
-static bool appendJwkJson(WTF::Vector<uint8_t>& out, JSColloCryptoKey* key)
+static bool appendOctJwkJson(JwkJsonSink& out, JSColloCryptoKey* key)
 {
-    if (isRsaAlgorithm(key->algorithm()))
-        return appendRsaJwkJson(out, key);
-    if (isEcAlgorithm(key->algorithm()))
-        return appendEcJwkJson(out, key);
-    if (isOkpAlgorithm(key->algorithm()))
-        return appendOkpJwkJson(out, key);
-
     if (!appendAscii(out, "{\"kty\":\"oct\",\"k\":\""))
         return false;
-    if (!appendBase64Url(out, key->material()))
+    if (!out.appendBase64Url(key->material()))
         return false;
     if (!appendAscii(out, "\""))
         return false;
@@ -483,6 +575,40 @@ static bool appendJwkJson(WTF::Vector<uint8_t>& out, JSColloCryptoKey* key)
     return appendAscii(out, "]}");
 }
 
+// Runs `write` once to measure the JSON, reserves exactly that many bytes in `out`, which must be empty, and runs it
+// again to fill them, so the text of a private key is never left behind in a reallocated buffer.
+template <typename Write> static bool writeJwkJsonExactly(SecretBytes& out, const Write& write)
+{
+    JwkJsonSink measure(nullptr);
+    if (!write(measure) || !out.tryReserveCapacity(measure.length()))
+        return false;
+    JwkJsonSink sink(&out);
+    if (!write(sink))
+        return false;
+    ASSERT(out.size() == measure.length());
+    return true;
+}
+
+static bool writeJwkJson(SecretBytes& out, JSColloCryptoKey* key)
+{
+    if (isRsaAlgorithm(key->algorithm())) {
+        RsaComponents components;
+        return exportRsaComponents(key, components)
+            && writeJwkJsonExactly(out, [&](JwkJsonSink& sink) { return appendRsaJwkJson(sink, key, components); });
+    }
+    if (isEcAlgorithm(key->algorithm())) {
+        EcComponents components;
+        return exportEcComponents(key, components)
+            && writeJwkJsonExactly(out, [&](JwkJsonSink& sink) { return appendEcJwkJson(sink, key, components); });
+    }
+    if (isOkpAlgorithm(key->algorithm())) {
+        OkpComponents components;
+        return exportOkpComponents(key, components)
+            && writeJwkJsonExactly(out, [&](JwkJsonSink& sink) { return appendOkpJwkJson(sink, key, components); });
+    }
+    return writeJwkJsonExactly(out, [&](JwkJsonSink& sink) { return appendOctJwkJson(sink, key); });
+}
+
 static bool getStringPropertyIfPresent(JSC::JSGlobalObject* global_object, JSC::TopExceptionScope& scope,
     JSC::JSObject* object, WTF::ASCIILiteral name, std::optional<String>& out, JSC::JSValue& out_error)
 {
@@ -495,6 +621,21 @@ static bool getStringPropertyIfPresent(JSC::JSGlobalObject* global_object, JSC::
     }
     out = valueToStringForPromise(global_object, scope, value, out_error);
     return !out_error;
+}
+
+// Decodes a JWK member's base64url text into `out`, which must be empty: malformed text is a DataError and a failed
+// allocation an OutOfMemoryError.
+static bool decodeJwkSecretMember(
+    JSC::JSGlobalObject* global_object, const String& encoded, SecretBytes& out, JSC::JSValue& out_error)
+{
+    bool allocation_failed = false;
+    if (decodeSecretBase64Url(encoded, out, allocation_failed))
+        return true;
+    if (allocation_failed)
+        out_error = JSC::createOutOfMemoryError(global_object);
+    else
+        out_error = domExceptionValue(global_object, DOMExceptionCode::DataError);
+    return false;
 }
 
 bool makeHmacKeyFromJwk(JSC::JSGlobalObject* global_object, JSC::TopExceptionScope& scope, JSValue key_data_value,
@@ -575,24 +716,21 @@ bool makeHmacKeyFromJwk(JSC::JSGlobalObject* global_object, JSC::TopExceptionSco
         }
     }
 
-    // FIXME: base64URLDecode leaves the last quarter of the decoded sextets in the capacity past size(). Neither the
-    // guard nor the key that takes `decoded` zeroes that capacity before it is freed.
-    auto decoded = WTF::base64URLDecode(*k);
-    if (!decoded || decoded->isEmpty()) {
+    SecretBytes decoded;
+    if (!decodeJwkSecretMember(global_object, *k, decoded, out_error))
+        return false;
+    if (decoded.isEmpty()) {
         out_error = domExceptionValue(global_object, DOMExceptionCode::DataError);
         return false;
     }
-    SecureVectorGuard decoded_guard(*decoded);
     // Web Crypto HMAC import requires a declared length to satisfy data_bits - 8 < length <= data_bits.
-    if (length_bits && (*length_bits > decoded->size() * 8 || *length_bits + 8 <= decoded->size() * 8)) {
+    if (length_bits && (*length_bits > decoded.size() * 8 || *length_bits + 8 <= decoded.size() * 8)) {
         out_error = domExceptionValue(global_object, DOMExceptionCode::DataError);
         return false;
     }
 
-    out_key = createHmacKey(global_object, hash->id, WTF::move(*decoded), extractable_value.toBoolean(global_object),
+    out_key = createHmacKey(global_object, hash->id, WTF::move(decoded), extractable_value.toBoolean(global_object),
         usages, length_bits.value_or(0));
-    if (out_key)
-        decoded_guard.dismiss();
     return !takePendingException(scope, out_error);
 }
 
@@ -641,19 +779,18 @@ bool makeAesKeyFromJwk(JSC::JSGlobalObject* global_object, JSC::TopExceptionScop
         return false;
     }
 
-    // FIXME: base64URLDecode leaves the last quarter of the decoded sextets in the capacity past size(). Neither the
-    // guard nor the key that takes `decoded` zeroes that capacity before it is freed.
-    auto decoded = WTF::base64URLDecode(*k);
-    if (!decoded || !isValidAesKeyLength(decoded->size())) {
+    SecretBytes decoded;
+    if (!decodeJwkSecretMember(global_object, *k, decoded, out_error))
+        return false;
+    if (!isValidAesKeyLength(decoded.size())) {
         out_error = domExceptionValue(global_object, DOMExceptionCode::DataError);
         return false;
     }
-    SecureVectorGuard decoded_guard(*decoded);
 
     std::optional<String> alg;
     if (!getStringPropertyIfPresent(global_object, scope, jwk, "alg"_s, alg, out_error))
         return false;
-    if (alg && !alg->isEmpty() && *alg != aesJwkAlgorithm(*algorithm, decoded->size())) {
+    if (alg && !alg->isEmpty() && *alg != aesJwkAlgorithm(*algorithm, decoded.size())) {
         out_error = domExceptionValue(global_object, DOMExceptionCode::DataError);
         return false;
     }
@@ -690,14 +827,14 @@ bool makeAesKeyFromJwk(JSC::JSGlobalObject* global_object, JSC::TopExceptionScop
     }
 
     out_key = createAesKey(
-        global_object, *algorithm, WTF::move(*decoded), extractable_value.toBoolean(global_object), usages);
-    if (out_key)
-        decoded_guard.dismiss();
+        global_object, *algorithm, WTF::move(decoded), extractable_value.toBoolean(global_object), usages);
     return !takePendingException(scope, out_error);
 }
 
+// Decodes an RSA member, public or private, into `out`, which must be empty. `trim_leading_zero` drops the one zero
+// byte an encoder may put before a modulus whose top bit is set.
 static bool getRsaJwkInteger(JSC::JSGlobalObject* global_object, JSC::TopExceptionScope& scope, JSC::JSObject* jwk,
-    WTF::ASCIILiteral name, WTF::Vector<uint8_t>& out, bool trim_leading_zero, JSC::JSValue& out_error)
+    WTF::ASCIILiteral name, SecretBytes& out, bool trim_leading_zero, JSC::JSValue& out_error)
 {
     std::optional<String> encoded;
     if (!getStringPropertyIfPresent(global_object, scope, jwk, name, encoded, out_error))
@@ -706,16 +843,16 @@ static bool getRsaJwkInteger(JSC::JSGlobalObject* global_object, JSC::TopExcepti
         out_error = domExceptionValue(global_object, DOMExceptionCode::DataError);
         return false;
     }
-    // FIXME: base64URLDecode leaves the last quarter of the decoded sextets in the capacity past size(). `out` takes
-    // that capacity along, and the caller's guard on a private member zeroes only size().
-    auto decoded = WTF::base64URLDecode(*encoded);
-    if (!decoded || decoded->isEmpty()) {
+    if (!decodeJwkSecretMember(global_object, *encoded, out, out_error))
+        return false;
+    if (out.isEmpty()) {
         out_error = domExceptionValue(global_object, DOMExceptionCode::DataError);
         return false;
     }
-    if (trim_leading_zero && decoded->size() > 1 && decoded->at(0) == 0)
-        decoded->removeAt(0);
-    out = WTF::move(*decoded);
+    if (trim_leading_zero && out.size() > 1 && !out.data()[0]) {
+        std::memmove(out.data(), out.data() + 1, out.size() - 1);
+        out.shrink(out.size() - 1);
+    }
     return true;
 }
 
@@ -824,8 +961,8 @@ bool makeRsaKeyFromJwk(JSC::JSGlobalObject* global_object, JSC::TopExceptionScop
     if (!validateRsaJwkCommon(global_object, scope, jwk, *algorithm, hash, usages, extractable, out_error))
         return false;
 
-    WTF::Vector<uint8_t> n;
-    WTF::Vector<uint8_t> e;
+    SecretBytes n;
+    SecretBytes e;
     if (!getRsaJwkInteger(global_object, scope, jwk, "n"_s, n, true, out_error))
         return false;
     if (!getRsaJwkInteger(global_object, scope, jwk, "e"_s, e, false, out_error))
@@ -846,18 +983,12 @@ bool makeRsaKeyFromJwk(JSC::JSGlobalObject* global_object, JSC::TopExceptionScop
     if (type == CryptoKeyType::Public)
         rsa.reset(RSA_new_public_key_large_e(bn_n.get(), bn_e.get()));
     else {
-        WTF::Vector<uint8_t> d;
-        WTF::Vector<uint8_t> p;
-        WTF::Vector<uint8_t> q;
-        WTF::Vector<uint8_t> dp;
-        WTF::Vector<uint8_t> dq;
-        WTF::Vector<uint8_t> qi;
-        SecureVectorGuard d_guard(d);
-        SecureVectorGuard p_guard(p);
-        SecureVectorGuard q_guard(q);
-        SecureVectorGuard dp_guard(dp);
-        SecureVectorGuard dq_guard(dq);
-        SecureVectorGuard qi_guard(qi);
+        SecretBytes d;
+        SecretBytes p;
+        SecretBytes q;
+        SecretBytes dp;
+        SecretBytes dq;
+        SecretBytes qi;
         if (!getRsaJwkInteger(global_object, scope, jwk, "d"_s, d, false, out_error))
             return false;
         if (!getRsaJwkInteger(global_object, scope, jwk, "p"_s, p, false, out_error))
@@ -908,8 +1039,9 @@ bool makeRsaKeyFromJwk(JSC::JSGlobalObject* global_object, JSC::TopExceptionScop
     return !takePendingException(scope, out_error);
 }
 
+// Decodes an EC coordinate or private scalar of exactly `byte_length` bytes into `out`, which must be empty.
 static bool getEcJwkInteger(JSC::JSGlobalObject* global_object, JSC::TopExceptionScope& scope, JSC::JSObject* jwk,
-    WTF::ASCIILiteral name, size_t byte_length, WTF::Vector<uint8_t>& out, JSC::JSValue& out_error)
+    WTF::ASCIILiteral name, size_t byte_length, SecretBytes& out, JSC::JSValue& out_error)
 {
     std::optional<String> encoded;
     if (!getStringPropertyIfPresent(global_object, scope, jwk, name, encoded, out_error))
@@ -918,15 +1050,12 @@ static bool getEcJwkInteger(JSC::JSGlobalObject* global_object, JSC::TopExceptio
         out_error = domExceptionValue(global_object, DOMExceptionCode::DataError);
         return false;
     }
-    // FIXME: base64URLDecode leaves the last quarter of the decoded sextets in the capacity past size(), which the
-    // guard on `decoded` does not zero, so a private "d" leaves part of itself in freed memory.
-    auto decoded = WTF::base64URLDecode(*encoded);
-    if (!decoded || decoded->size() != byte_length || !out.tryReserveInitialCapacity(byte_length)) {
+    if (!decodeJwkSecretMember(global_object, *encoded, out, out_error))
+        return false;
+    if (out.size() != byte_length) {
         out_error = domExceptionValue(global_object, DOMExceptionCode::DataError);
         return false;
     }
-    SecureVectorGuard decoded_guard(*decoded);
-    out.append(decoded->span());
     return true;
 }
 
@@ -1028,8 +1157,8 @@ bool makeEcKeyFromJwk(JSC::JSGlobalObject* global_object, JSC::TopExceptionScope
         return false;
 
     auto coordinate_bytes = coordinateBytesForNamedCurve(params.named_curve);
-    WTF::Vector<uint8_t> x;
-    WTF::Vector<uint8_t> y;
+    SecretBytes x;
+    SecretBytes y;
     if (!getEcJwkInteger(global_object, scope, jwk, "x"_s, coordinate_bytes, x, out_error))
         return false;
     if (!getEcJwkInteger(global_object, scope, jwk, "y"_s, coordinate_bytes, y, out_error))
@@ -1043,8 +1172,7 @@ bool makeEcKeyFromJwk(JSC::JSGlobalObject* global_object, JSC::TopExceptionScope
         return false;
     }
     if (type == CryptoKeyType::Private) {
-        WTF::Vector<uint8_t> d;
-        SecureVectorGuard d_guard(d);
+        SecretBytes d;
         if (!getEcJwkInteger(global_object, scope, jwk, "d"_s, coordinate_bytes, d, out_error))
             return false;
         auto bn_d = bytesToBn(d.span());
@@ -1072,8 +1200,9 @@ bool makeEcKeyFromJwk(JSC::JSGlobalObject* global_object, JSC::TopExceptionScope
     return !takePendingException(scope, out_error);
 }
 
+// Decodes an OKP member, the 32-byte "x" or "d", into `out`, which must be empty.
 static bool getOkpJwkBytes(JSC::JSGlobalObject* global_object, JSC::TopExceptionScope& scope, JSC::JSObject* jwk,
-    WTF::ASCIILiteral name, WTF::Vector<uint8_t>& out, JSC::JSValue& out_error)
+    WTF::ASCIILiteral name, SecretBytes& out, JSC::JSValue& out_error)
 {
     std::optional<String> encoded;
     if (!getStringPropertyIfPresent(global_object, scope, jwk, name, encoded, out_error))
@@ -1082,19 +1211,12 @@ static bool getOkpJwkBytes(JSC::JSGlobalObject* global_object, JSC::TopException
         out_error = domExceptionValue(global_object, DOMExceptionCode::DataError);
         return false;
     }
-    // FIXME: base64URLDecode leaves the last quarter of the decoded sextets in the capacity past size(), which the
-    // guard on `decoded` does not zero, so a private "d" leaves part of itself in freed memory.
-    auto decoded = WTF::base64URLDecode(*encoded);
-    if (!decoded || decoded->size() != 32) {
+    if (!decodeJwkSecretMember(global_object, *encoded, out, out_error))
+        return false;
+    if (out.size() != 32) {
         out_error = domExceptionValue(global_object, DOMExceptionCode::DataError);
         return false;
     }
-    SecureVectorGuard decoded_guard(*decoded);
-    if (!out.tryReserveInitialCapacity(decoded->size())) {
-        out_error = JSC::createOutOfMemoryError(global_object);
-        return false;
-    }
-    out.append(decoded->span());
     return true;
 }
 
@@ -1200,9 +1322,8 @@ bool makeOkpKeyFromJwk(JSC::JSGlobalObject* global_object, JSC::TopExceptionScop
     if (!validateOkpJwkCommon(global_object, scope, jwk, *algorithm, usages, extractable, out_error))
         return false;
 
-    WTF::Vector<uint8_t> material;
-    SecureVectorGuard material_guard(material);
-    WTF::Vector<uint8_t> declared_public;
+    SecretBytes material;
+    SecretBytes declared_public;
     if (type == CryptoKeyType::Private) {
         if (!getOkpJwkBytes(global_object, scope, jwk, "d"_s, material, out_error))
             return false;
@@ -1237,6 +1358,17 @@ bool makeOkpKeyFromJwk(JSC::JSGlobalObject* global_object, JSC::TopExceptionScop
     return !takePendingException(scope, out_error);
 }
 
+// Puts a private or secret member on an exported JWK object; false when its encoded text cannot be allocated.
+static bool putSecretJwkMember(
+    JSC::VM& vm, JSC::JSObject* object, WTF::ASCIILiteral name, std::span<const uint8_t> bytes)
+{
+    auto* encoded = secretBase64UrlJsString(vm, bytes);
+    if (!encoded)
+        return false;
+    object->putDirect(vm, JSC::Identifier::fromString(vm, name), encoded);
+    return true;
+}
+
 JSC::JSObject* createRsaJwkObject(
     JSC::JSGlobalObject* global_object, JSC::VM& vm, JSColloCryptoKey* key, JSC::JSValue& out_error)
 {
@@ -1252,20 +1384,20 @@ JSC::JSObject* createRsaJwkObject(
         result->putDirect(
             vm, JSC::Identifier::fromString(vm, name), JSC::jsString(vm, WTF::base64URLEncodeToString(bytes)));
     };
-    auto putSecretBase64 = [&](WTF::ASCIILiteral name, std::span<const uint8_t> bytes) {
-        result->putDirect(vm, JSC::Identifier::fromString(vm, name), secretBase64UrlJsString(vm, bytes));
-    };
 
     result->putDirect(vm, JSC::Identifier::fromString(vm, "kty"_s), JSC::jsString(vm, String("RSA"_s)));
     putBase64("n"_s, components.n.span());
     putBase64("e"_s, components.e.span());
     if (components.is_private) {
-        putSecretBase64("d"_s, components.d.span());
-        putSecretBase64("p"_s, components.p.span());
-        putSecretBase64("q"_s, components.q.span());
-        putSecretBase64("dp"_s, components.dp.span());
-        putSecretBase64("dq"_s, components.dq.span());
-        putSecretBase64("qi"_s, components.qi.span());
+        if (!putSecretJwkMember(vm, result, "d"_s, components.d.span())
+            || !putSecretJwkMember(vm, result, "p"_s, components.p.span())
+            || !putSecretJwkMember(vm, result, "q"_s, components.q.span())
+            || !putSecretJwkMember(vm, result, "dp"_s, components.dp.span())
+            || !putSecretJwkMember(vm, result, "dq"_s, components.dq.span())
+            || !putSecretJwkMember(vm, result, "qi"_s, components.qi.span())) {
+            out_error = JSC::createOutOfMemoryError(global_object);
+            return nullptr;
+        }
     }
     const auto jwk_alg = rsaJwkAlgorithm(key->algorithm(), key->hash());
     if (!jwk_alg.isEmpty())
@@ -1303,8 +1435,10 @@ JSC::JSObject* createEcJwkObject(
         vm, JSC::Identifier::fromString(vm, "crv"_s), JSC::jsString(vm, String(namedCurveName(key->namedCurve()))));
     putBase64("x"_s, components.x.span());
     putBase64("y"_s, components.y.span());
-    if (components.is_private)
-        result->putDirect(vm, JSC::Identifier::fromString(vm, "d"_s), secretBase64UrlJsString(vm, components.d.span()));
+    if (components.is_private && !putSecretJwkMember(vm, result, "d"_s, components.d.span())) {
+        out_error = JSC::createOutOfMemoryError(global_object);
+        return nullptr;
+    }
     result->putDirect(vm, JSC::Identifier::fromString(vm, "ext"_s), JSC::jsBoolean(key->extractable()));
     auto* key_ops = createUsagesArray(global_object, vm, key->usages());
     if (!key_ops) {
@@ -1337,8 +1471,10 @@ JSC::JSObject* createOkpJwkObject(
     result->putDirect(
         vm, JSC::Identifier::fromString(vm, "crv"_s), JSC::jsString(vm, String(namedCurveName(key->namedCurve()))));
     putBase64("x"_s, components.x.span());
-    if (components.is_private)
-        result->putDirect(vm, JSC::Identifier::fromString(vm, "d"_s), secretBase64UrlJsString(vm, components.d.span()));
+    if (components.is_private && !putSecretJwkMember(vm, result, "d"_s, components.d.span())) {
+        out_error = JSC::createOutOfMemoryError(global_object);
+        return nullptr;
+    }
     result->putDirect(vm, JSC::Identifier::fromString(vm, "ext"_s), JSC::jsBoolean(key->extractable()));
     auto* key_ops = createUsagesArray(global_object, vm, key->usages());
     if (!key_ops) {
@@ -1352,7 +1488,7 @@ JSC::JSObject* createOkpJwkObject(
 }
 
 bool exportKeyBytesForWrap(JSC::JSGlobalObject* global_object, const String& format, JSColloCryptoKey* key,
-    WTF::Vector<uint8_t>& out, JSC::JSValue& out_error)
+    SecretBytes& out, JSC::JSValue& out_error)
 {
     if (key->algorithm() == CryptoKeyAlgorithm::Pbkdf2 || key->algorithm() == CryptoKeyAlgorithm::Hkdf) {
         out_error = domExceptionValue(global_object, DOMExceptionCode::NotSupportedError);
@@ -1392,20 +1528,8 @@ bool exportKeyBytesForWrap(JSC::JSGlobalObject* global_object, const String& for
     }
 
     if (format == "jwk"_s) {
-        // FIXME: an RSA private key's JSON text takes about 0.75 bytes per modulus bit plus its member syntax, so from
-        // about 7600 bits up to maxWebCryptoRsaModulusLengthBits it runs past the 2048 + rsaModulusBits() / 2 bytes
-        // reserved. appendBase64Url then reallocates `out`, and a buffer it leaves behind, already holding secret
-        // members, is freed without being zeroed.
-        auto reserve_size = isRsaAlgorithm(key->algorithm())
-            ? 2048 + key->rsaModulusBits() / 2
-            : ((isEcAlgorithm(key->algorithm()) || isOkpAlgorithm(key->algorithm()))
-                      ? 512
-                      : 192 + key->material().size() * 2);
-        if (!out.tryReserveInitialCapacity(reserve_size)) {
-            out_error = JSC::createOutOfMemoryError(global_object);
-            return false;
-        }
-        if (!appendJwkJson(out, key)) {
+        if (!writeJwkJson(out, key)) {
+            out.clear();
             out_error = JSC::createOutOfMemoryError(global_object);
             return false;
         }

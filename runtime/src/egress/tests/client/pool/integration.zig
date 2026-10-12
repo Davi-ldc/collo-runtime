@@ -2,9 +2,11 @@
 //! on one memory-BIO TLS connection, wire and billed byte accounting, the
 //! HTTP/1 connection returned when ALPN settles on http/1.1, and TLS session
 //! resumption scoped to a security cell. A test that needs the io_uring data
-//! driver returns early when the kernel refuses a ring.
+//! driver skips when the kernel or its policy offers no io_uring
+//! (`initDataDriver`) and fails on any other setup error.
 
 const std = @import("std");
+const network_policy = @import("../network_policy.zig");
 const test_support = @import("support.zig");
 const pool = test_support.pool;
 const data_io = test_support.data_io;
@@ -21,6 +23,15 @@ const test_h2_origin_alpn_http11 = test_support.test_h2_origin_alpn_http11;
 const test_alpn_h2 = test_support.test_alpn_h2;
 const routableLocalIpv4 = test_support.routableLocalIpv4;
 const FakeWriteTransport = test_support.FakeWriteTransport;
+
+/// The io_uring data driver, or a skip when this kernel or its policy offers
+/// no usable ring; any other failure fails the test.
+fn initDataDriver() !data_io.Driver {
+    return data_io.Driver.init(std.testing.allocator) catch |err| switch (err) {
+        error.UnsupportedKernel, error.PermissionDenied => return error.SkipZigTest,
+        else => |other| return other,
+    };
+}
 
 fn writeHttp1FallbackRequest(wire: *transport.HttpConnection, request: []const u8) !void {
     var sent: usize = 0;
@@ -85,7 +96,7 @@ test "http2 pool multiplexes two requests through BIO TLS data path" {
     defer client_pool.deinit();
     var readiness_driver = readiness.Driver.init(std.testing.allocator);
     defer readiness_driver.deinit();
-    var data_driver = data_io.Driver.init(std.testing.allocator) catch return;
+    var data_driver = try initDataDriver();
     defer data_driver.deinit();
 
     var host_buffer: [64]u8 = undefined;
@@ -94,8 +105,10 @@ test "http2 pool multiplexes two requests through BIO TLS data path" {
     defer std.testing.allocator.free(url_one);
     const url_two = try std.fmt.allocPrint(std.testing.allocator, "https://{s}:{d}/two", .{ host, port });
     defer std.testing.allocator.free(url_two);
+    var origins: network_policy.Origins = .{};
+    try origins.init(host, &.{port});
     const config = transport.Config{
-        .allow_private_networks = true,
+        .network = origins.policy(),
         .insecure_tls = true,
         .socket_timeout_ms = 5_000,
         .tls_ciphertext_buffer_bytes = 256 * 1024,
@@ -278,7 +291,7 @@ test "h2 egress accounting conserves BIO ciphertext (no plaintext double-count)"
     defer client_pool.deinit();
     var readiness_driver = readiness.Driver.init(std.testing.allocator);
     defer readiness_driver.deinit();
-    var data_driver = data_io.Driver.init(std.testing.allocator) catch return;
+    var data_driver = try initDataDriver();
     defer data_driver.deinit();
 
     var host_buffer: [64]u8 = undefined;
@@ -287,8 +300,10 @@ test "h2 egress accounting conserves BIO ciphertext (no plaintext double-count)"
     defer std.testing.allocator.free(url_prime);
     const url_body = try std.fmt.allocPrint(std.testing.allocator, "https://{s}:{d}/body", .{ host, port });
     defer std.testing.allocator.free(url_body);
+    var origins: network_policy.Origins = .{};
+    try origins.init(host, &.{port});
     const config = transport.Config{
-        .allow_private_networks = true,
+        .network = origins.policy(),
         .insecure_tls = true,
         .socket_timeout_ms = 5_000,
         .tls_ciphertext_buffer_bytes = 256 * 1024,
@@ -492,15 +507,17 @@ test "http2 BIO connect reports HTTP/1 ALPN for fallback" {
 
     var readiness_driver = readiness.Driver.init(std.testing.allocator);
     defer readiness_driver.deinit();
-    var data_driver = data_io.Driver.init(std.testing.allocator) catch return;
+    var data_driver = try initDataDriver();
     defer data_driver.deinit();
 
     var host_buffer: [64]u8 = undefined;
     const host = try routableLocalIpv4(&host_buffer);
     const url = try std.fmt.allocPrint(std.testing.allocator, "https://{s}:{d}/fallback", .{ host, port });
     defer std.testing.allocator.free(url);
+    var origins: network_policy.Origins = .{};
+    try origins.init(host, &.{port});
     const config = transport.Config{
-        .allow_private_networks = true,
+        .network = origins.policy(),
         .insecure_tls = true,
         .socket_timeout_ms = 5_000,
         .tls_ciphertext_buffer_bytes = 256 * 1024,

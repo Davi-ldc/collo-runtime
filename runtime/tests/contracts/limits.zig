@@ -13,10 +13,14 @@
 const std = @import("std");
 const limits = @import("collo_limits");
 const cgroup = @import("collo_cgroup");
+const dns_name = @import("collo_dns_name");
 const ipc = @import("collo_ipc");
 const h2_protocol = @import("collo_http").http2;
+const network = @import("collo_network");
 const gateway_policy = @import("collo_egress_gateway").policy;
+const gateway_sessions = @import("collo_egress_gateway").sessions;
 const transport_config = @import("collo_egress_transport").config;
+const server_config = @import("collo_server_config");
 const server_main = @import("collo_server_main");
 const worker_shared_page = @import("collo_worker_state").page;
 
@@ -62,9 +66,10 @@ comptime {
         ipc.max_request_header_count);
 }
 
-// The fetches a worker lets one request start against the fetch budget the
-// server stamps into the request's egress token and into the boot token. The
-// worker refuses a request's fetch past its count itself
+// The fetches a worker lets start under one token against the fetch budget
+// the server stamps into a request's egress token and into the boot token.
+// The worker refuses a fetch past that count itself, counting a request's
+// fetches alone and every evaluation's together under the one boot token
 // (`fetch_runtime.schedule` in `worker/egress/`), and the gateway counts a
 // start past the token's budget as an invalid command, so a count above
 // either budget would have an honest worker struck.
@@ -76,12 +81,24 @@ comptime {
         gateway_policy.production.max_fetches_per_boot);
 }
 
+// The largest `concurrency` against the gateway's strike window. Across a
+// gateway replacement a worker keeps the tokens of every request it holds,
+// and each fetch they start fails the new gateway's key as an invalid
+// command, so an honest worker at full concurrency, every request at its
+// fetch budget, must stay under the window
+// (`max_invalid_commands_per_window` in `egress/gateway/sessions.zig`).
+comptime {
+    const in_flight_fetches = @as(usize, limits.server.worker_concurrency_max) *
+        gateway_policy.production.max_fetches_per_request;
+    std.debug.assert(in_flight_fetches < gateway_sessions.max_invalid_commands_per_window);
+}
+
 // The transport's `Config` defaults match the gateway policy's. The gateway
 // builds each fetch's `Config` from its policy, but a client built with the
 // default `Config`, as standalone callers, tests and benchmarks are, must
 // keep the same body budget.
 comptime {
-    const default_config = transport_config.Config{};
+    const default_config = transport_config.Config{ .network = network.public_https };
     std.debug.assert(default_config.max_response_body_bytes ==
         limits.http_body.MATERIALIZED_BODY_BYTES_MAX);
     std.debug.assert(default_config.max_encoded_response_bytes ==
@@ -190,7 +207,10 @@ comptime {
 }
 
 // The server's configuration bounds (`common/limits/server.zig`) against the
-// IPC messages and the state page a configured route travels through.
+// IPC messages a configured route travels through and the host-name bound of
+// `common/dns_name.zig`. The state page's live slots derive from
+// `worker_concurrency_max` directly (`LIVE_SLOT_COUNT`), so no assert ties
+// them.
 comptime {
     // A route's text bindings reach the worker as its section of the route
     // table; a larger per-route bound would accept bindings no worker can
@@ -202,9 +222,6 @@ comptime {
     std.debug.assert(limits.server.routes_per_definition_max ==
         ipc.route_table.routes_max);
     std.debug.assert(ipc.route_table.routes_max <= std.math.maxInt(u16) + 1);
-    // `concurrency` counts request slots on the worker's state page.
-    std.debug.assert(limits.server.worker_concurrency_max ==
-        worker_shared_page.LIVE_SLOT_COUNT);
     // Every `:param` segment of a matched pattern becomes one capture in the
     // dispatch message, so the deepest pattern's captures must fit it.
     std.debug.assert(limits.server.route_path_segments_max ==
@@ -213,6 +230,32 @@ comptime {
     // the pack format allows.
     std.debug.assert(limits.server.pack_bytes_total_max >=
         ipc.module_pack.max_pack_bytes);
+    // The longest `network.allow` entry is a suffix pattern over the longest
+    // host name DNS admits, with the largest port.
+    std.debug.assert(limits.server.network_allow_entry_bytes_max ==
+        "*.".len + dns_name.max_name_bytes + ":65535".len);
+}
+
+// The `network` grammar (`common/network/`, which imports only the limits)
+// against the modules that bound the same text. Its longest name is the DNS
+// name check's, and `common/tests/network/pattern.zig` tests that every
+// canonical name it admits passes `dns_name.validateName`. A denial's
+// message, which the worker writes to the tenant's log as one
+// console line, must fit one line of the console ring.
+comptime {
+    std.debug.assert(network.pattern.name_bytes_max == dns_name.max_name_bytes);
+    std.debug.assert(network.grant.denial_bytes_max <= worker_shared_page.LOG_LINE_BYTES_MAX);
+}
+
+// WorkerInit's unowned limit of a launch made without a worker definition
+// against the `timeoutMs` a definition gets when it sets none. A launch for a
+// definition sends that definition's own; the two defaults must not drift, or
+// a test launch would bound unowned JavaScript by a limit no configuration
+// gives.
+comptime {
+    const default_timeout_ns = @as(u64, server_config.default_settings.limits.timeout_ms) *
+        std.time.ns_per_ms;
+    std.debug.assert(ipc.WorkerInit.default_unowned_time_limit_ns == default_timeout_ns);
 }
 
 // A lane's ingress bounds (`common/limits/ingress.zig`, which imports

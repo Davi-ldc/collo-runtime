@@ -4,11 +4,13 @@
 //
 // A native callback reaches its cell through a DontEnum property of its
 // JSFunction, never through a captured pointer, so the collector traces the
-// edge. The identifiers are cached in the realm's ColloWebApiCache and live
-// until destroyVmContents clears it.
+// edge. The identifiers are private names cached in the main realm's
+// ColloWebApiCache, which destroyVmContents clears.
 #include "host_functions/webapi/streams/pipe_transform_stream_private.h"
 
 #include "host_functions/webapi/dom/dom_exception.h"
+
+#include <JavaScriptCore/PrivateName.h>
 
 namespace Collo::HostFunctions {
 
@@ -158,14 +160,16 @@ JSColloTransformStreamDefaultController* requireTransformStreamDefaultController
     return nullptr;
 }
 
+// Each identifier is a private name, so script can neither read nor enumerate the property, as it could on a read's
+// promise when these were strings. One name serves every realm of the VM, kept in the main realm's cache, so a stream
+// one realm's code linked is found again from any realm.
 const JSC::Identifier& cachedReadableStreamIdentifier(
     JSC::JSGlobalObject* global_object, JSC::Identifier ColloWebApiCache::* field, WTF::ASCIILiteral name)
 {
-    auto& vm = global_object->vm();
-    auto& cache = uncheckedDowncast<Collo::GlobalObject>(global_object)->webApiCache();
+    auto& cache = uncheckedDowncast<Collo::GlobalObject>(global_object)->owner().main_realm->webapi_cache;
     auto& identifier = cache.*field;
     if (identifier.isNull())
-        identifier = JSC::Identifier::fromString(vm, name);
+        identifier = JSC::Identifier::fromUid(JSC::PrivateName(JSC::PrivateName::PrivateSymbol, WTF::String(name)));
     return identifier;
 }
 
@@ -381,9 +385,10 @@ const JSC::Identifier& textDecoderStreamStateIdentifier(JSC::JSGlobalObject* glo
         global_object, &ColloWebApiCache::text_decoder_stream_state_identifier, "__colloTextDecoderStream"_s);
 }
 
+// The public property a ByteLengthQueuingStrategy reads from a chunk, unlike the private names above.
 const JSC::Identifier& byteLengthIdentifier(JSC::JSGlobalObject* global_object)
 {
-    return cachedReadableStreamIdentifier(global_object, &ColloWebApiCache::byte_length_identifier, "byteLength"_s);
+    return global_object->vm().propertyNames->byteLength;
 }
 
 JSC::JSFunction* cachedThenCallback(JSC::JSGlobalObject* global_object, JSC::WriteBarrier<JSC::JSFunction>& slot,
@@ -709,73 +714,32 @@ bool valueIsCallable(JSValue value)
     return JSC::getCallData(value).type != JSC::CallData::Type::None;
 }
 
-bool createDeferredPromise(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSC::JSValue& out_promise,
-    ColloPromiseDeferred*& out_deferred)
+bool settleAndClearPromise(
+    JSC::JSGlobalObject* global_object, JSC::WriteBarrier<JSC::JSPromise>& slot, JSValue value, bool is_rejection)
 {
-    out_promise = JSC::jsUndefined();
-    out_deferred = nullptr;
-    auto* collo_global = uncheckedDowncast<Collo::GlobalObject>(global_object);
-    ColloStatus status
-        = Collo::createPromiseDeferred(&collo_global->owner(), global_object, &out_promise, &out_deferred);
-    if (status == COLLO_STATUS_OK)
-        return true;
-    if (status == COLLO_STATUS_OUT_OF_MEMORY)
-        JSC::throwOutOfMemoryError(global_object, scope);
-    else
-        JSC::throwVMTypeError(global_object, scope, "failed to create stream promise"_s);
-    return false;
+    auto* promise = slot.get();
+    if (!promise)
+        return noExceptionPending(global_object->vm());
+    slot.clear();
+    return Collo::settlePromise(promise, value, is_rejection);
 }
 
-void settleDeferred(
-    JSC::JSGlobalObject* global_object, ColloPromiseDeferred*& deferred, JSC::JSValue value, bool is_rejection)
+bool ensurePromiseRejected(JSC::JSGlobalObject* global_object, const JSC::JSCell* owner,
+    JSC::WriteBarrier<JSC::JSPromise>& slot, JSValue reason)
 {
-    if (!deferred)
-        return;
-    auto* collo_global = uncheckedDowncast<Collo::GlobalObject>(global_object);
-    ColloValue* exception = nullptr;
-    Collo::settlePromiseDeferred(&collo_global->owner(), deferred, value, is_rejection, &exception);
-    if (exception)
-        Collo::releaseValueHandle(exception);
-    collo_promise_deferred_release(deferred);
-    deferred = nullptr;
-}
-
-bool createJSDeferredPromise(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSDeferredPromise& out)
-{
-    out = {};
-    auto data = JSC::JSPromise::createDeferredData(global_object, global_object->promiseConstructor());
-    if (data.promise && data.resolve && data.reject) {
-        out.promise = data.promise;
-        out.resolve = data.resolve;
-        out.reject = data.reject;
-        return true;
+    auto* promise = slot.get();
+    if (!promiseIsPending(promise)) {
+        promise = Collo::newPromise(global_object);
+        slot.set(global_object->vm(), owner, promise);
     }
-    JSC::throwOutOfMemoryError(global_object, scope);
-    return false;
-}
-
-void settleJSDeferredPromise(JSC::JSGlobalObject* global_object, JSC::JSValue callback, JSC::JSValue value)
-{
-    auto* callback_object = callback.isObject() ? callback.getObject() : nullptr;
-    RELEASE_ASSERT(callback_object);
-    auto call_data = JSC::getCallData(callback_object);
-    RELEASE_ASSERT(call_data.type != JSC::CallData::Type::None);
-
-    JSC::MarkedArgumentBuffer arguments;
-    arguments.append(value);
-    RELEASE_ASSERT(!arguments.hasOverflowed());
-
-    auto& vm = global_object->vm();
-    auto scope = DECLARE_TOP_EXCEPTION_SCOPE(vm);
-    JSC::call(global_object, callback_object, call_data, JSC::jsUndefined(), arguments);
-    if (scope.exception())
-        scope.clearExceptionExceptTermination();
+    // Marked before the rejection, so the rejection tracker never reports it.
+    promise->markAsHandled();
+    return Collo::settlePromise(promise, reason, true);
 }
 
 JSC::JSObject* createReadResult(JSC::JSGlobalObject* global_object, JSC::JSValue value, bool done)
 {
     auto& vm = global_object->vm();
-    JSC::Strong<JSC::Unknown> protected_value(vm, value);
     auto* object = JSC::constructEmptyObject(global_object, global_object->objectPrototype(), 2);
     object->putDirect(vm, vm.propertyNames->value, value);
     object->putDirect(vm, vm.propertyNames->done, JSC::jsBoolean(done));
@@ -942,24 +906,6 @@ public:
         }
         out_first = first.releaseNonNull();
         out_second = second.releaseNonNull();
-        m_bytes = nullptr;
-        m_position = 0;
-        m_offset = 0;
-        m_size = 0;
-        return true;
-    }
-
-    bool appendRemainingBytes(WTF::Vector<uint8_t>& out) override
-    {
-        if (!m_bytes || m_position >= m_size) {
-            m_bytes = nullptr;
-            m_position = 0;
-            m_offset = 0;
-            m_size = 0;
-            return true;
-        }
-        if (!m_bytes->appendTo(out, m_offset + m_position, m_size - m_position))
-            return false;
         m_bytes = nullptr;
         m_position = 0;
         m_offset = 0;

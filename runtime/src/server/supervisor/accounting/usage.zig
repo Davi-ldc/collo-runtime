@@ -1,20 +1,18 @@
-//! Usage identity: the key that tells whether a usage record for one request
-//! attempt was already written. Pure functions over server-assigned
-//! identities; no state, so any thread may call them.
+//! Usage identity: the key that tells whether a usage record in a worker's
+//! ring belongs to one request attempt, which synthesis asks before it
+//! writes a floor (`claimSynthesisForLifecycle` in `usage_drain.zig`). Pure
+//! functions over server-assigned identities; no state, so any thread may
+//! call them.
 
 const lifecycle = @import("collo_server_lifecycle");
 const worker_shared_page = @import("collo_worker_state").page;
 
 /// One request attempt on one worker incarnation. Request slots are reused
 /// across generations and worker ids across incarnations, so both generations
-/// belong to the key and nothing else does: a field one constructor left unset
-/// would still take part in the hash, and the lookups that keep a request from
-/// being recorded twice would stop matching the day another constructor set it.
-///
-/// The key answers whether the server synthesized a record for an attempt
-/// (`UsageLog.synthesisState` in `usage_log.zig`). Whether the worker's own
-/// record for the request was already written is answered by the request
-/// table (`RequestTable.usageRecorded` in `request_table.zig`).
+/// belong to the key and nothing else does: a field one constructor left
+/// unset would still take part in the comparison, and the match would stop
+/// holding the day another constructor set it. Which record of a request the
+/// server keeps is the request table's answer (`request_table.zig`).
 pub const UsageKey = struct {
     request_key: lifecycle.RequestKey,
     worker_key: lifecycle.WorkerKey,

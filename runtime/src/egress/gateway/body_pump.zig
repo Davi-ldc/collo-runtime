@@ -17,6 +17,7 @@ const os_process = @import("collo_os").process;
 
 const active_fetch = @import("active_fetch.zig");
 const body_credit = @import("collo_egress_client").body_credit;
+const task_model = @import("collo_egress_client").task;
 
 /// Largest body chunk a single `drainReadyForPull` can return: the engine's
 /// pending-decoded watermark, which the gateway never raises above its
@@ -123,11 +124,22 @@ pub fn publishHeadIfReady(engine: anytype, fetch: *active_fetch.Fetch) !void {
                 .billed_received_total = meters.billed_received,
                 .cost_total = meters.cost,
                 .ready_at_mono_ns = os_process.monotonicNowNsOrZero(),
+                .cause = failureCauseForIpc(failure.cause),
             });
             try fetch.sendPacketOrDetach(engine, bytes);
             fetch.terminal = true;
         },
     }
+}
+
+/// Maps the task's failure cause onto the wire enum here, at the IPC boundary, as
+/// `bodyEncodingForIpc` does for the body's coding. A denial is the tenant's event, so the
+/// gateway logs nothing for it; the worker tells the tenant.
+fn failureCauseForIpc(cause: task_model.FailureCause) ipc.EgressFetchErrorCause {
+    return switch (cause) {
+        .failed => .failed,
+        .network_denied => .network_denied,
+    };
 }
 
 /// Maps the transport's body coding onto the wire enum here, at the IPC

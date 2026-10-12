@@ -2,13 +2,16 @@
 //! connect, TLS over a socket or a memory BIO, and the HTTP/1 and HTTP/2
 //! wire protocols.
 //!
-//! A destination passes the egress policy before any socket opens: the URL is
-//! validated, and every DNS answer, including those a connect never tries, is
-//! checked against the ranges the policy blocks.
+//! A destination passes the fetch's network policy before any socket opens:
+//! each hop's scheme, host and port before DNS, and every DNS answer,
+//! including those a connect never tries, after it (`request/policy.zig`).
+//! `network` re-exports `collo_network`, whose `Policy` every `Config`
+//! names, so callers build configurations from this module alone.
 
 const core = @import("collo_egress_core");
 const dns_cache = @import("collo_egress_dns_cache");
 
+pub const network = @import("collo_network");
 pub const config = @import("config.zig");
 pub const tls = @import("collo_egress_tls");
 pub const policy = @import("request/policy.zig");
@@ -40,10 +43,13 @@ pub const ApplicationProtocol = tls.ApplicationProtocol;
 pub const Protocol = config.Protocol;
 pub const Config = config.Config;
 
-pub const EgressPolicy = policy.EgressPolicy;
 pub const RequestTarget = policy.RequestTarget;
 pub const ResolvedTarget = policy.ResolvedTarget;
-pub const validateProtocol = policy.validateProtocol;
+pub const DenialError = policy.DenialError;
+pub const parseTarget = policy.parseTarget;
+pub const resolveRequestTargetUntil = policy.resolveRequestTargetUntil;
+pub const selectResolvedAddress = policy.selectResolvedAddress;
+pub const denialOf = policy.denialOf;
 pub const ipv4Bytes = policy.ipv4Bytes;
 
 pub const ParsedHeaders = headers.ParsedHeaders;
@@ -58,6 +64,7 @@ pub const appendResponseChunk = request_plan.appendResponseChunk;
 pub const RedirectMode = redirect.RedirectMode;
 pub const FetchOptions = redirect.FetchOptions;
 pub const RedirectTarget = redirect.RedirectTarget;
+pub const RedirectBody = redirect.RedirectBody;
 pub const redirectTarget = redirect.redirectTarget;
 
 pub const CancelProbe = cancel_probe.CancelProbe;

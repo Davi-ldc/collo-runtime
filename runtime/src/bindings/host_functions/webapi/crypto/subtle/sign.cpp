@@ -1,5 +1,5 @@
 // `SubtleCrypto.sign` and `verify` for HMAC, Ed25519, ECDSA, RSASSA-PKCS1-v1_5 and RSA-PSS. Arguments are validated
-// and copied on the VM thread, an HMAC key's bytes into `SecureBytes` and an asymmetric key through
+// and copied on the VM thread, an HMAC key's bytes into `SecretBytes` and an asymmetric key through
 // `retainSharedPkey`, and every signature or check runs on the crypto pool.
 
 #include "jsc/runtime/state.h"
@@ -81,7 +81,7 @@ JSC_DEFINE_HOST_FUNCTION(subtleSign, (JSC::JSGlobalObject * global_object, JSC::
         if (!copyBufferSource(global_object, scope, call_frame->argument(2), data, error))
             return rejectedPromise(global_object, error);
 
-        SecureBytes key_material;
+        SecretBytes key_material;
         if (!key_material.tryAppend(key->material()))
             return rejectedPromise(global_object, JSC::createOutOfMemoryError(global_object));
 
@@ -89,16 +89,16 @@ JSC_DEFINE_HOST_FUNCTION(subtleSign, (JSC::JSGlobalObject * global_object, JSC::
         if (!context.ok)
             return context.error;
         const auto hash = key->hash();
-        auto job = std::unique_ptr<CryptoJob>(new (std::nothrow) BytesCryptoJob(context.value.owner,
-            context.value.deferred,
-            [hash, key_material = WTF::move(key_material), data = WTF::move(data)](WTF::Vector<uint8_t>& out) mutable {
-                std::array<uint8_t, EVP_MAX_MD_SIZE> signature;
-                unsigned signature_len = 0;
-                if (!hmacSign(hashSpec(hash), key_material.span(), data.span(), signature, signature_len))
-                    return false;
-                return out.tryAppend(std::span<const uint8_t> { signature.data(), signature_len });
-            }));
-        return enqueueCryptoJobPromise(global_object, scope, context.value, WTF::move(job));
+        auto job
+            = std::unique_ptr<CryptoJob>(new (std::nothrow) BytesCryptoJob(context.value.owner, context.value.deferred,
+                [hash, key_material = WTF::move(key_material), data = WTF::move(data)](SecretBytes& out) mutable {
+                    std::array<uint8_t, EVP_MAX_MD_SIZE> signature;
+                    unsigned signature_len = 0;
+                    if (!hmacSign(hashSpec(hash), key_material.span(), data.span(), signature, signature_len))
+                        return false;
+                    return out.tryAppend(std::span<const uint8_t> { signature.data(), signature_len });
+                }));
+        return enqueueCryptoJobPromise(global_object, context.value, WTF::move(job));
     }
 
     if (WTF::equalIgnoringASCIICase(algorithm_name, "Ed25519"_s)) {
@@ -120,11 +120,11 @@ JSC_DEFINE_HOST_FUNCTION(subtleSign, (JSC::JSGlobalObject * global_object, JSC::
         auto context = createCryptoAsyncContext(global_object, scope);
         if (!context.ok)
             return context.error;
-        auto job = std::unique_ptr<CryptoJob>(new (std::nothrow) BytesCryptoJob(context.value.owner,
-            context.value.deferred, [pkey, data = WTF::move(data)](WTF::Vector<uint8_t>& out) mutable {
+        auto job = std::unique_ptr<CryptoJob>(new (std::nothrow) BytesCryptoJob(
+            context.value.owner, context.value.deferred, [pkey, data = WTF::move(data)](SecretBytes& out) mutable {
                 return ed25519SignNative(pkey.get(), data.span(), out);
             }));
-        return enqueueCryptoJobPromise(global_object, scope, context.value, WTF::move(job));
+        return enqueueCryptoJobPromise(global_object, context.value, WTF::move(job));
     }
 
     if (WTF::equalIgnoringASCIICase(algorithm_name, "ECDSA"_s)) {
@@ -151,10 +151,10 @@ JSC_DEFINE_HOST_FUNCTION(subtleSign, (JSC::JSGlobalObject * global_object, JSC::
             return context.error;
         const auto hash = params.hash->id;
         auto job = std::unique_ptr<CryptoJob>(new (std::nothrow) BytesCryptoJob(context.value.owner,
-            context.value.deferred, [pkey, hash, data = WTF::move(data)](WTF::Vector<uint8_t>& out) mutable {
+            context.value.deferred, [pkey, hash, data = WTF::move(data)](SecretBytes& out) mutable {
                 return ecdsaSignNative(pkey.get(), hash, data.span(), out);
             }));
-        return enqueueCryptoJobPromise(global_object, scope, context.value, WTF::move(job));
+        return enqueueCryptoJobPromise(global_object, context.value, WTF::move(job));
     }
 
     auto rsa_algorithm = rsaAlgorithmFromName(algorithm_name);
@@ -191,10 +191,10 @@ JSC_DEFINE_HOST_FUNCTION(subtleSign, (JSC::JSGlobalObject * global_object, JSC::
     const auto hash = key->hash();
     int padding = *rsa_algorithm == CryptoKeyAlgorithm::RsaPss ? RSA_PKCS1_PSS_PADDING : RSA_PKCS1_PADDING;
     auto job = std::unique_ptr<CryptoJob>(new (std::nothrow) BytesCryptoJob(context.value.owner, context.value.deferred,
-        [pkey, hash, padding, pss_salt_length, data = WTF::move(data)](WTF::Vector<uint8_t>& out) mutable {
+        [pkey, hash, padding, pss_salt_length, data = WTF::move(data)](SecretBytes& out) mutable {
             return rsaSignDigestNative(pkey.get(), hash, data.span(), padding, pss_salt_length, out);
         }));
-    return enqueueCryptoJobPromise(global_object, scope, context.value, WTF::move(job));
+    return enqueueCryptoJobPromise(global_object, context.value, WTF::move(job));
 }
 
 JSC_DEFINE_HOST_FUNCTION(subtleVerify, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
@@ -231,7 +231,7 @@ JSC_DEFINE_HOST_FUNCTION(subtleVerify, (JSC::JSGlobalObject * global_object, JSC
         if (!copyBufferSource(global_object, scope, call_frame->argument(3), data, error))
             return rejectedPromise(global_object, error);
 
-        SecureBytes key_material;
+        SecretBytes key_material;
         if (!key_material.tryAppend(key->material()))
             return rejectedPromise(global_object, JSC::createOutOfMemoryError(global_object));
 
@@ -264,7 +264,7 @@ JSC_DEFINE_HOST_FUNCTION(subtleVerify, (JSC::JSGlobalObject * global_object, JSC
                 OPENSSL_cleanse(candidate.data(), candidate.size());
                 return true;
             }));
-        return enqueueCryptoJobPromise(global_object, scope, context.value, WTF::move(job));
+        return enqueueCryptoJobPromise(global_object, context.value, WTF::move(job));
     }
 
     if (WTF::equalIgnoringASCIICase(algorithm_name, "Ed25519"_s)) {
@@ -294,7 +294,7 @@ JSC_DEFINE_HOST_FUNCTION(subtleVerify, (JSC::JSGlobalObject * global_object, JSC
                 [pkey, signature_input = WTF::move(signature_input), data = WTF::move(data)](bool& out) mutable {
                     return ed25519VerifyNative(pkey.get(), signature_input.span(), data.span(), out);
                 }));
-        return enqueueCryptoJobPromise(global_object, scope, context.value, WTF::move(job));
+        return enqueueCryptoJobPromise(global_object, context.value, WTF::move(job));
     }
 
     if (WTF::equalIgnoringASCIICase(algorithm_name, "ECDSA"_s)) {
@@ -328,7 +328,7 @@ JSC_DEFINE_HOST_FUNCTION(subtleVerify, (JSC::JSGlobalObject * global_object, JSC
                 [pkey, hash, signature_input = WTF::move(signature_input), data = WTF::move(data)](bool& out) mutable {
                     return ecdsaVerifyNative(pkey.get(), hash, signature_input.span(), data.span(), out);
                 }));
-        return enqueueCryptoJobPromise(global_object, scope, context.value, WTF::move(job));
+        return enqueueCryptoJobPromise(global_object, context.value, WTF::move(job));
     }
 
     auto rsa_algorithm = rsaAlgorithmFromName(algorithm_name);
@@ -373,7 +373,7 @@ JSC_DEFINE_HOST_FUNCTION(subtleVerify, (JSC::JSGlobalObject * global_object, JSC
             return rsaVerifyDigestNative(
                 pkey.get(), hash, signature_input.span(), data.span(), padding, pss_salt_length, out);
         }));
-    return enqueueCryptoJobPromise(global_object, scope, context.value, WTF::move(job));
+    return enqueueCryptoJobPromise(global_object, context.value, WTF::move(job));
 }
 
 } // namespace Collo::HostFunctions

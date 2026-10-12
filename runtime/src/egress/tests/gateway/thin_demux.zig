@@ -19,7 +19,6 @@ const ipc = @import("collo_ipc");
 var test_decode_scratch: ipc.WorkerEgressDecodeScratch = .{};
 
 const body_credit = egress.core.body_credit;
-const decompress = egress.core.decompress;
 const encoded_body = egress.core.encoded_body;
 const fetch_body = egress.core.fetch_body;
 
@@ -43,9 +42,6 @@ test "thin demux body pool block size matches the h2 default max frame size" {
 }
 
 test "thin demux ships encoded chunks through a real endpoint and retires on release" {
-    if (!decompress.supportsZlib())
-        return error.SkipZigTest;
-
     var fixture = try EndpointFixture.init();
     defer fixture.deinit();
 

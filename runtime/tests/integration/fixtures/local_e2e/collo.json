@@ -10,6 +10,16 @@
 // api/token.js and api/upload.js answer with a token drawn once per worker
 // process, which tells the worker tests whether two responses came from one
 // worker.
+//
+// No definition here grants `network`, so no worker of this file has an
+// egress session and the server spawns no gateway for it. The tests that
+// fetch write a configuration whose grant names their origin's run-time
+// address (local_server/network.zig, `configText`), and use the handlers
+// api/fetch_gzip.js, api/network_fetch.js and api/network_no_grant.js. The
+// tests of a definition's limits (local_server/limits.zig) and of workers that
+// retire under load (local_server/workers.zig) write theirs with the same
+// template, around api/finalization_spin.js, api/memory_grow.js and
+// api/boot_rejects.js beside the handlers of this file.
 {
   "globalSettings": {
     "limits": { "memoryMiB": 1024, "timeoutMs": 15000 }
@@ -40,9 +50,6 @@
     "large-response": {
       "routes": { "/large-response": { "entry": "./api/large_response.js" } }
     },
-    "fetch-gzip": {
-      "routes": { "/fetch-gzip": { "entry": "./api/fetch_gzip.js" } }
-    },
     "todos": {
       "routes": { "/api/todos": { "entry": "./api/todos.js" } }
     },
@@ -65,6 +72,13 @@
     "upload": {
       "routes": { "/upload": { "entry": "./api/upload.js" } },
       "settings": { "limits": { "concurrency": 2 } }
+    },
+    // Streamed bodies (local_server/streams.zig): a request that follows a
+    // stream on its connection takes the worker's other slot while the lane
+    // still drains the first one's completion.
+    "stream": {
+      "routes": { "/stream": { "entry": "./api/stream.js" } },
+      "settings": { "limits": { "concurrency": 2, "timeoutMs": 10000 } }
     },
     // Two routes on one entry, each with its own binding, served by one
     // worker: in a realm each (the default), or in one shared realm.

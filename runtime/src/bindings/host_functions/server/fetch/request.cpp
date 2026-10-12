@@ -39,7 +39,6 @@
 #include <JavaScriptCore/ObjectConstructor.h>
 #include <JavaScriptCore/SlotVisitorMacros.h>
 #include <wtf/FastMalloc.h>
-#include <wtf/Locker.h>
 #include <wtf/RefCounted.h>
 #include <wtf/StdLibExtras.h>
 #include <wtf/URL.h>
@@ -379,8 +378,10 @@ namespace {
 
             WTF::Vector<ColloNameValuePair> pairs;
             const auto& data = this->data();
-            pairs.reserveInitialCapacity(static_cast<unsigned>(
-                std::min(data.headers.size(), static_cast<size_t>(std::numeric_limits<unsigned>::max()))));
+            if (!pairs.tryReserveInitialCapacity(data.headers.size())) {
+                JSC::throwOutOfMemoryError(global_object, scope);
+                return nullptr;
+            }
             for (auto& header : data.headers) {
                 pairs.append({
                     rawSlice(data, header.name),
@@ -540,7 +541,7 @@ namespace {
             }
 
             if (request->body().source() == BodyState::Source::RequestLazy) {
-                if (!request->body().beginStreamRead(global_object, scope, "Body already used"_s))
+                if (!request->beginStreamRead(global_object, scope, "Body already used"_s))
                     return {};
                 RETURN_IF_EXCEPTION(scope, {});
                 m_static_delivered = true;
@@ -548,7 +549,7 @@ namespace {
             }
 
             WTF::RefPtr<ColloSharedBytes> bytes;
-            if (!request->body().consumeToSharedBytes(global_object, scope, "Body already used"_s, bytes))
+            if (!request->consumeToSharedBytes(global_object, scope, "Body already used"_s, bytes))
                 return {};
             RETURN_IF_EXCEPTION(scope, {});
             m_static_delivered = true;
@@ -565,7 +566,7 @@ namespace {
             auto* request = m_request.get();
             if (request) {
                 auto scope = DECLARE_THROW_SCOPE(global_object->vm());
-                if (!request->body().cancelStream(global_object, scope, "Body already used"_s))
+                if (!request->cancelStream(global_object, scope, "Body already used"_s))
                     return rejectedTypeError(global_object, scope, "Body already used"_s);
             }
             m_static_delivered = true;
@@ -677,35 +678,13 @@ namespace {
     }
 
     // The DOM Standard's "create a dependent abort signal" from one signal, which the Fetch Standard's Request
-    // constructor and clone() use: the result aborts with the reason of `source` when `source` aborts. It follows
-    // AbortSignal.any in abort.cpp for a single input.
-    // FIXME: The results of addDependentSignal and addSourceSignal are ignored, so after an allocation failure the
-    // returned signal does not follow `source`; AbortSignal.any throws an OutOfMemoryError instead.
+    // constructor and clone() use: the result aborts with the reason of `source` when `source` aborts. Returns null
+    // with an exception thrown into `scope` when the links cannot be stored.
     static JSColloAbortSignal* makeFollowingAbortSignal(
-        JSC::VM& vm, Collo::GlobalObject* collo_global, JSColloAbortSignal* source)
+        JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSColloAbortSignal* source)
     {
-        if (source->aborted()) {
-            // An already-aborted source produces a signal that is aborted at birth;
-            // no abort event fires and no listener can be registered before return.
-            return JSColloAbortSignal::create(
-                vm, collo_global, collo_global->abortSignalStructure(), /* aborted */ true, source->reason());
-        }
-
-        auto* result = JSColloAbortSignal::create(vm, collo_global, collo_global->abortSignalStructure());
-        // A dependent source contributes its own sources, so dependencies never chain, as in AbortSignal.any.
-        const auto& source_signals = source->sourceSignals();
-        if (source_signals.isEmpty()) {
-            source->addDependentSignal(vm, result);
-            result->addSourceSignal(vm, source);
-        } else {
-            for (auto& source_signal : source_signals) {
-                if (auto* actual_source = source_signal.get()) {
-                    actual_source->addDependentSignal(vm, result);
-                    result->addSourceSignal(vm, actual_source);
-                }
-            }
-        }
-        return result;
+        JSColloAbortSignal* const inputs[] = { source };
+        return createDependentAbortSignal(global_object, scope, inputs);
     }
 
     static JSColloRequest* createPublicRequest(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope,
@@ -823,14 +802,18 @@ namespace {
             // aborts it with the same reason.
             auto* input_signal = input_request->signal(global_object);
             RETURN_IF_EXCEPTION(scope, nullptr);
-            signal = makeFollowingAbortSignal(vm, collo_global, input_signal);
+            signal = makeFollowingAbortSignal(global_object, scope, input_signal);
+            RETURN_IF_EXCEPTION(scope, nullptr);
             signal_controls_fetch = input_request->signalControlsFetch();
         } else {
             signal = JSColloAbortSignal::create(vm, collo_global, collo_global->abortSignalStructure());
         }
 
-        return JSColloRequest::create(vm, collo_global, WTF::move(data), WTF::move(body), headers, signal,
+        auto* request = JSColloRequest::create(vm, collo_global, WTF::move(data), WTF::move(body), headers, signal,
             signal_controls_fetch, WTF::move(options), structure);
+        if (!request)
+            JSC::throwOutOfMemoryError(global_object, scope);
+        return request;
     }
 
     JSC_DEFINE_HOST_FUNCTION(
@@ -871,14 +854,6 @@ namespace {
         JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSColloAbortSignal* signal, uint64_t fetch_id)
     {
         auto& vm = global_object->vm();
-        if (signal->eventTargetData().activeListenerCount() >= WebApiEventTargetMaxListeners) {
-            Runtime::cancelFetch(global_object, fetch_id, signal->reason());
-            auto* exception = createDOMException(
-                global_object, DOMExceptionCode::QuotaExceededError, "AbortSignal listener limit exceeded"_s);
-            JSC::throwException(global_object, scope, exception);
-            return nullptr;
-        }
-
         auto* callback = JSC::JSFunction::create(
             vm, global_object, 0, "fetch abort"_s, fetchAbortCancelCallback, JSC::ImplementationVisibility::Public);
         // A JS number holds integers exactly only up to 2^53, so the 64-bit fetch id travels as two 32-bit halves.
@@ -888,18 +863,28 @@ namespace {
             JSC::jsNumber(static_cast<uint32_t>(fetch_id >> 32)),
             static_cast<unsigned>(JSC::PropertyAttribute::DontEnum));
 
+        // The record counts toward the signal's listener cap like any listener, so its removal at the fetch's end
+        // uncounts only what was counted.
         WebApiEventListenerRecord record;
         record.type = "abort"_s;
-        record.callback.set(vm, signal, callback);
+        record.callback.setWithoutWriteBarrier(callback);
         record.order = signal->eventTargetData().allocateListenerOrder();
         record.once = true;
-        {
-            // The concurrent GC marker walks the listener buffer, so it grows under the signal's cell lock, as in
-            // event_target.cpp.
-            WTF::Locker locker { signal->cellLock() };
-            signal->eventTargetData().listeners().append(WTF::move(record));
+        switch (signal->eventTargetData().appendListener(vm, signal, WTF::move(record))) {
+        case WebApiEventTargetData::AppendResult::Appended:
+            return callback;
+        case WebApiEventTargetData::AppendResult::LimitReached:
+            Runtime::cancelFetch(global_object, fetch_id, signal->reason());
+            JSC::throwException(global_object, scope,
+                createDOMException(
+                    global_object, DOMExceptionCode::QuotaExceededError, "AbortSignal listener limit exceeded"_s));
+            return nullptr;
+        case WebApiEventTargetData::AppendResult::OutOfMemory:
+            Runtime::cancelFetch(global_object, fetch_id, signal->reason());
+            JSC::throwOutOfMemoryError(global_object, scope);
+            return nullptr;
         }
-        return callback;
+        return nullptr;
     }
 
     // Idempotent, so every terminal path may call it, more than once included: removeMatchingListener skips removed
@@ -970,7 +955,7 @@ JSC::EncodedJSValue scheduleFetchFromRequest(JSC::JSGlobalObject* global_object,
     RETURN_IF_EXCEPTION(scope, {});
 
     WTF::Vector<uint8_t> body;
-    if (!request->body().consumeToBytes(global_object, scope, "Body already used"_s, body))
+    if (!request->consumeToBytes(global_object, scope, "Body already used"_s, body))
         return {};
     RETURN_IF_EXCEPTION(scope, {});
 
@@ -1279,56 +1264,61 @@ namespace {
         auto* collo_global = uncheckedDowncast<Collo::GlobalObject>(global_object);
         auto* source_signal = request->signal(global_object);
         RETURN_IF_EXCEPTION(scope, {});
-        auto* cloned_signal = makeFollowingAbortSignal(vm, collo_global, source_signal);
+        auto* cloned_signal = makeFollowingAbortSignal(global_object, scope, source_signal);
+        RETURN_IF_EXCEPTION(scope, {});
         return JSValue::encode(JSColloRequest::createWithStorage(vm, collo_global, WTF::move(data), WTF::move(body),
             cloned_headers, cloned_signal, request->signalControlsFetch(), WTF::move(options)));
     }
 
-    static bool makeRequestData(const ColloRequestInit& init, RequestData& data)
+    // Copies every string of `init` into `data`. A string that is not borrowable or sizes that overflow are
+    // COLLO_STATUS_INVALID_ARGUMENT; a failed allocation is COLLO_STATUS_OUT_OF_MEMORY. The storage and both pair
+    // vectors are reserved whole first, so the copies below never grow them.
+    static ColloStatus makeRequestData(const ColloRequestInit& init, RequestData& data)
     {
         size_t storage_size = 0;
         if (!addRawStringLen(storage_size, init.method) || !addRawStringLen(storage_size, init.path)
             || !addRawStringLen(storage_size, init.raw_query) || !addRawStringLen(storage_size, init.authority))
-            return false;
+            return COLLO_STATUS_INVALID_ARGUMENT;
         for (size_t index = 0; index < init.headers_len; index++) {
             if (!addRawStringLen(storage_size, init.headers[index].name)
                 || !addRawStringLen(storage_size, init.headers[index].value))
-                return false;
+                return COLLO_STATUS_INVALID_ARGUMENT;
         }
         for (size_t index = 0; index < init.params_len; index++) {
             if (!addRawStringLen(storage_size, init.params[index].name)
                 || !addRawStringLen(storage_size, init.params[index].value))
-                return false;
+                return COLLO_STATUS_INVALID_ARGUMENT;
         }
         if (storage_size > std::numeric_limits<unsigned>::max())
-            return false;
+            return COLLO_STATUS_INVALID_ARGUMENT;
         if (init.headers_len > std::numeric_limits<unsigned>::max()
             || init.params_len > std::numeric_limits<unsigned>::max())
-            return false;
+            return COLLO_STATUS_INVALID_ARGUMENT;
 
-        data.storage.reserveInitialCapacity(static_cast<unsigned>(storage_size));
-        data.headers.reserveInitialCapacity(static_cast<unsigned>(init.headers_len));
-        data.params.reserveInitialCapacity(static_cast<unsigned>(init.params_len));
+        if (!data.storage.tryReserveInitialCapacity(storage_size)
+            || !data.headers.tryReserveInitialCapacity(init.headers_len)
+            || !data.params.tryReserveInitialCapacity(init.params_len))
+            return COLLO_STATUS_OUT_OF_MEMORY;
         if (!appendRawString(data, init.method, data.method) || !appendRawString(data, init.path, data.path)
             || !appendRawString(data, init.raw_query, data.raw_query)
             || !appendRawString(data, init.authority, data.authority))
-            return false;
+            return COLLO_STATUS_INVALID_ARGUMENT;
         data.identity = init.identity;
         for (size_t index = 0; index < init.headers_len; index++) {
             RequestPair pair;
             if (!appendRawString(data, init.headers[index].name, pair.name)
                 || !appendRawString(data, init.headers[index].value, pair.value))
-                return false;
+                return COLLO_STATUS_INVALID_ARGUMENT;
             data.headers.append(pair);
         }
         for (size_t index = 0; index < init.params_len; index++) {
             RequestPair pair;
             if (!appendRawString(data, init.params[index].name, pair.name)
                 || !appendRawString(data, init.params[index].value, pair.value))
-                return false;
+                return COLLO_STATUS_INVALID_ARGUMENT;
             data.params.append(pair);
         }
-        return true;
+        return COLLO_STATUS_OK;
     }
 
 } // namespace
@@ -1397,13 +1387,15 @@ extern "C" ColloStatus collo_request_new(
     auto scope = DECLARE_THROW_SCOPE(*vm->vm);
 
     RequestData data;
-    if (!makeRequestData(*init, data))
-        return COLLO_STATUS_INVALID_ARGUMENT;
+    if (auto status = makeRequestData(*init, data); status != COLLO_STATUS_OK)
+        return status;
 
     auto* object = JSColloRequest::create(
         *vm->vm, realm->global_object, WTF::move(data), PendingBody { BodyState::requestLazy(init->identity) });
     if (auto status = consumeExceptionStatus(vm, scope, out_exception); status != COLLO_STATUS_OK)
         return status;
+    if (!object)
+        return COLLO_STATUS_OUT_OF_MEMORY;
     return Collo::makeValueHandle(vm, object, out_value);
 }
 

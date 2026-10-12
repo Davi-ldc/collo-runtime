@@ -1,37 +1,28 @@
-//! Narrow zstd C ABI binding used by module-pack artifacts.
+//! Zstandard: the one Zig declaration of the part of its API Collo calls,
+//! one-shot compression and decompression. The declarations are translated
+//! from the pinned tree's `zstd.h` (`runtime/deps/zstd.version`), and the
+//! library is compiled from the same tree into every artifact that links
+//! this module's users (`runtime/build/codecs.zig`).
+
 const std = @import("std");
+const c = @import("zstd_h");
 
 // Zero-length sentinel: only ever returned for an empty slice, and zstd never
 // writes to a 0-capacity dst, so the mutable boundary can @constCast it safely.
 const empty_byte = [_]u8{0};
 
-extern "c" fn ZSTD_compressBound(srcSize: usize) usize;
-extern "c" fn ZSTD_compress(
-    dst: [*]u8,
-    dstCapacity: usize,
-    src: [*]const u8,
-    srcSize: usize,
-    compressionLevel: c_int,
-) usize;
-extern "c" fn ZSTD_decompress(
-    dst: [*]u8,
-    dstCapacity: usize,
-    src: [*]const u8,
-    compressedSize: usize,
-) usize;
-extern "c" fn ZSTD_isError(code: usize) c_uint;
-extern "c" fn ZSTD_getErrorName(code: usize) [*:0]const u8;
-
 pub fn compressBound(src_size: usize) usize {
-    return ZSTD_compressBound(src_size);
+    return c.ZSTD_compressBound(src_size);
 }
 
+/// Compresses all of `src` into `dst` at `level` and returns the compressed
+/// length; fails with `error.ZstdFailed` when `dst` is too small.
 pub fn compress(
     dst: []u8,
     src: []const u8,
     level: c_int,
 ) !usize {
-    const written = ZSTD_compress(
+    const written = c.ZSTD_compress(
         mutablePointer(dst),
         dst.len,
         constPointer(src),
@@ -41,11 +32,14 @@ pub fn compress(
     return check(written);
 }
 
+/// Decompresses one frame from `src` into `dst` and returns the decompressed
+/// length; fails with `error.ZstdFailed` on corrupt input or when `dst` is
+/// too small.
 pub fn decompress(
     dst: []u8,
     src: []const u8,
 ) !usize {
-    const written = ZSTD_decompress(
+    const written = c.ZSTD_decompress(
         mutablePointer(dst),
         dst.len,
         constPointer(src),
@@ -55,9 +49,9 @@ pub fn decompress(
 }
 
 fn check(result: usize) !usize {
-    if (ZSTD_isError(result) == 0)
+    if (c.ZSTD_isError(result) == 0)
         return result;
-    std.log.warn("zstd failure: {s}", .{std.mem.span(ZSTD_getErrorName(result))});
+    std.log.warn("zstd failure: {s}", .{std.mem.span(c.ZSTD_getErrorName(result))});
     return error.ZstdFailed;
 }
 

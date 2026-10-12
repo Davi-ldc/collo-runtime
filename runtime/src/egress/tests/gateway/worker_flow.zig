@@ -4,29 +4,37 @@
 //!
 //! A packet that does not decode removes the worker. A fetch start is admitted only under an
 //! egress token that verifies under the key of the gateway's hello, names the presenting
-//! session, has not expired, names an entry of the hello's policy table, fits the session's and
-//! the cell's active-fetch caps and has a fetch left in its budget, checked in that order. Each
-//! refusal queues an error packet. A forged token, another session's token and a spent budget
-//! count an invalid command; an expired token and an unknown policy id do not, since an honest
-//! worker can race its deadline and only the server mints policy ids. A failure after admission
-//! took the fetch gives it back to the budget, unless the worker caused it, which strikes. The
-//! request id, generation and deadline the engine gets come from the verified token, since the
-//! start names no request.
-//! Invalid commands past the window's budget remove the worker, and an honest worker still
-//! holding an earlier gateway's tokens stays below it. Cancels and body releases for unknown
-//! fetches count as invalid, and upload assembly refuses bad lengths, duplicate identities, ledger
-//! mismatches and bad handles, and keeps its buffers out of the shard's memory count whether the
-//! upload reaches the engine or not. The budget rules are covered in `budgets.zig`, the hello and
-//! `request_ended` in `control_flow.zig`, the token in `common/tests/ipc/egress_token.zig`, and
-//! the router, invalid-command window and backpressure state these mixins update in `runtime.zig`.
-//! Lane: egress-gateway-test.
+//! session, has not expired, names a policy of the hello's image, fits the session's and the
+//! cell's active-fetch caps, has a shape within the limits, fits the session's pooled upload bytes
+//! in flight and has a fetch left in its budget, checked in that order. Each refusal queues an
+//! error packet. A forged token, another session's token, a shape past the limits and a spent
+//! budget count an invalid command; an expired token, an unknown policy id and full upload bytes
+//! do not, since an honest worker can race its deadline, only the server mints policy ids and a
+//! worker cannot see when an earlier upload retired. A policy that grants nothing, policy 0
+//! included, is admitted, and the transport fails its fetch without a strike. A failure after
+//! admission took the fetch gives it back to the budget, unless the worker caused it, which
+//! strikes. The request id, generation, deadline and network policy the engine gets come from the
+//! verified token, since the start names no request. Invalid commands past the window's budget
+//! remove the worker, and an honest worker still holding an earlier gateway's tokens stays below
+//! it. Cancels and body releases for unknown fetches count as invalid. Upload assembly refuses
+//! duplicate identities, ledger mismatches and bad handles; it takes its buffers from the
+//! gateway's upload allocator, so a full upload budget fails one start, and never from the
+//! shard's; it hands the response cap admission resolved to the fetch's task; and an upload still
+//! assembling at its token's deadline fails and frees its buffer. The budget rules are covered in
+//! `budgets.zig`, the hello and `request_ended` in `control_flow.zig`, the transport's denial in
+//! `engine.zig`, the token in `common/tests/ipc/egress_token.zig`, and the router,
+//! invalid-command window and backpressure state these mixins update in `runtime.zig`. Lane:
+//! egress-gateway-test.
 
 const std = @import("std");
 const gateway = @import("collo_egress_gateway");
 const ipc = @import("collo_ipc");
 const limits = @import("collo_limits");
+const network = @import("collo_egress_client").network;
 
+const engine_test = @import("support/engine.zig");
 const loop_support = @import("support/loop.zig");
+const policy_image = @import("support/policy_image.zig");
 
 const policy = gateway.policy;
 const sessions = gateway.sessions;
@@ -83,11 +91,11 @@ test "admission: a fetch under a valid token reaches the engine with the token's
 
     try harness.expectAdmitted(.{ .fetch_id = 9, .body_id = 10, .token = token });
 
-    // Admission recorded the route under the token's policy entry and both counts once.
+    // Admission recorded the route under the token's policy and both counts once.
     const route = harness.loop.router.routeForBody(harness.session_id, 9, 10) orelse
         return error.MissingRoute;
     try std.testing.expectEqual(@as(usize, 0), route.record.shard_index);
-    try std.testing.expectEqual(policy.public_https_id, route.record.policy_id);
+    try std.testing.expectEqual(policy_image.public_https_id, route.record.policy_id);
     try std.testing.expectEqual(@as(usize, 1), harness.loop.activeFetchesForWorker(harness.session_id));
     try std.testing.expectEqual(@as(usize, 1), harness.loop.activeFetchesForSecurityCell(security_cell_id));
 
@@ -186,7 +194,7 @@ test "admission: a tagged token of another version or kind fails as an invalid t
 }
 
 test "admission: a gateway that has not received its hello admits no token" {
-    var harness = try Harness.init(.{ .hello_table = null });
+    var harness = try Harness.init(.{ .hello = false });
     defer harness.deinit();
     try std.testing.expect(harness.helloKey().isZero());
 
@@ -228,13 +236,64 @@ test "admission: a token naming a policy the hello did not carry fails without a
     @import("root").expect_log_errors = 1;
     var harness = try Harness.init(.{});
     defer harness.deinit();
-    const unknown_policy = harness.token(.{ .policy_id = policy.public_https_id + 1 });
+    const unknown_policy = harness.token(.{ .policy_id = policy_image.standard_policy_count });
     try harness.expectRefused(
         .{ .fetch_id = 1, .body_id = 1, .token = unknown_policy },
         "egress policy unknown",
         .no_strike,
     );
     try std.testing.expectEqual(@as(?u32, null), harness.budgetRemaining(request_id, request_generation));
+}
+
+test "admission: a fetch under policy 0 is admitted and fails in the transport without a strike" {
+    var harness = try Harness.init(.{});
+    defer harness.deinit();
+    try harness.startShardsDelivering();
+    const token = harness.token(.{ .policy_id = network.table.deny_all_id });
+
+    try harness.expectAdmitted(.{ .fetch_id = 1, .body_id = 2, .token = token });
+    try std.testing.expectEqual(@as(?u32, 15), harness.budgetRemaining(request_id, request_generation));
+
+    // The transport refuses the policy that grants nothing before DNS, and the denial reaches the
+    // worker as the fetch's error.
+    try harness.collectUntilRetired(1);
+    var host_buffer: [loop_support.loopback_host_bytes_max]u8 = undefined;
+    var text_buffer: [network.grant.denial_bytes_max]u8 = undefined;
+    var text: std.Io.Writer = .fixed(&text_buffer);
+    try network.writeDenial(&text, .{
+        .scheme = .https,
+        .host = loop_support.loopbackHost(&host_buffer, 1),
+        .port = loop_support.loopback_port,
+    }, .no_grant);
+    try harness.expectQueuedFetchErrorWithCause(1, 2, text.buffered(), .network_denied);
+    try harness.expectNoMoreCompletionPackets();
+    try std.testing.expectEqual(@as(u32, 0), harness.worker().invalid_commands.count);
+    try std.testing.expectEqual(@as(usize, 0), harness.loop.activeFetchesForWorker(harness.session_id));
+}
+
+test "admission: two tokens of one session with policies that differ land on pool keys that differ" {
+    var harness = try Harness.init(.{});
+    defer harness.deinit();
+    try harness.startShards();
+
+    const policy_ids = [_]network.PolicyId{ policy_image.public_https_id, policy_image.public_http_and_https_id };
+    for (policy_ids, 1..) |policy_id, fetch_id| {
+        try harness.expectAdmitted(.{
+            .fetch_id = fetch_id,
+            .body_id = fetch_id,
+            .token = harness.token(.{ .policy_id = policy_id, .request_id = 20 + fetch_id }),
+        });
+        const route = harness.loop.router.routeForFetch(harness.session_id, fetch_id) orelse
+            return error.MissingRoute;
+        try std.testing.expectEqual(policy_id, route.record.policy_id);
+    }
+    // A pool key is the session's security cell and its policy's isolation id, which a
+    // resubmission finds again through the policy id its route records.
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &harness.isolationId(policy_ids[0]),
+        &harness.isolationId(policy_ids[1]),
+    ));
 }
 
 test "admission: a token whose budget is spent fails and strikes" {
@@ -279,16 +338,32 @@ test "admission: a failure after the budget was taken gives the fetch back witho
     try std.testing.expectEqual(@as(?u32, 0), harness.budgetRemaining(request_id, request_generation));
 }
 
+test "admission: a start whose shape breaks the limits strikes before it takes from the budget" {
+    var harness = try Harness.init(.{});
+    defer harness.deinit();
+    const token = harness.token(.{ .budget = 2 });
+
+    // A response limit above the gateway's is what the worker asked for.
+    try harness.expectRefused(
+        .{ .fetch_id = 1, .body_id = 1, .token = token, .max_body_bytes = std.math.maxInt(u64) },
+        "EgressGatewayResponseBodyLimitExceeded",
+        .strike,
+    );
+    try std.testing.expectEqual(@as(?u32, null), harness.budgetRemaining(request_id, request_generation));
+    try std.testing.expectEqual(@as(usize, 0), harness.loop.activeFetchesForWorker(harness.session_id));
+}
+
 test "admission: a submit error the worker caused keeps the budget use and strikes" {
     var harness = try Harness.init(.{});
     defer harness.deinit();
     const token = harness.token(.{ .budget = 2 });
 
-    // A response limit above the gateway's is what the worker asked for, and the engine refuses
-    // it after admission took the fetch.
+    // The engine already runs a fetch of this identity that the router does not know, so its
+    // own identity check refuses the start after admission took the fetch.
+    try engine_test.injectActive(&harness.loop.shards.get(0).engine, harness.session_id, 1, 1);
     try harness.expectRefused(
-        .{ .fetch_id = 1, .body_id = 1, .token = token, .max_body_bytes = std.math.maxInt(u64) },
-        "EgressGatewayResponseBodyLimitExceeded",
+        .{ .fetch_id = 1, .body_id = 1, .token = token },
+        "EgressGatewayDuplicateFetchIdentity",
         .strike,
     );
     try std.testing.expectEqual(@as(?u32, 1), harness.budgetRemaining(request_id, request_generation));
@@ -331,7 +406,7 @@ test "admission: the deadline and the policy are checked before the caps, and th
         .no_strike,
     );
     try harness.expectRefused(
-        .{ .fetch_id = 2, .body_id = 2, .token = harness.token(.{ .policy_id = policy.public_https_id + 1 }) },
+        .{ .fetch_id = 2, .body_id = 2, .token = harness.token(.{ .policy_id = policy_image.standard_policy_count }) },
         "egress policy unknown",
         .no_strike,
     );
@@ -416,7 +491,7 @@ test "admission: a duplicate fetch identity refuses with a strike" {
     }, .{
         .shard_index = 0,
         .security_cell_id = security_cell_id,
-        .policy_id = policy.public_https_id,
+        .policy_id = policy_image.public_https_id,
     });
 
     try std.testing.expect(try harness.sendFetchStart(.{ .fetch_id = 7, .body_id = 8, .token = harness.token(.{}) }));
@@ -507,23 +582,171 @@ test "dispatch: a release-body for an unknown route is a strike, not a crash" {
     try std.testing.expectEqual(@as(u32, 1), worker.invalid_commands.count);
 }
 
-test "upload: registerPendingUpload rejects an empty or oversized announced body" {
-    var harness = try Harness.init(.{ .policy = .{ .max_request_body_bytes = 1024 } });
-    defer harness.deinit();
-    const worker = harness.worker();
-    const options = harness.uploadSubmitOptions(loop_support.live_deadline_ns);
-
+test "upload: the start's shape check refuses an empty or oversized announced body before any buffer exists" {
+    const limited = policy.Policy{ .max_request_body_bytes = 1024 };
     // The wire codec refuses an announced length of zero in both directions, so only a view
     // built here can reach this check.
     try std.testing.expectError(
         error.EgressGatewayRequestBodyLimitExceeded,
-        harness.loop.registerPendingUpload(worker, loop_support.pooledFetchView(1, 1, 0), 0, options),
+        gateway.engine.validateStart(loop_support.pooledFetchView(1, 1, 0), limited),
     );
-    // One byte over the policy's limit is refused before any buffer is allocated.
     try std.testing.expectError(
         error.EgressGatewayRequestBodyLimitExceeded,
-        harness.loop.registerPendingUpload(worker, loop_support.pooledFetchView(1, 1, 1025), 0, options),
+        gateway.engine.validateStart(loop_support.pooledFetchView(1, 1, 1025), limited),
     );
+    try std.testing.expectEqual(
+        limited.max_response_body_bytes,
+        try gateway.engine.validateStart(loop_support.pooledFetchView(1, 1, 1024), limited),
+    );
+
+    // Admission runs it before anything is taken: one byte over the limit strikes, takes nothing
+    // from the budget and allocates no buffer.
+    var harness = try Harness.init(.{ .policy = limited });
+    defer harness.deinit();
+    try harness.expectRefused(
+        .{ .fetch_id = 1, .body_id = 1, .token = harness.token(.{}), .pooled_body_len = 1025 },
+        "EgressGatewayRequestBodyLimitExceeded",
+        .strike,
+    );
+    try std.testing.expect(harness.pendingUpload(1) == null);
+    try std.testing.expectEqual(@as(u64, 0), harness.loop.upload_memory.liveBytes());
+    try std.testing.expectEqual(@as(?u32, null), harness.budgetRemaining(request_id, request_generation));
+}
+
+test "upload: a pooled start with a zero fetch id strikes at admission and assembles nothing" {
+    var harness = try Harness.init(.{});
+    defer harness.deinit();
+    // The wire codec carries a zero id, which names no fetch the worker could cancel or release.
+    try harness.expectRefused(
+        .{ .fetch_id = 0, .body_id = 5, .token = harness.token(.{}), .pooled_body_len = 32 },
+        "InvalidEgressGatewayFetchIdentity",
+        .strike,
+    );
+    try std.testing.expect(harness.pendingUpload(0) == null);
+    try std.testing.expectEqual(@as(u64, 0), harness.loop.upload_memory.liveBytes());
+    try std.testing.expectEqual(@as(?u32, null), harness.budgetRemaining(request_id, request_generation));
+}
+
+test "upload: a pooled fetch's response cap reaches its task, and one above the gateway's strikes" {
+    var harness = try Harness.init(.{});
+    defer harness.deinit();
+    try harness.startShards();
+    const worker = harness.worker();
+    const response_cap: u64 = 4096;
+
+    const payload = [_]u8{0x7a} ** 16;
+    try harness.expectAdmitted(.{
+        .fetch_id = 1,
+        .body_id = 2,
+        .token = harness.token(.{}),
+        .pooled_body_len = payload.len,
+        .max_body_bytes = response_cap,
+    });
+    const pending = harness.pendingUpload(1) orelse return error.MissingPendingUpload;
+    try std.testing.expectEqual(response_cap, pending.max_response_body_bytes);
+
+    const handle = try harness.writeUploadExtent(&payload);
+    var released = false;
+    try std.testing.expect(harness.loop.applyUploadChunk(worker, .{
+        .fetch_id = 1,
+        .upload_pool_offset = handle,
+        .len = payload.len,
+        .body_bytes_total = payload.len,
+    }, &released));
+    const fetch = harness.activeFetch(1, 2) orelse return error.MissingActiveFetch;
+    try std.testing.expectEqual(@as(?u64, response_cap), fetch.body.maxDecodedBytes());
+
+    // A cap above the gateway's is refused at admission, before any buffer exists.
+    try harness.expectRefused(
+        .{
+            .fetch_id = 3,
+            .body_id = 4,
+            .token = harness.token(.{}),
+            .pooled_body_len = payload.len,
+            .max_body_bytes = harness.loop.policy.max_response_body_bytes + 1,
+        },
+        "EgressGatewayResponseBodyLimitExceeded",
+        .strike,
+    );
+    try std.testing.expect(harness.pendingUpload(3) == null);
+}
+
+test "upload: pooled starts past the session's in-flight upload bytes are refused without a strike, and an ended upload returns its bytes" {
+    var harness = try Harness.init(.{});
+    defer harness.deinit();
+    const worker = harness.worker();
+    const largest = ipc.fetch_limits.request_body_pooled_bytes_max;
+    // Two of the largest bodies fill a session's bytes in flight.
+    try std.testing.expectEqual(2 * largest, ipc.fetch_limits.request_body_pooled_in_flight_bytes_max);
+
+    try harness.expectAdmitted(.{ .fetch_id = 1, .body_id = 1, .token = harness.token(.{}), .pooled_body_len = largest });
+    try harness.expectAdmitted(.{ .fetch_id = 2, .body_id = 2, .token = harness.token(.{}), .pooled_body_len = largest });
+    try std.testing.expectEqual(@as(u64, 2 * largest), worker.upload_bytes_in_flight);
+    try harness.expectRefused(
+        .{ .fetch_id = 3, .body_id = 3, .token = harness.token(.{}), .pooled_body_len = 1 },
+        "egress upload bytes in flight exceeded",
+        .no_strike,
+    );
+    // The refusal took nothing from the budget either.
+    try std.testing.expectEqual(@as(?u32, 14), harness.budgetRemaining(request_id, request_generation));
+
+    // A cancel retires the first upload's route, which returns its bytes.
+    const cancel = ipc.EgressCancel.init(1, 0);
+    try std.testing.expect(harness.loop.handleWorkerPacket(worker, std.mem.asBytes(&cancel)));
+    try harness.expectQueuedAbortAck(1, 1);
+    try std.testing.expectEqual(@as(u64, largest), worker.upload_bytes_in_flight);
+    try std.testing.expect(harness.pendingUpload(1) == null);
+    try harness.expectAdmitted(.{ .fetch_id = 4, .body_id = 4, .token = harness.token(.{}), .pooled_body_len = 1 });
+    try std.testing.expectEqual(@as(u32, 0), worker.invalid_commands.count);
+}
+
+test "upload: an upload still assembling at its token's deadline fails without a strike and frees its buffer" {
+    var harness = try Harness.init(.{});
+    defer harness.deinit();
+    const worker = harness.worker();
+    const deadline = loop_support.live_deadline_ns - 3;
+
+    try harness.expectAdmitted(.{
+        .fetch_id = 1,
+        .body_id = 2,
+        .token = harness.token(.{ .budget = 4, .deadline_monotonic_ns = deadline }),
+        .pooled_body_len = 64,
+    });
+    try std.testing.expectEqual(@as(u64, 64), harness.loop.upload_memory.liveBytes());
+    try std.testing.expectEqual(@as(?u32, 3), harness.budgetRemaining(request_id, request_generation));
+
+    // Before its deadline a pass leaves the upload alone.
+    harness.loop.expirePendingUploads(deadline - 1);
+    try std.testing.expect(harness.pendingUpload(1) != null);
+    try harness.expectNoMoreCompletionPackets();
+
+    harness.loop.expirePendingUploads(deadline);
+    try harness.expectQueuedFetchError(1, 2, "egress upload deadline exceeded");
+    try harness.expectNoMoreCompletionPackets();
+    try std.testing.expectEqual(@as(u32, 0), worker.invalid_commands.count);
+    try std.testing.expect(harness.pendingUpload(1) == null);
+    try std.testing.expect(harness.loop.router.routeForFetch(harness.session_id, 1) == null);
+    try std.testing.expectEqual(@as(u64, 0), harness.loop.upload_memory.liveBytes());
+    try std.testing.expectEqual(@as(u64, 0), worker.upload_bytes_in_flight);
+    try std.testing.expectEqual(@as(?u32, 4), harness.budgetRemaining(request_id, request_generation));
+}
+
+test "upload: a full gateway upload budget refuses the next pooled start without a strike" {
+    var harness = try Harness.init(.{});
+    defer harness.deinit();
+    harness.loop.upload_memory.setBudget(64);
+
+    try harness.expectAdmitted(.{ .fetch_id = 1, .body_id = 1, .token = harness.token(.{}), .pooled_body_len = 64 });
+    try harness.expectRefused(
+        .{ .fetch_id = 2, .body_id = 2, .token = harness.token(.{}), .pooled_body_len = 1 },
+        "OutOfMemory",
+        .no_strike,
+    );
+    // The refused fetch went back to the budget and holds no buffer or upload bytes.
+    try std.testing.expectEqual(@as(?u32, 15), harness.budgetRemaining(request_id, request_generation));
+    try std.testing.expect(harness.pendingUpload(2) == null);
+    try std.testing.expectEqual(@as(u64, 64), harness.loop.upload_memory.liveBytes());
+    try std.testing.expectEqual(@as(u64, 64), harness.worker().upload_bytes_in_flight);
 }
 
 test "upload: a duplicate pending-upload identity is rejected" {
@@ -531,12 +754,13 @@ test "upload: a duplicate pending-upload identity is rejected" {
     defer harness.deinit();
     const worker = harness.worker();
     const options = harness.uploadSubmitOptions(loop_support.live_deadline_ns);
+    const response_cap = harness.loop.policy.max_response_body_bytes;
 
-    try harness.loop.registerPendingUpload(worker, loop_support.pooledFetchView(5, 6, 32), 0, options);
+    try harness.loop.registerPendingUpload(worker, loop_support.pooledFetchView(5, 6, 32), 0, options, response_cap);
     // The same session and fetch id while the first upload still assembles can only be forged.
     try std.testing.expectError(
         error.EgressGatewayDuplicateFetchIdentity,
-        harness.loop.registerPendingUpload(worker, loop_support.pooledFetchView(5, 6, 32), 0, options),
+        harness.loop.registerPendingUpload(worker, loop_support.pooledFetchView(5, 6, 32), 0, options, response_cap),
     );
 }
 
@@ -550,6 +774,7 @@ test "upload: a chunk whose running total mismatches the ledger fails the upload
         loop_support.pooledFetchView(7, 8, 32),
         0,
         harness.uploadSubmitOptions(loop_support.live_deadline_ns),
+        harness.loop.policy.max_response_body_bytes,
     );
     const handle = try harness.writeUploadExtent(&[_]u8{0xab} ** 32);
 
@@ -583,6 +808,7 @@ test "upload: an unborrowable pool handle removes the worker" {
         loop_support.pooledFetchView(9, 10, 32),
         0,
         harness.uploadSubmitOptions(loop_support.live_deadline_ns),
+        harness.loop.policy.max_response_body_bytes,
     );
     // Handle 0 never names a published extent. A handle the pool rejects means corrupt shared
     // state, so `applyUploadChunk` returns false and the worker is removed.

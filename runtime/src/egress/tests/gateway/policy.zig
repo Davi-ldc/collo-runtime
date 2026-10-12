@@ -1,102 +1,63 @@
-//! The gateway's limits and network policies (`egress/gateway/policy.zig`): the table the hello
-//! carries and its lookup by a token's policy id, the `public_https` entry every route has until
-//! the configuration accepts `network`, the isolation id of each entry, which changes with the
-//! entry's id, its flags and the gateway's limits, the limits' own identity over every field, and
-//! limits a worker sends that cannot raise the gateway's. Admission, which looks a verified
-//! token's policy up and refuses an id past the table, is covered in `worker_flow.zig`. Lane:
-//! egress-gateway-test.
+//! The gateway's limits (`egress/gateway/policy.zig`): the isolation id of each policy of the
+//! hello's image, which changes with the policy's id, with the image and with the gateway's
+//! limits, the limits' own identity over every field, and limits a worker sends that cannot raise
+//! the gateway's. The image's layout and its policies are covered in `common/tests/network/`,
+//! their lookup by a verified token's policy id in `control_flow.zig` and admission, which refuses
+//! an id past the table, in `worker_flow.zig`. Lane: egress-gateway-test.
 
 const std = @import("std");
 const gateway = @import("collo_egress_gateway");
 const limits = @import("collo_limits");
 const ipc = @import("collo_ipc");
+const network = @import("collo_egress_client").network;
+
+const policy_image = @import("support/policy_image.zig");
 
 const policy = gateway.policy;
 
-test "the single table holds public_https as entry 0 and nothing past it" {
-    const table = policy.PolicyTable.single(policy.public_https);
-    try std.testing.expectEqual(@as(u16, 0), policy.public_https_id);
-    try std.testing.expectEqual(@as(u16, 1), table.count);
-    try std.testing.expectEqual(@as(usize, 1), table.slice().len);
+test "each policy of an image has its own isolation id, which changes with its id, its image and the limits" {
+    const standard = try policy_image.standard(std.testing.allocator);
+    defer std.testing.allocator.free(standard);
+    // Another image whose policy 1 grants exactly what the standard image's policy 1 grants, so
+    // only the digest tells the two apart.
+    const any_host = [_]network.Pattern{.{ .host = .any, .port = 0 }};
+    const name = [_]network.Pattern{.{ .host = .{ .name = "api.example.test" }, .port = 0 }};
+    const settings = [_]network.Setting{ .{ .allow = &any_host }, .{ .allow = &name } };
+    const first_members = [_]usize{0};
+    const second_members = [_]usize{1};
+    const policies = [_][]const usize{ &first_members, &second_members };
+    const other = try policy_image.encode(std.testing.allocator, &settings, &policies);
+    defer std.testing.allocator.free(other);
+    const standard_digest = policy_image.digest(standard);
+    const other_digest = policy_image.digest(other);
+    try std.testing.expect(!std.mem.eql(u8, &standard_digest, &other_digest));
 
-    const entry = table.lookup(policy.public_https_id) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(&table.slice()[0], entry);
-    // Any public host over HTTPS: private addresses and plain `http:` stay denied.
-    try std.testing.expectEqual(policy.PolicyKind.any_host, entry.kind);
-    try std.testing.expect(!entry.allow_private_networks);
-    try std.testing.expect(!entry.allow_http);
-
-    try std.testing.expect(table.lookup(1) == null);
-    try std.testing.expect(table.lookup(std.math.maxInt(u16)) == null);
-
-    // A gateway holds the empty table until its hello, and that table names no entry at all.
-    const empty: policy.PolicyTable = .{};
-    try std.testing.expect(empty.lookup(policy.public_https_id) == null);
-    try std.testing.expectEqual(@as(usize, 0), empty.slice().len);
-}
-
-test "a table looks up every id below its count and none past it" {
-    var table: policy.PolicyTable = .{ .count = 3 };
-    table.entries[0] = policy.public_https;
-    table.entries[1] = .{ .kind = .any_host, .allow_private_networks = true, .allow_http = false };
-    table.entries[2] = .{ .kind = .any_host, .allow_private_networks = false, .allow_http = true };
-    // A slot past the count holds an entry, which no lookup may return.
-    table.entries[3] = .{ .kind = .any_host, .allow_private_networks = true, .allow_http = true };
-
-    for (0..table.count) |index| {
-        const id: u16 = @intCast(index);
-        const entry = table.lookup(id) orelse return error.TestUnexpectedResult;
-        try std.testing.expectEqual(&table.entries[index], entry);
-    }
-    try std.testing.expect(table.lookup(3) == null);
-    try std.testing.expectEqual(@as(usize, 3), table.slice().len);
-    try std.testing.expectEqual(&table.entries[0], &table.slice()[0]);
-}
-
-test "a table holds an entry for every route the configuration can have" {
-    try std.testing.expectEqual(limits.server.routes_max, policy.policies_max);
-    try std.testing.expect(policy.policies_max <= std.math.maxInt(u16));
-
-    var table: policy.PolicyTable = .{ .count = policy.policies_max };
-    for (table.entries[0..policy.policies_max]) |*entry|
-        entry.* = policy.public_https;
-    const last: u16 = policy.policies_max - 1;
-    try std.testing.expectEqual(&table.entries[last], table.lookup(last).?);
-    try std.testing.expect(table.lookup(last + 1) == null);
-}
-
-test "each table entry has its own isolation id, which changes with its id, flags and limits" {
     const limits_id = policy.policyIsolationId(policy.production);
-    const base = policy.networkPolicyIsolationId(limits_id, policy.public_https_id, policy.public_https);
+    const base = policy.networkPolicyIsolationId(limits_id, standard_digest, policy_image.public_https_id);
 
     // Equal inputs give equal ids, so a fetch's pooled connections are found again.
-    try expectSameId(base, policy.networkPolicyIsolationId(limits_id, 0, policy.public_https));
+    try expectSameId(base, policy.networkPolicyIsolationId(limits_id, standard_digest, policy_image.public_https_id));
 
-    // Two entries of one table never share pools, even with equal flags.
-    try expectOtherId(base, policy.networkPolicyIsolationId(limits_id, 1, policy.public_https));
-    try expectOtherId(
-        policy.networkPolicyIsolationId(limits_id, 1, policy.public_https),
-        policy.networkPolicyIsolationId(limits_id, 2, policy.public_https),
-    );
-
-    const flag_variants = [_]policy.NetworkPolicy{
-        .{ .kind = .any_host, .allow_private_networks = true, .allow_http = false },
-        .{ .kind = .any_host, .allow_private_networks = false, .allow_http = true },
-        .{ .kind = .any_host, .allow_private_networks = true, .allow_http = true },
-    };
-    for (flag_variants, 0..) |variant, index| {
-        const variant_id = policy.networkPolicyIsolationId(limits_id, 0, variant);
-        try expectOtherId(base, variant_id);
-        for (flag_variants[index + 1 ..]) |other|
-            try expectOtherId(variant_id, policy.networkPolicyIsolationId(limits_id, 0, other));
+    // Two policies of one image never share pools.
+    for (0..policy_image.standard_policy_count) |index| {
+        const id: network.PolicyId = @intCast(index);
+        const isolation_id = policy.networkPolicyIsolationId(limits_id, standard_digest, id);
+        for (index + 1..policy_image.standard_policy_count) |other_index| {
+            const other_id: network.PolicyId = @intCast(other_index);
+            try expectOtherId(isolation_id, policy.networkPolicyIsolationId(limits_id, standard_digest, other_id));
+        }
     }
 
+    // One policy id of two images never shares pools.
+    try expectOtherId(base, policy.networkPolicyIsolationId(limits_id, other_digest, policy_image.public_https_id));
+
+    // Nor does one policy under other limits.
     var other_limits = policy.production;
     other_limits.max_redirects -= 1;
     const other_limits_id = policy.policyIsolationId(other_limits);
     try expectOtherId(
         base,
-        policy.networkPolicyIsolationId(other_limits_id, policy.public_https_id, policy.public_https),
+        policy.networkPolicyIsolationId(other_limits_id, standard_digest, policy_image.public_https_id),
     );
 }
 
@@ -117,7 +78,7 @@ test "the limits' identity changes with every field of the limits" {
             return error.TestUnexpectedResult;
         }
     }
-    // The network flags are no limit of the gateway's: each table entry carries its own.
+    // The network flags are no limit of the gateway's: each grant of a policy carries its own.
     try std.testing.expect(!@hasField(policy.Policy, "allow_plain_http"));
     try std.testing.expect(!@hasField(policy.Policy, "allow_private_networks"));
 }

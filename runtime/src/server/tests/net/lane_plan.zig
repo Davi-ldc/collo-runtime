@@ -1,14 +1,18 @@
 //! The ingress lane plan (`server/net/lane_plan.zig`): the lane count against
 //! its queue, CPU and memory caps, the memory a lane is charged against the
-//! tables and buffers it reserves, CPU selection, and the interface a listen
-//! address maps to. The interface lookups read this machine's own interface
-//! list, so they rely only on `lo` and on documentation addresses no host
-//! assigns. Lane `server-core-test`; the lanes running on the plan are covered
-//! by `server-ingress-test`.
+//! tables and buffers it reserves, CPU selection, the interface a listen
+//! address maps to, and the queues read from a sysfs fixture: none for `lo`,
+//! and none, with the CPUs as the target, where sysfs cannot give them. The
+//! interface lookups read this machine's own interface list, so they rely
+//! only on `lo` and on documentation addresses no host assigns. Lane
+//! `server-core-test`; the lanes running on the plan are covered by
+//! `server-ingress-test`.
 
 const std = @import("std");
 const ipc = @import("collo_ipc");
+const config = @import("collo_server_config");
 const ingress_limits = @import("collo_limits").ingress;
+const pool_limits = @import("collo_limits").pool;
 const server_main = @import("collo_server_main");
 const supervision = @import("collo_server_supervisor");
 const analytics = @import("collo_server_analytics");
@@ -24,10 +28,16 @@ test "static lane count follows RX queues within CPU and memory caps" {
     try std.testing.expectError(error.NoRxQueues, lane_plan.resolveStaticLaneCount(0, 4, 32, 0));
 }
 
+/// Every definition's `concurrency` added up, at the default for each.
+fn defaultSlotsTotal(definition_count: usize) usize {
+    return definition_count * config.default_settings.limits.concurrency;
+}
+
 test "each term of a lane's memory shape covers what its structure reserves at a serving lane's caps" {
     for ([_]usize{ 1, 16 }) |definition_count| {
-        const terms = runner.laneMemoryTerms(definition_count);
-        try std.testing.expectEqual(terms.total(), runner.laneMemoryShape(definition_count).resident_cap_bytes);
+        const slots_total = defaultSlotsTotal(definition_count);
+        const terms = runner.laneMemoryTerms(definition_count, slots_total);
+        try std.testing.expectEqual(terms.total(), runner.laneMemoryShape(definition_count, slots_total).resident_cap_bytes);
 
         // The connection deadline heap keeps one pointer per connection.
         var connections = try runner.connection_slot.ConnectionSlab.init(ingress_limits.connections_per_lane_max);
@@ -48,14 +58,14 @@ test "each term of a lane's memory shape covers what its structure reserves at a
 
         var queue = try ingress.commands.Queue.init(
             ingress_limits.commands_per_lane_max,
-            ingress.lane.obligationReserve(definition_count),
+            ingress.lane.obligationReserve(definition_count, slots_total),
         );
         defer queue.deinit();
         try std.testing.expect(terms.commands >= reservedBytes(queue.nodes.entries));
 
         // A lane's registration slab spans every worker the node can have,
         // but it holds one registration per worker the configuration runs.
-        const workers = definition_count * supervision.scheduler_limits.capacity.pool_workers_max;
+        const workers = definition_count * pool_limits.pool_workers_max;
         try std.testing.expect(terms.registrations >= workers * @sizeOf(ingress.completions.Registration));
 
         var http2 = try ingress.http2.lane_resources.LaneResources.init(ingress_limits.streams_per_lane_max);
@@ -77,7 +87,7 @@ test "a node with 10 GiB available runs a lane on each of 4 CPUs, with one worke
     const available_bytes: usize = 10 * 1024 * 1024 * 1024;
     const cpu_count = 4;
     for ([_]usize{ 1, 16 }) |definition_count| {
-        const shape = runner.laneMemoryShape(definition_count);
+        const shape = runner.laneMemoryShape(definition_count, defaultSlotsTotal(definition_count));
         const capacity = (available_bytes / lane_plan.lane_memory_share_divisor) / shape.estimatedHeavyLaneBytes();
         try std.testing.expectEqual(@as(usize, cpu_count), try lane_plan.resolveStaticLaneCount(cpu_count, cpu_count, capacity, 0));
     }
@@ -114,15 +124,39 @@ test "lane cpu selection rejects impossible lane counts" {
     );
 }
 
-test "loopback interface queues are read from sysfs" {
-    const interface = try lane_plan.interfaceQueues(std.testing.allocator, lane_plan.InterfaceName.loopback);
-    try std.testing.expectEqualStrings("lo", interface.name.slice());
-    try std.testing.expect(interface.rx_queues >= 1);
+test "an interface's queues are counted from its sysfs directory" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_][]const u8{ "eth9/queues/rx-0", "eth9/queues/rx-1", "eth9/queues/rx-2", "eth9/queues/tx-0" }) |queue|
+        try tmp.dir.makePath(queue);
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmp.dir.realpath(".", &root_buffer);
+
+    const queues = try lane_plan.interfaceQueues(std.testing.allocator, root, try lane_plan.InterfaceName.init("eth9"));
+    try std.testing.expectEqual(@as(usize, 3), queues.rx);
+    try std.testing.expectEqual(@as(usize, 1), queues.tx);
 }
 
-test "queues of an interface that does not exist fail clearly" {
+test "queues of an interface that does not exist fail clearly, and a plan follows the CPUs instead" {
     const missing = try lane_plan.InterfaceName.init("collo-missing");
-    try std.testing.expectError(error.FileNotFound, lane_plan.interfaceQueues(std.testing.allocator, missing));
+    try std.testing.expectError(error.FileNotFound, lane_plan.interfaceQueues(std.testing.allocator, lane_plan.sysfs_net_root, missing));
+    // One warning line, and no queue target.
+    const interface = try lane_plan.readInterface(std.testing.allocator, lane_plan.sysfs_net_root, missing);
+    try std.testing.expect(interface.queues == null);
+    try std.testing.expectEqual(@as(usize, 6), lane_plan.queueTarget(interface, 6));
+}
+
+test "a lane plan for loopback reads no queue count and builds without sysfs" {
+    var plan = try lane_plan.build(std.testing.allocator, .{
+        .listen = try std.net.Address.parseIp4("127.0.0.1", 0),
+        .shape = testShape(),
+        .sysfs_net_root = "/nonexistent/sys/class/net",
+    });
+    defer plan.deinit(std.testing.allocator);
+    const interface = plan.interface orelse return error.TestExpectedInterface;
+    try std.testing.expectEqualStrings("lo", interface.name.slice());
+    try std.testing.expect(interface.queues == null);
+    try std.testing.expectEqual(plan.allowed_cpu_count, plan.lane_count);
 }
 
 test "interface names reject empty, oversized and path-like names" {
@@ -167,8 +201,10 @@ test "an address no interface holds maps to no single interface" {
 }
 
 test "a loopback plan names lo and targets the schedulable CPUs, not lo's one queue" {
-    const shape = testShape();
-    var plan = try lane_plan.build(std.testing.allocator, try std.net.Address.parseIp4("127.0.0.1", 0), shape, 0);
+    var plan = try lane_plan.build(std.testing.allocator, .{
+        .listen = try std.net.Address.parseIp4("127.0.0.1", 0),
+        .shape = testShape(),
+    });
     defer plan.deinit(std.testing.allocator);
     const interface = plan.interface orelse return error.TestExpectedInterface;
     try std.testing.expectEqualStrings("lo", interface.name.slice());
@@ -177,16 +213,19 @@ test "a loopback plan names lo and targets the schedulable CPUs, not lo's one qu
     try std.testing.expectEqualSlices(usize, plan.allowed_cpu_ids[0..plan.lane_count], plan.lane_cpu_ids);
 }
 
-test "the queue target follows an interface's receive queues, except lo's" {
+test "the queue target follows an interface's receive queues, except lo's and unread ones" {
     const eth = try lane_plan.InterfaceName.init("eth0");
-    try std.testing.expectEqual(@as(usize, 4), lane_plan.queueTarget(.{ .name = eth, .rx_queues = 4, .tx_queues = 4 }, 8));
-    try std.testing.expectEqual(@as(usize, 8), lane_plan.queueTarget(.{ .name = lane_plan.InterfaceName.loopback, .rx_queues = 1, .tx_queues = 1 }, 8));
+    try std.testing.expectEqual(@as(usize, 4), lane_plan.queueTarget(.{ .name = eth, .queues = .{ .rx = 4, .tx = 4 } }, 8));
+    try std.testing.expectEqual(@as(usize, 8), lane_plan.queueTarget(.{ .name = eth, .queues = null }, 8));
+    try std.testing.expectEqual(@as(usize, 8), lane_plan.queueTarget(.{ .name = lane_plan.InterfaceName.loopback, .queues = .{ .rx = 1, .tx = 1 } }, 8));
     try std.testing.expectEqual(@as(usize, 8), lane_plan.queueTarget(null, 8));
 }
 
 test "an unspecified-address plan targets the schedulable CPUs" {
-    const shape = testShape();
-    var plan = try lane_plan.build(std.testing.allocator, try std.net.Address.parseIp4("0.0.0.0", 0), shape, 0);
+    var plan = try lane_plan.build(std.testing.allocator, .{
+        .listen = try std.net.Address.parseIp4("0.0.0.0", 0),
+        .shape = testShape(),
+    });
     defer plan.deinit(std.testing.allocator);
     try std.testing.expect(plan.interface == null);
     try std.testing.expect(plan.lane_count >= 1);

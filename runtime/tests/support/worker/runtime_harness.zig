@@ -23,6 +23,7 @@
 //! and needs a deadline taken from it.
 
 const std = @import("std");
+const collo_network = @import("collo_network");
 const fd_mod = @import("collo_os").fd;
 const host = @import("collo_host");
 const http1_common = @import("collo_http").framing;
@@ -62,22 +63,38 @@ pub const test_egress_key: ipc.egress_token.Key = .{ .bytes = @splat(0x5c) };
 /// names.
 pub const local_egress_session_id: u64 = 1;
 
-/// The network policy of a fetch to a `LocalOrigin`, which serves plain HTTP
-/// on a private address of the host.
-pub const local_origin_network: egress_gateway.policy.NetworkPolicy = .{
-    .kind = .any_host,
-    .allow_private_networks = true,
-    .allow_http = true,
+/// What a `LocalEgressGateway` lets its fetches reach.
+pub const LocalNetwork = enum {
+    /// Public HTTPS hosts on the default port, as a `"*"` grant admits them.
+    public_https,
+    /// Besides those, plain HTTP to an IPv4 literal on the port its URL
+    /// names, private addresses included, as a grant naming that literal and
+    /// port with both flags admits it: how a fetch reaches a `LocalOrigin`
+    /// or any other origin a test starts on this host's routable address.
+    /// Loopback, link-local and metadata addresses stay refused, as under
+    /// every grant.
+    local_origins,
 };
 
+/// The network of a `LocalEgressGateway` whose fetches reach a `LocalOrigin`,
+/// which serves plain HTTP on a private address of the host.
+pub const local_origin_network: LocalNetwork = .local_origins;
+
+/// The policy id every token the harness mints names: the first id a policy
+/// image's builder gives a granted policy (`collo_network.table.Builder`),
+/// which a configuration with one granted route mints for it.
+/// `LocalEgressGateway` runs no admission and reads no image, so the id
+/// only has to be one a server could mint.
+pub const harness_policy_id: collo_network.PolicyId = 1;
+
 /// The token the server's lane mints for a request dispatched to a worker
-/// attached to `LocalEgressGateway`'s session: kind request, the single
+/// attached to `LocalEgressGateway`'s session: kind request, the harness's
 /// policy, the production budget, and the request's own id, generation and
 /// deadline.
 pub fn requestEgressToken(parts: DispatchParts) ipc.egress_token.Bytes {
     const token = ipc.egress_token.mint(&test_egress_key, .{
         .kind = .request,
-        .policy_id = egress_gateway.policy.public_https_id,
+        .policy_id = harness_policy_id,
         .budget = @intCast(egress_gateway.policy.production.max_fetches_per_request),
         .session_id = local_egress_session_id,
         .request_id = parts.request_id,
@@ -90,11 +107,12 @@ pub fn requestEgressToken(parts: DispatchParts) ipc.egress_token.Bytes {
 /// The boot token a launch with an egress grant hands its worker in
 /// WorkerInit, minted as `host/launch.zig` mints it, with
 /// `deadline_monotonic_ns` standing for the end of the child window. An
-/// in-process runtime takes it through `Runtime.installBootContext`.
+/// in-process runtime takes it as `RuntimeOptions.boot_egress_token`, and
+/// every evaluation presents it.
 pub fn bootEgressToken(deadline_monotonic_ns: u64) ipc.egress_token.Bytes {
     const token = ipc.egress_token.mint(&test_egress_key, .{
         .kind = .boot,
-        .policy_id = egress_gateway.policy.public_https_id,
+        .policy_id = harness_policy_id,
         .budget = @intCast(egress_gateway.policy.production.max_fetches_per_boot),
         .session_id = local_egress_session_id,
         .request_id = 0,
@@ -112,7 +130,7 @@ pub fn localBootEgress() host.launch.BootEgress {
     return .{
         .key = test_egress_key,
         .session_id = local_egress_session_id,
-        .policy_id = egress_gateway.policy.public_https_id,
+        .policy_id = harness_policy_id,
         .budget = @intCast(egress_gateway.policy.production.max_fetches_per_boot),
     };
 }
@@ -355,7 +373,7 @@ pub const CompletionFixture = struct {
         errdefer std.posix.close(memfd);
         var view = try worker_shared_page.mapReadWrite(memfd);
         errdefer view.deinit();
-        view.initializeCrashDefault(@intCast(std.os.linux.getpid()), 512 * 1024 * 1024, 0);
+        view.initializeCrashDefault();
         return .{ .memfd = memfd, .view = view };
     }
 
@@ -497,8 +515,7 @@ pub fn runRouteAndReadIngressResponseWithRequest(
     defer dispatch.deinit();
     try enqueueIngressRoute(runtime, &dispatch, 1, request);
 
-    const request_item = runtime.scheduler.ready_queue.pop() orelse return error.MissingRequestWork;
-    try worker_testing.executeWorkItem(runtime, request_item);
+    try executeQueuedBegin(runtime);
     try executeUntilRequestDone(runtime, request_id);
 
     return readIngressResponse(runtime, server_control_fd, request_id);
@@ -528,8 +545,7 @@ pub fn runRouteAndReadBodyWithRequestCaptures(
     defer dispatch.deinit();
     try enqueueIngressRoute(runtime, &dispatch, 1, request);
 
-    const request_item = runtime.scheduler.ready_queue.pop() orelse return error.MissingRequestWork;
-    try worker_testing.executeWorkItem(runtime, request_item);
+    try executeQueuedBegin(runtime);
     try executeUntilRequestDone(runtime, request_id);
 
     return readIngressResponseBody(runtime, server_control_fd, request_id);
@@ -554,8 +570,7 @@ pub fn runRegisteredRouteAndReadBody(
     defer dispatch.deinit();
     try enqueueIngressRoute(runtime, &dispatch, 1, request);
 
-    const request_item = runtime.scheduler.ready_queue.pop() orelse return error.MissingRequestWork;
-    try worker_testing.executeWorkItem(runtime, request_item);
+    try executeQueuedBegin(runtime);
     try executeUntilRequestDone(runtime, request_id);
 
     return readIngressResponseBody(runtime, server_control_fd, request_id);
@@ -702,6 +717,15 @@ pub fn executeNextReady(runtime: *worker.Runtime) !void {
     try worker_testing.executeWorkItem(runtime, item);
 }
 
+/// Runs the work item of the request begin just enqueued, the next in the
+/// ready queue. Fails with `error.MissingRequestWork` when the queue is
+/// empty, so a begin that never queued fails where it happened instead of
+/// as a request that never completes.
+pub fn executeQueuedBegin(runtime: *worker.Runtime) !void {
+    const item = runtime.scheduler.ready_queue.pop() orelse return error.MissingRequestWork;
+    try worker_testing.executeWorkItem(runtime, item);
+}
+
 /// Runs the runtime's collectors and its ready queue until `request_id`
 /// leaves `requests.active`. Fails with `error.RequestDidNotComplete` after a
 /// fixed number of passes; a pass that finds nothing to run sleeps a
@@ -711,21 +735,70 @@ pub fn executeUntilRequestDone(runtime: *worker.Runtime, request_id: u64) !void 
     while (runtime.requests.active.contains(request_id)) : (attempts += 1) {
         if (attempts > 1000)
             return error.RequestDidNotComplete;
-        // A worker without a gateway session has no packets to collect.
-        _ = try runtime.collectEgressGatewayPacketsBounded(64);
-        runtime.collectModuleSettlements();
-        try runtime.collectCompletedCryptoJobs();
-        try runtime.collectCompletedFetches();
-        try runtime.collectReadyFetchBodies();
-        try runtime.collectDueTimers();
-        try runtime.collectReadyImmediates();
-        try runtime.collectDueRequestDeadlines();
+        try collectReadyWork(runtime);
         if (runtime.scheduler.ready_queue.pop()) |item| {
             try worker_testing.executeWorkItem(runtime, item);
             continue;
         }
         std.Thread.sleep(std.time.ns_per_ms);
     }
+}
+
+/// How `executeUntilRequestDoneOnFakeClock` moves a fake clock.
+pub const FakeClockPace = struct {
+    /// What one work item costs. Code that keeps the loop busy without
+    /// waiting on a timer still reaches its timers, a JavaScript test
+    /// timeout among them.
+    work_item_ns: u64 = 10 * std.time.ns_per_us,
+    /// The fake time the loop runs before it gives up. The request's own
+    /// deadline should lie beyond it, so the code under test decides how the
+    /// request ends.
+    budget_ns: u64,
+};
+
+/// As `executeUntilRequestDone`, for a runtime that reads the fake clock at
+/// `now_mono_ns`, which the loop moves: by `pace.work_item_ns` for each work
+/// item it runs, and while nothing is ready, by the millisecond it sleeps.
+/// Idle time therefore passes at the real rate, so work another thread
+/// finishes in real time (a crypto job, a gateway packet) is never overtaken
+/// by a fake timer, and a timer still fires however long its delay. Fails with
+/// `error.RequestDidNotComplete` once `pace.budget_ns` of fake time passed: a
+/// request that neither finishes nor is ended by its own timers, such as
+/// work that keeps the ready queue full or a wait on something that never
+/// arrives.
+pub fn executeUntilRequestDoneOnFakeClock(
+    runtime: *worker.Runtime,
+    now_mono_ns: *u64,
+    request_id: u64,
+    pace: FakeClockPace,
+) !void {
+    const give_up_mono_ns = now_mono_ns.* + pace.budget_ns;
+    while (runtime.requests.active.contains(request_id)) {
+        if (now_mono_ns.* > give_up_mono_ns)
+            return error.RequestDidNotComplete;
+        try collectReadyWork(runtime);
+        if (runtime.scheduler.ready_queue.pop()) |item| {
+            try worker_testing.executeWorkItem(runtime, item);
+            now_mono_ns.* += pace.work_item_ns;
+            continue;
+        }
+        std.Thread.sleep(std.time.ns_per_ms);
+        now_mono_ns.* += std.time.ns_per_ms;
+    }
+}
+
+/// Moves everything that became ready into the ready queue, as one pass of
+/// the worker's loop does before it runs work.
+fn collectReadyWork(runtime: *worker.Runtime) !void {
+    // A worker without a gateway session has no packets to collect.
+    _ = try runtime.collectEgressGatewayPacketsBounded(64);
+    runtime.collectModuleSettlements();
+    try runtime.collectCompletedCryptoJobs();
+    try runtime.collectCompletedFetches();
+    try runtime.collectReadyFetchBodies();
+    try runtime.collectDueTimers();
+    try runtime.collectReadyImmediates();
+    try runtime.collectDueRequestDeadlines();
 }
 
 /// The identity of one FetchStart a worker sent its gateway, recorded as it
@@ -740,12 +813,14 @@ pub const FetchStartIdentity = struct {
 /// A gateway engine (`egress/gateway/engine.zig`) whose packet loop runs on
 /// its own thread in the test process, serving one worker session over a
 /// real egress shared session (`ipc.egress_shared`). It runs no admission: it
-/// records each start's token and submits the fetch under `Options.network`,
-/// as a real gateway does once the token verified and named that policy.
-/// `start` returns it heap-allocated; the caller gives the worker the fds
-/// `takeWorkerSharedFds` returns and ends the gateway with `deinit`, which
-/// panics if that thread failed. Ending it closes the gateway's end of the
-/// session's liveness pipe, which a forked worker sees as its gateway gone.
+/// records each start's token and submits the fetch under the policy
+/// `Options.network` gives its URL, as a real gateway does once the token
+/// verified and named that policy, so the transport checks every hop as in
+/// production. `start` returns it heap-allocated; the caller gives the
+/// worker the fds `takeWorkerSharedFds` returns and ends the gateway with
+/// `deinit`, which panics if that thread failed. Ending it closes the
+/// gateway's end of the session's liveness pipe, which a forked worker sees
+/// as its gateway gone.
 pub const LocalEgressGateway = struct {
     allocator: std.mem.Allocator,
     worker_fds: ?ipc.egress_shared.SessionFds,
@@ -753,7 +828,13 @@ pub const LocalEgressGateway = struct {
     publish_mutex: std.Thread.Mutex = .{},
     stop_fd: std.posix.fd_t,
     engine: gateway_engine.Engine,
-    network: egress_gateway.policy.NetworkPolicy,
+    network: LocalNetwork,
+    /// The grants `.local_origins` made, one per IPv4 origin, oldest first.
+    /// Only the gateway's thread adds one, before the submit that hands its
+    /// policy to the engine, whose queue orders the write before every
+    /// shard's read, and none changes afterwards.
+    local_grants: [local_grants_max]LocalGrant = undefined,
+    local_grant_count: usize = 0,
     scratch: []u8,
     /// Where the gateway thread decodes fetch starts; a decoded view points
     /// into it until the next decode. It is on the heap because its arrays,
@@ -768,13 +849,25 @@ pub const LocalEgressGateway = struct {
     body_ends_published: std.atomic.Value(usize) = .init(0),
 
     const worker_session_id: u64 = local_egress_session_id;
+    /// Distinct IPv4 origins one gateway grants under `.local_origins`; a
+    /// test starts a handful. A fetch to one more fails.
+    const local_grants_max: usize = 32;
+
+    /// The grant of one IPv4 literal on one port with both flags, and the
+    /// policy of that grant alone. It points into itself, so it lives in the
+    /// gateway's heap allocation, which never moves, until `deinit`.
+    const LocalGrant = struct {
+        rule: [1]collo_network.Pattern,
+        grant: collo_network.Grant,
+        members: [1]*const collo_network.Grant,
+    };
 
     pub const Options = struct {
         /// The engine's limits.
         policy: egress_gateway.policy.Policy = .{},
-        /// The policy every fetch runs under. `local_origin_network` reaches
-        /// a `LocalOrigin`; the default admits public HTTPS hosts only.
-        network: egress_gateway.policy.NetworkPolicy = egress_gateway.policy.public_https,
+        /// What the fetches may reach. `local_origin_network` reaches a
+        /// `LocalOrigin`; the default admits public HTTPS hosts only.
+        network: LocalNetwork = .public_https,
     };
 
     /// Starts a gateway on a session of a wake set of its own, for a worker
@@ -923,16 +1016,27 @@ pub const LocalEgressGateway = struct {
                 return;
             }
             if ((pollfds[2].revents & std.posix.POLL.IN) != 0) {
-                if (!try self.handleWorkerPacket())
-                    return;
+                try self.handleWorkerPackets();
                 try self.engine.collectReady();
             }
         }
     }
 
-    fn handleWorkerPacket(self: *LocalEgressGateway) !bool {
+    /// Reads every command the worker queued. The worker signals the command
+    /// eventfd only when the ring may have been empty
+    /// (`notifyAfterPacketWrite` in `common/ipc/egress_shared/wake.zig`), so
+    /// a wake that left a packet behind would strand it, and every command
+    /// after it, until an unrelated wake.
+    fn handleWorkerPackets(self: *LocalEgressGateway) !void {
         ipc.egress_shared.drainEventfd(self.endpoint.command_eventfd);
-        const bytes = (try self.endpoint.command.readPacket(self.scratch)) orelse return true;
+        while (try self.endpoint.command.readPacket(self.scratch)) |bytes| {
+            try self.handleCommand(bytes);
+        }
+    }
+
+    /// Handles one command packet `bytes`, which lives in `scratch` until the
+    /// next read.
+    fn handleCommand(self: *LocalEgressGateway, bytes: []const u8) !void {
         if (bytes.len < @sizeOf(u32))
             return error.ShortRead;
 
@@ -950,11 +1054,15 @@ pub const LocalEgressGateway = struct {
                 // Without admission the token is read unverified: its fields
                 // only name the fetch's request inside the engine.
                 const token = ipc.egress_token.fromBytes(&fetch.egress_token);
+                const network = self.policyFor(fetch.url) catch |err| {
+                    try self.sendFetchError(fetch.fetch_id, fetch.body_id, @errorName(err));
+                    return;
+                };
                 self.engine.submit(worker_session_id, fetch, .{
-                    // One session with one policy: every fetch shares the
-                    // zero pool key.
+                    // One session: every fetch shares the zero pool key,
+                    // which a test with one origin per policy never splits.
                     .isolation = .{},
-                    .network = self.network,
+                    .network = network,
                     .budget_key = .{
                         .session_id = token.session_id,
                         .request_id = token.request_id,
@@ -981,7 +1089,57 @@ pub const LocalEgressGateway = struct {
             },
             else => return error.InvalidEgressPacket,
         }
-        return true;
+    }
+
+    /// The policy a fetch of `url` runs under: `public_https` for every URL
+    /// under `.public_https` and for a URL whose host is no IPv4 literal,
+    /// else the grant of that literal on the URL's port, made on the first
+    /// fetch to it.
+    fn policyFor(self: *LocalEgressGateway, url: []const u8) error{TooManyLocalOrigins}!collo_network.Policy {
+        switch (self.network) {
+            .public_https => return collo_network.public_https,
+            .local_origins => {},
+        }
+        const origin = ipv4OriginOf(url) orelse return collo_network.public_https;
+        for (self.local_grants[0..self.local_grant_count]) |*slot| {
+            const rule = slot.rule[0];
+            if (std.mem.eql(u8, &rule.host.ipv4, &origin.bytes) and rule.port == origin.port)
+                return .{ .grants = &slot.members };
+        }
+        if (self.local_grant_count == local_grants_max)
+            return error.TooManyLocalOrigins;
+        const slot = &self.local_grants[self.local_grant_count];
+        slot.rule = .{.{ .host = .{ .ipv4 = origin.bytes }, .port = origin.port }};
+        slot.grant = .{
+            .allow_http = true,
+            .allow_private_networks = true,
+            .any = false,
+            .names = &.{},
+            .suffixes = &.{},
+            .ipv4 = &slot.rule,
+            .ipv6 = &.{},
+        };
+        slot.members = .{&slot.grant};
+        self.local_grant_count += 1;
+        return .{ .grants = &slot.members };
+    }
+
+    const Ipv4Origin = struct { bytes: [4]u8, port: u16 };
+
+    /// The IPv4 literal and the port of an `http` or `https` URL, or null for
+    /// any other URL, which the transport judges on its own.
+    fn ipv4OriginOf(url: []const u8) ?Ipv4Origin {
+        const uri = std.Uri.parse(url) catch return null;
+        const default_port: u16 = if (std.ascii.eqlIgnoreCase(uri.scheme, "http"))
+            80
+        else if (std.ascii.eqlIgnoreCase(uri.scheme, "https"))
+            443
+        else
+            return null;
+        var host_buffer: [std.Uri.host_name_max]u8 = undefined;
+        const host_text = uri.getHost(&host_buffer) catch return null;
+        const address = std.net.Address.parseIp4(host_text, 0) catch return null;
+        return .{ .bytes = collo_network.address.ipv4Bytes(address), .port = uri.port orelse default_port };
     }
 
     fn sendFetchError(self: *LocalEgressGateway, fetch_id: u64, body_id: u64, message: []const u8) !void {

@@ -233,14 +233,36 @@ pub const headers = struct {
         }
     }
 
-    /// The connection-specific fields RFC 9113 §8.2.2 lists, which an HTTP/2
-    /// message must not carry.
+    /// The connection-specific fields RFC 9113 §8.2.2 forbids in every
+    /// HTTP/2 message by their name alone. `te` is connection-specific too,
+    /// but whether a message may carry it depends on its value and the
+    /// message's direction, which `isConnectionSpecificField` decides.
     pub fn isConnectionSpecificName(name: []const u8) bool {
         return std.ascii.eqlIgnoreCase(name, "connection") or
             std.ascii.eqlIgnoreCase(name, "keep-alive") or
             std.ascii.eqlIgnoreCase(name, "proxy-connection") or
             std.ascii.eqlIgnoreCase(name, "transfer-encoding") or
             std.ascii.eqlIgnoreCase(name, "upgrade");
+    }
+
+    /// Which way an HTTP/2 message travels, for the field rules that differ
+    /// between a request and a response.
+    pub const Direction = enum { request, response };
+
+    /// Whether an HTTP/2 message going `direction` must not carry the field
+    /// `name: value` (RFC 9113 §8.2.2): a field `isConnectionSpecificName`
+    /// names, and `te` unless the message is a request and the value is
+    /// `trailers`, compared case-insensitively once the whitespace around a
+    /// field value is trimmed. A response never carries `te`.
+    pub fn isConnectionSpecificField(name: []const u8, value: []const u8, direction: Direction) bool {
+        if (isConnectionSpecificName(name))
+            return true;
+        if (!std.ascii.eqlIgnoreCase(name, "te"))
+            return false;
+        return switch (direction) {
+            .request => !std.ascii.eqlIgnoreCase(std.mem.trim(u8, value, " \t"), "trailers"),
+            .response => true,
+        };
     }
 
     /// A field name valid in HTTP/2, which requires lowercase (RFC 9113

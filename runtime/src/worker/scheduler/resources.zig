@@ -1,45 +1,61 @@
 //! Scheduling policy over the runtime's scheduler state, on the worker's VM
-//! thread: setting up the worker ring, arming request deadlines with the
-//! sentinel, publishing the turn owner, and scheduling, collecting and
-//! cancelling timers and immediates. `Runtime` forwards to it through thin
-//! methods.
+//! thread: setting up the worker ring, arming request deadlines, and
+//! scheduling, collecting and cancelling timers and immediates. `Runtime`
+//! forwards to it through thin methods. The owner the sentinel may
+//! terminate, with its deadline, is published by `runtime/owner.zig` alone.
 //!
 //! Timers and immediates share one budget, `RuntimeLimits.max_timers_per_worker`,
 //! counted over the timer heap, the pending immediates, both ready maps and
-//! a repeating timer whose callback is running. Only an active request,
-//! including the boot context, can schedule them. Collection moves an entry
-//! into its ready map before queueing its work item, and an entry that finds
-//! the ready queue full goes back where it came from with its readiness
-//! stamp; if even that fails, the worker stops.
+//! a repeating timer whose callback is running. Only a context in the active
+//! map that accepts work, a dispatched request whose finish has not started
+//! or an open evaluation (`RequestContext.acceptsWork`), can schedule them,
+//! and only its own owner can cancel one. Collection moves an entry into its
+//! ready map before queueing its work item, and an entry that finds the
+//! ready queue full goes back where it came from with its readiness stamp;
+//! if even that fails, the worker stops.
 
 const std = @import("std");
-const bindings = @import("collo_bindings");
 const restricted_uring = @import("collo_common_io").restricted_uring;
 const worker_fs = @import("../fs/index.zig");
 const js_value = @import("collo_worker_js").value;
 const request_context = @import("collo_worker_request").context;
+const runtime_owner = @import("../runtime/owner.zig");
 const runtime_types = @import("../runtime/types.zig");
 const immediates = @import("immediates.zig");
 const timers = @import("timers.zig");
 
 /// Creates the timerfd and the worker ring over its complete fixed-file
-/// table; a second call does nothing. The two egress slots take the
-/// completion eventfd and the liveness pipe of the worker's wake descriptors,
-/// held by its endpoint or, for a worker launched without a session, by its
-/// egress state (`State.wakeFds` in `egress/state.zig`). Every later session
-/// of the worker carries the same two files, so the ring watches it without
-/// registering another. Fails with a `error.WorkerRingMissing*` error when a
-/// fixed file is absent, or with the validation or ring setup error, leaving
-/// no ring behind.
+/// table; a second call does nothing. For a worker with a network grant the
+/// two egress slots take the completion eventfd and the liveness pipe of its
+/// wake descriptors, held by its endpoint or, for a worker launched without
+/// a session, by its egress state (`State.wakeFds` in `egress/state.zig`).
+/// Every later session of the worker carries the same two files, so the
+/// ring watches it without registering another. A worker without a grant
+/// leaves both slots empty, which the kernel accepts in a sparse fixed-file
+/// set, and the loop never polls them, since such a worker never holds a
+/// session (`uring_backend.zig`). Fails with a `error.WorkerRingMissing*`
+/// error when a fixed file is absent, or with the validation or ring setup
+/// error, leaving no ring behind.
 pub fn initRestrictedWorkerRing(runtime: anytype) !void {
     if (runtime.scheduler.worker_ring != null)
         return;
     const control_fd = runtime.core.control_fd orelse return error.WorkerRingMissingControlFd;
     const wakeup_fd = runtime.scheduler.wakeup_fd orelse return error.WorkerRingMissingWakeupFd;
-    const egress_wake = runtime.egress.state.wakeFds() orelse
-        return error.WorkerRingMissingEgressWake;
-    const egress_completion_fd = egress_wake.completion_eventfd;
-    const egress_liveness_fd = egress_wake.liveness_fd;
+    const egress_slots: restricted_uring.EgressSlots = switch (runtime.egress.state.grant()) {
+        .granted => .granted,
+        .none => .none,
+    };
+    var egress_completion_fd: std.posix.fd_t = restricted_uring.empty_slot;
+    var egress_liveness_fd: std.posix.fd_t = restricted_uring.empty_slot;
+    switch (egress_slots) {
+        .granted => {
+            const egress_wake = runtime.egress.state.wakeFds() orelse
+                return error.WorkerRingMissingEgressWake;
+            egress_completion_fd = egress_wake.completion_eventfd;
+            egress_liveness_fd = egress_wake.liveness_fd;
+        },
+        .none => {},
+    }
     const ingress_payload_credit_eventfd = runtime.requests.ingress_payload_credit_eventfd orelse
         return error.WorkerRingMissingIngressPayloadCreditEventFd;
     // The fault channel is a required fixed file. The worker boot installs
@@ -61,7 +77,7 @@ pub fn initRestrictedWorkerRing(runtime: anytype) !void {
         ingress_payload_credit_eventfd,
         fs_fault_fd,
     };
-    try restricted_uring.validateWorkerFixedFiles(&fixed_files);
+    try restricted_uring.validateWorkerFixedFiles(&fixed_files, egress_slots);
     runtime.scheduler.worker_ring = try restricted_uring.WorkerRing.init(.{ .files = fixed_files });
     errdefer {
         if (runtime.scheduler.worker_ring) |*ring|
@@ -90,27 +106,19 @@ pub fn workerSchedulerMetricsSnapshot(runtime: anytype) runtime_types.WorkerSche
     return runtime.scheduler.metrics;
 }
 
-/// Arms the request's deadline in the sentinel and pushes it on the deadline
-/// heap; does nothing when it is already armed. A full heap is cleared of
-/// stale entries and the push retried. On failure the sentinel entry is
-/// disarmed again.
+/// Arms the deadline of `request`, a dispatched request or an evaluation, at
+/// `exec.deadline_monotonic_ns`: the loop's deadline heap answers it when it
+/// passes while the owner does not run, and the sentinel stops the owner's
+/// JavaScript when it passes while it runs (`runtime/owner.zig` publishes it,
+/// at once when the owner's window is open). Does nothing when it is already
+/// armed. A full heap is cleared of stale entries and the push retried; a
+/// push that still fails leaves the deadline unarmed.
 pub fn armRequestDeadline(
     runtime: anytype,
     request: *request_context.RequestContext,
 ) !void {
     if (request.deadline_armed)
         return;
-    var sentinel_armed = false;
-    errdefer {
-        if (sentinel_armed)
-            runtime.observability.sentinel.disarm(request.exec.request_id, request.deadline_generation);
-    }
-
-    request.deadline_generation = try runtime.observability.sentinel.arm(
-        request.exec.request_id,
-        request.exec.deadline_monotonic_ns,
-    );
-    sentinel_armed = true;
     pushRequestDeadline(runtime, request) catch |err| switch (err) {
         error.DeadlineHeapFull => {
             compactRequestDeadlineHeap(runtime);
@@ -119,62 +127,26 @@ pub fn armRequestDeadline(
         else => return err,
     };
     request.deadline_armed = true;
-    sentinel_armed = false;
+    runtime_owner.refreshPublication(runtime, request);
 }
 
-/// Disarms the request's deadline in the sentinel; does nothing when it is
-/// not armed. Its heap entry turns stale and is dropped by the reader.
+/// Disarms the deadline of `request`; does nothing when it is not armed. Its
+/// heap entry turns stale and is dropped by the reader, and the sentinel
+/// stops watching it at once when the owner's window is open, so a request
+/// that is being answered is never stopped mid-answer.
 pub fn disarmRequestDeadline(runtime: anytype, request: *request_context.RequestContext) void {
     if (!request.deadline_armed)
         return;
-    {
-        const sentinel = &runtime.observability.sentinel;
-        // Every terminal path of a request disarms here, and disarming drops
-        // the entry with its fire flag. A fire that landed where no path
-        // checks it, such as after the turn while the response is extracted,
-        // or in an exception the extract turned into a local 500, would
-        // otherwise leave a terminated VM serving 500s for good, so the flag
-        // is folded into `stop_after_deadline_fire` first.
-        if (sentinel.terminationWasRequested(request.exec.request_id, request.deadline_generation))
-            runtime.stop_after_deadline_fire = true;
-        sentinel.disarm(request.exec.request_id, request.deadline_generation);
-    }
     request.deadline_armed = false;
     request.deadline_due_queued = false;
-}
-
-/// Whether the sentinel fired for the request or its deadline has passed;
-/// false when no deadline is armed.
-pub fn requestDeadlineTerminationRequested(
-    runtime: anytype,
-    request: *const request_context.RequestContext,
-) bool {
-    if (!request.deadline_armed)
-        return false;
-    if (runtime.observability.sentinel.terminationWasRequested(request.exec.request_id, request.deadline_generation))
-        return true;
-    return runtime.nowMonoNs() >= request.exec.deadline_monotonic_ns;
-}
-
-/// Publishes `request_id` as the owner of the JavaScript about to run; zero
-/// means no single owner. The sentinel terminates the VM for an expired
-/// deadline only while that deadline's request is the published owner. The
-/// loop publishes around every work item, and the runtime around JavaScript
-/// that runs outside one, such as the boot evaluation
-/// (`runtime/boot_context.zig`) and module settlements
-/// (`runtime/modules.zig`).
-pub fn publishTurnOwner(runtime: anytype, request_id: u64) void {
-    runtime.observability.sentinel.publishTurnOwner(request_id);
-}
-
-pub fn clearTurnOwner(runtime: anytype) void {
-    runtime.observability.sentinel.clearTurnOwner();
+    runtime_owner.refreshPublication(runtime, request);
 }
 
 /// Schedules a timer of `request_id` due `delay_ms` from now, repeating when
 /// `repeats`, and returns its id. Takes `callback` and `args` on every path.
 /// Fails with `error.TimerOutsideActiveRequest` for a request that is not
-/// active, `error.TimerWorkerLimitExceeded` when the shared budget is spent,
+/// active or whose finish started, `error.TimerWorkerLimitExceeded` when the
+/// shared budget is spent,
 /// or the heap's error.
 pub fn scheduleTimer(
     runtime: anytype,
@@ -199,7 +171,7 @@ pub fn scheduleTimer(
         runtime.core.allocator.free(owned_args);
     };
 
-    if (request_id == 0 or !runtime.requests.active.contains(request_id))
+    if (!ownerAcceptsWork(runtime, request_id))
         return error.TimerOutsideActiveRequest;
     if (schedulerCallbackCount(runtime) >= runtime.core.limits.max_timers_per_worker)
         return error.TimerWorkerLimitExceeded;
@@ -251,7 +223,7 @@ pub fn scheduleImmediate(
         runtime.core.allocator.free(owned_args);
     };
 
-    if (request_id == 0 or !runtime.requests.active.contains(request_id))
+    if (!ownerAcceptsWork(runtime, request_id))
         return error.TimerOutsideActiveRequest;
     if (schedulerCallbackCount(runtime) >= runtime.core.limits.max_timers_per_worker)
         return error.TimerWorkerLimitExceeded;
@@ -274,6 +246,13 @@ pub fn scheduleImmediate(
     errdefer entry.deinit(runtime.core.allocator);
     try runtime.scheduler.pending_immediate_callbacks.push(entry);
     return immediate_id;
+}
+
+/// Whether `request_id` names a context in the active map that accepts work
+/// (`RequestContext.acceptsWork`); 0 and the worker owner never do.
+fn ownerAcceptsWork(runtime: anytype, request_id: u64) bool {
+    const owner = runtime.requests.active.get(request_id) orelse return false;
+    return owner.acceptsWork();
 }
 
 /// The entries the shared budget counts (see the file header).
@@ -476,6 +455,8 @@ pub fn cancelTimeout(runtime: anytype, request_id: u64, timer_id: u64) void {
             var removed_timer = removed.value;
             removed_timer.deinit(runtime.core.allocator);
         }
+        // Its item is queued and will find nothing to run.
+        runtime.withdrawReadyWork(.{ .timer_callback = timer_id });
         return;
     }
     if (runtime.scheduler.timers.cancelByIdForRequest(timer_id, request_id))
@@ -499,6 +480,8 @@ pub fn cancelImmediate(runtime: anytype, request_id: u64, immediate_id: u64) voi
             immediates.markDestroyed(runtime, &removed_immediate);
             removed_immediate.deinit(runtime.core.allocator);
         }
+        // Its item is queued and will find nothing to run.
+        runtime.withdrawReadyWork(.{ .immediate_callback = immediate_id });
         return;
     }
     if (runtime.scheduler.pending_immediate_callbacks.takeByIdForRequest(

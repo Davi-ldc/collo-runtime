@@ -91,7 +91,7 @@ private:
 
 } // namespace
 
-extern "C" ColloStatus collo_invoke(ColloVm* vm, const ColloExecCtx* expected_ctx, const ColloValue* callable,
+extern "C" ColloStatus collo_invoke(ColloRealm* realm, const ColloExecCtx* expected_ctx, const ColloValue* callable,
     const ColloValue* this_value, const ColloValue* const* argv, size_t argc, ColloValue** out_result,
     ColloValue** out_exception, uint64_t* out_call_started_ns)
 {
@@ -101,9 +101,10 @@ extern "C" ColloStatus collo_invoke(ColloVm* vm, const ColloExecCtx* expected_ct
         *out_result = nullptr;
     Collo::clearOutException(out_exception);
 
-    if (!vm || !vm->isReady() || !expected_ctx || !callable || !out_result || (argc && !argv))
+    if (!realmIsReady(realm) || !expected_ctx || !callable || !out_result || (argc && !argv))
         return COLLO_STATUS_INVALID_ARGUMENT;
 
+    ColloVm* vm = realm->vm;
     JSC::JSLockHolder locker(*vm->vm);
     if (!vm->entered_count || vm->current_exec_ctx != expected_ctx)
         return COLLO_STATUS_INVALID_ARGUMENT;
@@ -112,9 +113,10 @@ extern "C" ColloStatus collo_invoke(ColloVm* vm, const ColloExecCtx* expected_ct
     if (this_value && !Collo::valueBelongsToVm(vm, this_value))
         return COLLO_STATUS_INVALID_ARGUMENT;
 
-    // The callee's realm: where its errors are created and the marker is installed.
+    // The callee's realm, where its errors are created and the marker is installed, or the caller's for a callee that
+    // has none, such as a primitive.
     JSC::JSValue callable_value = Collo::toJSValue(callable);
-    auto* global_object = Collo::globalObjectForValue(vm, callable_value);
+    auto* global_object = Collo::globalObjectForValue(*realm, callable_value);
     auto* callable_object = dynamicDowncast<JSC::JSObject>(callable_value);
     if (!callable_object)
         return Collo::statusOr(

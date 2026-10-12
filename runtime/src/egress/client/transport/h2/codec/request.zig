@@ -144,18 +144,14 @@ fn validateRegularHeader(header: hpack.Header) !void {
         if (byte >= 'A' and byte <= 'Z')
             return error.InvalidHttp2RequestHeader;
     }
-    if (isForbiddenRequestHeader(header.name))
+    if (http.headers.isConnectionSpecificField(header.name, header.value, .request))
         return error.ForbiddenHttp2RequestHeader;
-    if (std.ascii.eqlIgnoreCase(header.name, "te") and !std.ascii.eqlIgnoreCase(std.mem.trim(u8, header.value, &std.ascii.whitespace), "trailers"))
+    if (isCodecOwnedRequestHeader(header.name))
         return error.ForbiddenHttp2RequestHeader;
 }
 
-fn isForbiddenRequestHeader(name: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(name, "connection") or
-        std.ascii.eqlIgnoreCase(name, "keep-alive") or
-        std.ascii.eqlIgnoreCase(name, "proxy-connection") or
-        std.ascii.eqlIgnoreCase(name, "transfer-encoding") or
-        std.ascii.eqlIgnoreCase(name, "upgrade") or
-        std.ascii.eqlIgnoreCase(name, "host") or
-        std.ascii.eqlIgnoreCase(name, "content-length");
+/// `host` travels as `:authority`, and the codec writes the request's one
+/// `content-length` itself. Names are lowercase by the time this runs.
+fn isCodecOwnedRequestHeader(name: []const u8) bool {
+    return std.mem.eql(u8, name, "host") or std.mem.eql(u8, name, "content-length");
 }

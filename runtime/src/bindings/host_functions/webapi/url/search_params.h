@@ -64,10 +64,15 @@ public:
     size_t memoryCost() const;
 
     // memoryCost() walks the pair Strings, which a mutator may be reallocating while the concurrent marker runs
-    // visitChildren, so the marker reads this cached copy instead. Every mutator that can change the cost refreshes
-    // it, which turns append into a walk over all pairs; WebApiUrlSearchParamsPairsMax bounds that walk.
+    // visitChildren, so the marker reads this cached copy instead. A mutator that already walks every pair (set,
+    // delete, a reset from the URL) refreshes it from memoryCost(); WebApiUrlSearchParamsPairsMax bounds that walk.
     void refreshGCReportedCost() { m_gc_reported_cost.store(memoryCost(), std::memory_order_relaxed); }
     size_t gcReportedCost() const { return m_gc_reported_cost.load(std::memory_order_relaxed); }
+
+    // Appends one pair, adding its cost and any growth of the pair vector to the cached cost without walking the
+    // other pairs, and reports that addition as allocated. Returns false, changing nothing, when the vector cannot
+    // grow. The caller applies the pair cap first.
+    bool tryAppendPair(WTF::String key, WTF::String value);
 
     // Replaces the pairs with those parsed from `search` after the associated URL's query changed. It writes
     // nothing back to the URL and applies no pair cap.

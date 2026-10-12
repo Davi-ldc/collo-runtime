@@ -2,12 +2,14 @@
 //! (`server/supervisor/worker_factory.zig`), against a gateway that stands
 //! behind the supervisor's egress hooks on the test thread. A worker of a
 //! definition with a grant gets a new session built on its wake set, and a
-//! boot token grant beside it that names the session's gateway key, the one
-//! entry of the policy table and the boot budget; once that gateway is no
-//! longer current the session comes without a grant. A launch with no
-//! gateway wired, a session the gateway hands back incomplete or an attach
-//! that fails leaves nothing open. What the launcher does with the grant is
-//! covered in `launcher.zig`. Lane `server-supervisor-test`.
+//! boot token grant beside it that names the session's gateway key, the
+//! definition's boot policy and the boot budget; once that gateway is no
+//! longer current the session comes without a grant. A definition without a
+//! grant gets nothing and asks the gateway nothing. A launch with no gateway
+//! wired, a session the gateway hands back incomplete or an attach that fails
+//! leaves nothing open. What the launcher does with the grant is covered in
+//! `launcher.zig`, and the union a boot policy names in
+//! `server/tests/routes/network.zig`. Lane `server-supervisor-test`.
 
 const std = @import("std");
 const ipc = @import("collo_ipc");
@@ -43,7 +45,9 @@ test "a launch's egress pairs a new session on the worker's wake set with a boot
     const boot = egress.boot orelse return error.TestExpectedBootGrant;
     try testing.expectEqualSlices(u8, &gateway_key.bytes, &boot.key.bytes);
     try testing.expectEqual(first_session_id, boot.session_id);
-    try testing.expectEqual(egress_policy.public_https_id, boot.policy_id);
+    const boot_policy = supervisor.routes.network.bootPolicy(fixture.default_definition);
+    try testing.expect(boot_policy != 0);
+    try testing.expectEqual(boot_policy, boot.policy_id);
     try testing.expectEqual(@as(u32, egress_policy.production.max_fetches_per_boot), boot.budget);
 
     // The attach named the worker's definition and built on its wake set.
@@ -67,6 +71,23 @@ test "a session whose gateway is no longer current once the attach returns comes
     try testing.expect(egress.attachment.isValid());
     try testing.expect(egress.boot == null);
     try testing.expectEqual(@as(?u64, gateway_generation), gateway.key_asked_for);
+}
+
+test "a definition without a network grant gets no session and asks the gateway nothing" {
+    var granted: [fixture.definition_names.len]bool = @splat(true);
+    granted[fixture.default_definition] = false;
+    var supervisor = try fixture.minimalSupervisorWith(testing.allocator, .{ .routes = .{ .granted = granted } });
+    defer fixture.deinitMinimal(&supervisor);
+    var gateway: FakeGateway = .{};
+    gateway.wire(&supervisor);
+    var wake_set = try WakeSet.create();
+    defer wake_set.deinit();
+
+    try testing.expect(!worker_factory.definitionHasEgressGrant(&supervisor, fixture.default_definition));
+    try testing.expect(worker_factory.definitionHasEgressGrant(&supervisor, fixture.default_definition + 1));
+    try testing.expect(try worker_factory.attachLaunchEgress(&supervisor, fixture.default_definition, &wake_set) == null);
+    try testing.expectEqual(@as(u32, 0), gateway.attaches);
+    try testing.expect(gateway.key_asked_for == null);
 }
 
 test "a launch's egress fails with nothing open when no gateway is wired, the attach fails or its session is incomplete" {

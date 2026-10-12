@@ -1,9 +1,11 @@
 //! Tests of streams sharing one codec `Connection`: out-of-order completion,
 //! local and peer concurrency limits, frame and CONTINUATION floods, failures
-//! and cancels that reset one stream while its neighbors finish, a cancel
-//! between HEADERS and CONTINUATION that must leave HPACK in step, GOAWAY and
-//! which streams may be reported unprocessed, the reset-tracking bound, late
-//! frames for closed streams, and receive-window growth. Each test feeds
+//! and cancels that reset one stream while its neighbors finish, cancels of
+//! streams the peer already ended, which leave no reset entry, a cancel
+//! between HEADERS and CONTINUATION and a discarded block over the header
+//! caps, both of which must leave HPACK in step, GOAWAY and which streams may
+//! be reported unprocessed, the reset-tracking bound, late frames for closed
+//! streams, and receive-window growth. Each test feeds
 //! hand-built server frames from memory and inspects the events and the
 //! frames the client wrote.
 
@@ -104,6 +106,25 @@ fn fillLocalResetTracking(connection: *egress_http2.Connection, writer: *std.Io.
         try connection.cancelStream(writer, stream_id);
     }
     try std.testing.expect(connection.canOpenStream());
+}
+
+/// Feeds a bodiless final head that ends `stream_id` in one HEADERS frame and
+/// checks that the connection reports it as that stream's head.
+fn receiveEndedHead(connection: *egress_http2.Connection, writer: *std.Io.Writer, stream_id: u32, status: []const u8) !void {
+    var head_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer head_wire.deinit();
+    try appendHeaderFramesForStream(&head_wire.writer, stream_id, &.{
+        .{ .name = ":status", .value = status },
+    }, true);
+    var event = (try processFrameWire(connection, writer, head_wire.written())) orelse return error.ExpectedHttp2Head;
+    defer event.deinit();
+    switch (event) {
+        .head => |head| {
+            try std.testing.expectEqual(stream_id, head.stream_id);
+            try std.testing.expect(head.result.end_stream);
+        },
+        else => return error.ExpectedHttp2Head,
+    }
 }
 
 fn appendPingFrame(writer: *std.Io.Writer) !void {
@@ -818,6 +839,150 @@ test "egress http2 cancel inside a split header block at the reset tracking boun
     try std.testing.expectEqual(@as(?egress_http2.Event, null), try processFrameWire(&connection, &sent_wire.writer, data_wire.written()));
 }
 
+test "egress http2 cancel after a bodiless END_STREAM response keeps no reset entry and sends no RST_STREAM" {
+    var sent_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer sent_wire.deinit();
+    var connection = try egress_http2.Connection.init(std.testing.allocator);
+    defer connection.deinit();
+
+    const redirected = try connection.openRequest(&sent_wire.writer, .{
+        .method = "GET",
+        .scheme = "https",
+        .authority = "demo.example.test",
+        .path = "/moved",
+    }, 16);
+
+    var settings_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer settings_wire.deinit();
+    try appendSettingsFrame(&settings_wire.writer);
+    try std.testing.expectEqual(@as(?egress_http2.Event, null), try processFrameWire(&connection, &sent_wire.writer, settings_wire.written()));
+
+    // A redirect without a body is one HEADERS frame with END_STREAM, and
+    // the engine cancels the stream right after its head.
+    try receiveEndedHead(&connection, &sent_wire.writer, redirected, "301");
+    try connection.cancelStream(&sent_wire.writer, redirected);
+
+    try std.testing.expect(!connection.hasActiveStreams());
+    try std.testing.expectEqual(@as(usize, 0), connection.local_reset_streams.items.len);
+    var resets = try clientFrameStreamIds(std.testing.allocator, sent_wire.written(), .rst_stream);
+    defer resets.deinit(std.testing.allocator);
+    try std.testing.expectEqualSlices(u32, &.{}, resets.items);
+}
+
+test "egress http2 canceling ended responses never exhausts reset tracking" {
+    var sent_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer sent_wire.deinit();
+    var connection = try egress_http2.Connection.init(std.testing.allocator);
+    defer connection.deinit();
+
+    var settings_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer settings_wire.deinit();
+    try appendSettingsFrame(&settings_wire.writer);
+    try std.testing.expectEqual(@as(?egress_http2.Event, null), try processFrameWire(&connection, &sent_wire.writer, settings_wire.written()));
+
+    // One round past the bound, where a remembered reset per cancel would
+    // stop the connection from opening streams.
+    for (0..egress_http2.client.max_local_reset_tombstones + 1) |_| {
+        const stream_id = try connection.openRequest(&sent_wire.writer, .{
+            .method = "GET",
+            .scheme = "https",
+            .authority = "demo.example.test",
+            .path = "/moved",
+        }, 16);
+        try receiveEndedHead(&connection, &sent_wire.writer, stream_id, "302");
+        try connection.cancelStream(&sent_wire.writer, stream_id);
+    }
+
+    try std.testing.expectEqual(@as(usize, 0), connection.local_reset_streams.items.len);
+    try std.testing.expect(connection.canOpenStream());
+}
+
+test "egress http2 cancel of a finished response with an unfinished upload still resets the stream" {
+    var sent_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer sent_wire.deinit();
+    var connection = try egress_http2.Connection.init(std.testing.allocator);
+    defer connection.deinit();
+
+    // One byte more than the peer's initial windows admit, so the last byte
+    // of the upload still waits for a WINDOW_UPDATE when the response ends.
+    const body = try std.testing.allocator.alloc(u8, h2.default_initial_window_size + 1);
+    defer std.testing.allocator.free(body);
+    @memset(body, 'u');
+    const upload = try connection.openRequest(&sent_wire.writer, .{
+        .method = "POST",
+        .scheme = "https",
+        .authority = "demo.example.test",
+        .path = "/upload",
+        .body = body,
+    }, 16);
+
+    var settings_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer settings_wire.deinit();
+    try appendSettingsFrame(&settings_wire.writer);
+    try std.testing.expectEqual(@as(?egress_http2.Event, null), try processFrameWire(&connection, &sent_wire.writer, settings_wire.written()));
+
+    // The origin answers before the upload ends and ends its own side.
+    try receiveEndedHead(&connection, &sent_wire.writer, upload, "413");
+    try connection.cancelStream(&sent_wire.writer, upload);
+
+    // The client's side is still open, so the peer must hear the reset, but
+    // the peer sends nothing more, so no reset entry waits for it.
+    var resets = try clientFrameStreamIds(std.testing.allocator, sent_wire.written(), .rst_stream);
+    defer resets.deinit(std.testing.allocator);
+    try std.testing.expectEqualSlices(u32, &.{upload}, resets.items);
+    try std.testing.expectEqual(@as(usize, 0), connection.local_reset_streams.items.len);
+}
+
+test "egress http2 late oversized header block for a canceled stream fails no other stream" {
+    var sent_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer sent_wire.deinit();
+    var connection = try egress_http2.Connection.init(std.testing.allocator);
+    defer connection.deinit();
+
+    const canceled = try connection.openRequest(&sent_wire.writer, .{
+        .method = "GET",
+        .scheme = "https",
+        .authority = "demo.example.test",
+        .path = "/canceled",
+    }, 16);
+    const kept = try connection.openRequest(&sent_wire.writer, .{
+        .method = "GET",
+        .scheme = "https",
+        .authority = "demo.example.test",
+        .path = "/kept",
+    }, 16);
+
+    var settings_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer settings_wire.deinit();
+    try appendSettingsFrame(&settings_wire.writer);
+    try std.testing.expectEqual(@as(?egress_http2.Event, null), try processFrameWire(&connection, &sent_wire.writer, settings_wire.written()));
+    try connection.cancelStream(&sent_wire.writer, canceled);
+
+    // The origin answered before it saw the reset, with a block that inserts
+    // two entries into the dynamic table and then holds more fields than a
+    // kept response may (each 0x88 is the static `:status: 200`).
+    var block: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer block.deinit();
+    try block.writer.writeAll(split_block_headers_fragment ++ split_block_continuation_fragment);
+    try block.writer.splatByteAll(0x88, egress_http2.response.max_response_header_count + 1);
+    var oversized_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer oversized_wire.deinit();
+    try appendFrame(&oversized_wire.writer, .headers, .{ .end_stream = true, .end_headers_or_ack = true }, canceled, block.written());
+    try std.testing.expectEqual(@as(?egress_http2.Event, null), try processFrameWire(&connection, &sent_wire.writer, oversized_wire.written()));
+    try std.testing.expectEqual(@as(usize, 0), connection.local_reset_streams.items.len);
+
+    // The kept stream's block refers to both insertions, so it decodes only
+    // when the discarded block kept the table in step.
+    var server_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer server_wire.deinit();
+    try appendFrame(&server_wire.writer, .headers, .{ .end_stream = true, .end_headers_or_ack = true }, kept, dynamic_table_reference_block);
+    var reader = std.Io.Reader.fixed(server_wire.written());
+    var response = try readCollectedResponse(std.testing.allocator, &connection, &reader, &sent_wire.writer, kept);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try expectHeaders(&dynamic_table_reference_headers, response.headers);
+}
+
 test "egress http2 response limit failure resets only its stream" {
     var server_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer server_wire.deinit();
@@ -867,7 +1032,7 @@ test "egress http2 response limit failure resets only its stream" {
     try std.testing.expectEqual(@as(u32, 5), try sumClientWindowUpdateIncrements(sent_wire.written(), 0));
 }
 
-test "egress http2 forbidden response body resets its stream and credits connection data" {
+test "egress http2 forbidden response body fails its stream and credits connection data, with no reset once the body ended it" {
     var server_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer server_wire.deinit();
     try appendSettingsFrame(&server_wire.writer);
@@ -907,9 +1072,13 @@ test "egress http2 forbidden response body resets its stream and credits connect
     defer kept_response.deinit();
     try std.testing.expectEqualStrings("ok", kept_response.body);
 
+    // The forbidden DATA carried END_STREAM and the request had no body, so
+    // the stream was closed on both sides and RFC 9113 §5.1 leaves nothing
+    // to send on it.
     var resets = try clientFrameStreamIds(std.testing.allocator, sent_wire.written(), .rst_stream);
     defer resets.deinit(std.testing.allocator);
-    try std.testing.expectEqualSlices(u32, &.{rejected}, resets.items);
+    try std.testing.expectEqualSlices(u32, &.{}, resets.items);
+    try std.testing.expectEqual(@as(usize, 0), connection.local_reset_streams.items.len);
     try std.testing.expectEqual(@as(u32, 3), try sumClientWindowUpdateIncrements(sent_wire.written(), 0));
 }
 

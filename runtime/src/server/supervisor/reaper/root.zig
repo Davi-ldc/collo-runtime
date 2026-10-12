@@ -1,24 +1,32 @@
 //! The reaper: the node's one thread that retires workers. Every worker that
 //! leaves its pool, whatever ended it, is torn down here, off every request
 //! path: SIGKILL, the exit wait, the final drains of its usage and console
-//! rings, and its descriptors, wake set, mappings and cgroup leaf released
-//! (`worker_registry.teardown`), then `Pool.remove`, which frees its table
-//! entry for a later launch. Its egress session needs nothing: the exit
-//! hangs up the liveness pipe its gateway watches, and the gateway drops the
-//! session. A failed launch's child and cgroup leaf are torn down here too
-//! (`AbandonedChild.reap` in `host/launch.zig`).
+//! rings, its line in `workers.jsonl`, and its descriptors, wake set,
+//! mappings and cgroup leaf released (`worker_registry.teardown`), then
+//! `Pool.remove`, which frees its table entry for a later launch. Its egress
+//! session needs nothing: the exit hangs up the liveness pipe its gateway
+//! watches, and the gateway drops the session. A failed launch's child and
+//! cgroup leaf are torn down here too (`AbandonedChild.reap` in
+//! `host/launch.zig`).
 //!
 //! Work reaches the reaper three ways. Other threads queue what their pool
 //! calls finished (`queueRetirement`): a lane whose `Pool.release`,
-//! `Pool.transferReader` or `Pool.markDead` said `.retire`, or the
-//! launcher's `Deps.retireForEgress`, whose `Pool.retireForEgress` did. The
-//! launcher's failed launches queue their leftovers (`queueLeftovers`). The
-//! reaper's own passes retire idle workers on its timer, on memory pressure
-//! and on demand reclaim (`reaping.zig`), and it watches the pidfds of the
-//! live workers no lane reads, rescanning them before every wait, so a lane
-//! that gives up reading a worker only wakes it (`wakeForPidfdScan`); a lane
-//! watches the pidfds of the workers it reads. When the reaper sees a death
-//! first, it marks the worker dead in its pool and posts `worker_died` to
+//! `Pool.transferReader`, `Pool.retireOnNotice` or `Pool.markDead` said
+//! `.retire`, or the launcher's `Deps.retireForEgress`, whose
+//! `Pool.retireForEgress` did. The launcher's failed launches queue their
+//! leftovers (`queueLeftovers`). The reaper's own passes retire idle workers
+//! on its timer, on memory pressure and on demand reclaim (`reaping.zig`),
+//! and ask again each reader that still holds a retiring worker with no
+//! request (`retryReleases`). It watches the live idle workers no lane
+//! reads, rescanning them before every wait, so a lane that gives up reading
+//! a worker only wakes it (`wakeForPidfdScan`); a lane watches the workers
+//! it reads. For each it polls the pidfd, and the control socket: such a
+//! worker holds no request, so the only thing it writes there is its
+//! `worker_retiring` notice, which takes it out of service
+//! (`Pool.retireOnNotice`) without the reaper ever reading the socket, since
+//! a lane may become its reader at any moment and read the notice itself.
+//! When the reaper sees a death first, its pidfd or a hung-up control
+//! socket, it marks the worker dead in its pool and posts `worker_died` to
 //! every lane that holds a slot of it or reads it.
 //!
 //! After a removal its definition's pool may grow again, and the reaper
@@ -67,21 +75,24 @@ const Supervisor = supervisor_mod.Supervisor;
 const WorkerPool = supervisor_mod.WorkerPool;
 const WorkerRecord = worker_table.Record;
 
-const pool_workers_max = scheduler_limits.capacity.pool_workers_max;
+const pool_workers_max = @import("collo_limits").pool.pool_workers_max;
 
 /// The PSI trigger, the demand-reclaim eventfd and the wake eventfd lead the
-/// poll set; each watched pidfd follows.
+/// poll set; each watched worker's pidfd and control socket follow, in that
+/// order.
 const poll_fixed_sources: usize = 3;
 const poll_wake: usize = 0;
 const poll_demand_reclaim: usize = 1;
 const poll_memory_pressure: usize = 2;
+const poll_entries_per_watched: usize = 2;
 
 /// How long the thread waits before polling again after poll(2) failed,
 /// which it does only when the kernel lacks memory for the poll table.
 const poll_retry_ns: u64 = 10 * std.time.ns_per_ms;
 
-/// Why a worker is retired. The reaper counts it, and a worker that died
-/// gets its cgroup's CPU burn logged before the teardown removes the cgroup.
+/// Why a worker is retired. The reaper counts each apart, and a worker's
+/// line in `workers.jsonl` says it, a death split into crash and memory
+/// (`usage_drain.classifyWorkerDeath`).
 pub const RetireReason = enum {
     /// `Pool.markDead` took it out of service: a fault, its exit or its
     /// deadline's grace.
@@ -93,6 +104,21 @@ pub const RetireReason = enum {
     /// and no other one could give it a session (`Launcher.gatewayLost` in
     /// `launcher.zig`).
     egress_reattach,
+    /// `Pool.retireOnNotice` took it out of service: it announced
+    /// `worker_retiring`, its routes having failed or its VM having been
+    /// terminated, and finished the requests it held.
+    recycled,
+
+    /// The reason for a worker its pool reports finished with `departure`,
+    /// which the pool keeps until `Pool.remove`.
+    pub fn fromDeparture(departure: pool.Departure) RetireReason {
+        return switch (departure) {
+            .idle => .idle,
+            .died => .died,
+            .egress => .egress_reattach,
+            .recycled => .recycled,
+        };
+    }
 };
 
 /// What the reaper calls to reach the lanes and the launcher. Each call gets
@@ -129,11 +155,15 @@ pub const Counters = struct {
     retired_died: u64 = 0,
     retired_idle: u64 = 0,
     retired_egress_reattach: u64 = 0,
+    retired_recycled: u64 = 0,
     /// Failed launches whose child and leaf were torn down.
     leftovers_reaped: u64 = 0,
     /// Exits the reaper saw before any lane, among the workers no lane
     /// reads.
     deaths_seen: u64 = 0,
+    /// Control sockets of idle workers no lane reads that turned readable,
+    /// each a `worker_retiring` notice the reaper took to the pool.
+    notices_seen: u64 = 0,
     /// Idle retirements by cause. A memory-pressure reap counts under the
     /// pressure it found, demand reclaim included.
     idle_ttl_retirements: u64 = 0,
@@ -158,18 +188,13 @@ const Retirement = union(enum) {
     leftovers: launcher.Leftovers,
 };
 
-/// A live worker no lane reads, whose pidfd the reaper polls.
+/// A live idle worker no lane reads, whose pidfd and control socket the
+/// reaper polls.
 const Watched = struct {
     record: *WorkerRecord,
     key: lifecycle.WorkerKey,
     pidfd: std.posix.fd_t,
-};
-
-/// An idle retirement that waits for its reader to give the role up.
-const PendingRelease = struct {
-    record: *WorkerRecord,
-    key: lifecycle.WorkerKey,
-    tenure: pool.ReaderTenure,
+    control_fd: std.posix.fd_t,
 };
 
 pub const Reaper = struct {
@@ -205,8 +230,6 @@ pub const Reaper = struct {
 
     watched: []Watched,
     watched_len: usize,
-    pending_releases: []PendingRelease,
-    pending_releases_len: usize,
     pollfds: []std.posix.pollfd,
     next_pass_ns: u64,
     /// What a failed memory read stands on (`readPressure`).
@@ -235,9 +258,7 @@ pub const Reaper = struct {
         errdefer gpa.free(queue);
         const watched = try gpa.alloc(Watched, records_max);
         errdefer gpa.free(watched);
-        const pending_releases = try gpa.alloc(PendingRelease, records_max);
-        errdefer gpa.free(pending_releases);
-        const pollfds = try gpa.alloc(std.posix.pollfd, poll_fixed_sources + records_max);
+        const pollfds = try gpa.alloc(std.posix.pollfd, poll_fixed_sources + poll_entries_per_watched * records_max);
         errdefer gpa.free(pollfds);
         var wake = fd_mod.OwnedFd.fromRaw(try std.posix.eventfd(0, std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK));
         errdefer wake.deinit();
@@ -266,8 +287,6 @@ pub const Reaper = struct {
             .thread = null,
             .watched = watched,
             .watched_len = 0,
-            .pending_releases = pending_releases,
-            .pending_releases_len = 0,
             .pollfds = pollfds,
             .next_pass_ns = 0,
             .last_reading = .{},
@@ -347,6 +366,30 @@ pub const Reaper = struct {
         return self.idlePass(now_ns);
     }
 
+    /// The watch on the calling thread, while no reaper thread runs: the
+    /// rescan of the idle workers no lane reads, one poll of their pidfds and
+    /// control sockets that does not wait, the exits and notices it found,
+    /// then the retire queue. Returns how many workers it watched. The memory
+    /// reading and the passes stay with the thread's timer and
+    /// `retireIdleWorkers`, so the watch runs without reading the node's
+    /// memory, which could retire the workers it watches.
+    pub fn pollWatchedWorkers(self: *Reaper) usize {
+        std.debug.assert(self.thread == null);
+        self.scanReaderless();
+        const count_polled = self.buildPollSet();
+        // The watched entries follow the fixed sources, so polling only them
+        // leaves their revents where `handleWatched` reads them.
+        const ready = std.posix.poll(self.pollfds[poll_fixed_sources..count_polled], 0) catch |err| {
+            self.count("poll_failures", 1);
+            std.log.warn("reaper poll failed: {s}", .{@errorName(err)});
+            return self.watched_len;
+        };
+        if (ready != 0)
+            self.handleWatched();
+        self.processQueue();
+        return self.watched_len;
+    }
+
     /// Withdraws the demand-reclaim eventfd from the supervisor, closes the
     /// reaper's descriptors and frees its tables, after `drainRetirements`.
     pub fn deinit(self: *Reaper) void {
@@ -357,7 +400,6 @@ pub const Reaper = struct {
         self.demand_reclaim.deinit();
         self.wake.deinit();
         self.gpa.free(self.pollfds);
-        self.gpa.free(self.pending_releases);
         self.gpa.free(self.watched);
         self.gpa.free(self.queue);
         self.* = undefined;
@@ -377,7 +419,9 @@ pub const Reaper = struct {
         switch (self.supervisor.poolFor(definition).retireIdle(worker)) {
             .not_idle => return false,
             .retire => self.retire(worker, .idle),
-            .release_reader => |tenure| self.requestRelease(worker, tenure),
+            // The idle passes ask again until the reader lets go
+            // (`retryReleases`).
+            .release_reader => |tenure| self.postRelease(worker.key(), tenure),
         }
         return true;
     }
@@ -396,7 +440,7 @@ pub const Reaper = struct {
     /// needed: a failed read acts on the last reading that succeeded, or as
     /// critical (`memory.LastReading`).
     fn readPressure(self: *Reaper) memory.MemoryPressure {
-        const pressure = self.last_reading.settle(memory.readMemoryPressure(self.gpa));
+        const pressure = self.last_reading.settle(memory.readMemoryPressure(self.gpa, &self.supervisor.memory_domains));
         self.supervisor.cached_used_percent.store(pressure.used_percent, .monotonic);
         const above = pressure.used_percent >= scheduler_limits.memory.autoscale_high_water_percent;
         if (above != self.above_high_water) {
@@ -471,13 +515,19 @@ pub const Reaper = struct {
             });
             return;
         }
-        self.forgetPendingRelease(worker);
-        if (reason == .died) {
-            const drain = self.supervisor.usageDrain();
-            usage_drain.noteWorkerDeathBurn(drain, worker, usage_drain.classifyWorkerDeath(drain, worker));
-        }
+        // Read while the cgroup that says whether the kernel killed it for
+        // memory still exists.
+        const ending: worker_registry.Ending = switch (reason) {
+            .idle => .idle,
+            .egress_reattach => .egress_reattach,
+            .recycled => .recycled,
+            .died => switch (usage_drain.classifyWorkerDeath(self.supervisor.usageDrain(), worker)) {
+                .memory => .memory,
+                else => .crash,
+            },
+        };
         const worker_id = worker.id;
-        worker_registry.teardown(self.supervisor, worker);
+        worker_registry.teardown(self.supervisor, worker, ending);
         // Checked above: dead or retiring, with no holder and no reader, which
         // a worker out of service never regains. A pool that refuses anyway
         // keeps the entry, and the definition one worker short.
@@ -489,6 +539,7 @@ pub const Reaper = struct {
             .died => self.count("retired_died", 1),
             .idle => self.count("retired_idle", 1),
             .egress_reattach => self.count("retired_egress_reattach", 1),
+            .recycled => self.count("retired_recycled", 1),
         }
         if (definition_pool.growthWanted(self.supervisor.memoryGate())) {
             self.deps.submit(self.deps.ctx, definition, .capacity);
@@ -496,39 +547,30 @@ pub const Reaper = struct {
         }
     }
 
-    /// Asks the reader of an idle worker that just left service to give its
-    /// role up, and keeps asking on each idle pass (`retryReleases`) until it
-    /// does.
-    fn requestRelease(self: *Reaper, worker: *WorkerRecord, tenure: pool.ReaderTenure) void {
-        const key = worker.key();
-        // Bounded by the records: a worker is retired idle once, and its
-        // entry leaves the list before its storage serves another worker.
-        std.debug.assert(self.pending_releases_len < self.pending_releases.len);
-        self.pending_releases[self.pending_releases_len] = .{ .record = worker, .key = key, .tenure = tenure };
-        self.pending_releases_len += 1;
-        self.postRelease(key, tenure);
-    }
-
+    /// Asks the reader `tenure` names to give its role over `key`'s worker
+    /// up. A refused post is counted; the idle passes ask again
+    /// (`retryReleases`).
     fn postRelease(self: *Reaper, key: lifecycle.WorkerKey, tenure: pool.ReaderTenure) void {
         if (!self.deps.postReleaseWorker(self.deps.ctx, tenure.lane, key, tenure.epoch))
             self.count("release_posts_failed", 1);
     }
 
-    /// Posts `release_worker` again for each idle retirement whose worker
-    /// still waits for the reader its tenure names, and forgets the ones
-    /// whose reader let go.
+    /// Posts `release_worker` again to the reader of every retiring worker
+    /// that holds no request (`Pool.retiringReaders`): an idle retirement
+    /// the reaper asked for, or a worker whose last request ended after it
+    /// announced its retirement, whose lane asked. A post can be refused,
+    /// and a reader ignores a request for a tenure it no longer holds, so the
+    /// pool, not a list of what was asked, says who still has to let go.
     fn retryReleases(self: *Reaper) void {
-        var kept: usize = 0;
-        for (self.pending_releases[0..self.pending_releases_len]) |pending| {
-            const view = self.supervisor.poolFor(pending.record.definition_index).inspect(pending.record) orelse continue;
-            if (view.state != .retiring) continue;
-            const reader = view.reader orelse continue;
-            if (reader.lane != pending.tenure.lane or reader.epoch != pending.tenure.epoch) continue;
-            self.postRelease(pending.key, pending.tenure);
-            self.pending_releases[kept] = pending;
-            kept += 1;
+        for (self.supervisor.pools) |*definition_pool| {
+            var buffer: [pool_workers_max]WorkerPool.RetiringReader = undefined;
+            for (definition_pool.retiringReaders(&buffer)) |pending| {
+                // A record's key is written only while its entry is
+                // launching, and a retiring entry stays until `remove`,
+                // which only this thread calls.
+                self.postRelease(pending.worker.key(), pending.tenure);
+            }
         }
-        self.pending_releases_len = kept;
     }
 
     fn idlePass(self: *Reaper, now_ns: u64) usize {
@@ -536,15 +578,18 @@ pub const Reaper = struct {
         return reaping.idleTtlPass(self, now_ns);
     }
 
-    fn forgetPendingRelease(self: *Reaper, worker: *WorkerRecord) void {
-        var index: usize = 0;
-        while (index < self.pending_releases_len) {
-            if (self.pending_releases[index].record == worker) {
-                self.pending_releases_len -= 1;
-                self.pending_releases[index] = self.pending_releases[self.pending_releases_len];
-            } else {
-                index += 1;
-            }
+    /// A watched worker's control socket turned readable: the worker holds
+    /// no request, so this is its `worker_retiring` notice, or bytes it has
+    /// no business writing, which retire it just the same. The pool decides
+    /// with the key the scan saw (`Pool.retireOnNotice`); a lane that took a
+    /// slot meanwhile is the worker's reader and reads the notice itself.
+    fn noticeReadable(self: *Reaper, watched: Watched) void {
+        self.count("notices_seen", 1);
+        const definition_pool = self.supervisor.poolFor(watched.record.definition_index);
+        switch (definition_pool.retireOnNotice(watched.record, watched.key)) {
+            .stale, .draining => {},
+            .retire => self.retire(watched.record, .recycled),
+            .release_reader => |tenure| self.postRelease(watched.key, tenure),
         }
     }
 
@@ -627,10 +672,7 @@ pub const Reaper = struct {
                 drainCounter(self.wake.fd(), "wake");
             if (self.pollfds[poll_memory_pressure].revents != 0)
                 pressure_event = self.memoryPressureEvent(self.pollfds[poll_memory_pressure].revents);
-            for (self.pollfds[poll_fixed_sources..count_polled], 0..) |polled, index| {
-                if (polled.revents != 0)
-                    self.workerExited(self.watched[index]);
-            }
+            self.handleWatched();
             if (self.pollfds[poll_demand_reclaim].revents != 0) {
                 drainCounter(self.demand_reclaim.fd(), "demand reclaim");
                 self.demandPass();
@@ -654,7 +696,28 @@ pub const Reaper = struct {
         return (revents & std.posix.POLL.PRI) != 0;
     }
 
-    /// A watched worker's pidfd reported its exit. The first caller of
+    /// Acts on what the last poll found on each watched worker. An exit wins
+    /// over a notice written before it. A control socket the worker hung up,
+    /// which polls readable too, is a death as well, and taking it as one
+    /// keeps such a socket from waking every poll until the pidfd reports the
+    /// exit. Each worker's descriptors stay open until its retirement, which
+    /// this loop carries out for that worker alone.
+    fn handleWatched(self: *Reaper) void {
+        const hung_up = std.posix.POLL.HUP | std.posix.POLL.ERR | std.posix.POLL.NVAL;
+        for (self.watched[0..self.watched_len], 0..) |watched, index| {
+            const entry = poll_fixed_sources + poll_entries_per_watched * index;
+            const pidfd_revents = self.pollfds[entry].revents;
+            const control_revents = self.pollfds[entry + 1].revents;
+            if (pidfd_revents != 0 or (control_revents & hung_up) != 0) {
+                self.workerExited(watched);
+            } else if ((control_revents & std.posix.POLL.IN) != 0) {
+                self.noticeReadable(watched);
+            }
+        }
+    }
+
+    /// A watched worker exited: its pidfd reported the exit, or its control
+    /// socket hung up. The first caller of
     /// `markDead` owns the death: the lanes that hold a slot of the worker
     /// or read it learn of it by `worker_died`, and a worker no lane holds
     /// is retired at once.
@@ -673,7 +736,9 @@ pub const Reaper = struct {
     }
 
     /// Lists the live workers no lane reads, which are idle, since the first
-    /// lane to take a slot of a worker becomes its reader.
+    /// lane to take a slot of a worker becomes its reader. Their descriptors
+    /// stay open until their retirement, which only this thread carries out
+    /// after the scan.
     fn scanReaderless(self: *Reaper) void {
         self.watched_len = 0;
         for (self.supervisor.pools, 0..) |*definition_pool, definition| {
@@ -685,6 +750,7 @@ pub const Reaper = struct {
                     .record = idle.worker,
                     .key = idle.worker.key(),
                     .pidfd = idle.worker.handle.pidfd,
+                    .control_fd = idle.worker.handle.control_fd,
                 };
                 self.watched_len += 1;
             }
@@ -702,9 +768,11 @@ pub const Reaper = struct {
             .revents = 0,
         };
         for (self.watched[0..self.watched_len], 0..) |watched, index| {
-            self.pollfds[poll_fixed_sources + index] = .{ .fd = watched.pidfd, .events = std.posix.POLL.IN, .revents = 0 };
+            const entry = poll_fixed_sources + poll_entries_per_watched * index;
+            self.pollfds[entry] = .{ .fd = watched.pidfd, .events = std.posix.POLL.IN, .revents = 0 };
+            self.pollfds[entry + 1] = .{ .fd = watched.control_fd, .events = std.posix.POLL.IN, .revents = 0 };
         }
-        return poll_fixed_sources + self.watched_len;
+        return poll_fixed_sources + poll_entries_per_watched * self.watched_len;
     }
 };
 

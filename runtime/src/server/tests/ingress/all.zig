@@ -22,9 +22,11 @@ comptime {
     _ = @import("runner_contract.zig");
     _ = @import("stream_target.zig");
     _ = @import("analytics_drain.zig");
+    _ = @import("service_observability.zig");
     _ = @import("worker_faults.zig");
     _ = @import("lane_commands.zig");
     _ = @import("lane_connections.zig");
+    _ = @import("early_answers.zig");
     _ = @import("lane_ring.zig");
     _ = @import("request_deadlines.zig");
     _ = @import("egress_tokens.zig");

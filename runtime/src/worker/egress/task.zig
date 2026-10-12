@@ -30,6 +30,11 @@ pub const Result = union(enum) {
     failure: struct {
         message: []const u8,
         owned: bool = true,
+        /// `network_denied` when the network setting of the fetch's route
+        /// refused it at the gateway, whose message then names the origin
+        /// and what to change; the rejection also goes to the tenant's log
+        /// (`completion_runtime.deliver`).
+        cause: ipc.EgressFetchErrorCause = .failed,
     },
 
     pub fn deinit(self: *Result) void {

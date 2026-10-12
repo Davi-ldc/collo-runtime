@@ -1,6 +1,8 @@
 //! Worker faults on an ingress lane: every input from a worker the lane must
 //! refuse, from a malformed control or fault datagram to a corrupt completion
-//! ring or payload ring, and a worker that dies while its client uploads. The
+//! ring or payload ring, and a worker that dies while its client uploads;
+//! and, set against them, the notice of a worker that asks to be retired,
+//! which ends no request and is no fault unless it is malformed. The
 //! lane marks the worker dead with the reason `fault.WorkerFaultReason` names,
 //! answers each of its requests in flight with 502, or resets a stream whose
 //! response head went out, queues the worker's retirement to the reaper, and
@@ -11,6 +13,7 @@
 //! mid-upload run in `local-e2e`.
 
 const std = @import("std");
+const ipc = @import("collo_ipc");
 const lane_harness = @import("lane_harness.zig");
 
 const ingress_channel = lane_harness.ingress_channel;
@@ -435,4 +438,52 @@ test "after corrupt output a published completion loses to the death" {
     try scene.stub.sendControlBytes(&.{0x0b});
     try scene.harness.handleControl(0, scene.stub);
     try scene.expectFaultAnswered(.packet_short);
+}
+
+test "a worker_retiring packet that names no reason faults its worker" {
+    var scene: OneWorker = undefined;
+    try scene.init(.{});
+    defer scene.deinit();
+    _ = try scene.get(1);
+
+    var notice = ipc.WorkerRetiring.init(.vm_terminated);
+    notice.reason = 9;
+    try scene.stub.sendControlBytes(std.mem.asBytes(&notice));
+    try scene.harness.handleControl(0, scene.stub);
+    try scene.expectFaultAnswered(.retiring_notice_invalid);
+}
+
+test "a worker_retiring packet takes its worker out of service without failing the request it holds, and the worker retires once that request ends" {
+    var scene: OneWorker = undefined;
+    try scene.init(.{});
+    defer scene.deinit();
+    const harness = &scene.harness;
+    const held = try scene.get(1);
+
+    const notice = ipc.WorkerRetiring.init(.vm_terminated);
+    try scene.stub.sendControlBytes(std.mem.asBytes(&notice));
+    try harness.handleControl(0, scene.stub);
+
+    // Out of service with no death: no request failed, nothing is retired
+    // while a slot is held, and the next request waits for another worker.
+    try harness.expectLanesRunning();
+    const retiring = harness.workerView(scene.stub) orelse return error.WorkerLeftThePool;
+    try std.testing.expectEqual(lane_harness.pool.EntryState.retiring, retiring.state);
+    try std.testing.expectEqual(@as(usize, 0), harness.reaper.retirementsOf(scene.stub.key));
+    try std.testing.expectEqual(@as(u64, 1), harness.lane(0).lane.counters.retirement_notices);
+    const waiting = try scene.client.getAdmitted(3);
+    try std.testing.expect(harness.lane(0).requests.entries[waiting.slot].waiting());
+
+    // The worker keeps answering what it holds.
+    try scene.stub.answer(held, 200, "after the notice");
+    try harness.serveWorker(0, scene.stub);
+    try scene.expectStatus(1, 200);
+    try std.testing.expectEqual(@as(?u16, 200), harness.takeAccessStatus(0));
+
+    // Its last slot is back: its reader, this lane, gives the role up
+    // through its own queue, and the reaper retires it as recycled.
+    try harness.handleCommands(0);
+    const retirement = harness.reaper.retirementOf(scene.stub.key) orelse return error.TestExpectedRetirement;
+    try std.testing.expectEqual(lane_harness.RetireReason.recycled, retirement.reason);
+    try std.testing.expectEqual(@as(?lane_harness.fault.WorkerFaultReason, null), retirement.fault_reason);
 }

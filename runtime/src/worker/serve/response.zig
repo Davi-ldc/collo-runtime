@@ -1,23 +1,25 @@
 //! Writes a request's response to the host and finishes the request. A
-//! buffered body goes through `response_writer.zig`; a body streamed from a
-//! fetch is pulled chunk by chunk, each chunk written when the shared
-//! payload ring has room, and the request finishes when the stream ends or
+//! buffered body goes through `response_writer.zig`. A streamed body pulls
+//! from its source (`request/response_stream.zig`): a fetch body chunk by
+//! chunk here, a ReadableStream the handler's Response carried through
+//! `response_body_stream.zig`. Either way the head goes out first, each
+//! chunk is written when the payload ring has room, and the request
+//! finishes when the source ends, or resets the client's stream when it
 //! fails. A pull that cannot start, as when the handler aborted the fetch,
 //! fails only that response. A step that finds no room in the ring or the
 //! control socket waits in the request's outbox until
 //! `flushPendingIngressResponses` sends it, and the request sends nothing
 //! else meanwhile. A path that answers the request anew or ends its response
-//! early drops what the outbox holds first, so no second head follows a
-//! parked one. It runs on the worker's VM thread.
+//! early drops what the outbox holds and releases the source first, so no
+//! second head follows a parked one. It runs on the worker's VM thread.
 
 const std = @import("std");
-const bindings = @import("collo_bindings");
 const h2 = @import("collo_http").http2;
 const ipc = @import("collo_ipc");
-const exception_log = @import("collo_worker_js").exception_log;
 const request_context = @import("collo_worker_request").context;
 const ingress_response_payload_writer = @import("response_payload_writer.zig");
 const ingress_response_writer = @import("response_writer.zig");
+const response_body_stream = @import("response_body_stream.zig");
 const response_outbox = @import("collo_worker_request").ingress.response_outbox;
 const response_finish = @import("response_finish.zig");
 const response_model = @import("collo_worker_request").response_model;
@@ -44,7 +46,10 @@ const PendingFlushResult = enum {
 
 /// Writes `response` and finishes the request with `done_status` and
 /// `http_status`, now or, when part of it waits in the outbox, once the
-/// flush sends it. A streamed body is taken out of `response`.
+/// flush sends it; a streamed body finishes the request when its source
+/// ends. A streamed body is taken out of `response`. The caller is inside
+/// the request's owner window, since a ReadableStream body's first read runs
+/// the tenant's JavaScript.
 pub fn writeAndFinishResponse(
     runtime: *state.Runtime,
     request_ctx: *request_context.RequestContext,
@@ -52,18 +57,19 @@ pub fn writeAndFinishResponse(
     done_status: ipc.RequestDoneStatus,
     http_status: u16,
 ) !void {
-    if (response.body.hasFetchStream()) {
-        try writeAndFinishStreamResponse(
-            runtime,
-            request_ctx,
-            response,
-            done_status,
-            http_status,
-        );
-        return;
+    switch (response.body) {
+        .fetch_stream => {
+            try writeFetchStreamResponse(runtime, request_ctx, response, done_status, http_status);
+            return;
+        },
+        .body_stream => {
+            try response_body_stream.start(runtime, request_ctx, response, done_status, http_status);
+            return;
+        },
+        .empty, .bytes, .owned, .abi => {},
     }
 
-    if (request_ctx.response_stream_body != null)
+    if (request_ctx.response_stream != .none)
         return error.ResponseBodyStreamAlreadyPending;
     try ingress_response_writer.writeAndFinish(
         runtime,
@@ -73,23 +79,6 @@ pub fn writeAndFinishResponse(
         http_status,
         response_finish.finishRequest,
     );
-}
-
-/// Logs the handler's uncaught `exception` and answers 500, or 504 when the
-/// exception is the request's deadline terminating the VM.
-pub fn writeException(
-    runtime: *state.Runtime,
-    request_ctx: *request_context.RequestContext,
-    exception: *const bindings.Value,
-) !void {
-    if (runtime.requestDeadlineTerminationRequested(request_ctx)) {
-        try writeSimpleError(runtime, request_ctx, 504, "gateway timeout", .deadline_timeout);
-        return;
-    }
-
-    exception_log.logException(runtime.core.vm, request_ctx.exec.request_id, exception, "js exception");
-    var response = Response{ .status = 500, .body = .{ .bytes = "internal server error" } };
-    try writeAndFinishResponse(runtime, request_ctx, &response, .js_exception, 500);
 }
 
 /// Answers `status` with `message` as a plain-text body.
@@ -122,12 +111,12 @@ pub fn replaceUnsentResponse(
     done_status: ipc.RequestDoneStatus,
 ) !void {
     std.debug.assert(!request_ctx.response_committed);
-    abandonResponse(runtime, request_ctx);
+    abandonResponse(runtime, request_ctx, done_status);
     try writeSimpleError(runtime, request_ctx, status, message, done_status);
 }
 
 /// Ends the response of `request_ctx`, which cannot go on, and finishes the
-/// request with `internal_error` and `http_status`. What is left of the
+/// request with `done_status` and `http_status`. What is left of the
 /// response is dropped first (`abandonResponse`). A head that went out means
 /// the client already has part of the response, so its stream is reset
 /// instead of ending cleanly. A reset that finds the control socket full
@@ -135,11 +124,13 @@ pub fn replaceUnsentResponse(
 pub fn failResponse(
     runtime: *state.Runtime,
     request_ctx: *request_context.RequestContext,
+    done_status: ipc.RequestDoneStatus,
     http_status: u16,
 ) !void {
     const request_id = request_ctx.exec.request_id;
-    abandonResponse(runtime, request_ctx);
-    // The flush finishes the request of a parked reset with this status.
+    abandonResponse(runtime, request_ctx, done_status);
+    // The flush finishes the request of a parked reset with these statuses.
+    request_ctx.response_done_status = done_status;
     request_ctx.response_http_status = http_status;
     if (request_ctx.response_committed) {
         // Every dispatched request has a nonzero stream
@@ -168,21 +159,27 @@ pub fn failResponse(
         }
     }
     tracing.mark(runtime, request_ctx, "response_write_done_ns");
-    _ = try response_finish.finishRequest(runtime, request_ctx, .internal_error, http_status);
+    _ = try response_finish.finishRequest(runtime, request_ctx, done_status, http_status);
 }
 
-/// Drops what is left of the response of `request_ctx`: the fetch body a
-/// streamed response pulls and the steps its outbox holds. A pull still in
-/// flight then finds no request streaming its body
-/// (`executeFetchBodyStreamReady`).
+/// Drops what is left of the response of `request_ctx`, which ends with
+/// `done_status`: its streamed source and the steps its outbox holds. A
+/// fetch body goes back to the runtime, and a pull still in flight then
+/// finds no request streaming it (`executeFetchBodyStreamReady`); a body
+/// stream still open is cancelled when `done_status` allows it
+/// (`response_body_stream.cancelFor`).
 fn abandonResponse(
     runtime: *state.Runtime,
     request_ctx: *request_context.RequestContext,
+    done_status: ipc.RequestDoneStatus,
 ) void {
-    if (request_ctx.response_stream_body) |stream_identity| {
-        request_ctx.response_stream_body = null;
-        request_ctx.response_stream_pull_pending = false;
-        _ = runtime.releaseFetchBody(stream_identity);
+    switch (request_ctx.response_stream) {
+        .none => {},
+        .fetch => |fetch| {
+            request_ctx.response_stream = .none;
+            _ = runtime.releaseFetchBody(fetch.identity);
+        },
+        .body_stream => response_body_stream.release(runtime, request_ctx, response_body_stream.cancelFor(done_status)),
     }
     response_finish.releasePendingIngressResponse(runtime, request_ctx);
 }
@@ -193,7 +190,8 @@ fn abandonResponse(
 /// (`scheduler/loop.zig`). A step that finds the socket full stays parked
 /// and ends the call; one that finds the ring full stays parked and the pass
 /// goes on. A request that finishes restarts the pass, because its removal
-/// invalidates the iterator.
+/// invalidates the iterator. Runs outside every owner window, so it never
+/// reads a body stream: it asks the stream's work item for the next read.
 pub fn flushPendingIngressResponses(runtime: *state.Runtime) !void {
     runtime.requests.control_send_blocked = false;
     while (true) {
@@ -224,7 +222,7 @@ pub fn flushPendingIngressResponses(runtime: *state.Runtime) !void {
 
 /// Sends the step the outbox of `request_ctx` holds. The step stays parked
 /// until it is sent whole, so a send that finds no room leaves the outbox
-/// as it was, apart from the progress a buffered body made.
+/// as it was, apart from the progress a body or a chunk made.
 fn flushPendingIngressResponse(
     runtime: *state.Runtime,
     request_ctx: *request_context.RequestContext,
@@ -285,17 +283,26 @@ fn flushStreamHead(
     return .progressed;
 }
 
+/// Sends a parked chunk of a streamed body from the offset it reached. The
+/// chunk keeps its place until all of it went out; then its credits go back
+/// to the gateway, a chunk that ended the body finishes the request, and any
+/// other asks its source for the next one.
 fn flushStreamChunk(
     runtime: *state.Runtime,
     request_ctx: *request_context.RequestContext,
     chunk: *response_outbox.StreamChunk,
 ) !PendingFlushResult {
-    const bytes = chunk.bytes.bytes();
-    if (!try ingress_response_payload_writer.canWritePayload(runtime, bytes.len))
-        return .blocked;
-    switch (try ingress_response_payload_writer.writeStreamChunk(runtime, request_ctx, bytes, chunk.done)) {
+    const offset_before = chunk.offset;
+    switch (try ingress_response_payload_writer.writeStreamBytes(
+        runtime,
+        request_ctx,
+        chunk.bytes.bytes(),
+        &chunk.offset,
+        chunk.done,
+    )) {
         .sent => {},
-        .blocked => return .socket_full,
+        .ring_full => return if (chunk.offset != offset_before) .progressed else .blocked,
+        .socket_full => return .socket_full,
     }
 
     var sent_chunk = request_ctx.response_outbox.take().stream_chunk;
@@ -340,13 +347,13 @@ fn flushStreamReset(
     _ = try response_finish.finishRequest(
         runtime,
         request_ctx,
-        .internal_error,
+        request_ctx.response_done_status,
         request_ctx.response_http_status,
     );
     return .finished;
 }
 
-fn writeAndFinishStreamResponse(
+fn writeFetchStreamResponse(
     runtime: *state.Runtime,
     request_ctx: *request_context.RequestContext,
     response: *Response,
@@ -354,20 +361,20 @@ fn writeAndFinishStreamResponse(
     http_status: u16,
 ) !void {
     const stream_identity = response.body.takeFetchStream() orelse return error.InvalidResponseBody;
-    if (request_ctx.response_stream_body != null)
+    if (request_ctx.response_stream != .none) {
+        response.body = .{ .fetch_stream = stream_identity };
         return error.ResponseBodyStreamAlreadyPending;
+    }
 
     var stream_moved = false;
     errdefer if (!stream_moved) {
-        request_ctx.response_stream_body = null;
-        request_ctx.response_stream_pull_pending = false;
+        request_ctx.response_stream = .none;
         response.body = .{ .fetch_stream = stream_identity };
     };
 
-    request_ctx.response_stream_body = stream_identity;
+    request_ctx.response_stream = .{ .fetch = .{ .identity = stream_identity } };
     request_ctx.response_done_status = done_status;
     request_ctx.response_http_status = http_status;
-    request_ctx.response_stream_pull_pending = false;
     switch (try ingress_response_payload_writer.writeStreamHead(runtime, request_ctx, response)) {
         .sent => {},
         .blocked => {
@@ -388,11 +395,12 @@ fn writeAndFinishStreamResponse(
 /// caller settles it as an ordinary fetch body instead.
 pub fn executeFetchBodyStreamReady(runtime: *state.Runtime, body_id: u64) !bool {
     const request_ctx = responseStreamRequestForBodyId(runtime, body_id) orelse return false;
-    if (!request_ctx.response_stream_pull_pending)
+    const fetch = &request_ctx.response_stream.fetch;
+    if (!fetch.pull_pending)
         return true;
 
-    const identity = request_ctx.response_stream_body orelse return false;
-    request_ctx.response_stream_pull_pending = false;
+    const identity = fetch.identity;
+    fetch.pull_pending = false;
 
     // Defers run last-in first-out: the drain's deinit below releases
     // borrowed pool extents after the drain's own flush ran, so the gateway
@@ -408,12 +416,12 @@ pub fn executeFetchBodyStreamReady(runtime: *state.Runtime, body_id: u64) !bool 
     if (drain.waiter == null) {
         credits_released = true;
         runtime.releaseFetchBodyResponseStreamCredits(drain.credits.slice());
-        request_ctx.response_stream_pull_pending = true;
+        fetch.pull_pending = true;
         return true;
     }
 
     if (drain.failed) {
-        try failResponse(runtime, request_ctx, request_ctx.response_http_status);
+        try failResponse(runtime, request_ctx, .internal_error, request_ctx.response_http_status);
         credits_released = true;
         runtime.releaseFetchBodyResponseStreamCredits(drain.credits.slice());
         return true;
@@ -421,25 +429,25 @@ pub fn executeFetchBodyStreamReady(runtime: *state.Runtime, body_id: u64) !bool 
 
     const drain_bytes = drain.bytes.bytes();
     if (drain_bytes.len != 0) {
-        if (try ingress_response_payload_writer.canWritePayload(runtime, drain_bytes.len)) {
-            switch (try ingress_response_payload_writer.writeStreamChunk(runtime, request_ctx, drain_bytes, drain.done)) {
-                .sent => {
-                    credits_released = true;
-                    runtime.releaseFetchBodyResponseStreamCredits(drain.credits.slice());
-                    if (drain.done) {
-                        try finishResponseStream(runtime, request_ctx);
-                    } else {
-                        _ = pullNextChunkOrFail(runtime, request_ctx);
-                    }
-                    return true;
-                },
-                .blocked => {},
-            }
+        var sent_len: usize = 0;
+        switch (try ingress_response_payload_writer.writeStreamBytes(runtime, request_ctx, drain_bytes, &sent_len, drain.done)) {
+            .sent => {
+                credits_released = true;
+                runtime.releaseFetchBodyResponseStreamCredits(drain.credits.slice());
+                if (drain.done) {
+                    try finishResponseStream(runtime, request_ctx);
+                } else {
+                    _ = pullNextChunkOrFail(runtime, request_ctx);
+                }
+                return true;
+            },
+            .ring_full, .socket_full => {},
         }
         // The ring or the control socket has no room, so the chunk waits in
-        // the outbox with its credits until the flush sends it.
+        // the outbox with its credits until the flush sends the rest.
         var chunk = response_outbox.StreamChunk{
             .bytes = drain.takeBytes(),
+            .offset = sent_len,
             .credits = drain.takeCredits(),
             .done = drain.done,
         };
@@ -473,7 +481,10 @@ fn responseStreamRequestForBodyId(
 ) ?*request_context.RequestContext {
     const body = runtime.egress.state.bodies.get(body_id) orelse return null;
     const request_ctx = runtime.requests.active.get(body.identity.request_id) orelse return null;
-    const stream_identity = request_ctx.response_stream_body orelse return null;
+    const stream_identity = switch (request_ctx.response_stream) {
+        .fetch => |fetch| fetch.identity,
+        .none, .body_stream => return null,
+    };
     if (stream_identity.request_id != body.identity.request_id)
         return null;
     if (stream_identity.request_generation != body.identity.request_generation)
@@ -485,21 +496,31 @@ fn responseStreamRequestForBodyId(
     return request_ctx;
 }
 
-/// Starts the pull of the next chunk of the fetch body the response of
-/// `request_ctx` streams. A body that can no longer be pulled, such as one
-/// whose fetch the handler aborted, ends only this response
-/// (`failResponse`), and the call returns false.
+/// Asks the source the response of `request_ctx` streams for its next
+/// chunk: a fetch body's pull starts here, and a body stream's read waits
+/// for the request's work item (`response_body_stream.readNextAfterFlush`),
+/// since this runs from the flush too. A fetch body that can no longer be
+/// pulled, such as one whose fetch the handler aborted, ends only this
+/// response (`failResponse`), and the call returns false.
 fn pullNextChunkOrFail(
     runtime: *state.Runtime,
     request_ctx: *request_context.RequestContext,
 ) bool {
-    scheduleNextResponseStreamPull(runtime, request_ctx) catch |err| {
+    switch (request_ctx.response_stream) {
+        .none => return true,
+        .body_stream => {
+            response_body_stream.readNextAfterFlush(runtime, request_ctx);
+            return true;
+        },
+        .fetch => {},
+    }
+    scheduleNextFetchPull(runtime, request_ctx) catch |err| {
         const request_id = request_ctx.exec.request_id;
         std.log.warn("failed to pull streamed response body request_id={d}: {s}", .{
             request_id,
             @errorName(err),
         });
-        failResponse(runtime, request_ctx, request_ctx.response_http_status) catch |fail_err| {
+        failResponse(runtime, request_ctx, .internal_error, request_ctx.response_http_status) catch |fail_err| {
             std.log.warn("failed to reset failed streamed response request_id={d}: {s}", .{
                 request_id,
                 @errorName(fail_err),
@@ -510,23 +531,34 @@ fn pullNextChunkOrFail(
     return true;
 }
 
-fn scheduleNextResponseStreamPull(
+fn scheduleNextFetchPull(
     runtime: *state.Runtime,
     request_ctx: *request_context.RequestContext,
 ) !void {
-    if (request_ctx.response_stream_pull_pending)
+    const fetch = switch (request_ctx.response_stream) {
+        .fetch => |*fetch| fetch,
+        .none, .body_stream => return error.FetchBodyNotFound,
+    };
+    if (fetch.pull_pending)
         return error.FetchBodyReadInProgress;
-    const identity = request_ctx.response_stream_body orelse return error.FetchBodyNotFound;
-    request_ctx.response_stream_pull_pending = true;
-    errdefer request_ctx.response_stream_pull_pending = false;
-    try runtime.beginFetchBodyResponseStreamPull(identity);
+    fetch.pull_pending = true;
+    errdefer fetch.pull_pending = false;
+    try runtime.beginFetchBodyResponseStreamPull(fetch.identity);
 }
 
-fn finishResponseStream(runtime: *state.Runtime, request_ctx: *request_context.RequestContext) !void {
-    const identity = request_ctx.response_stream_body orelse return error.FetchBodyNotFound;
-    request_ctx.response_stream_body = null;
-    request_ctx.response_stream_pull_pending = false;
-    _ = runtime.releaseFetchBody(identity);
+/// Finishes the request of a streamed response whose end went out, with the
+/// statuses the response was written with, after releasing its source: a
+/// fetch body back to the runtime, a body stream, which has closed, without
+/// a cancel.
+pub fn finishResponseStream(runtime: *state.Runtime, request_ctx: *request_context.RequestContext) !void {
+    switch (request_ctx.response_stream) {
+        .none => return error.ResponseStreamNotFound,
+        .fetch => |fetch| {
+            request_ctx.response_stream = .none;
+            _ = runtime.releaseFetchBody(fetch.identity);
+        },
+        .body_stream => response_body_stream.release(runtime, request_ctx, null),
+    }
     tracing.mark(runtime, request_ctx, "response_write_done_ns");
     _ = try response_finish.finishRequest(
         runtime,

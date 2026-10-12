@@ -1,10 +1,13 @@
 //! Validation and normalization of host names for routing, TLS SNI and Host
 //! headers. A valid name is at most `max_name_bytes` of ASCII letters,
-//! digits, hyphens and dots, has no trailing dot, and has no label that is
-//! empty, longer than 63 bytes, or starts or ends with a hyphen, so a
-//! bracketed IP literal, an underscore or a Unicode name fails. Normalizing
-//! trims surrounding whitespace, lowercases ASCII and changes nothing else.
-//! Pure functions, callable from any thread.
+//! digits, hyphens, underscores and dots, has no trailing dot, and has no
+//! label that is empty, longer than 63 bytes, or starts or ends with a
+//! hyphen, so a bracketed IP literal or a Unicode name fails. These are the
+//! name rules of the `network` grammar (`common/network/pattern.zig`), whose
+//! canonical form drops the trailing dot, so every name an allow entry or a
+//! fetch's URL host reads to passes here; `_` is accepted because URL hosts
+//! carry it. Normalizing trims surrounding whitespace, lowercases ASCII and
+//! changes nothing else. Pure functions, callable from any thread.
 
 const std = @import("std");
 
@@ -30,7 +33,7 @@ pub fn validateName(name: []const u8) !void {
             return error.InvalidDomain;
 
         for (label) |byte| {
-            if (!(std.ascii.isAlphanumeric(byte) or byte == '-'))
+            if (!(std.ascii.isAlphanumeric(byte) or byte == '-' or byte == '_'))
                 return error.InvalidDomain;
         }
     }

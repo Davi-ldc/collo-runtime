@@ -7,10 +7,12 @@
 //!
 //! Invariants:
 //! - Identity, method, path, route, client address and timings come from the
-//!   lane's own state. The worker's own report (CPU, I/O and waiting time,
-//!   how the request ended, the status it answered) is copied off its
-//!   completion into the slot the lane holds for that request, so a worker
-//!   cannot attach it to another request's record.
+//!   lane's own state. The worker's own report (how the request ended and
+//!   the status it answered) is copied off its completion into the slot the
+//!   lane holds for that request, so a worker cannot attach it to another
+//!   request's record. What a request used, its CPU and the worker's split
+//!   of its time, is in its usage record alone (`usage.zig`), joined to this
+//!   one on `worker_id`, `worker_generation` and `request_id`.
 //! - Facts and records are fixed-size plain data. Every string is cut at its
 //!   cap (`common/limits/runtime_logs.zig`) and copied when the facts are
 //!   stamped, so the request path never allocates for the access log; the
@@ -31,15 +33,16 @@
 //!     {"ts":<unix ms>,"request_id":N,"worker":"..","route":"..","worker_id":N,
 //!      "worker_generation":N,"method":"GET","path":"/..","status":200,
 //!      "answered_by":"worker","cold_start":false,"duration_ms":N,"ttfb_ms":N,
-//!      "cpu_time_ns":N,"io_time_ns":N,"waiting_ns":N,"cold_start_ms":N,
-//!      "cold_start_blocked_ms":N,"error_code":"done","worker_fault":"",
-//!      "client_ip":"..","user_agent":".."}
+//!      "cold_start_ms":N,"cold_start_blocked_ms":N,"error_code":"done",
+//!      "worker_fault":"","client_ip":"..","user_agent":".."}
 //!
 //! `ts` is when the request ended. `worker_id` and `worker_generation` are 0
 //! when no worker took the request, and `worker` and `route` are "" when it
-//! matched no route. `worker_fault` names the worker fault that ended the
-//! request (`WorkerFaultReason.label` in `server/ingress/fault.zig`), "" when
-//! none did.
+//! matched no route. `method` and `path` are "" for a request whose head
+//! never decoded. `ttfb_ms` is 0 only when no response head went out.
+//! `worker_fault` names the worker fault that ended the request
+//! (`WorkerFaultReason.label` in `server/ingress/fault.zig`), "" when none
+//! did.
 
 const std = @import("std");
 const os = @import("collo_os");
@@ -61,17 +64,13 @@ pub const AccessFacts = struct {
     request_id: u64 = 0,
     worker_id: u64 = 0,
     worker_generation: u64 = 0,
-    /// Monotonic time the lane admitted the request, before the pool hands it
-    /// a worker slot, or began answering it alone.
+    /// Monotonic time of the socket read that brought the request's head
+    /// (`ParsedHead.received_ns` in `server/ingress/http2/request_head.zig`),
+    /// from which the lane admits it or answers it alone.
     started_mono_ns: u64 = 0,
     /// Monotonic time the response head was queued toward the client; 0 when
     /// none was, as after a worker death or timeout before the head.
     first_byte_mono_ns: u64 = 0,
-    /// The worker's timeline, copied off its completion when the request
-    /// ends; 0 on every path where no worker finished the request.
-    cpu_time_ns: u64 = 0,
-    io_time_ns: u64 = 0,
-    waiting_ns: u64 = 0,
     /// The cold start this request waited for: the new worker's own boot
     /// work (`Record.boot_work_ns` in `server/supervisor/worker_table.zig`),
     /// and how long this request was blocked on it, from its admission to its
@@ -256,9 +255,6 @@ pub const json_record_bytes_max: usize = blk: {
             widest,
             widest,
             widest,
-            widest,
-            widest,
-            widest,
             record.longestTagName(CompletedStatus),
         }) +
         worker_fault_key.len + record.stringBytesMax(limits.WORKER_FAULT_BYTES_MAX) +
@@ -295,9 +291,6 @@ pub fn writeRecordJson(writer: *std.Io.Writer, access: *const AccessRecord, cloc
         if (facts.cold_start) "true" else "false",
         access.durationMs(),
         access.ttfbMs(),
-        facts.cpu_time_ns,
-        facts.io_time_ns,
-        facts.waiting_ns,
         facts.cold_start_ns / std.time.ns_per_ms,
         facts.cold_start_blocked_ns / std.time.ns_per_ms,
         @tagName(facts.error_code),
@@ -315,8 +308,7 @@ const head_format = "{{\"ts\":{d},\"request_id\":{d},";
 const method_key = ",\"method\":";
 const path_key = ",\"path\":";
 const measures_format = ",\"status\":{d},\"answered_by\":\"{s}\",\"cold_start\":{s},\"duration_ms\":{d}" ++
-    ",\"ttfb_ms\":{d},\"cpu_time_ns\":{d},\"io_time_ns\":{d},\"waiting_ns\":{d}" ++
-    ",\"cold_start_ms\":{d},\"cold_start_blocked_ms\":{d},\"error_code\":\"{s}\"";
+    ",\"ttfb_ms\":{d},\"cold_start_ms\":{d},\"cold_start_blocked_ms\":{d},\"error_code\":\"{s}\"";
 const worker_fault_key = ",\"worker_fault\":";
 const client_ip_key = ",\"client_ip\":";
 const user_agent_key = ",\"user_agent\":";

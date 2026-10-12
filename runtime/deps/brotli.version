@@ -1,0 +1,9 @@
+Source: https://github.com/google/brotli.git
+Tag: v1.2.0
+Commit: 028fb5a23661f123017c060daa546b55cf4bde29
+Patches: none
+
+Brotli's encoder and decoder, consumed as a shallow checkout of this commit
+(`zig build deps-provision`). `runtime/build/codecs.zig` compiles the C
+sources under `c/common`, `c/dec` and `c/enc` into a static library for each
+target, with the static tables computed at compile time.

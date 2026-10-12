@@ -157,6 +157,31 @@ describe("timers", () => {
     assert.deepEqual(order, ["omitted", "negative", "nan", "object"]);
   });
 
+  test("setTimeout converts its delay with ToInt32, so a delay past 2 ** 31 - 1 wraps instead of saturating", async () => {
+    // HTML's timeout is a WebIDL long: 2 ** 31 wraps to -(2 ** 31), which HTML
+    // clamps to 0, and 2 ** 32 + 2 wraps to 2.
+    const order = [];
+    await new Promise(resolve => {
+      setTimeout(() => order.push("wrapped-to-zero"), 2 ** 31);
+      setTimeout(() => order.push("one"), 1);
+      setTimeout(() => {
+        order.push("wrapped-to-two");
+        resolve();
+      }, 2 ** 32 + 2);
+    });
+    assert.deepEqual(order, ["wrapped-to-zero", "one", "wrapped-to-two"]);
+  });
+
+  test("clear functions ignore a number no timer id can be, at or past 2 ** 64", () => {
+    // Converting such a number to a 64-bit id is undefined behavior, which
+    // only the UBSan mode (-Dsanitize=undefined) turns into a failure.
+    assert.equal(clearTimeout(2 ** 64), undefined);
+    assert.equal(clearInterval(2 ** 64), undefined);
+    assert.equal(clearImmediate(2 ** 64), undefined);
+    assert.equal(clearTimeout(2 ** 70), undefined);
+    assert.equal(clearImmediate(2 ** 70), undefined);
+  });
+
   test("clearTimeout cancels pending callback", async () => {
     let called = false;
     const id = setTimeout(() => {

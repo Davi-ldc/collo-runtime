@@ -1,9 +1,10 @@
 //! The scheduler's structures and the worker ring: ready queue order,
 //! wrap-around and slot metadata, timer heap order and cancellation,
 //! immediate generations and cancellation, the fixed capacity of each, and
-//! the worker ring's fixed-file table, its idle re-arm and the control
-//! socket's write poll, armed only while a send waits, whose hangup fails
-//! the wait as the read poll's does. The one loop run here meets a hangup
+//! the worker ring's fixed-file table, with both egress slots empty and
+//! never polled for a worker without a network grant, its idle re-arm and
+//! the control socket's write poll, armed only while a send waits, whose
+//! hangup fails the wait as the read poll's does. The one loop run here meets a hangup
 //! before its first wait and stops cleanly. The loop running real turns, and
 //! flushing a parked response, is covered by `worker/tests/runtime/` in the
 //! same worker-test lane, and inside a sandboxed worker by the
@@ -521,6 +522,58 @@ test "worker ring fixed table contains only expected control wakeup egress timer
         try expectNotRegularFileOrDirectory(fd);
 }
 
+// A worker whose definition grants no network access gets no egress
+// descriptor with WorkerInit. Its runtime used to refuse the empty set
+// (`InvalidEgressSharedEndpoint`), and its ring had nothing to register in
+// the two egress slots (`WorkerRingMissingEgressWake`).
+test "a worker without a network grant registers its ring with both egress slots empty and every other slot filled" {
+    const control_pair = try fd_mod.socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
+    defer std.posix.close(control_pair[0]);
+    defer std.posix.close(control_pair[1]);
+    const ingress_payload_credit_fd = try std.posix.eventfd(0, std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK);
+    var ingress_payload_credit_owned_by_runtime = false;
+    errdefer if (!ingress_payload_credit_owned_by_runtime)
+        std.posix.close(ingress_payload_credit_fd);
+
+    const fault_pair = try fd_mod.socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
+    defer std.posix.close(fault_pair[0]);
+    defer std.posix.close(fault_pair[1]);
+    try worker.fs.installForTestWithFault(ring_index_bytes, worker.fs.deploy_root, fault_pair[0], worker.fs.deploy_root);
+    defer worker.fs.uninstallForTest();
+
+    var vm = try bindings.Vm.createDefault();
+    defer vm.deinit();
+
+    // The egress descriptors a launch without a grant sends: none at all, as
+    // `zygote/child_boot.zig` passes them.
+    var no_egress: ipc.egress_shared.RawFds = .{};
+    ingress_payload_credit_owned_by_runtime = true;
+    var completion_fixture = try rt.CompletionFixture.init();
+    defer completion_fixture.deinit();
+    var runtime = try worker.Runtime.init(std.testing.allocator, &vm, control_pair[0], &completion_fixture.view, try rt.createCompletionEventfd(), worker.RuntimeOptions{
+        .egress_shared_fds = &no_egress,
+        .ingress_payload_credit_eventfd = ingress_payload_credit_fd,
+    });
+    defer runtime.deinit();
+    try std.testing.expect(runtime.egress.state.grant() == .none);
+
+    try runtime.initRestrictedWorkerRing();
+
+    const fixed_files = runtime.workerRingFixedFiles() orelse return error.MissingWorkerRingFixedFiles;
+    try std.testing.expectEqual(restricted_uring.empty_slot, fixed_files[@intFromEnum(restricted_uring.FixedFile.egress_completion)]);
+    try std.testing.expectEqual(restricted_uring.empty_slot, fixed_files[@intFromEnum(restricted_uring.FixedFile.egress_liveness)]);
+    try std.testing.expectEqual(control_pair[0], fixed_files[@intFromEnum(restricted_uring.FixedFile.control)]);
+    try std.testing.expectEqual(runtime.workerTimerFd().?, fixed_files[@intFromEnum(restricted_uring.FixedFile.timer)]);
+    try std.testing.expectEqual(fault_pair[0], fixed_files[@intFromEnum(restricted_uring.FixedFile.fs_fault)]);
+
+    // The loop arms no egress poll on the empty slots.
+    var backend = try scheduler_uring_backend.UringBackend.init(&runtime);
+    defer backend.deinit();
+    try backend.arm(&runtime);
+    try std.testing.expect(!backend.egress_completion_poll_armed);
+    try std.testing.expect(!backend.egress_liveness_poll_armed);
+}
+
 test "worker ring fixed table rejects sockets outside the control slot" {
     const control_pair = try fd_mod.socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
     defer std.posix.close(control_pair[0]);
@@ -556,19 +609,19 @@ test "worker ring fixed table rejects sockets outside the control slot" {
         ingress_payload_credit_fd,
         fault_pair[0],
     };
-    try std.testing.expectError(error.InvalidWorkerRingFixedFile, restricted_uring.validateWorkerFixedFiles(&fixed_files));
+    try std.testing.expectError(error.InvalidWorkerRingFixedFile, restricted_uring.validateWorkerFixedFiles(&fixed_files, .granted));
 
     fixed_files[@intFromEnum(restricted_uring.FixedFile.egress_completion)] = completion_fd;
-    try restricted_uring.validateWorkerFixedFiles(&fixed_files);
+    try restricted_uring.validateWorkerFixedFiles(&fixed_files, .granted);
 
     fixed_files[@intFromEnum(restricted_uring.FixedFile.timer)] = wrong_socket_pair[0];
-    try std.testing.expectError(error.InvalidWorkerRingFixedFile, restricted_uring.validateWorkerFixedFiles(&fixed_files));
+    try std.testing.expectError(error.InvalidWorkerRingFixedFile, restricted_uring.validateWorkerFixedFiles(&fixed_files, .granted));
     fixed_files[@intFromEnum(restricted_uring.FixedFile.timer)] = liveness_fd;
-    try std.testing.expectError(error.InvalidWorkerRingFixedFile, restricted_uring.validateWorkerFixedFiles(&fixed_files));
+    try std.testing.expectError(error.InvalidWorkerRingFixedFile, restricted_uring.validateWorkerFixedFiles(&fixed_files, .granted));
     fixed_files[@intFromEnum(restricted_uring.FixedFile.timer)] = timer_fd;
 
     fixed_files[@intFromEnum(restricted_uring.FixedFile.wakeup)] = control_pair[0];
-    try std.testing.expectError(error.InvalidWorkerRingFixedFile, restricted_uring.validateWorkerFixedFiles(&fixed_files));
+    try std.testing.expectError(error.InvalidWorkerRingFixedFile, restricted_uring.validateWorkerFixedFiles(&fixed_files, .granted));
 }
 
 fn expectNotRegularFileOrDirectory(fd: std.posix.fd_t) !void {

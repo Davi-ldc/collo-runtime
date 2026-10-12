@@ -33,16 +33,15 @@ std::optional<CryptoKeyAlgorithm> aesAlgorithmFromName(const WTF::String&);
 uint8_t allowedUsagesForAes(CryptoKeyAlgorithm);
 // Takes the bytes and never returns null, like `createHmacKey` and `createRawDeriveKey`.
 JSColloCryptoKey* createAesKey(
-    JSC::JSGlobalObject*, CryptoKeyAlgorithm, WTF::Vector<uint8_t>&& material, bool extractable, uint8_t usages);
+    JSC::JSGlobalObject*, CryptoKeyAlgorithm, SecretBytes&& material, bool extractable, uint8_t usages);
 
 // `declared_length_bits` is the `length` an import declared, or 0 when it declared none; `key.algorithm.length`
 // reports it (`JSColloCryptoKey::hmacLengthBits`).
-JSColloCryptoKey* createHmacKey(JSC::JSGlobalObject*, WebCryptoHash, WTF::Vector<uint8_t>&& material, bool extractable,
+JSColloCryptoKey* createHmacKey(JSC::JSGlobalObject*, WebCryptoHash, SecretBytes&& material, bool extractable,
     uint8_t usages, size_t declared_length_bits = 0);
 
 // A PBKDF2 or HKDF key, which is never extractable.
-JSColloCryptoKey* createRawDeriveKey(
-    JSC::JSGlobalObject*, CryptoKeyAlgorithm, WTF::Vector<uint8_t>&& material, uint8_t usages);
+JSColloCryptoKey* createRawDeriveKey(JSC::JSGlobalObject*, CryptoKeyAlgorithm, SecretBytes&& material, uint8_t usages);
 
 bool isRsaAlgorithm(CryptoKeyAlgorithm);
 WTF::ASCIILiteral rsaAlgorithmName(CryptoKeyAlgorithm);
@@ -52,8 +51,10 @@ uint8_t allowedPrivateUsagesForRsa(CryptoKeyAlgorithm);
 uint8_t allowedUsagesForRsa(CryptoKeyAlgorithm);
 // Empty when JWK defines no `alg` for the pair, as for the SHA-3 hashes.
 WTF::ASCIILiteral rsaJwkAlgorithm(CryptoKeyAlgorithm, WebCryptoHash);
-// Writes the big-endian magnitude of `bn` to `out`; false for a null `bn` or a failed allocation.
+// Writes the big-endian magnitude of `bn` to `out`, which must be empty; false for a null `bn` or a failed
+// allocation. The SecretBytes form is for a private component.
 bool bnToBytes(const BIGNUM*, WTF::Vector<uint8_t>& out);
+bool bnToBytes(const BIGNUM*, SecretBytes& out);
 // Reads a big-endian magnitude; null for empty input or a failed allocation.
 bssl::UniquePtr<BIGNUM> bytesToBn(std::span<const uint8_t>);
 // Wraps `rsa` in a new `EVP_PKEY` that takes its own reference, so the caller keeps its own; `pkeyFromEc` does the

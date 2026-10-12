@@ -466,3 +466,37 @@ describe("abort listener exception isolation and born-aborted signals", () => {
     assert.equal(dependentFired, 0, "AbortSignal.any with an aborted source is aborted at birth");
   });
 });
+
+describe("AbortSignal listener accounting and bounds", () => {
+  // A fetch that the runtime accepts adds its own abort listener to the signal and removes it when the fetch ends.
+  // That listener counts toward the signal's listener cap like any other, so removing it leaves the count intact.
+  test("a fetch's abort listener leaves the signal's listener count intact", async () => {
+    const controller = new AbortController();
+    const { signal } = controller;
+    await fetch("https://example.com/", { signal }).catch(() => {});
+    await fetch("https://example.com/", { signal }).catch(() => {});
+    let calls = 0;
+    signal.addEventListener("abort", () => calls++);
+    controller.abort();
+    assert.equal(calls, 1);
+  });
+
+  test("replacing onabort many times keeps one handler", () => {
+    const controller = new AbortController();
+    let calls = 0;
+    for (let i = 0; i < 20000; i++) controller.signal.onabort = () => calls++;
+    controller.abort();
+    assert.equal(calls, 1);
+  });
+
+  test("AbortSignal.any refuses more inputs than its bound", () => {
+    const signal = new AbortController().signal;
+    const inputs = Array.from({ length: 1025 }, () => signal);
+    assert.throws(() => AbortSignal.any(inputs), DOMException);
+    const distinct = Array.from({ length: 64 }, () => new AbortController());
+    const dependent = AbortSignal.any(distinct.map(controller => controller.signal));
+    distinct[63].abort("last");
+    assert.equal(dependent.aborted, true);
+    assert.equal(dependent.reason, "last");
+  });
+});

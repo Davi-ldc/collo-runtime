@@ -2,8 +2,11 @@
 //! state: the writer view of the worker's shared state page, the sentinel,
 //! the trace settings and the handler counters. `Methods` holds the
 //! runtime's operations on it, which `Runtime` declares as its own
-//! (`root.zig`): trace events and the CPU each live request publishes to its
-//! slot on the page. It belongs to the worker's VM thread. The sentinel's
+//! (`root.zig`): trace events, the CPU each live request publishes to its
+//! slot on the page, and the network denials the runtime writes to the
+//! tenant's log. Every line of the tenant's log, these and the console and
+//! exception lines (`vm_hooks.zig`), carries the request id `ringRequestId`
+//! gives its owner. It belongs to the worker's VM thread. The sentinel's
 //! own thread reaches only the `Sentinel` state it guards, the VM's
 //! termination request, the trace fd and atomic stores to the page, and it
 //! exits the process on memory pressure (`sentinel.zig`).
@@ -13,8 +16,19 @@ const bindings = @import("collo_bindings");
 const process_limits = @import("collo_limits").process;
 const worker_shared_page = @import("collo_worker_state").page;
 const common_worker_metrics_state = @import("collo_worker_state").metrics;
+const request_context = @import("collo_worker_request").context;
 const runtime_types = @import("types.zig");
 const worker_sentinel = @import("sentinel.zig");
+
+/// The request id a line of the tenant's log carries on the console ring:
+/// its owner's id when the owner is a dispatched request, and 0 for an
+/// evaluation or the worker owner. The server reads 0 as no request, and a
+/// reserved id names nothing it knows.
+pub fn ringRequestId(request_id: u64) u64 {
+    if (request_context.isReservedId(request_id))
+        return 0;
+    return request_id;
+}
 
 pub const Observability = struct {
     /// Required, since the page carries every request's completion record
@@ -72,12 +86,27 @@ pub fn Methods(comptime Runtime: type) type {
             traceEventFmt(self.observability.trace_fd, fmt, args);
         }
 
+        /// Writes `message`, the network setting's denial of a fetch of
+        /// `request_id`, as one `warn` line in the tenant's log. A denial is
+        /// the tenant's event, so it never reaches the operator's stderr,
+        /// and it costs the tenant a fetch of its token's budget
+        /// (`fetch_runtime.zig`), which bounds the lines one request writes.
+        pub fn logNetworkDenial(self: *Runtime, request_id: u64, message: []const u8) void {
+            self.observability.metrics_view.publishLogLine(
+                .warn,
+                0,
+                ringRequestId(request_id),
+                self.nowMonoNs(),
+                message,
+            );
+        }
+
         /// Publishes each live request's accumulated CPU to its live slot, so a
         /// death record the host synthesizes after a crash, an out-of-memory
-        /// kill or a deadline reports the turns already run. The value is a
-        /// floor: the final, partial turn is missing. Called once per event-loop
-        /// tick on the VM thread, where `cpu_used_ns_total` is stable, since turns
-        /// add to it only between flushes.
+        /// kill or a deadline reports the windows already closed. The value is
+        /// a floor: the window running at the death is missing. Called on the
+        /// VM thread between work items, where no owner window is open, so
+        /// `RequestContext.cpu_ns` holds every window the request ran.
         pub fn flushLiveRequestCpuBestEffort(self: *Runtime) void {
             var work_state = self.observability.worker_metrics_state;
             var iterator = self.requests.active.valueIterator();
@@ -85,7 +114,7 @@ pub fn Methods(comptime Runtime: type) type {
                 const request_ctx = entry.*;
                 if (request_ctx.finish_started or request_ctx.live_slot_released)
                     continue;
-                work_state.updateLiveSlotCpu(request_ctx.live_slot_index, request_ctx.exec.cpu_used_ns_total) catch |err| switch (err) {
+                work_state.updateLiveSlotCpu(request_ctx.live_slot_index, request_ctx.cpu_ns) catch |err| switch (err) {
                     error.InvalidLiveSlot, error.StaleLiveSlot => {},
                 };
             }

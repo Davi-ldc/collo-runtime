@@ -7,10 +7,11 @@
 //! between a pool call and its command. After every step the model checks
 //! that no slot is lost or doubled, that a handoff goes to the oldest waiter
 //! that is neither expired nor cancelled, that no slot of a dead or retiring
-//! worker is handed out, that one lane at most reads a worker and its epoch
-//! moves only when the reader changes, and that a worker retires once. The
-//! lanes, the launcher and the reaper that act on these results run in
-//! `server-ingress` and `local-e2e`.
+//! worker is handed out while a worker that announced its retirement still
+//! finishes the requests it holds, that one lane at most reads a worker and
+//! its epoch moves only when the reader changes, and that a worker retires
+//! once. The lanes, the launcher and the reaper that act on these results run
+//! in `server-ingress` and `local-e2e`.
 
 const std = @import("std");
 const lifecycle = @import("collo_server_lifecycle");
@@ -77,7 +78,7 @@ fn expectAcquired(pool: *TestPool, lane: LaneId, request: u32) !TestPool.Acquire
 fn expectHandoff(released: TestPool.Released) !TestPool.Handoff {
     return switch (released) {
         .handed_to => |handoff| handoff,
-        .idle, .retire => error.TestExpectedHandoff,
+        .idle, .retire, .release_reader => error.TestExpectedHandoff,
     };
 }
 
@@ -682,6 +683,133 @@ test "retireForEgress of a worker no lane holds or reads asks for its retirement
     try pool.remove(&worker);
 }
 
+test "retireOnNotice takes a busy worker out of service, lets its requests finish and retires it after the last release, with no death" {
+    var pool: TestPool = undefined;
+    try pool.init(testing.allocator, shape(2, 1));
+    defer pool.deinit();
+    var worker: Worker = .{ .index = 0, .generation = 2 };
+
+    _ = try publishToNewWaiter(&pool, &worker, lane_a, 0);
+    const second = try expectAcquired(&pool, lane_b, 0);
+    const earlier: lifecycle.WorkerKey = .{ .worker_id = worker.key().worker_id, .worker_generation = 1 };
+    try testing.expect(pool.retireOnNotice(&worker, earlier) == .stale);
+    try testing.expectEqual(pool_mod.EntryState.live, pool.inspect(&worker).?.state);
+
+    try testing.expect(pool.retireOnNotice(&worker, worker.key()) == .draining);
+    const view = pool.inspect(&worker).?;
+    try testing.expectEqual(pool_mod.EntryState.retiring, view.state);
+    try testing.expectEqual(@as(?pool_mod.Departure, .recycled), view.departure);
+    try testing.expect(pool.retireOnNotice(&worker, worker.key()) == .stale);
+
+    // The reader keeps forwarding the requests the worker still holds, and no
+    // slot of it goes to a waiter.
+    try expectWait(&pool, lane_b, 1, far_ns);
+    try testing.expectEqual(Transfer.kept, pool.transferReader(&worker, .{ .lane = lane_a, .epoch = 1 }, .nothing));
+    try testing.expect((try pool.release(&worker, second.slot, 10)) == .idle);
+    var snapshot = pool.snapshot();
+    try testing.expectEqual(@as(u32, 1), snapshot.workers_retiring);
+    try testing.expectEqual(@as(u32, 1), snapshot.slots_held_retiring);
+    try testing.expectEqual(@as(u32, 1), snapshot.waiters);
+
+    // The last release asks the reader, which never learned of the notice,
+    // to let go, and its transfer retires the worker.
+    const tenure = switch (try pool.release(&worker, 0, 11)) {
+        .release_reader => |tenure| tenure,
+        .idle, .handed_to, .retire => return error.TestExpectedReaderRelease,
+    };
+    try testing.expectEqual(ReaderTenure{ .lane = lane_a, .epoch = 1 }, tenure);
+    try testing.expectEqual(Transfer.retire, pool.transferReader(&worker, tenure, .nothing));
+    snapshot = pool.snapshot();
+    try testing.expectEqual(@as(u64, 0), snapshot.counters.deaths);
+    try testing.expectEqual(@as(u64, 1), snapshot.counters.notice_retirements);
+    try testing.expectEqual(@as(u64, 1), snapshot.counters.retirements);
+    try pool.remove(&worker);
+}
+
+test "retireOnNotice of an idle worker retires it at once without a reader and asks its reader otherwise" {
+    var pool: TestPool = undefined;
+    try pool.init(testing.allocator, shape(1, 2));
+    defer pool.deinit();
+    var read: Worker = .{ .index = 0 };
+    var unread: Worker = .{ .index = 1 };
+
+    _ = try publishToNewWaiter(&pool, &read, lane_a, 0);
+    try expectWait(&pool, lane_a, 1, far_ns);
+    const ticket = pool.launchStarted(true) orelse return error.TestExpectedLaunch;
+    try testing.expect(pool.cancelWaiter(requestKey(lane_a, 1)));
+    _ = try pool.publish(ticket, &unread, 1);
+    _ = try pool.release(&read, 0, 2);
+
+    try testing.expect(pool.retireOnNotice(&unread, unread.key()) == .retire);
+    const tenure = switch (pool.retireOnNotice(&read, read.key())) {
+        .release_reader => |tenure| tenure,
+        .stale, .draining, .retire => return error.TestExpectedReaderRelease,
+    };
+    try testing.expectEqual(ReaderTenure{ .lane = lane_a, .epoch = 1 }, tenure);
+    // A retiring worker with no request is the reaper's to ask again.
+    var buffer: [2]TestPool.RetiringReader = undefined;
+    const pending = pool.retiringReaders(&buffer);
+    try testing.expectEqual(@as(usize, 1), pending.len);
+    try testing.expectEqual(&read, pending[0].worker);
+    try testing.expectEqual(tenure, pending[0].tenure);
+    // A death of either now finishes nothing more: both retirements are
+    // already on their way.
+    try testing.expect(pool.markDead(&unread, unread.key()) == null);
+    try testing.expect(pool.markDead(&read, read.key()) == null);
+
+    try testing.expectEqual(Transfer.retire, pool.transferReader(&read, tenure, .nothing));
+    try testing.expectEqual(@as(usize, 0), pool.retiringReaders(&buffer).len);
+    try testing.expectEqual(@as(u64, 2), pool.snapshot().counters.retirements);
+    try pool.remove(&read);
+    try pool.remove(&unread);
+}
+
+test "a worker that dies while it drains after its notice still has the lanes of its requests told" {
+    var pool: TestPool = undefined;
+    try pool.init(testing.allocator, shape(2, 1));
+    defer pool.deinit();
+    var worker: Worker = .{ .index = 0 };
+
+    _ = try publishToNewWaiter(&pool, &worker, lane_a, 0);
+    const second = try expectAcquired(&pool, lane_b, 0);
+    try testing.expect(pool.retireOnNotice(&worker, worker.key()) == .draining);
+
+    const death = pool.markDead(&worker, worker.key()) orelse return error.TestExpectedDeath;
+    try testing.expectEqualSlices(LaneId, &.{ lane_a, lane_b }, death.slice());
+    try testing.expect(!death.retire);
+    const view = pool.inspect(&worker).?;
+    try testing.expectEqual(pool_mod.EntryState.dead, view.state);
+    try testing.expectEqual(@as(?pool_mod.Departure, .died), view.departure);
+
+    try testing.expect((try pool.release(&worker, second.slot, 10)) == .idle);
+    try testing.expectEqual(Transfer.vacated, pool.transferReader(&worker, .{ .lane = lane_a, .epoch = 1 }, .nothing));
+    try testing.expect((try pool.release(&worker, 0, 11)) == .retire);
+    try testing.expectEqual(@as(u64, 1), pool.snapshot().counters.retirements);
+    try pool.remove(&worker);
+}
+
+test "a pool at the largest concurrency hands out every slot of one worker before a waiter queues, and a release hands its slot to the head waiter" {
+    const concurrency = limits.server.worker_concurrency_max;
+    var pool: TestPool = undefined;
+    try pool.init(testing.allocator, shape(concurrency, 1));
+    defer pool.deinit();
+    var worker: Worker = .{ .index = 0 };
+
+    _ = try publishToNewWaiter(&pool, &worker, lane_a, 0);
+    var request: u32 = 1;
+    while (request < concurrency) : (request += 1) {
+        const acquired = try expectAcquired(&pool, lane_a, request);
+        try testing.expectEqual(&worker, acquired.worker);
+        try testing.expectEqual(@as(Slot, @intCast(request)), acquired.slot);
+    }
+    try testing.expectEqual(@as(u32, concurrency), pool.snapshot().slots_held);
+    try expectWait(&pool, lane_b, 0, far_ns);
+    const handoff = try expectHandoff(try pool.release(&worker, 3, 1));
+    try testing.expect(handoff.waiter.request_key.eql(requestKey(lane_b, 0)));
+    try testing.expectEqual(@as(Slot, 3), handoff.slot);
+    try expectSlotsBalanced(&pool);
+}
+
 test "findLive visits live workers only, in table order, and stops at the first one picked" {
     var pool: TestPool = undefined;
     try pool.init(testing.allocator, shape(1, 3));
@@ -861,6 +989,9 @@ const Op = union(enum) {
     mark_dead: u8,
     /// The reaper starts the idle worker's retirement.
     retire_idle: u8,
+    /// The worker's `worker_retiring` notice reaches the pool, read by its
+    /// reader lane or, for a worker no lane reads, by the reaper's watch.
+    notice: u8,
     /// The clock moves forward to this time.
     advance: u64,
 };
@@ -932,6 +1063,7 @@ const World = struct {
             .publish => |worker| try world.publish(lane, worker),
             .mark_dead => |worker| try world.markDead(lane, worker),
             .retire_idle => |worker| try world.retireIdle(lane, worker),
+            .notice => |worker| try world.notice(lane, worker),
             .advance => |now_ns| world.now_ns = @max(world.now_ns, now_ns),
         }
         try world.check();
@@ -1038,11 +1170,15 @@ const World = struct {
     }
 
     fn markDead(world: *World, lane: *Lane, worker: u8) !void {
+        // A worker that announced its retirement and still holds requests is
+        // taken again, since the lanes of those requests wait on it.
+        const draining = world.retiring[worker] and !world.dead[worker] and world.heldCount(worker) != 0;
+        const taken = world.inService(worker) or draining;
         const death = world.pool.markDead(&world.workers[worker], world.workers[worker].key()) orelse {
-            try testing.expect(!world.inService(worker));
+            try testing.expect(!taken);
             return;
         };
-        try testing.expect(world.inService(worker));
+        try testing.expect(taken);
         const concerned = world.concernedLanes(worker);
         world.dead[worker] = true;
         // The death names every lane that holds a slot of the worker or
@@ -1085,6 +1221,31 @@ const World = struct {
         }
     }
 
+    fn notice(world: *World, lane: *Lane, worker: u8) !void {
+        switch (world.pool.retireOnNotice(&world.workers[worker], world.workers[worker].key())) {
+            .stale => try testing.expect(!world.inService(worker)),
+            .draining => {
+                try testing.expect(world.inService(worker));
+                try testing.expect(world.heldCount(worker) != 0);
+                world.retiring[worker] = true;
+            },
+            .retire => {
+                try testing.expect(world.inService(worker));
+                try testing.expectEqual(@as(usize, 0), world.heldCount(worker));
+                try testing.expect(world.reader[worker] == null);
+                world.retiring[worker] = true;
+                try world.onRetire(worker);
+            },
+            .release_reader => |tenure| {
+                try testing.expect(world.inService(worker));
+                try testing.expectEqual(@as(usize, 0), world.heldCount(worker));
+                try testing.expectEqual(world.reader[worker], tenure);
+                world.retiring[worker] = true;
+                try lane.post(tenure.lane, .{ .release_worker = .{ .worker = worker, .tenure = tenure } });
+            },
+        }
+    }
+
     fn giveBack(world: *World, lane: *Lane, worker: u8, slot: Slot) !void {
         const was_in_service = world.inService(worker);
         switch (try world.pool.release(&world.workers[worker], slot, world.now_ns)) {
@@ -1096,6 +1257,17 @@ const World = struct {
             .retire => {
                 try testing.expect(!was_in_service);
                 try world.onRetire(worker);
+            },
+            // The last request of a worker that announced its retirement
+            // ended, and its reader, which may be this lane, never learned
+            // that the worker is done.
+            .release_reader => |tenure| {
+                try testing.expect(!was_in_service);
+                try testing.expect(world.retiring[worker]);
+                try testing.expect(!world.dead[worker]);
+                try testing.expectEqual(@as(usize, 0), world.heldCount(worker));
+                try testing.expectEqual(world.reader[worker], tenure);
+                try lane.post(tenure.lane, .{ .release_worker = .{ .worker = worker, .tenure = tenure } });
             },
         }
     }
@@ -1202,8 +1374,11 @@ const World = struct {
         if (reader.lane != tenure.lane) return .stale;
         if (reader.epoch != tenure.epoch) return .stale;
         const held = world.heldCount(worker);
-        if (world.inService(worker)) return if (held != 0) .kept else .vacated;
-        return if (held == 0) .retire else .vacated;
+        if (world.dead[worker]) return if (held == 0) .retire else .vacated;
+        // A worker in service, or one that announced its retirement, keeps
+        // the reader that forwards the output of the requests it holds.
+        if (held != 0) return .kept;
+        return if (world.inService(worker)) .vacated else .retire;
     }
 
     fn applyTransfer(world: *World, lane: *Lane, worker: u8, result: Transfer) !void {
@@ -1586,6 +1761,45 @@ test "a death racing a reader transfer ends the tenure once and retires the work
         .setup = &idle_worker_read_by_a,
         .a = &.{ .drain, .{ .mark_dead = 0 }, .drain },
         .b = &.{ .{ .acquire = .{ .request = 0 } }, .drain, .{ .finish = 0 }, .drain },
+    });
+}
+
+test "a notice racing another lane's acquire and release lets the worker's requests finish, never serves it again and retires it once" {
+    try expectEveryInterleaving(.{
+        .options = shape(2, 1),
+        .setup = &busy_worker_read_by_a,
+        .a = &.{ .{ .notice = 0 }, .drain, .{ .finish = 0 }, .drain },
+        .b = &.{ .{ .acquire = .{ .request = 0 } }, .drain, .{ .finish = 0 }, .drain },
+    });
+}
+
+test "a death racing the notice of a worker two lanes hold reaches both holders and retires the worker once" {
+    const setup = busy_worker_read_by_a ++ [_]Step{
+        .{ .lane = 1, .op = .{ .acquire = .{ .request = 0 } } },
+    };
+    try expectEveryInterleaving(.{
+        .options = shape(2, 1),
+        .setup = &setup,
+        .a = &.{ .{ .notice = 0 }, .drain, .{ .finish = 0 }, .drain },
+        .b = &.{ .{ .mark_dead = 0 }, .drain, .{ .finish = 0 }, .drain },
+    });
+}
+
+test "the notice of an idle worker racing its reader's acquire never serves it after the notice and retires it once" {
+    try expectEveryInterleaving(.{
+        .options = shape(1, 1),
+        .setup = &idle_worker_read_by_a,
+        .a = &.{ .{ .acquire = .{ .request = 1 } }, .drain, .{ .finish = 1 }, .drain },
+        .b = &.{ .{ .notice = 0 }, .drain, .{ .acquire = .{ .request = 0 } }, .drain },
+    });
+}
+
+test "a notice racing an idle retirement of the same worker retires it once" {
+    try expectEveryInterleaving(.{
+        .options = shape(1, 1),
+        .setup = &idle_worker_read_by_a,
+        .a = &.{ .{ .notice = 0 }, .drain },
+        .b = &.{ .{ .retire_idle = 0 }, .drain },
     });
 }
 

@@ -235,7 +235,7 @@ fn connectStreamWithTimeout(
         for (pollfds[0..poll_count], contexts[0..poll_count]) |pollfd, attempt| {
             if ((pollfd.revents & (std.posix.POLL.OUT | std.posix.POLL.HUP | std.posix.POLL.ERR)) == 0)
                 continue;
-            std.posix.getsockoptError(attempt.fd) catch |err| {
+            common_socket.connectResult(attempt.fd) catch |err| {
                 last_error = err;
                 attempt.close();
                 active_count -= 1;
@@ -313,7 +313,7 @@ pub fn connectStreamWithReadiness(
         switch (try driver.wait(sources[0..source_count], wake_fd)) {
             .ready => |ready| {
                 const attempt: *ConnectAttempt = @ptrCast(@alignCast(ready.context));
-                std.posix.getsockoptError(attempt.fd) catch |err| {
+                common_socket.connectResult(attempt.fd) catch |err| {
                     last_error = err;
                     attempt.close();
                     active_count -= 1;

@@ -249,13 +249,14 @@ static std::optional<ParsedEventInit> parseEventInit(
     return parsed;
 }
 
+// Lives on the stack, which roots its values.
 struct ParsedMessageEventInit {
     ParsedEventInit event;
     JSValue data { JSC::jsNull() };
     String origin;
     String last_event_id;
     JSValue source { JSC::jsNull() };
-    JSC::Strong<JSC::Unknown> ports;
+    JSC::JSObject* ports { nullptr };
 };
 
 static void throwMessageEventSourceTypeError(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSValue value)
@@ -359,7 +360,7 @@ static std::optional<ParsedMessageEventInit> parseMessageEventInit(
         if (!ports)
             return std::nullopt;
         RETURN_IF_EXCEPTION(scope, std::nullopt);
-        parsed.ports.set(vm, ports);
+        parsed.ports = ports;
     }
 
     return parsed;
@@ -572,8 +573,7 @@ JSC_DEFINE_HOST_FUNCTION(
 
     return JSValue::encode(JSColloMessageEvent::create(vm, uncheckedDowncast<Collo::GlobalObject>(global_object),
         structure, WTF::move(type), init->event.bubbles, init->event.cancelable, init->event.composed, init->data,
-        WTF::move(init->origin), WTF::move(init->last_event_id), init->source,
-        init->ports ? uncheckedDowncast<JSC::JSObject>(init->ports.get()) : nullptr));
+        WTF::move(init->origin), WTF::move(init->last_event_id), init->source, init->ports));
 }
 
 JSC_DEFINE_HOST_FUNCTION(errorEventConstructorCall, (JSC::JSGlobalObject * global_object, JSC::CallFrame*))
@@ -890,13 +890,12 @@ JSC_DEFINE_HOST_FUNCTION(
         }
     }
 
-    JSC::Strong<JSC::Unknown> ports;
+    JSC::JSObject* ports = nullptr;
     if (call_frame->argumentCount() > 7) {
-        auto* normalized_ports = webApiNormalizeMessagePortsArray(global_object, scope, call_frame->argument(7));
-        if (!normalized_ports)
+        ports = webApiNormalizeMessagePortsArray(global_object, scope, call_frame->argument(7));
+        if (!ports)
             return {};
         RETURN_IF_EXCEPTION(scope, {});
-        ports.set(vm, normalized_ports);
     }
 
     String origin;
@@ -919,7 +918,7 @@ JSC_DEFINE_HOST_FUNCTION(
         call_frame->argumentCount() > 1 ? call_frame->argument(1).toBoolean(global_object) : false,
         call_frame->argumentCount() > 2 ? call_frame->argument(2).toBoolean(global_object) : false,
         call_frame->argumentCount() > 3 ? call_frame->argument(3) : JSC::jsNull(), WTF::move(origin),
-        WTF::move(last_event_id), source, ports ? uncheckedDowncast<JSC::JSObject>(ports.get()) : nullptr);
+        WTF::move(last_event_id), source, ports);
     return JSValue::encode(JSC::jsUndefined());
 }
 

@@ -156,6 +156,11 @@ bool validateRequiredUsages(uint8_t usages, JSC::JSValue& out_error, JSC::JSGlob
 // pending.
 JSC::JSArray* createUsagesArray(JSC::JSGlobalObject*, JSC::VM&, uint8_t usages);
 
+// Copies a BufferSource argument that holds secret bytes, such as key data or plaintext, into `out`, which must be
+// empty. Fails like `copyBufferSource` in js_support.h.
+bool copySecretBufferSource(
+    JSC::JSGlobalObject*, JSC::TopExceptionScope&, JSC::JSValue, SecretBytes& out, JSC::JSValue& out_error);
+
 bool parseAesGcmParamsAfterName(JSC::JSGlobalObject*, JSC::TopExceptionScope&, JSC::JSValue, const WTF::String& name,
     AesGcmParams& out, JSC::JSValue& out_error);
 

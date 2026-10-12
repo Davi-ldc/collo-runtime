@@ -13,6 +13,7 @@
 
 const std = @import("std");
 const ipc = @import("collo_ipc");
+const limits = @import("collo_limits");
 
 const backpressure = @import("backpressure.zig");
 const body_credit = @import("collo_egress_client").body_credit;
@@ -39,6 +40,14 @@ pub const SlotCreditResult = union(enum) {
 /// `invalid_command_window_ns` that opens with the first of them; the next one ends its session.
 pub const invalid_command_window_ns: u64 = 60 * std.time.ns_per_s;
 pub const max_invalid_commands_per_window: u32 = 1024;
+
+comptime {
+    // An honest worker presents a bad tag only for the fetches of its requests in flight across
+    // a gateway replacement: at most `worker_concurrency_max` requests of
+    // `max_fetches_per_request` fetches each, which must never end its session.
+    std.debug.assert(limits.server.worker_concurrency_max * policy_mod.production.max_fetches_per_request <
+        max_invalid_commands_per_window);
+}
 
 pub const InvalidCommandWindow = struct {
     count: u32 = 0,
@@ -74,6 +83,11 @@ pub const Worker = struct {
     /// (`SessionBudgets.take` in `runtime/worker_flow.zig`) to its `request_ended`
     /// (`runtime/control_flow.zig`).
     budgets: budgets.SessionBudgets = .{},
+    /// Bytes of pooled request bodies this session's admitted fetches hold in the gateway, by
+    /// their announced lengths, from admission to the retirement of each fetch's route
+    /// (`runtime/worker_flow.zig`). Admission refuses a pooled start that would take it past
+    /// `ipc.fetch_limits.request_body_pooled_in_flight_bytes_max`.
+    upload_bytes_in_flight: u64 = 0,
     invalid_commands: InvalidCommandWindow = .{},
     backpressure_level: backpressure.Level = .normal,
     /// When the worker reached `hard`, or 0 while it is below.

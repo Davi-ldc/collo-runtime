@@ -4,8 +4,9 @@
 //! its shared payload rings, the egress fetch messages and shared rings, the
 //! egress token's place in WorkerInit, DispatchWork and the fetch start, fs
 //! faults, module packs and packet framing. The token itself, the
-//! `egress_attach` packet, the fs index, the route table and its bindings
-//! sections, and the copy of a pool slot have their own files under `ipc/`.
+//! `egress_attach` and `worker_retiring` packets, the fs index, the route
+//! table and its bindings sections, the copy of a pool slot and the field
+//! contracts of `messages.zig` have their own files under `ipc/`.
 //! Everything runs over
 //! in-process socketpairs and memfds; the zygote integration lane covers the
 //! same handshakes against a real zygote and worker.
@@ -19,9 +20,11 @@ test {
     _ = @import("ipc/egress_attach.zig");
     _ = @import("ipc/egress_token.zig");
     _ = @import("ipc/fs_index.zig");
+    _ = @import("ipc/messages.zig");
     _ = @import("ipc/route_bindings.zig");
     _ = @import("ipc/route_table.zig");
     _ = @import("ipc/slot_snapshot.zig");
+    _ = @import("ipc/worker_retiring.zig");
 }
 
 /// Decode scratch for the egress decoders (this binary's tests are
@@ -2279,6 +2282,7 @@ test "worker init can transfer egress shared endpoint and enable strict sandbox 
     var init = try WorkerInit.init(128, ipc.WorkerRuntimeBootOptions.default());
     init.enableEgressGatewaySandbox();
     init.init_deadline_mono_ns = 1;
+    init.flags |= WorkerInit.flag_egress;
     init.boot_egress_token = bootTokenBytes();
     try init.validate();
     try std.testing.expect(init.wantsIsolatedNetwork());
@@ -2331,8 +2335,8 @@ test "egress shared gateway retained body-pool data fd is cloexec" {
 /// A real file for every descriptor of a WorkerInit table, for tests that send
 /// through the host's sender or build a table by hand. The table's shape lives
 /// here alone: the base descriptors, the session's regions a boot token
-/// announces, the wake descriptors every table carries, the fs pair and the
-/// definition's pack. The control pair is nonblocking, so a receive finds
+/// announces, the wake descriptors `flag_egress` announces, the fs pair and
+/// the definition's pack. The control pair is nonblocking, so a receive finds
 /// nothing when a send was refused. Initialized in place; `deinit` closes
 /// everything.
 const WorkerInitTableFixture = struct {
@@ -2360,6 +2364,9 @@ const WorkerInitTableFixture = struct {
     /// Descriptors of a WorkerInit without a boot token: the same table
     /// without the session's regions, its wake descriptors kept.
     const detached_fd_count: usize = attached_fd_count - ipc.egress_shared.region_fd_count;
+    /// Descriptors of a WorkerInit without egress: the table with no egress
+    /// descriptor at all.
+    const no_egress_fd_count: usize = attached_fd_count - ipc.egress_shared.shared_fd_count;
 
     fn init(self: *WorkerInitTableFixture) !void {
         const control_flags = std.posix.SOCK.CLOEXEC | std.posix.SOCK.NONBLOCK;
@@ -2450,6 +2457,17 @@ const WorkerInitTableFixture = struct {
         @memcpy(fds[0..base_fd_count], attached[0..base_fd_count]);
         @memcpy(fds[base_fd_count..wake_end], &self.detached_wake.asArray());
         @memcpy(fds[wake_end..], attached[half_end..]);
+        return fds;
+    }
+
+    /// The table of a WorkerInit without egress in wire order, followed by
+    /// the pack: the attached table without the session's half.
+    fn noEgressTable(self: *WorkerInitTableFixture) [no_egress_fd_count + 1]std.posix.fd_t {
+        const attached = self.attachedTable();
+        const half_end = base_fd_count + ipc.egress_shared.shared_fd_count;
+        var fds: [no_egress_fd_count + 1]std.posix.fd_t = undefined;
+        @memcpy(fds[0..base_fd_count], attached[0..base_fd_count]);
+        @memcpy(fds[base_fd_count..], attached[half_end..]);
         return fds;
     }
 
@@ -2719,15 +2737,17 @@ test "both senders refuse regions without a boot token, a token without regions 
     try std.testing.expectError(error.WouldBlock, recvWorkerInit(fixture.control_pair[1]));
 }
 
-test "the receiver reads the descriptor table the boot token announces" {
+test "the receiver reads the descriptor table the boot token and flag_egress announce" {
     var fixture: WorkerInitTableFixture = undefined;
     try fixture.init();
     defer fixture.deinit();
     const attached_table = fixture.attachedTable();
     const detached_table = fixture.detachedTable();
+    const no_egress_table = fixture.noEgressTable();
     const base = WorkerInitTableFixture.base_fd_count;
     const attached = WorkerInitTableFixture.attached_fd_count;
     const detached = WorkerInitTableFixture.detached_fd_count;
+    const no_egress = WorkerInitTableFixture.no_egress_fd_count;
 
     const wake = ipc.egress_shared.wake_fd_count;
     const detached_cases = [_]TableCase{
@@ -2748,7 +2768,24 @@ test "the receiver reads the descriptor table the boot token announces" {
         .{ .name = "flag and pack", .serves_routes = true, .fd_count = detached + 1, .expected = null },
     };
     for (detached_cases) |case|
-        try expectTableReceived(&fixture, false, &detached_table, case);
+        try expectTableReceived(&fixture, .wake, &detached_table, case);
+
+    const no_egress_cases = [_]TableCase{
+        .{ .name = "no route table", .fd_count = base - 1, .expected = error.MissingRouteTableFd },
+        .{ .name = "no fs index", .fd_count = base, .expected = error.MissingFsIndexFd },
+        .{ .name = "no fs fault", .fd_count = base + 1, .expected = error.MissingFsFaultFd },
+        .{ .name = "whole", .fd_count = no_egress, .expected = null },
+        .{ .name = "pack, no flag", .fd_count = no_egress + 1, .expected = error.InvalidFdCount },
+        .{
+            .name = "flag, no pack",
+            .serves_routes = true,
+            .fd_count = no_egress,
+            .expected = error.MissingModulePackFd,
+        },
+        .{ .name = "flag and pack", .serves_routes = true, .fd_count = no_egress + 1, .expected = null },
+    };
+    for (no_egress_cases) |case|
+        try expectTableReceived(&fixture, .none, &no_egress_table, case);
 
     const attached_cases = [_]TableCase{
         .{ .name = "half cut", .fd_count = attached - 3, .expected = error.MissingEgressSharedFd },
@@ -2765,20 +2802,41 @@ test "the receiver reads the descriptor table the boot token announces" {
         .{ .name = "flag and pack", .serves_routes = true, .fd_count = attached + 1, .expected = null },
     };
     for (attached_cases) |case|
-        try expectTableReceived(&fixture, true, &attached_table, case);
+        try expectTableReceived(&fixture, .session, &attached_table, case);
 
-    // The token and the session's regions come together or not at all.
-    try expectTableReceived(&fixture, false, &attached_table, .{
+    // The token and the session's regions come together or not at all, and
+    // so do `flag_egress` and the wake descriptors.
+    try expectTableReceived(&fixture, .wake, &attached_table, .{
         .name = "the regions without a token",
         .fd_count = attached,
         .expected = error.InvalidFdCount,
     });
-    try expectTableReceived(&fixture, true, &detached_table, .{
+    try expectTableReceived(&fixture, .session, &detached_table, .{
         .name = "a token without the regions",
         .fd_count = detached,
         .expected = error.MissingEgressSharedFd,
     });
+    try expectTableReceived(&fixture, .none, &detached_table, .{
+        .name = "wake descriptors without flag_egress",
+        .fd_count = detached,
+        .expected = error.InvalidFdCount,
+    });
+    try expectTableReceived(&fixture, .wake, &no_egress_table, .{
+        .name = "flag_egress without the wake descriptors",
+        .fd_count = no_egress,
+        .expected = error.MissingEgressSharedFd,
+    });
 }
+
+/// The egress a hand-built WorkerInit announces.
+const EgressShape = enum {
+    /// Neither `flag_egress` nor a boot token: no egress descriptor.
+    none,
+    /// `flag_egress` without a boot token: the wake descriptors alone.
+    wake,
+    /// `flag_egress` and a boot token: the session's whole half.
+    session,
+};
 
 /// One hand-built WorkerInit table and what `recvWorkerInit` makes of it.
 const TableCase = struct {
@@ -2791,22 +2849,28 @@ const TableCase = struct {
     expected: ?anyerror,
 };
 
-/// Sends a WorkerInit with a boot token or not and the first
+/// Sends a WorkerInit announcing the `egress` shape and the first
 /// `case.fd_count` descriptors of `table`, and checks the receiver's outcome:
 /// `case.expected`, or the wake descriptors, the regions and the pack the
 /// message announces. Refused or not, the receiver leaves no descriptor of
 /// its own open.
 fn expectTableReceived(
     fixture: *WorkerInitTableFixture,
-    token: bool,
+    egress: EgressShape,
     table: []const std.posix.fd_t,
     case: TableCase,
 ) !void {
-    errdefer std.debug.print("worker init table case: {s} (token {})\n", .{ case.name, token });
+    errdefer std.debug.print("worker init table case: {s} (egress {s})\n", .{ case.name, @tagName(egress) });
     var message = try WorkerInit.init(64, ipc.WorkerRuntimeBootOptions.default());
     message.enableEgressGatewaySandbox();
-    if (token)
-        message.boot_egress_token = bootTokenBytes();
+    switch (egress) {
+        .none => {},
+        .wake => message.flags |= WorkerInit.flag_egress,
+        .session => {
+            message.flags |= WorkerInit.flag_egress;
+            message.boot_egress_token = bootTokenBytes();
+        },
+    }
     if (case.serves_routes)
         message = servingRoutes(message, fixture);
 
@@ -2817,12 +2881,56 @@ fn expectTableReceived(
     } else {
         var received = try recvWorkerInit(fixture.control_pair[1]);
         defer received.deinit();
-        try std.testing.expect(received.egress_shared_fds.wakeFds().isValid());
-        const regions: usize = if (token) ipc.egress_shared.region_fd_count else 0;
+        switch (egress) {
+            .none => try std.testing.expect(received.egress_shared_fds.isEmpty()),
+            .wake, .session => try std.testing.expect(received.egress_shared_fds.wakeFds().isValid()),
+        }
+        const regions: usize = if (egress == .session) ipc.egress_shared.region_fd_count else 0;
         try std.testing.expectEqual(regions, received.egress_shared_fds.regionCount());
         try std.testing.expectEqual(case.serves_routes, received.module_pack_fd != null);
     }
     try std.testing.expectEqual(open_before, try openFdCount());
+}
+
+test "a worker init without egress carries no egress descriptor, and the sender owns flag_egress" {
+    var fixture: WorkerInitTableFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+
+    // A caller that sets the flag but has no egress descriptor sends none,
+    // and the packet says so.
+    var init = try WorkerInit.init(64, ipc.WorkerRuntimeBootOptions.default());
+    init.enableEgressGatewaySandbox();
+    init.flags |= WorkerInit.flag_egress;
+    try fixture.send(&init, .{}, null);
+    var received = try recvWorkerInit(fixture.control_pair[1]);
+    defer received.deinit();
+    try std.testing.expect(!received.message.hasEgress());
+    try std.testing.expect(received.egress_shared_fds.isEmpty());
+    // The fs pair follows the route table directly.
+    const fs_index_fd = received.takeFsIndexFd();
+    defer std.posix.close(fs_index_fd);
+    try fd_mod.requireSeals(fs_index_fd, fd_mod.memfd_readonly_seals);
+
+    // A caller that clears the flag but sends the wake descriptors gets the
+    // flag on the packet.
+    var plain = try WorkerInit.init(64, ipc.WorkerRuntimeBootOptions.default());
+    plain.enableEgressGatewaySandbox();
+    try fixture.send(&plain, fixture.detachedHalf(), null);
+    var detached = try recvWorkerInit(fixture.control_pair[1]);
+    defer detached.deinit();
+    try std.testing.expect(detached.message.hasEgress());
+    try std.testing.expect(detached.egress_shared_fds.wakeFds().isValid());
+
+    // A boot token needs the session's descriptors, and a partial set of wake
+    // descriptors is no launch's shape.
+    var with_token = plain;
+    with_token.boot_egress_token = bootTokenBytes();
+    try std.testing.expectError(error.InvalidWorkerInit, fixture.send(&with_token, .{}, null));
+    var partial = fixture.detachedHalf();
+    partial.liveness_fd = -1;
+    try std.testing.expectError(error.InvalidEgressSharedEndpoint, fixture.send(&plain, partial, null));
+    try std.testing.expectError(error.WouldBlock, recvWorkerInit(fixture.control_pair[1]));
 }
 
 test "worker init transfers missing strict egress sandbox flags for lifecycle validation" {
@@ -2863,6 +2971,56 @@ test "worker init transfers missing strict egress sandbox flags for lifecycle va
     try received.message.validate();
     try std.testing.expect(!received.message.wantsIsolatedNetwork());
     try std.testing.expect(!received.message.wantsDenyDirectEgress());
+}
+
+test "worker init carries the request CPU budget and the unowned limit through the init socket" {
+    var fixture: WorkerInitTableFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+
+    var init = try WorkerInit.init(64, ipc.WorkerRuntimeBootOptions.default());
+    init.enableEgressGatewaySandbox();
+    init.init_deadline_mono_ns = 1;
+    init.request_cpu_budget_ns = 50 * std.time.ns_per_ms;
+    init.unowned_time_limit_ns = 1_500 * std.time.ns_per_ms;
+    try fixture.send(&init, fixture.detachedHalf(), null);
+
+    var received = try recvWorkerInit(fixture.control_pair[1]);
+    defer received.deinit();
+    try received.message.validate();
+    try std.testing.expectEqual(@as(u64, 50 * std.time.ns_per_ms), received.message.request_cpu_budget_ns);
+    try std.testing.expectEqual(@as(u64, 1_500 * std.time.ns_per_ms), received.message.unowned_time_limit_ns);
+}
+
+test "worker init refuses a CPU budget or an unowned limit outside their bounds, and a boot token without flag_egress" {
+    var message = try WorkerInit.init(1024, ipc.WorkerRuntimeBootOptions.default());
+    message.init_deadline_mono_ns = 1;
+    try message.validate();
+
+    // 0 is no budget; the bound itself passes and one past it fails.
+    message.request_cpu_budget_ns = WorkerInit.request_cpu_budget_ns_max;
+    try message.validate();
+    message.request_cpu_budget_ns = WorkerInit.request_cpu_budget_ns_max + 1;
+    try std.testing.expectError(error.InvalidWorkerInitTimeLimit, message.validate());
+    message.request_cpu_budget_ns = 0;
+
+    // Unowned JavaScript always has a limit.
+    message.unowned_time_limit_ns = 0;
+    try std.testing.expectError(error.InvalidWorkerInitTimeLimit, message.validate());
+    message.unowned_time_limit_ns = WorkerInit.unowned_time_limit_ns_max;
+    try message.validate();
+    message.unowned_time_limit_ns = WorkerInit.unowned_time_limit_ns_max + 1;
+    try std.testing.expectError(error.InvalidWorkerInitTimeLimit, message.validate());
+    message.unowned_time_limit_ns = WorkerInit.default_unowned_time_limit_ns;
+
+    // A boot token is spent through egress descriptors the flag announces.
+    message.boot_egress_token = bootTokenBytes();
+    try std.testing.expectError(error.InvalidWorkerInitFlags, message.validate());
+    message.flags |= WorkerInit.flag_egress;
+    try message.validate();
+    message.boot_egress_token = egress_token.none;
+    try message.validate();
+    try std.testing.expectEqual(@as(u32, 1 << 4), WorkerInit.flag_egress);
 }
 
 test "worker init rejects inconsistent egress sandbox flags" {
@@ -4111,13 +4269,14 @@ test "fs fault wire round-trips and rejects invalid payloads and kinds" {
 
     // Kind table: 24 and 25 decode, and the holes and the next unassigned
     // value fail with InvalidMessageKind. Kinds 8, 9 and 10 have tests of
-    // their own, and `ipc/egress_attach.zig` pins 26.
+    // their own, `ipc/egress_attach.zig` pins 26 and
+    // `ipc/worker_retiring.zig` pins 27.
     try std.testing.expectEqual(MessageKind.fs_fault_request, try ipc.decodeMessageKind(24));
     try std.testing.expectEqual(MessageKind.fs_fault_response, try ipc.decodeMessageKind(25));
     try std.testing.expectError(error.InvalidMessageKind, ipc.decodeMessageKind(13));
     try std.testing.expectError(error.InvalidMessageKind, ipc.decodeMessageKind(21));
     try std.testing.expectError(error.InvalidMessageKind, ipc.decodeMessageKind(22));
-    try std.testing.expectError(error.InvalidMessageKind, ipc.decodeMessageKind(27));
+    try std.testing.expectError(error.InvalidMessageKind, ipc.decodeMessageKind(28));
 }
 
 test "module pack single module parses entry source" {
@@ -4437,20 +4596,26 @@ test "worker init starts with every optional authority absent and bounds tmpfs b
     try std.testing.expectEqual(@as(u64, 1024), message.tmpfs_size_bytes);
     // `messages.zig` pins the offsets beside this size, so a field added or
     // removed has to update both.
-    try std.testing.expectEqual(@as(usize, 184), @sizeOf(ipc.WorkerInit));
+    try std.testing.expectEqual(@as(usize, 192), @sizeOf(ipc.WorkerInit));
     try expectOffset(ipc.WorkerInit, "route_table_len", 24);
     try expectOffset(ipc.WorkerInit, "cpu_max_cores", 32);
     try expectOffset(ipc.WorkerInit, "_reserved0", 36);
     try expectOffset(ipc.WorkerInit, "boot_egress_token", 40);
     try expectOffset(ipc.WorkerInit, "init_deadline_mono_ns", 96);
-    try expectOffset(ipc.WorkerInit, "runtime", 104);
-    // No boot token, the empty route table, no route serving, and no init
-    // deadline: `validate` refuses a zero deadline, so every sender sets one
-    // explicitly.
+    try expectOffset(ipc.WorkerInit, "request_cpu_budget_ns", 104);
+    try expectOffset(ipc.WorkerInit, "unowned_time_limit_ns", 112);
+    try expectOffset(ipc.WorkerInit, "runtime", 120);
+    // No boot token, no egress, the empty route table, no route serving, no
+    // CPU budget, the unowned limit of a launch without a definition, and no
+    // init deadline: `validate` refuses a zero deadline, so every sender sets
+    // one explicitly.
     try std.testing.expect(egress_token.isNone(&message.boot_egress_token));
+    try std.testing.expect(!message.hasEgress());
     try std.testing.expectEqual(@as(u64, ipc.route_table.empty_blob.len), message.route_table_len);
     try std.testing.expect(!message.servesRoutes());
     try std.testing.expect(!message.isolatesRealms());
+    try std.testing.expectEqual(@as(u64, 0), message.request_cpu_budget_ns);
+    try std.testing.expectEqual(ipc.WorkerInit.default_unowned_time_limit_ns, message.unowned_time_limit_ns);
     try std.testing.expectEqual(@as(u64, 0), message.init_deadline_mono_ns);
 
     message.tmpfs_size_bytes = 0;

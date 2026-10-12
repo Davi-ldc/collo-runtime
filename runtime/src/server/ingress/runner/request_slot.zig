@@ -35,6 +35,7 @@ const server_config = @import("collo_server_config");
 const supervision = @import("collo_server_supervisor");
 const access_log = @import("collo_server_analytics").access;
 const worker_shared_page = @import("collo_worker_state").page;
+const server_responses = @import("../server_responses.zig");
 const slab = @import("../slab.zig");
 const timer_wheel = @import("../timer_wheel.zig");
 
@@ -79,6 +80,12 @@ pub const RequestSlot = struct {
     /// detached it: the worker's descriptors for it are dropped and the lane
     /// writes nothing more on it.
     h2_client_reset: bool = false,
+    /// The answer the lane gave the client itself on a dispatched request's
+    /// stream, refusing its body (`request_body.zig`). The client got this
+    /// and never the worker's response, so the request's access record
+    /// reports it, from the server, whatever the worker's completion says
+    /// (`request_finish.zig`).
+    local_answer: ?server_responses.Id = null,
     /// What the request's next send toward the worker waits for, or `.none`.
     send_blocked: SendBlock = .none,
     /// The request's `request_begin` reached the worker's socket.

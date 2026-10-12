@@ -26,7 +26,7 @@ const egress_token = ipc.egress_token;
 pub const per_session_max: usize = 4 * (limits.server.worker_concurrency_max + 1);
 
 /// Budgets one gateway holds at once, every slot of every session it can attach.
-pub const per_gateway_max: usize = sizing.workers_max * per_session_max;
+pub const per_gateway_max: usize = sizing.sessions_max * per_session_max;
 
 /// A token's budget as the rest of the gateway names it: the session that presented it and the
 /// request it names. Fetch records keep it so `request_ended` can cancel their request's fetches.

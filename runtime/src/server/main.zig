@@ -27,10 +27,13 @@
 //!
 //! `Server` owns the egress gateway manager on the heap: the supervisor's
 //! egress hooks, the service's lanes, which renew their leases from it, and
-//! every gateway record point at it. While `run` runs, the manager reports a
-//! lost gateway to the service, whose launcher spawns the next one and
-//! reattaches the live workers; `run` clears that link before the service
-//! goes.
+//! every gateway record point at it. The manager borrows the routes' policy
+//! image for every hello, which the routes outlive. While `run` runs, the
+//! manager reports a lost gateway to the service, whose launcher spawns the
+//! next one and reattaches the live workers; `run` clears that link before
+//! the service goes. A server whose definitions grant no route any network
+//! access never spawns a gateway: no worker of it attaches, and the prewarm
+//! does nothing.
 
 const std = @import("std");
 const analytics_mod = @import("collo_server_analytics");
@@ -38,7 +41,6 @@ const routes_mod = @import("collo_server_routes");
 const supervision = @import("collo_server_supervisor");
 const gateway = @import("collo_server_gateway");
 const zygote = @import("collo_zygote");
-const host = @import("collo_host");
 const ktls = @import("tls/ktls.zig");
 const tls_mod = @import("tls/root.zig");
 const ingress_mod = @import("ingress/root.zig");
@@ -64,9 +66,10 @@ pub const Options = struct {
     /// fails.
     routes: routes_mod.Routes,
     /// Existing directory the analytics sink appends `logs.jsonl`,
-    /// `access.jsonl` and `usage.jsonl` to (`analytics/sink.zig`). null keeps
-    /// only the console stream: worker console lines still reach stderr, and
-    /// access and usage records are counted and dropped.
+    /// `access.jsonl`, `usage.jsonl` and `workers.jsonl` to
+    /// (`analytics/sink.zig`). null keeps only the console stream: worker
+    /// console lines still reach stderr, and the records are counted and
+    /// dropped.
     analytics_directory: ?[]const u8 = null,
     /// Port 0 binds an ephemeral port; `port` and `address` report the one
     /// the kernel chose. The address also picks the interface whose receive
@@ -80,15 +83,18 @@ pub const Options = struct {
     ingress_tcp_notsent_lowat_bytes: u32 = 64 * 1024,
     tls_certificate: tls_mod.CertificateConfig,
     worker: WorkerConfig = .{},
-    egress_gateway: gateway.Config = .{},
-    /// Borrowed delegated cgroup subtree for per-worker cgroups. The caller
-    /// creates it before spawning the zygote, because a delegated placement
-    /// moves only the calling process out of its cgroup and a zygote already
-    /// there would block the controllers (`host/cgroup_root.zig`), and keeps
-    /// it alive past the server. Required: a worker launch refuses a child
-    /// born outside its own leaf, so a server without a root could never
-    /// serve.
-    worker_cgroup_root: *host.WorkerCgroupRoot,
+    /// The binary the egress gateway runs; null runs this one through its
+    /// `arg0` (`gateway.Config.executable_path`). What the gateway enforces
+    /// comes from the routes' `network` grants, never from here.
+    egress_gateway_executable_path: ?[]const u8 = null,
+    /// The worker cgroup root and the tmpfs mount point every launch borrows
+    /// (`supervision.launcher.WorkerHost`), which the caller keeps alive past
+    /// the server. The caller creates the root before spawning the zygote,
+    /// because a delegated placement moves only the calling process out of
+    /// its cgroup and a zygote already there would block the controllers
+    /// (`host/cgroup_root.zig`). Required: a worker launch refuses a child
+    /// born outside its own leaf, so a server without them could never serve.
+    worker_host: supervision.launcher.WorkerHost,
     /// Told the bound address once every lane accepts connections
     /// (`Service.ServingCallback` in `ingress/service.zig`).
     on_serving: ?ingress_mod.Service.ServingCallback = null,
@@ -139,12 +145,11 @@ pub const Server = struct {
         var tls_context = try tls_mod.BoringSslContext.initForKernelKtls(allocator, options.tls_certificate);
         errdefer tls_context.deinit();
 
-        var plan = try lane_plan_mod.build(
-            allocator,
-            options.listen,
-            ingress_mod.runner.laneMemoryShape(routes.definitionCount()),
-            options.ingress_lane_override,
-        );
+        var plan = try lane_plan_mod.build(allocator, .{
+            .listen = options.listen,
+            .shape = ingress_mod.runner.laneMemoryShape(routes.definitionCount(), routes.slotsPerWorkerTotal()),
+            .explicit_lane_count = options.ingress_lane_override,
+        });
         defer plan.deinit(allocator);
         logLanePlan(options.listen, plan);
 
@@ -161,7 +166,13 @@ pub const Server = struct {
 
         const gateway_manager = try allocator.create(gateway.Manager);
         errdefer allocator.destroy(gateway_manager);
-        gateway_manager.init(allocator, options.egress_gateway);
+        gateway_manager.init(allocator, .{
+            .executable_path = options.egress_gateway_executable_path,
+            .policy_image = .{
+                .fd = routes.network.imageFd(),
+                .bytes = routes.network.image_bytes,
+            },
+        });
         errdefer gateway_manager.deinit();
 
         const analytics_sink = try allocator.create(analytics_mod.Sink);
@@ -175,7 +186,7 @@ pub const Server = struct {
             routes,
             analytics_sink,
             options.worker,
-            options.worker_cgroup_root,
+            options.worker_host,
         );
         errdefer supervisor.deinit();
         supervisor.setEgressGatewayHooks(.{
@@ -205,8 +216,12 @@ pub const Server = struct {
     /// `gateway/manager.zig`), so a broken gateway binary fails the
     /// caller here instead of failing a request. Without this call the gateway
     /// spawns on the first worker attach, which callers need when their binary
-    /// cannot serve as the gateway through arg0 re-exec.
+    /// cannot serve as the gateway through arg0 re-exec. A server whose
+    /// definitions grant no network access spawns none, since no worker of it
+    /// would ever attach.
     pub fn prewarmEgressGateway(self: *Server) !void {
+        if (!self.routes.network.anyGranted())
+            return;
         try self.egress_gateways.prewarm();
     }
 
@@ -310,13 +325,14 @@ pub const Server = struct {
 
 fn logLanePlan(listen: std.net.Address, plan: lane_plan_mod.Plan) void {
     if (plan.interface) |interface| {
+        const queues: lane_plan_mod.Queues = interface.queues orelse .{ .rx = 0, .tx = 0 };
         std.log.info(
             "ingress lane plan listen={f} iface={s} rx_queues={d} tx_queues={d} allowed_cpu_count={d} mem_available_bytes={d} lane_count={d} lane_cpus={any}",
             .{
                 listen,
                 interface.name.slice(),
-                interface.rx_queues,
-                interface.tx_queues,
+                queues.rx,
+                queues.tx,
                 plan.allowed_cpu_count,
                 plan.mem_available_bytes,
                 plan.lane_count,

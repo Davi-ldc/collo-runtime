@@ -1,12 +1,14 @@
-// Promise deferreds for the ABI and host functions, the thenable check, and collo_request_task_settle_thenable, which
-// reports a handler's result to the Zig runtime once it settles. Runs on the VM thread.
+// The bridge's promise creation and settlement, promise deferreds for the ABI and host functions, the thenable check,
+// and collo_request_task_settle_thenable, which reports a handler's result to the Zig runtime once it settles. Runs on
+// the VM thread.
 //
-// A ColloPromiseDeferred holds a value handle to each of its promise's resolve and reject functions until it settles;
-// collo_promise_deferred_release frees it, settled or not, also after collo_vm_destroy, since releasing a value handle
-// is safe then. It also names its promise's realm, where the value that settles it is created; the VM owns that realm,
-// so the pointer is valid only while the VM lives, however long the deferred does. The settler functions capture the
-// request's completion token by value, and the Zig runtime checks its slot and generations, so a settlement that
-// arrives after its request ended cannot complete a later one.
+// A ColloPromiseDeferred holds a value handle to its pending promise until it settles; collo_promise_deferred_release
+// frees it, settled or not, also after collo_vm_destroy, since releasing a value handle is safe then. It also names its
+// promise's realm, where the value that settles it is created; the VM owns that realm, so the pointer is valid only
+// while the VM lives, however long the deferred does. Every settlement in the bridge goes through settlePromise, which
+// refuses while an exception is pending. The settler functions capture the request's completion token by value, and
+// the Zig runtime checks its slot and generations, so a settlement that arrives after its request ended cannot
+// complete a later one.
 
 #include "host_functions/internal.h"
 #include "jsc/runtime/state.h"
@@ -18,26 +20,21 @@ using namespace JSC;
 struct ColloPromiseDeferred {
     ColloVm* owner;
     ColloRealm* realm;
-    ColloValue* resolve;
-    ColloValue* reject;
+    // A handle to the pending promise, released once the deferred settles.
+    ColloValue* promise;
 
-    ColloPromiseDeferred(ColloRealm* promise_realm, ColloValue* resolve_handle, ColloValue* reject_handle)
+    ColloPromiseDeferred(ColloRealm* promise_realm, ColloValue* promise_handle)
         : owner(promise_realm->vm)
         , realm(promise_realm)
-        , resolve(resolve_handle)
-        , reject(reject_handle)
+        , promise(promise_handle)
     {
     }
 
     void clear()
     {
-        if (reject) {
-            Collo::releaseValueHandle(reject);
-            reject = nullptr;
-        }
-        if (resolve) {
-            Collo::releaseValueHandle(resolve);
-            resolve = nullptr;
+        if (promise) {
+            Collo::releaseValueHandle(promise);
+            promise = nullptr;
         }
         owner = nullptr;
     }
@@ -93,6 +90,25 @@ JSC::JSNativeStdFunction* requestTaskSettlerFunction(
 
 namespace Collo {
 
+JSC::JSPromise* newPromise(JSC::JSGlobalObject* global_object)
+{
+    return JSC::JSPromise::create(global_object->vm(), global_object->promiseStructure());
+}
+
+bool settlePromise(JSC::JSPromise* promise, JSC::JSValue value, bool is_rejection)
+{
+    auto* global_object = promise->realm();
+    auto& vm = global_object->vm();
+    auto scope = DECLARE_TOP_EXCEPTION_SCOPE(vm);
+    if (scope.exception())
+        return false;
+    if (is_rejection)
+        promise->reject(vm, value);
+    else
+        promise->resolve(global_object, vm, value);
+    return !scope.exception();
+}
+
 ColloStatus createPromiseDeferred(
     ColloVm* vm, JSC::JSGlobalObject* global_object, JSC::JSValue* out_promise, ColloPromiseDeferred** out_deferred)
 {
@@ -106,27 +122,16 @@ ColloStatus createPromiseDeferred(
     if (!collo_global || &collo_global->owner() != vm)
         return COLLO_STATUS_INVALID_ARGUMENT;
 
-    auto data = JSC::JSPromise::createDeferredData(global_object, global_object->promiseConstructor());
-    if (!data.promise || !data.resolve || !data.reject)
+    auto* promise = newPromise(global_object);
+    ColloValue* promise_handle = nullptr;
+    if (Collo::makeValueHandle(vm, promise, &promise_handle) != COLLO_STATUS_OK || !promise_handle)
         return COLLO_STATUS_OUT_OF_MEMORY;
-
-    ColloValue* resolve_handle = nullptr;
-    ColloValue* reject_handle = nullptr;
-    if (Collo::makeValueHandle(vm, data.resolve, &resolve_handle) != COLLO_STATUS_OK || !resolve_handle)
-        return COLLO_STATUS_OUT_OF_MEMORY;
-    if (Collo::makeValueHandle(vm, data.reject, &reject_handle) != COLLO_STATUS_OK || !reject_handle) {
-        Collo::releaseValueHandle(resolve_handle);
-        return COLLO_STATUS_OUT_OF_MEMORY;
-    }
-
-    auto* deferred = new (std::nothrow) ColloPromiseDeferred(&collo_global->realm(), resolve_handle, reject_handle);
+    auto* deferred = new (std::nothrow) ColloPromiseDeferred(&collo_global->realm(), promise_handle);
     if (!deferred) {
-        Collo::releaseValueHandle(reject_handle);
-        Collo::releaseValueHandle(resolve_handle);
+        Collo::releaseValueHandle(promise_handle);
         return COLLO_STATUS_OUT_OF_MEMORY;
     }
-
-    *out_promise = data.promise;
+    *out_promise = promise;
     *out_deferred = deferred;
     return COLLO_STATUS_OK;
 }
@@ -135,49 +140,37 @@ ColloStatus settlePromiseDeferred(
     ColloVm* vm, ColloPromiseDeferred* deferred, JSC::JSValue value, bool is_rejection, ColloValue** out_exception)
 {
     Collo::clearOutException(out_exception);
-    if (!vm || !vm->isReady() || !deferred || deferred->owner != vm || !deferred->resolve || !deferred->reject)
+    if (!vm || !vm->isReady() || !deferred || deferred->owner != vm || !deferred->promise)
         return COLLO_STATUS_INVALID_ARGUMENT;
-
-    ColloValue* callback_handle = is_rejection ? deferred->reject : deferred->resolve;
-    if (!Collo::valueBelongsToVm(vm, callback_handle))
+    if (!Collo::valueBelongsToVm(vm, deferred->promise))
         return COLLO_STATUS_INVALID_ARGUMENT;
-
-    JSC::JSValue callback_value = Collo::toJSValue(callback_handle);
-    auto* callback_object = dynamicDowncast<JSC::JSObject>(callback_value);
-    if (!callback_object)
+    auto* promise = dynamicDowncast<JSC::JSPromise>(Collo::toJSValue(deferred->promise));
+    if (!promise)
         return COLLO_STATUS_INVALID_ARGUMENT;
-
-    JSC::CallData call_data = JSC::getCallData(callback_object);
-    if (call_data.type == JSC::CallData::Type::None)
-        return COLLO_STATUS_INVALID_ARGUMENT;
-
-    JSC::MarkedArgumentBuffer arguments;
-    arguments.append(value);
-    if (arguments.hasOverflowed())
-        return COLLO_STATUS_OUT_OF_MEMORY;
 
     auto scope = DECLARE_TOP_EXCEPTION_SCOPE(*vm->vm);
-    JSC::call(deferred->realm->global_object, callback_object, call_data, JSC::jsUndefined(), arguments);
-    if (scope.exception()) {
-        ColloStatus status = Collo::caughtExceptionStatus(vm, scope, out_exception);
-        deferred->clear();
-        return status;
-    }
+    // A termination an earlier call left: nothing runs, and the deferred stays unsettled for its owner to release.
+    if (scope.exception())
+        return COLLO_STATUS_ERROR;
+    // The promise stays rooted by this frame's conservative stack scan once the handle is gone.
     deferred->clear();
-    return COLLO_STATUS_OK;
+    if (settlePromise(promise, value, is_rejection))
+        return COLLO_STATUS_OK;
+    return Collo::caughtExceptionStatus(vm, scope, out_exception);
 }
 
 } // namespace Collo
 
 extern "C" ColloStatus collo_value_is_thenable(
-    ColloVm* vm, const ColloValue* value, uint8_t* out_is_thenable, ColloValue** out_exception)
+    ColloRealm* realm, const ColloValue* value, uint8_t* out_is_thenable, ColloValue** out_exception)
 {
     if (out_is_thenable)
         *out_is_thenable = 0;
     Collo::clearOutException(out_exception);
-    if (!vm || !vm->isReady() || !Collo::valueBelongsToVm(vm, value) || !out_is_thenable)
+    if (!realmIsReady(realm) || !Collo::valueBelongsToVm(realm->vm, value) || !out_is_thenable)
         return COLLO_STATUS_INVALID_ARGUMENT;
 
+    ColloVm* vm = realm->vm;
     JSC::JSLockHolder locker(*vm->vm);
     JSC::JSValue js_value = Collo::toJSValue(value);
     auto* object = dynamicDowncast<JSC::JSObject>(js_value);
@@ -186,7 +179,7 @@ extern "C" ColloStatus collo_value_is_thenable(
 
     auto scope = DECLARE_TOP_EXCEPTION_SCOPE(*vm->vm);
     JSC::JSValue then_value
-        = object->get(Collo::globalObjectForValue(vm, object), JSC::Identifier::fromString(*vm->vm, "then"_s));
+        = object->get(Collo::globalObjectForValue(*realm, object), JSC::Identifier::fromString(*vm->vm, "then"_s));
     if (scope.exception())
         return Collo::caughtExceptionStatus(vm, scope, out_exception);
 
@@ -227,20 +220,22 @@ extern "C" void collo_promise_deferred_release(ColloPromiseDeferred* deferred)
 }
 
 extern "C" ColloStatus collo_request_task_settle_thenable(
-    ColloVm* vm, const ColloRequestCompletionToken* token, const ColloValue* value, ColloValue** out_exception)
+    ColloRealm* realm, const ColloRequestCompletionToken* token, const ColloValue* value, ColloValue** out_exception)
 {
     Collo::clearOutException(out_exception);
-    if (!vm || !vm->isReady() || !token || token->request_id == 0 || token->generation == 0
-        || token->request_generation == 0 || !Collo::valueBelongsToVm(vm, value))
+    if (!realmIsReady(realm) || !token || token->request_id == 0 || token->generation == 0
+        || token->request_generation == 0 || !Collo::valueBelongsToVm(realm->vm, value))
         return COLLO_STATUS_INVALID_ARGUMENT;
 
+    ColloVm* vm = realm->vm;
     JSC::JSLockHolder locker(*vm->vm);
     auto scope = DECLARE_TOP_EXCEPTION_SCOPE(*vm->vm);
 
-    // The handler's own realm, so a promise it returned is adopted as it is: PromiseResolve wraps a promise whose
-    // constructor is another realm's, which would cost the settlement an extra round of microtasks.
+    // The value's own realm, so a promise the handler returned is adopted as it is: PromiseResolve wraps a promise
+    // whose constructor is another realm's, which would cost the settlement an extra round of microtasks. A primitive
+    // result is wrapped in a promise of `realm`, the handler's.
     JSC::JSValue js_value = Collo::toJSValue(value);
-    auto* global_object = Collo::globalObjectForValue(vm, js_value);
+    auto* global_object = Collo::globalObjectForValue(*realm, js_value);
     auto* resolve_function = requestTaskSettlerFunction(*vm, global_object, *token, false);
     auto* reject_function = requestTaskSettlerFunction(*vm, global_object, *token, true);
     if (!resolve_function || !reject_function)

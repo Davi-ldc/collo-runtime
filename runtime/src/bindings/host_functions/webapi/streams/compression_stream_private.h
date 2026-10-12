@@ -1,20 +1,27 @@
-// CompressionStream and DecompressionStream: the cell, the codec that drives
-// zlib or Brotli, and the part of both libraries' C API the bridge calls. Runs
-// on the VM thread.
+// CompressionStream and DecompressionStream: the cell, and the codec that drives zlib or Brotli. Runs on the VM thread.
 //
-// The bridge loads zlib and Brotli with dlopen instead of including their
-// headers, so the constants and ZlibStream below restate zlib.h and the Brotli
-// headers and must match them on 64-bit Linux. deflateInit2_ and inflateInit2_
-// reject a ZlibStream of the wrong size, but not a reordered field. A codec's
-// library state is malloc memory the collector does not see; deinit or the
-// cell's destructor frees it.
+// The codec is native only: it never calls into JavaScript and never sees a stream. The cell runs it into a held
+// output buffer and then delivers that buffer to the readable side. A delivery can run script, because resolving a
+// pending read looks up `then` on the read result, and that script can cancel the stream, read again or error it.
+// So no span of the input or the output, and no library call, outlives a delivery: the codec has finished its step
+// before the cell delivers, and the cell re-reads its state after each delivery.
+//
+// The bridge compiles zlib.h with ZLIB_CONST (addBridgeIncludes in runtime/build/codecs.zig), so z_stream::next_in
+// takes read-only input. Both libraries allocate through the codec, which counts their bytes; the cell reports those
+// bytes, with its held input and output, to the collector.
 #pragma once
 
 #include "host_functions/webapi/streams/readable_stream_private.h"
 #include "host_functions/webapi/streams/writable_stream_private.h"
 
+#include <brotli/decode.h>
+#include <brotli/encode.h>
+#include <zlib.h>
+
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <span>
 
 namespace Collo::HostFunctions {
 
@@ -34,145 +41,46 @@ enum class CompressionFormat : uint8_t {
     Brotli,
 };
 
-enum class CompressionProcessResult : uint8_t {
-    Complete,
-    Blocked,
+enum class CodecStatus : uint8_t {
+    // The codec consumed its input and has no output it could produce without more.
+    NeedsInput,
+    // The codec stopped before it was done, usually because the output span filled. Call it again with the input
+    // that remains.
+    MoreOutput,
+    // The compressed stream ended; the codec has released its library state.
+    Finished,
+    // Invalid or truncated compressed data, data after the end of the compressed stream, or a library failure.
     Failed,
+    // A library allocation failed.
+    OutOfMemory,
 };
 
-constexpr int zlibOk = 0;
-constexpr int zlibStreamEnd = 1;
-constexpr int zlibStreamError = -2;
-constexpr int zlibDataError = -3;
-constexpr int zlibMemoryError = -4;
-constexpr int zlibBufferError = -5;
-constexpr int zlibNoFlush = 0;
-constexpr int zlibFinish = 4;
-constexpr int zlibDeflated = 8;
-constexpr int zlibDefaultCompression = -1;
-constexpr int zlibDefaultStrategy = 0;
-constexpr int brotliEncoderOperationProcess = 0;
-constexpr int brotliEncoderOperationFinish = 2;
-constexpr int brotliDecoderResultError = 0;
-constexpr int brotliDecoderResultSuccess = 1;
-constexpr int brotliDecoderResultNeedsMoreInput = 2;
-constexpr int brotliDecoderResultNeedsMoreOutput = 3;
-
-struct ZlibStream {
-    const uint8_t* next_in { nullptr };
-    unsigned int avail_in { 0 };
-    unsigned long total_in { 0 };
-    uint8_t* next_out { nullptr };
-    unsigned int avail_out { 0 };
-    unsigned long total_out { 0 };
-    const char* msg { nullptr };
-    void* state { nullptr };
-    void* zalloc { nullptr };
-    void* zfree { nullptr };
-    void* opaque { nullptr };
-    int data_type { 0 };
-    unsigned long adler { 0 };
-    unsigned long reserved { 0 };
+struct CodecStep {
+    CodecStatus status { CodecStatus::Failed };
+    size_t consumed { 0 };
+    size_t produced { 0 };
 };
-
-using ZlibVersionFn = const char* (*)();
-using ZlibDeflateInit2Fn = int (*)(ZlibStream*, int, int, int, int, int, const char*, int);
-using ZlibDeflateFn = int (*)(ZlibStream*, int);
-using ZlibDeflateEndFn = int (*)(ZlibStream*);
-using ZlibInflateInit2Fn = int (*)(ZlibStream*, int, const char*, int);
-using ZlibInflateFn = int (*)(ZlibStream*, int);
-using ZlibInflateEndFn = int (*)(ZlibStream*);
-
-struct ZlibLibrary {
-    bool available { false };
-    ZlibVersionFn version { nullptr };
-    ZlibDeflateInit2Fn deflate_init { nullptr };
-    ZlibDeflateFn deflate { nullptr };
-    ZlibDeflateEndFn deflate_end { nullptr };
-    ZlibInflateInit2Fn inflate_init { nullptr };
-    ZlibInflateFn inflate { nullptr };
-    ZlibInflateEndFn inflate_end { nullptr };
-};
-
-struct BrotliEncoderState;
-struct BrotliDecoderState;
-
-using BrotliAllocFn = void* (*)(void*, size_t);
-using BrotliFreeFn = void (*)(void*, void*);
-using BrotliEncoderCreateFn = BrotliEncoderState* (*)(BrotliAllocFn, BrotliFreeFn, void*);
-using BrotliEncoderDestroyFn = void (*)(BrotliEncoderState*);
-using BrotliEncoderCompressStreamFn
-    = int (*)(BrotliEncoderState*, int, size_t*, const uint8_t**, size_t*, uint8_t**, size_t*);
-using BrotliEncoderIsFinishedFn = int (*)(BrotliEncoderState*);
-using BrotliDecoderCreateFn = BrotliDecoderState* (*)(BrotliAllocFn, BrotliFreeFn, void*);
-using BrotliDecoderDestroyFn = void (*)(BrotliDecoderState*);
-using BrotliDecoderDecompressStreamFn
-    = int (*)(BrotliDecoderState*, size_t*, const uint8_t**, size_t*, uint8_t**, size_t*);
-
-struct BrotliLibrary {
-    bool available { false };
-    BrotliEncoderCreateFn encoder_create { nullptr };
-    BrotliEncoderDestroyFn encoder_destroy { nullptr };
-    BrotliEncoderCompressStreamFn encoder_compress_stream { nullptr };
-    BrotliEncoderIsFinishedFn encoder_is_finished { nullptr };
-    BrotliDecoderCreateFn decoder_create { nullptr };
-    BrotliDecoderDestroyFn decoder_destroy { nullptr };
-    BrotliDecoderDecompressStreamFn decoder_decompress_stream { nullptr };
-};
-
-const ZlibLibrary& sharedZlibLibrary();
-const BrotliLibrary& sharedBrotliLibrary();
-void preloadCompressionLibraries();
 
 class CompressionCodec {
 public:
     CompressionCodec() = default;
+    // The libraries hold this codec's address as their allocation context.
     CompressionCodec(const CompressionCodec&) = delete;
     CompressionCodec& operator=(const CompressionCodec&) = delete;
-    ~CompressionCodec() { deinit(); }
+    ~CompressionCodec() { release(); }
 
-    bool init(CompressionFormat format, bool decompressing)
-    {
-        m_format = format;
-        m_decompressing = decompressing;
-        if (format == CompressionFormat::Brotli)
-            return initBrotli(decompressing);
-        return initZlib(format, decompressing);
-    }
+    // Returns false when the library cannot allocate its state.
+    bool open(CompressionFormat, bool decompressing);
+    // Frees the library state. Every later step fails, unless the stream had already finished. Safe to repeat.
+    void release();
+    bool finished() const { return m_finished; }
+    // Bytes the libraries hold right now, allocation headers included.
+    size_t allocatedBytes() const { return m_allocated_bytes; }
 
-    void deinit()
-    {
-        if (m_kind == Kind::Zlib) {
-            if (m_decompressing) {
-                if (m_zlib_library && m_zlib_library->inflate_end)
-                    m_zlib_library->inflate_end(&m_zlib_stream);
-            } else if (m_zlib_library && m_zlib_library->deflate_end) {
-                m_zlib_library->deflate_end(&m_zlib_stream);
-            }
-        } else if (m_kind == Kind::Brotli) {
-            if (m_decompressing) {
-                if (m_brotli_library && m_brotli_decoder_state && m_brotli_library->decoder_destroy)
-                    m_brotli_library->decoder_destroy(m_brotli_decoder_state);
-            } else if (m_brotli_library && m_brotli_encoder_state && m_brotli_library->encoder_destroy) {
-                m_brotli_library->encoder_destroy(m_brotli_encoder_state);
-            }
-        }
-        m_kind = Kind::None;
-        m_zlib_library = nullptr;
-        m_brotli_library = nullptr;
-        m_brotli_encoder_state = nullptr;
-        m_brotli_decoder_state = nullptr;
-        m_finished = false;
-        m_pending_output.clear();
-        m_zlib_stream = {};
-    }
-
-    // Feeds input to the codec, with finish set on the last call, and enqueues
-    // output on readable while it accepts more. Blocked leaves the unconsumed
-    // byte count in remaining_input_size. Failed either leaves an exception
-    // pending or, for a codec error, leaves the caller to report one.
-    CompressionProcessResult process(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope,
-        std::span<const uint8_t> input, bool finish, JSColloReadableStream* readable, size_t& remaining_input_size);
+    // Runs one library call over input into output. finish asks a compressor to end the stream and tells a
+    // decompressor that no input follows, which makes a truncated stream fail; it is only passed with empty input.
+    // Runs no script. After Finished the codec holds no library state.
+    CodecStep step(std::span<const uint8_t> input, bool finish, std::span<uint8_t> output);
 
 private:
     enum class Kind : uint8_t {
@@ -181,89 +89,22 @@ private:
         Brotli,
     };
 
-    bool initZlib(CompressionFormat format, bool decompressing)
-    {
-        const auto& library = sharedZlibLibrary();
-        if (!library.available)
-            return false;
-        // zlib's windowBits: 15 is the largest window, adding 16 selects the
-        // gzip wrapper and negating it selects raw deflate. The 8 passed to
-        // deflateInit2_ below is zlib's default memLevel.
-        const int window_bits = [format] {
-            switch (format) {
-            case CompressionFormat::Gzip:
-                return 15 + 16;
-            case CompressionFormat::Deflate:
-                return 15;
-            case CompressionFormat::DeflateRaw:
-                return -15;
-            case CompressionFormat::Brotli:
-                return 0;
-            }
-            return 0;
-        }();
-        m_zlib_stream = {};
-        if (decompressing) {
-            int status = library.inflate_init(&m_zlib_stream, window_bits, library.version(), sizeof(ZlibStream));
-            if (status != zlibOk)
-                return false;
-        } else {
-            int status = library.deflate_init(&m_zlib_stream, zlibDefaultCompression, zlibDeflated, window_bits, 8,
-                zlibDefaultStrategy, library.version(), sizeof(ZlibStream));
-            if (status != zlibOk)
-                return false;
-        }
-        m_zlib_library = &library;
-        m_kind = Kind::Zlib;
-        return true;
-    }
+    CodecStep stepZlib(std::span<const uint8_t> input, bool finish, std::span<uint8_t> output);
+    CodecStep stepBrotliEncoder(std::span<const uint8_t> input, bool finish, std::span<uint8_t> output);
+    CodecStep stepBrotliDecoder(std::span<const uint8_t> input, bool finish, std::span<uint8_t> output);
 
-    bool initBrotli(bool decompressing)
-    {
-        const auto& library = sharedBrotliLibrary();
-        if (!library.available)
-            return false;
-        if (decompressing) {
-            m_brotli_decoder_state = library.decoder_create(nullptr, nullptr, nullptr);
-            if (!m_brotli_decoder_state)
-                return false;
-        } else {
-            m_brotli_encoder_state = library.encoder_create(nullptr, nullptr, nullptr);
-            if (!m_brotli_encoder_state)
-                return false;
-        }
-        m_brotli_library = &library;
-        m_kind = Kind::Brotli;
-        return true;
-    }
+    static void* allocate(void* opaque, size_t size);
+    static void deallocate(void* opaque, void* address);
+    static voidpf zlibAllocate(voidpf opaque, uInt items, uInt size);
+    static void zlibDeallocate(voidpf opaque, voidpf address);
 
-    bool readableCanAcceptOutput(JSColloReadableStream* readable) const;
-    // force skips the demand check. flushPendingOutput sets it after checking
-    // demand itself, and the codec loops set it for the output that completes
-    // the compressed stream.
-    CompressionProcessResult appendOutput(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope,
-        JSColloReadableStream* readable, std::span<const uint8_t> bytes, bool force);
-    CompressionProcessResult flushPendingOutput(
-        JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSColloReadableStream* readable);
-    CompressionProcessResult processZlib(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope,
-        std::span<const uint8_t> input, bool finish, JSColloReadableStream* readable, size_t& remaining_input_size);
-    CompressionProcessResult processBrotli(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope,
-        std::span<const uint8_t> input, bool finish, JSColloReadableStream* readable, size_t& remaining_input_size);
-    CompressionProcessResult processBrotliEncoder(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope,
-        std::span<const uint8_t> input, bool finish, JSColloReadableStream* readable, size_t& remaining_input_size);
-    CompressionProcessResult processBrotliDecoder(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope,
-        std::span<const uint8_t> input, bool finish, JSColloReadableStream* readable, size_t& remaining_input_size);
-
-    CompressionFormat m_format { CompressionFormat::Gzip };
     Kind m_kind { Kind::None };
     bool m_decompressing { false };
     bool m_finished { false };
-    WTF::Vector<uint8_t> m_pending_output;
-
-    const ZlibLibrary* m_zlib_library { nullptr };
-    const BrotliLibrary* m_brotli_library { nullptr };
-
-    ZlibStream m_zlib_stream;
+    // Set by allocate when the library asked for memory it could not get, so a library error reads as OOM.
+    bool m_allocation_failed { false };
+    size_t m_allocated_bytes { 0 };
+    z_stream m_zlib_stream {};
     BrotliEncoderState* m_brotli_encoder_state { nullptr };
     BrotliDecoderState* m_brotli_decoder_state { nullptr };
 };
@@ -279,7 +120,7 @@ public:
         return &vm.destructibleObjectSpace();
     }
 
-    static JSC::Structure* createStructure(JSC::VM& vm, JSC::JSGlobalObject* global_object, JSValue prototype)
+    static JSC::Structure* createStructure(JSC::VM& vm, JSC::JSGlobalObject* global_object, JSC::JSValue prototype)
     {
         return JSC::Structure::create(
             vm, global_object, prototype, JSC::TypeInfo(JSC::ObjectType, StructureFlags), info());
@@ -293,7 +134,10 @@ public:
         return object;
     }
 
-    static void destroy(JSCell* cell) { static_cast<JSColloCompressionStream*>(cell)->~JSColloCompressionStream(); }
+    static void destroy(JSC::JSCell* cell)
+    {
+        static_cast<JSColloCompressionStream*>(cell)->~JSColloCompressionStream();
+    }
 
     DECLARE_INFO;
     DECLARE_VISIT_CHILDREN;
@@ -303,11 +147,11 @@ public:
     JSColloWritableStream* writable() const { return m_writable.get(); }
 
     bool initialize(JSC::JSGlobalObject*, JSC::ThrowScope&, CompressionFormat, bool decompressing);
-    EncodedJSValue write(JSC::JSGlobalObject*, JSC::ThrowScope&, JSValue chunk);
-    EncodedJSValue close(JSC::JSGlobalObject*, JSC::ThrowScope&);
+    JSC::EncodedJSValue write(JSC::JSGlobalObject*, JSC::ThrowScope&, JSC::JSValue chunk);
+    JSC::EncodedJSValue close(JSC::JSGlobalObject*, JSC::ThrowScope&);
     void resume(JSC::JSGlobalObject*, JSC::ThrowScope&);
-    void readableCanceled(JSC::JSGlobalObject*, JSValue reason);
-    void abort(JSC::JSGlobalObject*, JSValue reason);
+    void readableCanceled(JSC::JSGlobalObject*, JSC::JSValue reason);
+    void abort(JSC::JSGlobalObject*, JSC::JSValue reason);
 
 private:
     enum class PendingOperation : uint8_t {
@@ -316,15 +160,22 @@ private:
         Close,
     };
 
+    enum class PumpResult : uint8_t {
+        // The operation's input is consumed and its output delivered.
+        Complete,
+        // The operation waits for the readable side to pull.
+        Blocked,
+        // Script settled the operation during a delivery, by canceling the readable side.
+        Superseded,
+        // The codec failed; no exception is pending.
+        CodecFailed,
+        // An exception is pending.
+        Threw,
+    };
+
     explicit JSColloCompressionStream(JSC::VM& vm, JSC::Structure* structure)
         : Base(vm, structure)
     {
-    }
-
-    ~JSColloCompressionStream()
-    {
-        if (m_pending_deferred)
-            collo_promise_deferred_release(m_pending_deferred);
     }
 
     void finishCreation(JSC::VM& vm)
@@ -333,26 +184,45 @@ private:
         ASSERT(inherits(info()));
     }
 
-    bool setPendingOperation(JSC::JSGlobalObject*, JSC::ThrowScope&, PendingOperation, std::span<const uint8_t>);
-    CompressionProcessResult pumpPendingOperation(JSC::JSGlobalObject*, JSC::ThrowScope&);
-    EncodedJSValue drivePendingOperation(JSC::JSGlobalObject*, JSC::ThrowScope&);
-    void resolvePendingOperation(JSC::JSGlobalObject*);
-    void rejectPendingOperation(JSC::JSGlobalObject*, JSValue reason);
-    void failBothSides(JSC::JSGlobalObject*, JSValue reason);
-    void clearPendingOperation();
+    bool beginOperation(JSC::JSGlobalObject*, JSC::ThrowScope&, PendingOperation);
+    JSC::EncodedJSValue drivePendingOperation(
+        JSC::JSGlobalObject*, JSC::ThrowScope&, std::span<const uint8_t> borrowed_input);
+    PumpResult pump(JSC::JSGlobalObject*, JSC::ThrowScope&, std::span<const uint8_t> borrowed_input);
+    CodecStatus fillOutput(std::span<const uint8_t> input, bool finish, size_t& consumed);
+    bool deliverOutput(JSC::JSGlobalObject*, JSC::ThrowScope&);
+    bool keepInput(JSC::JSGlobalObject*, JSC::ThrowScope&, std::span<const uint8_t> borrowed_input);
+    std::span<const uint8_t> pendingInput() const;
+    void consumePendingInput(size_t consumed);
+    bool readableWantsOutput() const;
+    JSC::JSPromise* takePendingOperation();
+    void completePendingOperation(JSC::JSGlobalObject*);
+    void rejectPendingOperation(JSC::JSValue reason);
+    void failBothSides(JSC::JSGlobalObject*, JSC::JSValue reason);
+    void noteMemoryCost();
 
     JSC::WriteBarrier<JSColloReadableStream> m_readable;
     JSC::WriteBarrier<JSColloWritableStream> m_writable;
-    JSC::WriteBarrier<JSC::Unknown> m_pending_promise;
+    // The promise the writable side waits on for the pending write or close.
+    JSC::WriteBarrier<JSC::JSPromise> m_pending_promise;
     CompressionCodec m_codec;
-    // A copy of the pending write's chunk: a blocked write resumes on a later
-    // pull, after script may have detached or changed the chunk's buffer.
+    // What a blocked write has not yet fed to the codec, copied out of its chunk: the write resumes on a later pull,
+    // after script may have detached or changed the chunk's buffer.
     WTF::Vector<uint8_t> m_pending_input;
     size_t m_pending_offset { 0 };
-    // Can keep this cell alive until VM teardown: see the FIXME in stream_common_private.h.
-    ColloPromiseDeferred* m_pending_deferred { nullptr };
+    // Codec output not yet delivered, at most WebApiCompressionStreamOutputChunkBytes.
+    WTF::Vector<uint8_t> m_output;
+    // The codec's last step stopped early, so it may hold output even with no input left.
+    bool m_codec_has_more_output { false };
+    // True while pump runs. A pull that script triggers during a delivery returns at once, since pump re-checks
+    // demand after every delivery.
+    bool m_pumping { false };
     PendingOperation m_pending_operation { PendingOperation::None };
     bool m_decompressing { false };
+    // The native bytes this cell holds, for visitChildren, which runs on collector threads and reads only this.
+    std::atomic<size_t> m_memory_cost { 0 };
+    // The most this cell has reported as allocated. Only growth past it is reported again, so output that is handed
+    // to the readable side and then replaced does not count as new allocation each time.
+    size_t m_memory_cost_reported { 0 };
 };
 
 } // namespace Collo::HostFunctions

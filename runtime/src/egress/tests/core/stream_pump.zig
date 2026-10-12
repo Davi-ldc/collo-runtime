@@ -10,9 +10,9 @@ const std = @import("std");
 const test_support = @import("support.zig");
 const body_credit = test_support.body_credit;
 const fetch_body = test_support.fetch_body;
-const decompress = test_support.decompress;
 const stream_pump = test_support.stream_pump;
 const transport = test_support.transport;
+const network = @import("collo_egress_client").network;
 const identity = test_support.identity;
 const waiter = test_support.waiter;
 const h2Credit = test_support.h2Credit;
@@ -38,7 +38,7 @@ test "h2 encoded sink transfers chunks with h2 encoded-byte credit" {
 }
 
 test "default h2 advertised stream window fits identity decoded queue" {
-    const config = transport.Config{};
+    const config = transport.Config{ .network = network.public_https };
     const h2_limits = try config.http2Limits().normalized();
     var body = fetch_body.Body.initOpen(std.testing.allocator, identity(82), config.max_response_body_bytes);
     defer {
@@ -352,9 +352,6 @@ test "http1 pump without capacity waiter still fails closed at decoded watermark
 }
 
 test "http1 compressed trailer can finish exactly at decoded budget" {
-    if (!decompress.supportsZlib())
-        return error.SkipZigTest;
-
     var pipe = Http1BackpressurePipe.init(std.testing.allocator, 0);
     defer pipe.deinit();
 
@@ -388,9 +385,6 @@ test "http1 compressed trailer can finish exactly at decoded budget" {
 }
 
 test "deflate sniffs zlib-wrapped and raw streams alike" {
-    if (!decompress.supportsZlib())
-        return error.SkipZigTest;
-
     // Both wire shapes of `Content-Encoding: deflate` decode: the conformant
     // zlib wrapper (RFC 1950) and the bare RFC 1951 stream that a long tail
     // of origins sends, which browsers and curl also tell apart by sniffing.
@@ -416,9 +410,6 @@ test "deflate sniffs zlib-wrapped and raw streams alike" {
 }
 
 test "deflate sniff survives a one-byte first chunk" {
-    if (!decompress.supportsZlib())
-        return error.SkipZigTest;
-
     // The sniff needs two bytes; a single-byte first read must be held and
     // replayed once the second byte decides the wrapping.
     const vector: []const u8 = &test_support.raw_deflate_hello_world;
@@ -440,9 +431,6 @@ test "deflate sniff survives a one-byte first chunk" {
 }
 
 test "deflate stream shorter than the sniff is truncated, not accepted" {
-    if (!decompress.supportsZlib())
-        return error.SkipZigTest;
-
     var pipe = Http1BackpressurePipe.init(std.testing.allocator, 0);
     defer pipe.deinit();
     var pump = try stream_pump.Pump.initWithLimits(.deflate, try (stream_pump.Limits{
@@ -460,9 +448,6 @@ test "deflate stream shorter than the sniff is truncated, not accepted" {
 }
 
 test "http1 compressed append fails when exhausted budget needs more output" {
-    if (!decompress.supportsZlib())
-        return error.SkipZigTest;
-
     var pipe = Http1BackpressurePipe.init(std.testing.allocator, 0);
     defer pipe.deinit();
 
@@ -482,9 +467,6 @@ test "http1 compressed append fails when exhausted budget needs more output" {
 }
 
 test "gzip pump decode allocation count stays bounded" {
-    if (!decompress.supportsZlib())
-        return error.SkipZigTest;
-
     // A gzip member that expands about 186 times (44 encoded bytes to 8192
     // decoded), pushed through the pump in two wire chunks, stays within ten
     // allocations. Each push that produces output may reserve its

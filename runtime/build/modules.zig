@@ -1,10 +1,11 @@
 //! Single source of truth for the collo_* module graph. Built once per
 //! (target, optimize, bindings-flavor); the JSC graph backs the runtime binary
 //! and JSC-linked tests, the h2_stub graph backs JSC-free transport tests and
-//! the egress benches.
+//! the egress benches. A module carries no library: the artifact that links
+//! names the pinned archives it needs (codecs.zig, deps.zig), because many
+//! compilations of these modules are objects that link.zig links later.
 const std = @import("std");
-const toolchain_mod = @import("toolchain.zig");
-const zstd_mod = @import("zstd.zig");
+const codecs_mod = @import("codecs.zig");
 
 pub const BindingsFlavor = enum {
     /// src/bindings/root.zig — requires linking the JSC bridge.
@@ -17,16 +18,19 @@ pub const GraphOptions = struct {
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     bindings: BindingsFlavor,
-    toolchain: *const toolchain_mod.ToolchainPaths,
-    zstd_link: zstd_mod.LinkMode,
+    /// Built for `target`.
+    codecs: *const codecs_mod.Codecs,
 };
 
 pub const ModuleId = enum {
     bindings,
+    zlib,
+    brotli,
     zstd,
     boringssl,
     hpack,
     dns_name,
+    network,
     limits,
     http,
     cgroup,
@@ -79,11 +83,14 @@ const egress_io_imports = [_]ModuleId{
 };
 
 const specs = [_]Spec{
-    .{ .id = .bindings, .root = "runtime/src/bindings/root.zig" },
+    .{ .id = .bindings, .root = "runtime/src/bindings/root.zig", .imports = &.{.limits} },
+    .{ .id = .zlib, .root = "runtime/src/bindings/zlib/root.zig" },
+    .{ .id = .brotli, .root = "runtime/src/bindings/brotli/root.zig" },
     .{ .id = .zstd, .root = "runtime/src/bindings/zstd/root.zig" },
     .{ .id = .boringssl, .root = "runtime/src/bindings/boringssl/root.zig" },
     .{ .id = .hpack, .root = "runtime/src/bindings/hpack/root.zig" },
     .{ .id = .dns_name, .root = "runtime/src/common/dns_name.zig", .libc = false },
+    .{ .id = .network, .root = "runtime/src/common/network/root.zig", .libc = false, .imports = &.{.limits} },
     .{ .id = .limits, .root = "runtime/src/common/limits/root.zig", .libc = false },
     .{ .id = .http, .root = "runtime/src/common/http/root.zig", .libc = false, .imports = &.{.dns_name} },
     .{ .id = .cgroup, .root = "runtime/src/common/cgroup.zig" },
@@ -91,8 +98,10 @@ const specs = [_]Spec{
     .{ .id = .ktls, .root = "runtime/src/common/tls/ktls.zig", .imports = &.{.os} },
     .{ .id = .ipc, .root = "runtime/src/common/ipc/root.zig", .imports = &.{ .os, .limits } },
     .{ .id = .io_uring_tags, .root = "runtime/src/common/io/uring_tags.zig", .libc = false },
-    .{ .id = .common_io, .root = "runtime/src/common/io/root.zig", .libc = false, .imports = &.{.io_uring_tags} },
-    .{ .id = .worker_state, .root = "runtime/src/common/worker_state/root.zig", .imports = &.{.os} },
+    // The restricted ring's descriptor checks read socket options through
+    // `collo_os.socket`, which links libc.
+    .{ .id = .common_io, .root = "runtime/src/common/io/root.zig", .imports = &.{ .io_uring_tags, .os } },
+    .{ .id = .worker_state, .root = "runtime/src/common/worker_state/root.zig", .imports = &.{ .os, .limits } },
     .{
         // Leaf JS↔JSC plumbing (deferred/value/exception_log/turn) shared by
         // worker and worker_request.
@@ -115,7 +124,7 @@ const specs = [_]Spec{
         .id = .egress_core,
         .root = "runtime/src/egress/core/root.zig",
         .libcpp = true,
-        .imports = &.{ .bindings, .common_io, .http, .limits },
+        .imports = &.{ .bindings, .common_io, .http, .limits, .zlib, .brotli },
     },
     .{ .id = .egress_io, .root = "runtime/src/egress/client/io.zig", .libc = false },
     .{
@@ -146,6 +155,7 @@ const specs = [_]Spec{
             .egress_readiness,
             .egress_dns_cache,
             .limits,
+            .network,
         } ++ egress_io_imports),
     },
     .{
@@ -197,13 +207,13 @@ const specs = [_]Spec{
         .imports = &.{
             .bindings,       .worker_state, .ipc,         .os,     .cgroup,
             .http,           .common_io,    .egress_core, .limits, .worker_js,
-            .worker_request,
+            .worker_request, .network,
         },
     },
     .{
         .id = .zygote,
         .root = "runtime/src/zygote/root.zig",
-        .imports = &.{ .bindings, .worker, .egress_core, .ipc, .os, .cgroup, .worker_state, .limits },
+        .imports = &.{ .bindings, .worker, .ipc, .os, .cgroup, .worker_state, .limits },
     },
     .{
         // The parent side of the zygote/worker contract: cgroup leaf,
@@ -215,19 +225,20 @@ const specs = [_]Spec{
     },
     .{
         // The parsed server configuration; it reads no module and starts no
-        // worker, so it needs only the limits and, from ipc, the binding name
-        // grammar the worker enforces too.
+        // worker, so it needs only the limits, from ipc the binding name
+        // grammar the worker enforces too, and the `network` grammar the
+        // gateway enforces.
         .id = .server_config,
         .root = "runtime/src/server/config/root.zig",
-        .imports = &.{ .limits, .ipc },
+        .imports = &.{ .limits, .ipc, .network },
     },
     .{
-        // The route table and the per-route artifacts built from the
-        // configuration: module packs come from the host's builder, bindings
-        // blobs and the placeholder fs index from ipc.
+        // The route table, the per-route artifacts and the `network` policy
+        // image built from the configuration: module packs and bindings blobs
+        // come from ipc, the image from the network module's builder.
         .id = .server_routes,
         .root = "runtime/src/server/routes/root.zig",
-        .imports = &.{ .server_config, .limits, .ipc, .os, .host },
+        .imports = &.{ .server_config, .limits, .ipc, .os, .network },
     },
     .{ .id = .server_lifecycle, .root = "runtime/src/server/lifecycle.zig", .imports = &.{.os} },
     .{
@@ -318,7 +329,11 @@ pub fn buildModuleGraph(b: *std.Build, opts: GraphOptions) ModuleSet {
             .link_libcpp = spec.libcpp,
         }));
     }
-    zstd_mod.addToModule(b, set.get(.zstd), opts.toolchain, opts.zstd_link);
+    // Each codec's binding module is the one importer of its translated
+    // headers.
+    set.get(.zlib).addImport("zlib_h", opts.codecs.zlib.header_module);
+    set.get(.brotli).addImport("brotli_h", opts.codecs.brotli.header_module);
+    set.get(.zstd).addImport("zstd_h", opts.codecs.zstd.header_module);
     for (specs) |spec| {
         const module = set.get(spec.id);
         for (spec.imports) |dep|

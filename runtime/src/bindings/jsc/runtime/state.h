@@ -7,11 +7,17 @@
 // `termination_requests` and `host_runtime` on ColloVm, a ColloValue's reference count and its owner state, and
 // ColloDeferredWorkWakeupGate, which the wasm worklist thread writes.
 //
+// The bridge reads no clock for its owners: which ColloExecCtx owns the running JavaScript is decided here
+// (ownerExecCtx), and whatever an embedder measures per owner it measures at the turn boundaries and the owner
+// transition hook.
+//
 // A ColloValue roots its JSValue with a JSC::Strong for as long as Zig holds a reference to it. Destroying the VM
 // clears the payload of every outstanding handle, so a handle released afterwards frees only its own memory. Every
 // other JSC::Strong here sits on a native object, never inside a cell: VM-lifetime roots on ColloVm and its realms,
 // cleared by destroyVmContents in vm.cpp, and per-request roots on ColloRequestScopedRoots holders, cleared when their
-// request ends.
+// request ends. A cell keeps its edges in WriteBarrier fields and its lists of edges in Collo::CellEdgeList
+// (jsc/runtime/cell_edges.h), and holds a promise it will settle as a WriteBarrier<JSPromise> settled through
+// settlePromise; ColloPromiseDeferred is for promises Zig holds.
 
 #pragma once
 
@@ -26,6 +32,7 @@
 #include <JavaScriptCore/GlobalObjectMethodTable.h>
 #include <JavaScriptCore/Identifier.h>
 #include <JavaScriptCore/InitializeThreading.h>
+#include <JavaScriptCore/IsoSubspace.h>
 #include <JavaScriptCore/JSArray.h>
 #include <JavaScriptCore/JSCInlines.h>
 #include <JavaScriptCore/JSFunction.h>
@@ -49,6 +56,7 @@
 #include <wtf/FastMalloc.h>
 #include <wtf/HashMap.h>
 #include <wtf/Seconds.h>
+#include <wtf/SharedTask.h>
 #include <wtf/URL.h>
 #include <wtf/Vector.h>
 #include <wtf/text/AtomString.h>
@@ -66,13 +74,16 @@
 #include "jsc/runtime/console_client.h"
 
 // Hooks added by WebKit patches 0001-compiler-thread-lifecycle (declared in wtf/AutomaticThread.h) and
-// 0002-gc-max-heap-size-override (declared in runtime/Options.h). The weak declaration of the registry reset lets
-// prepare_for_fork.cpp test for it before calling it.
+// 0002-embedder-memory-budget (declared in runtime/Options.h and wtf/AvailableMemory.h). The weak declaration of the
+// registry reset lets prepare_for_fork.cpp test for it before calling it.
 namespace WTF {
 
 WTF_EXPORT_PRIVATE void setColloAutomaticThreadTimeout(Seconds);
-WTF_EXPORT_PRIVATE void clearColloAutomaticThreadTimeoutOverride();
+WTF_EXPORT_PRIVATE void setColloAutomaticThreadCacheRelease(Seconds idleTime);
+WTF_EXPORT_PRIVATE void clearColloAutomaticThreadOverrides();
 WTF_EXPORT_PRIVATE void colloResetAutomaticThreadRegistry() __attribute__((weak));
+WTF_EXPORT_PRIVATE void setColloMemoryStatusOverride(size_t limitBytes, int memoryCurrentFd);
+WTF_EXPORT_PRIVATE void clearColloMemoryStatusOverride();
 
 } // namespace WTF
 
@@ -89,14 +100,16 @@ struct ColloWebApiCache;
 namespace Collo {
 
 class GlobalObject;
-// The JSC VM's clientData, installed once at VM creation and deleted by the JSC VM's destructor. GlobalObject::owner()
-// reads the ColloVm back through it.
+// The JSC VM's clientData, installed once at VM creation and deleted after heap finalization by the VM's destructor.
+// Its subspace follows sizeof(GlobalObject), including the native realm pointer, rather than sizeof(JSGlobalObject).
 struct VmClientData final : public JSC::VM::ClientData {
     explicit VmClientData(ColloVm*);
 
     WTF::String overrideSourceURL(const JSC::StackFrame&, const WTF::String& originalSourceURL) const override;
 
     ColloVm* owner;
+    JSC::IsoSubspace global_object_space;
+    JSC::GCClient::IsoSubspace global_object_allocator;
 };
 
 // Decodes borrowed UTF-8. A null pointer with a non-zero length, or invalid UTF-8, fails with
@@ -105,8 +118,6 @@ ColloStatus stringToWTFString(ColloString string, WTF::String& out);
 // Copies `string` as UTF-8 into malloc'd storage the caller frees with collo_free_buffer. An empty string yields a
 // null pointer and length 0. Fails with COLLO_STATUS_OUT_OF_MEMORY when the copy cannot be made.
 ColloStatus copyWTFStringToColloString(const WTF::String&, ColloString* out_string);
-// CPU time of the calling thread from CLOCK_THREAD_CPUTIME_ID. A failing clock aborts the process.
-uint64_t threadCpuTimeNs();
 void resumeFastMallocScavengerIfSuspended(ColloVm*);
 void resumeFastMallocScavengerForSandbox(ColloVm*);
 
@@ -140,9 +151,10 @@ ColloStatus caughtExceptionStatus(ColloVm* vm, JSC::TopExceptionScope& scope, Co
 ColloStatus setInternalError(ColloRealm* realm, const WTF::String& message, ColloValue** out_exception);
 // True while `value` is a live handle of `vm`: false for null, for another VM's handle and after `vm` is destroyed.
 bool valueBelongsToVm(const ColloVm* vm, const ColloValue* value);
-// The global of the realm `value` belongs to, which an operation on the value runs in: an object's own global, or
-// the main realm's for a primitive and for an object created without one.
-GlobalObject* globalObjectForValue(ColloVm* vm, JSC::JSValue value);
+// The global an operation on `value` runs in: an object's own Collo global, or `realm`'s for a primitive and for an
+// object that belongs to no Collo realm. `realm` is the caller's, so an error raised for such a value belongs to the
+// realm that asked, never to another route's.
+GlobalObject* globalObjectForValue(ColloRealm& realm, JSC::JSValue value);
 // Seeds the realm's Math.random from ColloVm::worker_weak_random_seed: the main realm takes the seed as it is, any
 // other a mix of the seed and the realm's index. Does nothing on a VM that was never reseeded.
 void seedRealmWeakRandom(ColloRealm& realm);
@@ -181,10 +193,22 @@ ColloStatus formatExceptionString(ColloVm* vm, JSC::JSValue exception_value, Col
 // it with collo_promise_deferred_release.
 ColloStatus createPromiseDeferred(
     ColloVm* vm, JSC::JSGlobalObject* global_object, JSC::JSValue* out_promise, ColloPromiseDeferred** out_deferred);
-// Resolves or rejects the deferred's promise with `value`, in the promise's realm. The deferred settles once:
-// afterwards it holds no handles, and a second call fails with COLLO_STATUS_INVALID_ARGUMENT.
+// Resolves or rejects the deferred's promise with `value` through settlePromise. The deferred settles once: afterwards
+// it holds no handle, and a second call fails with COLLO_STATUS_INVALID_ARGUMENT. While an exception is pending, as a
+// termination leaves it, it settles nothing, keeps the deferred unsettled and returns COLLO_STATUS_ERROR; a termination
+// that arrives during the settlement is reported as caughtExceptionStatus reports it.
 ColloStatus settlePromiseDeferred(
     ColloVm* vm, ColloPromiseDeferred* deferred, JSC::JSValue value, bool is_rejection, ColloValue** out_exception);
+// A pending promise of `global_object`'s realm. A cell that will settle it holds it in a WriteBarrier<JSPromise> field
+// it visits.
+JSC::JSPromise* newPromise(JSC::JSGlobalObject* global_object);
+// The bridge's one way to settle a promise: resolves `promise`, which must not be null, with `value`, or rejects it
+// when `is_rejection`, in the promise's own realm. A promise already settled, or already resolved with a thenable,
+// stays as it is. Returns false, having run nothing, while an exception is pending on the VM, such as the termination
+// an earlier call left, and false when a termination arrives during the call; either way the caller returns without
+// entering JavaScript again. Resolving with an object reads its `then` at once, which runs script, so the caller
+// re-reads every member it uses afterwards.
+bool settlePromise(JSC::JSPromise* promise, JSC::JSValue value, bool is_rejection);
 
 class GlobalObject final : public JSC::JSGlobalObject {
 public:
@@ -193,6 +217,13 @@ public:
 
     static GlobalObject* create(JSC::VM& vm, JSC::Structure* structure, ColloRealm* realm);
     static JSC::Structure* createStructure(JSC::VM& vm, JSC::JSValue prototype);
+
+    template <typename, JSC::SubspaceAccess> static JSC::GCClient::IsoSubspace* subspaceFor(JSC::VM& vm)
+    {
+        auto* client_data = static_cast<VmClientData*>(vm.clientData);
+        RELEASE_ASSERT(client_data);
+        return &client_data->global_object_allocator;
+    }
 
     DECLARE_INFO;
     static const JSC::GlobalObjectMethodTable s_globalObjectMethodTable;
@@ -301,10 +332,11 @@ private:
 } // namespace Collo
 
 // The roots of one realm's Web API constructors, prototypes and structures, plus identifiers the stream and codec
-// implementations look up. It lives on the realm, never in a cell, and destroyVmContents clears it while the VM is
-// still alive. webapi_cache.def lists the roots, and this header and webapi_cache.cpp each expand it twice: a GETTER
-// row also declares the GlobalObject accessor above, which aborts while the root is empty, and a FIELD row declares
-// only the root, which host code reads through GlobalObject::webApiCache and checks itself.
+// implementations look up; the stream identifiers are private names that only the main realm's cache holds
+// (stream_common.cpp:cachedReadableStreamIdentifier). It lives on the realm, never in a cell, and destroyVmContents
+// clears it while the VM is still alive. webapi_cache.def lists the roots, and this header and webapi_cache.cpp each
+// expand it twice: a GETTER row also declares the GlobalObject accessor above, which aborts while the root is empty,
+// and a FIELD row declares only the root, which host code reads through GlobalObject::webApiCache and checks itself.
 struct ColloWebApiCache {
 #define COLLO_WEBAPI_CACHE_GETTER(name, field, type) JSC::Strong<type> field;
 #define COLLO_WEBAPI_CACHE_FIELD(field, type) JSC::Strong<type> field;
@@ -347,7 +379,6 @@ struct ColloWebApiCache {
     JSC::Identifier compression_stream_state_identifier;
     JSC::Identifier text_encoder_stream_state_identifier;
     JSC::Identifier text_decoder_stream_state_identifier;
-    JSC::Identifier byte_length_identifier;
 
     void clear();
 };
@@ -357,7 +388,6 @@ struct ColloValueOwnerState;
 struct ColloModuleSourceEntry {
     WTF::RefPtr<JSC::SourceProvider> provider;
     ColloModuleLifetime lifetime { COLLO_MODULE_LIFETIME_EVICTABLE };
-    ColloModuleType module_type { COLLO_MODULE_TYPE_ESM };
     bool has_bytecode { false };
 };
 
@@ -369,9 +399,10 @@ struct ColloModuleSourceRecord {
 struct ColloBlobObjectURLEntry {
     JSC::Strong<JSC::Unknown> value;
     WTF::Vector<Collo::HostFunctions::BlobObjectURLBackingStore> backing_stores;
-    // The request that called createObjectURL, as activeExecContext resolves it, so module evaluation records the
-    // boot request id and the boot context's close revokes those entries. 0 means no exec context existed, as in
-    // the zygote or after the boot context closed; such an entry lives until revokeObjectURL or VM teardown.
+    // The request_id of the owner that called createObjectURL (Collo::ownerExecCtx), so an evaluation's top-level
+    // code records the evaluation's id and the evaluation's cleanup revokes those entries. 0 means no owner, as on
+    // the zygote's VM or in a continuation whose owner was released; such an entry, like one of an owner that is
+    // never cleaned up, lives until revokeObjectURL or VM teardown.
     uint64_t owner_request_id { 0 };
 
     ColloBlobObjectURLEntry() = default;
@@ -562,10 +593,9 @@ public:
     // releases.
     void detachRequestScopedRoots();
 
-    // The request that created the object, as activeExecContext resolves it. Module evaluation resolves to the
-    // worker's boot request id rather than 0, and closing the boot context reclaims that id. 0 means no exec context
-    // existed at all, as on the zygote's VM or for turnless JS after the boot context closed, and nothing reclaims
-    // such an object before VM teardown.
+    // The request_id of the owner that created the object (Collo::ownerExecCtx): an evaluation's top-level code
+    // records the evaluation's id, which its cleanup reclaims. 0 means no owner, as on the zygote's VM or in a
+    // continuation whose owner was released, and nothing reclaims such an object before VM teardown.
     uint64_t owner_request_id { 0 };
 
 private:
@@ -644,15 +674,26 @@ struct ColloValue {
 };
 
 // Tells the worker loop that JSC's DeferredWorkTimer has work, standing in for the RunLoop the worker never runs; the
-// pump section of vm.cpp owns the protocol. One per VM, installed lazily on the VM thread and shared through a
-// shared_ptr with the timer's notification, which runs on whichever thread schedules deferred work, such as the wasm
-// worklist thread, and can outlive the worker runtime whose eventfd it writes. The notification stores `pending`
-// before writing the eventfd, and collo_vm_deferred_work_scheduled consumes it once per loop tick. `wakeup_fd` is the
-// registered eventfd, or -1 while none is, so a notification that fires after teardown unregistered it writes
-// nothing instead of writing a recycled fd number.
-struct ColloDeferredWorkWakeupGate {
+// pump section of vm.cpp owns the protocol. It is itself the timer-set notification: run() fires on whichever thread
+// schedules deferred work, such as the wasm worklist thread, stores `pending`, then writes `wakeup_fd`, and
+// collo_vm_deferred_work_scheduled consumes `pending` once per loop tick. One per VM, created with the VM, in the
+// zygote before any fork, so a worker never allocates it after its seccomp filter; the VM and the timer each hold a
+// reference, and the timer's can outlive the worker runtime whose eventfd it writes. `wakeup_fd` is the registered
+// eventfd, or -1 while none is, so a notification that fires after teardown unregistered it writes nothing instead of
+// writing a recycled fd number.
+class ColloDeferredWorkWakeupGate final : public WTF::SharedTask<void()> {
+public:
+    // Null when the allocation fails. The storage comes from tryFastMalloc, which the fastFree of the base's
+    // operator delete releases.
+    static RefPtr<ColloDeferredWorkWakeupGate> tryCreate();
+
+    void run() final;
+
     std::atomic<bool> pending { false };
     std::atomic<int> wakeup_fd { -1 };
+
+private:
+    ColloDeferredWorkWakeupGate() = default;
 };
 
 struct ColloVm {
@@ -686,52 +727,55 @@ struct ColloVm {
     WTF::String deploy_hash;
     // Native holders of per-request GC roots the collector cannot reclaim; ColloRequestScopedRoots explains why.
     ColloRequestScopedRootsRegistry request_scoped_roots;
+    // The owner the outermost turn installed, or the one a restored continuation installed for its duration (null
+    // while that continuation has no owner). ownerExecCtx below decides the owner from it.
     ColloExecCtx* current_exec_ctx;
-    // The owner of the outermost turn, as opposed to the owner currently installed. A microtask dispatcher swaps
-    // current_exec_ctx for the duration of a continuation while this one stays put, so the two differ exactly while a
-    // restored continuation runs.
-    // FIXME: Nothing reads it. Whether enqueued work carries its owner is decided by the cross-task token
-    // ColloRestoredTurnScope installs in vm.cpp.
-    ColloExecCtx* turn_exec_ctx;
+    // The owner of JavaScript that runs outside every turn and every restored continuation: module evaluation and the
+    // drains inside it (collo_vm_set_turnless_exec_ctx). Borrowed from the worker runtime; null when none is
+    // installed, as always on the zygote's VM.
+    ColloExecCtx* turnless_exec_ctx;
+    // Restored continuations running now, nested ones included. While one runs, current_exec_ctx is the owner even
+    // when it is null, so a continuation whose registrant was released never falls back to the turnless context.
+    uint32_t restored_scope_depth;
     // Microtask owner table, fed by the hooks of WebKit patch 0004-microtask-owner-context. A promise reaction one
-    // request registers can run during another request's turn, as when both await a module-scope promise, so the
+    // owner registers can run during another owner's turn, as when two requests await a module-scope promise, so the
     // owner travels with the reaction. It travels as a token, never as a ColloExecCtx*: the promise outlives the
-    // request that awaited it, so a pointer stored in the reaction would dangle. A token whose slot was released
-    // resolves to no owner, the same fallback turnless JS takes.
+    // owner that awaited it, so a pointer stored in the reaction would dangle. A token whose slot was released
+    // resolves to no owner.
     //
     // Token 0 records no owner, and the engine then runs the reaction under whoever drains it; the engine treats
-    // tokens as opaque and only compares them.
-    // `owner_token_turnless` is a real token so that a restore can set current_exec_ctx back to null: if turnless
-    // were 0, the dispatcher could not tell a restore to nothing from no restore.
-    static constexpr uint64_t owner_token_turnless = 1;
-    static constexpr uint64_t owner_token_first = 2;
+    // tokens as opaque and only compares them. `owner_token_none` is a real token so that a restore can install no
+    // owner: if it were 0, the dispatcher could not tell a restore to nothing from no restore. Every other token is
+    // (serial << owner_token_index_bits) | slot index, so a token finds its slot without a search and a released slot
+    // never answers for a token minted before its release.
+    static constexpr uint64_t owner_token_none = 1;
+    // Every owner that can hold a token at once, COLLO_OWNER_SLOT_COUNT in abi.h. A full table therefore means a
+    // missed release, and acquisition warns instead of degrading silently.
+    static constexpr size_t owner_slot_count = COLLO_OWNER_SLOT_COUNT;
+    static constexpr unsigned owner_token_index_bits = 7;
+    static_assert(owner_slot_count <= (size_t { 1 } << owner_token_index_bits));
     struct OwnerSlot {
         uint64_t token; // 0 = free
         ColloExecCtx* exec_ctx;
     };
-    // Sized well above the contexts that can hold a token at once: LIVE_SLOT_COUNT requests
-    // (common/worker_state/page/live_slots.zig) plus the boot and host contexts the deferred-work pump enters. A full
-    // table therefore means a missed release, and acquisition warns instead of degrading silently.
-    static constexpr size_t owner_slot_count = 16;
     OwnerSlot owner_slots[owner_slot_count];
     // Never reused, so a token released and acquired again cannot collide and a stale reaction cannot resolve onto a
-    // later request.
-    uint64_t next_owner_token;
+    // later owner. Starts at 1, so every slot token is above owner_token_none.
+    uint64_t next_owner_serial;
+    // The last owner whose token was looked up and that token, so the registration of a reaction, which asks for the
+    // running owner's token each time, skips the table scan while the owner stays the same. Releasing that owner
+    // clears it.
+    ColloExecCtx* cached_owner_exec_ctx;
+    uint64_t cached_owner_token;
     // Told in pairs about every owner change inside a microtask drain: once when the restored owner takes over and
-    // once when it gives the turn back. The deadline arbiter and the request timeline live outside this ABI and would
-    // otherwise keep following the owner of the physical turn.
+    // once when it gives the turn back. The embedder's deadlines, request timeline and CPU windows live outside this
+    // ABI and would otherwise keep following the owner of the physical turn.
     ColloOwnerTransitionHook owner_transition_hook;
     void* owner_transition_ctx;
-    // Microtasks that ran under a restored owner, meaning their registrant was not the request draining the queue.
+    // Microtasks that ran under a restored owner, meaning their registrant was not the owner draining the queue.
     // One increment and no clock, so it costs nothing to keep, and it is the only evidence of how often the
-    // per-crossing accounting on that path is paid.
+    // per-crossing work on that path is paid.
     uint64_t owner_crossings;
-    // The worker's identity for turnless JS, meaning module evaluation and its microtask drains. activeExecContext
-    // serves it read-only when current_exec_ctx is null; it is never installed there or passed to collo_turn_enter,
-    // so it never owns a turn or a CPU slice. Installed by the worker runtime through collo_vm_set_boot_exec_ctx. The
-    // zygote never installs it, so evaluation on a bare VM finds no identity and fails closed.
-    ColloExecCtx boot_exec_ctx;
-    bool boot_exec_ctx_installed;
     // Nesting depth of collo_turn_enter. The outermost enter installs its context in current_exec_ctx, and a nested
     // enter must pass whatever context is installed there at that moment.
     uint32_t entered_count;
@@ -743,9 +787,10 @@ struct ColloVm {
     // Set and cleared by the Zig runtime on the VM thread. Host functions acquire-load the borrowed pointer and rely
     // on Zig to keep it alive while they run.
     std::atomic<void*> host_runtime;
-    // Null until the first pump export runs, and touched only on the VM thread: the worklist thread reaches the gate
-    // through the shared_ptr its notification captured, never through this member.
-    std::shared_ptr<ColloDeferredWorkWakeupGate> deferred_work_wakeup_gate;
+    // Created with the VM and registered as its DeferredWorkTimer's notification, so never null while the VM is
+    // ready. Read through this member only on the VM thread; the worklist thread reaches the gate through the
+    // timer's own reference.
+    RefPtr<ColloDeferredWorkWakeupGate> deferred_work_wakeup_gate;
     // Set by collo_vm_set_console_sink. Null until a worker runtime registers its sink, so the zygote's console
     // keeps its observable behavior and emits nothing. Read on the VM thread only, while a console call frame is
     // live.
@@ -775,14 +820,15 @@ struct ColloVm {
         , node_fs_enabled(false)
         , hardware_concurrency(1)
         , current_exec_ctx(nullptr)
-        , turn_exec_ctx(nullptr)
+        , turnless_exec_ctx(nullptr)
+        , restored_scope_depth(0)
         , owner_slots {}
-        , next_owner_token(owner_token_first)
+        , next_owner_serial(1)
+        , cached_owner_exec_ctx(nullptr)
+        , cached_owner_token(0)
         , owner_transition_hook(nullptr)
         , owner_transition_ctx(nullptr)
         , owner_crossings(0)
-        , boot_exec_ctx()
-        , boot_exec_ctx_installed(false)
         , entered_count(0)
         , ready(false)
         , destroying(false)
@@ -806,3 +852,21 @@ struct ColloVm {
 
 // A realm is usable while its VM is ready.
 inline bool realmIsReady(const ColloRealm* realm) { return realm && realm->vm && realm->vm->isReady(); }
+
+namespace Collo {
+
+// The owner of the JavaScript running now, which host calls, the console, the owner token hook and the owner
+// transition hook all ask: the context a turn or a restored continuation installed, else, outside every turn and
+// every restored continuation, the turnless context, else none. A restored continuation with no owner stays without
+// one: falling back to the turnless context would hand a released request's leftovers to the evaluation that happens
+// to be open. A turn whose context was released mid-turn has none either.
+inline ColloExecCtx* ownerExecCtx(const ColloVm& vm)
+{
+    if (vm.current_exec_ctx)
+        return vm.current_exec_ctx;
+    if (vm.entered_count || vm.restored_scope_depth)
+        return nullptr;
+    return vm.turnless_exec_ctx;
+}
+
+} // namespace Collo

@@ -2,7 +2,7 @@
 //! again with the same exec context nests, and microtasks drain only when the outermost turn
 //! exits; entering with another context, or invoking outside a turn or with another turn's
 //! context, fails with InvalidArgument. A failed allocation of the wrapper's argument array
-//! returns OutOfMemory, and `Vm.invokeWithTiming` records when a handler's first statement ran
+//! returns OutOfMemory, and `Realm.invokeWithTiming` records when a handler's first statement ran
 //! only through the marker it scopes to one synchronous call (`collo_invoke` in
 //! `jsc/runtime/invoke.cpp`). Lane: `bindings-test`.
 
@@ -104,7 +104,7 @@ test "invoke with different req ctx fails" {
     try vm.turnEnter(&exec_ctx_a);
     defer vm.turnExit() catch {};
 
-    try std.testing.expectError(error.InvalidArgument, vm.invoke(std.testing.allocator, &exec_ctx_b, &entry, null, &.{}));
+    try std.testing.expectError(error.InvalidArgument, vm.mainRealm().invoke(std.testing.allocator, &exec_ctx_b, &entry, null, &.{}));
 }
 
 test "invoke outside turn is rejected" {
@@ -124,7 +124,7 @@ test "invoke outside turn is rejected" {
     defer entry.deinit();
 
     var exec_ctx = support.makeExecCtx(92);
-    try std.testing.expectError(error.InvalidArgument, vm.invoke(std.testing.allocator, &exec_ctx, &entry, null, &.{}));
+    try std.testing.expectError(error.InvalidArgument, vm.mainRealm().invoke(std.testing.allocator, &exec_ctx, &entry, null, &.{}));
 }
 
 test "invoke argument allocation failure propagates out of memory" {
@@ -147,7 +147,7 @@ test "invoke argument allocation failure propagates out of memory" {
     try vm.turnEnter(&exec_ctx);
     defer vm.turnExit() catch {};
 
-    // One argument more than `Vm.invokeWithTiming` keeps on the stack, so the argument array
+    // One argument more than `Realm.invokeWithTiming` keeps on the stack, so the argument array
     // comes from the failing allocator.
     var args: [9]bindings.Value = undefined;
     for (&args, 0..) |*arg, index|
@@ -163,7 +163,7 @@ test "invoke argument allocation failure propagates out of memory" {
 
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     var started_ns: u64 = 99;
-    try std.testing.expectError(error.OutOfMemory, vm.invokeWithTiming(
+    try std.testing.expectError(error.OutOfMemory, vm.mainRealm().invokeWithTiming(
         failing.allocator(),
         &exec_ctx,
         &entry,
@@ -215,7 +215,7 @@ test "invoke timing requires a scoped first-statement marker" {
     defer deferred.deinit();
     var exec_ctx = support.makeExecCtx(94);
     var started_ns: u64 = 99;
-    try std.testing.expectError(error.InvalidArgument, vm.invokeWithTiming(
+    try std.testing.expectError(error.InvalidArgument, vm.mainRealm().invokeWithTiming(
         std.testing.allocator,
         &exec_ctx,
         &entry,
@@ -249,7 +249,7 @@ test "invoke timing requires a scoped first-statement marker" {
     try std.testing.expectEqual(@as(u64, 777), started_ns);
 
     started_ns = 0;
-    var exception = switch (try vm.invokeWithTiming(
+    var exception = switch (try vm.mainRealm().invokeWithTiming(
         std.testing.allocator,
         &exec_ctx,
         &throws,
@@ -271,7 +271,7 @@ test "invoke timing requires a scoped first-statement marker" {
     try support.expectValueString(&vm, &absent_exception, "undefined");
 
     const invalid: bindings.Value = .{};
-    try std.testing.expectError(error.InvalidJsValue, vm.invokeWithTiming(
+    try std.testing.expectError(error.InvalidJsValue, vm.mainRealm().invokeWithTiming(
         std.testing.allocator,
         &exec_ctx,
         &invalid,
@@ -295,8 +295,13 @@ fn timedInvokeOk(
     entry: *const bindings.Value,
     started_ns: *u64,
 ) !bindings.Value {
-    return switch (try vm.invokeWithTiming(
-        std.testing.allocator, exec_ctx, entry, null, &.{}, started_ns,
+    return switch (try vm.mainRealm().invokeWithTiming(
+        std.testing.allocator,
+        exec_ctx,
+        entry,
+        null,
+        &.{},
+        started_ns,
     )) {
         .success => |value| value,
         .exception => |value| {

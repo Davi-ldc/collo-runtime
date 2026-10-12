@@ -1,8 +1,10 @@
 //! The server's manager for its one egress gateway process. It spawns the gateway with a token key
-//! drawn for that gateway alone and the network policy table built at `init`, attaches worker
-//! sessions under their security cell, and hands each ingress lane what it mints tokens with
-//! (`lease.zig`). Nothing is registered with the gateway per request: a lane mints a token from its
-//! lease, and the gateway verifies it at fetch admission.
+//! drawn for that gateway alone and the configuration's policy image (`Config.policy_image`),
+//! attaches worker sessions under their security cell, and hands each ingress lane what it mints
+//! tokens with (`lease.zig`). Nothing is registered with the gateway per request: a lane mints a
+//! token from its lease, and the gateway verifies it at fetch admission. Only a worker of a
+//! definition with a `network` grant attaches, so a server whose definitions have none never
+//! spawns a gateway.
 //!
 //! The security cell of a worker session is its worker definition (`securityCellIdForDefinition`):
 //! workers of one definition share egress pools and the per-cell fetch cap, and never another
@@ -35,7 +37,6 @@ const fd_mod = @import("collo_os").fd;
 const ipc = @import("collo_ipc");
 const lifecycle = @import("collo_server_lifecycle");
 const control = @import("collo_egress_gateway").control;
-const policy = @import("collo_egress_gateway").policy;
 const control_client = @import("control_client.zig");
 const lease_mod = @import("lease.zig");
 const process_mod = @import("process.zig");
@@ -48,10 +49,10 @@ const no_key: egress_token.Key = .{ .bytes = @splat(0) };
 
 pub const Config = struct {
     executable_path: ?[]const u8 = null,
-    /// The single entry of every gateway's policy table until the configuration accepts
-    /// `network`. A server keeps `policy.public_https`; a test harness whose origins are plain
-    /// HTTP on a private address of the host loosens it.
-    network_policy: policy.NetworkPolicy = policy.public_https,
+    /// The policy image every gateway's hello carries, compiled from the configuration at boot
+    /// (`server/routes/network.zig`); borrowed for the manager's life. Egress tokens name its
+    /// policies by id.
+    policy_image: process_mod.PolicyImage,
 };
 
 /// What the manager calls when a gateway it held, or one session of it, is gone. Set with
@@ -77,9 +78,6 @@ pub const Deps = struct {
 pub const Manager = struct {
     allocator: std.mem.Allocator,
     config: Config,
-    /// Every gateway's network policies, built once from `config` and sent in each hello; a
-    /// token names its route's entry by id.
-    policy_table: policy.PolicyTable,
     serial: std.Thread.Mutex = .{},
     mutex: std.Thread.Mutex = .{},
     /// The gateway new sessions attach to; null before the first spawn and after a retire.
@@ -103,14 +101,14 @@ pub const Manager = struct {
     deps_mutex: std.Thread.Mutex = .{},
     deps: ?Deps = null,
 
-    /// Builds the policy table from `config` and spawns nothing; the first `prewarm` or
-    /// `attachWorker` does. Each gateway's record points back to the manager, so the manager
-    /// stays in place from the first spawn until `deinit`.
+    /// Keeps `config` and spawns nothing; the first `prewarm` or `attachWorker` does. Each
+    /// gateway's record points back to the manager, so the manager stays in place from the first
+    /// spawn until `deinit`.
     pub fn init(self: *Manager, allocator: std.mem.Allocator, config: Config) void {
+        std.debug.assert(config.policy_image.bytes >= 1);
         self.* = .{
             .allocator = allocator,
             .config = config,
-            .policy_table = policy.PolicyTable.single(config.network_policy),
         };
     }
 
@@ -150,7 +148,7 @@ pub const Manager = struct {
     }
 
     /// Spawns a gateway when none is current: draws its key (`egress_token.Key.random`), has
-    /// `process.spawn` send the hello with the table right after `gateway_ready`, starts the control
+    /// `process.spawn` send the hello with the image right after `gateway_ready`, starts the control
     /// reader and publishes the generation. It also destroys the record retired since the last
     /// spawn, joining its reader. The launcher calls it to start each reattach pass
     /// (`prewarmForPass` in `server/supervisor/launcher.zig`), and `Server.prewarmEgressGateway`
@@ -302,7 +300,7 @@ pub const Manager = struct {
         record.process = try process_mod.spawn(self.allocator, .{
             .executable_path = self.config.executable_path,
             .key = record.key,
-            .table = &self.policy_table,
+            .policy_image = self.config.policy_image,
         });
         errdefer record.process.deinit();
         record.generation = self.nextGatewayGeneration();

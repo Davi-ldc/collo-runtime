@@ -1,0 +1,11 @@
+Source: https://github.com/unicode-org/icu.git
+Tag: release-78.3
+Commit: 21d1eb0f306e1141c10931e914dfc038c06121da
+Patches: none
+
+ICU4C with its data, consumed as a sparse, blob-less checkout of
+`icu4c/source` at this commit (`zig build deps-provision`). `zig build icu`
+configures it out of tree with ICU's own build into
+`runtime/deps/icu-build/<triple>/`, as static libraries with the data built
+from source and packaged statically; the engine compiles against those
+headers and the binary links those archives.

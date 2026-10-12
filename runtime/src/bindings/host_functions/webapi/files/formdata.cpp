@@ -2,10 +2,9 @@
 // and collo_form_data_new_from_bytes, and the multipart serializer behind a FormData request or response body. Runs on
 // the VM thread, except visitChildren, which marking threads run concurrently.
 //
-// visitChildren walks the entry vector under cellLock(). Every change that can move the vector's buffer therefore
-// takes the lock, and nothing allocates a cell or reports extra memory while holding it: either can stop the mutator
-// for a collection whose marker then waits for the same lock. Code that runs JavaScript between reads copies each
-// entry out first, because the callback may change the vector. A File parsed from a multipart body views a copy of
+// The entry list is a Collo::CellEdgeList (jsc/runtime/cell_edges.h), which runs the lock and barrier protocol
+// visitChildren relies on; nothing here takes the cell lock itself. Code that runs JavaScript between reads copies
+// each entry out first, because the callback may change the list. A File parsed from a multipart body views a copy of
 // the whole body, so it keeps the whole body alive.
 
 #include "host_functions/webapi/files/formdata.h"
@@ -15,6 +14,7 @@
 #include "host_functions/webapi/encoding/utf8.h"
 #include "host_functions/webapi/files/blob.h"
 #include "host_functions/webapi/limits.h"
+#include "jsc/runtime/cell_edges.h"
 
 #include <JavaScriptCore/Error.h>
 #include <JavaScriptCore/IdentifierInlines.h>
@@ -30,7 +30,6 @@
 #include <JavaScriptCore/JSString.h>
 #include <JavaScriptCore/SlotVisitorMacros.h>
 #include <openssl/rand.h>
-#include <wtf/Locker.h>
 #include <wtf/URLParser.h>
 #include <wtf/Vector.h>
 #include <wtf/WallTime.h>
@@ -38,6 +37,7 @@
 #include <wtf/text/WTFString.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <limits>
 #include <optional>
@@ -81,6 +81,8 @@ namespace {
             String string_value;
             JSC::WriteBarrier<JSC::Unknown> file_value;
             bool is_file { false };
+
+            template <typename Visitor> void visitEdges(Visitor& visitor) const { visitor.append(file_value); }
         };
 
         template <typename CellType, JSC::SubspaceAccess> static JSC::CompleteSubspace* subspaceFor(JSC::VM& vm)
@@ -112,22 +114,14 @@ namespace {
         DECLARE_INFO;
         DECLARE_VISIT_CHILDREN;
 
-        // The off-heap memory this cell retains itself: the entry vector and each entry's name and value strings.
-        // File entries are cells that report their own bytes.
-        size_t memoryCost() const
-        {
-            WTF::Locker locker { cellLock() };
-            size_t cost = m_entries.capacity() * sizeof(Entry);
-            for (const auto& entry : m_entries)
-                cost += formDataStringMemoryCost(entry.name) + formDataStringMemoryCost(entry.string_value);
-            return cost;
-        }
+        // The off-heap memory this cell retains itself: a slot and the name and value strings of each entry. File
+        // entries are cells that report their own bytes.
+        size_t memoryCost() const { return m_memory_cost.load(std::memory_order_relaxed); }
 
-        WTF::Vector<Entry>& entries() { return m_entries; }
-        const WTF::Vector<Entry>& entries() const { return m_entries; }
+        const Collo::CellEdgeList<Entry>& entries() const { return m_entries; }
 
         // One entry copied out for serialization: owning string copies and a reference to the part's storage, so the
-        // serializer holds nothing that points into the entry vector.
+        // serializer holds nothing that points into the entry list.
         struct SerializationEntry {
             String name;
             String string_value;
@@ -140,10 +134,9 @@ namespace {
         };
 
         // Copies every entry into `out`. A File or Blob entry becomes a reference to its storage with its offset and
-        // size, sharing the bytes. Returns false on allocation failure. Only malloc memory is allocated under the lock.
+        // size, sharing the bytes. Returns false on allocation failure.
         bool snapshotForSerialization(WTF::Vector<SerializationEntry>& out) const
         {
-            WTF::Locker locker { cellLock() };
             if (!out.tryReserveCapacity(m_entries.size()))
                 return false;
             for (const auto& entry : m_entries) {
@@ -172,7 +165,7 @@ namespace {
             Entry entry;
             entry.name = WTF::move(name);
             entry.string_value = WTF::move(value);
-            return appendEntry(WTF::move(entry));
+            return appendEntry(vm(), WTF::move(entry));
         }
 
         bool appendFile(JSC::VM& vm, Collo::GlobalObject* global_object, String name, JSColloBlob& blob,
@@ -180,7 +173,7 @@ namespace {
         {
             auto entry = createFileEntry(
                 vm, global_object, WTF::move(name), blob, original_value, has_filename, WTF::move(filename));
-            return appendEntry(WTF::move(entry));
+            return appendEntry(vm, WTF::move(entry));
         }
 
         bool appendParsedFile(JSC::VM& vm, Collo::GlobalObject* global_object, String name,
@@ -194,8 +187,8 @@ namespace {
                 WTF::move(filename), last_modified);
             if (!file)
                 return false;
-            entry.file_value.set(vm, this, file);
-            return appendEntry(WTF::move(entry));
+            entry.file_value.setWithoutWriteBarrier(file);
+            return appendEntry(vm, WTF::move(entry));
         }
 
         // Appends a File that views `size` bytes at `offset` of `body_bytes`, the copy of the whole multipart body
@@ -214,8 +207,8 @@ namespace {
                 WTF::move(type), WTF::move(filename), last_modified);
             if (!file)
                 return false;
-            entry.file_value.set(vm, this, file);
-            return appendEntry(WTF::move(entry));
+            entry.file_value.setWithoutWriteBarrier(file);
+            return appendEntry(vm, WTF::move(entry));
         }
 
         bool setString(String name, String value)
@@ -223,7 +216,7 @@ namespace {
             Entry entry;
             entry.name = name;
             entry.string_value = WTF::move(value);
-            return setEntry(WTF::move(name), WTF::move(entry));
+            return setEntry(vm(), name, WTF::move(entry));
         }
 
         bool setFile(JSC::VM& vm, Collo::GlobalObject* global_object, String name, JSColloBlob& blob,
@@ -231,18 +224,17 @@ namespace {
         {
             auto entry
                 = createFileEntry(vm, global_object, name, blob, original_value, has_filename, WTF::move(filename));
-            return setEntry(WTF::move(name), WTF::move(entry));
+            return setEntry(vm, name, WTF::move(entry));
         }
 
         void remove(const String& name)
         {
-            WTF::Locker locker { cellLock() };
-            m_entries.removeAllMatching([&](const auto& entry) { return entry.name == name; });
+            m_entries.removeIf(this, [&](const Entry& entry) { return entry.name == name; });
+            updateMemoryCost();
         }
 
         // One entry copied out without allocating a cell. A File entry keeps its existing cell in `file_value`. A
-        // string entry keeps its text in `string_value`, and the caller creates the JSString after entryAt() has
-        // released the cell lock, since allocating a cell under the lock can deadlock with the marker.
+        // string entry keeps its text in `string_value`, and the caller creates the JSString from it.
         struct EntrySnapshot {
             String name;
             String string_value;
@@ -251,13 +243,12 @@ namespace {
         };
 
         // Copies the entry at `index` into `out`; false when `index` is out of range. forEach() and the iterator read
-        // entries only through it, because the JavaScript they run may change the vector and move its buffer.
+        // entries only through it, because the JavaScript they run may change the list and move its buffer.
         bool entryAt(unsigned index, EntrySnapshot& out) const
         {
-            WTF::Locker locker { cellLock() };
             if (index >= m_entries.size())
                 return false;
-            const auto& entry = m_entries[index];
+            const auto& entry = m_entries.at(index);
             out.name = entry.name;
             out.is_file = entry.is_file;
             if (entry.is_file)
@@ -267,11 +258,7 @@ namespace {
             return true;
         }
 
-        unsigned size() const
-        {
-            WTF::Locker locker { cellLock() };
-            return m_entries.size();
-        }
+        unsigned size() const { return m_entries.size(); }
 
     private:
         JSColloFormData(JSC::VM& vm, JSC::Structure* structure)
@@ -285,9 +272,8 @@ namespace {
         {
             Base::finishCreation(vm);
             ASSERT(inherits(info()));
-            // The cost is reported here, then by each append that grows it, and again by visitChildren in every
-            // collection, which is where removals stop counting.
-            vm.heap.reportExtraMemoryAllocated(this, memoryCost());
+            // A new FormData holds no entry. The cost is reported by each change that grows it, and again by
+            // visitChildren in every collection, which is where removals stop counting.
         }
 
         Entry createFileEntry(JSC::VM& vm, Collo::GlobalObject* global_object, String name, JSColloBlob& blob,
@@ -299,12 +285,12 @@ namespace {
 
             if (auto* file = dynamicDowncast<JSColloFile>(&blob)) {
                 if (!has_filename) {
-                    entry.file_value.set(vm, this, original_value);
+                    entry.file_value.setWithoutWriteBarrier(original_value);
                     return entry;
                 }
                 auto* renamed = JSColloFile::createFromBlob(
                     vm, global_object->fileStructure(), *file, WTF::move(filename), file->lastModified());
-                entry.file_value.set(vm, this, renamed);
+                entry.file_value.setWithoutWriteBarrier(renamed);
                 return entry;
             }
 
@@ -312,65 +298,65 @@ namespace {
             auto last_modified = WTF::WallTime::now().secondsSinceEpoch().milliseconds();
             auto* file = JSColloFile::createFromBlob(
                 vm, global_object->fileStructure(), blob, WTF::move(name_for_blob), last_modified);
-            entry.file_value.set(vm, this, file);
+            entry.file_value.setWithoutWriteBarrier(file);
             return entry;
         }
 
-        bool setEntry(const String& name, Entry&& replacement)
+        // The first entry named `name` takes the replacement's value in place, and every later one goes.
+        bool setEntry(JSC::VM& vm, const String& name, Entry&& replacement)
         {
-            const size_t added_cost = appendedEntryMemoryCost(replacement);
-            bool appended_new = false;
-            {
-                // Entries move within the buffer, which may then shrink or reallocate, so the lock covers the whole
-                // compaction.
-                WTF::Locker locker { cellLock() };
-                bool found = false;
-                unsigned write = 0;
-                for (unsigned read = 0; read < m_entries.size(); read++) {
-                    auto& entry = m_entries[read];
-                    if (entry.name != name) {
-                        if (write != read)
-                            m_entries[write] = WTF::move(entry);
-                        write++;
-                        continue;
-                    }
-                    if (!found) {
-                        if (write != read)
-                            m_entries[write] = WTF::move(replacement);
-                        else
-                            entry = WTF::move(replacement);
-                        write++;
-                        found = true;
-                    }
-                }
-                m_entries.shrink(write);
-                if (!found) {
-                    if (!m_entries.tryAppend(WTF::move(replacement)))
-                        return false;
-                    appended_new = true;
+            std::optional<size_t> first;
+            for (size_t index = 0; index < m_entries.size(); index++) {
+                if (m_entries.at(index).name == name) {
+                    first = index;
+                    break;
                 }
             }
-            if (appended_new)
-                reportEntryMemoryAllocated(added_cost);
+            if (!first)
+                return appendEntry(vm, WTF::move(replacement));
+            auto& entry = m_entries.at(*first);
+            entry.string_value = WTF::move(replacement.string_value);
+            entry.file_value.set(vm, this, replacement.file_value.get());
+            entry.is_file = replacement.is_file;
+            bool kept_first = false;
+            m_entries.removeIf(this, [&](const Entry& candidate) {
+                if (candidate.name != name)
+                    return false;
+                if (!kept_first) {
+                    kept_first = true;
+                    return false;
+                }
+                return true;
+            });
+            updateMemoryCost();
             return true;
         }
 
-        static size_t appendedEntryMemoryCost(const Entry& entry)
+        static size_t entryMemoryCost(const Entry& entry)
         {
             return sizeof(Entry) + formDataStringMemoryCost(entry.name) + formDataStringMemoryCost(entry.string_value);
         }
 
-        bool appendEntry(Entry&& entry)
+        bool appendEntry(JSC::VM& vm, Entry&& entry)
         {
-            const size_t added_cost = appendedEntryMemoryCost(entry);
-            bool appended = false;
-            {
-                WTF::Locker locker { cellLock() };
-                appended = m_entries.tryAppend(WTF::move(entry));
-            }
-            if (appended)
-                reportEntryMemoryAllocated(added_cost);
-            return appended;
+            const size_t added_cost = entryMemoryCost(entry);
+            if (!m_entries.tryAppend(vm, this, WTF::move(entry)))
+                return false;
+            m_memory_cost.fetch_add(added_cost, std::memory_order_relaxed);
+            reportEntryMemoryAllocated(added_cost);
+            return true;
+        }
+
+        // Recounts after a removal or a replacement. Growth is reported at once; a fall stops counting at
+        // visitChildren's report in the next collection.
+        void updateMemoryCost()
+        {
+            size_t cost = 0;
+            for (const auto& entry : m_entries)
+                cost += entryMemoryCost(entry);
+            const size_t previous = m_memory_cost.exchange(cost, std::memory_order_relaxed);
+            if (cost > previous)
+                reportEntryMemoryAllocated(cost - previous);
         }
 
         // Reports growth between collections; removals stop counting at visitChildren's report in the next
@@ -378,9 +364,9 @@ namespace {
         // whose marker needs that lock to visit this cell.
         void reportEntryMemoryAllocated(size_t cost) { vm().heap.reportExtraMemoryAllocated(this, cost); }
 
-        // Every change that can move this buffer (append, compaction, removal) takes cellLock() around the vector
-        // operation, and only there.
-        WTF::Vector<Entry> m_entries;
+        Collo::CellEdgeList<Entry> m_entries;
+        // Written on the VM thread and read by visitChildren on a marking thread; nothing else depends on it.
+        std::atomic<size_t> m_memory_cost { 0 };
     };
 
     class JSColloFormDataIterator final : public JSC::JSDestructibleObject {
@@ -458,17 +444,10 @@ namespace {
         auto* this_object = static_cast<JSColloFormData*>(cell);
         ASSERT_GC_OBJECT_INHERITS(this_object, info());
         Base::visitChildren(this_object, visitor);
-        // The lock keeps the entry buffer in place while this marking thread walks it (see m_entries).
-        WTF::Locker locker { this_object->cellLock() };
-        size_t cost = this_object->m_entries.capacity() * sizeof(Entry);
-        for (auto& entry : this_object->m_entries) {
-            cost += formDataStringMemoryCost(entry.name) + formDataStringMemoryCost(entry.string_value);
-            if (entry.is_file)
-                visitor.append(entry.file_value);
-        }
+        this_object->m_entries.visit(this_object, visitor);
         // A full collection resets the heap's extra memory count, so the retained cost is reported again in every
         // collection.
-        visitor.reportExtraMemoryVisited(cost);
+        visitor.reportExtraMemoryVisited(this_object->memoryCost());
     }
 
     DEFINE_VISIT_CHILDREN(JSColloFormData);
@@ -2099,7 +2078,7 @@ namespace {
 
         WTF::Vector<FormDataJSONGroup, 4> groups;
         for (unsigned entry_index = 0; entry_index < form_data->entries().size(); entry_index++) {
-            auto& entry = form_data->entries()[entry_index];
+            auto& entry = form_data->entries().at(entry_index);
             FormDataJSONGroup* group = nullptr;
             for (auto& candidate : groups) {
                 if (candidate.name == entry.name) {
@@ -2124,7 +2103,7 @@ namespace {
             auto identifier = JSC::Identifier::fromString(vm, group.name);
             if (group.count == 1) {
                 output->putDirectMayBeIndex(
-                    global_object, identifier, entryValue(vm, form_data->entries()[group.first_index]));
+                    global_object, identifier, entryValue(vm, form_data->entries().at(group.first_index)));
                 RETURN_IF_EXCEPTION(scope, {});
                 continue;
             }

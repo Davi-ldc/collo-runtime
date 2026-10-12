@@ -59,18 +59,6 @@ test "a pack that fails validation is released before registration returns" {
     try expectLive(baseline);
 }
 
-test "rejected register options still release the pack" {
-    const baseline = bindings.liveMappingCount();
-    var vm = try support.createVm();
-    defer vm.deinit();
-
-    const pack = try buildPack("/mapping/bad-options.js", "export default 1;");
-    defer std.testing.allocator.free(pack);
-
-    try std.testing.expectError(error.InvalidArgument, vm.registerModulePackWithOptions(pack, .{ .lifetime = 99 }));
-    try expectLive(baseline);
-}
-
 test "a pack whose modules are already registered is released at once" {
     const baseline = bindings.liveMappingCount();
     const pack = try buildPack("/mapping/duplicate.js", "export default 1;");

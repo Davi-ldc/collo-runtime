@@ -26,23 +26,34 @@ pub const WORKER_INIT_TIMEOUT_MS: i32 = 3_000;
 /// value is an initial floor, not a measurement.
 pub const WORKER_INIT_CLEANUP_RESERVE_NS: u64 = 100_000_000;
 
-// The kernel's OOM victim order puts workers first and the zygote next, ahead
-// of the server for as long as the score the server started with stays below
-// the zygote's; nothing in the runtime sets the server's own score.
-// oom_score_adj is inherited across fork and exec, so each spawn path writes
-// its child's score explicitly (`writeOomScoreAdj` in `common/os.zig`);
-// otherwise every descendant would keep the server's score. The order backs
-// up the worker cgroups' memory limits and never replaces them. The gateway's
-// score is the only one below the default 0, and lowering a score below the
-// `oom_score_adj_min` the gateway inherits from the server takes
-// CAP_SYS_RESOURCE, so the write succeeds only when the server holds that
-// capability or that minimum is at or below the gateway's score. The gateway
-// then goes after any server whose score is higher. Otherwise the write fails
-// with EACCES and the gateway keeps the server's score, which leaves the
-// kernel to pick whichever of the two uses more memory first.
+// The kernel's OOM victim order: workers first, then the egress gateway, then
+// the zygote, and the server last. A worker's death ends only its own
+// requests; the gateway's costs the fetches in flight and a respawn, and it
+// is where the pooled uploads sit; the zygote's stops every launch and with
+// it the server. oom_score_adj is inherited across fork and exec, so each
+// spawn path writes its child's score (`writeOomScoreAdj` in
+// `common/os.zig`); otherwise every descendant would keep the server's. Each
+// score is at or above 0, and the runtime never writes the server's own:
+// lowering a score below the `oom_score_adj_min` a process inherited takes
+// CAP_SYS_RESOURCE, while raising one takes no privilege, so every write
+// succeeds unprivileged. The server keeps the score it started with, 0 by
+// default, and the order holds while that score stays below the zygote's. It
+// backs up the worker cgroups' memory limits and never replaces them.
 pub const OOM_SCORE_ADJ_WORKER: i16 = 500;
+pub const OOM_SCORE_ADJ_EGRESS_GATEWAY: i16 = 300;
 pub const OOM_SCORE_ADJ_ZYGOTE: i16 = 200;
-pub const OOM_SCORE_ADJ_EGRESS_GATEWAY: i16 = -500;
+
+comptime {
+    if (OOM_SCORE_ADJ_WORKER <= OOM_SCORE_ADJ_EGRESS_GATEWAY)
+        @compileError("the kernel must pick a worker before the egress gateway");
+    if (OOM_SCORE_ADJ_EGRESS_GATEWAY <= OOM_SCORE_ADJ_ZYGOTE)
+        @compileError("the kernel must pick the egress gateway before the zygote");
+    if (OOM_SCORE_ADJ_ZYGOTE < 0)
+        @compileError("a score below 0 needs a privilege the runtime does not require");
+    // The kernel's range for oom_score_adj.
+    if (OOM_SCORE_ADJ_WORKER > 1000)
+        @compileError("oom_score_adj is at most 1000");
+}
 
 // Resource limits the egress gateway sets on itself before its first thread
 // starts (`sandbox.zig` in `egress/gateway`). Each sets both the soft
@@ -52,15 +63,21 @@ pub const OOM_SCORE_ADJ_EGRESS_GATEWAY: i16 = -500;
 
 /// Open files of the gateway. Worker endpoints, shard rings and outbound
 /// sockets all count against it, and `sizing.zig` in `egress/gateway`
-/// sizes shards and the worker cap from it.
+/// sizes shards and the session cap from it.
 pub const EGRESS_GATEWAY_OPEN_FILES_MAX: u64 = 65_536;
 /// Tasks of the gateway's user. The gateway sets it after entering its own
 /// user namespace, where kernels from 5.14 on count tasks per namespace, so
 /// it bounds the gateway's threads rather than every process of the user
 /// running the server.
 pub const EGRESS_GATEWAY_TASKS_MAX: u64 = 1_024;
-/// Address space of the gateway, a backstop above the shards' memory budgets.
-pub const EGRESS_GATEWAY_ADDRESS_SPACE_BYTES_MAX: u64 = 4 * 1024 * 1024 * 1024;
+/// The most address space the gateway's sizing plan may give it
+/// (`egress/gateway/sizing.zig:addressSpaceBytes`, which the gateway
+/// applies). The plan's own sum is the backstop, above the sessions'
+/// mappings, the shards' and uploads' budgets and the thread stacks; this
+/// bounds the sum, and `sizing.zig` checks that the largest plan fits under
+/// it. Address space costs nothing physical: the budgets bound what a
+/// gateway spends.
+pub const EGRESS_GATEWAY_ADDRESS_SPACE_BYTES_MAX: u64 = 128 * 1024 * 1024 * 1024;
 
 /// Size of the tmpfs the gateway mounts as its root. It holds only the
 /// directories and empty files its read-only binds cover, so one page would

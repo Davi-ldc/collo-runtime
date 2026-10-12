@@ -1,7 +1,8 @@
 //! The worker supervisor's own state and decisions
 //! (`server/supervisor/supervisor.zig`): its pools and record table built
 //! whole or not at all, a worker torn down with the supervisor, its last
-//! usage record written and its tmp root removed, how a worker's death
+//! usage record written and its line in `workers.jsonl` ended by the
+//! shutdown, how a worker's death
 //! classifies from the termination reason on its page, the usage drain (a
 //! full ring of refused records, and a head past the ring that fails it for
 //! good), synthesis and a full usage stream as the supervisor runs them, the
@@ -17,6 +18,7 @@
 
 const std = @import("std");
 const ipc = @import("collo_ipc");
+const process = @import("collo_os").process;
 const analytics = @import("collo_server_analytics");
 const routes_mod = @import("collo_server_routes");
 const zygote = @import("collo_zygote");
@@ -31,7 +33,6 @@ const usage_log = supervision.usage_log;
 const request_table = supervision.request_table;
 const worker_table = supervision.worker_table;
 const WorkerRecord = worker_table.Record;
-const usage_key = supervision.accounting.usage;
 const pool_mod = supervision.pool;
 const WorkerPool = pool_mod.Pool(WorkerRecord);
 
@@ -110,7 +111,7 @@ test "the supervisor's pools and record table are built whole or not at all" {
     );
 }
 
-test "a worker still in its pool when the supervisor ends is torn down, its last usage record written and its tmp root gone" {
+test "a worker still in its pool when the supervisor ends is torn down, its last usage record written and its line in workers.jsonl ended by the shutdown" {
     const allocator = std.testing.allocator;
     var analytics_dir = try fixture.AnalyticsDir.init(allocator);
     defer analytics_dir.deinit(allocator);
@@ -118,17 +119,27 @@ test "a worker still in its pool when the supervisor ends is torn down, its last
     var supervisor_live = true;
     defer if (supervisor_live) fixture.deinitMinimal(&supervisor);
 
-    const worker = try fixture.publishInertWorker(&supervisor, .{});
+    const worker = try fixture.publishInertWorker(&supervisor, .{
+        .record = .{ .created_mono_ns = process.monotonicNowNsOrZero() },
+    });
     try fixture.publishCompletedRecord(worker, 501);
-    const tmp_root = try allocator.dupe(u8, worker.handle.tmp_root);
-    defer allocator.free(tmp_root);
+    const worker_id = worker.id;
+    const worker_generation = worker.generation;
 
     // The record is still in the worker's ring. The supervisor's end drains it
-    // before the page goes, closing the sink writes it, and the testing
-    // allocator proves the worker's handle and scratch went too.
+    // before the page goes and writes the worker's line, closing the sink
+    // writes both out, and the testing allocator proves the worker's handle
+    // and scratch went too.
     fixture.deinitMinimal(&supervisor);
     supervisor_live = false;
-    try std.testing.expectError(error.FileNotFound, std.fs.accessAbsolute(tmp_root, .{}));
+
+    var worker_lines = try analytics_dir.readWorkers(allocator, null);
+    defer worker_lines.deinit();
+    try std.testing.expectEqual(@as(usize, 1), worker_lines.items.len);
+    try std.testing.expectEqualStrings(fixture.definition_names[demo], worker_lines.items[0].worker);
+    try std.testing.expectEqual(worker_id, worker_lines.items[0].worker_id);
+    try std.testing.expectEqual(worker_generation, worker_lines.items[0].worker_generation);
+    try std.testing.expectEqualStrings("shutdown", worker_lines.items[0].ending);
 
     const contents = try analytics_dir.tmp.dir.readFileAlloc(allocator, "usage.jsonl", 64 * 1024);
     defer allocator.free(contents);
@@ -176,18 +187,16 @@ test "a supervisor drain writes the worker's measurements to usage.jsonl" {
     defer std.posix.close(fd);
     var view = try worker_shared_page.mapReadWrite(fd);
     defer view.deinit();
-    view.initializeCrashDefault(1, 0, 0);
+    view.initializeCrashDefault();
 
     var state = worker_metrics_state.WorkState.init(&view);
     try state.appendCompletedRecord(std.mem.zeroInit(worker_shared_page.CompletedRecord, .{
         .request_id = 1,
-        .started_mono_ns = 10,
-        .finished_mono_ns = 20,
-        .cpu_time_ns = 1,
-        .io_time_ns = 9,
+        .cpu_ns = 1,
+        .io_ns = 9,
         .client_served_bytes = 100,
-        .fetch_billed_sent_bytes = 20,
-        .fetch_billed_received_bytes = 3,
+        .fetch_sent_bytes = 20,
+        .fetch_received_bytes = 3,
         .status = @intFromEnum(worker_shared_page.CompletedStatus.done),
     }));
 
@@ -195,6 +204,7 @@ test "a supervisor drain writes the worker's measurements to usage.jsonl" {
     worker.handle.metrics = view;
     worker.page_mapped = true;
     try worker.requests.record(fixture.dispatchedRequest(1));
+    worker.requests.noteEnded(1, fixture.request_ended_ns);
 
     try std.testing.expectEqual(
         @as(usize, 1),
@@ -208,9 +218,10 @@ test "a supervisor drain writes the worker's measurements to usage.jsonl" {
     const line = lines.items[0];
     try std.testing.expectEqual(@as(u64, 1), line.request_id);
     try std.testing.expectEqualStrings("demo", line.worker);
-    try std.testing.expectEqual(@as(u64, 10), line.wall_time_ns);
-    try std.testing.expectEqual(@as(u64, 1), line.cpu_time_ns);
-    try std.testing.expectEqual(@as(u64, 9), line.io_time_ns);
+    // The wall time is the server's, from its dispatch to the lane's end.
+    try std.testing.expectEqual(fixture.request_ended_ns - 1, line.wall_ns);
+    try std.testing.expectEqual(@as(u64, 1), line.cpu_ns);
+    try std.testing.expectEqual(@as(u64, 9), line.io_ns);
     try std.testing.expectEqual(@as(u64, 100), line.client_served_bytes);
     try std.testing.expectEqual(@as(u64, 20), line.fetch_sent_bytes);
     try std.testing.expectEqual(@as(u64, 3), line.fetch_received_bytes);
@@ -221,78 +232,12 @@ fn completedFor(identity: worker_shared_page.LifecycleIdentity) worker_shared_pa
     return std.mem.zeroInit(worker_shared_page.CompletedRecord, .{
         .request_id = identity.external_request_id,
         .request_generation = identity.request_generation,
-        .worker_id = identity.worker_id,
-        .worker_generation = identity.worker_generation,
-        .started_mono_ns = 1,
-        .finished_mono_ns = 2,
-        .cpu_time_ns = 77,
+        .cpu_ns = 77,
         .client_served_bytes = 4,
         .request_slot = identity.request_slot,
         .request_lane_id = identity.request_lane_id,
         .status = @intFromEnum(worker_shared_page.CompletedStatus.done),
     });
-}
-
-test "supervisor synthesized usage dedup uses lifecycle identity not external request id" {
-    var analytics_dir = try fixture.AnalyticsDir.init(std.testing.allocator);
-    defer analytics_dir.deinit(std.testing.allocator);
-    var supervisor = try fixture.minimalSupervisorWithAnalytics(std.testing.allocator, analytics_dir.path);
-    defer fixture.deinitMinimal(&supervisor);
-
-    const fd = try worker_shared_page.createMemfd("worker-lifecycle-usage");
-    defer std.posix.close(fd);
-    var view = try worker_shared_page.mapReadWrite(fd);
-    defer view.deinit();
-    view.initializeCrashDefault(1, 0, 0);
-
-    var worker = fixture.stackWorker(7, 3, demo);
-    worker.handle.metrics = view;
-    worker.page_mapped = true;
-
-    const synthetic_identity = worker_shared_page.LifecycleIdentity{
-        .external_request_id = 500,
-        .request_lane_id = 1,
-        .request_slot = 2,
-        .request_generation = 3,
-        .worker_id = 7,
-        .worker_generation = 3,
-    };
-    const reused_external_id_identity = worker_shared_page.LifecycleIdentity{
-        .external_request_id = 500,
-        .request_lane_id = 1,
-        .request_slot = 4,
-        .request_generation = 9,
-        .worker_id = 7,
-        .worker_generation = 3,
-    };
-
-    // The server ends the first attempt itself and writes its floor.
-    try worker.requests.record(dispatchedAs(synthetic_identity));
-    usage_drain.settleRequest(supervisor.usageDrain(), &worker, synthetic_identity.external_request_id, .{ .floor = .{ .status = .deadline } });
-    try std.testing.expectEqual(
-        usage_log.SynthesizedState.written,
-        supervisor.usage.synthesized.get(usage_key.keyFromIdentity(synthetic_identity)).?,
-    );
-
-    // A second attempt under the same request id is dispatched, so the
-    // request table expects its record; only the synthesis index can tell the
-    // two attempts apart.
-    try worker.requests.record(dispatchedAs(reused_external_id_identity));
-    var metrics = worker_metrics_state.WorkState.init(&view);
-    try metrics.appendCompletedRecord(completedFor(reused_external_id_identity));
-    try std.testing.expectEqual(@as(usize, 1), usage_drain.drainWorker(supervisor.usageDrain(), &worker));
-
-    // The worker's own record for the synthesized attempt is skipped.
-    try metrics.appendCompletedRecord(completedFor(synthetic_identity));
-    try std.testing.expectEqual(@as(usize, 0), usage_drain.drainWorker(supervisor.usageDrain(), &worker));
-
-    var lines = try analytics_dir.readUsage(std.testing.allocator, supervisor.analytics);
-    defer lines.deinit();
-    try std.testing.expectEqual(@as(usize, 2), lines.items.len);
-    try std.testing.expectEqualStrings("server", lines.items[0].origin);
-    try std.testing.expectEqualStrings("deadline", lines.items[0].error_code);
-    try std.testing.expectEqualStrings("worker", lines.items[1].origin);
-    try std.testing.expectEqual(@as(u64, 500), lines.items[1].request_id);
 }
 
 test "a drained record and a lifecycle synthesis write one record per attempt in either order" {
@@ -305,7 +250,7 @@ test "a drained record and a lifecycle synthesis write one record per attempt in
     defer std.posix.close(fd);
     var view = try worker_shared_page.mapReadWrite(fd);
     defer view.deinit();
-    view.initializeCrashDefault(1, 0, 0);
+    view.initializeCrashDefault();
 
     var worker = fixture.stackWorker(9, 2, demo);
     worker.handle.metrics = view;
@@ -327,18 +272,13 @@ test "a drained record and a lifecycle synthesis write one record per attempt in
     try metrics.appendCompletedRecord(completedFor(identity_real_first));
     try std.testing.expectEqual(
         usage_drain.SynthesisOutcome.settled,
-        try usage_drain.synthesizeFinalAccountingForLifecycle(supervisor.usageDrain(), &worker, identity_real_first.external_request_id, .{ .status = .crash }),
-    );
-    // No reservation was consumed for this identity.
-    try std.testing.expectEqual(
-        @as(?usage_log.SynthesizedState, null),
-        supervisor.usage.synthesized.get(usage_key.keyFromIdentity(identity_real_first)),
+        usage_drain.synthesizeFinalAccountingForLifecycle(supervisor.usageDrain(), &worker, identity_real_first.external_request_id, .{ .status = .crash }, fixture.request_ended_ns),
     );
     try std.testing.expectEqual(@as(usize, 0), usage_drain.drainWorker(supervisor.usageDrain(), &worker));
 
-    // Order 2: synthesis reserves and writes first; the worker's own record
-    // for the same identity lands in the ring afterwards. The drain must skip
-    // it instead of writing a second record.
+    // Order 2: synthesis writes first; the worker's own record for the same
+    // request lands in the ring afterwards. The drain must skip it, without
+    // counting it refused, instead of writing a second record.
     const identity_synth_first = worker_shared_page.LifecycleIdentity{
         .external_request_id = 601,
         .request_lane_id = 1,
@@ -350,13 +290,11 @@ test "a drained record and a lifecycle synthesis write one record per attempt in
     try worker.requests.record(dispatchedAs(identity_synth_first));
     try std.testing.expectEqual(
         usage_drain.SynthesisOutcome.settled,
-        try usage_drain.synthesizeFinalAccountingForLifecycle(supervisor.usageDrain(), &worker, identity_synth_first.external_request_id, .{ .status = .deadline }),
+        usage_drain.synthesizeFinalAccountingForLifecycle(supervisor.usageDrain(), &worker, identity_synth_first.external_request_id, .{ .status = .deadline }, fixture.request_ended_ns),
     );
     try metrics.appendCompletedRecord(completedFor(identity_synth_first));
     try std.testing.expectEqual(@as(usize, 0), usage_drain.drainWorker(supervisor.usageDrain(), &worker));
-    // The written key is reclaimed once the worker's record was skipped: the
-    // exactly-once account for this identity is closed, not leaked.
-    try std.testing.expectEqual(@as(usize, 0), supervisor.usage.synthesized.count());
+    try std.testing.expectEqual(@as(u64, 0), rejectedRecords(&supervisor));
 
     var lines = try analytics_dir.readUsage(std.testing.allocator, supervisor.analytics);
     defer lines.deinit();
@@ -366,7 +304,7 @@ test "a drained record and a lifecycle synthesis write one record per attempt in
     try std.testing.expectEqual(@as(u64, 600), lines.items[0].request_id);
     try std.testing.expectEqualStrings("worker", lines.items[0].origin);
     try std.testing.expectEqualStrings("done", lines.items[0].error_code);
-    try std.testing.expectEqual(@as(u64, 77), lines.items[0].cpu_time_ns);
+    try std.testing.expectEqual(@as(u64, 77), lines.items[0].cpu_ns);
     try std.testing.expectEqual(@as(u64, 601), lines.items[1].request_id);
     try std.testing.expectEqualStrings("server", lines.items[1].origin);
     try std.testing.expectEqualStrings("deadline", lines.items[1].error_code);
@@ -380,13 +318,13 @@ test "a full usage stream drops and counts a drain's records while dispatch goes
     var supervisor = try fixture.minimalSupervisorWithAnalytics(std.testing.allocator, analytics_dir.path);
     defer fixture.deinitMinimal(&supervisor);
     const published = try fixture.publishInertWorker(&supervisor, .{});
-    try fixture.fillUsageStream(std.testing.allocator, supervisor.analytics, 16);
+    try fixture.fillStream(std.testing.allocator, supervisor.analytics, .usage, 16);
 
     const fd = try worker_shared_page.createMemfd("worker-usage-stream-full");
     defer std.posix.close(fd);
     var view = try worker_shared_page.mapReadWrite(fd);
     defer view.deinit();
-    view.initializeCrashDefault(1, 0, 0);
+    view.initializeCrashDefault();
     var metrics = worker_metrics_state.WorkState.init(&view);
 
     // A completed request whose worker record waits for the drain.
@@ -394,8 +332,9 @@ test "a full usage stream drops and counts a drain's records while dispatch goes
     worker.handle.metrics = view;
     worker.page_mapped = true;
     try worker.requests.record(fixture.dispatchedRequest(2));
-    try metrics.appendCompletedRecord(fixture.completedRecord(&worker, 2));
-    try std.testing.expectEqual(request_table.Settled.awaiting_record, worker.requests.settle(2, true));
+    try metrics.appendCompletedRecord(fixture.completedRecord(2));
+    worker.requests.noteEnded(2, fixture.request_ended_ns);
+    try std.testing.expectEqual(request_table.Settled.parked, worker.requests.settle(2, true));
 
     // The stream has no room: the record is dropped and counted, the ring
     // moves past it, and the request no longer waits for it.
@@ -424,10 +363,8 @@ fn fillUsageRing(view: *worker_shared_page.WorkerWriterView) void {
     for (view.completed_records, 0..) |*record, index| {
         record.* = std.mem.zeroInit(worker_shared_page.CompletedRecord, .{
             .request_id = @as(u64, @intCast(index + 1)),
-            .started_mono_ns = 10,
-            .finished_mono_ns = 20,
-            .cpu_time_ns = 1,
-            .io_time_ns = 9,
+            .cpu_ns = 1,
+            .io_ns = 9,
             .client_served_bytes = 1,
             .status = @intFromEnum(worker_shared_page.CompletedStatus.done),
         });
@@ -444,7 +381,7 @@ test "a usage drain reads a full ring once and refuses the records of requests i
     defer std.posix.close(fd);
     var view = try worker_shared_page.mapReadWrite(fd);
     defer view.deinit();
-    view.initializeCrashDefault(1, 0, 0);
+    view.initializeCrashDefault();
     fillUsageRing(&view);
     @atomicStore(u64, &view.header.records_head, worker_shared_page.RECORD_RING_COUNT, .release);
 
@@ -480,7 +417,7 @@ test "a usage drain fails a ring whose head stands more than a ring past its tai
     defer std.posix.close(fd);
     var view = try worker_shared_page.mapReadWrite(fd);
     defer view.deinit();
-    view.initializeCrashDefault(1, 0, 0);
+    view.initializeCrashDefault();
     fillUsageRing(&view);
 
     var worker = fixture.stackWorker(1, 1, demo);
@@ -525,7 +462,7 @@ test "a drain of every worker writes a full usage stream out and offers the batc
     const second = try fixture.publishInertWorker(&supervisor, .{ .definition_index = beta });
     try fixture.publishCompletedRecord(first, 41);
     try fixture.publishCompletedRecord(second, 42);
-    try fixture.fillUsageStream(std.testing.allocator, supervisor.analytics, 16);
+    try fixture.fillStream(std.testing.allocator, supervisor.analytics, .usage, 16);
 
     // The first worker's record finds the stream full and stays in its ring
     // while the drain writes the stream out; offered again, it lands, and so
@@ -559,7 +496,7 @@ test "a drain of every worker drops what a write-out leaves no room for, and eve
     const second = try fixture.publishInertWorker(&supervisor, .{ .definition_index = beta });
     try fixture.publishCompletedRecord(first, 51);
     try fixture.publishCompletedRecord(second, 52);
-    try fixture.fillUsageStream(std.testing.allocator, supervisor.analytics, 16);
+    try fixture.fillStream(std.testing.allocator, supervisor.analytics, .usage, 16);
 
     // The file takes no writes, so the write-out frees nothing: the first
     // worker's record is dropped after it, and the second worker's is
@@ -595,7 +532,7 @@ const DrainableWorker = struct {
         self.fd = try worker_shared_page.createMemfd(name);
         errdefer std.posix.close(self.fd);
         self.view = try worker_shared_page.mapReadWrite(self.fd);
-        self.view.initializeCrashDefault(1, 0, 0);
+        self.view.initializeCrashDefault();
         self.record = fixture.stackWorker(id, generation, demo);
         self.record.handle.metrics = self.view;
         self.record.page_mapped = true;
@@ -607,17 +544,18 @@ const DrainableWorker = struct {
     }
 
     /// A completed request: entered in the worker's request table as a
-    /// dispatch does, unless it already is, and settled to wait for its
+    /// dispatch does, unless it already is, ended and settled to wait for its
     /// record, which is appended to the ring as the worker does before it
     /// publishes the completion.
     fn publish(self: *DrainableWorker, request_id: u64) !void {
         if (self.record.requests.dispatchedFor(request_id) == null) {
             try self.record.requests.record(fixture.dispatchedRequest(request_id));
-            if (self.record.requests.settle(request_id, true) != .awaiting_record)
+            self.record.requests.noteEnded(request_id, fixture.request_ended_ns);
+            if (self.record.requests.settle(request_id, true) != .parked)
                 return error.RequestTableFull;
         }
         var metrics = worker_metrics_state.WorkState.init(&self.view);
-        try metrics.appendCompletedRecord(fixture.completedRecord(&self.record, request_id));
+        try metrics.appendCompletedRecord(fixture.completedRecord(request_id));
     }
 
     fn pending(self: *const DrainableWorker) u64 {
@@ -672,14 +610,15 @@ test "a batch the usage stream cannot take is held whole for a thread that write
     defer worker.deinit();
     const clock = analytics.Clock.capture();
     const identity = analytics.Identity.ofWorker(&worker.record);
+    const dispatch: analytics.usage.Dispatch = .{ .started_mono_ns = 1, .accounting_flags = 0 };
     const records = [_]analytics.usage.UsageRecord{
-        analytics.usage.fromCompleted(identity, .worker, fixture.completedRecord(&worker.record, 1), clock),
-        analytics.usage.fromCompleted(identity, .worker, fixture.completedRecord(&worker.record, 2), clock),
+        analytics.usage.fromCompleted(identity, .worker, fixture.completedRecord(1), dispatch, clock.mono_now_ns, clock),
+        analytics.usage.fromCompleted(identity, .worker, fixture.completedRecord(2), dispatch, clock.mono_now_ns, clock),
     };
 
     // Room above the synthesis reserve for one of these records, a little
     // over 300 bytes each, but not for both.
-    try fixture.fillUsageStream(std.testing.allocator, supervisor.analytics, usage_log.synthesis_reserve_bytes + 400);
+    try fixture.fillStream(std.testing.allocator, supervisor.analytics, .usage, usage_log.synthesis_reserve_bytes + 400);
     // Held, the batch costs nothing: nothing is counted and the stream is not
     // full.
     try std.testing.expectEqual(usage_log.AppendOutcome.held, supervisor.usage.append(&records, .hold));
@@ -705,7 +644,7 @@ test "a drained batch may not take the synthesis reserve, and a floor may spend 
     defer analytics_dir.deinit(std.testing.allocator);
     var supervisor = try fixture.minimalSupervisorWithAnalytics(std.testing.allocator, analytics_dir.path);
     defer fixture.deinitMinimal(&supervisor);
-    try fixture.fillUsageStream(std.testing.allocator, supervisor.analytics, usage_log.synthesis_reserve_bytes);
+    try fixture.fillStream(std.testing.allocator, supervisor.analytics, .usage, usage_log.synthesis_reserve_bytes);
 
     var worker: DrainableWorker = undefined;
     try worker.init("worker-usage-synthesis-reserve", 7, 3);
@@ -730,7 +669,7 @@ test "a drained batch may not take the synthesis reserve, and a floor may spend 
     try worker.record.requests.record(dispatchedAs(identity));
     try std.testing.expectEqual(
         usage_drain.SynthesisOutcome.settled,
-        try usage_drain.synthesizeFinalAccountingForLifecycle(supervisor.usageDrain(), &worker.record, identity.external_request_id, .{ .status = .deadline }),
+        usage_drain.synthesizeFinalAccountingForLifecycle(supervisor.usageDrain(), &worker.record, identity.external_request_id, .{ .status = .deadline }, fixture.request_ended_ns),
     );
     try std.testing.expectEqual(@as(u64, 1), supervisor.analytics.stats(.usage).dropped);
     try std.testing.expect(supervisor.analytics.full(.usage));
@@ -749,7 +688,7 @@ test "a floor that finds the synthesis reserve spent is counted as lost and its 
     defer analytics_dir.deinit(std.testing.allocator);
     var supervisor = try fixture.minimalSupervisorWithAnalytics(std.testing.allocator, analytics_dir.path);
     defer fixture.deinitMinimal(&supervisor);
-    try fixture.fillUsageStream(std.testing.allocator, supervisor.analytics, 16);
+    try fixture.fillStream(std.testing.allocator, supervisor.analytics, .usage, 16);
 
     // A worker whose page is already gone: no record of it can be found.
     var worker = fixture.stackWorker(7, 3, demo);
@@ -768,14 +707,13 @@ test "a floor that finds the synthesis reserve spent is counted as lost and its 
     // stream must not end the lane with it.
     try std.testing.expectEqual(
         usage_drain.SynthesisOutcome.awaits_worker_record,
-        try usage_drain.synthesizeFinalAccountingForLifecycle(supervisor.usageDrain(), &worker, identity.external_request_id, .{ .status = .deadline }),
+        usage_drain.synthesizeFinalAccountingForLifecycle(supervisor.usageDrain(), &worker, identity.external_request_id, .{ .status = .deadline }, fixture.request_ended_ns),
     );
     try std.testing.expectEqual(@as(u64, 1), supervisor.analytics.stats(.usage).dropped);
-    // No floor exists, so the reservation is rolled back and the request's
-    // entry keeps expecting the worker's record: one that still arrives is
-    // written.
-    try std.testing.expect(!supervisor.usage.synthesized.contains(usage_key.keyFromIdentity(identity)));
-    try std.testing.expect(worker.requests.expected(identity.external_request_id) != null);
+    // No floor exists, so the request's entry keeps expecting the worker's
+    // record: one that still arrives is written.
+    try std.testing.expect(worker.requests.expectsRecord(identity.external_request_id));
+    try std.testing.expect(worker.requests.verdict(identity.external_request_id) == .write);
 }
 
 test "a request whose record a drain already wrote gets no floor when the server ends it" {
@@ -800,11 +738,13 @@ test "a request whose record a drain already wrote gets no floor when the server
     };
     try worker.record.requests.record(dispatchedAs(identity));
 
-    // The worker finishes and the periodic drain writes its record and empties
-    // the ring before the lane ends the request as an internal error.
+    // The worker finishes, the lane's end is noted, and the periodic drain
+    // writes the worker's record and empties the ring before the lane settles
+    // the request as an internal error.
     try worker.publish(identity.external_request_id);
+    worker.record.requests.noteEnded(identity.external_request_id, fixture.request_ended_ns);
     try std.testing.expectEqual(@as(usize, 1), usage_drain.drainWorker(supervisor.usageDrain(), &worker.record));
-    supervisor.settleRequest(&worker.record, identity.external_request_id, .{ .floor = .{ .status = .internal_error } });
+    supervisor.settleRequest(&worker.record, identity.external_request_id, .{ .floor = .{ .status = .internal_error } }, fixture.request_ended_ns);
 
     // The entry went with the settle.
     try std.testing.expect(worker.record.requests.dispatchedFor(identity.external_request_id) == null);
@@ -836,11 +776,11 @@ test "a worker that answered 504 at one request's deadline stays in service and 
     // worker answered 504 itself, appended its own usage record and published
     // the completion. The lane settles it as completed and gives its slot
     // back.
-    var deadline_record = fixture.completedRecord(worker, 1);
+    var deadline_record = fixture.completedRecord(1);
     deadline_record.status = @intFromEnum(worker_shared_page.CompletedStatus.deadline);
     var state = worker_metrics_state.WorkState.init(&worker.handle.metrics.?);
     try state.appendCompletedRecord(deadline_record);
-    supervisor.settleRequest(worker, 1, .completed);
+    supervisor.settleRequest(worker, 1, .completed, fixture.request_ended_ns);
     try std.testing.expect((try demo_pool.release(worker, timed_out.slot, 10)) == .idle);
 
     // Nothing took the worker out of service or queued its retirement, and it
@@ -862,8 +802,8 @@ test "a worker that answered 504 at one request's deadline stays in service and 
     try std.testing.expectEqualStrings("deadline", lines.items[0].error_code);
 
     // The other request completes on the same worker.
-    try state.appendCompletedRecord(fixture.completedRecord(worker, 2));
-    supervisor.settleRequest(worker, 2, .completed);
+    try state.appendCompletedRecord(fixture.completedRecord(2));
+    supervisor.settleRequest(worker, 2, .completed, fixture.request_ended_ns);
     try std.testing.expect((try demo_pool.release(worker, other.slot, 20)) == .idle);
     const after = demo_pool.inspect(worker) orelse return error.TestExpectedWorker;
     try std.testing.expectEqual(pool_mod.EntryState.live, after.state);
@@ -1003,6 +943,26 @@ test "the next stale egress worker is the first live worker of another gateway, 
     var second = supervisor.nextStaleEgressWorker(current + 1) orelse return error.TestExpectedStaleWorker;
     defer second.deinit();
     try std.testing.expectEqual(stale, second.record);
+}
+
+test "the reattach pass never names a worker of a definition without a network grant" {
+    var granted: [fixture.definition_names.len]bool = @splat(true);
+    granted[demo] = false;
+    var supervisor = try fixture.minimalSupervisorWith(std.testing.allocator, .{ .routes = .{ .granted = granted } });
+    defer fixture.deinitMinimal(&supervisor);
+    const current: u64 = 4;
+    // Session 0 of no gateway is what a worker without a grant holds, which
+    // reads as stale under any gateway.
+    _ = try fixture.publishInertWorker(&supervisor, .{ .definition_index = demo });
+    try std.testing.expect(supervisor.nextStaleEgressWorker(current) == null);
+
+    const granted_worker = try fixture.publishInertWorker(&supervisor, .{
+        .definition_index = beta,
+        .record = .{ .egress_wake_set = try ipc.egress_shared.WakeSet.create() },
+    });
+    var target = supervisor.nextStaleEgressWorker(current) orelse return error.TestExpectedStaleWorker;
+    defer target.deinit();
+    try std.testing.expectEqual(granted_worker, target.record);
 }
 
 test "a session its gateway removed is taken off the live worker that holds it, which the next pass then reaches" {

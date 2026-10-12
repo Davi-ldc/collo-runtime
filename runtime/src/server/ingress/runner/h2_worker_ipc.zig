@@ -407,7 +407,7 @@ pub fn Methods(comptime Self: type) type {
             }
             if (runtime.responseHeadQueued(stream_id))
                 return;
-            try Admission.writeH2ServerResponse(self, runtime, stream_id, response_id);
+            _ = try Admission.writeH2ServerResponse(self, runtime, stream_id, response_id);
         }
 
         fn handleReceived(

@@ -2,8 +2,10 @@
 //! in-process runner of `support.zig`: `runSuite` for Collo contract fixtures,
 //! `runLeakSuite` for the `_leak` fixtures, and `runCompatSuite` for the exact
 //! Bun and WPT ports. The second argument names the fixture's module and seeds
-//! its request ids. Compiled only under `-Dwebapi-compat` and run by
-//! `webapi-test`; `forked.zig` runs a fixture in a forked worker. Bug and spec
+//! its request ids. The `test` aggregate, `webapi-test` and the concurrent
+//! `bindings-gc-stress` profile run them; `forked.zig` runs a fixture in a
+//! forked worker. Every fixture under this directory is bound here or there,
+//! which `runtime/build/validate_webapi_tool.zig` checks. Bug and spec
 //! references belong in the fixture, next to the assertion they explain.
 
 const std = @import("std");

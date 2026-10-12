@@ -1,11 +1,12 @@
 //! The low-level helpers in `collo_os`, run against the live kernel: the
 //! cmsghdr layout, fd ownership, close-on-exec socket pairs, socket options,
 //! start ticks from `/proc/<pid>/stat`, spawning with mapped fds into a new
-//! session, closing every fd outside an allowlist, and the two fork
-//! primitives the zygote depends on, `makeAddressSpaceForkInheritable` and
-//! `cloneForkWithPidFd` with the errors a failed clone reports. The fork
-//! tests fork the test binary itself; the zygote's own fork loop is covered
-//! by the `zygote-integration` lane.
+//! session with the child's pidfd, closing every fd outside an allowlist,
+//! thread CPU clocks read from another thread, and the two fork primitives
+//! the zygote depends on, `makeAddressSpaceForkInheritable` and
+//! `cloneForkWithPidFd` with the thread identity it gives the child and the
+//! errors a failed clone reports. The fork tests fork the test binary itself;
+//! the zygote's own fork loop is covered by the `zygote-integration` lane.
 
 const std = @import("std");
 const os = @import("collo_os");
@@ -231,21 +232,117 @@ test "internal spawn maps explicit fd and closes the source side on exec" {
         .target_fd = 3,
     }};
 
-    const pid = try os.process.spawnInternal(.{
+    var spawned = try os.process.spawnInternal(.{
         .exe_path_z = exe_path_z,
         .argv = &argv,
         .envp = &envp,
         .fd_map = &fd_map,
     });
+    defer spawned.pidfd.deinit();
     write_fd.deinit();
 
     var buffer: [2]u8 = undefined;
     const read_len = try std.posix.read(read_fd.fd(), &buffer);
     try std.testing.expectEqualStrings("ok", buffer[0..read_len]);
 
-    const wait = std.posix.waitpid(@intCast(pid), 0);
+    const wait = std.posix.waitpid(@intCast(spawned.pid), 0);
     try std.testing.expect(std.c.W.IFEXITED(wait.status));
     try std.testing.expectEqual(@as(u32, 0), std.c.W.EXITSTATUS(wait.status));
+}
+
+test "a spawned process comes with a pidfd that reports its exit" {
+    const exe_path_z: [*:0]const u8 = "/bin/sh";
+    const arg0: [*:0]const u8 = "sh";
+    const arg1: [*:0]const u8 = "-c";
+    const arg2: [*:0]const u8 = "exit 7";
+    const argv = [_:null]?[*:0]const u8{ arg0, arg1, arg2 };
+    const envp = [_:null]?[*:0]const u8{};
+    const pipe_pair = try std.posix.pipe2(.{ .CLOEXEC = true });
+    defer std.posix.close(pipe_pair[0]);
+    defer std.posix.close(pipe_pair[1]);
+    const fd_map = [_]os.process.SpawnFdMap{.{ .source_fd = pipe_pair[1], .target_fd = pipe_pair[1] + 64 }};
+
+    var spawned = try os.process.spawnInternal(.{
+        .exe_path_z = exe_path_z,
+        .argv = &argv,
+        .envp = &envp,
+        .fd_map = &fd_map,
+    });
+    defer spawned.pidfd.deinit();
+
+    // The pidfd names the child the spawn created, with no window in which
+    // the child existed without it.
+    try std.testing.expect(try os.process.waitForPidFdExit(spawned.pidfd.fd(), 5_000));
+    const wait = std.posix.waitpid(@intCast(spawned.pid), 0);
+    try std.testing.expect(std.c.W.IFEXITED(wait.status));
+    try std.testing.expectEqual(@as(u32, 7), std.c.W.EXITSTATUS(wait.status));
+}
+
+test "a spawn whose exec fails reports the exec's error" {
+    const exe_path_z: [*:0]const u8 = "/nonexistent/collo-spawn-probe";
+    const arg0: [*:0]const u8 = "collo-spawn-probe";
+    const argv = [_:null]?[*:0]const u8{arg0};
+    const envp = [_:null]?[*:0]const u8{};
+    const pipe_pair = try std.posix.pipe2(.{ .CLOEXEC = true });
+    defer std.posix.close(pipe_pair[0]);
+    defer std.posix.close(pipe_pair[1]);
+    const fd_map = [_]os.process.SpawnFdMap{.{ .source_fd = pipe_pair[1], .target_fd = pipe_pair[1] + 64 }};
+
+    try std.testing.expectError(error.FileNotFound, os.process.spawnInternal(.{
+        .exe_path_z = exe_path_z,
+        .argv = &argv,
+        .envp = &envp,
+        .fd_map = &fd_map,
+    }));
+}
+
+test "a spawned child gets no descriptor below its highest target but its targets, close-on-exec or not" {
+    // Sources sit above both targets, which `spawnInternal` requires, and the
+    // leak candidate sits between the two targets without close-on-exec.
+    const source_fd_min: std.posix.fd_t = 96;
+    const ready_pair = try std.posix.pipe2(.{ .CLOEXEC = true });
+    var ready_read = os.fd.OwnedFd.fromRaw(ready_pair[0]);
+    defer ready_read.deinit();
+    var ready_write = try os.fd.OwnedFd.dupCloexecAtLeast(ready_pair[1], source_fd_min);
+    defer ready_write.deinit();
+    std.posix.close(ready_pair[1]);
+    const leak_min: std.posix.fd_t = 48;
+    const leak_fd: std.posix.fd_t = @intCast(try std.posix.fcntl(ready_read.fd(), std.posix.F.DUPFD, @intCast(leak_min)));
+    defer std.posix.close(leak_fd);
+    try std.testing.expect(leak_fd < source_fd_min - 1);
+    var far_source = try os.fd.OwnedFd.dupCloexecAtLeast(ready_read.fd(), source_fd_min);
+    defer far_source.deinit();
+    const far_target: std.posix.fd_t = leak_fd + 1;
+
+    var script_buffer: [128]u8 = undefined;
+    const script = try std.fmt.bufPrintZ(
+        &script_buffer,
+        "if [ -e /proc/self/fd/{d} ]; then printf leak >&3; else printf ok >&3; fi",
+        .{leak_fd},
+    );
+    const exe_path_z: [*:0]const u8 = "/bin/sh";
+    const arg0: [*:0]const u8 = "sh";
+    const arg1: [*:0]const u8 = "-c";
+    const argv = [_:null]?[*:0]const u8{ arg0, arg1, script.ptr };
+    const envp = [_:null]?[*:0]const u8{};
+    const fd_map = [_]os.process.SpawnFdMap{
+        .{ .source_fd = ready_write.fd(), .target_fd = 3 },
+        .{ .source_fd = far_source.fd(), .target_fd = far_target },
+    };
+    var spawned = try os.process.spawnInternal(.{
+        .exe_path_z = exe_path_z,
+        .argv = &argv,
+        .envp = &envp,
+        .fd_map = &fd_map,
+    });
+    defer spawned.pidfd.deinit();
+    ready_write.deinit();
+
+    var buffer: [4]u8 = undefined;
+    const read_len = try std.posix.read(ready_read.fd(), &buffer);
+    const wait = std.posix.waitpid(@intCast(spawned.pid), 0);
+    try std.testing.expectEqualStrings("ok", buffer[0..read_len]);
+    try std.testing.expect(std.c.W.IFEXITED(wait.status));
 }
 
 test "internal spawn starts the child as the leader of a new session and process group" {
@@ -276,12 +373,14 @@ test "internal spawn starts the child as the leader of a new session and process
         .{ .source_fd = ready_write.fd(), .target_fd = 3 },
         .{ .source_fd = release_read.fd(), .target_fd = 4 },
     };
-    const pid = try os.process.spawnInternal(.{
+    var spawned = try os.process.spawnInternal(.{
         .exe_path_z = exe_path_z,
         .argv = &argv,
         .envp = &envp,
         .fd_map = &fd_map,
     });
+    defer spawned.pidfd.deinit();
+    const pid = spawned.pid;
     ready_write.deinit();
     release_read.deinit();
 
@@ -344,7 +443,7 @@ test "close all except leaves no descriptor outside allowlist" {
 
 test "cloneForkWithPidFd returns an owned pidfd that observes child exit" {
     var pidfd: std.posix.fd_t = -1;
-    const pid = try os.process.cloneForkWithPidFd(null, &pidfd);
+    const pid = try os.process.cloneForkWithPidFd(try cloneOptions(null), &pidfd);
     if (pid == 0)
         childExit(7);
     defer std.posix.close(pidfd);
@@ -367,9 +466,154 @@ test "cloneForkWithPidFd rejects a non-cgroup target fd" {
     // fails with EBADF.
     try std.testing.expectError(
         error.InvalidHandle,
-        os.process.cloneForkWithPidFd(not_a_cgroup_fd, &pidfd),
+        os.process.cloneForkWithPidFd(try cloneOptions(not_a_cgroup_fd), &pidfd),
     );
     try std.testing.expectEqual(@as(std.posix.fd_t, -1), pidfd);
+}
+
+test "a cloned child's glibc names its own thread, so its thread CPU clock reads" {
+    // glibc computes the clock id from the thread id it caches in the thread's
+    // descriptor. A clone that left the caller's id there would name a thread
+    // of another process, which the kernel refuses with EINVAL.
+    var pidfd: std.posix.fd_t = -1;
+    const pid = try os.process.cloneForkWithPidFd(try cloneOptions(null), &pidfd);
+    if (pid == 0)
+        childExit(childReadsOwnThreadClock());
+    defer std.posix.close(pidfd);
+
+    try std.testing.expect(try os.process.waitForPidFdExit(pidfd, 5_000));
+    const wait = std.posix.waitpid(@intCast(pid), 0);
+    try std.testing.expect(std.c.W.IFEXITED(wait.status));
+    try std.testing.expectEqual(@as(u32, own_thread_clock_read), std.c.W.EXITSTATUS(wait.status));
+}
+
+/// The exit statuses of `childReadsOwnThreadClock`.
+const own_thread_clock_read: u8 = 0;
+const own_thread_clock_libc_failed: u8 = 1;
+const own_thread_clock_mismatch: u8 = 2;
+const own_thread_clock_refused: u8 = 3;
+
+/// Runs in a cloned child: glibc's clock id for the calling thread must be
+/// the one built from the kernel's thread id, and the kernel must read it.
+fn childReadsOwnThreadClock() u8 {
+    const libc_clock = os.process.libcThreadCpuClockId() catch return own_thread_clock_libc_failed;
+    if (libc_clock != os.process.threadCpuClockId(std.os.linux.gettid()))
+        return own_thread_clock_mismatch;
+    _ = os.process.threadCpuNs(libc_clock) catch return own_thread_clock_refused;
+    return own_thread_clock_read;
+}
+
+fn cloneOptions(cgroup_dir_fd: ?std.posix.fd_t) !os.process.CloneForkOptions {
+    return .{
+        .cgroup_dir_fd = cgroup_dir_fd,
+        .thread_id_word = try os.process.callingThreadIdWord(),
+    };
+}
+
+test "the calling thread's thread-id word holds its own thread id" {
+    const word = try os.process.callingThreadIdWord();
+    try std.testing.expectEqual(std.os.linux.gettid(), word.*);
+}
+
+test "another thread's CPU clock advances while it spins and stays still while it sleeps" {
+    var probe: SpinningThread = .{};
+    const thread = try std.Thread.spawn(.{}, SpinningThread.run, .{&probe});
+    defer thread.join();
+    defer probe.release.set();
+    probe.spun.wait();
+
+    const clock = os.process.threadCpuClockId(probe.tid.load(.acquire));
+    // The thread measured its own spin on its own clock before it parked, so
+    // the read from this thread sees at least that much.
+    const parked_ns = try os.process.threadCpuNs(clock);
+    try std.testing.expect(parked_ns >= spin_cpu_ns);
+    std.Thread.sleep(parked_wall_ns);
+    const later_ns = try os.process.threadCpuNs(clock);
+    try std.testing.expect(later_ns - parked_ns < parked_cpu_ns_max);
+}
+
+test "a CPU clock of a thread in another process is refused" {
+    // A forked child parks on a pipe read until the test closes the write
+    // end, so its thread exists while the clock is read.
+    const pipe_pair = try std.posix.pipe2(.{ .CLOEXEC = true });
+    defer std.posix.close(pipe_pair[0]);
+    var release_write = os.fd.OwnedFd.fromRaw(pipe_pair[1]);
+    defer release_write.deinit();
+    const pid = try std.posix.fork();
+    if (pid == 0) {
+        // Only raw system calls: fork cloned only the calling thread. The
+        // child drops its copy of the write end, so the read ends once the
+        // test closes its own.
+        if (os.linux.syscallErrno(std.os.linux.close(pipe_pair[1])) != .SUCCESS)
+            childExit(1);
+        var byte: [1]u8 = undefined;
+        switch (os.linux.syscallErrno(std.os.linux.read(pipe_pair[0], &byte, byte.len))) {
+            .SUCCESS => childExit(0),
+            else => childExit(1),
+        }
+    }
+    const refused = os.process.threadCpuNs(os.process.threadCpuClockId(pid));
+    release_write.deinit();
+    _ = std.posix.waitpid(pid, 0);
+    try std.testing.expectError(error.InvalidClock, refused);
+}
+
+/// The CPU the probe thread spends before it parks, the wall time the test
+/// lets it sleep, and the CPU it may show over that sleep: waking and
+/// parking on a futex costs microseconds.
+const spin_cpu_ns: u64 = 20 * std.time.ns_per_ms;
+const parked_wall_ns: u64 = 20 * std.time.ns_per_ms;
+const parked_cpu_ns_max: u64 = 1 * std.time.ns_per_ms;
+
+const SpinningThread = struct {
+    tid: std.atomic.Value(std.os.linux.pid_t) = .init(0),
+    spun: std.Thread.ResetEvent = .{},
+    release: std.Thread.ResetEvent = .{},
+
+    fn run(self: *SpinningThread) void {
+        self.tid.store(std.os.linux.gettid(), .release);
+        const own_clock = os.process.threadCpuClockId(std.os.linux.gettid());
+        while ((os.process.threadCpuNs(own_clock) catch spin_cpu_ns) < spin_cpu_ns)
+            std.atomic.spinLoopHint();
+        self.spun.set();
+        self.release.wait();
+    }
+};
+
+test "socket helpers read a socket's type and domain and refuse a descriptor that is not a socket" {
+    const pair = try os.fd.socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
+    defer std.posix.close(pair[0]);
+    defer std.posix.close(pair[1]);
+    try std.testing.expectEqual(@as(u32, std.posix.SOCK.SEQPACKET), try os.socket.socketType(pair[0]));
+    try std.testing.expectEqual(@as(u32, std.posix.AF.UNIX), try os.socket.socketDomain(pair[0]));
+
+    const not_a_socket = try std.posix.eventfd(0, std.os.linux.EFD.CLOEXEC);
+    defer std.posix.close(not_a_socket);
+    try std.testing.expectError(error.InvalidHandle, os.socket.socketType(not_a_socket));
+    try std.testing.expectError(error.InvalidHandle, os.socket.socketDomain(not_a_socket));
+}
+
+test "socket helpers find no upper-layer protocol on a fresh TCP socket and refuse TLS on a unix socket" {
+    var address = try std.net.Address.parseIp4("127.0.0.1", 0);
+    var server = try address.listen(.{ .reuse_address = true });
+    defer server.deinit();
+    var client = try std.net.tcpConnectToAddress(server.listen_address);
+    defer client.close();
+    try os.socket.connectResult(client.handle);
+    try std.testing.expect(!os.socket.tlsUlpAttached(client.handle));
+    // A kernel without the `tls` module refuses the attach; one with it
+    // reports the protocol attached afterwards.
+    if (os.socket.attachTlsUlp(client.handle)) {
+        try std.testing.expect(os.socket.tlsUlpAttached(client.handle));
+    } else |err| switch (err) {
+        error.OperationNotSupported => try std.testing.expect(!os.socket.tlsUlpAttached(client.handle)),
+        else => return err,
+    }
+
+    const pair = try os.fd.socketPairType(std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC);
+    defer std.posix.close(pair[0]);
+    defer std.posix.close(pair[1]);
+    try std.testing.expectError(error.OperationNotSupported, os.socket.attachTlsUlp(pair[0]));
 }
 
 test "a failed clone3 reports descriptor pressure as the descriptor quotas, and each cgroup refusal by its cause" {
@@ -430,7 +674,8 @@ fn cloneIntoFullDescriptorTable() u8 {
     } else return full_table_setup_failed;
 
     var pidfd: std.posix.fd_t = -1;
-    const child_pid = os.process.cloneForkWithPidFd(null, &pidfd) catch |err| switch (err) {
+    const options = cloneOptions(null) catch return full_table_setup_failed;
+    const child_pid = os.process.cloneForkWithPidFd(options, &pidfd) catch |err| switch (err) {
         error.ProcessFdQuotaExceeded => return full_table_quota_reported,
         else => return full_table_other_error,
     };

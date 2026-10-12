@@ -4,8 +4,9 @@
 //! poll per fixed file and direction is in flight, and `arm` re-queues each
 //! after its completion is handled. Every poll waits for input or a hangup,
 //! except the control socket's write poll, which `arm` queues only while a
-//! response send waits for room in the socket
-//! (`Requests.control_send_blocked`). A hangup or error seen by either
+//! response send or the retirement notice waits for room in the socket
+//! (`Requests.control_send_blocked`, `Retirement.notice_pending`). A hangup
+//! or error seen by either
 //! control poll fails `wait` and `drain` with `error.ControlPeerClosed`. The
 //! ring and its restrictions belong to `common/io/restricted_uring.zig`; the
 //! seccomp rules that confine io_uring_enter to it and deny setup and
@@ -74,6 +75,11 @@ pub const UringBackend = struct {
     /// timerfd; zero when no imminent deferred work is outstanding, the
     /// normal state. The loop refreshes it after every pump.
     deferred_backstop_deadline_ns: u64 = 0,
+    /// When the VM thread will have been idle `thread_cache_idle_release_ns`
+    /// and releases its allocator cache, folded into the timerfd as the
+    /// backstop is, since the ring admits only polls; zero when the cache is
+    /// released or the loop is not about to block (`scheduler/loop.zig`).
+    idle_cache_release_deadline_ns: u64 = 0,
 
     /// Arms every poll. Fails with `error.WorkerRingUnavailable` before
     /// `initRestrictedWorkerRing` has run.
@@ -106,8 +112,9 @@ pub const UringBackend = struct {
         }
 
         // A writable socket completes this poll at once, so it is armed only
-        // while a send waits for room.
-        if (runtime.requests.control_send_blocked and !self.control_writable_poll_armed) {
+        // while a response or the retirement notice waits for room.
+        const send_waits = runtime.requests.control_send_blocked or runtime.retirement.notice_pending;
+        if (send_waits and !self.control_writable_poll_armed) {
             try ring.pollFixed(userData(.control_writable_poll, 0), .control, pollMask(std.posix.POLL.OUT | std.posix.POLL.HUP | std.posix.POLL.ERR));
             self.control_writable_poll_armed = true;
             queued_sqes += 1;
@@ -311,16 +318,17 @@ pub const UringBackend = struct {
         return written;
     }
 
-    /// The earliest of the next timer, the next request deadline and the
-    /// deferred-work recheck, which must wake the loop even when no timer or
-    /// deadline is armed.
+    /// The earliest of the next timer, the next request deadline, the
+    /// deferred-work recheck and the idle cache release, the last two of
+    /// which must wake the loop even when no timer or deadline is armed.
     fn nextDeadlineWithBackstopNs(self: *const UringBackend, runtime: *state.Runtime) ?u64 {
-        const base = nextDeadlineNs(runtime);
-        if (self.deferred_backstop_deadline_ns == 0)
-            return base;
-        if (base) |deadline_ns|
-            return @min(deadline_ns, self.deferred_backstop_deadline_ns);
-        return self.deferred_backstop_deadline_ns;
+        var deadline: ?u64 = nextDeadlineNs(runtime);
+        for ([_]u64{ self.deferred_backstop_deadline_ns, self.idle_cache_release_deadline_ns }) |extra_ns| {
+            if (extra_ns == 0)
+                continue;
+            deadline = @min(deadline orelse extra_ns, extra_ns);
+        }
+        return deadline;
     }
 
     fn armTimerFd(self: *UringBackend, runtime: *state.Runtime, deadline_ns: u64) !void {

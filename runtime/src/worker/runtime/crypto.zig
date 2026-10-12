@@ -13,6 +13,7 @@ const std = @import("std");
 const bindings = @import("collo_bindings");
 const crypto_jobs = @import("../js/crypto/jobs.zig");
 const crypto_runtime = @import("../js/crypto/runtime.zig");
+const worker_limits = @import("collo_limits").worker;
 const runtime_types = @import("types.zig");
 
 pub const Crypto = struct {
@@ -26,7 +27,7 @@ pub const Crypto = struct {
         return .{
             .jobs = try crypto_jobs.Pool.init(allocator, wakeup_fd, .{
                 .thread_count = limits.crypto_thread_count,
-                .thread_stack_bytes = limits.crypto_thread_stack_bytes,
+                .thread_stack_bytes = worker_limits.crypto_thread_stack_bytes,
                 .max_in_flight_per_request = limits.crypto_max_in_flight_per_request,
                 .max_in_flight_per_worker = limits.crypto_max_in_flight_per_worker,
             }),
@@ -42,8 +43,6 @@ pub const Crypto = struct {
 pub fn Methods(comptime Runtime: type) type {
     return struct {
         pub fn scheduleCryptoJob(self: *Runtime, request_id: u64, job: *bindings.RawCryptoJob) !void {
-            if (self.bootIdentityClosed(request_id))
-                return error.CryptoJobOutsideActiveRequest;
             try crypto_runtime.scheduleJob(self, request_id, job);
         }
 

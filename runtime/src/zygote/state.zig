@@ -24,6 +24,10 @@ pub const WorkerState = struct {
     memory_limit_bytes: u64,
     metrics: ?worker_shared_page.WorkerWriterView,
     memory_events_fd: ?std.posix.fd_t,
+    /// The leaf's `memory.current`, which the engine reads as its footprint
+    /// from `setMemoryStatusOverride` on; `deinit` clears the override before
+    /// it closes the descriptor.
+    memory_current_fd: ?std.posix.fd_t,
     cgroup_dir: ?[]u8,
     lifecycle_state: worker_shared_page.State,
 
@@ -38,6 +42,7 @@ pub const WorkerState = struct {
             .memory_limit_bytes = memory_limit_bytes,
             .metrics = null,
             .memory_events_fd = null,
+            .memory_current_fd = null,
             .cgroup_dir = null,
             .lifecycle_state = .forked,
         };
@@ -48,6 +53,10 @@ pub const WorkerState = struct {
             metrics.deinit();
         if (self.memory_events_fd) |fd|
             std.posix.close(fd);
+        if (self.memory_current_fd) |fd| {
+            bindings.clearMemoryStatusOverride();
+            std.posix.close(fd);
+        }
         if (self.cgroup_dir) |path|
             self.allocator.free(path);
         self.* = undefined;
@@ -61,6 +70,11 @@ pub const Zygote = struct {
     warmup_corpus: bool,
     prepared_for_fork: bool,
     prepare_count: u32,
+    /// The zygote's main thread's thread-id word
+    /// (`collo_os.process.callingThreadIdWord`), read and checked by the
+    /// preparation; every clone hands it to the kernel, so each child's glibc
+    /// knows the child's own thread id. Null until the zygote is prepared.
+    thread_id_word: ?*std.os.linux.pid_t,
 
     pub fn init(trace_fd: ?std.posix.fd_t, options: ZygoteOptions) !Zygote {
         const exit_probe_path = if (options.postfork_exit_probe_path) |path|
@@ -76,6 +90,7 @@ pub const Zygote = struct {
             .warmup_corpus = options.warmup_corpus,
             .prepared_for_fork = false,
             .prepare_count = 0,
+            .thread_id_word = null,
         };
     }
 

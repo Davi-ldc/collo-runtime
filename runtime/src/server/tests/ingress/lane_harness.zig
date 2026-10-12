@@ -1,8 +1,8 @@
 //! A whole ingress lane driven from the test thread, for the suites that need
 //! the lane's own handlers: `worker_faults.zig`, `lane_commands.zig`,
 //! `lane_connections.zig`, `lane_ring.zig`, `request_deadlines.zig`,
-//! `completion_ring.zig`, `fs_fault.zig` and `egress_tokens.zig`. Not a
-//! suite of its own.
+//! `completion_ring.zig`, `fs_fault.zig`, `egress_tokens.zig` and
+//! `listener_accept.zig`. Not a suite of its own.
 //!
 //! Each lane is a `runner.LaneWorker` over `TestService`, which stands in for
 //! the ingress service: it holds the fixture supervisor and the lanes, posts
@@ -288,6 +288,10 @@ pub const TestService = struct {
                 .idle => {},
                 .handed_to => |again| next = again,
                 .retire => self.queueRetirement(handoff.worker),
+                .release_reader => |tenure| _ = try self.postToLane(tenure.lane, .{ .release_worker = .{
+                    .worker_key = handoff.worker.key(),
+                    .epoch = tenure.epoch,
+                } }),
             }
         }
     }
@@ -316,11 +320,20 @@ pub const TestService = struct {
     }
 
     /// Queues the retirement of `worker`, which a pool call answered
-    /// `.retire` for, to the reaper double.
+    /// `.retire` for, to the reaper double, with the reason its departure
+    /// names, as `Service.queueRetirement` does.
     pub fn queueRetirement(self: *TestService, worker: *WorkerRecord) void {
         const worker_pool = self.supervisor.poolFor(worker.definition_index);
-        const idle = if (worker_pool.inspect(worker)) |view| view.state == .retiring else false;
-        self.reaper.queueRetirement(worker, if (idle) .idle else .died);
+        const departure: pool.Departure = if (worker_pool.inspect(worker)) |view|
+            view.departure orelse .died
+        else
+            .died;
+        self.reaper.queueRetirement(worker, switch (departure) {
+            .idle => .idle,
+            .died => .died,
+            .egress => .egress_reattach,
+            .recycled => .recycled,
+        });
     }
 };
 
@@ -1120,7 +1133,7 @@ pub const StubWorker = struct {
         var server_page = try page.mapReadWrite(metrics_fd);
         var server_page_owned = true;
         errdefer if (server_page_owned) server_page.deinit();
-        server_page.initializeCrashDefault(@intCast(child_pid), 0, 0);
+        server_page.initializeCrashDefault();
         var worker_page = try page.mapReadWrite(metrics_fd);
         errdefer worker_page.deinit();
 
@@ -1140,22 +1153,17 @@ pub const StubWorker = struct {
         var worker_payload = try ingress_channel.mapSharedPayloadReadWrite(payload_fd, .worker);
         errdefer worker_payload.deinit();
 
-        var tmp_root_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const tmp_root = try uniqueTempPath(&tmp_root_buffer);
-        try std.fs.makeDirAbsolute(tmp_root);
-        errdefer std.fs.deleteTreeAbsolute(tmp_root) catch |err|
-            std.log.warn("lane harness left {s}: {s}", .{ tmp_root, @errorName(err) });
         var cgroup_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        // Inside the temp tree and never created, so the teardown's cgroup
-        // removal finds nothing and never reaches a real cgroup.
-        const cgroup_dir = try std.fmt.bufPrint(&cgroup_buffer, "{s}/cgroup", .{tmp_root});
+        // A fresh path under /tmp that is never created, so the teardown's
+        // cgroup removal finds nothing, never reaches a real cgroup and
+        // leaves nothing behind.
+        const cgroup_dir = try uniqueTempPath(&cgroup_buffer);
 
         const handle = try host.WorkerHandle.init(
             gpa,
             @intCast(child_pid),
             pidfd,
             control[0],
-            tmp_root,
             cgroup_dir,
             64 * 1024 * 1024,
             1,
@@ -1664,6 +1672,18 @@ pub const Client = struct {
         content_length: ?usize = null,
     };
 
+    /// A request head on `stream_id` made of exactly `fields`, pseudo-header
+    /// fields included, as a client the lane must refuse sends one. It ends
+    /// the stream unless a body follows.
+    pub fn requestFields(self: *Client, stream_id: u32, fields: []const hpack.Header, options: RequestOptions) !void {
+        var block = try self.encoder.encodeHeaders(self.harness.gpa, fields, 64 * 1024);
+        defer block.deinit(self.harness.gpa);
+        const end_headers: u8 = 0x4;
+        const end_stream: u8 = if (options.body_follows) 0 else 0x1;
+        try self.writeFrame(.headers, end_headers | end_stream, stream_id, block.bytes());
+        try self.trackStream(stream_id);
+    }
+
     /// A GET on `stream_id` that ends the stream.
     pub fn get(self: *Client, stream_id: u32) !void {
         try self.request(stream_id, "GET", default_path, .{});
@@ -1912,10 +1932,10 @@ fn reapChild(child_pid: std.posix.pid_t, kill_first: bool) void {
 
 var temp_path_sequence: std.atomic.Value(u64) = .init(0);
 
-/// A fresh path under /tmp for a stub worker's tmp root: the pid separates
-/// test processes, the sequence the workers of one process.
+/// A fresh path under /tmp for a stub worker's cgroup, never created: the
+/// pid separates test processes, the sequence the workers of one process.
 fn uniqueTempPath(buffer: []u8) ![]const u8 {
-    return std.fmt.bufPrint(buffer, "/tmp/collo-lane-harness-{d}-{d}", .{
+    return std.fmt.bufPrint(buffer, "/tmp/collo-lane-harness-cgroup-{d}-{d}", .{
         linux.getpid(),
         temp_path_sequence.fetchAdd(1, .monotonic),
     });

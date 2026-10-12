@@ -4,7 +4,8 @@
 //! gateway state, one real shared-memory endpoint and a socket pair. The test plays the worker on
 //! the endpoint, writing command packets into the command ring and reading what the gateway
 //! queues on the completion ring, and plays the server on its end of the socket pair, where the
-//! hello and `request_ended` arrive as a server sends them. Everything allocates from
+//! hello, attaches and `request_ended` arrive as a server sends them; the hello carries a policy
+//! image in a sealed memfd (`policy_image.zig`). Everything allocates from
 //! `std.testing.allocator`, so every case is also a leak check.
 //!
 //! The harness attaches its worker straight to the registry, not through an `attach_worker`
@@ -14,6 +15,9 @@ const std = @import("std");
 const gateway = @import("collo_egress_gateway");
 const ipc = @import("collo_ipc");
 const os = @import("collo_os");
+const network = @import("collo_egress_client").network;
+
+const policy_image = @import("policy_image.zig");
 
 const budgets = gateway.budgets;
 const control = gateway.control;
@@ -44,13 +48,22 @@ pub const security_cell_id: policy.SecurityCellId = @splat(7);
 pub const live_deadline_ns: u64 = std.math.maxInt(u64) / 2;
 /// A deadline every monotonic clock has passed, so a token minted with it has expired.
 pub const passed_deadline_ns: u64 = 1;
+/// The longest host `loopbackHost` writes.
+pub const loopback_host_bytes_max: usize = 16;
 /// The longest URL `loopbackUrl` writes.
 pub const loopback_url_bytes_max: usize = 32;
+/// The port of every URL `loopbackUrl` writes.
+pub const loopback_port: u16 = 9;
 /// The request every token names unless a test says otherwise.
 pub const request_id: u64 = 11;
 pub const request_generation: u64 = 3;
 /// The largest packet the loop sends the server, an attach ack; a removal report is shorter.
 const server_packet_bytes_max: usize = @sizeOf(control.Header) + @sizeOf(control.AttachAck);
+/// Collection passes `collectUntilRetired` runs before it fails. Each pass follows a wake, and
+/// every settled fetch wakes its engine at least once.
+const collection_rounds_max: usize = 64;
+/// How long one wait for an engine thread's wake lasts before the test fails.
+const wake_timeout_ms: i32 = 5_000;
 
 /// The gateway's loop state as `runtime/root.zig` declares it, with the same mixins.
 pub const Loop = struct {
@@ -61,13 +74,14 @@ pub const Loop = struct {
     limits: gateway.limit_tracker.Tracker = .{},
     router: gateway.router.Router = .{},
     completed_fetches: std.array_list.Aligned(gateway.active_fetch.WorkerScopedFetch, null) = .empty,
-    max_workers: usize = 4,
+    max_sessions: usize,
     policy: policy.Policy,
     hello: control_flow.HelloState = .{},
     scratch: []u8,
     decode_scratch: *ipc.GatewayEgressDecodeScratch = &loop_decode_scratch,
     pending_control_packets: control_flow.PendingControlPackets = .{},
     pending_uploads: upload_flow.PendingUploads = .{},
+    upload_memory: *gateway.counting_allocator.CountingAllocator,
     coalesce_completion_notifies: bool = false,
 
     const BodyReleaseFlow = body_release_flow.Methods(Loop);
@@ -89,8 +103,10 @@ pub const Loop = struct {
     pub const queuePacket = ShardFlow.queuePacket;
     pub const noteCompletionWrite = ShardFlow.noteCompletionWrite;
     pub const flushCompletionNotifies = ShardFlow.flushCompletionNotifies;
+    pub const collectShardReady = ShardFlow.collectShardReady;
 
     pub const registerPendingUpload = UploadFlow.registerPendingUpload;
+    pub const expirePendingUploads = UploadFlow.expirePendingUploads;
     pub const handleUploadChunkBatch = UploadFlow.handleUploadChunkBatch;
     pub const applyUploadChunk = UploadFlow.applyUploadChunk;
     pub const submitAssembledUpload = UploadFlow.submitAssembledUpload;
@@ -131,9 +147,12 @@ pub const Loop = struct {
 pub const Options = struct {
     /// The limits the loop admits under; only the suites that test a limit change it.
     policy: policy.Policy = .{},
-    /// The table of the hello the server sends at init, or null for a gateway that has not
-    /// received its hello.
-    hello_table: ?policy.PolicyTable = policy.PolicyTable.single(policy.public_https),
+    /// Whether the server sends the hello carrying `policy_image.standard` at init; false for a
+    /// gateway that has not received its hello.
+    hello: bool = true,
+    /// Sessions the loop holds at once (`sizing.Plan.sessions_max`); the harness's own session
+    /// takes one.
+    max_sessions: usize = 4,
     shard_count: usize = 1,
     /// Connector threads of each shard engine (`engine.Config.h2_connector_count`). With 0 an
     /// engine refuses every submission with `error.EgressEngineUnavailable` after its task took
@@ -148,7 +167,7 @@ pub const TokenOptions = struct {
     kind: egress_token.Kind = .request,
     /// The harness's own session when null.
     session_id: ?u64 = null,
-    policy_id: u16 = policy.public_https_id,
+    policy_id: network.PolicyId = policy_image.public_https_id,
     budget: u32 = 16,
     request_id: u64 = request_id,
     request_generation: u64 = request_generation,
@@ -166,15 +185,23 @@ pub const FetchOptions = struct {
     max_body_bytes: u64 = 0,
 };
 
-/// The URL of fetch `fetch_id`: a loopback origin, which the transport refuses whatever a policy
-/// entry allows, without a packet on the network. An admitted fetch to it stays in its engine's
-/// active table until a collection pass, which these suites never run, so its record can be read.
-/// Each fetch id below 62,500 gets an origin of its own, so no two fetches of a test share a
-/// connection attempt and the suites do not depend on how the transport groups them.
-pub fn loopbackUrl(buffer: *[loopback_url_bytes_max]u8, fetch_id: u64) []const u8 {
+/// The host of fetch `fetch_id`'s URL: a loopback address, which the transport refuses whatever a
+/// policy grants, without a packet on the network. Each fetch id below 62,500 gets an address of
+/// its own, so no two fetches of a test share a connection attempt and the suites do not depend
+/// on how the transport groups them.
+pub fn loopbackHost(buffer: *[loopback_host_bytes_max]u8, fetch_id: u64) []const u8 {
     const third = (fetch_id / 250) % 250;
     const fourth = fetch_id % 250 + 1;
-    return std.fmt.bufPrint(buffer, "https://127.0.{d}.{d}:9/", .{ third, fourth }) catch unreachable;
+    return std.fmt.bufPrint(buffer, "127.0.{d}.{d}", .{ third, fourth }) catch unreachable;
+}
+
+/// The URL of fetch `fetch_id`: `https://` `loopbackHost` on `loopback_port`. An admitted fetch
+/// to it stays in its engine's active table until a collection pass, which most of these suites
+/// never run, so its record can be read.
+pub fn loopbackUrl(buffer: *[loopback_url_bytes_max]u8, fetch_id: u64) []const u8 {
+    var host_buffer: [loopback_host_bytes_max]u8 = undefined;
+    const host = loopbackHost(&host_buffer, fetch_id);
+    return std.fmt.bufPrint(buffer, "https://{s}:{d}/", .{ host, loopback_port }) catch unreachable;
 }
 
 /// Owns the loop stand-in, the worker's view of the endpoint, whose other view the loop's
@@ -196,8 +223,10 @@ pub const Harness = struct {
             .loop = .{
                 .allocator = std.testing.allocator,
                 .control_fd = control_pair[0],
+                .max_sessions = options.max_sessions,
                 .policy = options.policy,
                 .scratch = undefined,
+                .upload_memory = undefined,
             },
             .worker_endpoint = undefined,
             .session_id = 0,
@@ -215,6 +244,11 @@ pub const Harness = struct {
         errdefer std.testing.allocator.free(self.encode_scratch);
         self.read_buffer = try std.testing.allocator.alloc(u8, ipc.max_message_bytes);
         errdefer std.testing.allocator.free(self.read_buffer);
+        // The gateway's upload allocator, budgeted as `runtime/root.zig` budgets it.
+        self.loop.upload_memory = try std.testing.allocator.create(gateway.counting_allocator.CountingAllocator);
+        errdefer std.testing.allocator.destroy(self.loop.upload_memory);
+        self.loop.upload_memory.* = .{ .child = std.testing.allocator };
+        self.loop.upload_memory.setBudget(gateway.supervisor_limits.upload_memory.budget_bytes);
 
         self.loop.shards = try gateway.shard_set.Set.init(
             std.testing.allocator,
@@ -225,8 +259,9 @@ pub const Harness = struct {
         errdefer self.loop.shards.deinit(std.testing.allocator);
 
         // The server sends the hello before any attach, right after the gateway reports ready.
-        if (options.hello_table) |table| {
-            try control.sendHello(self.server_fd, &hello_key, &table);
+        errdefer self.loop.hello.deinit(std.testing.allocator);
+        if (options.hello) {
+            try self.sendStandardHello();
             try std.testing.expect(!try self.loop.drainControl());
         }
 
@@ -257,12 +292,15 @@ pub const Harness = struct {
     pub fn deinit(self: *Harness) void {
         // `deinitPendingUploads` frees what a test left assembling. `shards.deinit` stops a
         // started engine, joins its threads and frees it the same way as one never started.
+        // Both free assembly buffers through the upload allocator, which goes last.
         self.loop.deinitPendingUploads();
         self.loop.shards.deinit(std.testing.allocator);
         self.loop.workers.deinit(std.testing.allocator);
         self.loop.limits.deinit(std.testing.allocator);
         self.loop.router.deinit(std.testing.allocator);
         self.loop.completed_fetches.deinit(std.testing.allocator);
+        self.loop.hello.deinit(std.testing.allocator);
+        std.testing.allocator.destroy(self.loop.upload_memory);
         self.worker_endpoint.deinit();
         std.posix.close(self.loop.control_fd);
         if (self.server_fd >= 0)
@@ -274,7 +312,7 @@ pub const Harness = struct {
     }
 
     /// Starts the shard engines, so an admitted fetch runs the real submit path. Only a test
-    /// that expects a fetch to reach an engine needs them.
+    /// that expects a fetch to reach an engine needs them. What the engines publish goes nowhere.
     pub fn startShards(self: *Harness) !void {
         try self.loop.shards.startAll(
             null,
@@ -283,6 +321,43 @@ pub const Harness = struct {
             unboundedPressureProbe,
             ignoringFaultReporter,
         );
+    }
+
+    /// Starts the shard engines with the loop's own publication of packets to workers, so the
+    /// packet a fetch ends with reaches the worker's completion ring once a collection pass runs
+    /// (`collectUntilRetired`). The engines hold a pointer to the loop, so the harness must not
+    /// move afterwards.
+    pub fn startShardsDelivering(self: *Harness) !void {
+        try self.loop.shards.startAll(
+            &self.loop,
+            deliveringPacketSender,
+            noopBodyChunkBatchSender,
+            unboundedPressureProbe,
+            ignoringFaultReporter,
+        );
+    }
+
+    /// Runs collection passes on the shard of fetch `fetch_id` as the gateway's loop does when
+    /// the shard's wake eventfd turns readable, until the fetch's route is gone, which the
+    /// collection pass that retires the fetch removes.
+    pub fn collectUntilRetired(self: *Harness, fetch_id: u64) !void {
+        const route = self.loop.router.routeForFetch(self.session_id, fetch_id) orelse
+            return error.MissingRoute;
+        const shard_index = route.record.shard_index;
+        const wake_fd = self.loop.shards.get(shard_index).engine.wake_fd;
+        for (0..collection_rounds_max) |_| {
+            if (self.loop.router.routeForFetch(self.session_id, fetch_id) == null)
+                return;
+            var pollfds = [_]std.posix.pollfd{.{
+                .fd = wake_fd,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            }};
+            if (try std.posix.poll(&pollfds, wake_timeout_ms) == 0)
+                return error.TestTimeout;
+            try self.loop.collectShardReady(shard_index);
+        }
+        return error.TestTimeout;
     }
 
     pub fn worker(self: *Harness) *sessions.Worker {
@@ -294,15 +369,10 @@ pub const Harness = struct {
         return &self.loop.hello.key;
     }
 
-    /// The hello's policy table, empty before it.
-    pub fn helloPolicies(self: *const Harness) *const policy.PolicyTable {
-        return &self.loop.hello.policies;
-    }
-
-    /// The pool isolation id the loop computed for entry `policy_id` of the hello's table.
-    pub fn isolationId(self: *const Harness, policy_id: u16) policy.PoolIsolationId {
-        std.debug.assert(policy_id < self.loop.hello.policies.count);
-        return self.loop.hello.isolation_ids[policy_id];
+    /// The pool isolation id the loop computed for policy `policy_id` of the hello's table.
+    pub fn isolationId(self: *const Harness, policy_id: network.PolicyId) policy.PoolIsolationId {
+        const granted = self.loop.hello.lookup(policy_id).?;
+        return granted.isolation_id;
     }
 
     pub fn tokenFields(self: *const Harness, options: TokenOptions) egress_token.Fields {
@@ -402,22 +472,81 @@ pub const Harness = struct {
         return self.worker_endpoint.upload_pool.writeChunk(bytes);
     }
 
+    /// Takes the next completion packet, which must fail fetch `fetch_id` with `message` and
+    /// the cause `failed`, as every refusal and failure the gateway itself decides does.
     pub fn expectQueuedFetchError(self: *Harness, fetch_id: u64, body_id: u64, message: []const u8) !void {
+        try self.expectQueuedFetchErrorWithCause(fetch_id, body_id, message, .failed);
+    }
+
+    pub fn expectQueuedFetchErrorWithCause(
+        self: *Harness,
+        fetch_id: u64,
+        body_id: u64,
+        message: []const u8,
+        cause: ipc.EgressFetchErrorCause,
+    ) !void {
         const packet = (try self.worker_endpoint.completion.readPacket(self.read_buffer)) orelse
             return error.MissingQueuedFetchError;
         const view = try ipc.decodeEgressFetchError(packet);
         try std.testing.expectEqual(fetch_id, view.fetch_id);
         try std.testing.expectEqual(body_id, view.body_id);
         try std.testing.expectEqualStrings(message, view.message);
+        try std.testing.expectEqual(cause, view.cause);
+    }
+
+    /// Takes the next completion packet, which must acknowledge the cancel or release of fetch
+    /// `fetch_id`.
+    pub fn expectQueuedAbortAck(self: *Harness, fetch_id: u64, body_id: u64) !void {
+        const packet = (try self.worker_endpoint.completion.readPacket(self.read_buffer)) orelse
+            return error.MissingQueuedAbortAck;
+        const ack = try ipc.decodeEgressAbortAck(packet);
+        try std.testing.expectEqual(fetch_id, ack.fetch_id);
+        try std.testing.expectEqual(body_id, ack.body_id);
     }
 
     pub fn expectNoMoreCompletionPackets(self: *Harness) !void {
         try std.testing.expect((try self.worker_endpoint.completion.readPacket(self.read_buffer)) == null);
     }
 
-    /// Sends the hello for `table` under `hello_key` as a server does, without draining it.
-    pub fn sendHello(self: *Harness, table: *const policy.PolicyTable) !void {
-        try control.sendHello(self.server_fd, &hello_key, table);
+    /// Sends a hello under `hello_key` whose image is the memfd `table_fd`, `table_bytes` long, as
+    /// a server does, without draining it.
+    pub fn sendHello(self: *Harness, table_fd: std.posix.fd_t, table_bytes: u32) !void {
+        try control.sendHello(self.server_fd, &hello_key, table_fd, table_bytes);
+    }
+
+    /// Sends the hello a server sends for `policy_image.standard`, without draining it.
+    pub fn sendStandardHello(self: *Harness) !void {
+        const image = try policy_image.standard(std.testing.allocator);
+        defer std.testing.allocator.free(image);
+        var memfd = try policy_image.memfdHolding(image, os.fd.memfd_readonly_seals);
+        defer memfd.deinit();
+        try self.sendHello(memfd.fd(), @intCast(image.len));
+    }
+
+    /// Sends the attach of the gateway's half `fds` of a session under `request_id`, as a server
+    /// does, and has the loop drain the control socket, which must keep the gateway running.
+    pub fn sendAttach(self: *Harness, request_id_value: u64, fds: ipc.egress_shared.RawFds) !void {
+        try control.sendAttachWorker(self.server_fd, request_id_value, security_cell_id, fds);
+        try std.testing.expect(!try self.loop.drainControl());
+    }
+
+    /// Takes the next packet the loop sent the server, which must be the ack of attach
+    /// `request_id_value` with `status`, and returns the session it names (0 for a refusal).
+    pub fn expectAttachAck(
+        self: *Harness,
+        request_id_value: u64,
+        status: control.AttachAckStatus,
+    ) !u64 {
+        var scratch: [server_packet_bytes_max]u8 = undefined;
+        var packet = try ipc.recvPacketWithFdsScratch(std.testing.allocator, self.server_fd, &scratch);
+        defer packet.deinit();
+        const ack = switch (try control.decodeGatewayToServerPacket(&packet)) {
+            .attach_ack => |ack| ack,
+            .session_removed => return error.TestUnexpectedControlPacket,
+        };
+        try std.testing.expectEqual(@intFromEnum(status), ack.status);
+        try std.testing.expectEqual(request_id_value, ack.request_id);
+        return ack.worker_session_id;
     }
 
     /// Sends `entries` as one `request_ended` packet, as a lane flushes its batch, and has the
@@ -505,15 +634,26 @@ pub const Harness = struct {
         return shard.engine.active.find(self.session_id, fetch_id, body_id);
     }
 
-    /// The submit options admission gives a fetch under a live request token of this session,
-    /// for the upload tests that register a pending upload directly.
+    /// The assembly state of fetch `fetch_id` of the harness's session, or null when none
+    /// assembles.
+    pub fn pendingUpload(self: *Harness, fetch_id: u64) ?*upload_flow.PendingUpload {
+        return self.loop.pending_uploads.get(.{
+            .worker_session_id = self.session_id,
+            .fetch_id = fetch_id,
+        });
+    }
+
+    /// The submit options admission gives a fetch under a live request token of this session
+    /// that names `policy_image.public_https_id`, for the upload tests that register a pending
+    /// upload directly.
     pub fn uploadSubmitOptions(self: *Harness, deadline_monotonic_ns: u64) gateway.engine.SubmitOptions {
+        const granted = self.loop.hello.lookup(policy_image.public_https_id).?;
         return .{
             .isolation = .{
                 .security_cell_id = security_cell_id,
-                .policy_id = self.isolationId(policy.public_https_id),
+                .policy_id = granted.isolation_id,
             },
-            .network = policy.public_https,
+            .network = granted.policy,
             .budget_key = .{
                 .session_id = self.session_id,
                 .request_id = request_id,
@@ -527,10 +667,10 @@ pub const Harness = struct {
 pub const Strike = enum { strike, no_strike };
 
 /// A fetch start whose body comes through the upload pool (the body-pooled flag set, no inline
-/// bytes), for the upload tests that call `registerPendingUpload` and `applyUploadChunk` directly
-/// instead of through the wire codec, so they also reach checks the codec makes unreachable, such
-/// as an announced length of zero. Admission has verified the token by then, so the view carries
-/// none.
+/// bytes), for the upload tests that call `engine.validateStart`, `registerPendingUpload` and
+/// `applyUploadChunk` directly instead of through the wire codec, so they also reach checks the
+/// codec makes unreachable, such as an announced length of zero. Admission has verified the token
+/// by then, so the view carries none.
 pub fn pooledFetchView(fetch_id: u64, body_id: u64, pooled_body_len: u64) ipc.EgressFetchStartView {
     return .{
         .fetch_id = fetch_id,
@@ -557,6 +697,13 @@ fn noopPacketSender(ctx: ?*anyopaque, worker_session_id: u64, bytes: []const u8)
     _ = ctx;
     _ = worker_session_id;
     _ = bytes;
+}
+
+/// The gateway's packet sink (`queuePacketCallback` in `runtime/root.zig`) over the loop
+/// stand-in.
+fn deliveringPacketSender(ctx: ?*anyopaque, worker_session_id: u64, bytes: []const u8) anyerror!void {
+    const loop: *Loop = @ptrCast(@alignCast(ctx.?));
+    try loop.queuePacket(worker_session_id, bytes);
 }
 
 fn noopBodyChunkBatchSender(
@@ -595,7 +742,9 @@ pub fn createSession() !ipc.egress_shared.SessionFds {
     return ipc.egress_shared.createSessionForWorker(&wake_set);
 }
 
-fn dupEgressRawFds(fds: ipc.egress_shared.RawFds) !ipc.egress_shared.RawFds {
+/// Duplicates every descriptor of `fds`, so a mapping that takes the copies leaves `fds` open
+/// for the session's other side.
+pub fn dupEgressRawFds(fds: ipc.egress_shared.RawFds) !ipc.egress_shared.RawFds {
     var out = ipc.egress_shared.RawFds{};
     errdefer out.close();
     out.command_control_fd = try std.posix.dup(fds.command_control_fd);

@@ -16,6 +16,9 @@ const linux = std.os.linux;
 const restricted_uring = @import("collo_common_io").restricted_uring;
 const tags = @import("collo_io_uring_tags");
 
+const shard_mod = @import("shard.zig");
+const sizing = @import("sizing.zig");
+
 pub const wait_tick_ns: u64 = 100 * std.time.ns_per_ms;
 pub const wait_ready_max: usize = 64;
 
@@ -142,9 +145,9 @@ pub const Backend = struct {
     timeout_storage: linux.kernel_timespec = timespecFromNs(wait_tick_ns),
     timeout_queued: bool = false,
 
-    pub fn init(allocator: std.mem.Allocator, shard_count: usize, max_workers: usize) !Backend {
+    pub fn init(allocator: std.mem.Allocator, shard_count: usize, max_sessions: usize) !Backend {
         var ring = try initRestrictedGatewayReadinessRing(
-            recommendedEntryCount(shard_count, max_workers),
+            recommendedEntryCount(shard_count, max_sessions),
         );
         errdefer ring.deinit();
         const shard_armed = try allocator.alloc(bool, shard_count);
@@ -346,12 +349,18 @@ pub const Backend = struct {
         try self.ops.put(self.allocator, id, .{ .target = target });
         errdefer _ = self.ops.remove(id);
         const user_data = try (UserData{ .kind = .poll, .op_id = id }).pack();
-        _ = try self.ring.poll_add(
-            user_data,
-            fd,
-            pollMask(events | std.posix.POLL.HUP | std.posix.POLL.ERR),
-        );
-        return id;
+        const mask = pollMask(events | std.posix.POLL.HUP | std.posix.POLL.ERR);
+        while (true) {
+            _ = self.ring.poll_add(user_data, fd, mask) catch |err| switch (err) {
+                // The kernel takes what the queue holds, which frees every entry.
+                error.SubmissionQueueFull => {
+                    _ = try self.ring.submit();
+                    continue;
+                },
+                else => return err,
+            };
+            return id;
+        }
     }
 
     fn decodeReady(self: *Backend, cqe: linux.io_uring_cqe) !?Ready {
@@ -470,8 +479,12 @@ fn decodeCancel(op_id: u64, res: i32) !void {
     return error.EgressGatewayReadinessCancelFailed;
 }
 
-fn initRestrictedGatewayReadinessRing(entries: u13) !linux.IoUring {
-    var ring = try linux.IoUring.init(entries, linux.IORING_SETUP_R_DISABLED);
+fn initRestrictedGatewayReadinessRing(entries: u16) !linux.IoUring {
+    var params = std.mem.zeroInit(linux.io_uring_params, .{
+        .flags = linux.IORING_SETUP_R_DISABLED,
+        .sq_thread_idle = 1000,
+    });
+    var ring = try restricted_uring.initRingParams(entries, &params);
     errdefer ring.deinit();
     var restrictions = gatewayReadinessRestrictions();
     // The set needs no SQE_FLAGS_ALLOWED entry: once restrictions are registered, the kernel
@@ -492,16 +505,30 @@ pub fn gatewayReadinessRestrictions() [gateway_readiness_restriction_count]restr
     };
 }
 
+/// Most submission entries a ring may have (`IORING_MAX_ENTRIES` in the kernel's io_uring
+/// setup), a power of two.
+pub const ring_entries_max: u16 = 32768;
+
 /// Submission entries for a pass that arms everything at once: the control poll, one poll per
-/// shard, two per worker and the tick timeout, plus headroom for removals; at least 256 and
-/// rounded up to a power of two (`ceilPowerOfTwo`).
-pub fn recommendedEntryCount(shard_count: usize, max_workers: usize) u13 {
+/// shard, two per session and the tick timeout, plus headroom for removals; at least 256, a
+/// power of two, and at most `ring_entries_max`. A pass that still finds the queue full submits
+/// what it holds and goes on (`Backend.poll`), so the count sizes the usual pass, and the
+/// completion queue, twice as large, holds a completion from every armed poll at once.
+pub fn recommendedEntryCount(shard_count: usize, max_sessions: usize) u16 {
     const minimum: usize = 256;
+    const target = @max(minimum, requiredEntryCount(shard_count, max_sessions));
+    return @intCast(std.math.ceilPowerOfTwoAssert(usize, @min(target, ring_entries_max)));
+}
+
+fn requiredEntryCount(shard_count: usize, max_sessions: usize) usize {
     const headroom: usize = 32;
-    const required = 1 + shard_count + max_workers * 2 + 1 + headroom;
-    const target = @max(minimum, required);
-    const max_entries: usize = std.math.maxInt(u13);
-    return @intCast(ceilPowerOfTwo(@min(target, max_entries)));
+    return 1 + shard_count + max_sessions * 2 + 1 + headroom;
+}
+
+comptime {
+    // The plan's largest gateway arms every poll of a pass without waiting on the kernel.
+    std.debug.assert(requiredEntryCount(shard_mod.default_max_shards, sizing.sessions_max) <= ring_entries_max);
+    std.debug.assert(std.math.isPowerOfTwo(ring_entries_max));
 }
 
 fn pollMask(events: i16) u32 {
@@ -531,21 +558,6 @@ fn errnoFromResult(res: i32) ?linux.E {
         return null;
     const errno_code: u16 = @intCast(-res);
     return @enumFromInt(errno_code);
-}
-
-/// FIXME: above 4096 this returns `maxInt(u13)`, which is not a power of two, so
-/// `IoUring.init` would fail with `error.EntriesNotPowerOfTwo`. With `sizing.workers_max`
-/// workers and `shard.default_max_shards` shards the count stays far below that.
-fn ceilPowerOfTwo(value: usize) usize {
-    if (value <= 1)
-        return 1;
-    var result: usize = 1;
-    while (result < value) {
-        if (result > std.math.maxInt(u13) / 2)
-            return std.math.maxInt(u13);
-        result *= 2;
-    }
-    return result;
 }
 
 fn timespecFromNs(ns: u64) linux.kernel_timespec {

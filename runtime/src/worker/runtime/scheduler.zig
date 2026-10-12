@@ -1,18 +1,19 @@
 //! The scheduler domain of the worker runtime. `Scheduler` is its state: the
 //! ready queue and its backlog, the request-deadline heap, timers and
 //! immediates with their ready maps, the loop's wakeup eventfd, the
-//! restricted worker ring, and the bookkeeping of the turn running now.
-//! `Methods` holds the runtime's operations on that state, which `Runtime`
-//! declares as its own (`root.zig`): queueing ready work, timers and
-//! immediates, request deadlines and the sentinel's view of them, the worker
-//! ring, and waking and draining the loop. It belongs to the worker's VM
-//! thread; other threads only write the wakeup eventfd (`wakeup_fd`). The
+//! restricted worker ring, and the bookkeeping of the timer callback running
+//! now. `Methods` holds the runtime's operations on that state, which
+//! `Runtime` declares as its own (`root.zig`): queueing ready work, timers
+//! and immediates, request deadlines, the worker ring, and waking and
+//! draining the loop. It belongs to the worker's
+//! VM thread; other threads only write the wakeup eventfd (`wakeup_fd`). The
 //! policy over the state lives in `scheduler/resources.zig` and
-//! `scheduler/loop.zig`. Every capacity comes from `RuntimeLimits` and is
-//! reserved in `init`.
+//! `scheduler/loop.zig`. Every capacity comes from `RuntimeLimits` and the
+//! route limit, and is reserved in `init`.
 
 const std = @import("std");
 const bindings = @import("collo_bindings");
+const server_limits = @import("collo_limits").server;
 const restricted_uring = @import("collo_common_io").restricted_uring;
 const js_value = @import("collo_worker_js").value;
 const request_context = @import("collo_worker_request").context;
@@ -40,21 +41,6 @@ pub const Scheduler = struct {
     worker_ring: ?restricted_uring.WorkerRing,
     worker_timer_fd: ?std.posix.fd_t,
     metrics: runtime_types.WorkerSchedulerMetrics,
-    /// The request whose completed record counts the running turn's duration
-    /// and queue wait, or 0. Timer, immediate and fault turns count toward no
-    /// request (`beginTurnTelemetry` in `scheduler/loop.zig`).
-    /// `finishRequest` reads it to fold a still-running final turn into the
-    /// record.
-    executing_turn_request_id: u64,
-    /// The owner of the running turn's work item, resolved at enqueue, or 0.
-    /// It differs from `executing_turn_request_id` for timer and immediate
-    /// turns, which count toward no request's record yet still run their
-    /// request in its I/O and waiting timeline.
-    executing_turn_real_owner: u64,
-    /// Monotonic start of the running turn, or 0 outside a turn.
-    turn_started_mono_ns: u64,
-    /// Ready-queue wait of the item that started the current turn.
-    turn_queued_wait_ns: u64,
     next_timer_id: u64,
     executing_timer_id: ?u64,
     executing_timer_request_id: u64,
@@ -75,9 +61,11 @@ pub const Scheduler = struct {
         var ready_backlog = try ready_queue_mod.ReadyQueue.init(allocator, limits.ready_queue_capacity);
         errdefer ready_backlog.deinit();
 
+        // Armed deadlines belong to live requests, at most one task each, and
+        // to evaluations, at most one per route of the definition.
         var request_deadlines = try deadlines_mod.DeadlineHeap.initCapacity(
             allocator,
-            limits.request_task_capacity,
+            limits.request_task_capacity + server_limits.routes_per_definition_max,
         );
         errdefer request_deadlines.deinit();
 
@@ -115,10 +103,6 @@ pub const Scheduler = struct {
             .worker_ring = null,
             .worker_timer_fd = null,
             .metrics = .{},
-            .executing_turn_request_id = 0,
-            .executing_turn_real_owner = 0,
-            .turn_started_mono_ns = 0,
-            .turn_queued_wait_ns = 0,
             .next_timer_id = 1,
             .executing_timer_id = null,
             .executing_timer_request_id = 0,
@@ -204,29 +188,6 @@ pub fn Methods(comptime Runtime: type) type {
             scheduler_resources.disarmRequestDeadline(self, request);
         }
 
-        pub fn requestDeadlineTerminationRequested(self: *Runtime, request: *const request_context.RequestContext) bool {
-            return scheduler_resources.requestDeadlineTerminationRequested(self, request);
-        }
-
-        /// True only when the sentinel requested termination for this request's
-        /// armed deadline, which leaves the VM unable to run JavaScript for good.
-        /// It is not the clock-expiry half of
-        /// `requestDeadlineTerminationRequested`: a 504 answered without a fire
-        /// leaves the VM healthy and the worker in service. Read it before the
-        /// disarm, which removes the entry and the bit with it.
-        pub fn requestDeadlineSentinelFired(self: *Runtime, request: *const request_context.RequestContext) bool {
-            if (!request.deadline_armed)
-                return false;
-            return self.observability.sentinel.terminationWasRequested(request.exec.request_id, request.deadline_generation);
-        }
-
-        fn releaseOwnedJsValues(allocator: std.mem.Allocator, args: ?[]js_value.JsValueOwned) void {
-            const owned_args = args orelse return;
-            for (owned_args) |*arg|
-                arg.deinit();
-            allocator.free(owned_args);
-        }
-
         pub fn scheduleTimer(
             self: *Runtime,
             request_id: u64,
@@ -236,16 +197,6 @@ pub fn Methods(comptime Runtime: type) type {
             delay_ms: u32,
             repeats: bool,
         ) !u64 {
-            if (self.bootIdentityClosed(request_id)) {
-                var owned_callback = callback;
-                owned_callback.deinit();
-                if (receiver) |owned_receiver| {
-                    var owned = owned_receiver;
-                    owned.deinit();
-                }
-                releaseOwnedJsValues(self.core.allocator, args);
-                return error.TimerOutsideActiveRequest;
-            }
             return scheduler_resources.scheduleTimer(self, request_id, callback, receiver, args, delay_ms, repeats);
         }
 
@@ -256,21 +207,13 @@ pub fn Methods(comptime Runtime: type) type {
             this_arg: ?js_value.JsValueOwned,
             args: ?[]js_value.JsValueOwned,
         ) !u64 {
-            if (self.bootIdentityClosed(request_id)) {
-                var owned_callback = callback;
-                owned_callback.deinit();
-                if (this_arg) |owned_this| {
-                    var owned = owned_this;
-                    owned.deinit();
-                }
-                releaseOwnedJsValues(self.core.allocator, args);
-                return error.TimerOutsideActiveRequest;
-            }
             return scheduler_resources.scheduleImmediate(self, request_id, callback, this_arg, args);
         }
 
-        /// The request a ready item belongs to, for the timeline and the turn
-        /// telemetry. It is resolved at enqueue, because the maps it reads may
+        /// The owner of a ready item: the request or evaluation whose work it
+        /// is, which runs it in its window (`executeWorkItem` in
+        /// `scheduler/loop.zig`) and, for a request, counts it in its
+        /// timeline. It is resolved at enqueue, because the maps it reads may
         /// lose the entry before the pop: an executed handler and a cancel both
         /// remove entries while the item still sits in the queue. An fs fault
         /// item spans several requests and has no single owner.
@@ -280,6 +223,7 @@ pub fn Methods(comptime Runtime: type) type {
                 .request_body_ready,
                 .request_cancelled,
                 .request_deadline,
+                .response_body_stream,
                 => |request_id| request_id,
                 .request_completion => |token| if (self.requests.tasks.get(token)) |task|
                     task.request_id
@@ -341,11 +285,28 @@ pub fn Methods(comptime Runtime: type) type {
             return false;
         }
 
+        /// Only a dispatched request keeps a timeline, so an evaluation's items
+        /// count nothing.
         fn noteOwnerReady(self: *Runtime, meta: ready_queue_mod.SlotMeta) void {
-            if (meta.owner_request_id == 0 or meta.owner_request_id == request_context.boot_request_id)
+            if (meta.owner_request_id == 0 or request_context.isReservedId(meta.owner_request_id))
                 return;
             const ctx = self.requests.active.get(meta.owner_request_id) orelse return;
             ctx.noteReady(meta.ready_since_mono_ns, meta.enqueued_mono_ns, true);
+        }
+
+        /// Gives back the ready count of `item`, queued for work that has
+        /// vanished, as a cleared timer's: the queue or its backlog stops
+        /// charging the item to its owner (`ReadyQueue.withdraw`), and a
+        /// dispatched request that owned it closes its runnable time now
+        /// (`RequestContext.noteReadyWithdrawn`). The item still pops, and
+        /// finds nothing to run.
+        pub fn withdrawReadyWork(self: *Runtime, item: ready_queue_mod.WorkItem) void {
+            const owner_id = self.scheduler.ready_queue.withdraw(item) orelse
+                self.scheduler.ready_backlog.withdraw(item) orelse return;
+            if (request_context.isReservedId(owner_id))
+                return;
+            const ctx = self.requests.active.get(owner_id) orelse return;
+            ctx.noteReadyWithdrawn(self.core.clock.now());
         }
 
         pub fn drainReadyBacklog(self: *Runtime) void {
@@ -354,7 +315,7 @@ pub fn Methods(comptime Runtime: type) type {
 
         fn markReadyRescanNeeded(self: *Runtime, item: ready_queue_mod.WorkItem) void {
             switch (item) {
-                .request, .request_body_ready, .request_cancelled => {
+                .request, .request_body_ready, .request_cancelled, .response_body_stream => {
                     self.scheduler.ingress_rescan_needed = true;
                 },
                 .request_completion => {

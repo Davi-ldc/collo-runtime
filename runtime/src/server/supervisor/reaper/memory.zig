@@ -1,13 +1,18 @@
 //! The reaper's readings of memory and its victim score: node memory
-//! pressure from the server's cgroup or `/proc/meminfo`, what a failed
-//! reading stands on, the PSI trigger that wakes the reaper, a worker's
-//! reclaimable memory from `smaps_rollup` or its cgroup, and the score that
-//! weighs those bytes by idle age. Pure functions, file reads and the reaper
-//! thread's own reading state, with no supervisor state; the reaper thread
-//! (`root.zig`) and its passes (`reaping.zig`) call them.
+//! pressure from every bound above the runtime, what a failed reading stands
+//! on, the PSI trigger that wakes the reaper, a worker's reclaimable memory
+//! from `smaps_rollup` or its cgroup, and the score that weighs those bytes
+//! by idle age. Pure functions, file reads and the reaper thread's own
+//! reading state, with no supervisor state; the reaper thread (`root.zig`)
+//! and its passes (`reaping.zig`) call them.
 //!
-//! The pressure levels are percentages of the memory `readMemoryPressure`
-//! reads, defined in `scheduler_limits.zig` with the reasons for each.
+//! Node memory is a question of which limit bounds the runtime, and the boot
+//! answers it once (`MemoryDomains`): the machine, and every cgroup above the
+//! workers and above the server, each of which may carry a `memory.max` an
+//! operator or a container runtime set. A reading takes, for each bound, the
+//! share of it in use, and reports the highest, since the bound nearest to
+//! being hit is the one that decides. The pressure levels are percentages of
+//! that share, defined in `scheduler_limits.zig` with the reasons for each.
 
 const std = @import("std");
 
@@ -154,6 +159,17 @@ pub fn readWorkerMemoryCurrent(allocator: std.mem.Allocator, cgroup_dir: []const
     return readUnsignedFile(allocator, path);
 }
 
+/// The highest `memory.current` the worker's cgroup reached since its
+/// creation, or null on a kernel without `memory.peak` (before Linux 5.19).
+pub fn readWorkerMemoryPeak(allocator: std.mem.Allocator, cgroup_dir: []const u8) !?u64 {
+    const path = try std.fmt.allocPrint(allocator, "{s}/memory.peak", .{cgroup_dir});
+    defer allocator.free(path);
+    return readUnsignedFile(allocator, path) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => |other| return other,
+    };
+}
+
 /// The worker's private resident bytes from `/proc/<pid>/smaps_rollup`: the
 /// pages only this worker maps, so the copy-on-write pages it still shares
 /// with the zygote do not count.
@@ -188,38 +204,146 @@ pub fn parseSmapsRollupPrivateRssBytes(bytes: []const u8) !u64 {
     return std.math.mul(u64, private_kb, 1024);
 }
 
-/// Node memory pressure: the `memory.current` of the cgroup `/proc/self/cgroup`
-/// names against its `memory.max`, or `MemTotal` less `MemAvailable` from
-/// `/proc/meminfo` when that cgroup has no limit or cannot be read.
-pub fn readMemoryPressure(allocator: std.mem.Allocator) !MemoryPressure {
-    // In the delegated placement the server's cgroup is `<own>/main`, which
-    // the server creates and never limits (`prepareDelegatedSubtree` in
-    // `host/cgroup_root.zig`), so the reading is the machine's. In the
-    // env-root placement it is the cgroup the server started in. Either way
-    // the cgroup holds the server, the zygote and the gateway, never a worker.
-    if (readCgroupMemoryPressure(allocator)) |pressure| {
-        return pressure;
-    } else |_| {}
-    return readMeminfoMemoryPressure(allocator);
+/// The cgroup directories a node reading watches at most.
+pub const domains_max: usize = limits.memory.cgroup_ancestors_max;
+
+/// Where the cgroup v2 hierarchy is mounted; the walk up from a cgroup stops
+/// at it, since the root cgroup carries no `memory.max`.
+pub const cgroup_mount_root = "/sys/fs/cgroup";
+
+/// The bounds node memory is read against, resolved once at boot from the
+/// cgroups that hold the workers and the server (`init`): every ancestor of
+/// each, itself included, up to `mount_root`, each once, kept open as a
+/// directory, the nearest first, and the machine's own reading. A directory
+/// that cannot be opened, or a cgroup past `domains_max`, is left out with a
+/// warning; a bound the walk misses only makes the reading less strict,
+/// never wrong about the bounds it holds. Only the thread that runs the
+/// reaper's passes reads it.
+pub const MemoryDomains = struct {
+    dirs: [domains_max]std.posix.fd_t = undefined,
+    len: usize = 0,
+    /// The machine's reading, `/proc/meminfo` outside tests.
+    meminfo_path: []const u8,
+    /// The domains whose failed read was warned about, so a domain warns
+    /// once per boot; the machine's is the last bit.
+    warned: std.StaticBitSet(domains_max + 1) = .initEmpty(),
+
+    pub const Options = struct {
+        /// The cgroups whose limits bound the runtime, as absolute paths.
+        cgroup_paths: []const []const u8,
+        mount_root: []const u8 = cgroup_mount_root,
+        meminfo_path: []const u8 = "/proc/meminfo",
+    };
+
+    /// Opens the directories `options` names. Never fails: what cannot be
+    /// opened is left out, with a warning.
+    pub fn init(target: *MemoryDomains, options: Options) void {
+        target.* = .{ .meminfo_path = options.meminfo_path };
+        var opened: [domains_max][]const u8 = undefined;
+        for (options.cgroup_paths) |cgroup_path| {
+            var current: []const u8 = cgroup_path;
+            // Each step drops one path component, so the walk ends.
+            while (isWithin(options.mount_root, current) and current.len > options.mount_root.len) {
+                defer current = std.fs.path.dirname(current) orelse options.mount_root;
+                const seen = for (opened[0..target.len]) |path| {
+                    if (std.mem.eql(u8, path, current)) break true;
+                } else false;
+                if (seen) continue;
+                if (target.len == domains_max) {
+                    std.log.warn("node memory: more than {d} cgroups above the runtime; {s} and its ancestors are not read", .{ domains_max, current });
+                    break;
+                }
+                const fd = std.posix.open(current, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0) catch |err| {
+                    std.log.warn("node memory: cannot open {s}, whose limit is then not read: {s}", .{ current, @errorName(err) });
+                    continue;
+                };
+                target.dirs[target.len] = fd;
+                opened[target.len] = current;
+                target.len += 1;
+            }
+        }
+    }
+
+    pub fn deinit(self: *MemoryDomains) void {
+        for (self.dirs[0..self.len]) |fd|
+            std.posix.close(fd);
+        self.* = undefined;
+    }
+
+    /// The share of its limit each domain uses, the highest of them, or
+    /// `error.NoMemoryDomainReadable` when not one could be read. A cgroup
+    /// without a limit is no bound and is not read further.
+    fn highestUsedPercent(self: *MemoryDomains, allocator: std.mem.Allocator) !u8 {
+        var highest: ?u8 = null;
+        for (self.dirs[0..self.len], 0..) |dir, index| {
+            const percent = cgroupUsedPercent(dir) catch |err| {
+                self.warnOnce(index, err);
+                continue;
+            } orelse continue;
+            highest = @max(highest orelse 0, percent);
+        }
+        if (meminfoUsedPercent(allocator, self.meminfo_path)) |percent| {
+            highest = @max(highest orelse 0, percent);
+        } else |err| {
+            self.warnOnce(domains_max, err);
+        }
+        return highest orelse error.NoMemoryDomainReadable;
+    }
+
+    fn warnOnce(self: *MemoryDomains, index: usize, err: anyerror) void {
+        if (self.warned.isSet(index))
+            return;
+        self.warned.set(index);
+        if (index == domains_max) {
+            std.log.warn("node memory: {s} cannot be read: {s}; the reading leaves it out", .{ self.meminfo_path, @errorName(err) });
+        } else {
+            std.log.warn("node memory: the limit of a cgroup above the runtime cannot be read: {s}; the reading leaves it out", .{@errorName(err)});
+        }
+    }
+};
+
+/// Node memory pressure: the highest share in use of any bound `domains`
+/// holds (`MemoryDomains`). Fails only when no bound could be read, which the
+/// caller's `LastReading` answers.
+pub fn readMemoryPressure(allocator: std.mem.Allocator, domains: *MemoryDomains) !MemoryPressure {
+    return memoryPressureFromUsedPercent(try domains.highestUsedPercent(allocator));
 }
 
-fn readCgroupMemoryPressure(allocator: std.mem.Allocator) !MemoryPressure {
-    const dir = try currentCgroupMemoryDir(allocator);
-    defer allocator.free(dir);
-    const current_path = try std.fmt.allocPrint(allocator, "{s}/memory.current", .{dir});
-    defer allocator.free(current_path);
-    const max_path = try std.fmt.allocPrint(allocator, "{s}/memory.max", .{dir});
-    defer allocator.free(max_path);
-
-    const current = try readUnsignedFile(allocator, current_path);
-    const max = (try readOptionalUnsignedFile(allocator, max_path)) orelse return error.UnboundedCgroupMemory;
+/// The share of its `memory.max` the cgroup in `dir` uses, or null when it
+/// has no limit: `max`, or no file, as at the root of a hierarchy.
+fn cgroupUsedPercent(dir: std.posix.fd_t) !?u8 {
+    const max = (readUnsignedAt(dir, "memory.max") catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => |other| return other,
+    }) orelse return null;
     if (max == 0)
         return error.InvalidCgroupMemoryLimit;
-    return memoryPressureFromUsedPercent(usedPercent(current, max));
+    const current = (try readUnsignedAt(dir, "memory.current")) orelse return error.InvalidCgroupMemoryCurrent;
+    return usedPercent(current, max);
 }
 
-fn readMeminfoMemoryPressure(allocator: std.mem.Allocator) !MemoryPressure {
-    const bytes = try readSmallFileAbsolute(allocator, "/proc/meminfo", 16 * 1024);
+/// A cgroup file of one unsigned number, or null for `max`.
+fn readUnsignedAt(dir: std.posix.fd_t, name: [:0]const u8) !?u64 {
+    const fd = try std.posix.openatZ(dir, name, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    defer std.posix.close(fd);
+    var buffer: [64]u8 = undefined;
+    const length = try std.posix.read(fd, &buffer);
+    const trimmed = std.mem.trim(u8, buffer[0..length], " \t\r\n");
+    if (std.mem.eql(u8, trimmed, "max"))
+        return null;
+    return try std.fmt.parseInt(u64, trimmed, 10);
+}
+
+/// True when `path` is `ancestor` or lies below it.
+fn isWithin(ancestor: []const u8, path: []const u8) bool {
+    if (!std.mem.startsWith(u8, path, ancestor))
+        return false;
+    return path.len == ancestor.len or path[ancestor.len] == '/';
+}
+
+/// The machine's share of memory in use, `MemTotal` less `MemAvailable`.
+fn meminfoUsedPercent(allocator: std.mem.Allocator, meminfo_path: []const u8) !u8 {
+    const bytes = try readSmallFileAbsolute(allocator, meminfo_path, 16 * 1024);
     defer allocator.free(bytes);
 
     var total_kb: ?u64 = null;
@@ -238,10 +362,12 @@ fn readMeminfoMemoryPressure(allocator: std.mem.Allocator) !MemoryPressure {
     if (total == 0)
         return error.InvalidMeminfoTotal;
     const used = if (available >= total) 0 else total - available;
-    return memoryPressureFromUsedPercent(usedPercent(used, total));
+    return usedPercent(used, total);
 }
 
-fn currentCgroupMemoryDir(allocator: std.mem.Allocator) ![]u8 {
+/// The server's own cgroup, from `/proc/self/cgroup`, as an absolute path
+/// under `cgroup_mount_root`; the caller frees it.
+pub fn currentCgroupDir(allocator: std.mem.Allocator) ![]u8 {
     const bytes = try readSmallFileAbsolute(allocator, "/proc/self/cgroup", 16 * 1024);
     defer allocator.free(bytes);
 
@@ -251,8 +377,8 @@ fn currentCgroupMemoryDir(allocator: std.mem.Allocator) ![]u8 {
             continue;
         const relative = line["0::".len..];
         if (relative.len == 0 or std.mem.eql(u8, relative, "/"))
-            return allocator.dupe(u8, "/sys/fs/cgroup");
-        return std.fmt.allocPrint(allocator, "/sys/fs/cgroup{s}", .{relative});
+            return allocator.dupe(u8, cgroup_mount_root);
+        return std.fmt.allocPrint(allocator, cgroup_mount_root ++ "{s}", .{relative});
     }
     return error.CgroupV2PathNotFound;
 }
@@ -283,15 +409,6 @@ fn readUnsignedFile(allocator: std.mem.Allocator, path: []const u8) !u64 {
     defer allocator.free(bytes);
     const trimmed = std.mem.trim(u8, bytes, " \t\r\n");
     return std.fmt.parseInt(u64, trimmed, 10);
-}
-
-fn readOptionalUnsignedFile(allocator: std.mem.Allocator, path: []const u8) !?u64 {
-    const bytes = try readSmallFileAbsolute(allocator, path, 128);
-    defer allocator.free(bytes);
-    const trimmed = std.mem.trim(u8, bytes, " \t\r\n");
-    if (std.mem.eql(u8, trimmed, "max"))
-        return null;
-    return try std.fmt.parseInt(u64, trimmed, 10);
 }
 
 fn readSmallFileAbsolute(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {

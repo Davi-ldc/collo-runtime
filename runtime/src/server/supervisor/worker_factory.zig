@@ -5,6 +5,13 @@
 //! The claim is `Supervisor.claimLaunch`, and the record a ready worker is
 //! built into is `worker_registry.buildRecord`.
 //!
+//! A definition gets egress only when some route of it has a `network` grant
+//! (`server/routes/network.zig`). A worker of any other definition gets no
+//! wake set, no session and no boot token, so it holds no egress path at all,
+//! no gateway is spawned on its account, and the reattach pass never names
+//! it. A granted definition's boot token names its boot policy, the union of
+//! its routes' grants, which its routes' module top-level code fetches under.
+//!
 //! Everything here runs on the launcher thread. `attachLaunchEgress` waits for
 //! the gateway's answer to the attach, one round trip on the server's control
 //! channel to the gateway, which the launcher never makes while a fork request
@@ -23,12 +30,11 @@ const pool = @import("pool.zig");
 
 const Supervisor = @import("supervisor.zig").Supervisor;
 
-/// Whether workers of `definition` get an egress session, at launch and again
-/// after their gateway is lost. Every definition has a grant: the
-/// configuration has no `network` setting that could withhold one.
-pub fn definitionHasEgressGrant(definition: *const config.WorkerDefinition) bool {
-    _ = definition;
-    return true;
+/// Whether workers of `definition` get an egress wake set and session, at
+/// launch and again after their gateway is lost: exactly when some route of
+/// it has a `network` grant.
+pub fn definitionHasEgressGrant(supervisor: *const Supervisor, definition: config.DefinitionIndex) bool {
+    return supervisor.routes.network.definitionGranted(definition);
 }
 
 /// Attaches a new egress session for a worker of `definition`, built on
@@ -44,7 +50,7 @@ pub fn attachLaunchEgress(
     definition: config.DefinitionIndex,
     wake_set: *const ipc.egress_shared.WakeSet,
 ) anyerror!?launcher.EgressAttach {
-    if (!definitionHasEgressGrant(supervisor.routes.definition(definition)))
+    if (!definitionHasEgressGrant(supervisor, definition))
         return null;
     var attachment = (try supervisor.attachEgressGatewayForDefinition(definition, wake_set)) orelse
         return error.EgressGatewayRequired;
@@ -53,7 +59,7 @@ pub fn attachLaunchEgress(
         return error.EgressGatewayRequired;
     return .{
         .attachment = attachment,
-        .boot = bootEgress(supervisor, &attachment),
+        .boot = bootEgress(supervisor, definition, &attachment),
     };
 }
 
@@ -74,11 +80,16 @@ pub fn endLaunch(
 /// What the boot token of `attachment`'s session carries besides its
 /// deadline, which `host/launch.zig` fixes when it sends WorkerInit; null when
 /// the session's gateway is no longer current, so no key can sign the token.
-/// The policy is the one entry of every gateway's table.
+/// The policy is `definition`'s boot policy, never 0 for a granted one.
 fn bootEgress(
     supervisor: *Supervisor,
+    definition: config.DefinitionIndex,
     attachment: *const lifecycle.EgressGatewayAttachment,
 ) ?host.launch.BootEgress {
+    const policy_id = supervisor.routes.network.bootPolicy(definition);
+    // Only a granted definition attaches, and granted means a boot policy
+    // other than 0.
+    std.debug.assert(policy_id != 0);
     var key: ipc.egress_token.Key = undefined;
     // The grant keeps the one copy the launch needs; this frame keeps none.
     defer std.crypto.secureZero(u8, &key.bytes);
@@ -87,7 +98,7 @@ fn bootEgress(
     return .{
         .key = key,
         .session_id = attachment.session_id,
-        .policy_id = policy.public_https_id,
+        .policy_id = policy_id,
         .budget = @intCast(policy.production.max_fetches_per_boot),
     };
 }

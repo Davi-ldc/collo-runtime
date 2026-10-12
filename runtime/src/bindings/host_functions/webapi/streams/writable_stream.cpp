@@ -3,46 +3,23 @@
 // ready and closed promises. Runs on the VM thread.
 //
 // processQueue starts a write or the close only after start has finished and
-// while no write, close or abort is in flight. abort() does not wait: it
-// rejects the active write and calls the sink's abort method even while the
-// sink's start, write or close promise is pending. Erroring lasts only for the
-// synchronous part of abort(): the stream is Errored before abort() returns,
-// unless a termination cuts it short. finishAbort or rejectAbort settles the
-// abort promise when the abort method returns one; otherwise abort() settles
-// it. The sink's start, write, close and abort run with the underlying sink as
-// this.
+// while no write, close or abort is in flight, and it marks the write or close
+// in flight before it calls the sink, so script the sink runs that writes
+// through this stream queues behind it. abort() does not wait: it rejects the
+// active write and calls the sink's abort method even while the sink's start,
+// write or close promise is pending. Erroring lasts only for the synchronous
+// part of abort(): the stream is Errored once the sink's abort method returns.
+// finishErroring settles the abort request and the closed promise of whichever
+// writer holds the stream then. The sink's start, write, close and abort run
+// with the underlying sink as this.
+//
+// Every promise is settled through Collo::settlePromise. A false result means a
+// termination is pending, and the caller returns at once without calling the
+// sink or settling anything else; the termination ends the request, whose
+// cleanup releases what the stream still holds.
 #include "host_functions/webapi/streams/writable_stream_private.h"
 
 namespace Collo::HostFunctions {
-namespace {
-
-    // Releases a deferred that write() created but did not queue; disarm()
-    // once the queue owns it.
-    class DeferredReleaseGuard {
-    public:
-        explicit DeferredReleaseGuard(ColloPromiseDeferred*& deferred)
-            : m_deferred(deferred)
-        {
-        }
-
-        ~DeferredReleaseGuard()
-        {
-            if (!m_armed)
-                return;
-            if (!m_deferred)
-                return;
-            collo_promise_deferred_release(m_deferred);
-            m_deferred = nullptr;
-        }
-
-        void disarm() { m_armed = false; }
-
-    private:
-        ColloPromiseDeferred*& m_deferred;
-        bool m_armed { true };
-    };
-
-} // namespace
 
 JSColloWritableStreamDefaultController* JSColloWritableStreamDefaultController::create(
     JSC::VM& vm, JSC::JSGlobalObject* global_object, JSColloWritableStream* stream)
@@ -60,123 +37,68 @@ JSColloWritableStream* JSColloWritableStream::create(JSC::VM& vm, Collo::GlobalO
 }
 
 JSColloWritableStream* JSColloWritableStream::createWithStructure(
-    JSC::VM& vm, Collo::GlobalObject* global_object, JSC::Structure* structure)
+    JSC::VM& vm, Collo::GlobalObject*, JSC::Structure* structure)
 {
     auto* object = new (NotNull, JSC::allocateCell<JSColloWritableStream>(vm)) JSColloWritableStream(vm, structure);
-    auto scope = DECLARE_THROW_SCOPE(vm);
-    if (!object->finishCreation(vm, global_object, scope))
-        return nullptr;
+    object->finishCreation(vm);
     return object;
 }
 
+void JSColloWritableStream::finishCreation(JSC::VM& vm)
+{
+    Base::finishCreation(vm);
+    ASSERT(inherits(info()));
+    m_queue_memory_limit_exceeded.set(vm, this, JSC::jsUndefined());
+}
+
 JSColloWritableStreamDefaultWriter* JSColloWritableStreamDefaultWriter::create(
-    JSC::VM& vm, JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSColloWritableStream* stream)
+    JSC::VM& vm, JSC::JSGlobalObject* global_object, JSC::ThrowScope&, JSColloWritableStream* stream)
 {
     auto* collo_global = uncheckedDowncast<Collo::GlobalObject>(global_object);
     auto* object = new (NotNull, JSC::allocateCell<JSColloWritableStreamDefaultWriter>(vm))
         JSColloWritableStreamDefaultWriter(vm, collo_global->writableStreamDefaultWriterStructure());
-    if (!object->finishCreation(vm, global_object, scope, stream))
+    if (!object->finishCreation(vm, global_object, stream))
         return nullptr;
     stream->lock(vm, object);
     return object;
 }
 
-JSColloWritableStreamDefaultWriter::~JSColloWritableStreamDefaultWriter()
-{
-    if (m_ready_deferred)
-        collo_promise_deferred_release(m_ready_deferred);
-    if (m_closed_deferred)
-        collo_promise_deferred_release(m_closed_deferred);
-}
-
-JSColloWritableStream::~JSColloWritableStream()
-{
-    if (m_close_deferred)
-        collo_promise_deferred_release(m_close_deferred);
-    if (m_abort_deferred)
-        collo_promise_deferred_release(m_abort_deferred);
-    if (m_has_active_write && m_active_write.deferred)
-        collo_promise_deferred_release(m_active_write.deferred);
-    for (auto& request : m_write_queue) {
-        if (request.deferred)
-            collo_promise_deferred_release(request.deferred);
-    }
-}
-
-bool JSColloWritableStream::finishCreation(JSC::VM& vm, JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope)
-{
-    Base::finishCreation(vm);
-    ASSERT(inherits(info()));
-    m_queue_memory_limit_exceeded.set(vm, this, JSC::jsUndefined());
-
-    return true;
-}
-
+// SetUpWritableStreamDefaultWriter.
 bool JSColloWritableStreamDefaultWriter::finishCreation(
-    JSC::VM& vm, JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSColloWritableStream* stream)
+    JSC::VM& vm, JSC::JSGlobalObject* global_object, JSColloWritableStream* stream)
 {
     Base::finishCreation(vm);
     ASSERT(inherits(info()));
     m_stream.set(vm, this, stream);
+    m_ready_promise.set(vm, this, Collo::newPromise(global_object));
+    m_closed_promise.set(vm, this, Collo::newPromise(global_object));
 
-    JSValue ready_promise;
-    if (!createDeferredPromise(global_object, scope, ready_promise, m_ready_deferred))
-        return false;
-    m_ready_promise.set(vm, this, ready_promise);
-
-    JSValue closed_promise;
-    if (!createDeferredPromise(global_object, scope, closed_promise, m_closed_deferred)) {
-        if (m_ready_deferred) {
-            collo_promise_deferred_release(m_ready_deferred);
-            m_ready_deferred = nullptr;
-        }
-        m_ready_promise.clear();
-        return false;
-    }
-    m_closed_promise.set(vm, this, closed_promise);
-
-    if (stream->state() == WritableState::Closed) {
-        settleReady(global_object, JSC::jsUndefined(), false);
-        settleClosed(global_object, JSC::jsUndefined(), false);
+    JSValue stored_error = stream->storedError();
+    if (!stored_error)
+        stored_error = JSC::jsUndefined();
+    switch (stream->state()) {
+    case WritableState::Writable:
+        // Ready stays pending only under backpressure with no close queued.
+        if (stream->closeRequested() || stream->desiredSize() > 0)
+            return settleReady(global_object, JSC::jsUndefined(), false);
         return true;
+    case WritableState::Erroring:
+        // Closed stays pending until finishErroring rejects it.
+        return settleReady(global_object, stored_error, true);
+    case WritableState::Closed:
+        return settleReady(global_object, JSC::jsUndefined(), false)
+            && settleClosed(global_object, JSC::jsUndefined(), false);
+    case WritableState::Errored:
+        return settleReady(global_object, stored_error, true) && settleClosed(global_object, stored_error, true);
     }
-    if (stream->state() == WritableState::Erroring) {
-        // SetUpWritableStreamDefaultWriter, "erroring" branch: ready is
-        // rejected with the stored error and marked handled, and closed stays
-        // pending. finishAbort or rejectAbort rejects it once the sink's abort
-        // promise settles.
-        JSValue error = stream->storedError();
-        if (!error)
-            error = JSC::jsUndefined();
-        settleReady(global_object, error, true);
-        if (auto* ready_promise = dynamicDowncast<JSC::JSPromise>(m_ready_promise.get()))
-            ready_promise->markAsHandled();
-        return true;
-    }
-    if (stream->state() == WritableState::Errored) {
-        JSValue error = stream->storedError();
-        if (!error)
-            error = JSC::jsUndefined();
-        settleReady(global_object, error, true);
-        settleClosed(global_object, error, true);
-        return true;
-    }
-    if (stream->desiredSize() > 0)
-        settleReady(global_object, JSC::jsUndefined(), false);
     return true;
 }
 
-bool JSColloWritableStreamDefaultWriter::ensureReadyPending(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope)
+void JSColloWritableStreamDefaultWriter::ensureReadyPending(JSC::JSGlobalObject* global_object)
 {
-    if (m_ready_deferred)
-        return true;
-    JSValue promise;
-    ColloPromiseDeferred* deferred = nullptr;
-    if (!createDeferredPromise(global_object, scope, promise, deferred))
-        return false;
-    m_ready_promise.set(global_object->vm(), this, promise);
-    m_ready_deferred = deferred;
-    return true;
+    if (promiseIsPending(m_ready_promise.get()))
+        return;
+    m_ready_promise.set(global_object->vm(), this, Collo::newPromise(global_object));
 }
 
 void JSColloWritableStreamDefaultWriter::resolveReadyIfNeeded(
@@ -189,24 +111,39 @@ void JSColloWritableStreamDefaultWriter::resolveReadyIfNeeded(
     settleReady(global_object, JSC::jsUndefined(), false);
 }
 
-void JSColloWritableStreamDefaultWriter::settleReady(
+// Every rejection of ready goes through WritableStreamDefaultWriterEnsureReadyPromiseRejected, which replaces a
+// settled promise and marks the result handled.
+bool JSColloWritableStreamDefaultWriter::settleReady(
     JSC::JSGlobalObject* global_object, JSValue value, bool is_rejection)
 {
-    settleDeferred(global_object, m_ready_deferred, value, is_rejection);
+    if (is_rejection)
+        return ensurePromiseRejected(global_object, this, m_ready_promise, value);
+    return Collo::settlePromise(m_ready_promise.get(), value, false);
 }
 
-void JSColloWritableStreamDefaultWriter::settleClosed(
-    JSC::JSGlobalObject* global_object, JSValue value, bool is_rejection)
+// Every rejection of closed is marked handled (WritableStreamRejectCloseAndClosedPromiseIfNeeded); a closed promise
+// that already settled stays as it is.
+bool JSColloWritableStreamDefaultWriter::settleClosed(
+    JSC::JSGlobalObject*, JSValue value, bool is_rejection)
 {
-    settleDeferred(global_object, m_closed_deferred, value, is_rejection);
+    auto* promise = m_closed_promise.get();
+    if (is_rejection && promiseIsPending(promise))
+        promise->markAsHandled();
+    return Collo::settlePromise(promise, value, is_rejection);
 }
 
-bool JSColloWritableStream::ensureReadyPending(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope)
+void JSColloWritableStreamDefaultWriter::release(JSC::JSGlobalObject* global_object)
 {
-    auto* current_writer = writer();
-    if (!current_writer)
-        return true;
-    return current_writer->ensureReadyPending(global_object, scope);
+    auto* current_stream = stream();
+    if (!current_stream)
+        return;
+    if (current_stream->writer() == this)
+        current_stream->unlock();
+    m_stream.clear();
+    auto* error = JSC::createTypeError(global_object, "WritableStreamDefaultWriter lock was released"_s);
+    if (!ensurePromiseRejected(global_object, this, m_ready_promise, error))
+        return;
+    ensurePromiseRejected(global_object, this, m_closed_promise, error);
 }
 
 void JSColloWritableStream::resolveReadyIfNeeded(JSC::JSGlobalObject* global_object)
@@ -215,10 +152,11 @@ void JSColloWritableStream::resolveReadyIfNeeded(JSC::JSGlobalObject* global_obj
         current_writer->resolveReadyIfNeeded(global_object, this);
 }
 
-void JSColloWritableStream::settleClosed(JSC::JSGlobalObject* global_object, JSValue value, bool is_rejection)
+bool JSColloWritableStream::settleClosed(JSC::JSGlobalObject* global_object, JSValue value, bool is_rejection)
 {
     if (auto* current_writer = writer())
-        current_writer->settleClosed(global_object, value, is_rejection);
+        return current_writer->settleClosed(global_object, value, is_rejection);
+    return noExceptionPending(global_object->vm());
 }
 
 bool JSColloWritableStream::queueMemoryCostWouldExceed(size_t memory_cost) const
@@ -234,15 +172,13 @@ bool JSColloWritableStream::queuePendingCountWouldExceed() const
 {
     if (!m_write_queue_pending_limit)
         return false;
-    return m_write_queue.size() - m_write_queue_start >= m_write_queue_pending_limit;
+    return m_write_queue.size() >= m_write_queue_pending_limit;
 }
 
-void JSColloWritableStream::subtractQueueMemoryCost(size_t memory_cost)
+void JSColloWritableStream::subtractQueueSize(double size, size_t memory_cost)
 {
-    if (m_queue_memory_cost > memory_cost)
-        m_queue_memory_cost -= memory_cost;
-    else
-        m_queue_memory_cost = 0;
+    m_queue_total_size = m_queue_total_size > size ? m_queue_total_size - size : 0;
+    m_queue_memory_cost = m_queue_memory_cost > memory_cost ? m_queue_memory_cost - memory_cost : 0;
 }
 
 bool JSColloWritableStream::notifyQueueMemoryLimitExceeded(
@@ -251,7 +187,7 @@ bool JSColloWritableStream::notifyQueueMemoryLimitExceeded(
     JSValue callback = m_queue_memory_limit_exceeded.get();
     if (!valueIsCallable(callback)) {
         error(global_object, reason);
-        return true;
+        return !scope.exception();
     }
 
     JSC::MarkedArgumentBuffer arguments;
@@ -266,112 +202,40 @@ bool JSColloWritableStream::notifyQueueMemoryLimitExceeded(
     return !scope.exception();
 }
 
-bool JSColloWritableStream::appendWriteRequest(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope,
-    JSValue chunk, double size, size_t memory_cost, JSValue promise, ColloPromiseDeferred* deferred)
+void JSColloWritableStream::activateFirstWrite(JSC::VM& vm)
 {
-    compactWriteQueueIfNeeded();
-    bool reserved = false;
-    {
-        // The cell lock keeps the concurrent GC marker out of m_write_queue
-        // while its buffer may reallocate. Never hold it across JS allocation.
-        WTF::Locker locker { cellLock() };
-        reserved = m_write_queue.tryReserveCapacity(m_write_queue.size() + 1);
-    }
-    if (!reserved) {
-        JSC::throwOutOfMemoryError(global_object, scope);
+    auto request = m_write_queue.takeFirst(this);
+    m_active_write.value.set(vm, this, request.value.get());
+    m_active_write.promise.set(vm, this, request.promise.get());
+    m_active_write.size = request.size;
+    m_active_write.memory_cost = request.memory_cost;
+    m_has_active_write = true;
+}
+
+bool JSColloWritableStream::settleActiveWrite(JSC::JSGlobalObject* global_object, JSValue value, bool is_rejection)
+{
+    m_has_active_write = false;
+    m_write_in_flight = false;
+    subtractQueueSize(m_active_write.size, m_active_write.memory_cost);
+    m_active_write.size = 0;
+    m_active_write.memory_cost = 0;
+    m_active_write.value.clear();
+    return settleAndClearPromise(global_object, m_active_write.promise, value, is_rejection);
+}
+
+bool JSColloWritableStream::clearWriteQueue(JSC::JSGlobalObject* global_object, JSValue error)
+{
+    if (m_has_active_write && !settleActiveWrite(global_object, error, true))
         return false;
-    }
-    if (m_high_water_mark - (m_queue_total_size + size) <= 0) {
-        if (!ensureReadyPending(global_object, scope))
+    while (!m_write_queue.isEmpty()) {
+        auto request = m_write_queue.takeFirst(this);
+        subtractQueueSize(request.size, request.memory_cost);
+        if (!Collo::settlePromise(request.promise.get(), error, true))
             return false;
     }
-
-    WriteRequest request;
-    request.value.set(global_object->vm(), this, chunk);
-    request.promise.set(global_object->vm(), this, promise);
-    request.deferred = deferred;
-    request.size = size;
-    request.memory_cost = memory_cost;
-    {
-        WTF::Locker locker { cellLock() };
-        RELEASE_ASSERT(m_write_queue.tryAppend(WTF::move(request)));
-    }
-    m_queue_total_size += size;
-    m_queue_memory_cost += memory_cost;
-    return true;
-}
-
-bool JSColloWritableStream::dequeueWriteRequest(WriteRequest& out)
-{
-    if (m_write_queue_start >= m_write_queue.size())
-        return false;
-    auto& slot = m_write_queue[m_write_queue_start++];
-    out = WTF::move(slot);
-    slot.deferred = nullptr;
-    slot.value.clear();
-    slot.promise.clear();
-    compactWriteQueueIfNeeded();
-    return true;
-}
-
-void JSColloWritableStream::compactWriteQueueIfNeeded()
-{
-    if (!m_write_queue_start)
-        return;
-    if (m_write_queue_start >= m_write_queue.size()) {
-        WTF::Locker locker { cellLock() };
-        m_write_queue.clear();
-        m_write_queue_start = 0;
-        return;
-    }
-    if (m_write_queue_start > 32 && m_write_queue_start * 2 >= m_write_queue.size()) {
-        WTF::Locker locker { cellLock() };
-        m_write_queue.removeAt(0, m_write_queue_start);
-        m_write_queue_start = 0;
-    }
-}
-
-void JSColloWritableStream::settleWriteRequest(
-    JSC::JSGlobalObject* global_object, WriteRequest& request, JSValue value, bool is_rejection)
-{
-    request.value.clear();
-    request.promise.clear();
-    settleDeferred(global_object, request.deferred, value, is_rejection);
-    request.size = 0;
-    request.memory_cost = 0;
-}
-
-void JSColloWritableStream::clearWriteQueue(JSC::JSGlobalObject* global_object, JSValue error)
-{
-    if (m_has_active_write) {
-        if (m_queue_total_size > m_active_write.size)
-            m_queue_total_size -= m_active_write.size;
-        else
-            m_queue_total_size = 0;
-        subtractQueueMemoryCost(m_active_write.memory_cost);
-        settleWriteRequest(global_object, m_active_write, error, true);
-        m_has_active_write = false;
-        m_write_in_flight = false;
-    }
-    while (m_write_queue_start < m_write_queue.size()) {
-        WriteRequest request;
-        if (!dequeueWriteRequest(request))
-            break;
-        if (m_queue_total_size > request.size)
-            m_queue_total_size -= request.size;
-        else
-            m_queue_total_size = 0;
-        subtractQueueMemoryCost(request.memory_cost);
-        settleWriteRequest(global_object, request, error, true);
-    }
-    {
-        WTF::Locker locker { cellLock() };
-        m_write_queue.clear();
-        m_write_queue_start = 0;
-    }
+    m_queue_total_size = 0;
     m_queue_memory_cost = 0;
-    if (auto* current_writer = writer())
-        current_writer->settleReady(global_object, error, true);
+    return true;
 }
 
 void JSColloWritableStream::finishStart(JSC::JSGlobalObject* global_object)
@@ -382,18 +246,21 @@ void JSColloWritableStream::finishStart(JSC::JSGlobalObject* global_object)
 
 void JSColloWritableStream::error(JSC::JSGlobalObject* global_object, JSValue error)
 {
-    if (m_state == WritableState::Erroring || m_state == WritableState::Errored || m_state == WritableState::Closed)
+    if (m_state != WritableState::Writable)
         return;
     m_state = WritableState::Errored;
     m_stored_error.set(global_object->vm(), this, error);
     clearAlgorithms();
     m_close_requested = false;
     m_close_in_flight = false;
-    clearWriteQueue(global_object, error);
-    settleDeferred(global_object, m_close_deferred, error, true);
-    m_close_promise.clear();
-    settleDeferred(global_object, m_abort_deferred, JSC::jsUndefined(), false);
-    m_abort_promise.clear();
+    if (!clearWriteQueue(global_object, error))
+        return;
+    if (auto* current_writer = writer(); current_writer && !current_writer->settleReady(global_object, error, true))
+        return;
+    if (!settleAndClearPromise(global_object, m_close_promise, error, true))
+        return;
+    if (!settleAndClearPromise(global_object, m_abort_promise, JSC::jsUndefined(), false))
+        return;
     settleClosed(global_object, error, true);
 }
 
@@ -401,15 +268,11 @@ void JSColloWritableStream::finishWrite(JSC::JSGlobalObject* global_object)
 {
     if (!m_has_active_write)
         return;
-    if (m_queue_total_size > m_active_write.size)
-        m_queue_total_size -= m_active_write.size;
-    else
-        m_queue_total_size = 0;
-    subtractQueueMemoryCost(m_active_write.memory_cost);
-    settleWriteRequest(global_object, m_active_write, JSC::jsUndefined(), false);
-    m_has_active_write = false;
-    m_write_in_flight = false;
+    if (!settleActiveWrite(global_object, JSC::jsUndefined(), false))
+        return;
     resolveReadyIfNeeded(global_object);
+    if (!noExceptionPending(global_object->vm()))
+        return;
     processQueue(global_object);
 }
 
@@ -420,19 +283,15 @@ void JSColloWritableStream::rejectWrite(JSC::JSGlobalObject* global_object, JSVa
 
 void JSColloWritableStream::finishClose(JSC::JSGlobalObject* global_object)
 {
-    if (m_state != WritableState::Writable || !m_close_requested) {
-        m_close_in_flight = false;
+    m_close_in_flight = false;
+    if (m_state != WritableState::Writable || !m_close_requested)
         return;
-    }
     m_state = WritableState::Closed;
     clearAlgorithms();
-    m_close_in_flight = false;
     m_close_requested = false;
-    settleDeferred(global_object, m_close_deferred, JSC::jsUndefined(), false);
-    m_close_promise.clear();
+    if (!settleAndClearPromise(global_object, m_close_promise, JSC::jsUndefined(), false))
+        return;
     settleClosed(global_object, JSC::jsUndefined(), false);
-    if (auto* current_writer = writer())
-        current_writer->settleReady(global_object, JSC::jsUndefined(), false);
 }
 
 void JSColloWritableStream::rejectClose(JSC::JSGlobalObject* global_object, JSValue reason)
@@ -446,23 +305,22 @@ void JSColloWritableStream::rejectClose(JSC::JSGlobalObject* global_object, JSVa
 void JSColloWritableStream::finishAbort(JSC::JSGlobalObject* global_object)
 {
     m_abort_in_flight = false;
-    m_state = WritableState::Errored;
-    settleDeferred(global_object, m_abort_deferred, JSC::jsUndefined(), false);
-    m_abort_promise.clear();
-    // Erroring is now finished: settle any closed promise left pending when a
-    // writer was acquired mid-erroring (no-op if it already settled).
-    settleClosed(global_object, storedError(), true);
+    finishErroring(global_object, JSC::jsUndefined(), false);
 }
 
 void JSColloWritableStream::rejectAbort(JSC::JSGlobalObject* global_object, JSValue error)
 {
     m_abort_in_flight = false;
+    finishErroring(global_object, error, true);
+}
+
+void JSColloWritableStream::finishErroring(JSC::JSGlobalObject* global_object, JSValue value, bool is_rejection)
+{
     m_state = WritableState::Errored;
-    settleDeferred(global_object, m_abort_deferred, error, true);
-    m_abort_promise.clear();
-    // Erroring is now finished: settle any closed promise left pending when a
-    // writer was acquired mid-erroring (no-op if it already settled).
-    settleClosed(global_object, storedError(), true);
+    if (!settleAndClearPromise(global_object, m_abort_promise, value, is_rejection))
+        return;
+    JSValue stored_error = storedError();
+    settleClosed(global_object, stored_error ? stored_error : JSC::jsUndefined(), true);
 }
 
 JSC_DEFINE_HOST_FUNCTION(writableStartFulfilled, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
@@ -476,6 +334,7 @@ JSC_DEFINE_HOST_FUNCTION(writableStartFulfilled, (JSC::JSGlobalObject * global_o
     RETURN_IF_EXCEPTION(scope, {});
     if (auto* stream = controller->stream())
         stream->finishStart(global_object);
+    RETURN_IF_EXCEPTION(scope, {});
     return JSValue::encode(JSC::jsUndefined());
 }
 
@@ -490,6 +349,7 @@ JSC_DEFINE_HOST_FUNCTION(writableStartRejected, (JSC::JSGlobalObject * global_ob
     RETURN_IF_EXCEPTION(scope, {});
     if (auto* stream = controller->stream())
         stream->error(global_object, call_frame->argument(0));
+    RETURN_IF_EXCEPTION(scope, {});
     return JSValue::encode(JSC::jsUndefined());
 }
 
@@ -530,8 +390,6 @@ void JSColloWritableStream::start(JSC::JSGlobalObject* global_object, JSC::Throw
         promise->performPromiseThen(global_object->vm(), global_object,
             current_controller->startFulfilledFunction(global_object),
             current_controller->startRejectedFunction(global_object), JSC::jsUndefined());
-        if (scope.exception())
-            return;
         return;
     }
     processQueue(global_object);
@@ -547,6 +405,7 @@ JSC_DEFINE_HOST_FUNCTION(writableWriteFulfilled, (JSC::JSGlobalObject * global_o
     auto* stream = requireWritableStream(global_object, scope, stream_value);
     RETURN_IF_EXCEPTION(scope, {});
     stream->finishWrite(global_object);
+    RETURN_IF_EXCEPTION(scope, {});
     return JSValue::encode(JSC::jsUndefined());
 }
 
@@ -560,6 +419,7 @@ JSC_DEFINE_HOST_FUNCTION(writableWriteRejected, (JSC::JSGlobalObject * global_ob
     auto* stream = requireWritableStream(global_object, scope, stream_value);
     RETURN_IF_EXCEPTION(scope, {});
     stream->rejectWrite(global_object, call_frame->argument(0));
+    RETURN_IF_EXCEPTION(scope, {});
     return JSValue::encode(JSC::jsUndefined());
 }
 
@@ -573,6 +433,7 @@ JSC_DEFINE_HOST_FUNCTION(writableCloseFulfilled, (JSC::JSGlobalObject * global_o
     auto* stream = requireWritableStream(global_object, scope, stream_value);
     RETURN_IF_EXCEPTION(scope, {});
     stream->finishClose(global_object);
+    RETURN_IF_EXCEPTION(scope, {});
     return JSValue::encode(JSC::jsUndefined());
 }
 
@@ -586,6 +447,7 @@ JSC_DEFINE_HOST_FUNCTION(writableCloseRejected, (JSC::JSGlobalObject * global_ob
     auto* stream = requireWritableStream(global_object, scope, stream_value);
     RETURN_IF_EXCEPTION(scope, {});
     stream->rejectClose(global_object, call_frame->argument(0));
+    RETURN_IF_EXCEPTION(scope, {});
     return JSValue::encode(JSC::jsUndefined());
 }
 
@@ -599,6 +461,7 @@ JSC_DEFINE_HOST_FUNCTION(writableAbortFulfilled, (JSC::JSGlobalObject * global_o
     auto* stream = requireWritableStream(global_object, scope, stream_value);
     RETURN_IF_EXCEPTION(scope, {});
     stream->finishAbort(global_object);
+    RETURN_IF_EXCEPTION(scope, {});
     return JSValue::encode(JSC::jsUndefined());
 }
 
@@ -612,6 +475,7 @@ JSC_DEFINE_HOST_FUNCTION(writableAbortRejected, (JSC::JSGlobalObject * global_ob
     auto* stream = requireWritableStream(global_object, scope, stream_value);
     RETURN_IF_EXCEPTION(scope, {});
     stream->rejectAbort(global_object, call_frame->argument(0));
+    RETURN_IF_EXCEPTION(scope, {});
     return JSValue::encode(JSC::jsUndefined());
 }
 
@@ -658,10 +522,9 @@ void JSColloWritableStream::processQueue(JSC::JSGlobalObject* global_object)
     if (m_starting || m_write_in_flight || m_close_in_flight || m_abort_in_flight)
         return;
 
-    if (!m_has_active_write) {
-        if (dequeueWriteRequest(m_active_write))
-            m_has_active_write = true;
-    }
+    auto& vm = global_object->vm();
+    if (!m_has_active_write && !m_write_queue.isEmpty())
+        activateFirstWrite(vm);
 
     if (m_has_active_write) {
         auto* current_controller = controller();
@@ -670,7 +533,6 @@ void JSColloWritableStream::processQueue(JSC::JSGlobalObject* global_object)
             finishWrite(global_object);
             return;
         }
-        auto& vm = global_object->vm();
         auto scope = DECLARE_TOP_EXCEPTION_SCOPE(vm);
         JSC::MarkedArgumentBuffer arguments;
         arguments.append(m_active_write.value.get());
@@ -679,22 +541,24 @@ void JSColloWritableStream::processQueue(JSC::JSGlobalObject* global_object)
             rejectWrite(global_object, JSC::createOutOfMemoryError(global_object));
             return;
         }
+        m_write_in_flight = true;
         auto call_data = JSC::getCallData(write_callback);
         JSValue result = JSC::call(
             global_object, write_callback.getObject(), call_data, current_controller->underlyingSink(), arguments);
         if (scope.exception()) {
             JSValue exception = scope.exception()->value();
-            scope.clearExceptionExceptTermination();
+            if (!scope.clearExceptionExceptTermination())
+                return;
             rejectWrite(global_object, exception);
             return;
         }
         if (auto* promise = dynamicDowncast<JSC::JSPromise>(result)) {
-            m_write_in_flight = true;
             promise->performPromiseThen(vm, global_object, writeFulfilledFunction(global_object),
                 writeRejectedFunction(global_object), JSC::jsUndefined());
             if (scope.exception()) {
                 JSValue exception = scope.exception()->value();
-                scope.clearExceptionExceptTermination();
+                if (!scope.clearExceptionExceptTermination())
+                    return;
                 rejectWrite(global_object, exception);
             }
             return;
@@ -711,25 +575,26 @@ void JSColloWritableStream::processQueue(JSC::JSGlobalObject* global_object)
         finishClose(global_object);
         return;
     }
-    auto& vm = global_object->vm();
     auto scope = DECLARE_TOP_EXCEPTION_SCOPE(vm);
+    m_close_in_flight = true;
     auto call_data = JSC::getCallData(close_callback);
     JSC::MarkedArgumentBuffer arguments;
     JSValue result = JSC::call(
         global_object, close_callback.getObject(), call_data, current_controller->underlyingSink(), arguments);
     if (scope.exception()) {
         JSValue exception = scope.exception()->value();
-        scope.clearExceptionExceptTermination();
+        if (!scope.clearExceptionExceptTermination())
+            return;
         rejectClose(global_object, exception);
         return;
     }
     if (auto* promise = dynamicDowncast<JSC::JSPromise>(result)) {
-        m_close_in_flight = true;
         promise->performPromiseThen(vm, global_object, closeFulfilledFunction(global_object),
             closeRejectedFunction(global_object), JSC::jsUndefined());
         if (scope.exception()) {
             JSValue exception = scope.exception()->value();
-            scope.clearExceptionExceptTermination();
+            if (!scope.clearExceptionExceptTermination())
+                return;
             rejectClose(global_object, exception);
         }
         return;
@@ -747,92 +612,61 @@ EncodedJSValue JSColloWritableStream::write(JSC::JSGlobalObject* global_object, 
     if (m_close_requested)
         return rejectedTypeError(global_object, scope, "WritableStream is closing"_s);
 
-    JSValue promise;
-    ColloPromiseDeferred* deferred = nullptr;
-    if (!createDeferredPromise(global_object, scope, promise, deferred))
-        return {};
-    DeferredReleaseGuard deferred_guard(deferred);
-
+    // WritableStreamDefaultControllerGetChunkSize: a size callback that throws
+    // or returns an invalid size errors the stream, and the write is rejected
+    // with the stored error below.
     double size = 1;
     if (auto* current_controller = controller()) {
         JSValue size_callback = current_controller->sizeCallback();
         if (valueIsCallable(size_callback)) {
+            JSValue size_error;
             JSC::MarkedArgumentBuffer arguments;
             arguments.append(chunk);
             if (arguments.hasOverflowed()) {
-                JSC::throwOutOfMemoryError(global_object, scope);
-                if (auto* exception = scope.exception()) {
-                    JSValue reason = exception->value();
-                    if (scope.tryClearException()) {
-                        error(global_object, reason);
-                        settleDeferred(global_object, deferred, reason, true);
-                        return JSValue::encode(promise);
+                size_error = JSC::createOutOfMemoryError(global_object);
+            } else {
+                auto call_data = JSC::getCallData(size_callback);
+                JSValue size_value
+                    = JSC::call(global_object, size_callback.getObject(), call_data, JSC::jsUndefined(), arguments);
+                if (scope.exception()) {
+                    size_error = scope.exception()->value();
+                    if (!scope.tryClearException())
+                        return {};
+                } else {
+                    size = size_value.toNumber(global_object);
+                    if (scope.exception()) {
+                        size_error = scope.exception()->value();
+                        if (!scope.tryClearException())
+                            return {};
+                    } else if (!std::isfinite(size) || size < 0) {
+                        size_error = JSC::createRangeError(
+                            global_object, "WritableStream chunk size must be a finite non-negative number"_s);
                     }
                 }
-                return {};
             }
-            auto call_data = JSC::getCallData(size_callback);
-            JSValue size_value
-                = JSC::call(global_object, size_callback.getObject(), call_data, JSC::jsUndefined(), arguments);
-            if (scope.exception()) {
-                JSValue reason = scope.exception()->value();
-                if (!scope.tryClearException())
-                    return {};
-                error(global_object, reason);
-                settleDeferred(global_object, deferred, reason, true);
-                return JSValue::encode(promise);
-            }
-            size = size_value.toNumber(global_object);
-            if (scope.exception()) {
-                JSValue reason = scope.exception()->value();
-                if (!scope.tryClearException())
-                    return {};
-                error(global_object, reason);
-                settleDeferred(global_object, deferred, reason, true);
-                return JSValue::encode(promise);
-            }
-            if (!std::isfinite(size) || size < 0) {
-                JSValue reason = JSC::createRangeError(
-                    global_object, "WritableStream chunk size must be a finite non-negative number"_s);
+            if (size_error) {
+                error(global_object, size_error);
                 RETURN_IF_EXCEPTION(scope, {});
-                error(global_object, reason);
-                settleDeferred(global_object, deferred, reason, true);
-                return JSValue::encode(promise);
+                return rejectedPromise(global_object, scope, size_error);
             }
         }
     }
 
     // The size callback is script and may have released the writer or closed,
     // aborted or errored the stream, so the checks above run again.
-    if (writer && writer->stream() != this) {
-        JSValue reason = JSC::createTypeError(global_object, "WritableStreamDefaultWriter has been released"_s);
-        RETURN_IF_EXCEPTION(scope, {});
-        settleDeferred(global_object, deferred, reason, true);
-        return JSValue::encode(promise);
-    }
-    if (m_state == WritableState::Closed) {
-        JSValue reason = JSC::createTypeError(global_object, "WritableStream is closed"_s);
-        RETURN_IF_EXCEPTION(scope, {});
-        settleDeferred(global_object, deferred, reason, true);
-        return JSValue::encode(promise);
-    }
-    if (m_state == WritableState::Errored || m_state == WritableState::Erroring) {
-        settleDeferred(global_object, deferred, storedError(), true);
-        return JSValue::encode(promise);
-    }
-    if (m_close_requested) {
-        JSValue reason = JSC::createTypeError(global_object, "WritableStream is closing"_s);
-        RETURN_IF_EXCEPTION(scope, {});
-        settleDeferred(global_object, deferred, reason, true);
-        return JSValue::encode(promise);
-    }
+    if (writer && writer->stream() != this)
+        return rejectedTypeError(global_object, scope, "WritableStreamDefaultWriter has been released"_s);
+    if (m_state == WritableState::Closed)
+        return rejectedTypeError(global_object, scope, "WritableStream is closed"_s);
+    if (m_state == WritableState::Errored || m_state == WritableState::Erroring)
+        return rejectedPromise(global_object, scope, storedError());
+    if (m_close_requested)
+        return rejectedTypeError(global_object, scope, "WritableStream is closing"_s);
 
     const size_t memory_cost = m_queue_memory_cost_limit ? streamChunkMemoryCost(chunk) : 0;
     if (queueMemoryCostWouldExceed(memory_cost) || queuePendingCountWouldExceed()) {
-        // Only createTextCodecTransform in text_codec.cpp sets queue limits on a
-        // writable stream, hence the message.
         JSValue reason
-            = JSValue(createStreamQueueLimitExceededError(global_object, "Text codec stream queue limit exceeded"_s));
+            = JSValue(createStreamQueueLimitExceededError(global_object, "WritableStream queue limit exceeded"_s));
         if (!notifyQueueMemoryLimitExceeded(global_object, scope, reason)) {
             if (!scope.exception())
                 JSC::throwOutOfMemoryError(global_object, scope);
@@ -840,17 +674,36 @@ EncodedJSValue JSColloWritableStream::write(JSC::JSGlobalObject* global_object, 
             if (!scope.tryClearException())
                 return {};
             error(global_object, exception);
-            settleDeferred(global_object, deferred, exception, true);
-            return JSValue::encode(promise);
+            RETURN_IF_EXCEPTION(scope, {});
+            return rejectedPromise(global_object, scope, exception);
         }
-        settleDeferred(global_object, deferred, reason, true);
-        return JSValue::encode(promise);
+        return rejectedPromise(global_object, scope, reason);
     }
 
-    if (!appendWriteRequest(global_object, scope, chunk, size, memory_cost, promise, deferred))
+    // Reserving first leaves nothing after the promise exists that can fail.
+    if (!m_write_queue.tryReserveAdditional(this, 1)) {
+        JSC::throwOutOfMemoryError(global_object, scope);
         return {};
-    deferred_guard.disarm();
+    }
+    auto& vm = global_object->vm();
+    if (m_high_water_mark - (m_queue_total_size + size) <= 0) {
+        if (auto* current_writer = this->writer())
+            current_writer->ensureReadyPending(global_object);
+    }
+    auto* promise = Collo::newPromise(global_object);
+    WriteRequest request;
+    request.value.setWithoutWriteBarrier(chunk);
+    request.promise.setWithoutWriteBarrier(promise);
+    request.size = size;
+    request.memory_cost = memory_cost;
+    if (!m_write_queue.tryAppend(vm, this, WTF::move(request))) {
+        JSC::throwOutOfMemoryError(global_object, scope);
+        return {};
+    }
+    m_queue_total_size += size;
+    m_queue_memory_cost += memory_cost;
     processQueue(global_object);
+    RETURN_IF_EXCEPTION(scope, {});
     return JSValue::encode(promise);
 }
 
@@ -865,44 +718,44 @@ EncodedJSValue JSColloWritableStream::close(JSC::JSGlobalObject* global_object, 
     if (m_close_requested)
         return rejectedTypeError(global_object, scope, "WritableStream is already closing"_s);
 
-    JSValue promise;
-    ColloPromiseDeferred* deferred = nullptr;
-    if (!createDeferredPromise(global_object, scope, promise, deferred))
-        return {};
+    auto* promise = Collo::newPromise(global_object);
     m_close_promise.set(global_object->vm(), this, promise);
-    // The checks above leave a writable stream with no close request, and every
-    // path that ends a close request settles its deferred.
-    ASSERT(!m_close_deferred);
-    m_close_deferred = deferred;
     m_close_requested = true;
+    // A writer waiting out backpressure is ready once the close is queued.
+    if (auto* current_writer = writer(); current_writer && desiredSize() <= 0) {
+        if (!current_writer->settleReady(global_object, JSC::jsUndefined(), false))
+            return {};
+    }
     processQueue(global_object);
+    RETURN_IF_EXCEPTION(scope, {});
     return JSValue::encode(promise);
 }
 
 EncodedJSValue JSColloWritableStream::abort(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSValue reason)
 {
-    // WritableStreamAbort: aborting a closed or errored stream resolves with
-    // undefined.
+    // WritableStreamAbort: a pending abort request answers every later abort
+    // with its own promise, and aborting a closed or errored stream resolves
+    // with undefined.
+    if (auto* pending = m_abort_promise.get())
+        return JSValue::encode(pending);
     if (m_state == WritableState::Closed || m_state == WritableState::Errored || m_state == WritableState::Erroring)
         return resolvedPromise(global_object, JSC::jsUndefined());
 
-    JSValue promise;
-    ColloPromiseDeferred* deferred = nullptr;
-    if (!createDeferredPromise(global_object, scope, promise, deferred))
-        return {};
-    m_abort_promise.set(global_object->vm(), this, promise);
-    // Only a writable stream gets here, and a stream never returns to writable
-    // once abort has run, so no earlier abort deferred exists.
-    ASSERT(!m_abort_deferred);
-    m_abort_deferred = deferred;
+    auto& vm = global_object->vm();
+    auto* promise = Collo::newPromise(global_object);
+    m_abort_promise.set(vm, this, promise);
     m_state = WritableState::Erroring;
-    m_stored_error.set(global_object->vm(), this, reason);
-    clearWriteQueue(global_object, reason);
+    m_stored_error.set(vm, this, reason);
+    if (!clearWriteQueue(global_object, reason))
+        return {};
+    if (auto* current_writer = writer(); current_writer && !current_writer->settleReady(global_object, reason, true))
+        return {};
     m_close_requested = false;
     m_close_in_flight = false;
-    settleDeferred(global_object, m_close_deferred, reason, true);
-    m_close_promise.clear();
-    settleClosed(global_object, reason, true);
+    if (!settleAndClearPromise(global_object, m_close_promise, reason, true))
+        return {};
+    if (!settleClosed(global_object, reason, true))
+        return {};
 
     // The sink's abort method is the last one the stream calls, so the
     // controller drops them all before calling it.
@@ -911,26 +764,17 @@ EncodedJSValue JSColloWritableStream::abort(JSC::JSGlobalObject* global_object, 
     JSValue sink = current_controller ? current_controller->underlyingSink() : JSC::jsUndefined();
     clearAlgorithms();
     if (!valueIsCallable(abort_callback)) {
-        m_state = WritableState::Errored;
-        settleDeferred(global_object, m_abort_deferred, JSC::jsUndefined(), false);
-        m_abort_promise.clear();
+        finishErroring(global_object, JSC::jsUndefined(), false);
+        RETURN_IF_EXCEPTION(scope, {});
         return JSValue::encode(promise);
     }
 
     JSC::MarkedArgumentBuffer arguments;
     arguments.append(reason);
     if (arguments.hasOverflowed()) {
-        JSC::throwOutOfMemoryError(global_object, scope);
-        if (auto* exception = scope.exception()) {
-            JSValue error = exception->value();
-            if (scope.tryClearException()) {
-                m_state = WritableState::Errored;
-                settleDeferred(global_object, m_abort_deferred, error, true);
-                m_abort_promise.clear();
-                return JSValue::encode(promise);
-            }
-        }
-        return {};
+        finishErroring(global_object, JSC::createOutOfMemoryError(global_object), true);
+        RETURN_IF_EXCEPTION(scope, {});
+        return JSValue::encode(promise);
     }
     // FIXME: WritableStreamStartErroring waits until start has finished and no
     // write or close is in flight before WritableStreamFinishErroring calls the
@@ -939,62 +783,34 @@ EncodedJSValue JSColloWritableStream::abort(JSC::JSGlobalObject* global_object, 
     // abort method's promise settles. Here the active write, the close promise
     // and the closed promise are already rejected, and the abort method runs at
     // once, even while the sink is still starting, writing or closing.
-    //
-    // FIXME: a writer acquired while the sink's abort method runs gets a
-    // pending closed promise, and only finishAbort or rejectAbort settles it.
-    // When the method throws or returns a non-promise, that promise stays
-    // pending until the writer is released.
     auto call_data = JSC::getCallData(abort_callback);
     JSValue result = JSC::call(global_object, abort_callback.getObject(), call_data, sink, arguments);
     if (scope.exception()) {
         JSValue error = scope.exception()->value();
         if (!scope.tryClearException())
             return {};
-        m_state = WritableState::Errored;
-        settleDeferred(global_object, m_abort_deferred, error, true);
-        m_abort_promise.clear();
+        finishErroring(global_object, error, true);
+        RETURN_IF_EXCEPTION(scope, {});
         return JSValue::encode(promise);
     }
     m_state = WritableState::Errored;
     if (auto* result_promise = dynamicDowncast<JSC::JSPromise>(result)) {
         m_abort_in_flight = true;
-        result_promise->performPromiseThen(global_object->vm(), global_object, abortFulfilledFunction(global_object),
+        result_promise->performPromiseThen(vm, global_object, abortFulfilledFunction(global_object),
             abortRejectedFunction(global_object), JSC::jsUndefined());
         if (scope.exception()) {
             JSValue error = scope.exception()->value();
             if (!scope.tryClearException())
                 return {};
             m_abort_in_flight = false;
-            settleDeferred(global_object, m_abort_deferred, error, true);
-            m_abort_promise.clear();
+            finishErroring(global_object, error, true);
+            RETURN_IF_EXCEPTION(scope, {});
         }
         return JSValue::encode(promise);
     }
-    settleDeferred(global_object, m_abort_deferred, JSC::jsUndefined(), false);
-    m_abort_promise.clear();
+    finishErroring(global_object, JSC::jsUndefined(), false);
+    RETURN_IF_EXCEPTION(scope, {});
     return JSValue::encode(promise);
-}
-
-void JSColloWritableStreamDefaultWriter::release(JSC::JSGlobalObject* global_object)
-{
-    if (auto* current_stream = stream()) {
-        if (current_stream->writer() == this)
-            current_stream->unlock();
-        auto* error = JSC::createTypeError(global_object, "WritableStreamDefaultWriter lock was released"_s);
-        settleReady(global_object, error, true);
-        settleClosed(global_object, error, true);
-        m_stream.clear();
-        // WritableStreamDefaultWriterRelease: afterwards ready and closed are
-        // handled promises rejected with a TypeError, even when the earlier
-        // promises had already settled.
-        auto& vm = global_object->vm();
-        auto* rejected_ready = JSC::JSPromise::rejectedPromise(global_object, error);
-        rejected_ready->markAsHandled();
-        m_ready_promise.set(vm, this, rejected_ready);
-        auto* rejected_closed = JSC::JSPromise::rejectedPromise(global_object, error);
-        rejected_closed->markAsHandled();
-        m_closed_promise.set(vm, this, rejected_closed);
-    }
 }
 
 JSColloWritableStream* createWritableStreamFromCallbacks(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope,
@@ -1004,9 +820,6 @@ JSColloWritableStream* createWritableStreamFromCallbacks(JSC::JSGlobalObject* gl
     auto& vm = global_object->vm();
     auto* collo_global = uncheckedDowncast<Collo::GlobalObject>(global_object);
     auto* stream = JSColloWritableStream::create(vm, collo_global);
-    RETURN_IF_EXCEPTION(scope, nullptr);
-    if (!stream)
-        return nullptr;
     auto* controller = JSColloWritableStreamDefaultController::create(vm, global_object, stream);
     stream->setController(vm, controller);
     stream->setHighWaterMark(high_water_mark);

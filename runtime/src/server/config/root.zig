@@ -5,7 +5,9 @@
 //! artifacts are built from a `Config` by `server/routes/`.
 //!
 //! - `model.zig`: the `Config` types, their defaults and their ownership.
-//! - `parse.zig`: the file format, validation and the settings cascade.
+//! - `parse.zig`: the file format, validation and the settings cascade;
+//!   each `network` value is read and checked with the rules of
+//!   `common/network/`, the same rules the gateway enforces.
 //! - `synthesize.zig`: the configuration of `collo serve <entry>`.
 //! - `pattern.zig`: the route pattern grammar the parser checks and the
 //!   route table reads, and the path prefix the server keeps for itself.
@@ -26,6 +28,7 @@ pub const Config = model.Config;
 pub const Tls = model.Tls;
 pub const Analytics = model.Analytics;
 pub const Settings = model.Settings;
+pub const Network = model.Network;
 pub const Limits = model.Limits;
 pub const WorkerDefinition = model.WorkerDefinition;
 pub const Route = model.Route;
@@ -41,6 +44,7 @@ pub const default_listen = model.default_listen;
 pub const default_settings = model.default_settings;
 pub const synthesized_route_pattern = synthesize_file.route_pattern;
 pub const synthesized_fallback_worker_name = synthesize_file.fallback_worker_name;
+pub const synthesized_network = synthesize_file.network;
 
 pub const load = parse_file.load;
 pub const parse = parse_file.parse;

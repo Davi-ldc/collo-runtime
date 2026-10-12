@@ -3,7 +3,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const shims = @import("shims.zig");
-const zstd = @import("zstd.zig");
 const buildtool = @import("buildtool.zig");
 
 /// The engine's CMake configuration, independent of the Zig optimize mode: the
@@ -14,25 +13,13 @@ pub const JscProfile = enum { release, debug };
 pub const Options = struct {
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
-    webapi_compat: bool,
     sanitizer: shims.BindingsSanitizer,
     jsc_profile: JscProfile,
-    /// True admits the engine already in runtime/deps/jsc-build by its provenance and
-    /// fails instead of building when it is stale.
+    /// True admits the engine already in runtime/deps/jsc-build, and the ICU build it compiled
+    /// against, by their provenance, and fails instead of building when either is stale.
     jsc_prebuilt: bool,
     jsc_build_dir: []const u8,
     webkit_source_dir: []const u8,
-    boringssl_build_dir: []const u8,
-    /// `-Dboringssl-build-dir` exactly as given. Null means no override, and
-    /// every consumer then derives the directory from ITS OWN target — the dev
-    /// graph from the host target, each release step from the architecture it
-    /// builds for. A single resolved string cannot serve both.
-    boringssl_build_dir_override: ?[]const u8,
-    /// Flag-level choice; build.zig collapses `auto` via `zstd.resolveChoice`
-    /// once the toolchain is discovered. A consumer that builds its own
-    /// toolchain — the release steps do — must resolve against that one, never
-    /// against this raw value.
-    zstd_link: zstd.LinkChoice,
     // Toolchain knobs are pinned constants with env escape hatches; they are
     // deliberately not part of the -D surface.
     cxx_stdlib_version: []const u8,
@@ -44,20 +31,15 @@ pub const Options = struct {
 };
 
 pub fn parse(b: *std.Build) Options {
-    const webapi_compat = b.option(
-        bool,
-        "webapi-compat",
-        "Include JS WebAPI compatibility tests in zig build test",
-    ) orelse false;
-
     const sanitize = b.option(
-        enum { none, address },
+        enum { none, address, undefined },
         "sanitize",
-        "Sanitizer for the JSC bindings test steps: none or address (ASan+LSan)",
+        "Sanitizer for Collo's C++: none, address (ASan+LSan) or undefined (UBSan alignment and float-cast-overflow, aborting on a report)",
     );
     const sanitizer: shims.BindingsSanitizer = if (sanitize) |mode| switch (mode) {
         .none => .{ .mode = .none },
         .address => .{ .mode = .address_leak },
+        .undefined => .{ .mode = .undefined_behavior },
     } else shims.parseBindingsSanitizer(b.graph.env_map.get("COLLO_SANITIZE") orelse "none");
 
     const target = b.standardTargetOptions(.{ .default_target = defaultTargetQuery() });
@@ -71,40 +53,20 @@ pub fn parse(b: *std.Build) Options {
     const jsc_prebuilt = b.option(
         bool,
         "jsc-prebuilt",
-        "Admit the engine in runtime/deps/jsc-build by provenance; fail instead of building when stale",
+        "Admit the engine and its ICU by provenance; fail instead of building when stale",
     ) orelse false;
 
     const triple = target.result.linuxTriple(b.allocator) catch @panic("OOM");
     const engine = engineDirs(b, triple, jscProfileName(b, jsc_profile, null));
 
-    const boringssl_build_dir_override = b.option(
-        []const u8,
-        "boringssl-build-dir",
-        "Directory containing BoringSSL libssl.a and libcrypto.a",
-    );
-    const zstd_link_raw = b.option(
-        []const u8,
-        "zstd-link",
-        "zstd link mode: auto (default: static when libzstd.a exists, else system-dynamic), static, or system-dynamic",
-    ) orelse "auto";
-    const zstd_link = zstd.parseLinkChoice(zstd_link_raw) orelse std.process.fatal(
-        "invalid -Dzstd-link={s}; expected auto, static or system-dynamic",
-        .{zstd_link_raw},
-    );
-
     return .{
         .target = target,
         .optimize = optimize,
-        .webapi_compat = webapi_compat,
         .sanitizer = sanitizer,
         .jsc_profile = jsc_profile,
         .jsc_prebuilt = jsc_prebuilt,
         .jsc_build_dir = engine.jsc,
         .webkit_source_dir = engine.webkit_src,
-        .boringssl_build_dir_override = boringssl_build_dir_override,
-        .boringssl_build_dir = boringssl_build_dir_override orelse
-            defaultBoringSslBuildDir(target.result.cpu.arch),
-        .zstd_link = zstd_link,
         .cxx_stdlib_version = b.graph.env_map.get("COLLO_CXX_STDLIB_VERSION") orelse "13",
         .cxx_sysroot = b.graph.env_map.get("COLLO_CXX_SYSROOT") orelse "",
         .native_cxx_linker = b.graph.env_map.get("CXX") orelse "c++",
@@ -113,18 +75,6 @@ pub fn parse(b: *std.Build) Options {
         else
             discoverCompilerRtBuiltins(b, target.result.cpu.arch),
         .release_mcpu = b.graph.env_map.get("COLLO_RELEASE_MCPU"),
-    };
-}
-
-/// BoringSSL archives are per-architecture and the tree carries one directory
-/// per arch it links. Deriving the directory from the target is what keeps a
-/// cross build from linking the host's archives: the mismatch is invisible
-/// until the final link, where it surfaces as undefined symbols rather than as
-/// "you picked the wrong directory".
-pub fn defaultBoringSslBuildDir(arch: std.Target.Cpu.Arch) []const u8 {
-    return switch (arch) {
-        .aarch64 => "runtime/deps/boringssl/build-aarch64",
-        else => "runtime/deps/boringssl/build",
     };
 }
 

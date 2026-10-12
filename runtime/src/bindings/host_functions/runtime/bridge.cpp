@@ -48,18 +48,9 @@ VmOwnerResult requireVmOwner(JSC::JSGlobalObject* global_object, JSC::ThrowScope
 
 void* hostRuntime(ColloVm& owner) { return owner.host_runtime.load(std::memory_order_acquire); }
 
-ColloExecCtx* activeExecContext(ColloVm& owner)
-{
-    if (owner.current_exec_ctx)
-        return owner.current_exec_ctx;
-    // Turnless JS, meaning module evaluation and its microtask drains, gets the worker's boot context when one is
-    // installed; `boot_exec_ctx` in jsc/runtime/state.h describes it. Code that needs the turn itself, such as the turn
-    // checks in invoke.cpp and vm.cpp and the turnless precondition of awaitModulePromiseSync, reads current_exec_ctx
-    // directly instead of calling this.
-    if (owner.boot_exec_ctx_installed)
-        return &owner.boot_exec_ctx;
-    return nullptr;
-}
+// Code that needs the turn itself, such as the turn checks in invoke.cpp and vm.cpp and the turnless precondition of
+// awaitModulePromiseSync, reads current_exec_ctx directly instead of calling this.
+ColloExecCtx* activeExecContext(ColloVm& owner) { return Collo::ownerExecCtx(owner); }
 
 ActiveRequestRuntimeResult requireActiveRequestRuntime(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope,
     WTF::ASCIILiteral runtime_unavailable_message, WTF::ASCIILiteral active_turn_message, RuntimeCheckOrder order)

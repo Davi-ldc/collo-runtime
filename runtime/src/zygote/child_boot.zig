@@ -7,9 +7,12 @@
 //!
 //! The boot crosses the sandbox in a fixed order, and each step sits where
 //! the kernel or the engine forces it:
-//! - The namespaces come first, while the child is still provably
-//!   single-threaded: unshare(CLONE_NEWUSER) fails in a multi-threaded
-//!   process.
+//! - The child first checks that glibc knows its thread's own id, which the
+//!   clone set (`fork_loop.zig`), since a wrong one would name a thread of
+//!   the zygote in every call that reads it.
+//! - The namespaces come first among the sandbox steps, while the child is
+//!   still provably single-threaded: unshare(CLONE_NEWUSER) fails in a
+//!   multi-threaded process.
 //! - The child stays single-threaded and leaves the VM untouched until
 //!   `applyPreThread` (`worker_boot/sandbox.zig`) has set no-new-privileges
 //!   and dropped capabilities, since both are per-thread and a thread started
@@ -17,16 +20,22 @@
 //!   single-threaded just before, while /proc is still there to read.
 //! - The child checks the cgroup leaf it was born in
 //!   (`worker_boot/cgroup.zig`) before the VM resumes, so no engine or tenant
-//!   code runs under limits nobody set.
+//!   code runs under limits nobody set, and opens the leaf files it reads for
+//!   its life before the chroot hides them.
 //! - Every thread the worker will ever have starts between the capability
 //!   drop and the seccomp filter, which denies clone: a thread started on
 //!   first use after the filter aborts the worker. So the helper threads are
-//!   pinned against retiring and the compiler threads start before it.
+//!   pinned against retiring as soon as the VM resumes, and the compiler
+//!   threads start before the filter.
 //! - The worker's end of the control socket stops blocking right before the
 //!   filter, which lets fcntl read flags but not set them.
 //! - The filter is the last sandbox step. The first tenant code, the
 //!   evaluation of every route's entry, runs after it and before
 //!   `WorkerReady`, so a ready worker's first request needs no module work.
+//!
+//! From the mapping of the state page on, every `std.log` line of the child
+//! goes into the page's console ring (`log_sink.zig`), since the child's
+//! standard error points at /dev/null by then.
 
 const std = @import("std");
 const bindings = @import("collo_bindings");
@@ -34,7 +43,10 @@ const worker_shared_page = @import("collo_worker_state").page;
 const ipc = @import("collo_ipc");
 const fd_mod = @import("collo_os").fd;
 const process = @import("collo_os").process;
-const process_limits = @import("collo_limits").process;
+const socket = @import("collo_os").socket;
+const limits = @import("collo_limits");
+const process_limits = limits.process;
+const log_sink = @import("log_sink.zig");
 const state = @import("state.zig");
 const trace = @import("trace.zig");
 const worker_runtime = @import("collo_worker");
@@ -118,10 +130,22 @@ fn workerChildMainImpl(zygote: *state.Zygote, child_init_fd: std.posix.fd_t, rep
     // page, so a child stuck mid-boot leaves its progress readable.
     var boot_stamps = [_]u64{0} ** worker_shared_page.BOOT_PHASE_COUNT;
 
-    // Namespaces come first, while the child is provably single-threaded (the
-    // zygote checks before clone3): unshare(CLONE_NEWUSER) fails with EINVAL in
-    // a multi-threaded process, and postForkChild later restarts the libpas
-    // scavenger thread.
+    // The clone wrote this thread's id into glibc's copy of it
+    // (`fork_loop.zig`); a clone that did not would leave the zygote's
+    // thread there, and glibc's thread clock, the owner of a recursive or
+    // robust mutex, and affinity calls on `pthread_self()` would all name
+    // the zygote's thread. glibc builds its clock id without a system call,
+    // so the raw `gettid` is the check's only one.
+    validateOwnThreadIdentity() catch |err| {
+        traceEventFmt(trace_fd, "child.thread_identity.invalid={s}", .{@errorName(err)});
+        return report.fail(.internal_error);
+    };
+    traceEvent(trace_fd, "child.thread_identity.checked");
+
+    // Namespaces come before every other sandbox step, while the child is
+    // provably single-threaded (the zygote checks before clone3):
+    // unshare(CLONE_NEWUSER) fails with EINVAL in a multi-threaded process,
+    // and postForkChild later restarts the libpas scavenger thread.
     worker_sandbox.applyPostForkNamespaces() catch |err| {
         std.log.err("worker namespace setup failed: {s}", .{@errorName(err)});
         return report.fail(.internal_error);
@@ -227,27 +251,35 @@ fn workerChildMainImpl(zygote: *state.Zygote, child_init_fd: std.posix.fd_t, rep
 
     worker_state.metrics = maybe_metrics;
     metrics_owned_by_state = true;
+    // Uninstalled before `worker_state.deinit` unmaps the page, since this
+    // defer runs first.
+    log_sink.install(&(worker_state.metrics.?));
+    defer log_sink.uninstall();
+    traceEvent(trace_fd, "child.log_sink.installed");
 
-    const memory_events = worker_cgroup.validateAndOpenWorkerMemoryEventsAt(
-        received.cgroup_dir_fd,
-        pid,
-        received.message.memory_limit_bytes,
-        received.message.cpu_max_cores,
-    ) catch {
+    const leaf = worker_cgroup.validateAndOpenWorkerLeafAt(received.cgroup_dir_fd, pid, .{
+        .memory_limit_bytes = received.message.memory_limit_bytes,
+        .cpu_max_cores = received.message.cpu_max_cores,
+    }) catch |err| {
         maybe_metrics.setState(.dead, .init_failed);
+        traceEventFmt(trace_fd, "child.cgroup.invalid={s}", .{@errorName(err)});
         return report.fail(.invalid_worker_init);
     };
-    worker_state.memory_events_fd = memory_events.fd;
+    worker_state.memory_events_fd = leaf.memory_events_fd;
+    worker_state.memory_current_fd = leaf.memory_current_fd;
     std.posix.close(received.takeCgroupDirFd());
     traceEvent(trace_fd, "child.cgroup.validated");
     traceEvent(trace_fd, "child.memory_events.opened");
+    traceEvent(trace_fd, "child.memory_current.opened");
     stampBootPhase(&boot_stamps, &maybe_metrics, .cgroup_validated);
 
-    // Every WorkerInit carries the worker's wake descriptors, and the
-    // session's regions exactly when it carries a boot token
-    // (`ipc.recvWorkerInit`). Without the regions the child boots detached:
-    // the runtime holds the wake descriptors for its ring and maps no
-    // endpoint.
+    // The worker's wake descriptors come exactly when WorkerInit sets
+    // `flag_egress`, and the session's regions exactly when it carries a
+    // boot token (`ipc.recvWorkerInit`), and `validateWorkerInitFds` holds
+    // the child to that. With the wake descriptors and no regions the child
+    // boots detached: the runtime holds the wake descriptors for its ring and
+    // maps no endpoint. With neither, the worker's definition has no network
+    // grant, and the set the runtime gets is empty (`RawFds.isEmpty`).
     var egress_shared_fds = received.takeEgressSharedFds();
     errdefer egress_shared_fds.close();
 
@@ -288,6 +320,27 @@ fn workerChildMainImpl(zygote: *state.Zygote, child_init_fd: std.posix.fd_t, rep
     };
     traceEvent(trace_fd, "child.post_fork_child");
 
+    // Every helper thread is pinned against retiring
+    // (`WORKER_HELPER_THREAD_PIN_TIMEOUT_NS`), and an idle one releases its
+    // allocator cache once after `thread_cache_idle_release_ns`, which lets
+    // the libpas scavenger reach its deep sleep in an idle worker. Both are
+    // set right after `postForkChild`, which reset the registry of automatic
+    // threads and cleared the zygote's overrides: a thread reads them each
+    // time it parks, and one that parked under the pin is never woken by a
+    // later change, so any helper thread the boot starts from here on, by a
+    // collection or by the prespawn below, parks under both.
+    bindings.setHelperThreadsTimeoutOverrideNs(WORKER_HELPER_THREAD_PIN_TIMEOUT_NS) catch {
+        worker_state.metrics.?.setState(.dead, .init_failed);
+        return report.fail(.internal_error);
+    };
+    bindings.setHelperThreadsCacheReleaseNs(limits.worker.thread_cache_idle_release_ns) catch {
+        worker_state.metrics.?.setState(.dead, .init_failed);
+        return report.fail(.internal_error);
+    };
+    traceEventFmt(trace_fd, "child.helper_threads.pinned=cache_release:{d}", .{
+        limits.worker.thread_cache_idle_release_ns,
+    });
+
     var seeds: bindings.RandomSeeds = undefined;
     std.posix.getrandom(std.mem.asBytes(&seeds)) catch {
         worker_state.metrics.?.setState(.dead, .init_failed);
@@ -313,6 +366,24 @@ fn workerChildMainImpl(zygote: *state.Zygote, child_init_fd: std.posix.fd_t, rep
         return report.fail(.internal_error);
     };
     traceEventFmt(trace_fd, "child.gc_override={d}", .{gc_max_heap_size_bytes});
+
+    // The engine measures its memory against the worker's limit, as its
+    // leaf's `memory.current`, which is what `memory.high` bounds, tmpfs and
+    // kernel memory included; its own figure, from the zygote's statm and
+    // the machine's memory, says nothing about the worker. The engine reads
+    // the descriptor with pread, which the filter keeps.
+    bindings.setMemoryStatusOverride(received.message.memory_limit_bytes, leaf.memory_current_fd) catch {
+        worker_state.metrics.?.setState(.dead, .init_failed);
+        return report.fail(.internal_error);
+    };
+    const memory_status = bindings.memoryStatus() catch {
+        worker_state.metrics.?.setState(.dead, .init_failed);
+        return report.fail(.internal_error);
+    };
+    traceEventFmt(trace_fd, "child.memory_status={d},{d}", .{
+        memory_status.footprint_bytes,
+        received.message.memory_limit_bytes,
+    });
     stampBootPhase(&boot_stamps, &maybe_metrics, .vm_resumed);
 
     // The fs index is mapped after the chroot, so the working directory and
@@ -334,7 +405,7 @@ fn workerChildMainImpl(zygote: *state.Zygote, child_init_fd: std.posix.fd_t, rep
 
     const runtime_options = runtimeOptionsFromWorkerInit(&received.message, .{
         .clock = worker_runtime.Clock.monotonic(),
-        .memory_events_fd = memory_events.fd,
+        .memory_events_fd = leaf.memory_events_fd,
         .trace_fd = trace_fd,
         .ingress_payload_fd = received.ingress_payload_fd,
         .ingress_payload_credit_eventfd = received.takeIngressPayloadCreditEventfd(),
@@ -343,6 +414,9 @@ fn workerChildMainImpl(zygote: *state.Zygote, child_init_fd: std.posix.fd_t, rep
         // above runs after the runtime's deferred teardown below.
         .route_table = mapped_route_table,
         .isolate_realm = received.message.isolatesRealms(),
+        // Every evaluation of a route module copies it, so top-level code
+        // fetches under it (`worker/runtime/evaluations.zig`).
+        .boot_egress_token = received.message.boot_egress_token,
     });
     traceEvent(trace_fd, "child.runtime_options.resolved");
 
@@ -398,15 +472,12 @@ fn workerChildMainImpl(zygote: *state.Zygote, child_init_fd: std.posix.fd_t, rep
 
     // Every thread the worker will ever have must exist before seccomp denies
     // clone; after it, WTF's Thread::create aborts the process. So every
-    // AutomaticThread is pinned against retiring, then every compiler thread
-    // is started: the JS worklist, which serves all JIT tiers, and the wasm
-    // worklist. Each would otherwise start lazily on its first enqueue. They
-    // start with empty queues and park until work arrives. collo_vm_create
-    // sizes both worklists so this set is complete.
-    bindings.setHelperThreadsTimeoutOverrideNs(WORKER_HELPER_THREAD_PIN_TIMEOUT_NS) catch {
-        worker_state.metrics.?.setState(.dead, .init_failed);
-        return report.fail(.internal_error);
-    };
+    // compiler thread is started now, under the pin set after
+    // `postForkChild`: the JS worklist, which serves all JIT tiers, and the
+    // wasm worklist, each of which would otherwise start lazily on its first
+    // enqueue, and the collector thread. They start with empty queues and
+    // park until work arrives. collo_vm_create sizes both worklists so this
+    // set is complete.
     zygote.vm.prespawnCompilerThreads() catch |err| {
         worker_state.metrics.?.setState(.dead, .init_failed);
         std.log.err("worker compiler thread pre-spawn failed: {s}", .{@errorName(err)});
@@ -446,23 +517,6 @@ fn workerChildMainImpl(zygote: *state.Zygote, child_init_fd: std.posix.fd_t, rep
         return report.fail(.internal_error);
     };
     traceEvent(trace_fd, "child.node_fs.enabled");
-
-    // The boot context is the identity that module top-level code uses for
-    // fetches and timers, installed for every child that serves routes
-    // (`WorkerInit.flag_serves_routes`). Without it, top-level fetch and
-    // timers stay denied; a failed install degrades to that state rather than
-    // failing the init.
-    if (received.message.servesRoutes()) {
-        if (runtime.installBootContext(&received.message.boot_egress_token)) {
-            traceEvent(trace_fd, "child.boot_context.installed");
-        } else |err| {
-            std.log.err("boot context install failed; instance-scoped fetch stays denied: {s}", .{
-                @errorName(err),
-            });
-            traceEvent(trace_fd, "child.boot_context.failed");
-        }
-    }
-    stampBootPhase(&boot_stamps, &maybe_metrics, .boot_context_ready);
 
     // The definition's pack is registered and every route's entry evaluated
     // before ready, so a ready worker's first request needs no module work.
@@ -549,6 +603,10 @@ fn recvWorkerInitBeforeTimeout(
     return ipc.recvWorkerInit(fd);
 }
 
+/// Closes every descriptor WorkerInit did not bring, except the init socket
+/// and the trace pipe, and points the standard descriptors at /dev/null. The
+/// leaf files the child keeps (`worker_boot/cgroup.zig:OpenedWorkerLeaf`)
+/// are opened after it, so they need no place in the allowlist.
 fn closeUnexpectedWorkerFds(
     child_init_fd: std.posix.fd_t,
     trace_fd: ?std.posix.fd_t,
@@ -590,15 +648,16 @@ fn closeUnexpectedWorkerFds(
         len += 1;
     }
 
-    // The receiver took the wake descriptors always and the regions whole or
-    // not at all, so a half that is not whole has only its wake descriptors.
+    // The receiver took the wake descriptors exactly with `flag_egress` and
+    // the regions whole or not at all, so a set that is not whole has its
+    // wake descriptors or nothing.
     const egress = received.egress_shared_fds;
     if (egress.isValid()) {
         for (egress.asArray()) |fd| {
             allow[len] = fd;
             len += 1;
         }
-    } else {
+    } else if (received.message.hasEgress()) {
         for (egress.wakeFds().asArray()) |fd| {
             allow[len] = fd;
             len += 1;
@@ -630,7 +689,21 @@ fn validateWorkerInitFds(received: *const ipc.WorkerInitWithFds) !void {
     // filesystem access.
     try fd_mod.requireSeals(received.fs_index_fd, fd_mod.memfd_readonly_seals);
     try validateSeqpacketSocketFd(received.fs_fault_fd);
-    const egress_wake = received.egress_shared_fds.wakeFds();
+    try validateEgressFds(&received.message, received.egress_shared_fds);
+}
+
+/// A worker whose definition has a network grant gets its wake descriptors
+/// (`flag_egress`), and one without gets no egress descriptor at all, so it
+/// has nothing to reach a gateway with. The receiver already counted them
+/// against the flag; this checks what they are, while /proc can still name
+/// an eventfd.
+fn validateEgressFds(message: *const ipc.WorkerInit, egress: ipc.egress_shared.RawFds) !void {
+    if (!message.hasEgress()) {
+        if (!egress.isEmpty())
+            return error.UnexpectedEgressFds;
+        return;
+    }
+    const egress_wake = egress.wakeFds();
     try fd_mod.requireEventFd(egress_wake.command_eventfd);
     try fd_mod.requireEventFd(egress_wake.completion_eventfd);
 }
@@ -638,19 +711,18 @@ fn validateWorkerInitFds(received: *const ipc.WorkerInitWithFds) !void {
 fn validateSeqpacketSocketFd(fd: std.posix.fd_t) !void {
     if (fd < 0)
         return error.InvalidFsFaultFd;
-    var sock_type: u32 = 0;
-    var option_len: u32 = @sizeOf(u32);
-    const rc = std.os.linux.getsockopt(
-        fd,
-        std.posix.SOL.SOCKET,
-        std.posix.SO.TYPE,
-        std.mem.asBytes(&sock_type),
-        &option_len,
-    );
-    if (std.os.linux.E.init(rc) != .SUCCESS or option_len != @sizeOf(u32))
+    const socket_type = socket.socketType(fd) catch return error.InvalidFsFaultFd;
+    if (socket_type != std.posix.SOCK.SEQPACKET)
         return error.InvalidFsFaultFd;
-    if (sock_type != std.posix.SOCK.SEQPACKET)
-        return error.InvalidFsFaultFd;
+}
+
+/// Fails unless glibc's CPU clock id for the calling thread is the one the
+/// kernel builds from the thread's own id, which holds only when glibc's
+/// cached thread id is the thread's own.
+fn validateOwnThreadIdentity() !void {
+    const libc_clock = try process.libcThreadCpuClockId();
+    if (libc_clock != process.threadCpuClockId(std.os.linux.gettid()))
+        return error.ThreadIdentityMismatch;
 }
 
 fn mapRouteTableReadOnly(
@@ -711,6 +783,11 @@ fn markInitFailedIfPossible(metrics_fd: std.posix.fd_t) void {
 fn runtimeOptionsFromWorkerInit(message: *const ipc.WorkerInit, base: worker_runtime.RuntimeOptions) worker_runtime.RuntimeOptions {
     var options = base;
     options.limits = runtimeLimitsFromBootOptions(&message.runtime);
+    // The definition's limits on JavaScript, checked by `WorkerInit.validate`:
+    // each request's CPU budget, and the wall time JavaScript no request owns
+    // may run at a stretch.
+    options.request_cpu_budget_ns = message.request_cpu_budget_ns;
+    options.unowned_time_limit_ns = message.unowned_time_limit_ns;
     options.trace_requests = (message.runtime.runtime_flags & ipc.WorkerRuntimeBootOptions.flag_trace_requests) != 0;
     options.trace_all_requests = (message.runtime.runtime_flags & ipc.WorkerRuntimeBootOptions.flag_trace_all_requests) != 0;
     options.bench_handler =
@@ -727,7 +804,6 @@ fn runtimeLimitsFromBootOptions(options: *const ipc.WorkerRuntimeBootOptions) wo
         .ready_queue_capacity = @intCast(options.ready_queue_capacity),
         .request_task_capacity = @intCast(options.request_task_capacity),
         .crypto_thread_count = @intCast(options.crypto_thread_count),
-        .crypto_thread_stack_bytes = @intCast(options.crypto_thread_stack_bytes),
         .crypto_max_in_flight_per_request = @intCast(options.crypto_max_in_flight_per_request),
         .crypto_max_in_flight_per_worker = @intCast(options.crypto_max_in_flight_per_worker),
     };

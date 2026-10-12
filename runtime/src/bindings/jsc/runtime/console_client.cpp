@@ -19,6 +19,7 @@
 #include <JavaScriptCore/JSDateMath.h>
 #include <JavaScriptCore/JSMap.h>
 #include <JavaScriptCore/JSSet.h>
+#include <JavaScriptCore/MarkedVector.h>
 #include <JavaScriptCore/ProxyObject.h>
 #include <JavaScriptCore/RegExpObject.h>
 #include <JavaScriptCore/ScriptArguments.h>
@@ -31,6 +32,8 @@
 #include <wtf/text/StringBuilder.h>
 #include <wtf/text/StringConcatenateNumbers.h>
 #include <wtf/unicode/CharacterNames.h>
+
+#include <algorithm>
 
 using namespace JSC;
 using Inspector::ScriptArguments;
@@ -58,7 +61,9 @@ namespace {
         JSC::VM& vm;
         // Growth cap in UTF-16 units: the sink's byte budget plus console_unit_slack.
         size_t unit_budget;
-        WTF::Vector<JSObject*, 8> seen;
+        // The objects being formatted, innermost last, for cycle detection; rooted like any list of cells kept across
+        // allocation.
+        JSC::MarkedVector<JSObject*, 8> seen;
         bool saw_termination { false };
     };
 
@@ -306,7 +311,7 @@ namespace {
 
     void appendObject(InspectState& state, StringBuilder& builder, JSObject* object, unsigned depth)
     {
-        if (state.seen.contains(object)) {
+        if (std::find(state.seen.begin(), state.seen.end(), object) != state.seen.end()) {
             builder.append("[Circular]"_s);
             return;
         }
@@ -550,26 +555,21 @@ bool ConsoleClient::sinkActive() const { return owner->console_sink != nullptr; 
 
 uint64_t ConsoleClient::currentRequestId() const
 {
-    if (owner->current_exec_ctx)
-        return owner->current_exec_ctx->request_id;
-    if (owner->boot_exec_ctx_installed)
-        return owner->boot_exec_ctx.request_id;
-    return 0;
+    ColloExecCtx* exec_ctx = Collo::ownerExecCtx(*owner);
+    return exec_ctx ? exec_ctx->request_id : 0;
 }
 
 // Past either per-request cap, ColloVm::console_request_lines_max or console_request_bytes_max, a request's further
 // console calls are not formatted, and each reaches the sink only as a drop marker carrying no bytes, which the worker
 // runtime counts into the log ring's dropped-lines counter.
 
-// Output from the boot identity, the installed boot exec context, or from id 0, meaning no exec context at all,
-// belongs to no request. Both identities last as long as the worker, so charging them a per-request cap would
-// silence background output for good once their lifetime spend crossed it. The log ring's drop-newest policy
-// already bounds that output, so it is never checked, charged or tracked.
+// Output with no owner, id 0, or under an id above COLLO_REQUEST_ID_MAX, a module evaluation or the worker owner,
+// belongs to no request. The worker owner lasts as long as the worker, so charging it a per-request cap would silence
+// background output for good once its lifetime spend crossed it. The log ring's drop-newest policy already bounds
+// that output, so it is never checked, charged or tracked.
 bool ConsoleClient::budgetExempt(uint64_t request_id) const
 {
-    if (request_id == 0)
-        return true;
-    return owner->boot_exec_ctx_installed && request_id == owner->boot_exec_ctx.request_id;
+    return request_id == 0 || request_id > COLLO_REQUEST_ID_MAX;
 }
 
 bool ConsoleClient::requestOutputExhausted(uint64_t request_id) const

@@ -1,16 +1,25 @@
 //! The one place that knows how to link a Zig object against the JSC bridge,
-//! the JSC static archives, BoringSSL, ICU and compiler-rt.
+//! the JSC static archives, ICU, BoringSSL, the codecs and compiler-rt.
+//!
+//! Every library Collo runs is linked statically from a pinned build; the
+//! only shared objects an executable names are the platform's (libc, libm,
+//! libstdc++, libgcc_s and the dynamic loader), and the loader functions it
+//! imports are the few that linked code calls without loading a library.
+//! `runtime/tests/contracts/binary_dependencies.zig` checks both on the
+//! installed binary. No `-ldl` is linked.
 const std = @import("std");
+const codecs_mod = @import("codecs.zig");
+const deps_mod = @import("deps.zig");
 const toolchain_mod = @import("toolchain.zig");
 const shims = @import("shims.zig");
-const zstd_mod = @import("zstd.zig");
 
 pub const LinkContext = struct {
     toolchain: *const toolchain_mod.ToolchainPaths,
     jsc_build_dir: []const u8,
     jsc_step: ?*std.Build.Step.Run,
-    boringssl_build_dir: []const u8,
-    zstd_link: zstd_mod.LinkMode,
+    icu: deps_mod.Icu,
+    boringssl: deps_mod.BoringSsl,
+    codecs: *const codecs_mod.Codecs,
     link_quadmath: bool,
     /// Zig compiler-rt for the external link, from `addCompilerRtCarrier`.
     /// Built per (target, optimize) like every other object in the link.
@@ -60,6 +69,10 @@ pub fn addJscLink(b: *std.Build, ctx: LinkContext, in: LinkInputs) LinkedArtifac
     link.setName(b.fmt("link {s}", .{in.name}));
     if (ctx.jsc_step) |step|
         link.step.dependOn(&step.step);
+    // The ICU and BoringSSL archives are named by path, which carries no
+    // step, so the link waits on the builds that produce them.
+    link.step.dependOn(&ctx.icu.step.step);
+    link.step.dependOn(&ctx.boringssl.step.step);
     toolchain_mod.addCxxTargetArgs(link, ctx.toolchain);
     for (in.sanitizer.linkArgs()) |arg|
         link.addArg(arg);
@@ -82,13 +95,16 @@ pub fn addJscLink(b: *std.Build, ctx: LinkContext, in: LinkInputs) LinkedArtifac
     link.addFileArg(.{ .cwd_relative = b.pathJoin(&.{ ctx.jsc_build_dir, "lib/libWTF.a" }) });
     link.addFileArg(.{ .cwd_relative = b.pathJoin(&.{ ctx.jsc_build_dir, "lib/libbmalloc.a" }) });
     link.addArg("-Wl,--end-group");
-    link.addFileArg(b.path(b.pathJoin(&.{ ctx.boringssl_build_dir, "libssl.a" })));
-    link.addFileArg(b.path(b.pathJoin(&.{ ctx.boringssl_build_dir, "libcrypto.a" })));
-    zstd_mod.addToCxxLink(b, link, ctx.toolchain, ctx.zstd_link);
-    link.addArg("-ldl");
-    link.addArg("-licuuc");
-    link.addArg("-licui18n");
-    link.addArg("-licudata");
+    // WTF and JSC call ICU, so its archives follow theirs.
+    for (ctx.icu.archives(b)) |archive|
+        link.addFileArg(.{ .cwd_relative = archive });
+    for (ctx.boringssl.archives(b)) |archive|
+        link.addFileArg(.{ .cwd_relative = archive });
+    codecs_mod.addToCxxLink(link, ctx.codecs);
+    // A platform library enters DT_NEEDED only when something references
+    // it, whatever the driver's default, so the binary's dependencies are
+    // decided by its code.
+    link.addArg("-Wl,--as-needed");
     link.addArg("-latomic");
     link.addArg("-lm");
     if (ctx.link_quadmath)

@@ -1,4 +1,4 @@
-//! Fetch task bookkeeping: cancellation, the boot context's reap, and
+//! Fetch task bookkeeping: cancellation, an evaluation's reap, and
 //! publishing a task's result to the ready queue. Runs on the worker's event
 //! loop thread. Body storage belongs to `body/`, and packet I/O to
 //! `gateway_control.zig` and `gateway_runtime.zig`. A request's fetch count
@@ -15,25 +15,36 @@ const gateway_control = @import("gateway_control.zig");
 const FetchResult = task_mod.Result;
 const FetchTask = task_mod.Task;
 
-/// Marks every task of `request_id` canceled and asks the gateway to stop each
-/// one, for request cleanup. A canceled task ends when its completion runs
-/// (`completion_runtime.execute`): its promise is rejected while the request
-/// is still active, and once the request is gone the task is destroyed
-/// without running JS.
+/// Cancels every task of `request_id` (`cancelTask`), for request cleanup.
 pub fn cancelForRequest(runtime: *egress_context.Context, request_id: u64) void {
     var iterator = runtime.egress_state.tasks.iterator();
     while (iterator.next()) |entry| {
         const task = entry.value_ptr.*;
-        if (task.request_id == request_id) {
-            if (runtime.egress_state.shared != null)
-                gateway_control.sendCancel(runtime, task.id, "request canceled");
-            task.markCanceled();
-        }
+        if (task.request_id == request_id)
+            cancelTask(runtime, task, "request canceled");
     }
 }
 
-/// Destroys every task of `request_id` in place, for the boot context's close
-/// (`Runtime.closeBootContext` in `runtime/boot_context.zig`). That context is
+/// Marks `task` canceled, the one way a task is canceled. A canceled task
+/// ends when its completion runs (`completion_runtime.execute`): its promise
+/// is rejected while its request is still active, and once the request is
+/// gone the task is destroyed without running JS. A task whose start is in
+/// the gateway's command ring is told to stop, and the gateway's answer
+/// queues that completion. A task whose start never left, parked on a full
+/// ring, has nothing at the gateway to answer for it, and a cancel would
+/// only cost the session a strike for a fetch it never heard of, so it
+/// publishes its own failure and its completion runs from the ready queue.
+fn cancelTask(runtime: *egress_context.Context, task: *FetchTask, gateway_reason: []const u8) void {
+    task.markCanceled();
+    if (task.start_sent) {
+        gateway_control.sendCancel(runtime, task.id, gateway_reason);
+        return;
+    }
+    publishResult(runtime, task, .{ .failure = .{ .message = "fetch aborted", .owned = false } });
+}
+
+/// Destroys every task of `request_id` in place, for an evaluation's close
+/// (`Runtime.closeEvaluation` in `runtime/evaluations.zig`). That context is
 /// discarded natively, so no JS can observe these promises, and the gateway
 /// may never send a completion for a canceled fetch to destroy its task. A
 /// completion already queued then finds no task, which
@@ -54,8 +65,9 @@ pub fn reapForRequest(runtime: *egress_context.Context, request_id: u64) void {
         const fetch_id = reap_id orelse return;
         const removed = runtime.egress_state.tasks.fetchRemove(fetch_id) orelse return;
         const task = removed.value;
-        if (runtime.egress_state.shared != null)
-            gateway_control.sendCancel(runtime, task.id, "boot context closed");
+        // A start that never left has nothing at the gateway to stop.
+        if (task.start_sent)
+            gateway_control.sendCancel(runtime, task.id, "evaluation closed");
         if (task.result) |*stale_result| {
             stale_result.deinit();
             task.result = null;
@@ -66,24 +78,24 @@ pub fn reapForRequest(runtime: *egress_context.Context, request_id: u64) void {
     }
 }
 
-/// Aborts fetch `fetch_id` for JS and takes ownership of `reason`. The gateway
-/// is asked to stop. A task still waiting is marked canceled and keeps
-/// `reason` for its rejection; once the task is gone, the reason goes to the
-/// fetch's bodies instead.
+/// Aborts fetch `fetch_id` for JS and takes ownership of `reason`. A task
+/// still waiting keeps `reason` for its rejection and is canceled
+/// (`cancelTask`), so a fetch whose start never left rejects at once. Once
+/// the task is gone its head arrived, so the gateway is asked to stop the
+/// body it still streams, and the reason goes to the fetch's bodies.
 pub fn cancel(runtime: *egress_context.Context, fetch_id: u64, reason: ?bindings.Value) void {
     var owned_reason = reason;
     defer if (owned_reason) |*value|
         value.deinit();
 
-    gateway_control.sendCancel(runtime, fetch_id, "fetch aborted");
-
     if (runtime.egress_state.tasks.get(fetch_id)) |task| {
-        task.markCanceled();
         if (owned_reason) |*value| {
             task.setAbortReason(value);
             owned_reason = null;
         }
+        cancelTask(runtime, task, "fetch aborted");
     } else {
+        gateway_control.sendCancel(runtime, fetch_id, "fetch aborted");
         // `cancelForFetch` takes ownership of the reason.
         fetch_body_runtime.cancelForFetch(runtime, fetch_id, owned_reason);
         owned_reason = null;

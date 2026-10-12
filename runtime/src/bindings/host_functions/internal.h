@@ -33,10 +33,10 @@
 namespace Collo::HostFunctions {
 
 // Defines the functions and classes globals.def lists, `self`, and any explicit resource management symbol the engine
-// lacks. collo_vm_create calls it unless the options disable Web APIs, so in production the zygote installs these
-// globals once and every worker inherits them. It has no failure path: JSC aborts the process when a cell allocation
-// fails, and the install helpers abort when an object they define is missing afterwards, so a change to that policy
-// aborts rather than leaving a global half built.
+// lacks. collo_vm_create calls it unless its flags hold COLLO_VM_CREATE_DISABLE_WEB_APIS, so in production the zygote
+// installs these globals once and every worker inherits them. It has no failure path: JSC aborts the process when a
+// cell allocation fails, and the install helpers abort when an object they define is missing afterwards, so a change
+// to that policy aborts rather than leaving a global half built.
 void install(Collo::GlobalObject* global_object, JSC::VM& vm);
 // Defines the `process` global: an empty `env`, plus `platform`, `version` and `pid`. A worker child calls it after the
 // fork through collo_vm_install_process, so `pid` is the worker's own. Returns COLLO_STATUS_INVALID_ARGUMENT for a null

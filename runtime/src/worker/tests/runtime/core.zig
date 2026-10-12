@@ -3,9 +3,10 @@
 //! timer, immediate and fetch needs, the callback budget timers and
 //! immediates share, the requeue slot a running interval holds, immediates
 //! collected one generation at a time, the backlog behind a full ready
-//! queue, and how `Runtime.init` takes its boot flags and resolves limits
-//! left at zero. Timer and immediate callbacks that run JavaScript are
-//! covered by the web API `timers` suite (`runtime/tests/webapi/timers/`,
+//! queue, how `Runtime.init` takes its boot flags and resolves limits left
+//! at zero, and the precedence of a turn's outcomes
+//! (`js/jsc/turn.zig:turnOutcome`). Timer and immediate callbacks that run
+//! JavaScript are covered by the web API `timers` suite (`runtime/tests/webapi/timers/`,
 //! `webapi-test`), and the cancellation of a finished request's timers and
 //! immediates by `lifecycle.zig`. Runs in `worker-test`.
 
@@ -329,7 +330,6 @@ test "runtime consumes pre-resolved boot flags and normalizes auto limits" {
         .log_full_js_exceptions = false,
         .limits = .{
             .crypto_thread_count = 0,
-            .crypto_thread_stack_bytes = 0,
             .crypto_max_in_flight_per_request = 0,
             .crypto_max_in_flight_per_worker = 0,
         },
@@ -344,10 +344,6 @@ test "runtime consumes pre-resolved boot flags and normalizes auto limits" {
     // per-request cap (`resolveAutoRuntimeLimits` in `runtime/types.zig`).
     try std.testing.expectEqual(@as(usize, 2), runtime.core.limits.crypto_thread_count);
     try std.testing.expectEqual(
-        @as(usize, 4 * 1024 * 1024),
-        runtime.core.limits.crypto_thread_stack_bytes,
-    );
-    try std.testing.expectEqual(
         @as(usize, 6),
         runtime.core.limits.crypto_max_in_flight_per_request,
     );
@@ -355,4 +351,17 @@ test "runtime consumes pre-resolved boot flags and normalizes auto limits" {
         @as(usize, 384),
         runtime.core.limits.crypto_max_in_flight_per_worker,
     );
+}
+
+// The drain's exception used to replace any operation result, a Zig error
+// included, so an out-of-memory became the tenant's `js_exception` instead
+// of reaching the request's boundary.
+test "a turn's operation error wins over its drain's exception, and its exit error over both" {
+    const turnOutcome = worker.testing.turn.turnOutcome;
+    try std.testing.expectEqual(.operation_error, turnOutcome(false, true, true));
+    try std.testing.expectEqual(.operation_error, turnOutcome(false, true, false));
+    try std.testing.expectEqual(.drain_exception, turnOutcome(false, false, true));
+    try std.testing.expectEqual(.operation, turnOutcome(false, false, false));
+    try std.testing.expectEqual(.exit_error, turnOutcome(true, true, true));
+    try std.testing.expectEqual(.exit_error, turnOutcome(true, false, false));
 }

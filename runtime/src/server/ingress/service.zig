@@ -1,12 +1,12 @@
 //! The server's HTTP/2 ingress service: one lane thread per listener, fixed
 //! for the service's life, and the threads around them. A metrics thread
-//! drains usage records, console lines and access records every tick and
-//! flushes the analytics record files (`analytics_drain.zig`); a console
-//! thread is the only writer of console lines to stderr while the service
-//! runs; the launcher (`server/supervisor/launcher.zig`) turns pool claims
-//! into published workers and watches the zygote; the reaper
-//! (`server/supervisor/reaper/`) owns every worker retirement and watches
-//! the workers no lane reads.
+//! drains console lines, usage records and access records every tick, takes
+//! faulty workers out of service and flushes the analytics record files
+//! (`analytics_drain.zig`); a console thread is the only writer of console
+//! lines to stderr while the service runs; the launcher
+//! (`server/supervisor/launcher.zig`) turns pool claims into published
+//! workers and watches the zygote; the reaper (`server/supervisor/reaper/`)
+//! owns every worker retirement and watches the workers no lane reads.
 //!
 //! This file holds `Service` and its lifecycle: `init`, `run`, which starts
 //! every thread above and stops them in order, the stop flag, the fatal
@@ -27,8 +27,11 @@
 //! Start order is console, metrics, reaper, launcher, lanes; a stop runs the
 //! producers down before their consumers (`stopAndDrainForExit`): the lanes
 //! finish their requests while the launcher still publishes workers to their
-//! waiters, then the launcher ends its launches into the reaper's queue, then
-//! the reaper stops and the exiting thread tears down what it left.
+//! waiters and the metrics and console threads still drain what they
+//! produce, which keep running past the stop flag until their own stop
+//! (`observability_stop`); then the launcher ends its launches into the
+//! reaper's queue, then the reaper stops and the exiting thread tears down
+//! what it left.
 //!
 //! Borrowed from `Server` (`server/main.zig`), all outliving this service:
 //! the listeners, the supervisor, the egress gateway manager, whose loss
@@ -71,6 +74,10 @@ pub const Service = struct {
     tls_context: *tls_mod.BoringSslContext,
     hard_timeout_grace_ns: u64,
     stop_requested: *std.atomic.Value(bool),
+    /// Ends the metrics and console threads' loops. Raised only once every
+    /// lane has joined (`stopAndDrainForExit`), since those threads consume
+    /// what the lanes produce until then.
+    observability_stop: std.atomic.Value(bool) = .init(false),
     lane_cpu_ids: []const usize,
     ingress_tcp_notsent_lowat_bytes: u32,
     lanes: []LaneRunner,
@@ -207,7 +214,7 @@ pub const Service = struct {
             },
             .zygote_process = self.supervisor.zygote_process,
             .routes = self.routes,
-            .worker_cgroup_root = self.supervisor.worker_cgroup_root,
+            .worker_host = self.supervisor.worker_host,
             .boot = self.worker_boot,
             .tmpfs_size_bytes = self.worker_tmpfs_size_bytes,
             .launches_per_definition_max = scheduler_limits.capacity.pool_cold_starts_in_flight_max,
@@ -375,18 +382,22 @@ pub const Service = struct {
     /// Stops what `run` started, producers before their consumers. The lanes
     /// stop taking requests and serve the ones they hold; a request still
     /// waiting gets a worker the launcher publishes, or 503 at its deadline.
-    /// The metrics and console threads end their last tick next, so the
-    /// console drain's death path (`analytics_drain.zig`) queues no
-    /// retirement after the reaper's last drain. The launcher then ends its
-    /// launches in flight as `.stopping`, which queues what they left to the
-    /// reaper. The reaper stops last, and what its queue still holds is torn
-    /// down on this thread: shutdown owns the latency. Runs once.
+    /// The metrics and console threads keep draining meanwhile, since the
+    /// stop flag does not end them: only once every lane has joined does
+    /// `observability_stop` rise and they end their last tick, before the
+    /// launcher and the reaper stop, so the analytics drain's death path
+    /// (`analytics_drain.zig`) queues no retirement after the reaper's last
+    /// drain. The launcher then ends its launches in flight as `.stopping`,
+    /// which queues what they left to the reaper. The reaper stops last, and
+    /// what its queue still holds is torn down on this thread: shutdown owns
+    /// the latency. Runs once.
     fn stopAndDrainForExit(self: *Service, started: *Started) void {
         if (started.drained)
             return;
         started.drained = true;
         self.requestStopSignal();
         self.stopAndJoinAllLanes();
+        self.observability_stop.store(true, .release);
         if (started.metrics) |thread|
             thread.join();
         if (started.console) |thread|

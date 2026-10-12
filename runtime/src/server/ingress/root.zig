@@ -13,7 +13,8 @@
 //! error a lane meets into the connection, worker or lane failure domain.
 //! `http2/` is the connection protocol, `completions.zig` a lane's
 //! registration of one worker, `analytics_drain.zig` the metrics thread's
-//! drain of console lines and access records, `peer_address.zig` the
+//! tick over console lines, usage records and access records and the
+//! workers it takes out of service, `peer_address.zig` the
 //! client's address and `server_responses.zig` the responses a lane writes
 //! without a worker.
 

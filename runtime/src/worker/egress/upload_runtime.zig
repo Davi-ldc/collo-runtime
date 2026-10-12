@@ -11,6 +11,13 @@
 //! eventfd both when it returns upload extents and after a drain pass that
 //! found commands dropped on a full ring, so a parked task is always woken
 //! once space returns.
+//!
+//! A pooled start also waits for room in the session's upload reservations
+//! (`State.uploadRoom`), so the worker never announces more pooled bytes
+//! than the gateway admits in flight. Room returns only with a completion
+//! packet that ends a reserved fetch, after which the pump runs, and a
+//! start waits only while some fetch holds a reservation, since one body
+//! never exceeds the whole room.
 
 const std = @import("std");
 const ipc = @import("collo_ipc");
@@ -32,6 +39,10 @@ pub fn ensureTaskUploadProgress(runtime: *egress_context.Context, task: *FetchTa
     if (!task.start_sent) {
         sendStart(runtime, task) catch |err| switch (err) {
             error.EgressSharedRingFull => return park(runtime, task),
+            error.EgressUploadRoomExhausted => {
+                runtime.egress_state.upload_room_waiter = true;
+                return park(runtime, task);
+            },
             else => return err,
         };
         task.start_sent = true;
@@ -69,11 +80,24 @@ fn sendStart(runtime: *egress_context.Context, task: *FetchTask) !void {
     const pooled = task.bodyPooled();
     if (task.body.len > ipc.fetch_limits.request_body_pooled_bytes_max)
         return error.EgressGatewayRequestBodyLimitExceeded;
+    if (pooled) {
+        // A start waiting for room already goes first, so a small start
+        // cannot keep a large one waiting.
+        const egress_state = runtime.egress_state;
+        if (egress_state.upload_room_waiter or task.body.len > egress_state.uploadRoom())
+            return error.EgressUploadRoomExhausted;
+        try egress_state.upload_reservations.ensureUnusedCapacity(runtime.allocator, 1);
+    }
 
-    // The token is the start's only identity (`ipc.EgressFetchStartHeader`).
-    // `fetch_runtime.schedule` already refused a request without one; this
-    // check keeps `none` off the wire on every later pass too, since the
-    // gateway counts a start it cannot verify against the worker's session.
+    // The token is the start's only identity (`ipc.EgressFetchStartHeader`),
+    // so the worker's own ids never reach the gateway: a request's start
+    // names the request the server minted its token for, and every
+    // evaluation's start presents its copy of the boot token, which names
+    // the boot permit (request id and generation 0), whichever evaluation id
+    // owns the fetch inside the worker. `fetch_runtime.schedule` already
+    // refused an owner without a token; this check keeps `none` off the wire
+    // on every later pass too, since the gateway counts a start it cannot
+    // verify against the worker's session.
     if (ipc.egress_token.isNone(&request.dispatch_work.egress_token))
         return error.FetchWithoutEgressToken;
     const bytes = try ipc.encodeEgressFetchStartInto(runtime.dispatch_recv_scratch, .{
@@ -96,6 +120,8 @@ fn sendStart(runtime: *egress_context.Context, task: *FetchTask) !void {
         bytes,
         ipc.egress_shared.command_control_reserve_bytes,
     );
+    if (pooled)
+        runtime.egress_state.reserveUpload(task.id, task.body.len);
 }
 
 fn progressPooledBody(runtime: *egress_context.Context, task: *FetchTask) !void {
@@ -196,6 +222,8 @@ fn park(runtime: *egress_context.Context, task: *FetchTask) void {
 }
 
 fn pumpPendingUploads(runtime: *egress_context.Context) void {
+    // Every start that still finds no room in this pass sets it again.
+    runtime.egress_state.upload_room_waiter = false;
     if (runtime.egress_state.pending_uploads.items.len == 0)
         return;
     // The queue moves aside and unfinished tasks park again in the fresh

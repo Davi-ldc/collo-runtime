@@ -6,3 +6,9 @@ Patches: patches/boringssl
 BoringSSL does not provide stability-branch semantics. Upstream periodic
 0.YYYYMMDD.N tags are snapshots for consumers that need tags; Collo pins this
 snapshot and should update intentionally.
+
+Consumed as a shallow checkout of this commit (`zig build deps-provision`).
+`zig build boringssl` applies the series to a worktree of the commit and
+builds `libssl.a` and `libcrypto.a` with CMake into
+`runtime/deps/boringssl-build/<triple>/`; the checkout itself is never
+edited.

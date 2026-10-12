@@ -108,14 +108,13 @@ const Category = enum(u8) {
     anonymous_executable_jit,
     collo_executable,
     jsc_file,
-    icu_file,
     stdlib_file,
     libc_file,
     kernel_mapping,
     file_other,
 };
 
-const category_count = 12;
+const category_count = @typeInfo(Category).@"enum".fields.len;
 
 const Snapshot = struct {
     total: Totals = .{},
@@ -225,7 +224,7 @@ fn runVariant(
     iterations_per_call: u32,
 ) !void {
     try bindings.setHelperThreadsTimeoutOverrideNs(fork_helper_timeout_ns);
-    defer bindings.clearHelperThreadsTimeoutOverride();
+    defer bindings.clearHelperThreadsOverrides();
     try bindings.prepareProcessForFork();
 
     const self_pid: u32 = @intCast(std.c.getpid());
@@ -700,7 +699,7 @@ fn invokeWorkloadInChild(
 ) !u64 {
     var exec_ctx = bindings.ExecCtx.init(1);
     try vm.turnEnter(&exec_ctx);
-    const invoke_result = vm.invoke(allocator, &exec_ctx, entry, null, &.{});
+    const invoke_result = vm.mainRealm().invoke(allocator, &exec_ctx, entry, null, &.{});
     const exit_result = vm.turnExitResult();
     try handleTurnExit(vm, exit_result);
 
@@ -798,7 +797,7 @@ fn unwrapValueResult(
 }
 
 fn valueToUtf8Ok(vm: *bindings.Vm, value: *const bindings.Value) !bindings.OwnedString {
-    return switch (try vm.valueToUtf8Copy(value)) {
+    return switch (try vm.mainRealm().valueToUtf8Copy(value)) {
         .success => |text| text,
         .exception => |exception| {
             var owned = exception;
@@ -1013,8 +1012,6 @@ fn categoryFor(permissions: []const u8, path: []const u8) Category {
         return .collo_executable;
     if (std.mem.containsAtLeast(u8, path, 1, "JavaScriptCore"))
         return .jsc_file;
-    if (std.mem.containsAtLeast(u8, path, 1, "libicu"))
-        return .icu_file;
     if (std.mem.containsAtLeast(u8, path, 1, "libstdc++"))
         return .stdlib_file;
     if (std.mem.containsAtLeast(u8, path, 1, "libc.so") or
@@ -1325,7 +1322,6 @@ const category_names = [_][]const u8{
     "anonymous_executable_jit",
     "collo_executable",
     "jsc_file",
-    "icu_file",
     "stdlib_file",
     "libc_file",
     "kernel_mapping",

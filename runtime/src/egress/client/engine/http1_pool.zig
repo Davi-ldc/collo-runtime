@@ -49,7 +49,6 @@ pub fn Methods(
                 origin.host,
                 origin.port,
                 command.config.insecure_tls,
-                command.config.allow_private_networks,
                 command.config.pool_security_cell_id,
                 command.config.pool_policy_id,
             )) {
@@ -64,7 +63,6 @@ pub fn Methods(
                 .authority_host_lower = owned_host,
                 .port = origin.port,
                 .insecure_tls = command.config.insecure_tls,
-                .allow_private_networks = command.config.allow_private_networks,
                 .pool_security_cell_id = command.config.pool_security_cell_id,
                 .pool_policy_id = command.config.pool_policy_id,
             }) catch |err| {
@@ -90,7 +88,6 @@ pub fn Methods(
                 origin.host,
                 origin.port,
                 command.config.insecure_tls,
-                command.config.allow_private_networks,
                 command.config.pool_security_cell_id,
                 command.config.pool_policy_id,
             );
@@ -101,14 +98,12 @@ pub fn Methods(
             host: []const u8,
             port: u16,
             insecure_tls: bool,
-            allow_private_networks: bool,
             pool_security_cell_id: transport.PoolIsolationId,
             pool_policy_id: transport.PoolIsolationId,
         ) bool {
             for (self.http1_origins.items) |hint| {
                 if (hint.port == port and
                     hint.insecure_tls == insecure_tls and
-                    hint.allow_private_networks == allow_private_networks and
                     std.mem.eql(u8, &hint.pool_security_cell_id, &pool_security_cell_id) and
                     std.mem.eql(u8, &hint.pool_policy_id, &pool_policy_id) and
                     std.ascii.eqlIgnoreCase(hint.authority_host_lower, host))

@@ -1,18 +1,25 @@
 //! The local full flow: the server on a TLS listener serving the routes of
 //! `fixtures/local_e2e/collo.json`, a zygote that forks fully sandboxed
-//! workers, and the egress gateway behind them. The tests here drive it with
-//! h2 clients from the TLS test shim and check responses, deadlines, the
-//! handler's `env`, the routes of one definition served by one worker in a
-//! realm each and in one shared realm, a module loaded through `import()`
-//! from the definition's pack, the paths the server answers itself, the
-//! analytics records, and a worker
-//! that outlives its gateway: a gateway killed mid-fetch fails that fetch
-//! with a TypeError, the worker keeps serving, and its fetches reach the
-//! origin again once the launcher attaches it to the next gateway. Four
-//! benchmarks run only when their environment variable is set. How the
-//! server shares and loses workers across requests and lanes is covered in
-//! `workers.zig`, which this file brings into the lane, and the stack both
-//! drive is `harness.zig`. Lane: `local-e2e`
+//! workers, and, for a configuration that grants `network`, the egress
+//! gateway behind them. The tests here drive it with h2 clients from the TLS
+//! test shim and check responses, deadlines, the handler's `env`, the routes
+//! of one definition served by one worker in a realm each and in one shared
+//! realm, a module loaded through `import()` from the definition's pack, the
+//! paths and the heads the server answers itself (404, 431, 413 and 400),
+//! each with one record under an id of its own, the analytics records, the
+//! gateway's OOM score, and a worker that outlives its gateway: a gateway
+//! killed mid-fetch fails that fetch with a TypeError, the worker keeps
+//! serving, and its fetches reach the origin again once the launcher
+//! attaches it to the next gateway. Four benchmarks run only when their
+//! environment variable is set. The static fixture grants no route any
+//! network access; the tests that fetch write a configuration that grants
+//! their origin. How the server shares, loses and retires workers across
+//! requests and lanes is covered in `workers.zig`, what the `network`
+//! setting admits and denies in `network.zig`, bodies streamed from a
+//! ReadableStream in `streams.zig`, and a definition's `cpuMs`, `timeoutMs`
+//! for JavaScript no request owns, `concurrency` and `memoryMiB` in
+//! `limits.zig`, all of which this file brings into the lane, and the stack
+//! they drive is `harness.zig`. Lane: `local-e2e`
 //! (`skills/runtime/references/e2e.md`). The installed binary's own boot and
 //! shutdown under `collo serve` belong to the serve smoke
 //! (`runtime/tests/support/serve_smoke.zig`).
@@ -23,14 +30,18 @@
 //! anchors the fixture paths, and needs the delegated cgroup subtree and a
 //! kernel with a usable kTLS cipher; without either a test skips. A test that
 //! fetches through the gateway also skips on a host with no routable IPv4
-//! address (`GzipOrigin`).
+//! address (`origin.zig`).
 
 const std = @import("std");
+const ipc = @import("collo_ipc");
+const limits = @import("collo_limits");
 const server_main = @import("collo_server_main");
 const config = @import("collo_server_config");
 const routes_mod = @import("collo_server_routes");
 const zygote_support = @import("zygote_support");
 const harness_mod = @import("harness.zig");
+const network_mod = @import("network.zig");
+const origin_mod = @import("origin.zig");
 
 const tls_shim = @import("collo_test_tls_shim");
 const TlsMaterial = tls_shim.TlsMaterial;
@@ -53,16 +64,19 @@ const responseStatus = harness_mod.responseStatus;
 const waitForCompletedRequests = harness_mod.waitForCompletedRequests;
 const waitForRecordLines = harness_mod.waitForRecordLines;
 const dumpZygoteTrace = harness_mod.dumpZygoteTrace;
+const GzipOrigin = origin_mod.GzipOrigin;
+const gzipRoutePath = origin_mod.gzipRoutePath;
 
 comptime {
     _ = @import("workers.zig");
+    _ = @import("streams.zig");
+    _ = @import("limits.zig");
+    _ = network_mod;
 }
 
 test "local e2e drives TLS ALPN h2 through server worker streams" {
     var harness: Harness = undefined;
-    // The gateway spawns on the first worker attach here, the path a server
-    // takes when nothing prewarms it.
-    try harness.init(.{ .prewarm_gateway = false });
+    try harness.init(.{});
     defer harness.deinit();
     errdefer dumpZygoteTrace(&harness.spawned);
 
@@ -95,39 +109,6 @@ test "local e2e drives TLS ALPN h2 through server worker streams" {
     try std.testing.expect(delta.h2_request_body_frames >= 2);
     try std.testing.expect(delta.h2_request_body_bytes >= 11);
     try std.testing.expect(delta.ingress_response_body_bytes >= 4 * 1024 * 1024);
-
-    // A fetch through the egress gateway: the origin answers with
-    // `content-encoding: gzip`, and both `text()` and the streamed body
-    // reader in the worker must see the decoded string.
-    var gzip_origin = try GzipOrigin.start(std.testing.allocator);
-    defer gzip_origin.stop(std.testing.allocator);
-
-    const gzip_path = try gzipRoutePath(std.testing.allocator, "/fetch-gzip", gzip_origin);
-    defer std.testing.allocator.free(gzip_path);
-    var gzip_body: [2048]u8 = undefined;
-    var gzip_body_len: u64 = 0;
-    if (collo_test_h2_server_get(
-        harness.port(),
-        &harness.tls_material,
-        gzip_path.ptr,
-        &gzip_body,
-        gzip_body.len,
-        &gzip_body_len,
-        null,
-        0,
-        null,
-    ) != 0) {
-        std.debug.print("HTTP/2 gzip fetch helper failed: {s}\n", .{std.mem.span(collo_test_tls_last_error())});
-        return error.H2GzipFetchFailed;
-    }
-    const gzip_response = gzip_body[0..@intCast(gzip_body_len)];
-    try std.testing.expect(std.mem.containsAtLeast(u8, gzip_response, 1, "\"status\":200"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, gzip_response, 1, "\"text\":\"hello world\""));
-    try std.testing.expect(std.mem.containsAtLeast(u8, gzip_response, 1, "\"streamed\":\"hello world\""));
-    // The handler fetches twice, and the origin closes every connection, so
-    // it accepted at least two.
-    try std.testing.expect(gzip_origin.accepted.load(.acquire) >= 2);
-    try waitForCompletedRequests(&harness.runtime_server, before.completed_requests + 4);
 }
 
 test "local e2e maps a hung route's deadline to the server timeout response and reclaims the slot" {
@@ -325,7 +306,12 @@ test "local e2e usage and access records land in the analytics directory" {
     try std.testing.expectEqualStrings("hello", usage_record.worker);
     try std.testing.expectEqualStrings("worker", usage_record.origin);
     try std.testing.expectEqualStrings("done", usage_record.error_code);
-    try std.testing.expect(usage_record.wall_time_ns > 0);
+    // The server's own clock gives the usage record's wall time, from the
+    // dispatch to the lane's end of the request, which lies inside the
+    // access record's span from arrival to end; `duration_ms` is whole
+    // milliseconds, so one more covers its rounding.
+    try std.testing.expect(usage_record.wall_ns > 0);
+    try std.testing.expect(usage_record.wall_ns <= (access_record.duration_ms + 1) * std.time.ns_per_ms);
 
     // The client address is the TCP peer the lane accepted.
     try std.testing.expectEqual(@as(u16, 200), access_record.status);
@@ -371,23 +357,91 @@ test "local e2e answers the health path and unmatched paths itself and records e
     }
 
     // Each 404 leaves one access record that the server answered, with no
-    // worker and no route; the health path leaves none.
+    // worker and no route, under a request id of its own; the health path
+    // leaves none.
     var access = try waitForRecordLines(harness_mod.LocalAccessLine, &harness, "access.jsonl", unmatched.len);
     defer access.deinit();
     try std.testing.expectEqual(unmatched.len, access.items.len);
-    for (access.items) |record| {
+    for (access.items, 0..) |record, index| {
         try std.testing.expectEqual(@as(u16, 404), record.status);
         try std.testing.expectEqualStrings("server", record.answered_by);
         try std.testing.expectEqualStrings("", record.worker);
         try std.testing.expectEqualStrings("", record.route);
         try std.testing.expectEqual(@as(u64, 0), record.worker_id);
+        try expectFreshRequestId(access.items[0..index], record.request_id);
     }
+}
+
+/// Fails unless `request_id` is nonzero and no record of `earlier` has it.
+fn expectFreshRequestId(earlier: []const harness_mod.LocalAccessLine, request_id: u64) !void {
+    try std.testing.expect(request_id != 0);
+    for (earlier) |record| try std.testing.expect(record.request_id != request_id);
+}
+
+test "local e2e answers a head with too many fields, an oversized declared body and a malformed head itself, each with one record" {
+    var harness: Harness = undefined;
+    try harness.init(.{});
+    defer harness.deinit();
+    errdefer dumpZygoteTrace(&harness.spawned);
+    var client = try Client.open(&harness);
+    defer client.close();
+
+    // A head holds at most `ipc.max_request_header_count` + 3 fields with its
+    // four pseudo-header fields (`server/ingress/http2/request_head.zig`), so
+    // this many regular fields are one too many.
+    const too_many_fields = ipc.max_request_header_count;
+    var field_names: [too_many_fields][16:0]u8 = undefined;
+    var fields: [too_many_fields]tls_shim.H2Field = undefined;
+    for (&field_names, &fields, 0..) |*name, *field, index| {
+        const written = try std.fmt.bufPrintZ(name, "x-field-{d}", .{index});
+        field.* = .{ .name = written.ptr, .value = "v" };
+    }
+    const crowded = try client.readResponse(try client.sendRequestWithFields("GET", "/hello/crowded", &fields));
+    try std.testing.expectEqual(@as(u16, 431), crowded.status);
+
+    // A body declared past what a request may carry is refused on a matched
+    // route before any byte of it arrives.
+    const oversized = try client.readResponse(
+        try client.sendPost("/echo", limits.http_body.MATERIALIZED_BODY_BYTES_MAX + 1),
+    );
+    try std.testing.expectEqual(@as(u16, 413), oversized.status);
+
+    // `te` in a request may only say `trailers` (RFC 9113 §8.2.2); the head
+    // decoded, so the lane answers it instead of resetting the stream.
+    const te_field = [_]tls_shim.H2Field{.{ .name = "te", .value = "gzip" }};
+    const malformed = try client.readResponse(try client.sendRequestWithFields("GET", "/hello/te", &te_field));
+    try std.testing.expectEqual(@as(u16, 400), malformed.status);
+
+    // One record each, answered by the server under a request id of its own;
+    // the 413's names the route it matched.
+    var access = try waitForRecordLines(harness_mod.LocalAccessLine, &harness, "access.jsonl", 3);
+    defer access.deinit();
+    try std.testing.expectEqual(@as(usize, 3), access.items.len);
+    var seen_413 = false;
+    for (access.items, 0..) |record, index| {
+        try std.testing.expectEqualStrings("server", record.answered_by);
+        try std.testing.expectEqual(@as(u64, 0), record.worker_id);
+        try expectFreshRequestId(access.items[0..index], record.request_id);
+        switch (record.status) {
+            431, 400 => {},
+            413 => {
+                seen_413 = true;
+                try std.testing.expectEqualStrings("echo", record.worker);
+                try std.testing.expectEqualStrings("/echo", record.route);
+            },
+            else => {
+                std.debug.print("unexpected early answer status {d}\n", .{record.status});
+                return error.TestUnexpectedResult;
+            },
+        }
+    }
+    try std.testing.expect(seen_413);
 }
 
 test "local e2e fails a fetch in flight with a TypeError when the gateway dies, keeps the worker serving and fetches again after the reattach (#47)" {
     var origin = try GzipOrigin.start(std.testing.allocator);
     defer origin.stop(std.testing.allocator);
-    var fixture = try FetchTokenFixture.write(std.testing.allocator);
+    var fixture = try FetchTokenFixture.write(std.testing.allocator, origin);
     defer fixture.deinit(std.testing.allocator);
 
     var harness: Harness = undefined;
@@ -434,6 +488,35 @@ test "local e2e fails a fetch in flight with a TypeError when the gateway dies, 
     // The server runs one gateway again, the one that took over.
     var replacement = try harness_mod.currentGatewayProcess();
     replacement.deinit();
+}
+
+test "local e2e gives the gateway its OOM score without any privilege" {
+    // Any grant makes the server run a gateway, which the harness spawns
+    // before traffic. The lane runs unprivileged, and a score at or above the
+    // server's own needs no privilege to write.
+    const allow = [_][]const u8{"*"};
+    const configuration = try network_mod.configText(std.testing.allocator, &.{.{
+        .name = "granted",
+        .routes = &.{.{ .path = "/hello/:name", .entry = "./api/hello.js" }},
+        .network = .{ .allow = &allow },
+    }});
+    defer std.testing.allocator.free(configuration);
+
+    var harness: Harness = undefined;
+    try harness.init(.{ .config_source = configuration });
+    defer harness.deinit();
+    errdefer dumpZygoteTrace(&harness.spawned);
+
+    var gateway = try harness_mod.currentGatewayProcess();
+    defer gateway.deinit();
+    var path_buffer: [48]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, "/proc/{d}/oom_score_adj", .{gateway.pid});
+    var contents_buffer: [16]u8 = undefined;
+    const file = try std.fs.openFileAbsolute(path, .{});
+    defer file.close();
+    const contents = contents_buffer[0..try file.readAll(&contents_buffer)];
+    const score = try std.fmt.parseInt(i16, std.mem.trim(u8, contents, &std.ascii.whitespace), 10);
+    try std.testing.expectEqual(limits.process.OOM_SCORE_ADJ_EGRESS_GATEWAY, score);
 }
 
 /// Fetches `waitForFetchAfterReattach` sends at most,
@@ -495,13 +578,13 @@ fn fetchResultOf(response: *const harness_mod.Response) !FetchResult {
     return error.UnexpectedFetchOutcome;
 }
 
-/// A temporary configuration with one route, `route_path`, whose worker
-/// answers with a token drawn once per worker process (`entry_source`). A
-/// request that names a path of the origin has the worker fetch that path
-/// first, and the reply says how the fetch ended. The route takes two
-/// requests at once, so a request that arrives while the lane still drains
-/// the previous one's completion takes the worker's other slot, and one
-/// worker serves them all.
+/// A temporary configuration with one route, `route_path`, granted the
+/// origin, whose worker answers with a token drawn once per worker process
+/// (`entry_source`). A request that names a path of the origin has the
+/// worker fetch that path first, and the reply says how the fetch ended. The
+/// route takes two requests at once, so a request that arrives while the
+/// lane still drains the previous one's completion takes the worker's other
+/// slot, and one worker serves them all.
 const FetchTokenFixture = struct {
     directory: []u8,
     config_path: []u8,
@@ -511,19 +594,6 @@ const FetchTokenFixture = struct {
     /// Bytes of a path `requestPath` builds: the route, the origin's IPv4
     /// address and port, and a short origin path.
     const request_path_bytes_max: usize = 128;
-
-    const configuration =
-        \\{
-        \\  "globalSettings": { "limits": { "memoryMiB": 1024, "timeoutMs": 15000 } },
-        \\  "workers": {
-        \\    "fetch-token": {
-        \\      "routes": { "/fetch-token": { "entry": "./entry.js" } },
-        \\      "settings": { "limits": { "concurrency": 2 } }
-        \\    }
-        \\  }
-        \\}
-        \\
-    ;
 
     const entry_source =
         \\let token = "";
@@ -543,13 +613,22 @@ const FetchTokenFixture = struct {
         \\
     ;
 
-    fn write(allocator: std.mem.Allocator) !FetchTokenFixture {
+    fn write(allocator: std.mem.Allocator, origin: *const GzipOrigin) !FetchTokenFixture {
         const directory = try zygote_support.makeTempPath(allocator, "collo-local-e2e-fetch-token");
         errdefer allocator.free(directory);
         try std.fs.makeDirAbsolute(directory);
         errdefer std.fs.deleteTreeAbsolute(directory) catch {};
         var dir = try std.fs.openDirAbsolute(directory, .{});
         defer dir.close();
+        var authority_buffer: [network_mod.authority_bytes_max]u8 = undefined;
+        const allow = [_][]const u8{try origin.authority(&authority_buffer)};
+        const configuration = try network_mod.configText(allocator, &.{.{
+            .name = "fetch-token",
+            .routes = &.{.{ .path = route_path, .entry = "./entry.js" }},
+            .network = try network_mod.originGrant(&allow, origin.host()),
+            .concurrency = 2,
+        }});
+        defer allocator.free(configuration);
         try dir.writeFile(.{ .sub_path = "collo.json", .data = configuration });
         try dir.writeFile(.{ .sub_path = "entry.js", .data = entry_source });
         const config_path = try std.fs.path.join(allocator, &.{ directory, "collo.json" });
@@ -1082,23 +1161,32 @@ fn reportMem(label: []const u8, m: MemSample, mi: anytype) void {
 test "local e2e bench: what one more worker costs the system (env-gated)" {
     if (std.posix.getenv("COLLO_BENCH_MEM") == null) return error.SkipZigTest;
 
+    // One request on a real route takes the whole production path: the
+    // route's pool, the launch and the gateway session, which the route's
+    // grant of the origin gives it. Both phases hit the same route, or the
+    // second worker would price a different module graph and the delta
+    // would stop being a marginal cost.
+    var gzip_origin = try GzipOrigin.start(std.testing.allocator);
+    defer gzip_origin.stop(std.testing.allocator);
+    var authority_buffer: [network_mod.authority_bytes_max]u8 = undefined;
+    const allow = [_][]const u8{try gzip_origin.authority(&authority_buffer)};
+    const configuration = try network_mod.configText(std.testing.allocator, &.{.{
+        .name = "fetch-gzip",
+        .routes = &.{.{ .path = "/fetch-gzip", .entry = "./api/fetch_gzip.js" }},
+        .network = try network_mod.originGrant(&allow, gzip_origin.host()),
+    }});
+    defer std.testing.allocator.free(configuration);
+    const hold_path = try gzipRoutePath(std.testing.allocator, "/fetch-gzip", gzip_origin);
+    defer std.testing.allocator.free(hold_path);
+
     var harness: Harness = undefined;
-    try harness.init(.{});
+    try harness.init(.{ .config_source = configuration });
     defer harness.deinit();
 
     const self_pid: u32 = @intCast(std.os.linux.getpid());
     const base = try sampleProcessTree(std.testing.allocator, self_pid, "0-workers");
     const base_mi = sampleMeminfo();
     reportMem("0-workers", base, base_mi);
-
-    // One request on a real route takes the whole production path: the
-    // route's pool, the launch and the gateway session. Both phases hit the
-    // same route, or the second worker would price a different module graph
-    // and the delta would stop being a marginal cost.
-    var gzip_origin = try GzipOrigin.start(std.testing.allocator);
-    defer gzip_origin.stop(std.testing.allocator);
-    const hold_path = try gzipRoutePath(std.testing.allocator, "/fetch-gzip", gzip_origin);
-    defer std.testing.allocator.free(hold_path);
 
     var body: [4096]u8 = undefined;
     var body_len: u64 = 0;
@@ -1179,15 +1267,15 @@ test "local e2e bench: private bytes per byte of module pack (env-gated)" {
     if (filler_mib % 2 != 0 or filler_mib > pack_filler_mib_max)
         return error.InvalidPackVariant;
 
-    var pack_variant = try PackVariant.write(std.testing.allocator, filler_mib / 2);
+    var gzip_origin = try GzipOrigin.start(std.testing.allocator);
+    defer gzip_origin.stop(std.testing.allocator);
+    var pack_variant = try PackVariant.write(std.testing.allocator, filler_mib / 2, gzip_origin);
     defer pack_variant.deinit(std.testing.allocator);
 
     var harness: Harness = undefined;
     try harness.init(.{ .config_path = pack_variant.config_path });
     defer harness.deinit();
 
-    var gzip_origin = try GzipOrigin.start(std.testing.allocator);
-    defer gzip_origin.stop(std.testing.allocator);
     const path = try gzipRoutePath(std.testing.allocator, PackVariant.route_path, gzip_origin);
     defer std.testing.allocator.free(path);
 
@@ -1217,8 +1305,8 @@ const pack_filler_module_bytes: usize = 2 * 1024 * 1024 - 8;
 /// (`common/ipc/module_pack.zig`) with room for the entry.
 const pack_filler_mib_max: usize = 14;
 
-/// A temporary directory holding the pack benchmark's configuration, its
-/// entry and its filler modules.
+/// A temporary directory holding the pack benchmark's configuration, whose
+/// one route is granted the origin, its entry and its filler modules.
 const PackVariant = struct {
     directory: []u8,
     config_path: []u8,
@@ -1226,7 +1314,7 @@ const PackVariant = struct {
     /// The one route the configuration `write` produces declares.
     const route_path = "/fetch-gzip-big";
 
-    fn write(allocator: std.mem.Allocator, filler_count: usize) !PackVariant {
+    fn write(allocator: std.mem.Allocator, filler_count: usize, origin: *const GzipOrigin) !PackVariant {
         const directory = try zygote_support.makeTempPath(allocator, "collo-local-e2e-pack");
         errdefer allocator.free(directory);
         try std.fs.makeDirAbsolute(directory);
@@ -1234,18 +1322,15 @@ const PackVariant = struct {
         var dir = try std.fs.openDirAbsolute(directory, .{});
         defer dir.close();
 
-        try dir.writeFile(.{
-            .sub_path = "collo.json",
-            .data =
-            \\{
-            \\  "globalSettings": { "limits": { "memoryMiB": 1024, "timeoutMs": 15000 } },
-            \\  "workers": {
-            \\    "fetch-gzip-big": { "routes": { "/fetch-gzip-big": { "entry": "./entry.js" } } }
-            \\  }
-            \\}
-            \\
-            ,
-        });
+        var authority_buffer: [network_mod.authority_bytes_max]u8 = undefined;
+        const allow = [_][]const u8{try origin.authority(&authority_buffer)};
+        const configuration = try network_mod.configText(allocator, &.{.{
+            .name = "fetch-gzip-big",
+            .routes = &.{.{ .path = route_path, .entry = "./entry.js" }},
+            .network = try network_mod.originGrant(&allow, origin.host()),
+        }});
+        defer allocator.free(configuration);
+        try dir.writeFile(.{ .sub_path = "collo.json", .data = configuration });
 
         const filler = try allocator.alloc(u8, pack_filler_module_bytes);
         defer allocator.free(filler);
@@ -1278,192 +1363,3 @@ const PackVariant = struct {
         self.* = undefined;
     }
 };
-
-/// `route?host=<origin host>&port=<origin port>`, for the handlers that
-/// fetch from the gzip origin.
-fn gzipRoutePath(allocator: std.mem.Allocator, route: []const u8, origin: *const GzipOrigin) ![:0]u8 {
-    return std.fmt.allocPrintSentinel(allocator, "{s}?host={s}&port={d}", .{ route, origin.host(), origin.port }, 0);
-}
-
-/// A plain HTTP/1.1 origin that answers every request with a precomputed
-/// gzip body and `content-encoding: gzip`, except a request for `hold_path`,
-/// which it reads and then holds open without an answer until it stops, so a
-/// fetch of that path stays in flight. It listens on every IPv4 address,
-/// and handlers reach it through this host's routable one, because the
-/// gateway refuses loopback even when private networks are allowed. It
-/// cannot be a TLS origin: the test server certificate names no address the
-/// gateway could verify it against.
-const GzipOrigin = struct {
-    server: std.net.Server,
-    host_buffer: [64]u8,
-    host_len: usize,
-    port: u16,
-    thread: std.Thread,
-    accepted: std.atomic.Value(usize),
-    /// How many requests for `hold_path` the origin holds; their streams are
-    /// the first `held` entries of `held_streams`. Only the origin's thread
-    /// writes either, and `stop` closes the streams after joining it.
-    held: std.atomic.Value(usize),
-    held_streams: [held_streams_max]std.net.Stream,
-    stopping: std.atomic.Value(bool),
-
-    const hold_path = "/hold";
-    /// Requests the origin holds at once; a request past them is closed
-    /// unanswered.
-    const held_streams_max: usize = 4;
-    /// Polls `waitForHeld` makes, `held_poll_interval_ns` apart.
-    const held_polls_max: usize = 500;
-    const held_poll_interval_ns: u64 = 10 * std.time.ns_per_ms;
-
-    /// What `gzip_hello_world` decodes to.
-    const decoded_body = "hello world";
-    /// gzip("hello world").
-    const gzip_hello_world = [_]u8{
-        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x03, 0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0x57,
-        0x28, 0xcf, 0x2f, 0xca, 0x49, 0x01, 0x00, 0x85,
-        0x11, 0x4a, 0x0d, 0x0b, 0x00, 0x00, 0x00,
-    };
-    const response_head = std.fmt.comptimePrint(
-        "HTTP/1.1 200 OK\r\n" ++
-            "content-type: text/plain\r\n" ++
-            "content-encoding: gzip\r\n" ++
-            "content-length: {d}\r\n" ++
-            "connection: close\r\n\r\n",
-        .{gzip_hello_world.len},
-    );
-
-    fn start(allocator: std.mem.Allocator) !*GzipOrigin {
-        var host_buffer: [64]u8 = undefined;
-        const host_value = try routableLocalIpv4(&host_buffer);
-        const address = try std.net.Address.parseIp4("0.0.0.0", 0);
-        var server = try address.listen(.{ .reuse_address = true });
-        errdefer server.deinit();
-        const origin = try allocator.create(GzipOrigin);
-        errdefer allocator.destroy(origin);
-        origin.* = .{
-            .server = server,
-            .host_buffer = host_buffer,
-            .host_len = host_value.len,
-            .port = server.listen_address.getPort(),
-            .thread = undefined,
-            .accepted = std.atomic.Value(usize).init(0),
-            .held = std.atomic.Value(usize).init(0),
-            .held_streams = undefined,
-            .stopping = std.atomic.Value(bool).init(false),
-        };
-        origin.thread = try std.Thread.spawn(.{}, GzipOrigin.serve, .{origin});
-        return origin;
-    }
-
-    fn host(self: *const GzipOrigin) []const u8 {
-        return self.host_buffer[0..self.host_len];
-    }
-
-    fn stop(self: *GzipOrigin, allocator: std.mem.Allocator) void {
-        self.stopping.store(true, .release);
-        const address = std.net.Address.parseIp4("127.0.0.1", self.port) catch null;
-        if (address) |addr| {
-            if (std.net.tcpConnectToAddress(addr)) |stream| {
-                stream.close();
-            } else |_| {}
-        }
-        self.thread.join();
-        for (self.held_streams[0..self.held.load(.acquire)]) |stream|
-            stream.close();
-        self.server.deinit();
-        allocator.destroy(self);
-    }
-
-    /// Waits until the origin holds `minimum` requests for `hold_path`, at
-    /// most `held_polls_max` polls.
-    fn waitForHeld(self: *const GzipOrigin, minimum: usize) !void {
-        for (0..held_polls_max) |_| {
-            if (self.held.load(.acquire) >= minimum)
-                return;
-            std.Thread.sleep(held_poll_interval_ns);
-        }
-        return error.OriginHeldRequestNotObserved;
-    }
-
-    fn serve(self: *GzipOrigin) void {
-        while (!self.stopping.load(.acquire)) {
-            const connection = self.server.accept() catch return;
-            if (self.stopping.load(.acquire)) {
-                connection.stream.close();
-                return;
-            }
-            var buffer: [2048]u8 = undefined;
-            const head = readRequestHead(connection.stream, &buffer);
-            _ = self.accepted.fetchAdd(1, .acq_rel);
-            if (std.mem.startsWith(u8, head, "GET " ++ hold_path ++ " ")) {
-                self.hold(connection.stream);
-            } else {
-                answer(connection.stream);
-                connection.stream.close();
-            }
-        }
-    }
-
-    /// Keeps `stream` open without an answer until `stop`, or closes it at
-    /// once when the origin already holds `held_streams_max` requests.
-    fn hold(self: *GzipOrigin, stream: std.net.Stream) void {
-        const count = self.held.load(.monotonic);
-        if (count < held_streams_max) {
-            self.held_streams[count] = stream;
-            self.held.store(count + 1, .release);
-        } else {
-            stream.close();
-        }
-    }
-
-    /// Writes the gzip response; a peer that left first loses only its
-    /// answer.
-    fn answer(stream: std.net.Stream) void {
-        stream.writeAll(response_head) catch return;
-        stream.writeAll(&gzip_hello_world) catch return;
-    }
-
-    /// Reads `stream` until the end of a request head, a full `buffer`, the
-    /// peer's close or a read error, and returns what it read.
-    fn readRequestHead(stream: std.net.Stream, buffer: []u8) []const u8 {
-        var total: usize = 0;
-        while (std.mem.indexOf(u8, buffer[0..total], "\r\n\r\n") == null) {
-            if (total == buffer.len)
-                break;
-            const read_len = stream.read(buffer[total..]) catch break;
-            if (read_len == 0)
-                break;
-            total += read_len;
-        }
-        return buffer[0..total];
-    }
-};
-
-/// The source address the kernel would route external traffic from, written
-/// into `out`. Skips the test when the host has no such IPv4 address, or only
-/// a loopback one.
-fn routableLocalIpv4(out: *[64]u8) ![]const u8 {
-    const remote = std.net.Address.parseIp4("1.1.1.1", 9) catch return error.SkipZigTest;
-    const socket = std.posix.socket(
-        std.posix.AF.INET,
-        std.posix.SOCK.DGRAM | std.posix.SOCK.CLOEXEC,
-        0,
-    ) catch return error.SkipZigTest;
-    defer std.posix.close(socket);
-    // A UDP connect sends nothing; it only selects the routed source address.
-    std.posix.connect(socket, &remote.any, remote.getOsSockLen()) catch return error.SkipZigTest;
-
-    var storage: std.posix.sockaddr.storage = undefined;
-    var storage_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
-    std.posix.getsockname(socket, @ptrCast(&storage), &storage_len) catch return error.SkipZigTest;
-    if (storage.family != std.posix.AF.INET)
-        return error.SkipZigTest;
-    const socket_address: *align(4) const std.posix.sockaddr = @ptrCast(&storage);
-    const address = std.net.Address.initPosix(socket_address);
-    const bytes = std.mem.asBytes(&address.in.sa.addr);
-    if (bytes[0] == 127)
-        return error.SkipZigTest;
-    return std.fmt.bufPrint(out, "{d}.{d}.{d}.{d}", .{ bytes[0], bytes[1], bytes[2], bytes[3] }) catch
-        return error.SkipZigTest;
-}

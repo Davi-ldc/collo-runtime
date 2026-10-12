@@ -8,8 +8,10 @@
 //! own fs modules, an empty module, the targets of string-literal `import()`
 //! packed with their own imports while computed ones and those that cannot
 //! be packed stay out, the ways a graph fails with the file and line each
-//! failure names, allocation failure at every step, and the configuration
-//! local-e2e serves.
+//! failure names, as invalid routes, a descriptor quota failing the build as
+//! unavailable resources instead, allocation failure at every step, and the
+//! configuration local-e2e serves. The network policies are covered in
+//! `network.zig`.
 //!
 //! What a worker does with the artifacts is covered by `worker-test`,
 //! `zygote-integration` and `local-e2e`.
@@ -104,11 +106,12 @@ fn expectEntrySpecifier(artifact: *const routes.DefinitionArtifact, index: usize
     try std.testing.expectEqualStrings(expected, actual);
 }
 
+/// The build of `source` fails as invalid routes, naming `expected`.
 fn expectBuildFailure(fixture: *const Fixture, source: []const u8, expected: []const u8) !void {
     var diagnostic: config.Diagnostic = .{};
     const parsed = try fixture.parse(std.testing.allocator, source, &diagnostic);
     var built: routes.Routes = undefined;
-    try std.testing.expectError(error.RouteBuildFailed, built.init(std.testing.allocator, parsed, &diagnostic));
+    try std.testing.expectError(error.RoutesInvalid, built.init(std.testing.allocator, parsed, &diagnostic));
     if (std.mem.indexOf(u8, diagnostic.message(), expected) == null) {
         std.debug.print("message: {s}\nexpected it to contain: {s}\n", .{ diagnostic.message(), expected });
         return error.TestUnexpectedMessage;
@@ -524,6 +527,36 @@ test "a graph that cannot be packed fails with the route and the file" {
     try expectBuildFailure(&fixture, catchAll("{\"entry\": \"imports-broken.js\"}"), broken);
 
     try expectBuildFailure(&fixture, catchAll("{\"entry\": \"imports-spaced.js\"}"), "my file.js has a path that cannot be a module specifier");
+}
+
+test "a descriptor the server cannot get fails the build as unavailable resources, not as invalid routes" {
+    const allocator = std.testing.allocator;
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    try fixture.write("app/index.js", index_source);
+    try fixture.write("app/lib/greet.js", greet_source);
+    var diagnostic: config.Diagnostic = .{};
+    const parsed = try fixture.parse(allocator, catchAll("{\"entry\": \"./app/index.js\"}"), &diagnostic);
+
+    // Every descriptor below the lowest free one is open, so a soft limit at
+    // it refuses the next memfd and the next module file alike. The runner
+    // is single-threaded, so nothing else opens a descriptor meanwhile.
+    const probe = try std.fs.openFileAbsolute("/dev/null", .{});
+    const lowest_free = probe.handle;
+    probe.close();
+    const saved = try std.posix.getrlimit(.NOFILE);
+    try std.posix.setrlimit(.NOFILE, .{ .cur = @intCast(lowest_free), .max = saved.max });
+    var built: routes.Routes = undefined;
+    const result = built.init(allocator, parsed, &diagnostic);
+    try std.posix.setrlimit(.NOFILE, saved);
+
+    if (result) |_| {
+        built.deinit();
+        return error.TestExpectedResourceFailure;
+    } else |err| {
+        try std.testing.expectEqual(error.RouteResourcesUnavailable, err);
+    }
 }
 
 fn buildFixtureRoutes(allocator: std.mem.Allocator, fixture: *const Fixture) !void {

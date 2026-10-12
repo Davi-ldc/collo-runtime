@@ -8,6 +8,10 @@
 // through fetchBodyReleaseForIdentity, and transferFetchStreamForHostResponse hands it to the caller. A RequestLazy
 // body names the request whose body Zig still holds and owns nothing. A body is used once a consumer, a stream read
 // or a transfer has taken it, or once its stream is disturbed, and a used body can be neither consumed nor cloned.
+//
+// The collector paces itself by the memory cells report outside the heap, so the owner reports the bytes its body
+// holds in this process: a text body's string, a bytes body's buffer and a shared body's BlobStorage. Bytes that Zig
+// holds (a lazy request body, a fetch stream) and a stream body's chunks are not the body's to report.
 
 #pragma once
 
@@ -25,6 +29,8 @@
 #include <wtf/Vector.h>
 #include <wtf/text/WTFString.h>
 
+#include <atomic>
+#include <cstddef>
 #include <span>
 
 namespace Collo::HostFunctions {
@@ -86,6 +92,12 @@ public:
 
     Source source() const { return m_source; }
     const WTF::String& text() const { return m_text; }
+    // The bytes a text or bytes body keeps in this process: the string's buffer or the byte buffer, each charged
+    // whole while others share it. A shared body's BlobStorage is left out, because its sharers report it once per
+    // collection through BlobStorage::tryClaimExtraMemoryReport, and every other source holds no bytes here.
+    size_t ownedMemoryCost() const;
+    // The storage a SharedBytes body views, or null for every other source.
+    BlobStorage* sharedStorage() const { return m_shared_storage.get(); }
     // byteLength, appendBytes and copyBytesInto, like extractByteSegmentsForHostResponse, neither check nor set the
     // used flag. Empty, Text, Bytes and SharedBytes bodies answer synchronously. A fetch stream answers byteLength and
     // appendBytes during its own request turn once Zig holds its whole body; every other case throws a TypeError.
@@ -209,18 +221,32 @@ bool createBodyStateFromJS(JSC::JSGlobalObject*, JSC::ThrowScope&, JSC::JSValue 
 // whole life. That stream may reach back to the cell (a native body's source reads through it, a user source can
 // close over it); the cycle is traced, so the collector reclaims it. Only this class writes the edge, and always
 // through the barrier, because the cell may already be old when the stream is new.
+//
+// The owner reports its body's memory: finishCreation reports it allocated and visitChildren reports it visited, as
+// Heap::reportExtraMemoryAllocated requires. The marker runs while the VM thread changes the BodyState, so it never
+// reads the state: it reads m_owned_body_cost, which the VM thread stores again after every change, and
+// m_viewed_storage, which never changes after construction. The body is reachable for writing only through the owner
+// methods below, each of which stores the cost again, so no path changes a body without its cost following.
 class JSColloBodyOwner : public JSC::JSDestructibleObject {
     using Base = JSC::JSDestructibleObject;
 
 public:
     DECLARE_VISIT_CHILDREN;
 
-    BodyState& body() { return m_body; }
     const BodyState& body() const { return m_body; }
     JSC::JSObject* bodyStream() const { return m_body_stream.get(); }
     // Stores the stream `body` created for a native body; the cell has none yet.
     void setBodyStream(JSC::VM&, JSC::JSObject*);
     bool bodyUsed() const;
+
+    // Each calls the BodyState method of the same name.
+    bool consumeToBytes(
+        JSC::JSGlobalObject*, JSC::ThrowScope&, WTF::ASCIILiteral already_used_message, WTF::Vector<uint8_t>& out);
+    bool consumeToSharedBytes(JSC::JSGlobalObject*, JSC::ThrowScope&, WTF::ASCIILiteral already_used_message,
+        WTF::RefPtr<ColloSharedBytes>& out);
+    bool beginStreamRead(JSC::JSGlobalObject*, JSC::ThrowScope&, WTF::ASCIILiteral already_used_message);
+    bool cancelStream(JSC::JSGlobalObject*, JSC::ThrowScope&, WTF::ASCIILiteral already_used_message);
+    ColloFetchBodyIdentity transferFetchStreamForHostResponse();
 
     // Each calls the matching BodyState method, clone for cloneBody, with this cell's stream; cloneBody also stores
     // the tee branch a stream body keeps.
@@ -243,8 +269,15 @@ protected:
     void finishCreation(JSC::VM&, JSC::JSObject* body_stream);
 
 private:
+    // Stores the body's owned cost after a change and reports any rise as allocated. Consuming or transferring a body
+    // can only release its storage, so the rise is a guard for a source that would grow one in place.
+    void storeOwnedBodyCost();
+
     BodyState m_body;
     JSC::WriteBarrier<JSC::JSObject> m_body_stream;
+    std::atomic<size_t> m_owned_body_cost { 0 };
+    // The SharedBytes body's storage, held again so the marker can claim its report without touching m_body.
+    const WTF::RefPtr<BlobStorage> m_viewed_storage;
 };
 
 } // namespace Collo::HostFunctions

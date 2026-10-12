@@ -33,12 +33,6 @@ JSColloTransformStream* JSColloTransformStream::createWithStructure(JSC::VM& vm,
     return object;
 }
 
-JSColloTransformStream::~JSColloTransformStream()
-{
-    if (m_pending_write_deferred)
-        collo_promise_deferred_release(m_pending_write_deferred);
-}
-
 EncodedJSValue JSColloTransformStream::performTransform(
     JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSValue chunk)
 {
@@ -62,60 +56,50 @@ EncodedJSValue JSColloTransformStream::performTransform(
 EncodedJSValue JSColloTransformStream::deferWrite(
     JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSValue chunk)
 {
-    // The writable side serializes writes, so at most one can be pending.
-    RELEASE_ASSERT(!m_has_pending_write);
-    JSValue promise;
-    ColloPromiseDeferred* deferred = nullptr;
-    if (!createDeferredPromise(global_object, scope, promise, deferred))
-        return {};
+    // The writable side marks a write in flight before it calls this sink and
+    // keeps it so until the returned promise settles, so a second write never
+    // arrives while one is parked; one that did is refused, never parked over
+    // the first.
+    if (m_pending_write_promise.get())
+        return rejectedTypeError(global_object, scope, "TransformStream already has a parked write"_s);
     auto& vm = global_object->vm();
+    auto* promise = Collo::newPromise(global_object);
     m_pending_write_chunk.set(vm, this, chunk);
     m_pending_write_promise.set(vm, this, promise);
-    m_pending_write_deferred = deferred;
-    m_has_pending_write = true;
     return JSValue::encode(promise);
 }
 
 void JSColloTransformStream::readablePulled(JSC::JSGlobalObject* global_object)
 {
     m_backpressure = false;
-    if (!m_has_pending_write)
+    auto* promise = m_pending_write_promise.get();
+    if (!promise)
         return;
     JSValue chunk = m_pending_write_chunk.get();
-    auto* deferred = m_pending_write_deferred;
-    m_pending_write_deferred = nullptr;
     m_pending_write_chunk.clear();
     m_pending_write_promise.clear();
-    m_has_pending_write = false;
 
     auto& vm = global_object->vm();
     auto scope = DECLARE_THROW_SCOPE(vm);
     JSValue result = JSValue::decode(performTransform(global_object, scope, chunk));
     if (scope.exception()) {
         JSValue reason = scope.exception()->value();
-        if (!scope.tryClearException()) {
-            settleDeferred(global_object, deferred, reason, true);
+        if (!scope.tryClearException())
             return;
-        }
         error(global_object, reason);
-        settleDeferred(global_object, deferred, reason, true);
+        RETURN_IF_EXCEPTION(scope, void());
+        Collo::settlePromise(promise, reason, true);
         return;
     }
     // Resolving with the transform result adopts it when it is a promise,
     // so async transforms keep the writable side waiting.
-    settleDeferred(global_object, deferred, result ? result : JSC::jsUndefined(), false);
+    Collo::settlePromise(promise, result ? result : JSC::jsUndefined(), false);
 }
 
-void JSColloTransformStream::rejectPendingWrite(JSC::JSGlobalObject* global_object, JSValue reason)
+bool JSColloTransformStream::rejectPendingWrite(JSC::JSGlobalObject* global_object, JSValue reason)
 {
-    if (!m_has_pending_write)
-        return;
-    auto* deferred = m_pending_write_deferred;
-    m_pending_write_deferred = nullptr;
     m_pending_write_chunk.clear();
-    m_pending_write_promise.clear();
-    m_has_pending_write = false;
-    settleDeferred(global_object, deferred, reason, true);
+    return settleAndClearPromise(global_object, m_pending_write_promise, reason, true);
 }
 
 void JSColloTransformStream::errorWritableAndUnblockWrite(JSC::JSGlobalObject* global_object, JSValue reason)
@@ -124,6 +108,8 @@ void JSColloTransformStream::errorWritableAndUnblockWrite(JSC::JSGlobalObject* g
     m_backpressure = false;
     if (auto* stream = writable())
         stream->error(global_object, reason);
+    if (!noExceptionPending(global_object->vm()))
+        return;
     rejectPendingWrite(global_object, reason);
 }
 
@@ -135,13 +121,11 @@ JSColloPipeToState* JSColloPipeToState::create(JSC::VM& vm, JSC::JSGlobalObject*
     auto* structure = collo_global->webApiCache().pipe_to_state_structure.get();
     RELEASE_ASSERT(structure);
     auto* object = new (NotNull, JSC::allocateCell<JSColloPipeToState>(vm)) JSColloPipeToState(vm, structure);
-    auto scope = DECLARE_THROW_SCOPE(vm);
-    if (!object->finishCreation(vm, global_object, scope, source, destination, reader, writer))
-        return nullptr;
+    object->finishCreation(vm, global_object, source, destination, reader, writer);
     return object;
 }
 
-bool JSColloPipeToState::finishCreation(JSC::VM& vm, JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope,
+void JSColloPipeToState::finishCreation(JSC::VM& vm, JSC::JSGlobalObject* global_object,
     JSColloReadableStream* source, JSColloWritableStream* destination, JSColloReadableStreamDefaultReader* reader,
     JSColloWritableStreamDefaultWriter* writer)
 {
@@ -152,19 +136,13 @@ bool JSColloPipeToState::finishCreation(JSC::VM& vm, JSC::JSGlobalObject* global
     m_reader.set(vm, this, reader);
     m_writer.set(vm, this, writer);
 
-    JSDeferredPromise deferred;
-    if (!createJSDeferredPromise(global_object, scope, deferred))
-        return false;
-
+    auto* promise = Collo::newPromise(global_object);
     // Nothing reads this property: it keeps the state reachable from its
     // promise until clearPromiseOwner overwrites it with undefined, when the
     // pipe settles or its start fails.
-    deferred.promise.getObject()->putDirect(
+    promise->putDirect(
         vm, pipeToStateIdentifier(global_object), this, static_cast<unsigned>(JSC::PropertyAttribute::DontEnum));
-    m_promise.set(vm, this, deferred.promise);
-    m_resolve.set(vm, this, deferred.resolve);
-    m_reject.set(vm, this, deferred.reject);
-    return true;
+    m_promise.set(vm, this, promise);
 }
 
 void JSColloPipeToState::cleanupLocks(JSC::JSGlobalObject* global_object)
@@ -192,17 +170,14 @@ void JSColloPipeToState::detachSignal()
 
 void JSColloPipeToState::clearPromiseOwner(JSC::JSGlobalObject* global_object)
 {
-    auto& vm = global_object->vm();
-    if (auto* promise_object = dynamicDowncast<JSC::JSObject>(m_promise.get())) {
-        promise_object->putDirect(vm, pipeToStateIdentifier(global_object), JSC::jsUndefined(),
+    if (auto* promise = m_promise.get()) {
+        promise->putDirect(global_object->vm(), pipeToStateIdentifier(global_object), JSC::jsUndefined(),
             static_cast<unsigned>(JSC::PropertyAttribute::DontEnum));
     }
 }
 
-void JSColloPipeToState::settlePromise(JSC::JSGlobalObject* global_object, JSValue value, bool is_rejection)
+void JSColloPipeToState::settlePipePromise(JSC::JSGlobalObject* global_object, JSValue value, bool is_rejection)
 {
-    JSValue callback = is_rejection ? m_reject.get() : m_resolve.get();
-    settleJSDeferredPromise(global_object, callback, value);
     clearPromiseOwner(global_object);
     m_read_fulfilled.clear();
     m_read_rejected.clear();
@@ -211,10 +186,8 @@ void JSColloPipeToState::settlePromise(JSC::JSGlobalObject* global_object, JSVal
     m_shutdown_fulfilled.clear();
     m_shutdown_rejected.clear();
     m_shutdown_reason.clear();
-    m_promise.clear();
-    m_resolve.clear();
-    m_reject.clear();
     m_shutdown_pending = 0;
+    settleAndClearPromise(global_object, m_promise, value, is_rejection);
 }
 
 void JSColloPipeToState::settle(JSC::JSGlobalObject* global_object, JSValue value, bool is_rejection)
@@ -228,7 +201,7 @@ void JSColloPipeToState::settle(JSC::JSGlobalObject* global_object, JSValue valu
     cleanupLocks(global_object);
     m_source.clear();
     m_destination.clear();
-    settlePromise(global_object, value, is_rejection);
+    settlePipePromise(global_object, value, is_rejection);
 }
 
 void JSColloPipeToState::abandonStartFailure(JSC::JSGlobalObject* global_object)
@@ -244,8 +217,6 @@ void JSColloPipeToState::abandonStartFailure(JSC::JSGlobalObject* global_object)
     m_source.clear();
     m_destination.clear();
     m_promise.clear();
-    m_resolve.clear();
-    m_reject.clear();
     m_read_fulfilled.clear();
     m_read_rejected.clear();
     m_write_fulfilled.clear();
@@ -747,9 +718,9 @@ static bool pipeToOptionBoolean(
     return result;
 }
 
+// Lives on the stack, which roots `signal`.
 struct PipeToOptions {
-    JSC::Strong<JSC::Unknown> signal;
-    bool has_signal { false };
+    JSColloAbortSignal* signal { nullptr };
     bool prevent_close { false };
     bool prevent_abort { false };
     bool prevent_cancel { false };
@@ -784,31 +755,31 @@ static bool parsePipeToOptions(
         JSC::throwVMTypeError(global_object, scope, "ReadableStream pipeTo signal must be an AbortSignal"_s);
         return false;
     }
-    out.signal = JSC::Strong<JSC::Unknown>(vm, abort_signal);
-    out.has_signal = true;
+    out.signal = abort_signal;
     return true;
 }
 
 EncodedJSValue startReadablePipeTo(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope,
-    JSColloReadableStream* source, JSColloWritableStream* destination, JSValue options, bool reject_option_errors)
+    JSColloReadableStream* source, JSColloWritableStream* destination, JSValue options, PipeToErrors errors)
 {
     auto& vm = global_object->vm();
-    if (source->locked())
-        return rejectedTypeError(global_object, scope, "ReadableStream is already locked"_s);
-    if (destination->locked())
-        return rejectedTypeError(global_object, scope, "WritableStream is already locked"_s);
-
+    // Web IDL converts the options before the method's steps check the locks.
     PipeToOptions parsed_options;
     if (!parsePipeToOptions(global_object, scope, options, parsed_options)) {
-        if (reject_option_errors && scope.exception()) {
-            JSValue exception = scope.exception()->value();
-            if (!scope.tryClearException())
-                return {};
-            return rejectedPromise(global_object, exception);
-        }
-        return {};
+        if (errors == PipeToErrors::Throw || !scope.exception())
+            return {};
+        JSValue exception = scope.exception()->value();
+        if (!scope.tryClearException())
+            return {};
+        return rejectedPromise(global_object, exception);
     }
     RETURN_IF_EXCEPTION(scope, {});
+    if (source->locked() || destination->locked()) {
+        auto message = source->locked() ? "ReadableStream is already locked"_s : "WritableStream is already locked"_s;
+        if (errors == PipeToErrors::Reject)
+            return rejectedTypeError(global_object, scope, message);
+        return JSC::throwVMTypeError(global_object, scope, message);
+    }
 
     auto* reader = JSColloReadableStreamDefaultReader::create(vm, global_object, source);
     RETURN_IF_EXCEPTION(scope, {});
@@ -831,12 +802,13 @@ EncodedJSValue startReadablePipeTo(JSC::JSGlobalObject* global_object, JSC::Thro
 
     state->setOptions(parsed_options.prevent_close, parsed_options.prevent_abort, parsed_options.prevent_cancel);
 
-    auto* signal = parsed_options.has_signal ? webApiAbortSignalFromValue(parsed_options.signal.get()) : nullptr;
-    if (signal) {
+    // Read before the pipe starts: a pipe that settles at once drops its promise.
+    JSValue pipe_promise = state->promise();
+    if (auto* signal = parsed_options.signal) {
         state->setSignal(vm, signal);
         if (signal->aborted()) {
-            JSValue pipe_promise = state->promise();
             state->abortFromSignal(global_object, signal->reason());
+            RETURN_IF_EXCEPTION(scope, {});
             return JSValue::encode(pipe_promise);
         }
 
@@ -849,7 +821,8 @@ EncodedJSValue startReadablePipeTo(JSC::JSGlobalObject* global_object, JSC::Thro
     }
 
     state->pump(global_object);
-    return JSValue::encode(state->promise());
+    RETURN_IF_EXCEPTION(scope, {});
+    return JSValue::encode(pipe_promise);
 }
 
 void JSColloTransformStream::enqueue(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSValue chunk)

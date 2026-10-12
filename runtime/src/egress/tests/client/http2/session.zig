@@ -233,6 +233,30 @@ test "egress http2 request encoder rejects connection scoped headers" {
     }));
 }
 
+test "egress http2 request validation admits te only with the value trailers" {
+    try egress_http2.validateRequestHead(.{
+        .method = "GET",
+        .scheme = "https",
+        .authority = "demo.example.test",
+        .path = "/",
+        .headers = &.{.{ .name = "te", .value = "trailers" }},
+    });
+    try std.testing.expectError(error.ForbiddenHttp2RequestHeader, egress_http2.validateRequestHead(.{
+        .method = "GET",
+        .scheme = "https",
+        .authority = "demo.example.test",
+        .path = "/",
+        .headers = &.{.{ .name = "te", .value = "gzip" }},
+    }));
+    try std.testing.expectError(error.ForbiddenHttp2RequestHeader, egress_http2.validateRequestHead(.{
+        .method = "GET",
+        .scheme = "https",
+        .authority = "demo.example.test",
+        .path = "/",
+        .headers = &.{.{ .name = "host", .value = "demo.example.test" }},
+    }));
+}
+
 test "egress http2 settings frame updates peer settings and returns ack" {
     var session = try egress_http2.Session.init(std.testing.allocator);
     defer session.deinit();

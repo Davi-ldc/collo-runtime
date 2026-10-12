@@ -1,12 +1,13 @@
 //! The console line ring: a byte ring of frames, each a `LogFrameHeader`
-//! with its UTF-8 payload inline. The worker's VM thread appends lines and
-//! never fails, and the host drains them through its `WorkerWriterView` of
-//! the worker, the ring's one consumer. The drain keeps the host's tail in
-//! host memory and stores it to the page without reading it back, loads the
-//! worker's head once, and copies each frame header once and validates the
-//! copy, so a worker that rewrites the ring during a drain can garble a
-//! line's text but never a length or a cursor; a corrupt cursor or frame
-//! turns the ring fatal.
+//! with its UTF-8 payload inline. The worker's threads append lines under
+//! one lock (`producer_mutex`) and never fail, and the host drains them
+//! through its `WorkerWriterView` of the worker, the ring's one consumer.
+//! The drain keeps
+//! the host's tail in host memory and stores it to the page without reading
+//! it back, loads the worker's head once, and copies each frame header once
+//! and validates the copy, so a worker that rewrites the ring during a drain
+//! can garble a line's text but never a length or a cursor; a corrupt cursor
+//! or frame turns the ring fatal.
 
 const std = @import("std");
 
@@ -36,11 +37,17 @@ pub const LogLineFlags = struct {
     /// The line is an uncaught JavaScript exception the worker formatted. The
     /// console formatter never sets it.
     pub const js_exception: u8 = 1 << 1;
+    /// The line is the worker runtime's own log, for the operator, not the
+    /// tenant's console; the host writes it to its stderr and never to the
+    /// tenant's log. It is the worker's claim, so a worker that sets it on a
+    /// console line only hides that line from its own log.
+    pub const runtime: u8 = 1 << 2;
 };
 
 const log_line_flags_valid: u8 =
     LogLineFlags.truncated |
-    LogLineFlags.js_exception;
+    LogLineFlags.js_exception |
+    LogLineFlags.runtime;
 
 /// The fixed prefix of every log ring entry, followed inline by its UTF-8
 /// payload. A frame wraps across the end of the ring, so the ring holds no
@@ -80,6 +87,12 @@ pub const DrainedLogLine = struct {
     payload: []const u8,
 };
 
+/// Serializes the producers of the one console ring a worker process writes:
+/// the VM thread's console and exception lines and the runtime's log lines
+/// from any of its threads (`zygote/log_sink.zig`). A host only drains, and a
+/// process that writes several rings, as a test does, only waits longer.
+var producer_mutex: std.Thread.Mutex = .{};
+
 pub fn publishLogLineImpl(
     header: *LogRingHeader,
     log_bytes: []u8,
@@ -89,6 +102,8 @@ pub fn publishLogLineImpl(
     ts_mono_ns: u64,
     payload: []const u8,
 ) void {
+    producer_mutex.lock();
+    defer producer_mutex.unlock();
     if (@atomicLoad(u32, &header.fatal, .acquire) != 0)
         return;
 

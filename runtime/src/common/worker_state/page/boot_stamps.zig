@@ -25,7 +25,6 @@ pub const BootPhase = enum(u32) {
     runtime_initialized,
     helper_threads_pinned,
     seccomp_applied,
-    boot_context_ready,
     // `routes_evaluated` alone would not measure module execution: the span
     // before it covers mapping the definition's pack, parsing and validating
     // it in Zig, a second validation in C++ and registration, so these three

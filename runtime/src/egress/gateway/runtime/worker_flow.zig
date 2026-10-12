@@ -8,22 +8,27 @@
 //! network policy of a fetch come from the verified token alone, never from the packet around it.
 //! Admission checks, in this order, the tag, the token's session against the session whose ring
 //! carried it, the deadline, the policy id in the hello's table, the active-fetch caps of the
-//! session and of its security cell, and unused fetch and body ids in the session. Only then does
-//! it take one fetch from the token's budget (`budgets.zig`), its first step that changes state,
-//! so a refused fetch costs no budget. It then records the route and the counts and undoes them,
-//! with the budget use, unless the fetch reaches an engine or the upload assembler; a failure the
-//! worker caused (`isWorkerPolicySubmitError`) keeps the budget use.
+//! session and of its security cell, unused fetch and body ids in the session, the start's shape
+//! (`engine.validateStart`, the same for an inline and a pooled body, before any buffer exists)
+//! and, for a pooled body, the session's upload bytes in flight. Only then does it take one fetch
+//! from the token's budget (`budgets.zig`), its first step that changes state, so a refused fetch
+//! costs no budget. It then records the route, the counts and the reserved upload bytes and
+//! undoes them, with the budget use, unless the fetch reaches an engine or the upload assembler;
+//! a failure the worker caused (`isWorkerPolicySubmitError`) keeps the budget use.
 //!
 //! A failing command ring, a command that does not decode or an upload extent the pool rejects
 //! removes the worker at once. A well-formed command that breaks a rule counts as invalid
 //! instead, and more of those than `sessions.max_invalid_commands_per_window` in one window
 //! remove the worker. Every removal the server did not ask for is reported to it
 //! (`control.SessionRemoved`), and the server gives the worker a new session no sooner than its
-//! reattach interval allows (`server/supervisor/launcher.zig`). A bad token, another session's token and an exhausted budget count; an
-//! expired token, an ended boot token and an unknown policy id do not, since an honest fetch can
-//! race its token's deadline or its boot's end and only the server mints a policy id. An honest
+//! reattach interval allows (`server/supervisor/launcher.zig`). A bad token, another session's
+//! token, a start whose shape breaks the limits and an exhausted budget count; an expired token,
+//! an ended boot token, an unknown policy id and a session's full upload bytes do not, since an
+//! honest fetch can race its token's deadline or its boot's end, only the server mints a policy
+//! id, and a worker cannot see when the gateway retired an earlier upload's route. An honest
 //! worker presents a bad tag only for its requests in flight across a gateway replacement, whose
-//! tokens carry the old key, far fewer than the window allows.
+//! tokens carry the old key, fewer than the window allows (`sessions.zig`). A fetch its policy
+//! denies is admitted and fails in the transport, without a strike.
 
 const std = @import("std");
 const ipc = @import("collo_ipc");
@@ -61,6 +66,7 @@ const Refusal = enum {
     shard_restarting,
     budget_exhausted,
     boot_ended,
+    upload_bytes_in_flight,
 
     /// The message the worker's fetch fails with.
     fn message(self: Refusal) []const u8 {
@@ -76,6 +82,7 @@ const Refusal = enum {
             .shard_restarting => "egress shard restarting",
             .budget_exhausted => "egress fetch budget exhausted",
             .boot_ended => "egress boot token ended",
+            .upload_bytes_in_flight => "egress upload bytes in flight exceeded",
         };
     }
 
@@ -95,6 +102,7 @@ const Refusal = enum {
             .unknown_policy,
             .shard_restarting,
             .boot_ended,
+            .upload_bytes_in_flight,
             => false,
         };
     }
@@ -161,10 +169,10 @@ pub fn Methods(comptime Gateway: type) type {
                 return refuseFetch(self, worker, fetch, .clock_unavailable);
             if (egress_token.expired(&token, now_ns))
                 return refuseFetch(self, worker, fetch, .expired);
-            const network = self.hello.policies.lookup(fields.policy_id) orelse {
+            const granted = self.hello.lookup(fields.policy_id) orelse {
                 std.log.err("egress token names policy id={d} outside the hello's {d} policies", .{
                     fields.policy_id,
-                    self.hello.policies.count,
+                    self.hello.policyCount(),
                 });
                 return refuseFetch(self, worker, fetch, .unknown_policy);
             };
@@ -176,9 +184,21 @@ pub fn Methods(comptime Gateway: type) type {
                 return refuseFetch(self, worker, fetch, .security_cell_fetch_limit);
             if (self.router.containsIdentity(worker.session_id, fetch.fetch_id, fetch.body_id))
                 return refuseFetch(self, worker, fetch, .duplicate_identity);
+            const max_response_body_bytes = engine_mod.validateStart(fetch, self.policy) catch |err| {
+                // Every shape error is the worker's own, and no budget was taken yet.
+                if (!self.recordInvalidWorkerCommand(worker))
+                    return false;
+                failFetch(self, worker, fetch, @errorName(err));
+                return true;
+            };
+            const pooled = (fetch.flags & ipc.egress_fetch_start_flag_body_pooled) != 0;
+            const upload_bytes: u64 = if (pooled) fetch.pooled_body_len else 0;
+            const upload_room = ipc.fetch_limits.request_body_pooled_in_flight_bytes_max -| worker.upload_bytes_in_flight;
+            if (upload_bytes > upload_room)
+                return refuseFetch(self, worker, fetch, .upload_bytes_in_flight);
             const isolation = policy_mod.PoolIsolation{
                 .security_cell_id = worker.security_cell_id,
-                .policy_id = self.hello.isolation_ids[fields.policy_id],
+                .policy_id = granted.isolation_id,
             };
             const shard_index = self.shards.selectIndex(isolation, fetch.url);
             if (self.shards.get(shard_index).quarantined) {
@@ -199,9 +219,12 @@ pub fn Methods(comptime Gateway: type) type {
                 .fetch_id = fetch.fetch_id,
                 .body_id = fetch.body_id,
             };
+            // A policy that grants nothing, policy 0 included, is admitted like any other and
+            // refused by the transport on the fetch's first hop, so one place decides what a
+            // fetch may reach; the refusal is no strike.
             const options = engine_mod.SubmitOptions{
                 .isolation = isolation,
-                .network = network.*,
+                .network = granted.policy,
                 .request_deadline_mono_ns = fields.deadline_monotonic_ns,
                 .budget_key = budgets.BudgetKey.ofToken(fields),
             };
@@ -218,11 +241,15 @@ pub fn Methods(comptime Gateway: type) type {
                 .shard_index = shard_index,
                 .security_cell_id = worker.security_cell_id,
                 .policy_id = fields.policy_id,
+                .upload_bytes = upload_bytes,
             }) catch |err| {
                 failFetch(self, worker, fetch, @errorName(err));
                 return true;
             };
             admission.route_recorded = true;
+            // The route's retirement returns them (`retireRoute`).
+            worker.upload_bytes_in_flight += upload_bytes;
+            admission.upload_bytes_reserved = upload_bytes;
             self.shards.recordWorkerFetch(
                 self.allocator,
                 worker.session_id,
@@ -246,10 +273,9 @@ pub fn Methods(comptime Gateway: type) type {
             // A body-pooled fetch waits in the upload assembler until its announced length has
             // arrived as upload-pool extents (`runtime/upload_flow.zig`); any other goes to its
             // engine now. Either way the fetch is committed once the call returns.
-            const pooled = (fetch.flags & ipc.egress_fetch_start_flag_body_pooled) != 0;
             const engine = &self.shards.get(shard_index).engine;
             const handed_over = if (pooled)
-                self.registerPendingUpload(worker, fetch, shard_index, options)
+                self.registerPendingUpload(worker, fetch, shard_index, options, max_response_body_bytes)
             else
                 engine.submit(worker.session_id, fetch, options);
             handed_over catch |err| {
@@ -482,11 +508,18 @@ pub fn Methods(comptime Gateway: type) type {
         }
 
         /// Undoes the admission of a route already taken out of the router: drops the fetch's
-        /// assembly state if it has any, and lowers the shard's per-worker count and the active
-        /// fetches of the worker and of its security cell. Cancels, failures, a request's end and
-        /// worker removal all retire routes through here.
+        /// assembly state if it has any, returns its upload bytes to its session, and lowers the
+        /// shard's per-worker count and the active fetches of the worker and of its security
+        /// cell. Cancels, failures, a request's end and worker removal all retire routes through
+        /// here; a removed worker's session is gone, and its bytes with it.
         pub fn retireRoute(self: *Gateway, route: router_mod.Route) void {
             self.retirePendingUpload(route.key.worker_session_id, route.key.fetch_id);
+            if (route.record.upload_bytes != 0) {
+                if (self.workers.bySession(route.key.worker_session_id)) |worker| {
+                    std.debug.assert(worker.upload_bytes_in_flight >= route.record.upload_bytes);
+                    worker.upload_bytes_in_flight -= route.record.upload_bytes;
+                }
+            }
             self.shards.removeWorkerFetch(
                 self.allocator,
                 route.key.worker_session_id,
@@ -548,6 +581,8 @@ fn FetchAdmission(comptime Gateway: type) type {
         budget_taken_ns: u64,
         budget_refund_pending: bool = true,
         route_recorded: bool = false,
+        /// Pooled-body bytes reserved on the session along with the route.
+        upload_bytes_reserved: u64 = 0,
         shard_worker_recorded: bool = false,
         worker_count_incremented: bool = false,
         security_cell_count_incremented: bool = false,
@@ -568,6 +603,8 @@ fn FetchAdmission(comptime Gateway: type) type {
                 );
             if (self.route_recorded)
                 _ = gateway.router.remove(gateway.allocator, self.route_key);
+            if (self.upload_bytes_reserved != 0)
+                self.worker.upload_bytes_in_flight -= self.upload_bytes_reserved;
             if (self.budget_refund_pending)
                 self.worker.budgets.refund(self.budget_key, self.budget_taken_ns);
         }

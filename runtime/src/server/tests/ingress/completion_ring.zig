@@ -40,7 +40,7 @@ test "one drain after an eventfd wake takes every completion and stores the serv
     defer std.posix.close(fd);
     var view = try worker_shared_page.mapReadWrite(fd);
     defer view.deinit();
-    view.initializeCrashDefault(1, 0, 0);
+    view.initializeCrashDefault();
     const event_fd = try std.posix.eventfd(0, std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK);
     defer std.posix.close(event_fd);
     try publishOn(&view, 1, 0);
@@ -61,7 +61,7 @@ test "worker completion sequence mismatch is fatal and does not wedge tail" {
     defer std.posix.close(fd);
     var view = try worker_shared_page.mapReadWrite(fd);
     defer view.deinit();
-    view.initializeCrashDefault(1, 0, 0);
+    view.initializeCrashDefault();
     try publishOn(&view, 1, 0);
     view.completion_records[0].sequence = 99;
     var out: [1]worker_shared_page.WorkerCompletionRecord = undefined;
@@ -76,14 +76,13 @@ test "worker completion ring overflow marks shared page fatal" {
     defer std.posix.close(fd);
     var view = try worker_shared_page.mapReadWrite(fd);
     defer view.deinit();
-    view.initializeCrashDefault(1, 0, 0);
+    view.initializeCrashDefault();
 
     var index: u32 = 0;
     while (index < worker_shared_page.COMPLETION_RING_COUNT) : (index += 1)
         try publishOn(&view, index + 1, index);
     try std.testing.expectError(error.WorkerCompletionRingOverflow, publishOn(&view, 9999, 0));
     try std.testing.expectEqual(@as(u32, 1), @atomicLoad(u32, &view.completion_header.fatal, .acquire));
-    try std.testing.expectEqual(@as(u64, 1), @atomicLoad(u64, &view.completion_header.overflow_count, .acquire));
 }
 
 test "a completion naming a request that ended is dropped, also once a later request holds its slot" {

@@ -3,7 +3,8 @@
 //! item, due once the injected clock reaches the delay. The callback gets the global object as
 //! `this` and the extra arguments; `clearTimeout` accepts an id passed as a string; an interval
 //! whose callback throws keeps firing; a delay is converted to a number, and one that converts
-//! to NaN counts as zero; and the four globals are writable and configurable. Lane:
+//! to NaN counts as zero; the four globals are writable and configurable; and outside a request
+//! turn `setTimeout` and `setInterval` each throw a TypeError that names the caller. Lane:
 //! `bindings-test`. Timers across requests and the worker's lifecycle are covered in
 //! `worker-test` (`worker/tests/runtime/`), and the web-facing contract in the `webapi` lane's
 //! `runtime/tests/webapi/timers/`.
@@ -255,4 +256,46 @@ test "setTimeout schedules a callback through the Zig runtime" {
     defer coerced_result.deinit();
     try support.expectValueString(&vm, &coerced_result, "coerced-immediate");
     try vm.turnExit();
+}
+
+test "setTimeout and setInterval called outside a request turn each name themselves in their TypeError" {
+    var vm = try support.createVm();
+    defer vm.deinit();
+
+    var now_mono_ns: u64 = 1_000;
+    var completion_fixture = try rt.CompletionFixture.init();
+    defer completion_fixture.deinit();
+    var runtime = try worker.Runtime.init(std.testing.allocator, &vm, null, &completion_fixture.view, try rt.createCompletionEventfd(), worker.RuntimeOptions{
+        .clock = .{
+            .ctx = &now_mono_ns,
+            .now_fn = fakeNow,
+        },
+    });
+    defer runtime.deinit();
+    try runtime.attachHostRuntime();
+
+    // A module evaluated directly runs with no owner: no turn is open and no evaluation is the turnless context, so
+    // the host runtime is attached but no request can own a timer.
+    const module_specifier = "/__collo_route/test/timers_outside_turn.js";
+    const source =
+        \\function messageOf(schedule) {
+        \\    try {
+        \\        schedule(() => {}, 0);
+        \\        return "scheduled";
+        \\    } catch (error) {
+        \\        return error.constructor.name + ": " + error.message;
+        \\    }
+        \\}
+        \\export const messages = [messageOf(setTimeout), messageOf(setInterval)].join("|");
+    ;
+    try support.registerModule(&vm, module_specifier, source);
+    try support.evaluateOk(&vm, module_specifier);
+
+    var messages = try support.getExportOk(&vm, module_specifier, "messages");
+    defer messages.deinit();
+    try support.expectValueString(
+        &vm,
+        &messages,
+        "TypeError: setTimeout requires an active request turn.|TypeError: setInterval requires an active request turn.",
+    );
 }

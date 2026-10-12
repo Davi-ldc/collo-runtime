@@ -222,6 +222,11 @@ pub extern fn collo_boringssl_self_signed_generate(
     out_key_pem_len: *usize,
 ) c_int;
 
+/// Checks the shim's reading of a ClientHello's cipher suites against fixed lists: 0 when every
+/// case reads as expected, -1 with the failing case in the thread's last error. Only the TLS test
+/// shim (`runtime/tests/support/tls/tls_shim.cc`) calls it.
+pub extern fn collo_boringssl_test_tls13_policy_cipher_flags() c_int;
+
 /// The calling thread's last shim error as a NUL-terminated string; `lastErrorSlice` wraps it.
 pub extern fn collo_boringssl_last_error() [*:0]const u8;
 

@@ -1,5 +1,8 @@
 //! A ready worker as the host holds it: the process, its channels, and the
-//! resources the host must release when the worker goes away.
+//! resources the host must release when the worker goes away. Its tmpfs
+//! lives in its own mount namespace over the host's shared mount point
+//! (`tmp_mount.zig`), so it ends with the worker and leaves the host nothing
+//! to remove.
 
 const std = @import("std");
 const ipc = @import("collo_ipc");
@@ -17,7 +20,6 @@ pub const WorkerHandle = struct {
     /// The per-worker control socket: WorkerInit went over it, and after
     /// ready it carries dispatch descriptors in and response frames out.
     control_fd: std.posix.fd_t,
-    tmp_root: []u8,
     cgroup_dir: []u8,
     memory_limit_bytes: u64,
     /// The cgroup's CPU limit in cores (`cpu.max`). It travels with the
@@ -45,7 +47,6 @@ pub const WorkerHandle = struct {
         pid: u32,
         pidfd: std.posix.fd_t,
         control_fd: std.posix.fd_t,
-        tmp_root: []const u8,
         cgroup_dir: []const u8,
         memory_limit_bytes: u64,
         cpu_max_cores: u32,
@@ -57,8 +58,6 @@ pub const WorkerHandle = struct {
         metrics: worker_shared_page.WorkerWriterView,
         fs_fault_fd: std.posix.fd_t,
     ) !WorkerHandle {
-        const owned_tmp_root = try allocator.dupe(u8, tmp_root);
-        errdefer allocator.free(owned_tmp_root);
         const owned_cgroup_dir = try allocator.dupe(u8, cgroup_dir);
         errdefer allocator.free(owned_cgroup_dir);
 
@@ -67,7 +66,6 @@ pub const WorkerHandle = struct {
             .pid = pid,
             .pidfd = pidfd,
             .control_fd = control_fd,
-            .tmp_root = owned_tmp_root,
             .cgroup_dir = owned_cgroup_dir,
             .memory_limit_bytes = memory_limit_bytes,
             .cpu_max_cores = cpu_max_cores,
@@ -118,13 +116,8 @@ pub const WorkerHandle = struct {
         // -1 only for a handle that never had a shared page (`metrics`).
         if (self.metrics_fd >= 0)
             std.posix.close(self.metrics_fd);
-        std.fs.deleteTreeAbsolute(self.tmp_root) catch |err| switch (err) {
-            error.FileNotFound => {},
-            else => std.log.warn("host resource leak: failed to delete tmp_root '{s}': {s}", .{ self.tmp_root, @errorName(err) }),
-        };
         cgroup.cleanupWorker(self.cgroup_dir);
         std.posix.close(self.pidfd);
-        self.allocator.free(self.tmp_root);
         self.allocator.free(self.cgroup_dir);
         self.* = undefined;
     }

@@ -8,6 +8,10 @@
 //! The root allocator is the process-lifetime allocator that the gateway and
 //! the server receive: a `DebugAllocator` in Debug builds and `smp_allocator`
 //! otherwise.
+//!
+//! Every process of the binary logs through `zygote/log_sink.zig:logFn`: to
+//! standard error, except in a worker child, which installs its state page so
+//! that its threads' `std.log` lines go into the page's console ring.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -17,6 +21,8 @@ const server = @import("collo_server_main");
 
 const boot_mod = server.boot;
 const command_line = boot_mod.command_line;
+
+pub const std_options: std.Options = .{ .logFn = zygote.log_sink.logFn };
 
 pub fn main() !void {
     if (try boot()) |exit_status|

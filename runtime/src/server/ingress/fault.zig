@@ -76,7 +76,8 @@ pub const LaneFault = error{
     Unexpected,
     // A completion whose user data the lane never packed: a kind that is no
     // `EventKind` (`runner/event_sources.zig`), or an accept tag whose lane
-    // field does not fit a lane id (`uring.unpackAcceptUserData`).
+    // field does not fit a lane id (`uring.unpackAcceptUserData`) or names
+    // another lane, whose accept never arms on this lane's ring.
     UnknownCqeTag,
     InvalidLaneId,
     // The listener's multishot accept ended with an errno no single
@@ -375,7 +376,6 @@ pub const TlsHandshakeError = error{
 /// `normalizeAuthority`, and `TooManyRequestHeaders` for a head with more
 /// fields than a dispatch carries (`ipc.max_request_header_count`).
 pub const RequestHeadError = error{
-    RequestTooLarge,
     TooManyRequestHeaders,
     InvalidHeaderLine,
     Http2UppercaseHeaderName,
@@ -570,11 +570,11 @@ fn classifyTlsHandshake(err: (LaneFault || TlsHandshakeError)) LaneFault!Connect
 }
 
 // The block was decompressed before it was refused, so both ends' header
-// tables agree and only the stream fails: RST_STREAM PROTOCOL_ERROR, or 413
-// and 431 for the size bounds.
+// tables agree and only the stream fails: the lane answers a head 431 for
+// the size bounds and 400 for the rest (`runner/admission.zig`), and resets
+// a trailer block's stream.
 fn classifyRequestHead(err: (LaneFault || RequestHeadError)) LaneFault!ConnectionOutcome {
     return switch (err) {
-        error.RequestTooLarge,
         error.TooManyRequestHeaders,
         error.InvalidHeaderLine,
         error.Http2UppercaseHeaderName,
@@ -689,6 +689,11 @@ pub const WorkerFaultReason = enum {
     /// A request of the worker outlived its deadline by
     /// `hard_timeout_grace_ns` without the worker ending it.
     deadline_grace_expired,
+    /// The worker's VM thread kept working for an owner past that owner's
+    /// deadline by `ownerOverrunGraceNs`, as the metrics thread read it off
+    /// the worker's page (`analytics_drain.zig`): the worker's sentinel
+    /// could not stop it.
+    owner_overran,
     /// The worker's usage record ring has its head where no append puts it:
     /// behind the server's own cursor or more than a ring past it
     /// (`RecordCursor.peek` in `common/worker_state/page/snapshots.zig`).
@@ -700,6 +705,9 @@ pub const WorkerFaultReason = enum {
     /// it a session, so the launcher retired it (`Launcher.gatewayLost` in
     /// `server/supervisor/launcher.zig`).
     egress_session_failed,
+    /// A `worker_retiring` packet of another size than the notice, or naming
+    /// a reason `ipc.WorkerRetiringReason` does not (`ipc.worker_retiring`).
+    retiring_notice_invalid,
 
     /// The reason as `access.jsonl` and `usage.jsonl` spell it. Consumers
     /// read these strings, so a label never changes once it ships.
@@ -726,9 +734,11 @@ pub const WorkerFaultReason = enum {
             .peer_closed => "peer_closed",
             .exited => "exited",
             .deadline_grace_expired => "deadline_grace_expired",
+            .owner_overran => "owner_overran",
             .usage_record_protocol => "usage_record_protocol",
             .log_ring_corrupt => "log_ring_corrupt",
             .egress_session_failed => "egress_session_failed",
+            .retiring_notice_invalid => "retiring_notice_invalid",
         };
     }
 
@@ -753,6 +763,7 @@ pub const WorkerOutcome = union(enum) {
 pub const WorkerError = union(enum) {
     receive: (LaneFault || PacketReceiveError),
     ingress_decode: (LaneFault || IngressDecodeError),
+    retiring_decode: (LaneFault || RetiringDecodeError),
     fs_fault_decode: (LaneFault || FsFaultDecodeError),
     wake: (LaneFault || WakeError),
     completion: (LaneFault || CompletionError),
@@ -790,6 +801,14 @@ pub const IngressDecodeError = error{
     IngressSharedPayloadTooLarge,
     ShortRead,
     OutOfMemory,
+};
+
+/// `ipc.worker_retiring.decode`, on a packet whose kind already read as
+/// `worker_retiring` and that carries no descriptor.
+pub const RetiringDecodeError = error{
+    InvalidMessageKind,
+    InvalidPacket,
+    InvalidWorkerRetiringReason,
 };
 
 /// `ipc.fs_fault.decodeRequest`.
@@ -851,6 +870,7 @@ pub fn classifyWorkerError(err: WorkerError) LaneFault!WorkerOutcome {
     return switch (err) {
         .receive => |receive_error| classifyReceive(receive_error),
         .ingress_decode => |decode_error| classifyIngressDecode(decode_error),
+        .retiring_decode => |decode_error| classifyRetiringDecode(decode_error),
         .fs_fault_decode => |decode_error| classifyFsFaultDecode(decode_error),
         .wake => |wake_error| classifyWake(wake_error),
         .completion => |completion_error| classifyCompletion(completion_error),
@@ -895,6 +915,16 @@ fn classifyIngressDecode(err: (LaneFault || IngressDecodeError)) LaneFault!Worke
         error.ShortRead,
         => fault(.payload_ring_invalid),
         error.OutOfMemory => fault(.allocation_failed),
+        inline else => |lane_fault| @errorCast(lane_fault),
+    };
+}
+
+fn classifyRetiringDecode(err: (LaneFault || RetiringDecodeError)) LaneFault!WorkerOutcome {
+    return switch (err) {
+        error.InvalidMessageKind => fault(.unknown_kind),
+        error.InvalidPacket,
+        error.InvalidWorkerRetiringReason,
+        => fault(.retiring_notice_invalid),
         inline else => |lane_fault| @errorCast(lane_fault),
     };
 }
@@ -1199,10 +1229,12 @@ pub const loop_handlers = [_]LoopHandler{
 //   Flushes the connection's queued writes after its write poll fired, then
 //   drives it as `handleConnectionReadable` does, with the same outcomes.
 // handleAcceptCqe(lane, cqe: std.os.linux.io_uring_cqe) LaneFault!void
-//   Gives an accepted socket a connection slot and starts its handshake, or
-//   re-arms the multishot accept the kernel ended. A socket that cannot be
-//   set up (`ConnectionError.accept`) closes alone and is counted; a failed
-//   re-arm or an accept errno no single connection explains is a lane fault.
+//   Gives an accepted socket a connection slot and starts its handshake,
+//   whichever arming of the accept delivered it, or re-arms the multishot
+//   accept the kernel ended. A socket that cannot be set up
+//   (`ConnectionError.accept`) closes alone and is counted; a failed re-arm,
+//   an accept errno no single connection explains and an accept tag of
+//   another lane are lane faults.
 // handleCommands(lane) LaneFault!void
 //   Takes the lane's wake bits, retrying the request bodies parked on a full
 //   payload ring and resuming the workers whose forwarding window reopened,

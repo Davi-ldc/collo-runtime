@@ -72,6 +72,20 @@ test "egress http2 response parser rejects malformed header blocks" {
     }, true));
 }
 
+test "egress http2 response parser refuses te in a head and in trailers, even as trailers" {
+    try std.testing.expectError(error.Http2MalformedResponse, egress_http2.parseResponseHead(&.{
+        .{ .name = ":status", .value = "200" },
+        .{ .name = "te", .value = "trailers" },
+    }, true));
+    try std.testing.expectError(error.Http2MalformedResponse, egress_http2.parseResponseHead(&.{
+        .{ .name = ":status", .value = "200" },
+        .{ .name = "te", .value = "gzip" },
+    }, true));
+    try std.testing.expectError(error.Http2MalformedResponse, egress_http2.response.validateTrailers(&.{
+        .{ .name = "te", .value = "trailers" },
+    }));
+}
+
 test "egress http2 hpack encoder poison closes connection for reuse" {
     var sent_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer sent_wire.deinit();

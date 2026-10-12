@@ -205,18 +205,17 @@
    BSSL_CHECK(MD4_Init(reinterpret_cast<MD4_CTX *>(ctx->md_data)));
 --- a/crypto/digest/digest_test.cc
 +++ b/crypto/digest/digest_test.cc
-@@ -293,6 +293,10 @@
+@@ -293,6 +293,9 @@
    static const uint8_t kSHA256GarbageParam[] = {
        0x30, 0x0e, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01,
        0x65, 0x03, 0x04, 0x02, 0x01, 0x02, 0x01, 0x2a};
 +  static const uint8_t kSHA3_256NoParam[] = {0x30, 0x0b, 0x06, 0x09, 0x60,
 +                                             0x86, 0x48, 0x01, 0x65, 0x03,
 +                                             0x04, 0x02, 0x08};
-+
+
    // Serialize SHA-256, with and without NULL.
    cbb.Reset();
-   ASSERT_TRUE(CBB_init(cbb.get(), 0));
-@@ -305,6 +309,20 @@
+@@ -306,6 +309,20 @@
    EXPECT_EQ(Bytes(kSHA256NoParam),
              Bytes(CBB_data(cbb.get()), CBB_len(cbb.get())));
  
@@ -237,14 +236,14 @@
    // Parse SHA-256. Either absent or NULL parameters are tolerated for
    // compatibility.
    CBS cbs;
-@@ -314,6 +332,10 @@
+@@ -315,6 +332,9 @@
    CBS_init(&cbs, kSHA256NoParam, sizeof(kSHA256NoParam));
    EXPECT_EQ(EVP_sha256(), EVP_parse_digest_algorithm(&cbs));
    EXPECT_EQ(0u, CBS_len(&cbs));
 +  CBS_init(&cbs, kSHA3_256NoParam, sizeof(kSHA3_256NoParam));
 +  EXPECT_EQ(EVP_sha3_256(), EVP_parse_digest_algorithm(&cbs));
 +  EXPECT_EQ(0u, CBS_len(&cbs));
-+
+
    // Garbage parameters are not.
    CBS_init(&cbs, kSHA256GarbageParam, sizeof(kSHA256GarbageParam));
    EXPECT_FALSE(EVP_parse_digest_algorithm(&cbs));

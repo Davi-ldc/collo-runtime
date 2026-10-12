@@ -16,6 +16,13 @@ test "domain validation rejects unsafe labels" {
     try std.testing.expectError(error.InvalidDomain, domain.validateName("demo..example.test"));
     try std.testing.expectError(error.InvalidDomain, domain.validateName("-demo.example.test"));
     try std.testing.expectError(error.InvalidDomain, domain.validateName("demo.example.test."));
+    try std.testing.expectError(error.InvalidDomain, domain.validateName("[::1]"));
+    try std.testing.expectError(error.InvalidDomain, domain.validateName("bücher.example"));
+}
+
+test "domain validation accepts an underscore, as URL hosts carry it" {
+    try domain.validateName("_dmarc.example.com");
+    try domain.validateName("my_service.internal");
 }
 
 test "subdomain helper requires a strict dotted suffix match" {

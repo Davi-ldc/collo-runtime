@@ -1,16 +1,19 @@
-//! Per-fetch transport configuration: policy switches, body and protocol
-//! limits, timeouts and pool isolation identities.
+//! Per-fetch transport configuration: the network policy every hop is
+//! checked against, body and protocol limits, timeouts and pool isolation
+//! identities.
 //!
-//! The defaults serve standalone use and tests. The gateway builds one
-//! `Config` per fetch from its policy, the fetch's request deadline and its
-//! isolation identities. Deadlines are absolute monotonic nanoseconds, and
-//! zero means none.
+//! The defaults serve standalone use and tests, except `network`, which has
+//! none, so every caller names what its fetches may reach. The gateway
+//! builds one `Config` per fetch from its limits, the policy its token
+//! names, the fetch's request deadline and its isolation identities.
+//! Deadlines are absolute monotonic nanoseconds, and zero means none.
 
 const std = @import("std");
 const core = @import("collo_egress_core");
 const egress_tls = @import("collo_egress_tls");
 const http2 = @import("collo_egress_http2");
 const limits = @import("collo_limits");
+const network = @import("collo_network");
 
 const decompress = core.decompress;
 const stream_pump = core.stream_pump;
@@ -38,8 +41,12 @@ pub const Protocol = enum {
 };
 
 pub const Config = struct {
-    allow_plain_http: bool = false,
-    allow_private_networks: bool = false,
+    /// What the fetch may reach, checked on every hop, redirects included:
+    /// the scheme, host and port before DNS and every resolved address after
+    /// it (`request/policy.zig`). It points into memory its owner keeps for
+    /// as long as the fetch runs: the gateway's decoded table, or a constant
+    /// such as `network.public_https`.
+    network: network.Policy,
     max_response_body_bytes: usize = limits.http_body.MATERIALIZED_BODY_BYTES_MAX,
     /// Wire bytes accepted for one response, bounded apart from decoded bytes
     /// so a compressed response cannot spend unbounded network and CPU while

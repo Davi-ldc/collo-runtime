@@ -1,19 +1,22 @@
 //! The shared state page of one worker: a memfd the host creates and maps,
 //! and the worker maps read-write at boot. It holds the worker's lifecycle
-//! header, one live slot per request in flight, the usage record ring, the
-//! completion ring, the console line ring, the boot phase stamps and the
-//! first-handler benchmark record.
+//! header with its owner section, one live slot per request in flight, the
+//! completion ring, the console line ring, the boot phase stamps, the
+//! first-handler benchmark record and the usage record ring.
 //!
 //! The worker writes the page from its VM thread. Its sentinel thread writes
-//! only the lifecycle header, right before it ends the process under memory
-//! pressure. Each ring has one producer, the VM thread, and one consumer at a
-//! time on the host side. The worker can write any byte of the page at any
-//! moment, so every value the host loads from it is hostile input: a host
-//! reader loads each field once into a private copy, validates the copy and
-//! uses only the copy, and keeps the cursors it owns in its own memory.
-//! `snapshots.zig` holds those reads for the header, the live slots and the
-//! usage record ring; the completion and console rings keep the same rule in
-//! their drains.
+//! the lifecycle header only for the running owner's CPU, and the state and
+//! reason right before it ends the process. The usage and completion rings
+//! have one producer, the VM thread; the console ring takes lines from any
+//! of the worker's threads, the runtime's `std.log` lines included
+//! (`zygote/log_sink.zig`), which serialize on its lock (`console_ring.zig`);
+//! each ring has one consumer at a time on the host side. The worker
+//! can write any byte of the page at any moment, so every value the host
+//! loads from it is hostile input: a host reader loads each field once into
+//! a private copy, validates the copy and uses only the copy, and keeps the
+//! cursors it owns in its own memory. `snapshots.zig` holds those reads for
+//! the header, the live slots and the usage record ring; the completion and
+//! console rings keep the same rule in their drains.
 //!
 //! The sections live under `page/`, one file each: `lifecycle.zig` holds the
 //! lifecycle header, `live_slots.zig` the live slots, `usage_records.zig` the
@@ -45,8 +48,7 @@ pub const LifecycleIdentity = live_slots.LifecycleIdentity;
 pub const RECORD_RING_COUNT = usage_records.RECORD_RING_COUNT;
 pub const CompletedStatus = usage_records.CompletedStatus;
 pub const CompletedRecord = usage_records.CompletedRecord;
-pub const CompletedRecordFlags = usage_records.CompletedRecordFlags;
-pub const completedRecordHasFlag = usage_records.completedRecordHasFlag;
+pub const AccountingFlags = usage_records.AccountingFlags;
 
 pub const COMPLETION_RING_COUNT = completion_ring.COMPLETION_RING_COUNT;
 pub const worker_completion_status_max = completion_ring.worker_completion_status_max;
@@ -70,6 +72,8 @@ pub const BOOT_PHASE_COUNT = boot_stamps.BOOT_PHASE_COUNT;
 pub const BenchHandlerRecord = boot_stamps.BenchHandlerRecord;
 
 pub const LifecycleSnapshot = snapshots.LifecycleSnapshot;
+pub const OwnerSnapshot = snapshots.OwnerSnapshot;
+pub const RunningOwnerSnapshot = snapshots.RunningOwnerSnapshot;
 pub const LiveSlotSnapshot = snapshots.LiveSlotSnapshot;
 pub const RecordCursor = snapshots.RecordCursor;
 

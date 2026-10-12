@@ -3,7 +3,8 @@
 //! structural, so the gateway's policy (`egress/gateway/policy.zig`) can
 //! tighten them and never loosen them. A small request body rides inline in
 //! the start packet; a larger one streams through the upload pool as
-//! extents, bounded only by `request_body_pooled_bytes_max`, and the gateway
+//! extents, bounded by `request_body_pooled_bytes_max` per body and
+//! `request_body_pooled_in_flight_bytes_max` per session, and the gateway
 //! assembles it on its heap and keeps it for redirect replay.
 //!
 //! The start packet holds its header, method, URL, request headers and
@@ -45,12 +46,21 @@ pub const request_body_inline_preferred_bytes_max: usize = 16 * 1024;
 /// `max_request_body_bytes` above it.
 pub const request_body_pooled_bytes_max: usize = 32 * 1024 * 1024;
 
+/// Pool-streamed request-body bytes one egress session may have announced and
+/// not yet seen end, counted by the length each start announces: two bodies
+/// at `request_body_pooled_bytes_max`. Both ends read it. The worker parks a
+/// pooled start that would pass it until earlier uploads end, and the gateway
+/// refuses one past it with a fetch error rather than a strike, since the
+/// worker cannot see when the gateway let an earlier upload go.
+pub const request_body_pooled_in_flight_bytes_max: usize = 2 * request_body_pooled_bytes_max;
+
 comptime {
     std.debug.assert(request_packet_bytes_max > request_start_header_bytes);
     std.debug.assert(request_body_inline_bytes_max > 0);
     std.debug.assert(request_body_inline_preferred_bytes_max <= request_body_inline_bytes_max);
     std.debug.assert(request_body_pooled_bytes_max >= request_body_inline_bytes_max);
     std.debug.assert(request_body_pooled_bytes_max <= std.math.maxInt(u32));
+    std.debug.assert(request_body_pooled_in_flight_bytes_max >= request_body_pooled_bytes_max);
     std.debug.assert(request_start_header_bytes <= std.math.maxInt(u32));
     std.debug.assert(request_method_bytes_max <= std.math.maxInt(u32));
     std.debug.assert(request_url_bytes_max <= std.math.maxInt(u32));

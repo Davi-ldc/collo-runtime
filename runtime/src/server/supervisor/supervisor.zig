@@ -20,8 +20,8 @@
 //!   read a record when.
 //! - `next_worker_id` and `next_worker_generation` belong to the launcher
 //!   thread, which alone builds records (`worker_registry.buildRecord`).
-//! - Usage records take no lock of this struct. `usage` locks itself and
-//!   owns the exactly-once index, `analytics` locks its own streams, each
+//! - Usage records take no lock of this struct. `usage` locks itself,
+//!   `analytics` locks its own streams, each
 //!   worker record's request table has its own leaf lock, and
 //!   `usage_counters` are atomics.
 //! - `egress_gateway` is set once by the server before the launcher starts
@@ -47,6 +47,7 @@ pub const analytics = @import("collo_server_analytics");
 const launcher = @import("launcher.zig");
 const pool = @import("pool.zig");
 const reaping = @import("reaper/reaping.zig");
+const reaper_memory = @import("reaper/memory.zig");
 const scheduler_limits = @import("scheduler_limits.zig");
 const worker_table = @import("worker_table.zig");
 const usage_drain = @import("usage_drain.zig");
@@ -61,7 +62,7 @@ const WorkerCgroupRoot = cgroup_root.WorkerCgroupRoot;
 pub const WorkerPool = pool.Pool(WorkerRecord);
 pub const SettleOutcome = usage_drain.SettleOutcome;
 
-const pool_workers_max = scheduler_limits.capacity.pool_workers_max;
+const pool_workers_max = pool_limits.pool_workers_max;
 
 comptime {
     // A launch ticket names its entry in a byte, and each pool's options
@@ -133,7 +134,7 @@ pub const Supervisor = struct {
     /// at `init` and kept until `deinit`.
     pools: []WorkerPool,
     /// Every worker record: entry `e` of pool `d` is
-    /// `records[d * scheduler_limits.capacity.pool_workers_max + e]`, the
+    /// `records[d * pool_workers_max + e]`, the
     /// entry a `LaunchTicket` names. Allocated at `init` and never freed
     /// while the server runs, so a pointer stays dereferenceable after its
     /// worker leaves; holders tell workers apart by `Record.key`.
@@ -154,24 +155,28 @@ pub const Supervisor = struct {
     demand_reclaim_eventfd: std.atomic.Value(std.posix.fd_t) = .init(-1),
     /// Borrowed: the server opens the sink before the supervisor and closes it
     /// after `deinit` (`server/main.zig`). A worker's final drain writes its
-    /// last console lines into it, and the usage log appends usage records to
-    /// it.
+    /// last console lines into it, its teardown its line in `workers.jsonl`,
+    /// and the usage log appends usage records to it.
     analytics: *analytics.Sink,
-    /// The usage log: the producer side of `usage.jsonl` and the exactly-once
-    /// index. Self contained and self locked; the supervisor hands it records
-    /// and asks it questions, and owns none of its state.
+    /// The usage log: the producer side of `usage.jsonl`. Self contained and
+    /// self locked; the supervisor hands it records and owns none of its
+    /// state.
     usage: usage_log.UsageLog,
     usage_counters: usage_drain.Counters = .{},
     hard_timeout_grace_ns: u64,
     worker_idle_ttl_ns: u64 = default_worker_idle_ttl_ns,
     reaper_interval_ns: u64 = reaping.default_interval_ns,
     memory_pressure_state: reaping.MemoryPressureState = .{},
+    /// The bounds node memory is read against, resolved at `init` from the
+    /// cgroups of the workers and of the server; the reaper thread alone
+    /// reads them (`Reaper.readPressure`).
+    memory_domains: reaper_memory.MemoryDomains,
     /// Set by `setEgressGatewayHooks`; null in fixtures without a gateway.
     egress_gateway: ?EgressGatewayHooks = null,
-    /// Borrowed; the caller of `init` owns it and keeps it alive past the
-    /// supervisor. null only in fixtures that never launch: a fork with no
-    /// prepared leaf has no launch path.
-    worker_cgroup_root: ?*WorkerCgroupRoot = null,
+    /// Borrowed; the caller of `init` owns both parts and keeps them alive
+    /// past the supervisor. null only in fixtures that never launch: a fork
+    /// with no prepared leaf has no launch path.
+    worker_host: ?launcher.WorkerHost = null,
 
     /// Builds one empty pool per definition of `routes` and every record,
     /// vacant. `routes` and `analytics_sink` are borrowed and must outlive
@@ -185,7 +190,7 @@ pub const Supervisor = struct {
         routes: *const Routes,
         analytics_sink: *analytics.Sink,
         supervisor_config: Config,
-        worker_cgroup_root: ?*WorkerCgroupRoot,
+        worker_host: ?launcher.WorkerHost,
     ) error{ OutOfMemory, InvalidPoolOptions }!Supervisor {
         const definition_count = routes.definitionCount();
         const pools = try allocator.alloc(WorkerPool, definition_count);
@@ -211,7 +216,10 @@ pub const Supervisor = struct {
             record.* = WorkerRecord.vacant(definition, routes.definition(definition).name);
         }
 
-        const usage = try usage_log.UsageLog.init(allocator, analytics_sink);
+        var usage = try usage_log.UsageLog.init(allocator, analytics_sink);
+        errdefer usage.deinit();
+        var memory_domains: reaper_memory.MemoryDomains = undefined;
+        try initMemoryDomains(&memory_domains, allocator, if (worker_host) |placement| placement.cgroup_root else null);
         return .{
             .allocator = allocator,
             .zygote_process = zygote_process,
@@ -225,8 +233,38 @@ pub const Supervisor = struct {
             .hard_timeout_grace_ns = supervisor_config.hard_timeout_grace_ns,
             .worker_idle_ttl_ns = supervisor_config.worker_idle_ttl_ns,
             .reaper_interval_ns = supervisor_config.reaper_interval_ns,
-            .worker_cgroup_root = worker_cgroup_root,
+            .memory_domains = memory_domains,
+            .worker_host = worker_host,
         };
+    }
+
+    /// The domains of node memory: every cgroup above the workers' and above
+    /// the server's own, the machine included. A server cgroup that cannot be
+    /// named leaves only the workers' side and the machine, with a warning.
+    fn initMemoryDomains(
+        target: *reaper_memory.MemoryDomains,
+        allocator: std.mem.Allocator,
+        worker_cgroup_root: ?*WorkerCgroupRoot,
+    ) error{OutOfMemory}!void {
+        var paths: [2][]const u8 = undefined;
+        var path_count: usize = 0;
+        if (worker_cgroup_root) |root| {
+            paths[path_count] = root.workers_dir_path;
+            path_count += 1;
+        }
+        const own = reaper_memory.currentCgroupDir(allocator) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => blk: {
+                std.log.warn("node memory: the server's cgroup cannot be named: {s}; its limits are not read", .{@errorName(err)});
+                break :blk null;
+            },
+        };
+        defer if (own) |path| allocator.free(path);
+        if (own) |path| {
+            paths[path_count] = path;
+            path_count += 1;
+        }
+        target.init(.{ .cgroup_paths = paths[0..path_count] });
     }
 
     /// Tears down, on the calling thread, every worker a record still holds
@@ -238,7 +276,7 @@ pub const Supervisor = struct {
     pub fn deinit(self: *Supervisor) void {
         for (self.records) |*record| {
             if (record.id != 0)
-                worker_registry.teardown(self, record);
+                worker_registry.teardown(self, record, .shutdown);
         }
         for (self.pools) |*definition_pool|
             definition_pool.deinit();
@@ -247,6 +285,7 @@ pub const Supervisor = struct {
         // The sink stays open: the server closes it after this returns, and
         // that close writes and syncs what the teardowns above appended.
         self.usage.deinit();
+        self.memory_domains.deinit();
         self.* = undefined;
     }
 
@@ -297,14 +336,22 @@ pub const Supervisor = struct {
         return ticket;
     }
 
-    /// Settles the usage of the request `request_id` that ended on `worker`,
-    /// as `outcome` says, and frees or parks its entry in the worker's
-    /// request table (`usage_drain.settleRequest`). The lane that finishes
-    /// the request calls it before it gives the request's slot back
-    /// (`Pool.release`); it takes only the worker's own locks, and never
-    /// fails.
-    pub fn settleRequest(self: *Supervisor, worker: *WorkerRecord, request_id: u64, outcome: SettleOutcome) void {
-        usage_drain.settleRequest(self.usageDrain(), worker, request_id, outcome);
+    /// Settles the usage of the request `request_id` that ended on `worker`
+    /// at `ended_mono_ns`, as `outcome` says, and frees or parks its entry in
+    /// the worker's request table (`usage_drain.settleRequest`). The lane
+    /// that finishes the request calls it first in its finish, with the
+    /// CLOCK_MONOTONIC instant its access record ends at, before it gives the
+    /// request's slot back (`Pool.release`); the request's usage record then
+    /// ends at that instant too. It takes only the worker's own locks, and
+    /// never fails.
+    pub fn settleRequest(
+        self: *Supervisor,
+        worker: *WorkerRecord,
+        request_id: u64,
+        outcome: SettleOutcome,
+        ended_mono_ns: u64,
+    ) void {
+        usage_drain.settleRequest(self.usageDrain(), worker, request_id, outcome, ended_mono_ns);
     }
 
     /// The status the floors of a dead worker's requests carry: `.memory`
@@ -402,7 +449,7 @@ pub const Supervisor = struct {
         std.debug.assert(generation != 0);
         for (self.pools, 0..) |*definition_pool, index| {
             const definition: config.DefinitionIndex = @intCast(index);
-            if (!worker_factory.definitionHasEgressGrant(self.routes.definition(definition)))
+            if (!worker_factory.definitionHasEgressGrant(self, definition))
                 continue;
             var finder: StaleEgressFinder = .{ .generation = generation };
             const record = definition_pool.findLive(&finder) orelse continue;

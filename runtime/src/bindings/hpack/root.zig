@@ -317,6 +317,56 @@ pub const Decoder = struct {
         };
     }
 
+    /// Decodes `block` only to keep the dynamic table in step with the
+    /// peer's encoder and keeps no field, for a block whose stream takes no
+    /// more headers. No count or size cap applies, so a block `decodeBlock`
+    /// would refuse with `HpackHeaderListTooLarge` passes. Every error it
+    /// returns (`HpackBadData`, `HpackOutputTooSmall`, the shim's) leaves the
+    /// table out of step, so the caller fails the connection on it.
+    pub fn skipBlock(self: *Decoder, allocator: std.mem.Allocator, block: []const u8) !void {
+        try self.ensureInitialized();
+        if (block.len == 0)
+            return;
+        try self.skipBlockScratch(try self.ensureScratch(allocator), block);
+    }
+
+    /// `skipBlock` with the caller's scratch, as `decodeBlockScratch` takes it.
+    pub fn skipBlockScratch(self: *Decoder, scratch: []u8, block: []const u8) !void {
+        std.debug.assert(scratch.len >= max_single_header_decode_bytes);
+        try self.ensureInitialized();
+        if (block.len == 0)
+            return;
+        var offset: usize = 0;
+        while (true) {
+            if (offset != 0 and offset < block.len and isDynamicTableSizeUpdate(block[offset]))
+                return error.HpackBadData;
+            var raw = RawDecodedHeader{
+                .name_offset = 0,
+                .name_len = 0,
+                .value_offset = 0,
+                .value_len = 0,
+            };
+            const status = collo_hpack_decode_one(
+                self.handle.?,
+                block.ptr,
+                block.len,
+                &offset,
+                @ptrCast(scratch.ptr),
+                scratch.len,
+                &raw,
+            );
+            switch (status) {
+                collo_hpack_ok => {},
+                collo_hpack_done => return,
+                collo_hpack_output_too_small => return error.HpackOutputTooSmall,
+                else => {
+                    try statusToError(status);
+                    unreachable;
+                },
+            }
+        }
+    }
+
     fn ensureScratch(self: *Decoder, allocator: std.mem.Allocator) ![]u8 {
         if (self.scratch_allocator) |scratch_allocator| {
             // First-allocator-wins: callers hold one stable allocator per

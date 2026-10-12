@@ -8,10 +8,13 @@
 //! loopback address is `lo`, a specific address is the interface the kernel
 //! lists it under, and the unspecified address, or an address no interface
 //! holds, maps to no single interface, in which case the schedulable CPUs are
-//! the target. `lo` targets the CPUs too: it has one queue and no
-//! interrupts, because the kernel receives a loopback packet on the CPU that
-//! sent it, so a loopback connection arrives on whichever CPU its client runs
-//! on. Two caps always apply: no more lanes than CPUs this process may
+//! the target. `lo` targets the CPUs too, and its queues are never read: it
+//! has one queue and no interrupts, because the kernel receives a loopback
+//! packet on the CPU that sent it, so a loopback connection arrives on
+//! whichever CPU its client runs on. The queue counts are a hint, not a
+//! requirement: an interface whose counts sysfs cannot give, as in a
+//! container without `/sys/class/net`, targets the CPUs with a warning. Two
+//! caps always apply: no more lanes than CPUs this process may
 //! run on, because more hot lane threads than CPUs only add scheduling and
 //! cache cost, and no more lanes than one `lane_memory_share_divisor`-th of
 //! the available memory pays for at each lane's worst-case footprint
@@ -39,6 +42,8 @@ pub const if_inet6_bytes_max: usize = 64 * 1024;
 /// Bytes read from the head of `/proc/meminfo`, which lists `MemAvailable`
 /// on its third line.
 const meminfo_head_bytes: usize = 4096;
+/// Where the kernel lists each network interface's queues.
+pub const sysfs_net_root = "/sys/class/net";
 
 pub const Error = error{
     InvalidLaneCount,
@@ -58,7 +63,7 @@ pub const Plan = struct {
     /// One CPU per lane, in listener order.
     lane_cpu_ids: []usize,
     /// The interface that holds the listen address, whose receive queues set
-    /// the target unless it is `lo`, or null when the address maps to no
+    /// the target when they were read, or null when the address maps to no
     /// single interface. Without queues to follow, the target is the
     /// schedulable CPU count.
     interface: ?Interface,
@@ -73,8 +78,24 @@ pub const Plan = struct {
 
 pub const Interface = struct {
     name: InterfaceName,
-    rx_queues: usize,
-    tx_queues: usize,
+    /// Null for `lo`, whose queues are never read, and for an interface
+    /// whose queues sysfs could not give.
+    queues: ?Queues,
+};
+
+pub const Queues = struct {
+    rx: usize,
+    tx: usize,
+};
+
+pub const BuildOptions = struct {
+    listen: std.net.Address,
+    shape: MemoryShape,
+    /// Zero lets the plan choose.
+    explicit_lane_count: usize = 0,
+    /// Where the interfaces' queues are listed; a test points it at a
+    /// fixture.
+    sysfs_net_root: []const u8 = sysfs_net_root,
 };
 
 /// A kernel network interface name: 1 to `IFNAMESIZE - 1` bytes, never a
@@ -113,16 +134,10 @@ pub const MemoryShape = struct {
     }
 };
 
-/// `explicit_lane_count` zero lets the plan choose. The caller owns the plan
-/// and calls `deinit`. Fails with `error.NoAllowedCpus` when the process may
-/// run on no CPU, and with `error.NoRxQueues` or a sysfs error when the
-/// interface that holds `listen` lists no receive queue or cannot be read.
-pub fn build(
-    allocator: std.mem.Allocator,
-    listen: std.net.Address,
-    shape: MemoryShape,
-    explicit_lane_count: usize,
-) Error!Plan {
+/// The caller owns the plan and calls `deinit`. Fails with
+/// `error.NoAllowedCpus` when the process may run on no CPU, and with an
+/// error of the kernel's interface list or the allocator's.
+pub fn build(allocator: std.mem.Allocator, options: BuildOptions) Error!Plan {
     const allowed_cpu_ids = try discoverAllowedCpus(allocator);
     errdefer allocator.free(allowed_cpu_ids);
     if (allowed_cpu_ids.len == 0)
@@ -130,14 +145,14 @@ pub fn build(
     const allowed_cpu_count = allowed_cpu_ids.len;
 
     var interface: ?Interface = null;
-    if (try interfaceFor(allocator, listen)) |name|
-        interface = try interfaceQueues(allocator, name);
+    if (try interfaceFor(allocator, options.listen)) |name|
+        interface = try readInterface(allocator, options.sysfs_net_root, name);
     const queue_target = queueTarget(interface, allowed_cpu_count);
 
     const mem_available = readMemAvailableBytes() catch mem_available_fallback_bytes;
-    const heavy_lane_bytes = @max(shape.estimatedHeavyLaneBytes(), @as(usize, 1));
+    const heavy_lane_bytes = @max(options.shape.estimatedHeavyLaneBytes(), @as(usize, 1));
     const lane_memory_capacity = @max(@as(usize, 1), (mem_available / lane_memory_share_divisor) / heavy_lane_bytes);
-    const lane_count = try resolveStaticLaneCount(queue_target, allowed_cpu_count, lane_memory_capacity, explicit_lane_count);
+    const lane_count = try resolveStaticLaneCount(queue_target, allowed_cpu_count, lane_memory_capacity, options.explicit_lane_count);
     const lane_cpu_ids = try selectLaneCpuIds(allocator, allowed_cpu_ids, lane_count);
     errdefer allocator.free(lane_cpu_ids);
 
@@ -172,15 +187,35 @@ pub fn interfaceFor(allocator: std.mem.Allocator, address: std.net.Address) Erro
     }
 }
 
-/// The receive and transmit queue counts of `name`, from sysfs. Fails with
-/// `error.FileNotFound` when no such interface exists and with
-/// `error.NoRxQueues` when it lists no receive queue.
-pub fn interfaceQueues(allocator: std.mem.Allocator, name: InterfaceName) Error!Interface {
-    const rx_queues = try countQueues(allocator, name, "rx-");
-    const tx_queues = try countQueues(allocator, name, "tx-");
-    if (rx_queues == 0)
+/// The interface `name` with its queues: none read for `lo`, and none when
+/// sysfs under `sysfs_root` cannot give them, which a warning reports, since
+/// the plan then targets the CPUs. Fails only for want of memory.
+pub fn readInterface(allocator: std.mem.Allocator, sysfs_root: []const u8, name: InterfaceName) error{OutOfMemory}!Interface {
+    if (std.mem.eql(u8, name.slice(), InterfaceName.loopback.slice()))
+        return .{ .name = name, .queues = null };
+    const queues = interfaceQueues(allocator, sysfs_root, name) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            std.log.warn("ingress lane plan: the queues of {s} cannot be read from {s}: {s}; the lanes follow the CPUs", .{
+                name.slice(),
+                sysfs_root,
+                @errorName(err),
+            });
+            return .{ .name = name, .queues = null };
+        },
+    };
+    return .{ .name = name, .queues = queues };
+}
+
+/// The receive and transmit queue counts of `name`, from sysfs under
+/// `sysfs_root`. Fails with `error.FileNotFound` when no such interface
+/// exists and with `error.NoRxQueues` when it lists no receive queue.
+pub fn interfaceQueues(allocator: std.mem.Allocator, sysfs_root: []const u8, name: InterfaceName) Error!Queues {
+    const rx = try countQueues(allocator, sysfs_root, name, "rx-");
+    const tx = try countQueues(allocator, sysfs_root, name, "tx-");
+    if (rx == 0)
         return error.NoRxQueues;
-    return .{ .name = name, .rx_queues = rx_queues, .tx_queues = tx_queues };
+    return .{ .rx = rx, .tx = tx };
 }
 
 /// The CPUs this process may run on, ascending, from its affinity mask. When
@@ -217,13 +252,15 @@ pub fn discoverAllowedCpus(allocator: std.mem.Allocator) Error![]usize {
 }
 
 /// The receive queue count of the listen interface, or `allowed_cpu_count`
-/// when the address maps to no single interface or to `lo`, whose one queue
-/// says nothing about where connections arrive.
+/// when the address maps to no single interface, to `lo`, whose one queue
+/// says nothing about where connections arrive, or to an interface whose
+/// queues were not read.
 pub fn queueTarget(interface: ?Interface, allowed_cpu_count: usize) usize {
     const found = interface orelse return allowed_cpu_count;
     if (std.mem.eql(u8, found.name.slice(), InterfaceName.loopback.slice()))
         return allowed_cpu_count;
-    return found.rx_queues;
+    const queues = found.queues orelse return allowed_cpu_count;
+    return queues.rx;
 }
 
 /// `queue_target` comes from `queueTarget`. A nonzero `explicit_lane_count`
@@ -375,8 +412,8 @@ comptime {
     std.debug.assert(ipv4_addresses_max * @sizeOf(linux.ifreq) <= std.math.maxInt(c_int));
 }
 
-fn countQueues(allocator: std.mem.Allocator, name: InterfaceName, prefix: []const u8) Error!usize {
-    const path = try std.fmt.allocPrint(allocator, "/sys/class/net/{s}/queues", .{name.slice()});
+fn countQueues(allocator: std.mem.Allocator, sysfs_root: []const u8, name: InterfaceName, prefix: []const u8) Error!usize {
+    const path = try std.fmt.allocPrint(allocator, "{s}/{s}/queues", .{ sysfs_root, name.slice() });
     defer allocator.free(path);
     var dir = try std.fs.openDirAbsolute(path, .{ .iterate = true });
     defer dir.close();

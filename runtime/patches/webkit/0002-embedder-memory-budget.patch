@@ -1,0 +1,232 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Davi <davilimacarv2536@gmail.com>
+Date: Sun, 13 Sep 2026 22:38:42 -0300
+Subject: [PATCH 2/5] embedder memory budget
+
+Lets an embedder that forks give each child its own memory budget after
+the fork, in the two places where the engine weighs its work against
+memory. Both hooks are process-local, because the figures the engine
+uses by default are computed once, before the fork, and every child
+inherits them.
+
+`setColloGCMaxHeapSizeOverride` replaces `Options::gcMaxHeapSize` in
+the collection trigger through `JSC::effectiveGCMaxHeapSize`. With
+`USE(BUN_JSC_ADDITIONS)`, `Heap::collectIfNecessaryOrDefer` requests a
+collection as soon as the bytes allocated since the last one pass it,
+and the heap's own trigger still runs below it. The option itself
+cannot carry a child's value: JSC's options live in the configuration
+pages that `VM` creation freezes read-only, so they are fixed before
+the first fork.
+
+`setColloMemoryStatusOverride` makes `WTF::memoryStatus` measure the
+process against the embedder's budget. `Heap::overCriticalMemoryThreshold`
+compares that status with `criticalGCMemoryThreshold` to decide full
+collections, synchronous sweeps and a smaller collection budget. On
+Linux the status is the resident size read from a `/proc/self/statm`
+descriptor that the first call opens and keeps, over `availableMemory()`,
+which the first call computes and keeps. A child forked after those
+calls inherits the parent's limit and a descriptor number it may have
+closed; a sandboxed child cannot reopen statm, and the number may by
+then name another file, which the engine then parses as statm. With the
+override, the footprint is the byte count in a cgroup v2
+`memory.current` descriptor the embedder opened, and the share in use
+is that footprint over the limit it passed, so critical mode engages at
+`criticalGCMemoryThreshold` of the child's own budget. A lock held
+across the read lets `clearColloMemoryStatusOverride` guarantee that no
+thread reads the descriptor after it returns. `availableMemory()` and
+the heap sizing derived from it keep their inherited values.
+---
+ Source/JavaScriptCore/heap/Heap.cpp       | 14 ++++---
+ Source/JavaScriptCore/runtime/Options.cpp | 22 +++++++++++
+ Source/JavaScriptCore/runtime/Options.h   |  8 ++++
+ Source/WTF/wtf/AvailableMemory.cpp        | 46 +++++++++++++++++++++++
+ Source/WTF/wtf/AvailableMemory.h          | 14 +++++++
+ 5 files changed, 98 insertions(+), 6 deletions(-)
+
+diff --git a/Source/JavaScriptCore/heap/Heap.cpp b/Source/JavaScriptCore/heap/Heap.cpp
+index ebe7cbd1..e39d264c 100644
+--- a/Source/JavaScriptCore/heap/Heap.cpp
++++ b/Source/JavaScriptCore/heap/Heap.cpp
+@@ -3033,11 +3033,12 @@ void Heap::collectIfNecessaryOrDefer(GCDeferralContext* deferralContext)
+         if (Options::logGC()) [[unlikely]]
+             logRequestGC = m_requests.isEmpty() && !deferralContext && !isDeferred();
+ #if !USE(BUN_JSC_ADDITIONS)
+-        if (Options::gcMaxHeapSize()) [[unlikely]] {
++        size_t gcMaxHeapSizeThreshold = effectiveGCMaxHeapSize();
++        if (gcMaxHeapSizeThreshold) [[unlikely]] {
+             size_t bytesAllocatedThisCycle = totalBytesAllocatedThisCycle();
+-            if (bytesAllocatedThisCycle <= Options::gcMaxHeapSize())
++            if (bytesAllocatedThisCycle <= gcMaxHeapSizeThreshold)
+                 return false;
+-            dataLogLnIf(logRequestGC, "Requesting GC because bytes allocated this cycle: ", bytesAllocatedThisCycle, " exceed Options::gcMaxHeapSize(): ", Options::gcMaxHeapSize());
++            dataLogLnIf(logRequestGC, "Requesting GC because bytes allocated this cycle: ", bytesAllocatedThisCycle, " exceed GC max heap threshold: ", gcMaxHeapSizeThreshold);
+             return true;
+         }
+ #endif
+@@ -3052,9 +3053,10 @@ void Heap::collectIfNecessaryOrDefer(GCDeferralContext* deferralContext)
+         size_t bytesAllocatedThisCycle = totalBytesAllocatedThisCycle();
+ 
+ #if USE(BUN_JSC_ADDITIONS)
+-        if (Options::gcMaxHeapSize()) {
+-            if (bytesAllocatedThisCycle > Options::gcMaxHeapSize()) {
+-                dataLogLnIf(logRequestGC, "Requesting GC because bytes allocated this cycle: ", bytesAllocatedThisCycle, " exceed Options::gcMaxHeapSize(): ", Options::gcMaxHeapSize());
++        size_t gcMaxHeapSizeThreshold = effectiveGCMaxHeapSize();
++        if (gcMaxHeapSizeThreshold) {
++            if (bytesAllocatedThisCycle > gcMaxHeapSizeThreshold) {
++                dataLogLnIf(logRequestGC, "Requesting GC because bytes allocated this cycle: ", bytesAllocatedThisCycle, " exceed GC max heap threshold: ", gcMaxHeapSizeThreshold);
+                 return true;
+             }
+         }
+diff --git a/Source/JavaScriptCore/runtime/Options.cpp b/Source/JavaScriptCore/runtime/Options.cpp
+index 587ff75b..19dda556 100644
+--- a/Source/JavaScriptCore/runtime/Options.cpp
++++ b/Source/JavaScriptCore/runtime/Options.cpp
+@@ -32,6 +32,7 @@
+ #include "MacroAssembler.h"
+ #include "MinimumReservedZoneSize.h"
+ #include <algorithm>
++#include <atomic>
+ #include <limits>
+ #include <mutex>
+ #include <stdlib.h>
+@@ -71,6 +72,27 @@ WTF_ALLOW_UNSAFE_BUFFER_USAGE_BEGIN
+ 
+ namespace JSC {
+ 
++// Kept apart from Options so that a process can set its own value after a fork, and atomic because the allocation
++// path reads it in Heap::collectIfNecessaryOrDefer. 0 means Options::gcMaxHeapSize().
++static std::atomic<size_t> s_colloGCMaxHeapSizeOverride { 0 };
++
++void setColloGCMaxHeapSizeOverride(size_t bytes)
++{
++    s_colloGCMaxHeapSizeOverride.store(bytes, std::memory_order_release);
++}
++
++void clearColloGCMaxHeapSizeOverride()
++{
++    s_colloGCMaxHeapSizeOverride.store(0, std::memory_order_release);
++}
++
++size_t effectiveGCMaxHeapSize()
++{
++    if (size_t overrideBytes = s_colloGCMaxHeapSizeOverride.load(std::memory_order_relaxed))
++        return overrideBytes;
++    return Options::gcMaxHeapSize();
++}
++
+ bool useOSLogOptionHasChanged = false;
+ Options::SandboxPolicy Options::machExceptionHandlerSandboxPolicy = Options::SandboxPolicy::Unknown;
+ 
+diff --git a/Source/JavaScriptCore/runtime/Options.h b/Source/JavaScriptCore/runtime/Options.h
+index 80a5b11f..b167c3df 100644
+--- a/Source/JavaScriptCore/runtime/Options.h
++++ b/Source/JavaScriptCore/runtime/Options.h
+@@ -202,4 +202,12 @@ private:
+     }
+ };
+ 
++// A process-local replacement for Options::gcMaxHeapSize(), for an embedder that forks and gives each child its own
++// memory budget after the fork. effectiveGCMaxHeapSize() returns the override when it is nonzero and the option
++// otherwise. With USE(BUN_JSC_ADDITIONS), Heap::collectIfNecessaryOrDefer requests a collection as soon as the bytes
++// allocated since the last one exceed it, and the heap's own trigger still runs below it.
++JS_EXPORT_PRIVATE void setColloGCMaxHeapSizeOverride(size_t);
++JS_EXPORT_PRIVATE void clearColloGCMaxHeapSizeOverride();
++JS_EXPORT_PRIVATE size_t effectiveGCMaxHeapSize();
++
+ } // namespace JSC
+diff --git a/Source/WTF/wtf/AvailableMemory.cpp b/Source/WTF/wtf/AvailableMemory.cpp
+index 89f95958..fb17288d 100644
+--- a/Source/WTF/wtf/AvailableMemory.cpp
++++ b/Source/WTF/wtf/AvailableMemory.cpp
+@@ -28,6 +28,8 @@
+ 
+ #include <array>
+ #include <mutex>
++#include <optional>
++#include <wtf/Lock.h>
+ #include <wtf/PageBlock.h>
+ #include <wtf/text/ParsingUtilities.h>
+ #include <wtf/text/StringToIntegerConversion.h>
+@@ -138,6 +140,48 @@ struct LinuxMemory {
+     long pageSize { 0 };
+     int statmFd { -1 };
+ };
++
++struct ColloMemoryStatusOverride {
++    size_t limitBytes;
++    int memoryCurrentFd;
++};
++
++// Held across the read, so once clearColloMemoryStatusOverride returns no thread reads the descriptor again.
++static Lock s_colloMemoryStatusOverrideLock;
++static std::optional<ColloMemoryStatusOverride> s_colloMemoryStatusOverride WTF_GUARDED_BY_LOCK(s_colloMemoryStatusOverrideLock);
++
++void setColloMemoryStatusOverride(size_t limitBytes, int memoryCurrentFd)
++{
++    RELEASE_ASSERT(limitBytes);
++    RELEASE_ASSERT(memoryCurrentFd >= 0);
++    Locker locker { s_colloMemoryStatusOverrideLock };
++    s_colloMemoryStatusOverride = ColloMemoryStatusOverride { limitBytes, memoryCurrentFd };
++}
++
++void clearColloMemoryStatusOverride()
++{
++    Locker locker { s_colloMemoryStatusOverrideLock };
++    s_colloMemoryStatusOverride = std::nullopt;
++}
++
++// A cgroup v2 memory.current file holds one decimal byte count and a newline. A failed read or parse reports 0,
++// as LinuxMemory::footprint does when statm cannot be read.
++static std::optional<MemoryStatus> colloOverriddenMemoryStatus()
++{
++    Locker locker { s_colloMemoryStatusOverrideLock };
++    if (!s_colloMemoryStatusOverride)
++        return std::nullopt;
++
++    size_t memoryFootprint = 0;
++    std::array<char, 32> buffer;
++    ssize_t numBytes = pread(s_colloMemoryStatusOverride->memoryCurrentFd, buffer.data(), buffer.size(), 0);
++    if (numBytes > 0) {
++        auto parsingBuffer = spanReinterpretCast<const Latin1Character>(unsafeMakeSpan(buffer.data(), numBytes));
++        memoryFootprint = parseIntegerAllowingTrailingJunk<size_t>(parsingBuffer).value_or(0);
++    }
++    double percentInUse = static_cast<double>(memoryFootprint) / static_cast<double>(s_colloMemoryStatusOverride->limitBytes);
++    return MemoryStatus(memoryFootprint, std::min(percentInUse, 1.0));
++}
+ #endif
+ 
+ static size_t computeAvailableMemory()
+@@ -208,6 +252,8 @@ MemoryStatus memoryStatus()
+     if (KERN_SUCCESS == task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)(&vmInfo), &vmSize))
+         memoryFootprint = static_cast<size_t>(vmInfo.phys_footprint);
+ #elif OS(LINUX)
++    if (auto overridden = colloOverriddenMemoryStatus())
++        return *overridden;
+     auto& memory = LinuxMemory::singleton();
+     size_t memoryFootprint = memory.footprint();
+ #elif OS(FREEBSD)
+diff --git a/Source/WTF/wtf/AvailableMemory.h b/Source/WTF/wtf/AvailableMemory.h
+index 05e6bdc9..ffebbd29 100644
+--- a/Source/WTF/wtf/AvailableMemory.h
++++ b/Source/WTF/wtf/AvailableMemory.h
+@@ -46,6 +46,20 @@ struct MemoryStatus {
+ 
+ WTF_EXPORT_PRIVATE MemoryStatus memoryStatus();
+ 
++#if OS(LINUX)
++// Makes memoryStatus() measure this process against a memory budget the embedder names. Until it is set, the
++// footprint is the resident size from a /proc/self/statm descriptor that the first call opens and keeps, measured
++// against availableMemory(), which the first call computes and keeps. A forked child inherits both, so it would read
++// its parent's limit and a descriptor number the child may have closed and reused. Once set, the footprint is the
++// decimal byte count read at offset 0 of memoryCurrentFd, a cgroup v2 memory.current file, and the share in use is
++// that footprint over limitBytes, capped at 1. availableMemory() itself is unchanged.
++//
++// limitBytes must be nonzero. The caller keeps memoryCurrentFd open until clearColloMemoryStatusOverride returns,
++// and each memoryStatus() call then costs one pread of it.
++WTF_EXPORT_PRIVATE void setColloMemoryStatusOverride(size_t limitBytes, int memoryCurrentFd);
++WTF_EXPORT_PRIVATE void clearColloMemoryStatusOverride();
++#endif
++
+ inline double percentAvailableMemoryInUse()
+ {
+     auto memoryUse = memoryStatus();

@@ -10,9 +10,13 @@
 //! (`entered_count` in `state.h`), which inside a restored microtask is the
 //! continuation's owner. Only the outermost exit drains microtasks, so promise
 //! reactions run after the operation, inside the same turn, and the owner
-//! dispatcher in `vm.cpp` charges each reaction, where it can, to the request
-//! that registered it. When the drain throws, its exception takes
-//! the place of the operation's result, which is released here. An exception
+//! dispatcher in `vm.cpp` restores each reaction, where it can, to the owner
+//! that registered it, whose window the worker opens for it
+//! (`worker/runtime/owner.zig`). A turn reads no clock; the caller's owner
+//! window covers it. When the drain throws, its exception takes the place of
+//! the operation's result, which is released here, unless the operation
+//! failed with a Zig error, which wins after the exception is logged
+//! (`turnOutcome`). An exception
 //! this file does not return to its caller is logged with the request id
 //! through `exception_log.zig` and becomes `error.JsException`.
 
@@ -22,19 +26,22 @@ const exception_log = @import("exception_log.zig");
 const promise_deferred = @import("deferred.zig");
 
 /// Calls `callable` with `this_value` and `args`, all borrowed, in a turn on
-/// `exec_ctx`; `allocator` holds the argument array when it outgrows the
-/// bridge's stack buffer. Returns the call's value or exception, owned by the
-/// caller, where an exception the drain threw takes the place of the call's
-/// result. Fails with the enter, call or exit error.
+/// `exec_ctx`; `realm` is the realm of the code the call belongs to, which
+/// serves only a callable that has none of its own (`Realm.invoke`), and
+/// `allocator` holds the argument array when it outgrows the bridge's stack
+/// buffer. Returns the call's value or exception, owned by the caller, where
+/// an exception the drain threw takes the place of the call's result. Fails
+/// with the enter, call or exit error.
 pub fn invoke(
     vm: *bindings.Vm,
+    realm: bindings.Realm,
     allocator: std.mem.Allocator,
     exec_ctx: *bindings.ExecCtx,
     callable: *const bindings.Value,
     this_value: ?*const bindings.Value,
     args: []const *const bindings.Value,
 ) !bindings.ValueResult {
-    return invokeWithTiming(vm, allocator, exec_ctx, callable, this_value, args, null);
+    return invokeWithTiming(vm, realm, allocator, exec_ctx, callable, this_value, args, null);
 }
 
 /// `invoke` with the benchmark marker. When `out_call_started_ns` is not null
@@ -44,6 +51,7 @@ pub fn invoke(
 /// the handler keeps and calls from a microtask at turn exit records nothing.
 pub fn invokeWithTiming(
     vm: *bindings.Vm,
+    realm: bindings.Realm,
     allocator: std.mem.Allocator,
     exec_ctx: *bindings.ExecCtx,
     callable: *const bindings.Value,
@@ -53,7 +61,7 @@ pub fn invokeWithTiming(
 ) !bindings.ValueResult {
     if (out_call_started_ns) |out| out.* = 0;
     try vm.turnEnter(exec_ctx);
-    const invoke_result = vm.invokeWithTiming(
+    const invoke_result = realm.invokeWithTiming(
         allocator,
         exec_ctx,
         callable,
@@ -76,13 +84,14 @@ pub fn invokeWithTiming(
 /// call or the drain threw it, is logged and returned as `error.JsException`.
 pub fn invokeDiscard(
     vm: *bindings.Vm,
+    realm: bindings.Realm,
     allocator: std.mem.Allocator,
     exec_ctx: *bindings.ExecCtx,
     callable: *const bindings.Value,
     this_value: ?*const bindings.Value,
     args: []const *const bindings.Value,
 ) !void {
-    switch (try invoke(vm, allocator, exec_ctx, callable, this_value, args)) {
+    switch (try invoke(vm, realm, allocator, exec_ctx, callable, this_value, args)) {
         .success => |value| {
             var owned = value;
             owned.deinit();
@@ -99,13 +108,14 @@ pub fn invokeDiscard(
 /// Behaves as `invokeDiscard`, under its own log context.
 pub fn invokeDiscardPropagatingException(
     vm: *bindings.Vm,
+    realm: bindings.Realm,
     allocator: std.mem.Allocator,
     exec_ctx: *bindings.ExecCtx,
     callable: *const bindings.Value,
     this_value: ?*const bindings.Value,
     args: []const *const bindings.Value,
 ) !void {
-    switch (try invoke(vm, allocator, exec_ctx, callable, this_value, args)) {
+    switch (try invoke(vm, realm, allocator, exec_ctx, callable, this_value, args)) {
         .success => |value| {
             var owned = value;
             owned.deinit();
@@ -199,29 +209,33 @@ pub fn formDataFromBytes(
 }
 
 /// Converts the Response `value` into a native response within `limits`, in
-/// a turn, with the results and failures of `jsonParseUtf8`.
+/// a turn, with the results and failures of `jsonParseUtf8`. `realm` serves
+/// only a value with no realm of its own, a primitive.
 pub fn extractResponse(
     vm: *bindings.Vm,
+    realm: bindings.Realm,
     exec_ctx: *bindings.ExecCtx,
     value: *const bindings.Value,
     limits: bindings.ResponseExtractLimits,
 ) !bindings.ExtractResponseResult {
     try vm.turnEnter(exec_ctx);
-    const extract_result = vm.extractResponse(value, limits);
+    const extract_result = realm.extractResponse(value, limits);
     try finishExtractResponseTurn(vm, exec_ctx, "response extraction", extract_result);
     return try extract_result;
 }
 
 /// Reports whether `value` has a callable `then`. Reading `then` can run a
 /// getter, hence the turn; an exception from it or from the drain is logged
-/// and returned as `error.JsException`.
+/// and returned as `error.JsException`. `realm` serves only a value with no
+/// realm of its own, a primitive.
 pub fn isThenable(
     vm: *bindings.Vm,
+    realm: bindings.Realm,
     exec_ctx: *bindings.ExecCtx,
     value: *const bindings.Value,
 ) !bool {
     try vm.turnEnter(exec_ctx);
-    const check_result = vm.isThenable(value);
+    const check_result = realm.isThenable(value);
     if (try finishTurn(bindings.BoolResult, vm, exec_ctx, "thenable check", check_result, deinitBoolResult)) |exception|
         return failTurnException(vm, exec_ctx, "thenable check", exception);
 
@@ -239,16 +253,46 @@ pub fn isThenable(
 /// Completes the request task named by `token` when `value` settles: in a
 /// turn, `value` goes through `Promise.resolve` and the task's settlers are
 /// attached to the result. An exception from that or from the drain is
-/// logged and returned as `error.JsException`.
+/// logged and returned as `error.JsException`. `realm` serves only a value
+/// with no realm of its own, a primitive.
 pub fn settleRequestThenable(
     vm: *bindings.Vm,
+    realm: bindings.Realm,
     exec_ctx: *bindings.ExecCtx,
     token: bindings.RequestCompletionToken,
     value: *const bindings.Value,
 ) !void {
     try vm.turnEnter(exec_ctx);
-    const settle_result = vm.requestTaskSettleThenable(token, value);
+    const settle_result = realm.requestTaskSettleThenable(token, value);
     try finishNativeTurn(vm, exec_ctx, "request thenable settlement", settle_result);
+}
+
+/// Starts one read of `stream`, the request's locked response body, in a
+/// turn on `exec_ctx`: the stream's pull runs here, and the read's result
+/// reaches `collo_runtime_response_body_stream_settled` from a reaction that
+/// runs under this owner. An exception from the read or the drain is logged
+/// and returned as `error.JsException`.
+pub fn readResponseBodyStream(
+    vm: *bindings.Vm,
+    exec_ctx: *bindings.ExecCtx,
+    stream: bindings.ResponseBodyStream,
+) !void {
+    try vm.turnEnter(exec_ctx);
+    const read_result = stream.read(exec_ctx.request_id);
+    try finishNativeTurn(vm, exec_ctx, "response body stream read", read_result);
+}
+
+/// Cancels `stream` with `reason` in a turn on `exec_ctx`, which runs the
+/// stream's cancel algorithm. Fails as `readResponseBodyStream`.
+pub fn cancelResponseBodyStream(
+    vm: *bindings.Vm,
+    exec_ctx: *bindings.ExecCtx,
+    stream: bindings.ResponseBodyStream,
+    reason: bindings.ResponseBodyStreamCancel,
+) !void {
+    try vm.turnEnter(exec_ctx);
+    const cancel_result = stream.cancel(reason);
+    try finishNativeTurn(vm, exec_ctx, "response body stream cancel", cancel_result);
 }
 
 /// Settles the promise of the finished crypto `job` in a turn and consumes
@@ -345,10 +389,13 @@ fn finishExtractResponseTurn(
     }
 }
 
-/// Exits the caller's turn. Returns null when the drain ran clean, leaving
-/// `operation_result` to the caller. Otherwise it disposes of
-/// `operation_result` through `deinitOrLogOperation` and either returns the
-/// drain's exception, owned by the caller, or fails with the exit error.
+/// Exits the caller's turn and applies `turnOutcome`. Returns null when the
+/// drain ran clean, or threw after the operation failed with a Zig error
+/// (the exception is then logged), leaving `operation_result` to the caller.
+/// When the drain threw after a successful operation, it releases the
+/// operation's result and returns the drain's exception, owned by the
+/// caller. When the exit failed, it disposes of `operation_result` through
+/// `deinitOrLogOperation` and fails with the exit error.
 fn finishTurn(
     comptime Result: type,
     vm: *bindings.Vm,
@@ -357,17 +404,60 @@ fn finishTurn(
     operation_result: anyerror!Result,
     comptime deinitResult: fn (Result) void,
 ) !?bindings.Value {
+    const operation_failed = if (operation_result) |_| false else |_| true;
     const exit_result = vm.turnExitResult() catch |exit_err| {
-        deinitOrLogOperation(Result, exec_ctx, context, operation_result, deinitResult, .turn_exit_failure, exit_err);
+        std.debug.assert(turnOutcome(true, operation_failed, false) == .exit_error);
+        deinitOrLogOperation(Result, context, operation_result, deinitResult, exit_err);
         return exit_err;
     };
     switch (exit_result) {
         .success => return null,
-        .exception => |exception| {
-            deinitOrLogOperation(Result, exec_ctx, context, operation_result, deinitResult, .microtask_exception, null);
-            return exception;
+        .exception => |exception| switch (turnOutcome(false, operation_failed, true)) {
+            .operation_error => {
+                // The drain's exception is the tenant's, so it goes to the
+                // tenant's log; the operation's error reaches the caller,
+                // whose boundary decides what it means.
+                var owned = exception;
+                exception_log.logException(vm, exec_ctx.request_id, &owned, context);
+                owned.deinit();
+                return null;
+            },
+            .drain_exception => {
+                if (operation_result) |result| deinitResult(result) else |_| unreachable;
+                return exception;
+            },
+            .exit_error, .operation => unreachable,
         },
     }
+}
+
+/// What a turn's caller gets, from the three ways a turn can end badly.
+pub const TurnOutcome = enum {
+    /// The turn's exit failed, so the VM's turn state is broken.
+    exit_error,
+    /// The operation failed with a Zig error, out of memory among them.
+    operation_error,
+    /// The drain after the operation threw.
+    drain_exception,
+    /// The operation's own result, success or exception.
+    operation,
+};
+
+/// The precedence of a turn's outcomes. The exit error comes first: nothing
+/// after it can be trusted. The operation's Zig error comes before the
+/// drain's exception, since replacing it would turn an out-of-memory, which
+/// the request's boundary must decide on (conventions.md, "Errors and
+/// assertions"), into an exception of the tenant's code; the drain's
+/// exception is still logged to the tenant (`finishTurn`). Then the drain's
+/// exception, which replaces a successful result.
+pub fn turnOutcome(exit_failed: bool, operation_failed: bool, drain_threw: bool) TurnOutcome {
+    if (exit_failed)
+        return .exit_error;
+    if (operation_failed)
+        return .operation_error;
+    if (drain_threw)
+        return .drain_exception;
+    return .operation;
 }
 
 /// Logs and releases `exception`, returning `error.JsException` for the
@@ -384,36 +474,23 @@ fn failTurnException(
     return error.JsException;
 }
 
-const TurnExitFailurePhase = enum {
-    turn_exit_failure,
-    microtask_exception,
-};
-
-/// Releases a successful operation result. An operation error is logged with
-/// `std.log.err` instead, because the exit error or the drain's exception
-/// takes its place and the caller never sees it.
+/// Releases a successful operation result after the turn's exit failed. An
+/// operation error is logged with `std.log.err` instead, because the exit
+/// error takes its place and the caller never sees it.
 fn deinitOrLogOperation(
     comptime Result: type,
-    exec_ctx: *bindings.ExecCtx,
     context: []const u8,
     operation_result: anyerror!Result,
     comptime deinitResult: fn (Result) void,
-    phase: TurnExitFailurePhase,
-    exit_err: ?anyerror,
+    exit_err: anyerror,
 ) void {
     if (operation_result) |result| {
         deinitResult(result);
     } else |operation_err| {
-        switch (phase) {
-            .turn_exit_failure => std.log.err(
-                "worker native turn failed before turnExit failure: context={s} operation={s} turnExit={s}",
-                .{ context, @errorName(operation_err), @errorName(exit_err.?) },
-            ),
-            .microtask_exception => std.log.err(
-                "worker native turn failed before microtask exception: request_id={d} context={s} operation={s}",
-                .{ exec_ctx.request_id, context, @errorName(operation_err) },
-            ),
-        }
+        std.log.err(
+            "worker native turn failed before turnExit failure: context={s} operation={s} turnExit={s}",
+            .{ context, @errorName(operation_err), @errorName(exit_err) },
+        );
     }
 }
 

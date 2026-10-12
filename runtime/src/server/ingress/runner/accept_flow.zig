@@ -61,9 +61,12 @@ pub fn Methods(comptime Self: type) type {
         }
 
         /// Loop handler for one accept completion. A completion of an earlier
-        /// arming is counted as stale and its socket closed, and one tagged
-        /// for another lane is only counted. The loop routes only accept
-        /// completions here, so a tag that is not one is the lane's fault.
+        /// arming is counted as stale, and the socket it carries is a client
+        /// the kernel accepted all the same, so it is served like any other
+        /// (or closed as a shutdown's once the server stops). The loop
+        /// routes only accept completions here and each lane's ring carries
+        /// only its own accept, so a tag that is not one, or names another
+        /// lane, is the lane's fault.
         pub fn handleAcceptCqe(self: *Self, cqe: linux.io_uring_cqe) LaneFault!void {
             self.lane.counters.readiness_cqes_processed += 1;
             const ring = self.runtime_ring orelse return error.IngressRingUnavailable;
@@ -71,21 +74,14 @@ pub fn Methods(comptime Self: type) type {
                 error.InvalidUserDataTag => return error.UnknownCqeTag,
                 error.InvalidLaneId => return error.InvalidLaneId,
             };
-            if (decoded.lane_id != self.lane.lane_id) {
-                self.accept_counters.multishot_stale_cqes += 1;
-                return;
-            }
+            if (decoded.lane_id != self.lane.lane_id)
+                return error.InvalidLaneId;
             if (decoded.generation != self.lane.accept_registration.generation or
                 self.lane.accept_registration.state != .active)
             {
                 self.accept_counters.multishot_stale_cqes += 1;
-                if (cqe.res >= 0) {
-                    accept.closeRejectedAcceptedFd(
-                        @intCast(cqe.res),
-                        &self.lane.counters,
-                        .connection_slab_exhaustion,
-                    );
-                }
+                if (cqe.res >= 0)
+                    try acceptConnection(self, @intCast(cqe.res));
                 return;
             }
 

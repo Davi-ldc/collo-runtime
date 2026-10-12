@@ -2,13 +2,16 @@
 //! (`ingress/uring.zig`) through more-flagged, final, stale and EMFILE
 //! completions and the backoff that keeps it from spinning, the accept
 //! user_data packing, an accepted socket closed when the connection slab
-//! runs out (`ingress/accept.zig`), and lane listeners that share one port.
-//! Lane `server-ingress-test`; the listeners alone are covered in
-//! `tests/net/listener.zig`.
+//! runs out (`ingress/accept.zig`), the lane's handler serving the socket of
+//! a stale arming and refusing another lane's tag
+//! (`runner/accept_flow.zig`, through `lane_harness.zig`), and lane listeners
+//! that share one port. Lane `server-ingress-test`; the listeners alone are
+//! covered in `tests/net/listener.zig`.
 
 const std = @import("std");
 const fd_helpers = @import("collo_os").fd;
 const server_main = @import("collo_server_main");
+const lane_harness = @import("lane_harness.zig");
 
 const ingress = server_main.ingress;
 
@@ -100,14 +103,59 @@ test "accepted fd is closed on connection slab exhaustion" {
     defer slab.deinit();
     _ = slab.acquire() orelse return error.SlabRefusedItsFirstEntry;
     try std.testing.expect(slab.acquire() == null);
-    var lane = try ingress.lane.IngressLane.init(std.testing.allocator, .{ .definition_count = 0, .max_requests = 1 }, 0);
+    var lane = try ingress.lane.IngressLane.init(std.testing.allocator, .{
+        .definition_count = 0,
+        .slots_per_worker_total = 0,
+        .max_requests = 1,
+    }, 0);
     defer lane.deinit();
     ingress.accept.closeRejectedAcceptedFd(pair[0], &lane.counters, .connection_slab_exhaustion);
     var scratch: [1]u8 = undefined;
     const read_len = try std.posix.read(pair[1], &scratch);
     try std.testing.expectEqual(@as(usize, 0), read_len);
-    try std.testing.expectEqual(@as(u64, 1), lane.counters.silent_queue_overflows);
     try std.testing.expectEqual(@as(u64, 1), lane.counters.accepted_connection_slab_exhaustion);
+    // A refused socket overflowed no queue.
+    try std.testing.expectEqual(@as(u64, 0), lane.counters.silent_queue_overflows);
+}
+
+test "a socket from an earlier accept arming takes a connection slot instead of closing as slab exhaustion" {
+    var harness: lane_harness.Harness = undefined;
+    try harness.init(std.testing.allocator, .{});
+    defer harness.deinit();
+    const lane = harness.lane(0);
+    // The harness never arms the lane's accept, so every accept completion
+    // belongs to an earlier arming.
+    try std.testing.expect(lane.lane.accept_registration.state != .active);
+
+    // A socket pair stands for the client the kernel accepted. It is no TCP
+    // socket, so its setup fails at the first socket option and the slot it
+    // took closes it, which the harness has no TLS context to go past.
+    const pair = try fd_helpers.socketPairType(std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC | std.posix.SOCK.NONBLOCK);
+    defer std.posix.close(pair[1]);
+    const user_data = try ingress.uring.packAcceptUserData(0, lane.lane.accept_registration.generation);
+    try lane.handleAcceptCqe(.{ .user_data = user_data, .res = pair[0], .flags = 0 });
+    try harness.finishPass(0);
+
+    try std.testing.expectEqual(@as(u64, 1), lane.accept_counters.multishot_stale_cqes);
+    try std.testing.expectEqual(@as(u64, 1), lane.lane.counters.accepted_connections);
+    try std.testing.expectEqual(@as(u64, 1), lane.lane.counters.accepted_setup_failures);
+    try std.testing.expectEqual(@as(u64, 0), lane.lane.counters.accepted_connection_slab_exhaustion);
+    try std.testing.expectEqual(@as(u64, 0), lane.lane.counters.silent_queue_overflows);
+    try harness.expectLanesRunning();
+}
+
+test "an accept completion tagged for another lane is a fault of the lane whose ring delivered it" {
+    var harness: lane_harness.Harness = undefined;
+    try harness.init(std.testing.allocator, .{});
+    defer harness.deinit();
+    // Lane 0's ring carries only lane 0's accept, so a tag naming lane 1
+    // there is corrupt user data.
+    const user_data = try ingress.uring.packAcceptUserData(1, 0);
+    const again = -@as(i32, @intFromEnum(std.os.linux.E.AGAIN));
+    try std.testing.expectError(
+        error.InvalidLaneId,
+        harness.lane(0).handleAcceptCqe(.{ .user_data = user_data, .res = again, .flags = 0 }),
+    );
 }
 
 test "negative accept cqe with more flag keeps active state" {

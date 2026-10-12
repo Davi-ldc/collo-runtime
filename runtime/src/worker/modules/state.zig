@@ -5,8 +5,8 @@
 //! changes the route records. `collo_runtime_module_eval_settled` in
 //! `worker/host/module_settlement.zig` appends to the settlement list, and
 //! `Runtime` in `worker/runtime/modules.zig` drains it and keeps the stalled
-//! waiters. `routes.zig` alone sets `recycle_after_drain`, and the runtime
-//! acts on it.
+//! waiters. `routes.zig` alone sets `fresh_worker_may_serve`, and the
+//! runtime acts on it (`worker/runtime/retirement.zig`).
 
 const std = @import("std");
 const bindings = @import("collo_bindings");
@@ -22,7 +22,7 @@ pub const RouteModule = runtime_types.RouteModule;
 /// keeps that handler from being served whatever JSC returns for a re-import
 /// of a module whose evaluation failed. A failure ends only its own route:
 /// the worker gives way to a fresh one only once no route can serve
-/// (`State.recycle_after_drain`).
+/// (`State.fresh_worker_may_serve`).
 pub const RouteModuleState = union(enum) {
     /// The entry has not been evaluated in the route's realm, or its
     /// default export was not callable the last time it was read. A worker's
@@ -45,6 +45,11 @@ pub const RouteModuleState = union(enum) {
         /// Routes that share a module instance share its deadline, so they
         /// expire together, as they settle together.
         deadline_mono_ns: u64,
+        /// The evaluation that owns the instance's top-level code
+        /// (`worker/runtime/evaluations.zig`), the same for every route that
+        /// shares the instance. It stays open while any route evaluates under
+        /// it.
+        evaluation_id: u64,
     };
 
     /// Why a route failed, which decides whether a fresh worker could do
@@ -98,6 +103,14 @@ pub const PendingSettlement = struct {
     resolved: bool,
 };
 
+/// A request a module settlement made ready while the ready queue and its
+/// backlog were full, with the instant it became ready, which every retry
+/// keeps so the wait for room counts as the request's waiting.
+pub const StalledWaiter = struct {
+    request_id: u64,
+    ready_since_ns: u64,
+};
+
 pub const State = struct {
     /// Every specifier of the packs the worker registered, each registered
     /// permanent, so a specifier never leaves. The set owns its keys.
@@ -111,20 +124,18 @@ pub const State = struct {
     /// VM's main realm. Fixed for the runtime's life.
     isolate_realm: bool = false,
     pending_settlements: std.ArrayListUnmanaged(PendingSettlement) = .empty,
-    /// Request ids of waiters that found the ready queue and its backlog
-    /// full when their module settled. The settled record no longer lists
-    /// them, so `Runtime.collectModuleSettlements` retries them until the
-    /// queue takes them; a waiter dropped here would wait until its
-    /// deadline.
-    stalled_waiters: std.ArrayListUnmanaged(u64) = .empty,
+    /// Waiters that found the ready queue and its backlog full when their
+    /// module settled. The settled record no longer lists them, so
+    /// `Runtime.collectModuleSettlements` retries them until the queue takes
+    /// them; a waiter dropped here would wait until its deadline.
+    stalled_waiters: std.ArrayListUnmanaged(StalledWaiter) = .empty,
     /// Set once no route can serve and a fresh worker might
     /// (`pinFailed` in `routes.zig` owns the rule), and never cleared, since
-    /// a failed route stays failed. The scheduler loop stops the worker only
-    /// after every parked waiter and in-flight request has drained with its
-    /// own 500 from the worker (`Runtime.maybeRecycleAfterFailedEvaluation`).
-    /// Stopping at once would leave the loop before any waiter ran, and the
-    /// server would answer them with errors of its own.
-    recycle_after_drain: bool = false,
+    /// a failed route stays failed. The loop then asks the server to retire
+    /// the worker and goes on answering what reaches it
+    /// (`runtime/retirement.zig`), so every parked waiter and in-flight
+    /// request still gets its own 500 from the worker.
+    fresh_worker_may_serve: bool = false,
 
     /// Appends a route with no realm and an `idle` module, and returns its
     /// index. `entry_specifier` is copied; `bindings_section` must be a

@@ -86,7 +86,8 @@ pub const WakeFds = struct {
 /// order `asArray` lists them, which is the order the gateway's attach packet,
 /// `egress_attach` and WorkerInit carry them in: the regions, then the wake
 /// descriptors. A worker launched without a session has its wake descriptors
-/// and no region (`wakeOnly`).
+/// and no region (`wakeOnly`), and one launched without egress has neither
+/// (`isEmpty`).
 pub const RawFds = struct {
     command_control_fd: std.posix.fd_t = -1,
     command_producer_fd: std.posix.fd_t = -1,
@@ -170,6 +171,15 @@ pub const RawFds = struct {
     pub fn isValid(self: RawFds) bool {
         for (self.slots()) |fd| {
             if (fd < 0)
+                return false;
+        }
+        return true;
+    }
+
+    /// Whether no descriptor is present, neither a region nor a wake one.
+    pub fn isEmpty(self: RawFds) bool {
+        for (self.slots()) |fd| {
+            if (fd >= 0)
                 return false;
         }
         return true;

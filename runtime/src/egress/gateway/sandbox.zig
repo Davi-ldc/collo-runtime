@@ -5,7 +5,8 @@
 //!
 //! `applyProcessBaseline` runs first, while the process is single-threaded, because
 //! `unshare(CLONE_NEWUSER)` refuses a multithreaded caller. It enters a user and a mount namespace
-//! and lowers the resource limits. It then opens the machine's trust store and resolver files and
+//! and lowers the resource limits, the open files and the address space to what the sizing plan
+//! derived (`sizing.zig`). It then opens the machine's trust store and resolver files and
 //! mounts a tmpfs over `staging_path`, which hides what the machine keeps below that path in this
 //! namespace only; binds the opened files into the tmpfs read-only, makes the tmpfs read-only too
 //! and chroots into it; and finally drops every capability, sets no-new-privileges and installs a
@@ -17,13 +18,12 @@
 //! `etc/ssl/cert.pem`, the trust store BoringSSL loads by default, and the `resolver_files`
 //! glibc's resolver reads. Each is a read-only bind of the machine's file as it was at boot, so a
 //! file replaced later stays the old one for this gateway. The root has no `/proc`, no `/dev` and
-//! no shared library, and nothing in it is writable. A library first opened inside the root is
-//! therefore missing, so the gateway loads every library it uses before `applyProcessBaseline`
-//! (`runtime/root.zig`). The gateway's user namespace maps only the uid and gid it was started
-//! with, so under a server run by root the gateway keeps uid 0 outside its namespace while
-//! holding no capability in the initial one. Abstract Unix sockets, which belong to the network
-//! namespace the gateway shares with the server, would still see that identity, so the filter
-//! denies creating Unix sockets.
+//! no shared library, and nothing in it is writable. The binary links every library the gateway
+//! runs, so nothing needs opening inside the root. The gateway's user namespace maps only the uid
+//! and gid it was started with, so under a server run by root the gateway keeps uid 0 outside its
+//! namespace while holding no capability in the initial one. Abstract Unix sockets, which belong
+//! to the network namespace the gateway shares with the server, would still see that identity, so
+//! the filter denies creating Unix sockets.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -78,15 +78,15 @@ comptime {
 }
 
 /// Applies every step that must come before the gateway's first thread, in the order the header
-/// gives. The calling process must be single-threaded and must hold no descriptor of a directory,
-/// which would let `fchdir` walk back out of the chroot. Fails with
-/// `error.EgressGatewayTrustStoreMissing` when the machine has no CA bundle at any of
-/// `trust_store_sources`.
-pub fn applyProcessBaseline() !void {
+/// gives, with the open-file and address-space limits of `plan`. The calling process must be
+/// single-threaded and must hold no descriptor of a directory, which would let `fchdir` walk back
+/// out of the chroot. Fails with `error.EgressGatewayTrustStoreMissing` when the machine has no
+/// CA bundle at any of `trust_store_sources`.
+pub fn applyProcessBaseline(plan: sizing.Plan) !void {
     try os_process.assertSingleThreadedSelf();
     try namespaces.enter();
     // After the user namespace, so the task limit counts this namespace's tasks.
-    try resource_limits.apply();
+    try resource_limits.apply(plan);
     try root.mountAndEnter();
     try privileges.dropCapabilities();
     try privileges.disableNewPrivs();
@@ -154,11 +154,11 @@ const namespaces = struct {
 };
 
 const resource_limits = struct {
-    fn apply() !void {
+    fn apply(plan: sizing.Plan) !void {
         try lower(.CORE, 0);
-        try lower(.NOFILE, try sizing.openFilesLimit());
+        try lower(.NOFILE, plan.open_files);
         try lower(.NPROC, process_limits.EGRESS_GATEWAY_TASKS_MAX);
-        try lower(.AS, process_limits.EGRESS_GATEWAY_ADDRESS_SPACE_BYTES_MAX);
+        try lower(.AS, plan.address_space_bytes);
     }
 
     /// Sets the soft and hard limit of `resource` to `ceiling`, or to the inherited hard limit

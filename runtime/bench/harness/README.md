@@ -10,7 +10,7 @@ The reference machine is Ubuntu 24.04 aarch64 on Oracle A1, with Bash, jq, coreu
 export PREFIX=/path/to/artifacts
 export JSC="$PWD/runtime/deps/jsc-build/aarch64-linux-gnu/release/build"
 
-zig build webkit-provision
+zig build deps-provision
 zig build -j4 -Doptimize=ReleaseSafe --prefix "$PREFIX" install install-bench-host
 
 BENCH_BIN="$PREFIX/bin/host_lifecycle" \

@@ -8,11 +8,12 @@
 //!
 //! The driver is generic over `Worker`, the lane. It reads the lane's
 //! `h2_lane` (`lane_resources.zig`) and `service.allocator`, and calls on it
-//! the stream handlers of `runner/admission.zig` (`startDynamicH2`) and
-//! `runner/request_body.zig` (`handleH2DataFrame`, `handleH2DataFrameBatch`,
-//! `handleH2ResetFrame`, `flushPendingH2RequestBodies`),
-//! `updateConnectionInterest` and `closeRuntimeConnection`, each of which
-//! `LaneWorker` declares (`runner/root.zig`).
+//! the stream handlers of `runner/admission.zig` (`startDynamicH2`,
+//! `refuseH2Stream`) and `runner/request_body.zig` (`handleH2DataFrame`,
+//! `handleH2DataFrameBatch`, `handleH2ResetFrame`,
+//! `flushPendingH2RequestBodies`), `updateConnectionInterest`,
+//! `closeRuntimeConnection` and the lane's clock (`monotonicNowNs`), each of
+//! which `LaneWorker` declares (`runner/root.zig`).
 //!
 //! Every error a client causes ends in the driver as a `ConnectionOutcome`
 //! (`server/ingress/fault.zig`), sorted with the table of the callee that

@@ -23,6 +23,9 @@ pub const WorkItem = union(enum) {
     /// A response arrived for this fault id; settles the reads waiting on
     /// it (`fs/fault_completion.zig`).
     fs_fault_completion: u64,
+    /// The body stream of this request's response has a read's result to
+    /// send, or needs its next read (`serve/response_body_stream.zig`).
+    response_body_stream: u64,
 };
 
 /// Metadata a slot carries from enqueue to pop. The owner is resolved once,
@@ -45,8 +48,8 @@ pub const ReadyQueue = struct {
     tail: usize,
     len: usize,
     /// Metadata of the item the latest `pop` returned, all zero when
-    /// unstamped. The loop's turn telemetry reads and clears it right after
-    /// the pop.
+    /// unstamped. `executeWorkItem` in `loop.zig` reads its owner and clears
+    /// it right after the pop.
     last_popped_meta: SlotMeta,
 
     pub fn init(allocator: std.mem.Allocator, capacity: usize) !ReadyQueue {
@@ -84,8 +87,9 @@ pub const ReadyQueue = struct {
     }
 
     /// Appends `item` with `meta`, whose stamps come from the runtime's
-    /// clock so a test's fake clock stays consistent; zeroed metadata leaves
-    /// the turn telemetry inert. Returns false when the queue is full.
+    /// clock so a test's fake clock stays consistent; zeroed metadata names
+    /// no owner, so the item runs in no owner window. Returns false when the
+    /// queue is full.
     pub fn tryPushStamped(self: *ReadyQueue, item: WorkItem, meta: SlotMeta) bool {
         if (self.len == self.items.len)
             return false;
@@ -106,6 +110,27 @@ pub const ReadyQueue = struct {
         self.head = (self.head + 1) % self.items.len;
         self.len -= 1;
         return item;
+    }
+
+    /// Takes back the owner of `item`, a work item whose work vanished while
+    /// it waited, such as a timer its owner cleared: clears the owner of the
+    /// first slot that holds `item` with one, so its pop opens no window and
+    /// consumes no ready count, and returns that owner; null when no slot
+    /// names one. Scans at most the queue's capacity, on the rare path where
+    /// a cancel finds its work already queued.
+    pub fn withdraw(self: *ReadyQueue, item: WorkItem) ?u64 {
+        var offset: usize = 0;
+        while (offset < self.len) : (offset += 1) {
+            const index = (self.head + offset) % self.items.len;
+            const owner_id = self.meta[index].owner_request_id;
+            if (owner_id == 0)
+                continue;
+            if (!std.meta.eql(self.items[index], item))
+                continue;
+            self.meta[index].owner_request_id = 0;
+            return owner_id;
+        }
+        return null;
     }
 
     /// Moves items, with their metadata and in order, into `target` until

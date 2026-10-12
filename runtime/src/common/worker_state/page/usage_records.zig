@@ -10,6 +10,8 @@
 /// ring stops the worker (`WorkState.appendCompletedRecord`).
 pub const RECORD_RING_COUNT: usize = 1024;
 
+/// How a request ended, in the vocabulary of the usage and access records'
+/// `error_code`.
 pub const CompletedStatus = enum(u32) {
     done = 0,
     cpu = 1,
@@ -20,70 +22,66 @@ pub const CompletedStatus = enum(u32) {
     js_exception = 6,
     internal_error = 7,
     client_closed = 8,
+    /// The request reached a worker that had asked to be retired, which ran
+    /// none of its JavaScript.
+    worker_retiring = 9,
+    /// A termination another owner of the worker's VM caused stopped the
+    /// request.
+    worker_stopped = 10,
 };
 
 /// What one finished request measured, as the worker appends it to the usage
-/// record ring before it publishes the request's completion. Every identity
-/// field is the worker's claim, which the host checks against its own
-/// records before it writes anything under it.
+/// record ring before it publishes the request's completion. The request key
+/// (`request_id`, `request_generation`, `request_slot`, `request_lane_id`) is
+/// the worker's claim, which the host checks against its own records before
+/// it writes anything under it; the times of the request's life and its
+/// cold-start flag are the server's own and never ride here.
+///
+/// `exec_ns`, `waiting_ns` and `io_ns` partition the worker's span of the
+/// request, from the decode of its begin to its finish: running, runnable
+/// but not running, and waiting on I/O. `cpu_ns` is the request's CPU: the
+/// VM thread's while the request owns it, plus the crypto pool's on its jobs.
+/// The byte meters carry the names the usage record's JSON gives them; all
+/// four stay zero on a record the host writes for a request the worker could
+/// not account for.
 pub const CompletedRecord = extern struct {
     request_id: u64,
     request_generation: u64 = 0,
-    worker_id: u64 = 0,
-    worker_generation: u64 = 0,
-    started_mono_ns: u64,
-    finished_mono_ns: u64,
-    /// The worker process's CPU time since its previous record, as the
-    /// CLOCK_PROCESS_CPUTIME_ID delta. It includes collection, compilation,
-    /// crypto and wasm work, and a worker's first record includes its module
-    /// evaluation. `turn_cpu_ns` holds the request's own turns.
-    cpu_time_ns: u64,
-    io_time_ns: u64,
-    /// Time the request was runnable but not executing, the interference part
-    /// of wall time = execution + waiting + I/O. Disjoint from `io_time_ns`,
-    /// since a request is in one state at a time.
+    exec_ns: u64 = 0,
     waiting_ns: u64 = 0,
-    /// Sum of the ready-queue waits of the request's work items, the delay
-    /// other requests on the worker added. Items queued at once overlap, so
-    /// this is not a part of wall time; `waiting_ns` is.
-    queued_ns: u64 = 0,
-    /// Longest event-loop turn the request ran, the head-of-line blocking it
-    /// caused the worker's other requests.
-    max_turn_ns: u64 = 0,
-    /// CPU time of the request's own event-loop turns
-    /// (CLOCK_THREAD_CPUTIME_ID, folded at each turn's exit); the usage
-    /// record carries `cpu_time_ns`.
-    turn_cpu_ns: u64 = 0,
-    /// Byte meters: bytes served to the request's client, outbound fetch
-    /// payload bytes per direction, and outbound fetch bytes on the wire with
-    /// TLS framing. All four stay zero on a record the host synthesizes for a
-    /// worker that died.
+    io_ns: u64 = 0,
+    cpu_ns: u64 = 0,
+    /// Bytes served to the request's client.
     client_served_bytes: u64 = 0,
-    fetch_billed_sent_bytes: u64 = 0,
-    fetch_billed_received_bytes: u64 = 0,
-    fetch_cost_bytes: u64 = 0,
-    billing_sequence: u64 = 0,
+    /// Outbound fetch payload bytes, per direction.
+    fetch_sent_bytes: u64 = 0,
+    fetch_received_bytes: u64 = 0,
+    /// Outbound fetch bytes on the wire, TLS framing included.
+    fetch_wire_bytes: u64 = 0,
     request_slot: u32 = 0,
     request_lane_id: u16 = 0,
     _reserved1: u16 = 0,
+    /// `CompletedStatus`; the host reads a value outside it as
+    /// `internal_error`.
     status: u32,
-    /// Bits of `CompletedRecordFlags`; every other bit is reserved and must stay zero.
-    flags: u32,
+    _reserved2: u32 = 0,
 };
 
-/// The host's accounting flags, which the worker echoes from the dispatch.
-pub const CompletedRecordFlags = struct {
+/// The accounting flags the server stamps on a dispatch and keeps in its
+/// request table (`Dispatched.accounting_flags` in
+/// `server/supervisor/request_table.zig`).
+pub const AccountingFlags = struct {
     /// The dispatch launched a worker for this request.
     pub const cold_start: u32 = 1 << 0;
 };
 
-pub fn completedRecordHasFlag(record: CompletedRecord, flag: u32) bool {
-    return (record.flags & flag) != 0;
-}
-
 comptime {
-    if (@sizeOf(CompletedRecord) != 152)
+    if (@sizeOf(CompletedRecord) != 96)
         @compileError("worker_state.page.CompletedRecord size mismatch");
+    if (@offsetOf(CompletedRecord, "client_served_bytes") != 48)
+        @compileError("worker_state.page.CompletedRecord client_served_bytes offset mismatch");
+    if (@offsetOf(CompletedRecord, "status") != 88)
+        @compileError("worker_state.page.CompletedRecord status offset mismatch");
     if (@intFromEnum(CompletedStatus.done) != 0)
         @compileError("worker_state.page zero-filled completed records must decode as done if inspected");
 }

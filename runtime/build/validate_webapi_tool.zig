@@ -1,11 +1,32 @@
-//! Build-time tool enforcing the WebAPI test/bench contract:
-//! every runtime/tests/webapi/**.test.js has a sibling .bench.js that is embedded by
-//! the webapi bench target, and every .bench.js declares bench(...) cases and
-//! keeps the Bun comparison enabled.
+//! Build-time check of the WebAPI fixtures under `runtime/tests/webapi/`, run
+//! by the `test` aggregate and the webapi bench step on every build that
+//! needs it (build.zig says why it never answers from cache):
 //!
-//! argv: <webapi_dir> <bench_source> [extra scan sources...] <out_stamp>
-//! Runs as a cached Run step (inputs hashed), not at configure time.
+//! - every `*.test.js` is embedded by one of the suite files that bind
+//!   fixtures to runners (`suites.zig`, `forked.zig`), so a fixture nobody
+//!   bound cannot sit in the tree without running;
+//! - every Collo contract fixture has a sibling `.bench.js` that the webapi
+//!   bench embeds; the exact Bun and WPT ports and the `_leak` fixtures have
+//!   none;
+//! - every `.bench.js` has its fixture, declares `bench(...)` cases and keeps
+//!   the Bun comparison enabled.
+//!
+//! argv: `<webapi_dir> <out_stamp>`, then `--bench=<file>` for each source the
+//! webapi bench embeds its benches through and `--suite=<file>` for each file
+//! that binds fixtures. Every file name is relative to the working directory.
 const std = @import("std");
+
+/// The sources `check` reads besides the fixture tree.
+pub const Inputs = struct {
+    /// Searched for `runtime/tests/webapi/<bench>`, the path the bench embeds.
+    bench_sources: []const []const u8,
+    /// Searched for `@embedFile("<fixture>")`, the fixture's path relative to
+    /// the fixture tree, which is where the suite files live.
+    suite_sources: []const []const u8,
+};
+
+/// The largest source or fixture the tool reads.
+const file_bytes_max = 4 * 1024 * 1024;
 
 pub fn main() !void {
     var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -13,47 +34,90 @@ pub fn main() !void {
     const arena = arena_state.allocator();
 
     const args = try std.process.argsAlloc(arena);
-    if (args.len < 4) {
-        std.debug.print("usage: {s} <webapi_dir> <bench_source> [scan sources...] <out_stamp>\n", .{args[0]});
-        std.process.exit(64);
-    }
+    if (args.len < 3) usage(args[0]);
     const webapi_dir_path = args[1];
-    const out_stamp_path = args[args.len - 1];
-    const scan_paths = args[2 .. args.len - 1];
+    const out_stamp_path = args[2];
 
-    var scan_sources = try arena.alloc([]const u8, scan_paths.len);
-    for (scan_paths, 0..) |path, index|
-        scan_sources[index] = try std.fs.cwd().readFileAlloc(arena, path, 4 * 1024 * 1024);
+    var bench_sources: std.ArrayList([]const u8) = .empty;
+    var suite_sources: std.ArrayList([]const u8) = .empty;
+    for (args[3..]) |arg| {
+        if (std.mem.startsWith(u8, arg, "--bench=")) {
+            try bench_sources.append(arena, try std.fs.cwd().readFileAlloc(arena, arg["--bench=".len..], file_bytes_max));
+        } else if (std.mem.startsWith(u8, arg, "--suite=")) {
+            try suite_sources.append(arena, try std.fs.cwd().readFileAlloc(arena, arg["--suite=".len..], file_bytes_max));
+        } else {
+            usage(args[0]);
+        }
+    }
+    if (bench_sources.items.len == 0 or suite_sources.items.len == 0) usage(args[0]);
 
     var root = try std.fs.cwd().openDir(webapi_dir_path, .{ .iterate = true });
     defer root.close();
+
+    var stderr_buffer: [1024]u8 = undefined;
+    var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
+    const report = &stderr_writer.interface;
+    const passed = try check(arena, root, .{
+        .bench_sources = bench_sources.items,
+        .suite_sources = suite_sources.items,
+    }, report);
+    try report.flush();
+    if (!passed) std.process.exit(1);
+    try std.fs.cwd().writeFile(.{ .sub_path = out_stamp_path, .data = "ok\n" });
+}
+
+fn usage(program: []const u8) noreturn {
+    std.debug.print(
+        "usage: {s} <webapi_dir> <out_stamp> --bench=<file>... --suite=<file>...\n",
+        .{program},
+    );
+    std.process.exit(64);
+}
+
+/// Checks the fixture tree at `root` against `inputs` and writes one line per
+/// problem to `report`. Returns whether the tree passed. `arena` holds the
+/// paths and fixture bytes until the caller frees it.
+pub fn check(
+    arena: std.mem.Allocator,
+    root: std.fs.Dir,
+    inputs: Inputs,
+    report: *std.Io.Writer,
+) !bool {
     var walker = try root.walk(arena);
     defer walker.deinit();
 
-    var failed = false;
+    var passed = true;
     while (try walker.next()) |entry| {
         if (entry.kind != .file)
             continue;
 
         if (std.mem.endsWith(u8, entry.path, ".test.js")) {
+            if (!try isBoundBySuite(arena, entry.path, inputs.suite_sources)) {
+                try report.print(
+                    "WebAPI fixture runtime/tests/webapi/{s} is bound by no suite; embed it in suites.zig or forked.zig\n",
+                    .{entry.path},
+                );
+                passed = false;
+            }
             if (isImportedFixturePath(entry.path) or isLeakFixturePath(entry.path))
                 continue;
             const bench_rel = try benchPathForTestPath(arena, entry.path);
             root.access(bench_rel, .{}) catch {
-                std.debug.print("missing WebAPI bench for runtime/tests/webapi/{s}; expected runtime/tests/webapi/{s}\n", .{ entry.path, bench_rel });
-                failed = true;
+                try report.print(
+                    "missing WebAPI bench for runtime/tests/webapi/{s}; expected runtime/tests/webapi/{s}\n",
+                    .{ entry.path, bench_rel },
+                );
+                passed = false;
                 continue;
             };
 
             const embed_path = try std.fmt.allocPrint(arena, "runtime/tests/webapi/{s}", .{bench_rel});
-            var embedded = false;
-            for (scan_sources) |source| {
-                if (std.mem.indexOf(u8, source, embed_path) != null)
-                    embedded = true;
-            }
-            if (!embedded) {
-                std.debug.print("WebAPI bench runtime/tests/webapi/{s} is not embedded by the webapi bench target\n", .{bench_rel});
-                failed = true;
+            if (!containsInAny(inputs.bench_sources, embed_path)) {
+                try report.print(
+                    "WebAPI bench runtime/tests/webapi/{s} is not embedded by the webapi bench target\n",
+                    .{bench_rel},
+                );
+                passed = false;
             }
             continue;
         }
@@ -61,26 +125,52 @@ pub fn main() !void {
         if (std.mem.endsWith(u8, entry.path, ".bench.js")) {
             const test_rel = try testPathForBenchPath(arena, entry.path);
             root.access(test_rel, .{}) catch {
-                std.debug.print("orphan WebAPI bench runtime/tests/webapi/{s}; expected runtime/tests/webapi/{s}\n", .{ entry.path, test_rel });
-                failed = true;
+                try report.print(
+                    "orphan WebAPI bench runtime/tests/webapi/{s}; expected runtime/tests/webapi/{s}\n",
+                    .{ entry.path, test_rel },
+                );
+                passed = false;
                 continue;
             };
 
-            const source = try root.readFileAlloc(arena, entry.path, 1024 * 1024);
+            const source = try root.readFileAlloc(arena, entry.path, file_bytes_max);
             if (!hasBenchCase(source)) {
-                std.debug.print("WebAPI bench runtime/tests/webapi/{s} does not declare any bench(...) cases\n", .{entry.path});
-                failed = true;
+                try report.print(
+                    "WebAPI bench runtime/tests/webapi/{s} does not declare any bench(...) cases\n",
+                    .{entry.path},
+                );
+                passed = false;
             }
             if (hasDisabledComparison(source)) {
-                std.debug.print("WebAPI bench runtime/tests/webapi/{s} disables Bun comparison\n", .{entry.path});
-                failed = true;
+                try report.print(
+                    "WebAPI bench runtime/tests/webapi/{s} disables Bun comparison\n",
+                    .{entry.path},
+                );
+                passed = false;
             }
         }
     }
+    return passed;
+}
 
-    if (failed)
-        std.process.exit(1);
-    try std.fs.cwd().writeFile(.{ .sub_path = out_stamp_path, .data = "ok\n" });
+/// Whether a suite file embeds the fixture at `fixture_path`, relative to the
+/// fixture tree. The walker separates components with the host's separator,
+/// which on the build hosts is the `/` an `@embedFile` path uses.
+fn isBoundBySuite(
+    arena: std.mem.Allocator,
+    fixture_path: []const u8,
+    suite_sources: []const []const u8,
+) error{OutOfMemory}!bool {
+    const needle = try std.fmt.allocPrint(arena, "@embedFile(\"{s}\")", .{fixture_path});
+    return containsInAny(suite_sources, needle);
+}
+
+fn containsInAny(sources: []const []const u8, needle: []const u8) bool {
+    for (sources) |source| {
+        if (std.mem.indexOf(u8, source, needle) != null)
+            return true;
+    }
+    return false;
 }
 
 fn isImportedFixturePath(path: []const u8) bool {

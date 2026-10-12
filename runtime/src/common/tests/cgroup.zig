@@ -2,11 +2,12 @@
 //! plain temporary directory standing in for a worker cgroup: parsing
 //! `/proc/<pid>/cgroup`, `cpu.max`, `cpu.stat` and `memory.events.local`,
 //! rejecting a missing cgroup root, deriving `memory.max`, and writing and
-//! validating worker limits by path and by directory fd. The writers open
-//! limit files without O_CREAT, so a fixture creates every file it expects
-//! written; fixtures leave out `memory.oom.group`, which the writers skip when
-//! it is missing. Limits on a real delegated cgroup are covered by the
-//! `zygote-integration` lane.
+//! validating a worker leaf's limits, swap included, through its directory
+//! fd. The writers open limit files without O_CREAT, so a fixture creates
+//! every file it expects written; fixtures leave out `memory.oom.group`,
+//! which the writers skip when it is missing, and leave out
+//! `memory.swap.max` unless the test is about swap. Limits on a real
+//! delegated cgroup are covered by the `zygote-integration` lane.
 
 const std = @import("std");
 const cgroup = @import("collo_cgroup");
@@ -49,7 +50,7 @@ test "cgroup backend rejects missing real cgroup root with typed error" {
     try std.testing.expectError(error.RealCgroupRootUnavailable, cgroup.path.validateRoot(missing_root));
 }
 
-test "worker cgroup memory limits are validated against the project limit" {
+test "worker cgroup memory limits are validated against the worker's memory limit" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -58,23 +59,74 @@ test "worker cgroup memory limits are validated against the project limit" {
     // `memory.MAX_RATIO_NUM` over `memory.MAX_RATIO_DEN`, which stays
     // unaligned because it is under one page.
     try tmp.dir.writeFile(.{ .sub_path = "memory.max", .data = "1177\n" });
-    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
-    defer std.testing.allocator.free(root);
 
-    try cgroup.memory.validateWorkerLimits(std.testing.allocator, root, 1024, .require_configured);
+    try cgroup.memory.validateWorkerLimitsAt(tmp.dir.fd, 1024);
 
     try tmp.dir.writeFile(.{ .sub_path = "memory.high", .data = "max\n" });
     try std.testing.expectError(
         error.WorkerCgroupMemoryLimitNotConfigured,
-        cgroup.memory.validateWorkerLimits(std.testing.allocator, root, 1024, .require_configured),
+        cgroup.memory.validateWorkerLimitsAt(tmp.dir.fd, 1024),
     );
-    try cgroup.memory.validateWorkerLimits(std.testing.allocator, root, 1024, .allow_unconfigured);
 
     try tmp.dir.writeFile(.{ .sub_path = "memory.high", .data = "2048\n" });
     try std.testing.expectError(
         error.WorkerCgroupMemoryHighMismatch,
-        cgroup.memory.validateWorkerLimits(std.testing.allocator, root, 1024, .require_configured),
+        cgroup.memory.validateWorkerLimitsAt(tmp.dir.fd, 1024),
     );
+}
+
+test "worker cgroup base limits write memory.swap.max 0 where the file exists" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeLimitFixture(tmp.dir);
+    // Empty, since the writers do not truncate as a cgroup file needs none,
+    // and a plain file would keep the tail of a longer value.
+    try tmp.dir.writeFile(.{ .sub_path = "memory.swap.max", .data = "" });
+
+    const limits = cgroup.worker.Limits{ .memory_limit_bytes = 1024 };
+    try cgroup.worker.configureLimitsAt(tmp.dir.fd, limits);
+    var buffer: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("0", try tmp.dir.readFile("memory.swap.max", &buffer));
+    try cgroup.worker.validateLimitsAt(tmp.dir.fd, limits);
+}
+
+test "worker cgroup base limits skip memory.swap.max on a kernel without swap accounting" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // No `memory.swap.max`: the kernel has no swap accounting, so no worker
+    // memory can go to swap and both the write and the check pass it by.
+    try writeLimitFixture(tmp.dir);
+    const limits = cgroup.worker.Limits{ .memory_limit_bytes = 1024 };
+    try cgroup.worker.configureLimitsAt(tmp.dir.fd, limits);
+    try cgroup.worker.validateLimitsAt(tmp.dir.fd, limits);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access("memory.swap.max", .{}));
+}
+
+test "a worker leaf's checks refuse a memory.swap.max other than 0" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeLimitFixture(tmp.dir);
+    const limits = cgroup.worker.Limits{ .memory_limit_bytes = 1024 };
+    try cgroup.worker.configureLimitsAt(tmp.dir.fd, limits);
+
+    for ([_][]const u8{ "max\n", "4096\n" }) |swap_max| {
+        try tmp.dir.writeFile(.{ .sub_path = "memory.swap.max", .data = swap_max });
+        try std.testing.expectError(error.WorkerCgroupSwapMismatch, cgroup.worker.validateLimitsAt(tmp.dir.fd, limits));
+    }
+    try tmp.dir.writeFile(.{ .sub_path = "memory.swap.max", .data = "0\n" });
+    try cgroup.worker.validateLimitsAt(tmp.dir.fd, limits);
+}
+
+/// The limit files a worker leaf has whatever the kernel's options, each
+/// holding the value a fresh cgroup holds.
+fn writeLimitFixture(dir: std.fs.Dir) !void {
+    try dir.writeFile(.{ .sub_path = "memory.high", .data = "max\n" });
+    try dir.writeFile(.{ .sub_path = "memory.max", .data = "max\n" });
+    try dir.writeFile(.{ .sub_path = "cpu.max", .data = "max 100000\n" });
+    try dir.writeFile(.{ .sub_path = "pids.max", .data = "max\n" });
 }
 
 test "worker cgroup memory max is page aligned for kernel validation" {
@@ -135,47 +187,19 @@ test "worker cgroup memory.events.local reader classifies kernel oom_kill" {
     try std.testing.expectEqual(@as(u64, 4), events.high);
 }
 
-test "worker cgroup base limits configure memory cpu and pids" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.writeFile(.{ .sub_path = "memory.high", .data = "max\n" });
-    try tmp.dir.writeFile(.{ .sub_path = "memory.max", .data = "max\n" });
-    try tmp.dir.writeFile(.{ .sub_path = "cpu.max", .data = "max 100000\n" });
-    try tmp.dir.writeFile(.{ .sub_path = "pids.max", .data = "max\n" });
-    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
-    defer std.testing.allocator.free(root);
-
-    const limits = cgroup.worker.Limits{ .memory_limit_bytes = 1024 };
-    try cgroup.worker.configureLimits(std.testing.allocator, root, limits);
-    try cgroup.worker.validateLimits(std.testing.allocator, root, limits, .require_configured);
-
-    // `Limits` defaults to `cpu.DEFAULT_MAX_CORES`, one core, so the quota
-    // written equals the period, `cpu.DEFAULT_PERIOD_US`.
-    const cpu_max = try cgroup.cpu.readMax(std.testing.allocator, root, "cpu.max");
-    try std.testing.expectEqual(@as(?u64, 100_000), cpu_max.quota_us);
-    try std.testing.expectEqual(@as(u64, 100_000), cpu_max.period_us);
-}
-
 test "worker cgroup base limits configure memory cpu and pids through a dir fd" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(.{ .sub_path = "memory.high", .data = "max\n" });
-    try tmp.dir.writeFile(.{ .sub_path = "memory.max", .data = "max\n" });
-    try tmp.dir.writeFile(.{ .sub_path = "cpu.max", .data = "max 100000\n" });
-    try tmp.dir.writeFile(.{ .sub_path = "pids.max", .data = "max\n" });
+    try writeLimitFixture(tmp.dir);
 
     const limits = cgroup.worker.Limits{ .memory_limit_bytes = 1024 };
     try cgroup.worker.configureLimitsAt(tmp.dir.fd, limits);
-    try cgroup.worker.validateLimitsAt(
-        std.testing.allocator,
-        tmp.dir.fd,
-        limits,
-        .require_configured,
-    );
+    try cgroup.worker.validateLimitsAt(tmp.dir.fd, limits);
 
-    const cpu_max = try cgroup.cpu.readMaxAt(std.testing.allocator, tmp.dir.fd, "cpu.max");
+    // `Limits` defaults to `cpu.DEFAULT_MAX_CORES`, one core, so the quota
+    // written equals the period, `cpu.DEFAULT_PERIOD_US`.
+    const cpu_max = try cgroup.cpu.readMaxAt(tmp.dir.fd);
     try std.testing.expectEqual(@as(?u64, 100_000), cpu_max.quota_us);
     try std.testing.expectEqual(@as(u64, 100_000), cpu_max.period_us);
 
@@ -183,6 +207,25 @@ test "worker cgroup base limits configure memory cpu and pids through a dir fd" 
         error.ZeroMemoryLimit,
         cgroup.worker.configureLimitsAt(tmp.dir.fd, .{ .memory_limit_bytes = 0 }),
     );
+}
+
+test "a worker leaf's checks name the first limit that differs" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeLimitFixture(tmp.dir);
+    const limits = cgroup.worker.Limits{ .memory_limit_bytes = 1024 };
+    try std.testing.expectError(error.WorkerCgroupMemoryLimitNotConfigured, cgroup.worker.validateLimitsAt(tmp.dir.fd, limits));
+    try cgroup.worker.configureLimitsAt(tmp.dir.fd, limits);
+
+    try tmp.dir.writeFile(.{ .sub_path = "cpu.max", .data = "200000 100000\n" });
+    try std.testing.expectError(error.WorkerCgroupCpuQuotaMismatch, cgroup.worker.validateLimitsAt(tmp.dir.fd, limits));
+    try tmp.dir.writeFile(.{ .sub_path = "cpu.max", .data = "max 100000\n" });
+    try std.testing.expectError(error.WorkerCgroupCpuLimitNotConfigured, cgroup.worker.validateLimitsAt(tmp.dir.fd, limits));
+    try tmp.dir.writeFile(.{ .sub_path = "cpu.max", .data = "100000 100000\n" });
+
+    try tmp.dir.writeFile(.{ .sub_path = "pids.max", .data = "64\n" });
+    try std.testing.expectError(error.WorkerCgroupPidsMaxMismatch, cgroup.worker.validateLimitsAt(tmp.dir.fd, limits));
 }
 
 test "worker cgroup at-writers reject missing limit files" {
@@ -193,24 +236,5 @@ test "worker cgroup at-writers reject missing limit files" {
     try std.testing.expectError(
         error.FileNotFound,
         cgroup.worker.configureLimitsAt(tmp.dir.fd, limits),
-    );
-}
-
-test "worker cgroup aggregate validation can tolerate non-dedicated test cgroups" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.writeFile(.{ .sub_path = "memory.high", .data = "max\n" });
-    try tmp.dir.writeFile(.{ .sub_path = "memory.max", .data = "max\n" });
-    try tmp.dir.writeFile(.{ .sub_path = "cpu.max", .data = "max 100000\n" });
-    try tmp.dir.writeFile(.{ .sub_path = "pids.max", .data = "4915\n" });
-    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
-    defer std.testing.allocator.free(root);
-
-    const limits = cgroup.worker.Limits{ .memory_limit_bytes = 1024 };
-    try cgroup.worker.validateLimits(std.testing.allocator, root, limits, .allow_unconfigured);
-    try std.testing.expectError(
-        error.WorkerCgroupMemoryLimitNotConfigured,
-        cgroup.worker.validateLimits(std.testing.allocator, root, limits, .require_configured),
     );
 }

@@ -36,7 +36,10 @@ const imports_mod = @import("imports.zig");
 
 const Diagnostic = config.Diagnostic;
 
-pub const Error = error{ OutOfMemory, RouteBuildFailed };
+/// `RoutesInvalid` for a graph the configuration's files cannot form,
+/// `RouteResourcesUnavailable` for a file the server could not read for a
+/// cause of its own.
+pub const Error = error{ OutOfMemory, RoutesInvalid, RouteResourcesUnavailable };
 
 /// The source an empty module file is packed as.
 const empty_module_source = "\n";
@@ -130,7 +133,22 @@ pub const Graph = struct {
         const read_source = std.fs.cwd().readFileAlloc(self.arena, path, module_pack.max_pack_bytes) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.FileTooBig => return fail(diagnostic, label, importer, "module {s} exceeds {d} bytes", .{ path, module_pack.max_pack_bytes }),
-            else => return fail(diagnostic, label, importer, "cannot read module {s}: {s}", .{ path, @errorName(err) }),
+            // What the configuration names: a path to nothing, to a
+            // directory, through a loop or a non-directory, too long, or a
+            // file the server may not read.
+            error.FileNotFound,
+            error.IsDir,
+            error.NotDir,
+            error.SymLinkLoop,
+            error.NameTooLong,
+            error.BadPathName,
+            error.AccessDenied,
+            error.PermissionDenied,
+            => return fail(diagnostic, label, importer, "cannot read module {s}: {s}", .{ path, @errorName(err) }),
+            // The rest are the server's: descriptor quotas, kernel memory,
+            // I/O errors and locks, which a correct configuration also
+            // meets.
+            else => return unavailable(diagnostic, label, importer, "cannot read module {s}: {s}", .{ path, @errorName(err) }),
         };
         // An empty file is a valid module that exports nothing, but the pack
         // format refuses an empty source (`validateModuleList` in
@@ -245,6 +263,7 @@ fn isWithin(ancestor: []const u8, directory: []const u8) bool {
     return std.mem.eql(u8, ancestor, "/") or directory[ancestor.len] == '/';
 }
 
+/// Sets the message and returns `error.RoutesInvalid`.
 fn fail(
     diagnostic: *Diagnostic,
     label: Label,
@@ -252,6 +271,29 @@ fn fail(
     comptime format: []const u8,
     args: anytype,
 ) Error {
+    describe(diagnostic, label, importer, format, args);
+    return error.RoutesInvalid;
+}
+
+/// Sets the message and returns `error.RouteResourcesUnavailable`.
+fn unavailable(
+    diagnostic: *Diagnostic,
+    label: Label,
+    importer: ?Graph.Importer,
+    comptime format: []const u8,
+    args: anytype,
+) Error {
+    describe(diagnostic, label, importer, format, args);
+    return error.RouteResourcesUnavailable;
+}
+
+fn describe(
+    diagnostic: *Diagnostic,
+    label: Label,
+    importer: ?Graph.Importer,
+    comptime format: []const u8,
+    args: anytype,
+) void {
     if (importer) |site| {
         const site_args = .{ label.worker, label.pattern, site.path, site.line, site.specifier };
         switch (site.kind) {
@@ -261,5 +303,4 @@ fn fail(
     } else {
         diagnostic.set("worker '{s}' route '{s}': " ++ format, .{ label.worker, label.pattern } ++ args);
     }
-    return error.RouteBuildFailed;
 }

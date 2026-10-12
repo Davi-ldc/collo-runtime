@@ -77,12 +77,12 @@ JSC_DEFINE_HOST_FUNCTION(subtleDigest, (JSC::JSGlobalObject * global_object, JSC
         = data.size() <= inlineDigestByteLimit ? CryptoJobCost::InlinePreferred : CryptoJobCost::Heavy;
     auto job = std::unique_ptr<CryptoJob>(new (std::nothrow) BytesCryptoJob(
         context.value.owner, context.value.deferred,
-        [hash_id, data = WTF::move(data)](WTF::Vector<uint8_t>& out) mutable {
+        [hash_id, data = WTF::move(data)](SecretBytes& out) mutable {
             const auto& spec = hashSpec(hash_id);
             return digestBytes(spec, data.span(), out);
         },
         cost));
-    return enqueueCryptoJobPromise(global_object, scope, context.value, WTF::move(job));
+    return enqueueCryptoJobPromise(global_object, context.value, WTF::move(job));
 }
 
 } // namespace Collo::HostFunctions

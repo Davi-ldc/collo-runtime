@@ -7,6 +7,10 @@
 // and requests co-scheduled on that realm share them, so nothing may reset them when a request ends. Another realm of
 // the same VM has a timeline of its own. Resource timing is not implemented: no resource entry is ever recorded, and
 // the buffer size and buffer-full handler are only stored.
+//
+// The entry buffer, the observer list and each observer's pending entries are Collo::CellEdgeList, which owns the
+// lock and barrier protocol the concurrent marker needs (jsc/runtime/cell_edges.h). A list of entries collected to
+// build an array is a MarkedVector, since building the array allocates.
 
 #pragma once
 
@@ -14,6 +18,7 @@
 
 #include "host_functions/runtime/bridge.h"
 #include "host_functions/webapi/limits.h"
+#include "jsc/runtime/cell_edges.h"
 
 #include <JavaScriptCore/Error.h>
 #include <JavaScriptCore/IdentifierInlines.h>
@@ -24,6 +29,7 @@
 #include <JavaScriptCore/JSFunction.h>
 #include <JavaScriptCore/JSObject.h>
 #include <JavaScriptCore/JSString.h>
+#include <JavaScriptCore/MarkedVector.h>
 #include <JavaScriptCore/SlotVisitorMacros.h>
 #include <wtf/MonotonicTime.h>
 #include <wtf/Vector.h>
@@ -324,8 +330,28 @@ private:
     }
 };
 
+// One entry in the buffer or in an observer's pending list.
+struct PerformanceEntrySlot {
+    JSC::WriteBarrier<JSColloPerformanceEntry> entry;
+
+    template <typename Visitor> void visitEdges(Visitor& visitor) const { visitor.append(entry); }
+};
+
+// Entries collected to build an array, rooted while the array is allocated.
+using PerformanceEntryRoots = JSC::MarkedVector<JSColloPerformanceEntry*, 8, WTF::RecordOverflow>;
+
+// The entries in `entries` ordered by startTime and stable for equal times, as a new array. Returns null with the
+// exception pending when the array cannot be built.
+JSC::JSObject* performanceEntriesArray(JSC::JSGlobalObject*, PerformanceEntryRoots& entries);
+
 class JSColloPerformance final : public JSC::JSDestructibleObject {
     using Base = JSC::JSDestructibleObject;
+
+    struct ObserverSlot {
+        JSC::WriteBarrier<JSC::JSObject> observer;
+
+        template <typename Visitor> void visitEdges(Visitor& visitor) const { visitor.append(observer); }
+    };
 
 public:
     template <typename CellType, JSC::SubspaceAccess> static JSC::CompleteSubspace* subspaceFor(JSC::VM& vm)
@@ -393,19 +419,22 @@ public:
     }
 
     // Buffers `entry`, dropping the oldest once PerformanceMaxEntries are held, and queues it for every observer
-    // that watches its type.
-    void appendEntry(JSC::JSGlobalObject* global_object, JSC::VM& vm, JSColloPerformanceEntry* entry)
+    // that watches its type. Returns false, with an OutOfMemoryError thrown into the scope, when the buffer cannot
+    // grow.
+    bool appendEntry(
+        JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSC::VM& vm, JSColloPerformanceEntry* entry)
     {
         ensureTimeOriginForAccess();
-        if (entryCount() >= PerformanceMaxEntries) {
-            m_entries[m_entries_head].clear();
-            m_entries_head++;
-            compactEntriesIfNeeded();
+        if (m_entries.size() >= PerformanceMaxEntries)
+            m_entries.takeFirst(this);
+        PerformanceEntrySlot slot;
+        slot.entry.setWithoutWriteBarrier(entry);
+        if (!m_entries.tryAppend(vm, this, WTF::move(slot))) {
+            JSC::throwOutOfMemoryError(global_object, scope);
+            return false;
         }
-        JSC::WriteBarrier<JSColloPerformanceEntry> barrier;
-        barrier.set(vm, this, entry);
-        m_entries.append(WTF::move(barrier));
         notifyPerformanceObservers(global_object, vm, *this, entry);
+        return true;
     }
 
     // Fixes the time origin at the first access. It resets nothing: the timeline is the realm's, and a reset keyed
@@ -418,55 +447,38 @@ public:
         m_resource_timing_buffer_size = std::min(size, PerformanceMaxEntries);
     }
 
-    // Adds `observer` unless it is already registered.
-    void registerObserver(JSC::VM& vm, JSC::JSObject* observer)
+    // Adds `observer` unless it is already registered. Returns false when the list cannot grow.
+    bool registerObserver(JSC::VM& vm, JSC::JSObject* observer)
     {
         for (auto& existing : m_observers) {
-            if (existing.get() == observer)
-                return;
+            if (existing.observer.get() == observer)
+                return true;
         }
-        JSC::WriteBarrier<JSC::JSObject> barrier;
-        barrier.set(vm, this, observer);
-        m_observers.append(WTF::move(barrier));
+        ObserverSlot slot;
+        slot.observer.setWithoutWriteBarrier(observer);
+        return m_observers.tryAppend(vm, this, WTF::move(slot));
     }
 
     void unregisterObserver(JSC::JSObject* observer)
     {
-        unsigned write = 0;
-        for (unsigned read = 0; read < m_observers.size(); read++) {
-            if (m_observers[read].get() == observer)
-                continue;
-            if (write != read)
-                m_observers[write] = WTF::move(m_observers[read]);
-            write++;
-        }
-        m_observers.shrink(write);
+        m_observers.removeIf(this, [observer](const ObserverSlot& slot) { return slot.observer.get() == observer; });
     }
 
     // Removes the buffered entries that match both filters; a nullopt filter matches every entry.
     void clearEntries(std::optional<String> name, std::optional<PerformanceEntryKind> kind)
     {
-        compactEntries();
-        unsigned write = 0;
-        for (unsigned read = 0; read < m_entries.size(); read++) {
-            auto* entry = m_entries[read].get();
-            if (!entry)
-                continue;
-            if ((!kind || entry->kind() == *kind) && (!name || entry->name() == *name))
-                continue;
-            if (write != read)
-                m_entries[write] = WTF::move(m_entries[read]);
-            write++;
-        }
-        m_entries.shrink(write);
+        m_entries.removeIf(this, [&](const PerformanceEntrySlot& slot) {
+            auto* entry = slot.entry.get();
+            return !entry || ((!kind || entry->kind() == *kind) && (!name || entry->name() == *name));
+        });
     }
 
     // The most recently buffered mark named `name`, or null. User Timing resolves a mark name in measure() to its
     // most recent occurrence.
     JSColloPerformanceEntry* findLatestMark(const String& name)
     {
-        for (auto index = m_entries.size(); index > m_entries_head; index--) {
-            auto* entry = m_entries[index - 1].get();
+        for (auto index = m_entries.size(); index > 0; index--) {
+            auto* entry = m_entries.at(index - 1).entry.get();
             if (entry && entry->kind() == PerformanceEntryKind::Mark && entry->name() == name)
                 return entry;
         }
@@ -474,38 +486,30 @@ public:
     }
 
     // A new array of the buffered entries that satisfy `predicate`, ordered by startTime and stable for equal times.
+    // Returns null with the exception pending when the array cannot be built.
     template <typename Predicate> JSC::JSObject* entriesArray(JSC::JSGlobalObject* global_object, Predicate predicate)
     {
         ensureTimeOriginForAccess();
-        WTF::Vector<JSColloPerformanceEntry*> matches;
-        for (unsigned index = m_entries_head; index < m_entries.size(); index++) {
-            auto& barrier = m_entries[index];
-            auto* entry = barrier.get();
-            if (entry && predicate(*entry))
+        PerformanceEntryRoots matches;
+        forEachEntry([&](JSColloPerformanceEntry* entry) {
+            if (predicate(*entry))
                 matches.append(entry);
-        }
-        std::stable_sort(matches.begin(), matches.end(),
-            [](auto* left, auto* right) { return left->startTime() < right->startTime(); });
-
-        auto* result = JSC::constructEmptyArray(global_object, nullptr, matches.size());
-        for (unsigned index = 0; index < matches.size(); index++)
-            result->putDirectIndex(global_object, index, matches[index]);
-        return result;
+        });
+        return performanceEntriesArray(global_object, matches);
     }
 
     template <typename Visitor> void forEachEntry(Visitor visitor)
     {
-        for (unsigned index = m_entries_head; index < m_entries.size(); index++) {
-            auto& barrier = m_entries[index];
-            if (auto* entry = barrier.get())
+        for (auto& slot : m_entries) {
+            if (auto* entry = slot.entry.get())
                 visitor(entry);
         }
     }
 
     template <typename Visitor> void forEachObserver(Visitor visitor)
     {
-        for (auto& barrier : m_observers) {
-            if (auto* observer = barrier.get())
+        for (auto& slot : m_observers) {
+            if (auto* observer = slot.observer.get())
                 visitor(observer);
         }
     }
@@ -532,37 +536,6 @@ private:
         m_on_resource_timing_buffer_full.set(vm, this, JSC::jsNull());
     }
 
-    unsigned entryCount() const { return m_entries.size() - m_entries_head; }
-
-    void compactEntries()
-    {
-        if (!m_entries_head)
-            return;
-        if (m_entries_head >= m_entries.size()) {
-            m_entries.clear();
-            m_entries_head = 0;
-            return;
-        }
-
-        unsigned write = 0;
-        for (unsigned read = m_entries_head; read < m_entries.size(); read++) {
-            if (write != read)
-                m_entries[write] = WTF::move(m_entries[read]);
-            write++;
-        }
-        m_entries.shrink(write);
-        m_entries_head = 0;
-    }
-
-    // Compacting once the dropped prefix reaches half the vector keeps dropping the oldest entry amortized O(1).
-    void compactEntriesIfNeeded()
-    {
-        if (!m_entries_head)
-            return;
-        if (m_entries_head >= m_entries.size() || (m_entries_head >= 256 && m_entries_head * 2 >= m_entries.size()))
-            compactEntries();
-    }
-
     void ensureOrigin()
     {
         if (m_origin_monotonic)
@@ -584,15 +557,10 @@ private:
     JSC::WriteBarrier<JSC::Structure> m_observer_entry_list_structure;
     JSC::WriteBarrier<JSColloPerformanceTiming> m_timing;
     JSC::WriteBarrier<JSC::Unknown> m_on_resource_timing_buffer_full;
-    // Live entries start at m_entries_head; the slots before it were dropped and are cleared.
-    // FIXME: visitChildren walks m_entries and m_observers under cellLock(), but appendEntry, clearEntries,
-    // registerObserver, unregisterObserver and the compaction helpers reallocate them without taking it, so the
-    // concurrent marker can read a freed buffer.
-    WTF::Vector<JSC::WriteBarrier<JSColloPerformanceEntry>> m_entries;
-    WTF::Vector<JSC::WriteBarrier<JSC::JSObject>> m_observers;
+    Collo::CellEdgeList<PerformanceEntrySlot> m_entries;
+    Collo::CellEdgeList<ObserverSlot> m_observers;
     WTF::MonotonicTime m_origin_monotonic;
     double m_origin_wall_ms { 0 };
-    unsigned m_entries_head { 0 };
     unsigned m_resource_timing_buffer_size { PerformanceMaxEntries };
 };
 
@@ -619,15 +587,13 @@ public:
             vm, global_object, prototype, JSC::TypeInfo(JSC::ObjectType, StructureFlags), info());
     }
 
+    // Holds `entries`, which the caller roots, ordered by startTime and stable for equal times.
     static JSColloPerformanceObserverEntryList* create(
-        JSC::VM& vm, JSC::Structure* structure, WTF::Vector<JSColloPerformanceEntry*>&& entries)
+        JSC::VM& vm, JSC::Structure* structure, std::span<JSColloPerformanceEntry* const> entries)
     {
-        std::stable_sort(entries.begin(), entries.end(),
-            [](auto* left, auto* right) { return left->startTime() < right->startTime(); });
-
         auto* object = new (NotNull, JSC::allocateCell<JSColloPerformanceObserverEntryList>(vm))
             JSColloPerformanceObserverEntryList(vm, structure);
-        object->finishCreation(vm, WTF::move(entries));
+        object->finishCreation(vm, entries);
         return object;
     }
 
@@ -639,15 +605,24 @@ public:
     DECLARE_INFO;
     DECLARE_VISIT_CHILDREN;
 
+    // A new array of the held entries that satisfy `predicate`, in the list's order. Returns null with the exception
+    // pending when the array cannot be built.
     template <typename Predicate> JSC::JSObject* entriesArray(JSC::JSGlobalObject* global_object, Predicate predicate)
     {
+        auto scope = DECLARE_THROW_SCOPE(global_object->vm());
         auto* result = JSC::constructEmptyArray(global_object, nullptr, 0);
+        RETURN_IF_EXCEPTION(scope, nullptr);
+        if (!result) {
+            JSC::throwOutOfMemoryError(global_object, scope);
+            return nullptr;
+        }
         unsigned out_index = 0;
         for (auto& barrier : m_entries) {
             auto* entry = barrier.get();
             if (!entry || !predicate(*entry))
                 continue;
             result->putDirectIndex(global_object, out_index++, entry);
+            RETURN_IF_EXCEPTION(scope, nullptr);
         }
         return result;
     }
@@ -660,16 +635,17 @@ private:
 
     ~JSColloPerformanceObserverEntryList() = default;
 
-    void finishCreation(JSC::VM& vm, WTF::Vector<JSColloPerformanceEntry*>&& entries)
+    // The list is filled before the cell is published and never changes afterwards, so visitChildren reads it without
+    // a lock.
+    void finishCreation(JSC::VM& vm, std::span<JSColloPerformanceEntry* const> entries)
     {
         Base::finishCreation(vm);
         ASSERT(inherits(info()));
         m_entries.reserveInitialCapacity(entries.size());
-        for (auto* entry : entries) {
-            JSC::WriteBarrier<JSColloPerformanceEntry> barrier;
-            barrier.set(vm, this, entry);
-            m_entries.append(WTF::move(barrier));
-        }
+        for (auto* entry : entries)
+            m_entries.append(JSC::WriteBarrier<JSColloPerformanceEntry>(vm, this, entry));
+        std::stable_sort(m_entries.begin(), m_entries.end(),
+            [](const auto& left, const auto& right) { return left->startTime() < right->startTime(); });
     }
 
     WTF::Vector<JSC::WriteBarrier<JSColloPerformanceEntry>> m_entries;
@@ -715,17 +691,16 @@ public:
     }
 
     // Queues `entry` for the next delivery, dropping the oldest pending entry once
-    // WebApiPerformanceObserverPendingEntriesMax are pending, and schedules a delivery unless one is scheduled.
+    // WebApiPerformanceObserverPendingEntriesMax are pending, and schedules a delivery unless one is scheduled. An
+    // entry the list has no room for is dropped like the oldest one.
     void queueEntry(JSC::JSGlobalObject* global_object, JSC::VM& vm, JSColloPerformanceEntry* entry)
     {
-        if (pendingEntryCount() >= WebApiPerformanceObserverPendingEntriesMax) {
-            m_entries_to_deliver[m_entries_to_deliver_head].clear();
-            m_entries_to_deliver_head++;
-            compactPendingEntriesIfNeeded();
-        }
-        JSC::WriteBarrier<JSColloPerformanceEntry> barrier;
-        barrier.set(vm, this, entry);
-        m_entries_to_deliver.append(WTF::move(barrier));
+        if (m_entries_to_deliver.size() >= WebApiPerformanceObserverPendingEntriesMax)
+            m_entries_to_deliver.takeFirst(this);
+        PerformanceEntrySlot slot;
+        slot.entry.setWithoutWriteBarrier(entry);
+        if (!m_entries_to_deliver.tryAppend(vm, this, WTF::move(slot)))
+            return;
         scheduleDeliveryIfNeeded(global_object, vm);
     }
 
@@ -752,48 +727,14 @@ private:
     }
 
     void scheduleDeliveryIfNeeded(JSC::JSGlobalObject*, JSC::VM&);
-    WTF::Vector<JSColloPerformanceEntry*> pendingRecordsVector();
-    unsigned pendingEntryCount() const { return m_entries_to_deliver.size() - m_entries_to_deliver_head; }
-    void clearPendingEntries()
-    {
-        m_entries_to_deliver.clear();
-        m_entries_to_deliver_head = 0;
-    }
-    void compactPendingEntries()
-    {
-        if (!m_entries_to_deliver_head)
-            return;
-        if (m_entries_to_deliver_head >= m_entries_to_deliver.size()) {
-            clearPendingEntries();
-            return;
-        }
-
-        unsigned write = 0;
-        for (unsigned read = m_entries_to_deliver_head; read < m_entries_to_deliver.size(); read++) {
-            if (write != read)
-                m_entries_to_deliver[write] = WTF::move(m_entries_to_deliver[read]);
-            write++;
-        }
-        m_entries_to_deliver.shrink(write);
-        m_entries_to_deliver_head = 0;
-    }
-    // Compacting once the dropped prefix reaches half the vector keeps dropping the oldest pending entry
-    // amortized O(1).
-    void compactPendingEntriesIfNeeded()
-    {
-        if (!m_entries_to_deliver_head)
-            return;
-        if (m_entries_to_deliver_head >= m_entries_to_deliver.size()
-            || (m_entries_to_deliver_head >= 64 && m_entries_to_deliver_head * 2 >= m_entries_to_deliver.size()))
-            compactPendingEntries();
-    }
+    // Appends the pending entries to `out`, which the caller roots.
+    void pendingRecords(PerformanceEntryRoots& out);
+    unsigned pendingEntryCount() const { return m_entries_to_deliver.size(); }
+    void clearPendingEntries() { m_entries_to_deliver.clear(this); }
 
     JSC::WriteBarrier<JSColloPerformance> m_performance;
     JSC::WriteBarrier<JSC::JSObject> m_callback;
-    // FIXME: visitChildren walks this vector without cellLock(), while queueEntry and the pending-entry helpers
-    // reallocate it, so the concurrent marker can read a freed buffer.
-    WTF::Vector<JSC::WriteBarrier<JSColloPerformanceEntry>> m_entries_to_deliver;
-    unsigned m_entries_to_deliver_head { 0 };
+    Collo::CellEdgeList<PerformanceEntrySlot> m_entries_to_deliver;
     uint8_t m_type_mask { PerformanceObserverTypeNone };
     bool m_registered { false };
     bool m_is_type_observer { false };

@@ -1,12 +1,14 @@
 //! The admission of each new HTTP/2 stream on an ingress lane thread of the
 //! server: the route match, the server's own paths, the lane request slot
 //! and the deadline a matched request takes, its place in the pool of its
-//! worker definition, and the answers the lane writes alone, with the access
-//! record of a stream it answers before admitting it. When a request has to
-//! wait, and after a worker of the pool dies (`worker_fault.zig`), the lane
-//! asks the launcher for a worker or answers 503 to the waiters nothing can
-//! serve (`growOrStrand`). The lookups of a request's slot and connection by
-//! the keys admission gives them are here too.
+//! worker definition, and every answer the lane gives a stream before
+//! admitting it, with that answer's access record (`answerUnadmitted`),
+//! including the heads the HTTP/2 layer refused (`refuseH2Stream`). When a
+//! request has to wait, and after a worker of the pool dies
+//! (`worker_fault.zig`), the lane asks the launcher for a worker or answers
+//! 503 to the waiters nothing can serve (`growOrStrand`). The lookups of a
+//! request's slot and connection by the keys admission gives them are here
+//! too.
 //!
 //! Invariants:
 //! - The request path alone selects the route, matched once per stream
@@ -21,7 +23,8 @@
 //!   `request.url`.
 //! - The lane assigns the route key, the request id and the access facts'
 //!   identity from its own match and tables, never from worker output.
-//! - A request's one deadline, admission plus its definition's `timeoutMs`,
+//! - A request's one deadline, its arrival (`ParsedHead.received_ns`, the
+//!   socket read that brought its head) plus its definition's `timeoutMs`,
 //!   is fixed here with its lane request slot and its wheel entry, before
 //!   its pool sees it. The request keeps all three whether it dispatches at
 //!   once or waits in the pool's FIFO as this lane's own state. Later steps
@@ -32,10 +35,12 @@
 //!   driver classifies.
 //! - A request yields at most one access record: an admitted request emits
 //!   when it finishes (`request_finish.zig`), and a stream the lane answers
-//!   404 before admitting it emits at that answer (`emitLocalAccessRecord`).
-//!   The lane's other answers before admission emit none: the health answer,
-//!   a refused stream, a head the lane cannot forward and the answers of a
-//!   stopping server.
+//!   before admitting it emits at that answer. `answerUnadmitted` is the one
+//!   place such an answer is given, and its exhaustive `UnadmittedAnswer`
+//!   decides for each kind what the client gets and whether the access log
+//!   hears of it: every answer with a status records under a fresh request
+//!   id, except the health answer, and the RST_STREAM of a refused stream
+//!   records nothing and is counted (`streams_refused`).
 //! - The health answer reads the server's state without a lock
 //!   (`healthState`), so a lane gives it without waiting on another thread,
 //!   and a stopping server still gives it, so it comes before the stop check
@@ -63,6 +68,7 @@ const worker_registration = @import("worker_registration.zig");
 
 const access_log = @import("collo_server_analytics").access;
 const Sink = @import("collo_server_analytics").Sink;
+const http_body_limits = @import("collo_limits").http_body;
 const pool_limits = @import("collo_limits").pool;
 const record_limits = @import("collo_limits").runtime_logs;
 
@@ -93,6 +99,72 @@ pub const StreamTarget = union(enum) {
     /// it is one of the server's own paths with no answer.
     not_found,
     matched: routes_mod.Match,
+};
+
+/// What the lane answers a stream before admitting it. `answerUnadmitted`
+/// switches over every kind, so a new early answer does not build until it
+/// decides what the client gets and whether the access log hears of it.
+pub const UnadmittedAnswer = union(enum) {
+    /// The server's health path, answered from the server's state with no
+    /// access record: a probe every few seconds would flood the log.
+    health,
+    /// No route matches the path, or it is one of the server's own paths
+    /// with no answer: 404.
+    not_found,
+    /// A head with more fields or decoded bytes than a head may hold: 431,
+    /// naming the route when the head matched one.
+    header_fields_too_large: ?server_config.RouteKey,
+    /// A head whose block decoded but that RFC 9113 §8.3 calls malformed:
+    /// 400. Its path never reaches the route table.
+    malformed,
+    /// A matched head that declares a body over
+    /// `http_body.MATERIALIZED_BODY_BYTES_MAX`: 413.
+    payload_too_large: server_config.RouteKey,
+    /// A matched head while the server stops admitting requests: 503.
+    stopping: server_config.RouteKey,
+    /// No room for the stream on its connection or on the lane:
+    /// RST_STREAM REFUSED_STREAM, which the client may retry, with no
+    /// access record, since no HTTP status went out; counted instead
+    /// (`streams_refused`).
+    refused,
+};
+
+/// What the lane knows of a stream it answers before admission. The strings
+/// are borrowed for the call.
+pub const UnadmittedStream = struct {
+    stream_id: u32,
+    /// The END_STREAM flag of the head's frame. A client still sending its
+    /// request is asked to stop once the answer is queued
+    /// (`http2/writing.zig:answerStreamAlone`).
+    request_ended: bool,
+    /// When the head arrived (`ParsedHead.received_ns`), where the answer's
+    /// access record starts.
+    received_ns: u64,
+    method: []const u8,
+    path: []const u8,
+    user_agent: []const u8,
+
+    pub fn ofHead(stream_id: u32, head: *const h2_request.ParsedHead) UnadmittedStream {
+        return .{
+            .stream_id = stream_id,
+            .request_ended = head.end_stream,
+            .received_ns = head.received_ns,
+            .method = head.method,
+            .path = head.path,
+            .user_agent = access_log.userAgent(head.headers),
+        };
+    }
+
+    pub fn ofRefused(stream_id: u32, refused: *const h2_request.RefusedHead) UnadmittedStream {
+        return .{
+            .stream_id = stream_id,
+            .request_ended = refused.request_ended,
+            .received_ns = refused.received_ns,
+            .method = refused.method,
+            .path = refused.path,
+            .user_agent = refused.user_agent,
+        };
+    }
 };
 
 /// Classifies a new stream by its request path: a path under the server's
@@ -177,9 +249,9 @@ pub fn Methods(comptime Self: type) type {
         /// Admits a new stream. A stream whose path matches a route takes its
         /// lane request slot and its deadline, then a worker slot from its
         /// definition's pool or a place in the pool's FIFO; every other
-        /// stream gets the lane's own answer. A stream the connection or the
-        /// lane has no room for is refused alone (REFUSED_STREAM), so the
-        /// client may retry it. Returns false when the stream cannot be
+        /// stream gets the lane's own answer (`answerUnadmitted`). A stream
+        /// the connection or the lane has no room for is refused alone, so
+        /// the client may retry it. Returns false when the stream cannot be
         /// opened, which the connection driver answers as a protocol error.
         pub fn startDynamicH2(
             self: *Self,
@@ -187,53 +259,37 @@ pub fn Methods(comptime Self: type) type {
             stream_id: u32,
             head: *const h2_request.ParsedHead,
         ) StreamError!bool {
-            runtime.h2ReserveStream(stream_id) catch |err| switch (err) {
-                error.Http2TooManyConcurrentStreams, error.Http2StreamSlabFull => {
-                    try http2_writing.queueRstStream(Self, self, runtime, stream_id, .refused_stream);
-                    return true;
-                },
-                error.Http2StreamAlreadyOpen => return false,
-            };
-            var stream_unclaimed = true;
-            defer if (stream_unclaimed) {
-                _ = runtime.h2RemoveStream(self.service.allocator, stream_id);
-            };
-            runtime.h2SetRequestBodyExpectation(stream_id, head.body_framing, head.content_length, head.end_stream) catch return false;
+            const stream = UnadmittedStream.ofHead(stream_id, head);
+            if (!try reserveStream(self, runtime, stream))
+                return true;
             self.lane.counters.ingress_channels_started += 1;
 
             var captures: routes_mod.Captures = undefined;
             const matched = switch (streamTarget(&self.service.routes.table, head.path, &captures)) {
                 .health => {
-                    try writeH2HealthResponse(self, runtime, stream_id);
-                    stream_unclaimed = false;
-                    finishH2LocalResponse(self, runtime, stream_id);
+                    try answerUnadmitted(self, runtime, stream, .health);
                     return true;
                 },
                 .not_found => {
-                    const access = stampAccessFacts(self, runtime, null, .{
-                        .request_id = self.service.allocateRequestId(),
-                        .method = head.method,
-                        .path = head.path,
-                        .user_agent = access_log.userAgent(head.headers),
-                        .started_mono_ns = self.monotonicNowNs(),
-                    });
-                    try writeH2ServerResponse(self, runtime, stream_id, .route_not_found);
-                    emitLocalAccessRecord(self, &access, server_responses.get(.route_not_found).status);
-                    stream_unclaimed = false;
-                    finishH2LocalResponse(self, runtime, stream_id);
+                    try answerUnadmitted(self, runtime, stream, .not_found);
                     return true;
                 },
                 .matched => |found| found,
             };
+            // Checked once the route is known, so the 413's record names it.
+            if (head.content_length) |length| {
+                if (length > http_body_limits.MATERIALIZED_BODY_BYTES_MAX) {
+                    try answerUnadmitted(self, runtime, stream, .{ .payload_too_large = matched.key });
+                    return true;
+                }
+            }
 
             // The one place a request is admitted. Refusing new ones once
             // `shouldStop()` trips lets the lane's shutdown drain
             // (`ring_driver.zig`) run out under continuous traffic; requests
             // admitted before the stop drain normally.
             if (self.service.shouldStop()) {
-                try writeH2ServerResponse(self, runtime, stream_id, .service_unavailable);
-                stream_unclaimed = false;
-                finishH2LocalResponse(self, runtime, stream_id);
+                try answerUnadmitted(self, runtime, stream, .{ .stopping = matched.key });
                 return true;
             }
             self.lane.counters.route_matches += 1;
@@ -244,24 +300,30 @@ pub fn Methods(comptime Self: type) type {
                 // carries, so only a decoder bound looser than the dispatch's
                 // reaches this.
                 error.TooManyRequestHeaders => {
-                    try writeH2ServerResponse(self, runtime, stream_id, .request_header_fields_too_large);
-                    stream_unclaimed = false;
-                    finishH2LocalResponse(self, runtime, stream_id);
+                    try answerUnadmitted(self, runtime, stream, .{ .header_fields_too_large = matched.key });
                     return true;
                 },
             };
 
-            const now = self.monotonicNowNs();
-            const definition = self.service.routes.definition(matched.key.definition);
-            const deadline_ns = now +| definition.settings.limits.timeoutNs();
-            const request_id = self.service.allocateRequestId();
+            // Until a request binds it, the stream leaves the table on every
+            // way out.
+            var stream_unclaimed = true;
+            defer if (stream_unclaimed) {
+                _ = runtime.h2RemoveStream(self.service.allocator, stream_id);
+            };
+            runtime.h2SetRequestBodyExpectation(stream_id, head.body_framing, head.content_length, head.end_stream) catch return false;
             const acquired = self.requests.acquire() orelse {
-                // The lane request slab is full. Only this stream is shed,
-                // with REFUSED_STREAM, so the client may retry it; the
-                // connection and every other stream on the lane stay.
-                try http2_writing.queueRstStream(Self, self, runtime, stream_id, .refused_stream);
+                // The lane request slab is full. Only this stream is shed, so
+                // the client may retry it; the connection and every other
+                // stream on the lane stay.
+                stream_unclaimed = false;
+                try answerUnadmitted(self, runtime, stream, .refused);
                 return true;
             };
+            const now = self.monotonicNowNs();
+            const definition = self.service.routes.definition(matched.key.definition);
+            const deadline_ns = head.received_ns +| definition.settings.limits.timeoutNs();
+            const request_id = self.service.allocateRequestId();
             const slot = acquired.entry;
             slot.request_key = .{ .lane_id = self.lane.lane_id, .slot = acquired.index, .generation = acquired.generation };
             slot.request_id = request_id;
@@ -269,7 +331,7 @@ pub fn Methods(comptime Self: type) type {
             slot.ingress_channel_id = stream_id;
             slot.route = matched.key;
             slot.deadline_ns = deadline_ns;
-            slot.admitted_ns = now;
+            slot.admitted_ns = head.received_ns;
             {
                 errdefer {
                     _ = self.lane.cancelRequestDeadline(&slot.deadline);
@@ -285,8 +347,8 @@ pub fn Methods(comptime Self: type) type {
                 .request_id = request_id,
                 .method = head.method,
                 .path = head.path,
-                .user_agent = access_log.userAgent(head.headers),
-                .started_mono_ns = now,
+                .user_agent = stream.user_agent,
+                .started_mono_ns = head.received_ns,
             });
             self.request_count += 1;
             try placeRequest(self, acquired.index, .{
@@ -395,52 +457,127 @@ pub fn Methods(comptime Self: type) type {
                 try deadline_driver.armTimerAt(Self, self, now);
         }
 
-        /// Queues the lane's own answer `response_id` whole on `stream_id`.
-        /// A stream that can take no answer, because it is gone, drains one
-        /// already or carries the worker's head, gets nothing, and a
-        /// connection that cannot take the frames is asked to close
-        /// (`http2_writing.queueServerResponse`).
+        /// Queues the lane's own answer `response_id` whole on `stream_id`,
+        /// and returns whether it was queued. A stream that can take no
+        /// answer, because it is gone, drains one already or carries the
+        /// worker's head, gets nothing, and a connection that cannot take
+        /// the frames is asked to close (`http2_writing.queueServerResponse`).
         pub fn writeH2ServerResponse(
             self: *Self,
             runtime: *ConnectionSlot,
             stream_id: u32,
             response_id: server_responses.Id,
-        ) LaneFault!void {
-            _ = try http2_writing.queueServerResponse(Self, self, runtime, stream_id, server_responses.get(response_id));
-        }
-
-        /// Answers the health path from the server's own state
-        /// (`healthState`). The HTTP/2 layer copies the body before it
-        /// returns, so the body lives on this stack.
-        fn writeH2HealthResponse(self: *Self, runtime: *ConnectionSlot, stream_id: u32) LaneFault!void {
-            const state = healthState(
-                self.service.shouldStop(),
-                self.service.supervisor.zygote_process.pidfd,
-                self.service.lanes,
-                self.service.analytics,
-            );
-            var body_buffer: [server_responses.health_body_bytes_max]u8 = undefined;
-            _ = try http2_writing.queueServerResponse(Self, self, runtime, stream_id, server_responses.health(state, &body_buffer));
+        ) LaneFault!bool {
+            return http2_writing.queueServerResponse(Self, self, runtime, stream_id, server_responses.get(response_id));
         }
 
         pub fn finishH2LocalResponse(self: *Self, runtime: *ConnectionSlot, stream_id: u32) void {
             _ = runtime.h2FinishLocalResponse(self.service.allocator, stream_id);
         }
 
-        /// Pushes onto this lane's ring the access record of a stream the
-        /// lane answers before admitting it, such as the route 404, with the
-        /// server as its source. An admitted request emits through its slot
-        /// (`request_finish.zig`). Facts whose `request_id` is 0 emit
-        /// nothing.
-        fn emitLocalAccessRecord(self: *Self, facts: *const access_log.AccessFacts, http_status: u16) void {
-            if (facts.request_id == 0)
+        /// The HTTP/2 driver's hook for a request head it refused before
+        /// parsing it whole (`http2/reading.zig:processRequestHead`): the
+        /// stream enters the connection's table, or is refused past its
+        /// bounds, and gets 431 or 400 with its access record. The head's
+        /// path never reaches the route table, which takes only heads
+        /// `request_head.parse` accepted.
+        pub fn refuseH2Stream(
+            self: *Self,
+            runtime: *ConnectionSlot,
+            stream_id: u32,
+            refused: *const h2_request.RefusedHead,
+        ) StreamError!void {
+            const stream = UnadmittedStream.ofRefused(stream_id, refused);
+            if (!try reserveStream(self, runtime, stream))
                 return;
-            _ = self.access_ring.push(access_log.recordFromFacts(
-                facts.*,
-                http_status,
-                .server,
-                self.monotonicNowNs(),
-            ));
+            try answerUnadmitted(self, runtime, stream, switch (refused.reason) {
+                .fields_too_large => .{ .header_fields_too_large = null },
+                .malformed => .malformed,
+            });
+        }
+
+        /// The one place the lane answers a stream before admitting it: it
+        /// writes `answer` on `stream`, which the connection's table holds
+        /// unless the answer is `refused`, ends the stream's tie to the
+        /// lane, and pushes the access record the answer calls for. A
+        /// recorded answer takes a fresh request id, so the record's join on
+        /// worker and request ids stays unique, and names the server as its
+        /// author, no worker, `done` as its error code and its route when the
+        /// head matched one.
+        pub fn answerUnadmitted(
+            self: *Self,
+            runtime: *ConnectionSlot,
+            stream: UnadmittedStream,
+            answer: UnadmittedAnswer,
+        ) StreamError!void {
+            switch (answer) {
+                .refused => {
+                    self.lane.counters.streams_refused += 1;
+                    // A stream refused at its reservation never entered the
+                    // table, and one refused for the request slab leaves it.
+                    _ = runtime.h2RemoveStream(self.service.allocator, stream.stream_id);
+                    try http2_writing.queueRstStream(Self, self, runtime, stream.stream_id, .refused_stream);
+                },
+                .health => {
+                    // The HTTP/2 layer copies the body before it returns, so
+                    // the body lives on this stack.
+                    var body_buffer: [server_responses.health_body_bytes_max]u8 = undefined;
+                    const response = server_responses.health(healthState(
+                        self.service.shouldStop(),
+                        self.service.supervisor.zygote_process.pidfd,
+                        self.service.lanes,
+                        self.service.analytics,
+                    ), &body_buffer);
+                    _ = try http2_writing.answerStreamAlone(Self, self, runtime, stream.stream_id, response, stream.request_ended);
+                },
+                .not_found => try answerRecorded(self, runtime, stream, .route_not_found, null),
+                .header_fields_too_large => |route| try answerRecorded(self, runtime, stream, .request_header_fields_too_large, route),
+                .malformed => try answerRecorded(self, runtime, stream, .bad_request, null),
+                .payload_too_large => |route| try answerRecorded(self, runtime, stream, .payload_too_large, route),
+                .stopping => |route| try answerRecorded(self, runtime, stream, .service_unavailable, route),
+            }
+        }
+
+        /// Answers `stream` with `response_id` and pushes its access record
+        /// (`answerUnadmitted`), whose first byte is the answer's when the
+        /// stream took it.
+        fn answerRecorded(
+            self: *Self,
+            runtime: *ConnectionSlot,
+            stream: UnadmittedStream,
+            response_id: server_responses.Id,
+            route: ?server_config.RouteKey,
+        ) LaneFault!void {
+            const response = server_responses.get(response_id);
+            const queued = try http2_writing.answerStreamAlone(Self, self, runtime, stream.stream_id, response, stream.request_ended);
+            const answered_ns = self.monotonicNowNs();
+            var facts = stampAccessFacts(self, runtime, route, .{
+                .request_id = self.service.allocateRequestId(),
+                .method = stream.method,
+                .path = stream.path,
+                .user_agent = stream.user_agent,
+                .started_mono_ns = stream.received_ns,
+            });
+            if (queued)
+                facts.first_byte_mono_ns = answered_ns;
+            _ = self.access_ring.push(access_log.recordFromFacts(facts, response.status, .server, answered_ns));
+        }
+
+        /// Takes `stream` into the connection's stream table and returns
+        /// true. Past the connection's concurrent streams or the lane's
+        /// stream slab, the stream is refused alone (`answerUnadmitted`) and
+        /// the call returns false. The HTTP/2 layer hands only stream ids
+        /// above every one the client used, so an id already open is the
+        /// lane's own mistake, which closes the connection.
+        fn reserveStream(self: *Self, runtime: *ConnectionSlot, stream: UnadmittedStream) StreamError!bool {
+            runtime.h2ReserveStream(stream.stream_id) catch |err| switch (err) {
+                error.Http2TooManyConcurrentStreams, error.Http2StreamSlabFull => {
+                    try answerUnadmitted(self, runtime, stream, .refused);
+                    return false;
+                },
+                error.Http2StreamAlreadyOpen => return error.Http2StreamAlreadyOpen,
+            };
+            return true;
         }
 
         /// Access facts for a request on `runtime`'s connection. The worker

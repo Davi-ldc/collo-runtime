@@ -12,7 +12,11 @@
 //! 1. Refuse to run as root (`rootRefusal`), before anything else. The
 //!    zygote, every worker and the gateway run as the server's user, so a
 //!    worker that gets out of its namespaces, chroot and seccomp filter holds
-//!    what that user holds; as root, that is the whole node.
+//!    what that user holds; as root, that is the whole node. Then warn when
+//!    the server's own `oom_score_adj` is at or above the lowest score the
+//!    runtime gives its children (`oomOrderHolds`): every score it writes is
+//!    at or above 0 and needs no privilege, so only the score the server was
+//!    started with can break the order `common/limits/process.zig` sets.
 //! 2. Block SIGHUP, SIGINT and SIGTERM and start their monitor
 //!    (`signals.zig`), before any other thread exists and before anything
 //!    that needs cleaning up. A first SIGINT or SIGTERM during the boot waits
@@ -22,16 +26,20 @@
 //!    Ctrl-C stops it, and it stops them, while a hangup makes it reopen its
 //!    analytics files and keep serving.
 //! 3. Raise the soft open file limit to the hard one, then load the
-//!    configuration and build every definition's artifact. The artifacts
-//!    alone keep `artifact_descriptors_max` descriptors open for the server's
+//!    configuration, build every definition's artifact and compile the
+//!    `network` grants into the gateway's sealed policy image. These alone
+//!    keep `artifact_descriptors_max` descriptors open for the server's
 //!    life, before any client connection or worker channel.
 //! 4. Require a kernel TLS cipher, which the server cannot serve without.
 //!    Nothing here depends on the steps after it, so a missing `tls` module
 //!    fails the boot before any child process exists.
-//! 5. Create the worker cgroup root. It must exist before the zygote: a
-//!    delegated placement moves only the calling process into `<own>/main`,
-//!    and a zygote left in `<own>` would keep its controllers from being
-//!    enabled (`prepareDelegatedSubtree` in `host/cgroup_root.zig`).
+//! 5. Create the worker cgroup root, then claim the one directory every
+//!    worker mounts its tmpfs over (`host/tmp_mount.zig`). The root must
+//!    exist before the zygote: a delegated placement moves only the calling
+//!    process into `<own>/main`, and a zygote left in `<own>` would keep its
+//!    controllers from being enabled (`prepareDelegatedSubtree` in
+//!    `host/cgroup_root.zig`). Both sweep what dead hosts left before this
+//!    server's first worker.
 //! 6. Spawn the zygote with the warmup corpus, then drain its trace pipe,
 //!    which holds the zygote's boot events until the drain starts.
 //! 7. Choose the certificate: the configured one, or a generated self-signed
@@ -42,17 +50,20 @@
 //!
 //! The boot does not prewarm the egress gateway
 //! (`Server.prewarmEgressGateway` in `server/main.zig`), so the gateway
-//! starts when the first worker attaches to it.
+//! starts when the first worker attaches to it. Only a worker of a
+//! definition with a `network` grant attaches, so a configuration that
+//! grants no route any network access never starts a gateway.
 //! Teardown runs in reverse: the monitor detaches from the `Server`, the
-//! `Server` stops its workers, the drain stops, then the zygote and the
-//! cgroup root go. The monitor joins last, so a second stop signal during the
+//! `Server` stops its workers, the drain stops, then the zygote, the tmpfs
+//! mount point and the cgroup root go. The monitor joins last, so a second stop signal during the
 //! teardown still ends the process at once instead of taking its default
 //! action halfway through it.
 //!
 //! Exit status (`ExitStatus`): `ok` after a stop a signal requested,
 //! `invalid` for invalid usage, a run as root or a configuration that cannot
 //! be served (the configuration file, an entry module or a path it names),
-//! `failure` for anything else, and 128 plus the signal number when a second
+//! `failure` for anything else, resources the routes could not get included
+//! (`routesFailure`), and 128 plus the signal number when a second
 //! stop signal cuts the boot, the drain or the teardown short. Every failure
 //! ends with one `report.line` that names its cause; a library that logs its
 //! own reason, such as BoringSSL, adds that line before it.
@@ -63,6 +74,7 @@ const routes_mod = @import("collo_server_routes");
 const zygote = @import("collo_zygote");
 const host = @import("collo_host");
 const server_limits = @import("collo_limits").server;
+const process_limits = @import("collo_limits").process;
 const server_main = @import("../main.zig");
 const tls = @import("../tls/root.zig");
 const ktls = @import("../tls/ktls.zig");
@@ -84,8 +96,8 @@ pub const ExitStatus = enum(u8) {
 pub const worker_cgroup_root_env = "COLLO_WORKER_CGROUP_ROOT";
 
 /// Every definition's sealed module pack and route table, plus the
-/// filesystem index they share.
-pub const artifact_descriptors_max: usize = 2 * server_limits.worker_definitions_max + 1;
+/// filesystem index they share and the network policy image.
+pub const artifact_descriptors_max: usize = 2 * server_limits.worker_definitions_max + 2;
 
 /// Prints why `command_line.parse` refused the arguments, then the usage
 /// line.
@@ -93,6 +105,49 @@ pub fn invalidUsage(diagnostic: *const command_line.Diagnostic) ExitStatus {
     report.line("{s}", .{diagnostic.message()});
     std.fs.File.stderr().writeAll(command_line.usage) catch return .invalid;
     return .invalid;
+}
+
+/// The status a failed `Routes.init` ends the boot with, after reporting its
+/// diagnostic: `invalid` for routes the configuration cannot serve,
+/// `failure` for resources the server could not get, since only the first
+/// is the operator's configuration to fix.
+pub fn routesFailure(err: routes_mod.Error, diagnostic: *const config.Diagnostic) ExitStatus {
+    switch (err) {
+        error.OutOfMemory => return outOfMemory(),
+        error.RoutesInvalid => return invalidConfiguration(diagnostic),
+        error.RouteResourcesUnavailable => {
+            report.line("{s}", .{diagnostic.message()});
+            return .failure;
+        },
+    }
+}
+
+/// Whether a server whose `oom_score_adj` is `server_score` keeps the kernel's
+/// OOM order: every child's score is above the server's, so the kernel takes
+/// a worker, then the gateway, then the zygote, and the server last. The
+/// zygote's score is the lowest the runtime writes.
+pub fn oomOrderHolds(server_score: i16) bool {
+    return server_score < process_limits.OOM_SCORE_ADJ_ZYGOTE;
+}
+
+/// Reports on stderr when the server's own `oom_score_adj` breaks the order
+/// (`oomOrderHolds`), which only the score it was started with can do.
+fn warnOomOrder() void {
+    var buffer: [16]u8 = undefined;
+    const text = std.fs.cwd().readFile("/proc/self/oom_score_adj", &buffer) catch |err| {
+        report.line("cannot read the server's oom_score_adj, so the OOM order is not checked: {s}", .{@errorName(err)});
+        return;
+    };
+    const server_score = std.fmt.parseInt(i16, std.mem.trim(u8, text, " \n"), 10) catch |err| {
+        report.line("cannot read the server's oom_score_adj, so the OOM order is not checked: {s}", .{@errorName(err)});
+        return;
+    };
+    if (oomOrderHolds(server_score))
+        return;
+    report.line("the server's oom_score_adj is {d}, at or above the zygote's {d}: under memory pressure the kernel may kill the server before its workers, the egress gateway or the zygote; start it with a lower score, such as OOMScoreAdjust=-1000 under systemd", .{
+        server_score,
+        process_limits.OOM_SCORE_ADJ_ZYGOTE,
+    });
 }
 
 /// Null for an unprivileged effective user. For root, reports on stderr why
@@ -112,6 +167,7 @@ pub fn rootRefusal(effective_uid: std.posix.uid_t) ?ExitStatus {
 pub fn serve(gpa: std.mem.Allocator, invocation: command_line.Invocation) ExitStatus {
     if (rootRefusal(std.posix.geteuid())) |status|
         return status;
+    warnOomOrder();
 
     var monitor: signals.Signals = undefined;
     monitor.start() catch |err| {
@@ -135,10 +191,7 @@ pub fn serve(gpa: std.mem.Allocator, invocation: command_line.Invocation) ExitSt
         return invalidConfiguration(&diagnostic);
     };
     var routes: routes_mod.Routes = undefined;
-    routes.init(gpa, loaded, &diagnostic) catch |err| switch (err) {
-        error.OutOfMemory => return outOfMemory(),
-        error.RouteBuildFailed => return invalidConfiguration(&diagnostic),
-    };
+    routes.init(gpa, loaded, &diagnostic) catch |err| return routesFailure(err, &diagnostic);
     // `Server.init` takes the routes on every call, failure included.
     var routes_owned = true;
     defer if (routes_owned) routes.deinit();
@@ -161,6 +214,13 @@ pub fn serve(gpa: std.mem.Allocator, invocation: command_line.Invocation) ExitSt
         },
     };
     defer cgroup_root.deinit(gpa);
+
+    var tmp_mount_point: host.TmpMountPoint = undefined;
+    tmp_mount_point.init(host.tmp_mount.default_parent_dir) catch |err| {
+        report.line("cannot create the workers' tmpfs mount point under " ++ host.tmp_mount.default_parent_dir ++ ": {s}", .{@errorName(err)});
+        return .failure;
+    };
+    defer tmp_mount_point.deinit();
 
     var spawned = zygote.host_client.spawnZygote(.{ .warmup_corpus = true }) catch |err| {
         report.line("cannot start the zygote: {s}", .{@errorName(err)});
@@ -208,7 +268,7 @@ pub fn serve(gpa: std.mem.Allocator, invocation: command_line.Invocation) ExitSt
             .analytics_directory = if (routes.config.analytics) |analytics| analytics.directory_path else null,
             .listen = listen,
             .tls_certificate = certificate,
-            .worker_cgroup_root = &cgroup_root,
+            .worker_host = .{ .cgroup_root = &cgroup_root, .tmp_mount_point = &tmp_mount_point },
             .on_serving = &announceListening,
         }) catch |err| return serverInitFailure(err, .{
             .listen = listen,

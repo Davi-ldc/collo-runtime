@@ -103,7 +103,8 @@ test "a full queue refuses a command and keeps the ones it holds" {
 }
 
 test "deaths and reader grants fill a one-definition lane's reserve, which the other commands never reach" {
-    const reserve = ingress.lane.obligationReserve(1);
+    // One definition at the default `concurrency` of 2.
+    const reserve = ingress.lane.obligationReserve(1, 2);
     var queue = try Queue.init(1, reserve);
     defer queue.deinit();
     var record: supervision.worker_table.Record = .{

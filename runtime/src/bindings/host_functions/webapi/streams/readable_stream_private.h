@@ -3,18 +3,11 @@
 // iterator. Everything runs on the VM thread, except visitChildren (readable_stream_objects.cpp), which collector
 // threads run concurrently.
 //
-// Every edge from one of these cells to another cell is a WriteBarrier field, except the ColloPromiseDeferred of a
-// pending BYOB read and of a default reader's closed promise. The cell owns that deferred, which roots its promise's
-// resolve and reject functions through Strong handles (ColloValue) until settleDeferred settles and releases it or
-// the cell's destructor releases one that never settled. A pending BYOB read's promise points back at the stream
-// through its owner property, so that stream stays alive until the read settles.
-// FIXME: these Strong handles hide cycles from the collector. A stream nothing else references leaks until its
-// pending BYOB read settles or the VM is destroyed, and a reaction on a closed promise that captures its reader keeps
-// that reader alive the same way. Hold these promises in WriteBarrier fields, as ReadRequest does.
-//
-// The concurrent marker reads the stream's queue, its two read-request vectors and its native source pointer, so any
-// change that can move or free a vector's buffer, or detach the source, happens under cellLock(), and nothing holds
-// that lock across a JavaScript allocation or a call into JavaScript or Zig.
+// Every edge from one of these cells to another cell is a WriteBarrier field, the promises they will settle included,
+// and those promises settle through Collo::settlePromise. The stream's queue and its two lists of pending reads are
+// Collo::CellEdgeList and its native source a Collo::CellNativeRef, which own the lock and barrier protocol the
+// concurrent marker needs (jsc/runtime/cell_edges.h). Until a read settles, its promise refers back to the stream
+// through a private property, so a stream reachable only from a pending read's promise stays alive.
 
 #pragma once
 
@@ -298,23 +291,31 @@ class JSColloReadableStream final : public JSC::JSDestructibleObject {
         size_t memory_cost { 0 };
         // Bytes at the front of a byte chunk already copied into BYOB reads.
         size_t byte_offset { 0 };
+
+        template <typename Visitor> void visitEdges(Visitor& visitor) const { visitor.append(value); }
     };
 
+    // A pending default read: the promise read() returned.
     struct ReadRequest {
-        JSC::WriteBarrier<JSC::Unknown> promise;
-        JSC::WriteBarrier<JSC::Unknown> resolve;
-        JSC::WriteBarrier<JSC::Unknown> reject;
+        JSC::WriteBarrier<JSC::JSPromise> promise;
+
+        template <typename Visitor> void visitEdges(Visitor& visitor) const { visitor.append(promise); }
     };
 
     struct ByobReadRequest {
-        ColloPromiseDeferred* deferred { nullptr };
-        JSC::WriteBarrier<JSC::Unknown> promise;
+        JSC::WriteBarrier<JSC::JSPromise> promise;
         // The view being filled, over a buffer transferred from the reader's view when the read was issued or
         // allocated for autoAllocateChunkSize.
         JSC::WriteBarrier<JSC::JSArrayBufferView> view;
         size_t bytes_filled { 0 };
         // In bytes: the read's min option times the view's element size, or 1 for an autoAllocateChunkSize read.
         size_t min_bytes { 1 };
+
+        template <typename Visitor> void visitEdges(Visitor& visitor) const
+        {
+            visitor.append(promise);
+            visitor.append(view);
+        }
     };
 
 public:
@@ -373,7 +374,7 @@ public:
     {
         if (!hasByobReadRequests())
             return 0;
-        const auto& request = m_byob_read_requests[m_byob_read_request_start];
+        const auto& request = m_byob_read_requests.first();
         auto* view = request.view.get();
         if (arrayBufferViewIsUnavailable(view))
             return 0;
@@ -428,53 +429,45 @@ public:
 
         if (hasReadRequests()) {
             auto request = takeFirstReadRequest();
-            settleReadRequest(global_object, WTF::move(request), createReadResult(global_object, chunk, false), false);
-            return true;
+            return settleReadRequest(
+                global_object, WTF::move(request), createReadResult(global_object, chunk, false), false);
         }
 
+        // ReadableStreamDefaultControllerEnqueue: a size callback that throws or returns an invalid size errors the
+        // stream and rethrows to the caller of enqueue.
         double size = 1;
         if (auto* current_controller = controller()) {
             JSValue size_callback = current_controller->sizeCallback();
             if (valueIsCallable(size_callback)) {
+                JSValue size_error;
                 JSC::MarkedArgumentBuffer arguments;
                 arguments.append(chunk);
                 if (arguments.hasOverflowed()) {
-                    JSC::throwOutOfMemoryError(global_object, scope);
-                    if (auto* exception = scope.exception()) {
-                        JSValue reason = exception->value();
-                        if (scope.tryClearException()) {
-                            error(global_object, reason);
-                            JSC::throwException(global_object, scope, reason);
+                    size_error = JSC::createOutOfMemoryError(global_object);
+                } else {
+                    auto call_data = JSC::getCallData(size_callback);
+                    JSValue size_value = JSC::call(
+                        global_object, size_callback.getObject(), call_data, JSC::jsUndefined(), arguments);
+                    if (scope.exception()) {
+                        size_error = scope.exception()->value();
+                        if (!scope.tryClearException())
+                            return false;
+                    } else {
+                        size = size_value.toNumber(global_object);
+                        if (scope.exception()) {
+                            size_error = scope.exception()->value();
+                            if (!scope.tryClearException())
+                                return false;
+                        } else if (!std::isfinite(size) || size < 0) {
+                            size_error = JSC::createRangeError(
+                                global_object, "ReadableStream chunk size must be a finite non-negative number"_s);
                         }
                     }
-                    return false;
                 }
-                auto call_data = JSC::getCallData(size_callback);
-                JSValue size_value
-                    = JSC::call(global_object, size_callback.getObject(), call_data, JSC::jsUndefined(), arguments);
-                if (scope.exception()) {
-                    JSValue reason = scope.exception()->value();
-                    if (!scope.tryClearException())
-                        return false;
-                    error(global_object, reason);
-                    JSC::throwException(global_object, scope, reason);
-                    return false;
-                }
-                size = size_value.toNumber(global_object);
-                if (scope.exception()) {
-                    JSValue reason = scope.exception()->value();
-                    if (!scope.tryClearException())
-                        return false;
-                    error(global_object, reason);
-                    JSC::throwException(global_object, scope, reason);
-                    return false;
-                }
-                if (!std::isfinite(size) || size < 0) {
-                    JSValue reason = JSC::createRangeError(
-                        global_object, "ReadableStream chunk size must be a finite non-negative number"_s);
+                if (size_error) {
+                    error(global_object, size_error);
                     RETURN_IF_EXCEPTION(scope, false);
-                    error(global_object, reason);
-                    JSC::throwException(global_object, scope, reason);
+                    JSC::throwException(global_object, scope, size_error);
                     return false;
                 }
             }
@@ -507,7 +500,8 @@ public:
     bool settleByobRequestWithView(
         JSC::JSGlobalObject*, JSC::ThrowScope&, JSColloReadableStreamBYOBRequest*, JSC::JSArrayBufferView*);
     EncodedJSValue readInto(JSC::JSGlobalObject*, JSC::ThrowScope&, JSC::JSArrayBufferView*, size_t min_bytes);
-    void rejectByobReadRequests(JSC::JSGlobalObject*, JSValue);
+    // Rejects every pending BYOB read with the value. Returns false when a termination is pending.
+    bool rejectByobReadRequests(JSC::JSGlobalObject*, JSValue);
 
     void callDefaultTeePullIfNeeded(JSC::JSGlobalObject* global_object);
     JSC::JSFunction* nativePullFulfilledFunction(JSC::JSGlobalObject*);
@@ -537,34 +531,28 @@ public:
         return enqueueWithSizeUnchecked(global_object, scope, chunk, size);
     }
 
+    // Returns false with an exception pending: a thrown error, or a termination that settling a read met.
     bool enqueueWithSizeUnchecked(
         JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSValue chunk, double size)
     {
         if (hasReadRequests()) {
             auto request = takeFirstReadRequest();
-            settleReadRequest(global_object, WTF::move(request), createReadResult(global_object, chunk, false), false);
-            return true;
+            return settleReadRequest(
+                global_object, WTF::move(request), createReadResult(global_object, chunk, false), false);
         }
 
-        QueuedChunk entry;
-        entry.value.set(global_object->vm(), this, chunk);
-        entry.size = size;
         const size_t memory_cost = m_queue_memory_cost_limit ? streamChunkMemoryCost(chunk) : 0;
-        entry.memory_cost = memory_cost;
         if (queueMemoryCostWouldExceed(memory_cost)) {
             auto* exception
-                = createStreamQueueLimitExceededError(global_object, "Text codec stream queue limit exceeded"_s);
+                = createStreamQueueLimitExceededError(global_object, "ReadableStream queue limit exceeded"_s);
             JSC::throwException(global_object, scope, exception);
             return false;
         }
-        compactQueueIfNeeded();
-        bool appended = false;
-        {
-            // The append may move the buffer the concurrent marker walks; see the file header for the lock rules.
-            WTF::Locker locker { cellLock() };
-            appended = m_queue.tryAppend(WTF::move(entry));
-        }
-        if (!appended) {
+        QueuedChunk entry;
+        entry.value.setWithoutWriteBarrier(chunk);
+        entry.size = size;
+        entry.memory_cost = memory_cost;
+        if (!m_queue.tryAppend(global_object->vm(), this, WTF::move(entry))) {
             JSC::throwOutOfMemoryError(global_object, scope);
             return false;
         }
@@ -575,7 +563,8 @@ public:
 
     void close(JSC::JSGlobalObject* global_object);
     void error(JSC::JSGlobalObject* global_object, JSValue error);
-    void rejectReadRequests(JSC::JSGlobalObject* global_object, JSValue error);
+    // Rejects every pending default read with `error`. Returns false when a termination is pending.
+    bool rejectReadRequests(JSC::JSGlobalObject* global_object, JSValue error);
 
     EncodedJSValue read(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope);
     EncodedJSValue cancel(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSValue reason);
@@ -593,42 +582,25 @@ private:
     {
     }
 
+    // The sweep runs the destructor after the last visit, so a source still attached is released here.
     ~JSColloReadableStream()
     {
-        if (m_native_source)
-            m_native_source->release();
-        for (auto& request : m_read_requests) {
-            request.promise.clear();
-            request.resolve.clear();
-            request.reject.clear();
-        }
-        m_read_requests.clear();
-        for (auto& request : m_byob_read_requests) {
-            request.promise.clear();
-            request.view.clear();
-            if (request.deferred)
-                collo_promise_deferred_release(request.deferred);
-        }
-        m_byob_read_requests.clear();
+        if (auto* source = m_native_source.get())
+            source->release();
     }
 
-    // No marker can have seen the cell before finishCreation returns, so the source is attached without the cell lock.
     void finishCreation(JSC::VM& vm, WTF::RefPtr<ReadableStreamNativeSource>&& native_source = nullptr)
     {
         Base::finishCreation(vm);
         ASSERT(inherits(info()));
-        m_native_source = WTF::move(native_source);
+        if (native_source)
+            m_native_source.set(vm, this, WTF::move(native_source));
     }
 
-    // The marker visits m_native_source under the cell lock, so the pointer is cleared under it. The source is
-    // released and freed after the lock is dropped, because release() may call into Zig.
+    // The source is released after CellNativeRef dropped it, because release() may call into Zig.
     void releaseNativeSource()
     {
-        WTF::RefPtr<ReadableStreamNativeSource> source;
-        {
-            WTF::Locker locker { cellLock() };
-            source = WTF::move(m_native_source);
-        }
+        auto source = m_native_source.take(this);
         m_native_pulling = false;
         if (source)
             source->release();
@@ -645,32 +617,20 @@ private:
 
     void clearQueue()
     {
-        WTF::Locker locker { cellLock() };
-        m_queue.clear();
-        m_queue_start = 0;
+        m_queue.clear(this);
         m_queue_total_size = 0;
         m_queue_memory_cost = 0;
     }
 
-    bool queueEmpty() const { return m_queue_start >= m_queue.size(); }
+    bool queueEmpty() const { return m_queue.isEmpty(); }
 
     bool dequeue(JSValue& value)
     {
         if (queueEmpty())
             return false;
-        auto& entry = m_queue[m_queue_start++];
+        auto entry = m_queue.takeFirst(this);
         value = entry.value.get();
-        entry.value.clear();
-        double size = entry.size;
-        size_t memory_cost = entry.memory_cost;
-        entry.size = 0;
-        entry.memory_cost = 0;
-        if (m_queue_total_size > size)
-            m_queue_total_size -= size;
-        else
-            m_queue_total_size = 0;
-        subtractQueueMemoryCost(memory_cost);
-        compactQueueIfNeeded();
+        subtractQueueSize(entry.size, entry.memory_cost);
         return true;
     }
 
@@ -679,7 +639,7 @@ private:
         out = {};
         if (queueEmpty())
             return false;
-        auto& entry = m_queue[m_queue_start];
+        auto& entry = m_queue.first();
         auto* view = dynamicDowncast<JSC::JSArrayBufferView>(entry.value.get());
         if (arrayBufferViewIsUnavailable(view))
             return false;
@@ -694,33 +654,22 @@ private:
     {
         if (queueEmpty())
             return false;
-        auto& entry = m_queue[m_queue_start];
+        auto& entry = m_queue.first();
         auto* view = dynamicDowncast<JSC::JSArrayBufferView>(entry.value.get());
         if (arrayBufferViewIsUnavailable(view))
             return false;
         auto bytes = viewBytes(view);
-        if (entry.byte_offset > bytes.size())
+        const size_t byte_offset = entry.byte_offset;
+        if (byte_offset > bytes.size())
             return false;
-        if (entry.byte_offset == 0) {
-            value = entry.value.get();
+        if (byte_offset == 0) {
+            value = view;
         } else {
-            value
-                = createUint8ArrayView(global_object, scope, view, entry.byte_offset, bytes.size() - entry.byte_offset);
+            value = createUint8ArrayView(global_object, scope, view, byte_offset, bytes.size() - byte_offset);
             RETURN_IF_EXCEPTION(scope, false);
         }
-        entry.value.clear();
-        double size = entry.size;
-        size_t memory_cost = entry.memory_cost;
-        entry.size = 0;
-        entry.memory_cost = 0;
-        entry.byte_offset = 0;
-        ++m_queue_start;
-        if (m_queue_total_size > size)
-            m_queue_total_size -= size;
-        else
-            m_queue_total_size = 0;
-        subtractQueueMemoryCost(memory_cost);
-        compactQueueIfNeeded();
+        auto taken = m_queue.takeFirst(this);
+        subtractQueueSize(taken.size, taken.memory_cost);
         return true;
     }
 
@@ -731,54 +680,17 @@ private:
             return false;
         if (bytes > source.size())
             return false;
-        auto& entry = m_queue[m_queue_start];
+        if (bytes == source.size()) {
+            auto taken = m_queue.takeFirst(this);
+            subtractQueueSize(taken.size, taken.memory_cost);
+            return true;
+        }
+        auto& entry = m_queue.first();
         entry.byte_offset += bytes;
-        if (bytes >= source.size()) {
-            entry.value.clear();
-            double size = entry.size;
-            size_t memory_cost = entry.memory_cost;
-            entry.size = 0;
-            entry.memory_cost = 0;
-            entry.byte_offset = 0;
-            ++m_queue_start;
-            if (m_queue_total_size > size)
-                m_queue_total_size -= size;
-            else
-                m_queue_total_size = 0;
-            subtractQueueMemoryCost(memory_cost);
-            compactQueueIfNeeded();
-        } else {
-            const double copied_size = static_cast<double>(bytes);
-            if (entry.size > copied_size)
-                entry.size -= copied_size;
-            else
-                entry.size = 0;
-            if (m_queue_total_size > copied_size)
-                m_queue_total_size -= copied_size;
-            else
-                m_queue_total_size = 0;
-        }
+        const double copied_size = static_cast<double>(bytes);
+        entry.size = entry.size > copied_size ? entry.size - copied_size : 0;
+        m_queue_total_size = m_queue_total_size > copied_size ? m_queue_total_size - copied_size : 0;
         return true;
-    }
-
-    // Consumed slots stay at the front until every slot is consumed, which clears the vector, or until more than 32
-    // have built up and fill at least half of it. A compaction then shifts at most as many live entries as it drops.
-    // compactReadRequestsIfNeeded and compactByobReadRequestsIfNeeded follow the same rule.
-    void compactQueueIfNeeded()
-    {
-        if (!m_queue_start)
-            return;
-        if (m_queue_start >= m_queue.size()) {
-            WTF::Locker locker { cellLock() };
-            m_queue.clear();
-            m_queue_start = 0;
-            return;
-        }
-        if (m_queue_start > 32 && m_queue_start * 2 >= m_queue.size()) {
-            WTF::Locker locker { cellLock() };
-            m_queue.removeAt(0, m_queue_start);
-            m_queue_start = 0;
-        }
     }
 
     bool queueMemoryCostWouldExceed(size_t memory_cost) const
@@ -790,82 +702,48 @@ private:
         return memory_cost > m_queue_memory_cost_limit - m_queue_memory_cost;
     }
 
-    void subtractQueueMemoryCost(size_t memory_cost)
+    void subtractQueueSize(double size, size_t memory_cost)
     {
-        if (m_queue_memory_cost > memory_cost)
-            m_queue_memory_cost -= memory_cost;
-        else
-            m_queue_memory_cost = 0;
+        m_queue_total_size = m_queue_total_size > size ? m_queue_total_size - size : 0;
+        m_queue_memory_cost = m_queue_memory_cost > memory_cost ? m_queue_memory_cost - memory_cost : 0;
     }
 
-    bool hasReadRequests() const { return m_read_request_start < m_read_requests.size(); }
-    bool hasByobReadRequests() const { return m_byob_read_request_start < m_byob_read_requests.size(); }
+    bool hasReadRequests() const { return !m_read_requests.isEmpty(); }
+    bool hasByobReadRequests() const { return !m_byob_read_requests.isEmpty(); }
 
-    // Until a read settles, its promise refers back to the stream through a non-enumerable property, so a stream
-    // reachable only from a pending read's promise stays alive. appendByobReadRequest does the same, and settling
-    // either kind of read removes the reference.
-    bool appendReadRequest(
-        JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, const JSDeferredPromise& deferred)
+    // A pending read's promise holds the stream under a private name until the read settles; see the file header.
+    void setReadPromiseOwner(JSC::JSGlobalObject* global_object, JSC::JSPromise* promise, JSValue owner)
     {
-        if (auto* object = deferred.promise.getObject()) {
-            object->putDirect(global_object->vm(), readableStreamOwnerIdentifier(global_object), this,
-                static_cast<unsigned>(JSC::PropertyAttribute::DontEnum));
-        }
+        promise->putDirect(global_object->vm(), readableStreamOwnerIdentifier(global_object), owner,
+            static_cast<unsigned>(JSC::PropertyAttribute::DontEnum));
+    }
+
+    bool appendReadRequest(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSC::JSPromise* promise)
+    {
         ReadRequest request;
-        request.promise.set(global_object->vm(), this, deferred.promise);
-        request.resolve.set(global_object->vm(), this, deferred.resolve);
-        request.reject.set(global_object->vm(), this, deferred.reject);
-        compactReadRequestsIfNeeded();
-        bool appended = false;
-        {
-            WTF::Locker locker { cellLock() };
-            appended = m_read_requests.tryAppend(WTF::move(request));
+        request.promise.setWithoutWriteBarrier(promise);
+        if (!m_read_requests.tryAppend(global_object->vm(), this, WTF::move(request))) {
+            JSC::throwOutOfMemoryError(global_object, scope);
+            return false;
         }
-        if (appended)
-            return true;
-        if (auto* object = deferred.promise.getObject()) {
-            object->putDirect(global_object->vm(), readableStreamOwnerIdentifier(global_object), JSC::jsUndefined(),
-                static_cast<unsigned>(JSC::PropertyAttribute::DontEnum));
-        }
-        JSC::throwOutOfMemoryError(global_object, scope);
-        return false;
+        setReadPromiseOwner(global_object, promise, this);
+        return true;
     }
 
-    ReadRequest takeFirstReadRequest()
-    {
-        ASSERT(hasReadRequests());
-        auto& slot = m_read_requests[m_read_request_start++];
-        auto request = WTF::move(slot);
-        slot.promise.clear();
-        slot.resolve.clear();
-        slot.reject.clear();
-        compactReadRequestsIfNeeded();
-        return request;
-    }
+    ReadRequest takeFirstReadRequest() { return m_read_requests.takeFirst(this); }
 
-    void compactReadRequestsIfNeeded()
-    {
-        if (!m_read_request_start)
-            return;
-        if (m_read_request_start >= m_read_requests.size()) {
-            WTF::Locker locker { cellLock() };
-            m_read_requests.clear();
-            m_read_request_start = 0;
-            return;
-        }
-        if (m_read_request_start > 32 && m_read_request_start * 2 >= m_read_requests.size()) {
-            WTF::Locker locker { cellLock() };
-            m_read_requests.removeAt(0, m_read_request_start);
-            m_read_request_start = 0;
-        }
-    }
-
-    bool appendByobReadRequest(JSC::JSGlobalObject*, JSC::ThrowScope&, JSValue, ColloPromiseDeferred*,
-        JSC::JSArrayBufferView*, JSColloReadableStreamBYOBRequest*, size_t min_bytes);
+    bool appendByobReadRequest(JSC::JSGlobalObject*, JSC::ThrowScope&, JSC::JSPromise*, JSC::JSArrayBufferView*,
+        JSColloReadableStreamBYOBRequest*, size_t min_bytes);
     bool pushFrontQueuedByteChunk(JSC::JSGlobalObject*, JSC::ThrowScope&, JSC::JSArrayBufferView*);
-    ByobReadRequest takeFirstByobReadRequest();
-    void compactByobReadRequestsIfNeeded();
-    void settleByobReadRequest(JSC::JSGlobalObject*, ByobReadRequest&&, JSValue, bool is_rejection);
+    ByobReadRequest takeFirstByobReadRequest() { return m_byob_read_requests.takeFirst(this); }
+    // Both return false when a termination is pending.
+    bool settleByobReadRequest(JSC::JSGlobalObject*, ByobReadRequest&&, JSValue, bool is_rejection);
+    bool settleReadRequest(JSC::JSGlobalObject* global_object, ReadRequest&& request, JSValue value, bool is_rejection)
+    {
+        auto* promise = request.promise.get();
+        setReadPromiseOwner(global_object, promise, JSC::jsUndefined());
+        return Collo::settlePromise(promise, value, is_rejection);
+    }
     bool refreshFirstByobReadRequest(JSC::JSGlobalObject*, JSC::ThrowScope&);
     bool refreshFirstByobReadRequestAndPullIfNeeded(JSC::JSGlobalObject*, JSC::ThrowScope&);
     bool settleFirstByobReadRequestWithFilledBytes(JSC::JSGlobalObject*, JSC::ThrowScope&, bool done);
@@ -873,19 +751,9 @@ private:
     bool fulfillFirstByobReadRequestWithChunk(
         JSC::JSGlobalObject*, JSC::ThrowScope&, JSC::JSArrayBufferView*, size_t offset);
     bool drainQueuedBytesIntoByobRequests(JSC::JSGlobalObject*, JSC::ThrowScope&);
-
-    void settleReadRequest(JSC::JSGlobalObject* global_object, ReadRequest&& request, JSValue value, bool is_rejection)
-    {
-        JSValue callback = is_rejection ? request.reject.get() : request.resolve.get();
-        settleJSDeferredPromise(global_object, callback, value);
-        if (auto promise = request.promise.get(); promise.isObject()) {
-            promise.getObject()->putDirect(global_object->vm(), readableStreamOwnerIdentifier(global_object),
-                JSC::jsUndefined(), static_cast<unsigned>(JSC::PropertyAttribute::DontEnum));
-        }
-        request.promise.clear();
-        request.resolve.clear();
-        request.reject.clear();
-    }
+    // The end of cancel once the source's cancel steps ran: drops the queue, rejects the pending BYOB reads with
+    // `byob_reason` and closes the stream. Returns false when a termination is pending.
+    bool closeForCancel(JSC::JSGlobalObject*, JSValue byob_reason);
 
     StreamState m_state { StreamState::Readable };
     JSC::WriteBarrier<JSC::Unknown> m_stored_error;
@@ -895,14 +763,10 @@ private:
     JSC::WriteBarrier<JSC::JSObject> m_default_tee_state;
     JSC::WriteBarrier<JSC::JSFunction> m_native_pull_fulfilled;
     JSC::WriteBarrier<JSC::JSFunction> m_native_pull_rejected;
-    WTF::Vector<QueuedChunk> m_queue;
-    WTF::Vector<ReadRequest> m_read_requests;
-    WTF::Vector<ByobReadRequest> m_byob_read_requests;
-    // visitChildren visits the source under the cell lock; see releaseNativeSource.
-    WTF::RefPtr<ReadableStreamNativeSource> m_native_source;
-    size_t m_queue_start { 0 };
-    size_t m_read_request_start { 0 };
-    size_t m_byob_read_request_start { 0 };
+    Collo::CellEdgeList<QueuedChunk> m_queue;
+    Collo::CellEdgeList<ReadRequest> m_read_requests;
+    Collo::CellEdgeList<ByobReadRequest> m_byob_read_requests;
+    Collo::CellNativeRef<ReadableStreamNativeSource> m_native_source;
     size_t m_queue_memory_cost { 0 };
     // Caps the bytes queued chunks may retain, as streamChunkMemoryCost measures them; an enqueue past it throws a
     // QuotaExceededError. Zero means no cap.
@@ -942,14 +806,21 @@ public:
 
     JSColloReadableStream* stream() const { return m_stream.get(); }
     JSValue closedPromise() const { return m_closed_promise.get(); }
+    // ReadableStreamDefaultReaderRelease: closed ends rejected with a TypeError and handled, a pending one rejected in
+    // place, and every pending read is rejected.
     void release(JSC::JSGlobalObject* global_object);
-    void resolveClosed(JSC::JSGlobalObject* global_object)
+    // Each returns false when a termination is pending. A rejection of closed is always marked handled
+    // (ReadableStreamError).
+    bool resolveClosed(JSC::JSGlobalObject*)
     {
-        settleDeferred(global_object, m_closed_deferred, JSC::jsUndefined(), false);
+        return Collo::settlePromise(m_closed_promise.get(), JSC::jsUndefined(), false);
     }
-    void rejectClosed(JSC::JSGlobalObject* global_object, JSValue reason)
+    bool rejectClosed(JSC::JSGlobalObject*, JSValue reason)
     {
-        settleDeferred(global_object, m_closed_deferred, reason, true);
+        auto* promise = m_closed_promise.get();
+        if (promiseIsPending(promise))
+            promise->markAsHandled();
+        return Collo::settlePromise(promise, reason, true);
     }
 
 private:
@@ -958,32 +829,24 @@ private:
     {
     }
 
-    ~JSColloReadableStreamDefaultReader()
-    {
-        if (m_closed_deferred)
-            collo_promise_deferred_release(m_closed_deferred);
-    }
+    ~JSColloReadableStreamDefaultReader() = default;
 
-    bool finishCreation(
-        JSC::VM& vm, JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSColloReadableStream* stream)
+    // ReadableStreamReaderGenericInitialize. Returns false when a termination is pending.
+    bool finishCreation(JSC::VM& vm, JSC::JSGlobalObject* global_object, JSColloReadableStream* stream)
     {
         Base::finishCreation(vm);
         ASSERT(inherits(info()));
         m_stream.set(vm, this, stream);
-        JSValue promise;
-        if (!createDeferredPromise(global_object, scope, promise, m_closed_deferred))
-            return false;
-        m_closed_promise.set(vm, this, promise);
+        m_closed_promise.set(vm, this, Collo::newPromise(global_object));
         if (stream->state() == StreamState::Closed)
-            resolveClosed(global_object);
-        else if (stream->state() == StreamState::Errored)
-            rejectClosed(global_object, stream->storedError());
+            return resolveClosed(global_object);
+        if (stream->state() == StreamState::Errored)
+            return rejectClosed(global_object, stream->storedError());
         return true;
     }
 
     JSC::WriteBarrier<JSColloReadableStream> m_stream;
-    JSC::WriteBarrier<JSC::Unknown> m_closed_promise;
-    ColloPromiseDeferred* m_closed_deferred { nullptr };
+    JSC::WriteBarrier<JSC::JSPromise> m_closed_promise;
 };
 
 // A BYOB reader locks its stream through an internal default reader, which also owns the closed promise, so the

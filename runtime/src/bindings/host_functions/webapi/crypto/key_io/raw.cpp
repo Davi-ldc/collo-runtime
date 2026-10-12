@@ -1,5 +1,5 @@
 // Import of "raw" key data: HMAC, AES, PBKDF2 and HKDF secrets, and EC, Ed25519 and X25519 public keys, under the
-// contract in key_io.h. Imported secret bytes stay under a SecureVectorGuard until the new CryptoKey owns them.
+// contract in key_io.h. Imported secret bytes are copied into a `SecretBytes` that the new CryptoKey takes over.
 
 #include "jsc/runtime/state.h"
 
@@ -60,10 +60,9 @@ bool makeHmacKeyFromRaw(JSC::JSGlobalObject* global_object, JSC::TopExceptionSco
     if (!validateRequiredUsages(usages, out_error, global_object))
         return false;
 
-    WTF::Vector<uint8_t> material;
-    if (!copyBufferSource(global_object, scope, key_data_value, material, out_error))
+    SecretBytes material;
+    if (!copySecretBufferSource(global_object, scope, key_data_value, material, out_error))
         return false;
-    SecureVectorGuard material_guard(material);
     if (material.isEmpty()) {
         out_error = domExceptionValue(global_object, DOMExceptionCode::DataError);
         return false;
@@ -76,8 +75,6 @@ bool makeHmacKeyFromRaw(JSC::JSGlobalObject* global_object, JSC::TopExceptionSco
 
     out_key = createHmacKey(global_object, hash->id, WTF::move(material), extractable_value.toBoolean(global_object),
         usages, length_bits.value_or(0));
-    if (out_key)
-        material_guard.dismiss();
     return !takePendingException(scope, out_error);
 }
 
@@ -104,10 +101,9 @@ bool makeAesKeyFromRaw(JSC::JSGlobalObject* global_object, JSC::TopExceptionScop
     if (!validateRequiredUsages(usages, out_error, global_object))
         return false;
 
-    WTF::Vector<uint8_t> material;
-    if (!copyBufferSource(global_object, scope, key_data_value, material, out_error))
+    SecretBytes material;
+    if (!copySecretBufferSource(global_object, scope, key_data_value, material, out_error))
         return false;
-    SecureVectorGuard material_guard(material);
     if (!isValidAesKeyLength(material.size())) {
         out_error = domExceptionValue(global_object, DOMExceptionCode::DataError);
         return false;
@@ -116,8 +112,6 @@ bool makeAesKeyFromRaw(JSC::JSGlobalObject* global_object, JSC::TopExceptionScop
     // AES import takes a plain Algorithm dictionary, so a "length" member is ignored.
     out_key = createAesKey(
         global_object, *algorithm, WTF::move(material), extractable_value.toBoolean(global_object), usages);
-    if (out_key)
-        material_guard.dismiss();
     return !takePendingException(scope, out_error);
 }
 
@@ -138,14 +132,11 @@ bool makeDeriveKeyFromRaw(JSC::JSGlobalObject* global_object, JSC::TopExceptionS
         return false;
     }
 
-    WTF::Vector<uint8_t> material;
-    if (!copyBufferSource(global_object, scope, key_data_value, material, out_error))
+    SecretBytes material;
+    if (!copySecretBufferSource(global_object, scope, key_data_value, material, out_error))
         return false;
-    SecureVectorGuard material_guard(material);
 
     out_key = createRawDeriveKey(global_object, algorithm, WTF::move(material), usages);
-    if (out_key)
-        material_guard.dismiss();
     return !takePendingException(scope, out_error);
 }
 
@@ -171,7 +162,6 @@ bool makeEcKeyFromRaw(JSC::JSGlobalObject* global_object, JSC::TopExceptionScope
         return false;
 
     WTF::Vector<uint8_t> bytes;
-    SecureVectorGuard bytes_guard(bytes);
     if (!copyBufferSource(global_object, scope, key_data_value, bytes, out_error))
         return false;
     // A raw EC key is accepted only as an uncompressed point, a 0x04 octet followed by both affine coordinates. Web
@@ -246,46 +236,6 @@ bool makeOkpKeyFromRaw(JSC::JSGlobalObject* global_object, JSC::TopExceptionScop
         out_error = domExceptionValue(global_object, DOMExceptionCode::DataError);
         return false;
     }
-    return !takePendingException(scope, out_error);
-}
-
-bool makeDerivedKeyFromMaterial(JSC::JSGlobalObject* global_object, JSC::TopExceptionScope& scope,
-    WTF::Vector<uint8_t>&& material, const DerivedKeySpec& spec, bool extractable, uint8_t usages,
-    JSColloCryptoKey*& out_key, JSC::JSValue& out_error)
-{
-    SecureVectorGuard material_guard(material);
-    if (material.size() * 8 != spec.length_bits) {
-        out_error = domExceptionValue(global_object, DOMExceptionCode::DataError);
-        return false;
-    }
-
-    if (isAesAlgorithm(spec.algorithm)) {
-        if (!validateRequestedUsages(usages, allowedUsagesForAes(spec.algorithm), out_error, global_object))
-            return false;
-        if (!validateRequiredUsages(usages, out_error, global_object))
-            return false;
-        if (!isValidAesKeyLength(material.size())) {
-            out_error = domExceptionValue(global_object, DOMExceptionCode::DataError);
-            return false;
-        }
-        out_key = createAesKey(global_object, spec.algorithm, WTF::move(material), extractable, usages);
-        if (out_key)
-            material_guard.dismiss();
-        return !takePendingException(scope, out_error);
-    }
-
-    ASSERT(spec.algorithm == CryptoKeyAlgorithm::Hmac);
-    if (!validateRequestedUsages(usages, CryptoKeyUsageSign | CryptoKeyUsageVerify, out_error, global_object))
-        return false;
-    if (!validateRequiredUsages(usages, out_error, global_object))
-        return false;
-    if (material.isEmpty()) {
-        out_error = domExceptionValue(global_object, DOMExceptionCode::DataError);
-        return false;
-    }
-    out_key = createHmacKey(global_object, spec.hash->id, WTF::move(material), extractable, usages);
-    if (out_key)
-        material_guard.dismiss();
     return !takePendingException(scope, out_error);
 }
 

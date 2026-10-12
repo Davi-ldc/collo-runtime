@@ -293,14 +293,17 @@ namespace {
             resolve(global_object, value);
         }
 
-        void resolve(JSC::JSGlobalObject* global_object, JSValue value)
+        // Both settle through Collo::settlePromise, which settles nothing while a termination is pending; the
+        // request's cleanup then clears the roots.
+        void resolve(JSC::JSGlobalObject*, JSValue value)
         {
             if (m_settled)
                 return;
             m_settled = true;
-            if (auto* promise = dynamicDowncast<JSC::JSPromise>(m_promise.get()))
-                promise->resolve(global_object, global_object->vm(), value);
+            auto* promise = dynamicDowncast<JSC::JSPromise>(m_promise.get());
             clear();
+            if (promise)
+                Collo::settlePromise(promise, value, false);
         }
 
         void reject(JSC::JSGlobalObject* global_object, JSValue reason)
@@ -309,9 +312,10 @@ namespace {
                 return;
             m_settled = true;
             releaseReader(global_object);
-            if (auto* promise = dynamicDowncast<JSC::JSPromise>(m_promise.get()))
-                promise->reject(global_object->vm(), reason);
+            auto* promise = dynamicDowncast<JSC::JSPromise>(m_promise.get());
             clear();
+            if (promise)
+                Collo::settlePromise(promise, reason, true);
         }
 
         void releaseReader(JSC::JSGlobalObject* global_object)

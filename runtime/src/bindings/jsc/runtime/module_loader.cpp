@@ -71,13 +71,6 @@ constexpr auto zygoteInternalModulePrefix = "/__collo/"_s;
 // event loop, set to the pack module cap so a deep but valid graph can settle. One drain empties the whole queue, so
 // the loop stops at the first drain that leaves the promise pending and the bound is only a backstop.
 constexpr unsigned maxSynchronousModuleDrains = static_cast<unsigned>(modulePackMaxModules);
-constexpr ColloModuleRegisterOptions defaultModuleRegisterOptions {
-    sizeof(ColloModuleRegisterOptions),
-    COLLO_MODULE_LIFETIME_EVICTABLE,
-    COLLO_MODULE_TYPE_ESM,
-    0,
-    0,
-};
 
 bool isRelativeSpecifier(const WTF::String& specifier)
 {
@@ -367,7 +360,6 @@ struct StagedModuleSource {
     WTF::String specifier;
     WTF::RefPtr<JSC::SourceProvider> provider;
     ColloModuleLifetime lifetime { COLLO_MODULE_LIFETIME_EVICTABLE };
-    ColloModuleType module_type { COLLO_MODULE_TYPE_ESM };
     bool has_bytecode { false };
     bool is_existing { false };
     bool replace_provider { false };
@@ -411,22 +403,6 @@ bool isValidModulePackSpecifierBytes(const uint8_t* bytes, size_t len)
 bool isValidModuleLifetime(ColloModuleLifetime lifetime)
 {
     return lifetime == COLLO_MODULE_LIFETIME_EVICTABLE || lifetime == COLLO_MODULE_LIFETIME_PERMANENT;
-}
-
-bool isValidModuleType(ColloModuleType moduleType) { return moduleType == COLLO_MODULE_TYPE_ESM; }
-
-ColloStatus normalizeModuleRegisterOptions(
-    const ColloModuleRegisterOptions* options, ColloModuleRegisterOptions& outOptions)
-{
-    outOptions = defaultModuleRegisterOptions;
-    if (!options)
-        return COLLO_STATUS_OK;
-    if (options->abi_size != sizeof(ColloModuleRegisterOptions) || options->reserved0 != 0 || options->flags != 0)
-        return COLLO_STATUS_INVALID_ARGUMENT;
-    if (!isValidModuleLifetime(options->lifetime) || !isValidModuleType(options->module_type))
-        return COLLO_STATUS_INVALID_ARGUMENT;
-    outOptions = *options;
-    return COLLO_STATUS_OK;
 }
 
 ColloModuleLifetime mergedLifetime(ColloModuleLifetime lhs, ColloModuleLifetime rhs)
@@ -772,12 +748,12 @@ bool trySetModuleSource(
 // Validates the pack in place and registers its modules. `pack_mapping` moves
 // into the ColloModulePackData only when a new provider needs the bytes;
 // otherwise the caller's owner releases it on return.
-ColloStatus registerModulePackLocked(ColloVm* vm, OwnedMapping& pack_mapping, ColloModuleRegisterOptions options)
+ColloStatus registerModulePackLocked(ColloVm* vm, OwnedMapping& pack_mapping, ColloModuleLifetime lifetime)
 {
     const ColloBuffer pack = pack_mapping.bytes();
     if (!vm || !vm->isReady() || (!pack.ptr && pack.len))
         return COLLO_STATUS_INVALID_ARGUMENT;
-    if (!isValidModuleLifetime(options.lifetime) || !isValidModuleType(options.module_type))
+    if (!isValidModuleLifetime(lifetime))
         return COLLO_STATUS_INVALID_ARGUMENT;
     if (pack.len < modulePackHeaderSize || pack.len > modulePackMaxBytes)
         return COLLO_STATUS_INVALID_ARGUMENT;
@@ -867,8 +843,6 @@ ColloStatus registerModulePackLocked(ColloVm* vm, OwnedMapping& pack_mapping, Co
         }
 
         if (auto* source = findModuleSource(vm->module_sources, specifier_string)) {
-            if (source->entry.module_type != options.module_type)
-                return COLLO_STATUS_ALREADY_EXISTS;
             if (!registeredSourceEqualsBytes(source->entry.provider.get(),
                     std::span<const uint8_t> { pack.ptr + record.sourceOffset, record.sourceLen }))
                 return COLLO_STATUS_ALREADY_EXISTS;
@@ -960,7 +934,7 @@ ColloStatus registerModulePackLocked(ColloVm* vm, OwnedMapping& pack_mapping, Co
         for (const auto& pending : pending_modules) {
             auto* source = findModuleSource(vm->module_sources, pending.specifier);
             ASSERT(source);
-            source->entry.lifetime = mergedLifetime(source->entry.lifetime, options.lifetime);
+            source->entry.lifetime = mergedLifetime(source->entry.lifetime, lifetime);
         }
         if (vm->deploy_hash.isNull() && !pack_deploy_hash.isNull())
             vm->deploy_hash = pack_deploy_hash;
@@ -980,8 +954,7 @@ ColloStatus registerModulePackLocked(ColloVm* vm, OwnedMapping& pack_mapping, Co
         if (auto* source = findModuleSource(vm->module_sources, pending.specifier)) {
             StagedModuleSource staged;
             staged.specifier = pending.specifier;
-            staged.lifetime = mergedLifetime(source->entry.lifetime, options.lifetime);
-            staged.module_type = source->entry.module_type;
+            staged.lifetime = mergedLifetime(source->entry.lifetime, lifetime);
             staged.has_bytecode = source->entry.has_bytecode;
             staged.is_existing = true;
             if (!source->entry.has_bytecode && record.bytecodeLen) {
@@ -1006,8 +979,7 @@ ColloStatus registerModulePackLocked(ColloVm* vm, OwnedMapping& pack_mapping, Co
         StagedModuleSource staged;
         staged.specifier = pending.specifier;
         staged.provider = WTF::move(provider);
-        staged.lifetime = options.lifetime;
-        staged.module_type = options.module_type;
+        staged.lifetime = lifetime;
         staged.has_bytecode = record.bytecodeLen != 0;
         staged.replace_provider = true;
         if (!staged_sources.tryAppend(WTF::move(staged)))
@@ -1039,7 +1011,6 @@ ColloStatus registerModulePackLocked(ColloVm* vm, OwnedMapping& pack_mapping, Co
         ColloModuleSourceEntry entry;
         entry.provider = WTF::move(staged.provider);
         entry.lifetime = staged.lifetime;
-        entry.module_type = staged.module_type;
         entry.has_bytecode = staged.has_bytecode;
         if (!trySetModuleSource(replacement_sources, WTF::move(staged.specifier), WTF::move(entry)))
             return COLLO_STATUS_OUT_OF_MEMORY;
@@ -1302,7 +1273,7 @@ static ColloStatus registerModuleEvalSettlement(
         return COLLO_STATUS_OUT_OF_MEMORY;
     promise->performPromiseThen(jsc_vm, realm->global_object, resolve_function, reject_function, JSC::jsUndefined());
     if (scope.exception()) {
-        scope.clearExceptionExceptTermination();
+        (void)scope.clearExceptionExceptTermination();
         return COLLO_STATUS_ERROR;
     }
     return COLLO_STATUS_OK;
@@ -1546,23 +1517,18 @@ JSC::JSObject* GlobalObject::moduleLoaderCreateImportMetaProperties(JSC::JSGloba
 
 } // namespace Collo
 
-extern "C" ColloStatus collo_module_register_pack(
-    ColloVm* vm, ColloMapping pack, const ColloModuleRegisterOptions* options)
+extern "C" ColloStatus collo_module_register_pack(ColloVm* vm, ColloMapping pack, ColloModuleLifetime lifetime)
 {
     // Takes ownership first, so every return releases the mapping exactly once, and is declared before the lock, so
     // a mapping no provider kept is released after the JSC API lock drops.
     OwnedMapping pack_mapping { pack };
     if (!vm || !vm->isReady() || !pack.ptr)
         return COLLO_STATUS_INVALID_ARGUMENT;
-    if (!pack.len || pack.len > modulePackMaxBytes)
+    if (!pack.len || pack.len > modulePackMaxBytes || !isValidModuleLifetime(lifetime))
         return COLLO_STATUS_INVALID_ARGUMENT;
-    ColloModuleRegisterOptions normalized_options;
-    ColloStatus options_status = normalizeModuleRegisterOptions(options, normalized_options);
-    if (options_status != COLLO_STATUS_OK)
-        return options_status;
 
     JSC::JSLockHolder locker(*vm->vm);
-    return registerModulePackLocked(vm, pack_mapping, normalized_options);
+    return registerModulePackLocked(vm, pack_mapping, lifetime);
 }
 
 extern "C" ColloStatus collo_module_evict_specifier(

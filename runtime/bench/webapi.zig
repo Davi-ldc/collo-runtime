@@ -167,7 +167,7 @@ fn runColloBench(allocator: std.mem.Allocator, spec: BenchSpec, run_count: u32) 
     defer std.posix.close(metrics_fd);
     var metrics_view = try worker_shared_page.mapReadWrite(metrics_fd);
     defer metrics_view.deinit();
-    metrics_view.initializeCrashDefault(@intCast(std.os.linux.getpid()), 512 * 1024 * 1024, 0);
+    metrics_view.initializeCrashDefault();
     const completion_eventfd = try std.posix.eventfd(0, std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK);
 
     var now_mono_ns: u64 = 0;

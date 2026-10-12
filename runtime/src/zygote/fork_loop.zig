@@ -18,6 +18,12 @@
 //!   conventions gate `zygote fork loop stays VM-free and allocation-free
 //!   after prepare` reads only the body of `serveForkRequests`; what it calls
 //!   keeps the rule without a gate.
+//! - Every child starts with its own thread id in glibc, as a child of
+//!   glibc's fork does: the clone hands the kernel the zygote thread's
+//!   thread-id word (`CloneForkOptions.thread_id_word` in `common/os.zig`),
+//!   which the preparation reads with PR_GET_TID_ADDRESS and checks. A kernel
+//!   without CONFIG_CHECKPOINT_RESTORE has no PR_GET_TID_ADDRESS, and the
+//!   zygote refuses to prepare there.
 //! - A failure caused by one fork's resources refuses that fork, and the
 //!   zygote keeps serving (`isTransientForkError`); any other failure ends
 //!   the zygote.
@@ -26,7 +32,6 @@
 
 const std = @import("std");
 const bindings = @import("collo_bindings");
-const decompress = @import("collo_egress_core").decompress;
 const ipc = @import("collo_ipc");
 const fd_mod = @import("collo_os").fd;
 const process = @import("collo_os").process;
@@ -84,7 +89,7 @@ pub fn runFromInheritedFds() !void {
 fn zygoteOptionsFromEnv() !state.ZygoteOptions {
     var options = state.ZygoteOptions{};
     if (std.posix.getenv(zygote_env_vm_flags)) |value| {
-        options.vm_options.flags = try std.fmt.parseUnsigned(u32, value, 10);
+        options.vm_options = try bindings.VmOptions.fromFlags(try std.fmt.parseUnsigned(u32, value, 10));
     }
     if (std.posix.getenv(zygote_env_postfork_exit_probe_path)) |value| {
         const path = value;
@@ -101,10 +106,25 @@ fn prepareZygoteAtBoot(zygote: *state.Zygote) !void {
     if (zygote.prepared_for_fork)
         return;
 
-    // A worker decodes encoded fetch bodies inside a chroot that holds no library files, so the
-    // decoders' libraries load here, before the first fork, and every worker inherits them
-    // loaded (`decompress.load`).
-    _ = decompress.load();
+    // Every clone hands the kernel this thread's thread-id word, which is how
+    // a worker's glibc learns the worker's own thread id. A zygote that
+    // cannot name the word would fork workers whose glibc names this thread,
+    // so it ends here.
+    zygote.thread_id_word = process.callingThreadIdWord() catch |err| {
+        switch (err) {
+            error.CheckpointRestoreUnavailable => std.log.err(
+                "the kernel lacks CONFIG_CHECKPOINT_RESTORE, which the zygote needs for PR_GET_TID_ADDRESS",
+                .{},
+            ),
+            error.ThreadIdWordUnset,
+            error.ThreadIdWordMismatch,
+            error.Unexpected,
+            => std.log.err("the zygote cannot find its thread's id in glibc: {s}", .{@errorName(err)}),
+        }
+        return err;
+    };
+    traceEvent(zygote.trace_fd, "zygote.thread_id_word.checked");
+
     try bindings.setHelperThreadsTimeoutOverrideNs(PREFORK_HELPER_THREAD_IDLE_TIMEOUT_NS);
     traceEventFmt(zygote.trace_fd, "zygote.helper_timeout.override={d}", .{PREFORK_HELPER_THREAD_IDLE_TIMEOUT_NS});
     if (zygote.warmup_corpus) {
@@ -207,7 +227,11 @@ fn serveForkRequests(zygote: *state.Zygote, control_fd: std.posix.fd_t) !void {
             },
         };
         var worker_pidfd_raw: std.posix.fd_t = -1;
-        const worker_pid = process.cloneForkWithPidFd(request.cgroup_dir_fd, &worker_pidfd_raw) catch |err| {
+        const clone_options: process.CloneForkOptions = .{
+            .cgroup_dir_fd = request.cgroup_dir_fd,
+            .thread_id_word = zygote.thread_id_word orelse return error.ZygoteNotPreparedForFork,
+        };
+        const worker_pid = process.cloneForkWithPidFd(clone_options, &worker_pidfd_raw) catch |err| {
             // A failed clone created no child and left the VM intact, so a
             // transient failure ends only this job.
             if (!isTransientForkError(err))

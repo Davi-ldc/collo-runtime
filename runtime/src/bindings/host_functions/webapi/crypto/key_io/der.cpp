@@ -73,7 +73,6 @@ bool makeRsaKeyFromSpki(JSC::JSGlobalObject* global_object, JSC::TopExceptionSco
     WTF::Vector<uint8_t> bytes;
     if (!copyBufferSource(global_object, scope, key_data_value, bytes, out_error))
         return false;
-    SecureVectorGuard bytes_guard(bytes);
     const uint8_t* ptr = bytes.span().data();
     const uint8_t* end = ptr + bytes.size();
     bssl::UniquePtr<EVP_PKEY> pkey(d2i_PUBKEY(nullptr, &ptr, bytes.size()));
@@ -118,10 +117,9 @@ bool makeRsaKeyFromPkcs8(JSC::JSGlobalObject* global_object, JSC::TopExceptionSc
     if (!validateRequiredUsages(usages, out_error, global_object))
         return false;
 
-    WTF::Vector<uint8_t> bytes;
-    if (!copyBufferSource(global_object, scope, key_data_value, bytes, out_error))
+    SecretBytes bytes;
+    if (!copySecretBufferSource(global_object, scope, key_data_value, bytes, out_error))
         return false;
-    SecureVectorGuard bytes_guard(bytes);
     const uint8_t* ptr = bytes.span().data();
     const uint8_t* end = ptr + bytes.size();
     bssl::UniquePtr<PKCS8_PRIV_KEY_INFO> pkcs8(d2i_PKCS8_PRIV_KEY_INFO(nullptr, &ptr, bytes.size()));
@@ -208,10 +206,9 @@ bool makeEcKeyFromPkcs8(JSC::JSGlobalObject* global_object, JSC::TopExceptionSco
     if (!validateRequiredUsages(usages, out_error, global_object))
         return false;
 
-    WTF::Vector<uint8_t> bytes;
-    if (!copyBufferSource(global_object, scope, key_data_value, bytes, out_error))
+    SecretBytes bytes;
+    if (!copySecretBufferSource(global_object, scope, key_data_value, bytes, out_error))
         return false;
-    SecureVectorGuard bytes_guard(bytes);
     const uint8_t* ptr = bytes.span().data();
     const uint8_t* end = ptr + bytes.size();
     bssl::UniquePtr<PKCS8_PRIV_KEY_INFO> pkcs8(d2i_PKCS8_PRIV_KEY_INFO(nullptr, &ptr, bytes.size()));
@@ -290,10 +287,9 @@ bool makeOkpKeyFromPkcs8(JSC::JSGlobalObject* global_object, JSC::TopExceptionSc
     if (!validateRequiredUsages(usages, out_error, global_object))
         return false;
 
-    WTF::Vector<uint8_t> bytes;
-    if (!copyBufferSource(global_object, scope, key_data_value, bytes, out_error))
+    SecretBytes bytes;
+    if (!copySecretBufferSource(global_object, scope, key_data_value, bytes, out_error))
         return false;
-    SecureVectorGuard bytes_guard(bytes);
     const uint8_t* ptr = bytes.span().data();
     const uint8_t* end = ptr + bytes.size();
     bssl::UniquePtr<PKCS8_PRIV_KEY_INFO> pkcs8(d2i_PKCS8_PRIV_KEY_INFO(nullptr, &ptr, bytes.size()));
@@ -316,8 +312,7 @@ bool makeOkpKeyFromPkcs8(JSC::JSGlobalObject* global_object, JSC::TopExceptionSc
     return !takePendingException(scope, out_error);
 }
 
-bool exportEcRaw(
-    JSC::JSGlobalObject* global_object, JSColloCryptoKey* key, WTF::Vector<uint8_t>& out, JSC::JSValue& out_error)
+bool exportEcRaw(JSC::JSGlobalObject* global_object, JSColloCryptoKey* key, SecretBytes& out, JSC::JSValue& out_error)
 {
     if (key->type() != CryptoKeyType::Public) {
         out_error = domExceptionValue(global_object, DOMExceptionCode::InvalidAccessError);
@@ -331,27 +326,27 @@ bool exportEcRaw(
         return false;
     }
     auto length = EC_POINT_point2oct(group, point, POINT_CONVERSION_UNCOMPRESSED, nullptr, 0, nullptr);
-    if (!length || !out.tryReserveInitialCapacity(length)) {
+    if (!length || !out.tryGrow(length)) {
         out_error = domExceptionValue(global_object, DOMExceptionCode::OperationError);
         return false;
     }
-    out.grow(length);
-    if (EC_POINT_point2oct(group, point, POINT_CONVERSION_UNCOMPRESSED, out.mutableSpan().data(), out.size(), nullptr)
-        != length) {
+    if (EC_POINT_point2oct(group, point, POINT_CONVERSION_UNCOMPRESSED, out.data(), out.size(), nullptr) != length) {
         out_error = domExceptionValue(global_object, DOMExceptionCode::OperationError);
         return false;
     }
     return true;
 }
 
-bool exportOkpRaw(
-    JSC::JSGlobalObject* global_object, JSColloCryptoKey* key, WTF::Vector<uint8_t>& out, JSC::JSValue& out_error)
+bool exportOkpRaw(JSC::JSGlobalObject* global_object, JSColloCryptoKey* key, SecretBytes& out, JSC::JSValue& out_error)
 {
     if (key->type() != CryptoKeyType::Public) {
         out_error = domExceptionValue(global_object, DOMExceptionCode::InvalidAccessError);
         return false;
     }
-    if (!evpGetRawPublic(key->asymmetricKey(), out)) {
+    size_t length = 0;
+    if (EVP_PKEY_get_raw_public_key(key->asymmetricKey(), nullptr, &length) != 1 || !length || !out.tryGrow(length)
+        || EVP_PKEY_get_raw_public_key(key->asymmetricKey(), out.data(), &length) != 1 || length != out.size()) {
+        out.clear();
         out_error = domExceptionValue(global_object, DOMExceptionCode::OperationError);
         return false;
     }
@@ -359,19 +354,18 @@ bool exportOkpRaw(
 }
 
 bool exportAsymmetricSpki(
-    JSC::JSGlobalObject* global_object, JSColloCryptoKey* key, WTF::Vector<uint8_t>& out, JSC::JSValue& out_error)
+    JSC::JSGlobalObject* global_object, JSColloCryptoKey* key, SecretBytes& out, JSC::JSValue& out_error)
 {
     if (key->type() != CryptoKeyType::Public) {
         out_error = domExceptionValue(global_object, DOMExceptionCode::InvalidAccessError);
         return false;
     }
     int len = i2d_PUBKEY(key->asymmetricKey(), nullptr);
-    if (len <= 0 || !out.tryReserveInitialCapacity(static_cast<size_t>(len))) {
+    if (len <= 0 || !out.tryGrow(static_cast<size_t>(len))) {
         out_error = domExceptionValue(global_object, DOMExceptionCode::OperationError);
         return false;
     }
-    out.grow(static_cast<size_t>(len));
-    auto* ptr = out.mutableSpan().data();
+    auto* ptr = out.data();
     if (i2d_PUBKEY(key->asymmetricKey(), &ptr) != len) {
         out_error = domExceptionValue(global_object, DOMExceptionCode::OperationError);
         return false;
@@ -380,7 +374,7 @@ bool exportAsymmetricSpki(
 }
 
 bool exportAsymmetricPkcs8(
-    JSC::JSGlobalObject* global_object, JSColloCryptoKey* key, WTF::Vector<uint8_t>& out, JSC::JSValue& out_error)
+    JSC::JSGlobalObject* global_object, JSColloCryptoKey* key, SecretBytes& out, JSC::JSValue& out_error)
 {
     if (key->type() != CryptoKeyType::Private) {
         out_error = domExceptionValue(global_object, DOMExceptionCode::InvalidAccessError);
@@ -392,12 +386,11 @@ bool exportAsymmetricPkcs8(
         return false;
     }
     int len = i2d_PKCS8_PRIV_KEY_INFO(pkcs8.get(), nullptr);
-    if (len <= 0 || !out.tryReserveInitialCapacity(static_cast<size_t>(len))) {
+    if (len <= 0 || !out.tryGrow(static_cast<size_t>(len))) {
         out_error = domExceptionValue(global_object, DOMExceptionCode::OperationError);
         return false;
     }
-    out.grow(static_cast<size_t>(len));
-    auto* ptr = out.mutableSpan().data();
+    auto* ptr = out.data();
     if (i2d_PKCS8_PRIV_KEY_INFO(pkcs8.get(), &ptr) != len) {
         out_error = domExceptionValue(global_object, DOMExceptionCode::OperationError);
         return false;

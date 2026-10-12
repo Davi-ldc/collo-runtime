@@ -6,14 +6,16 @@
 //! A worker writes its records into memory it controls, so the drain keeps a
 //! record only when the server's own state vouches for it. The record must
 //! name a request of the request table of the worker whose ring held it, one
-//! whose record is still expected (`RequestTable.expected`), and it is
-//! written under that table's request id, stamped with the identity the
-//! server holds for the worker and the pattern of the route the table
-//! recorded for the request (`requestIdentity`), never with the identity
-//! fields the worker wrote. Any other record is counted in
-//! `Counters.records_rejected` and dropped. A worker therefore cannot choose
-//! whose record its measurements enter, nor record a request twice or a
-//! request it was never dispatched.
+//! whose record is still expected and that the server has ended
+//! (`RequestTable.verdict`), and it is written under that table's request
+//! id, stamped with the identity the server holds for the worker and the
+//! pattern of the route the table recorded for the request
+//! (`requestIdentity`), never with the identity fields the worker wrote. Its
+//! times are the server's: from the dispatch to the lane's end of the
+//! request (`RequestTable.noteEnded`), and its cold start is the dispatch's.
+//! Any other record is counted in `Counters.records_rejected` and dropped. A
+//! worker therefore cannot choose whose record its measurements enter, nor
+//! record a request twice or a request it was never dispatched.
 //!
 //! A worker's ring is drained under its `metrics_mutex`, the only thing that
 //! serializes two drains of the same worker: the exactly-once filter, the
@@ -34,14 +36,15 @@
 //! server ends on that worker gets a floor, and the metrics thread takes the
 //! worker out of service (`server/ingress/analytics_drain.zig`). A floor
 //! takes what the worker measured from one copy of its request's live slot
-//! (`LiveSlotSnapshot`), and the death classification reads the lifecycle
-//! header once (`LifecycleSnapshot`).
+//! (`LiveSlotSnapshot`) and from what the worker's sentinel measured of the
+//! window running at the death (`RunningOwnerSnapshot`), and the death
+//! classification reads the lifecycle header once (`LifecycleSnapshot`).
 //!
-//! Exactly once: the drain skips a worker record for an attempt the server
-//! already synthesized (`UsageLog.synthesisState`), the request table refuses
-//! a worker record while the floor of its request is being written, and
-//! synthesis writes no floor for a request whose worker record a drain
-//! already settled (`RequestTable.usageRecorded`).
+//! Exactly once, and the request table alone decides it: a drain leaves a
+//! worker record in the ring while the server has not ended its request or
+//! writes its floor, skips without a count the record of a request whose
+//! floor the server wrote, and synthesis writes no floor for a request whose
+//! worker record a drain already settled (`RequestTable.usageRecorded`).
 //!
 //! A full usage stream fails no caller and holds up no request. A drain on a
 //! thread that may block (`drainWorkerFlushing`: the metrics, reaper and
@@ -57,7 +60,7 @@
 //! reserve is dropped and counted the same way, and the request's entry then
 //! keeps expecting the worker's record
 //! (`SynthesisOutcome.awaits_worker_record`), the one record it may still
-//! get.
+//! get. Nothing here allocates.
 
 const std = @import("std");
 const process = @import("collo_os").process;
@@ -76,7 +79,6 @@ const request_table = @import("request_table.zig");
 
 const WorkerRecord = worker_table.Record;
 const CompletedRecord = worker_shared_page.CompletedRecord;
-const UsageKey = accounting.usage.UsageKey;
 
 const batch_len = usage_log.batch_records_max;
 
@@ -107,21 +109,23 @@ pub const Counters = struct {
     /// Each was dropped, and each means the worker broke the protocol.
     records_rejected: std.atomic.Value(u64) = .init(0),
     /// Ring drains that stopped early because the record at the head belongs
-    /// to an identity another thread is synthesizing for. The ring advances by
-    /// a contiguous prefix, so one blocked record holds back every record
-    /// behind it, and the worker stops itself if its ring fills. Growth here
-    /// is the only warning before that, so it reads as a latency signal, not
-    /// an error.
+    /// to a request the server has not ended yet or whose floor another
+    /// thread is writing. The ring advances by a contiguous prefix, so one
+    /// waiting record holds back every record behind it, and the worker
+    /// stops itself if its ring fills. Growth here is the only warning before
+    /// that, so it reads as a latency signal, not an error.
     drains_blocked: std.atomic.Value(u64) = .init(0),
     /// Floor records written after the deep ring scan came back empty. This
     /// is the path where a wrong answer records a request the worker had
     /// already reported: the scan is the last thing between a dying worker and
     /// a second record for the same request. Non-zero is normal.
     floors_after_deep_scan: std.atomic.Value(u64) = .init(0),
-    /// Floors not written because the exactly-once index could not grow. The
-    /// request's entry keeps expecting the worker's record, its only record
-    /// from then on.
-    floors_unindexed: std.atomic.Value(u64) = .init(0),
+    /// Console lines whose request id the worker's request table did not
+    /// confirm (`RequestTable.routeOfRecent`), printed under request id 0: a
+    /// worker naming a request it was never sent, or one that ended more than
+    /// `request_table.ended_requests_max` requests ago. The metrics thread
+    /// (`server/ingress/analytics_drain.zig`) and the final drain count them.
+    console_ids_refused: std.atomic.Value(u64) = .init(0),
 };
 
 /// How a request ended, as the settle of its usage needs to know it.
@@ -131,7 +135,8 @@ pub const SettleOutcome = union(enum) {
     completed,
     /// The server ended the request without a completion from the worker. It
     /// writes the request's floor record, unless the worker already wrote its
-    /// own (`synthesizeFinalAccountingForLifecycle`).
+    /// own (`synthesizeFinalAccountingForLifecycle`). Only a request whose
+    /// begin reached the worker gets one.
     floor: Floor,
     /// The request never reached the worker: no record is written or kept.
     abandoned,
@@ -224,14 +229,15 @@ pub fn drainWorkerFlushing(ctx: UsageDrain, worker: *WorkerRecord) bool {
 /// its page (`Record.vacate`): the usage ring written out on this thread
 /// (`drainWorkerFlushing`), then, under one hold of `worker.metrics_mutex`,
 /// the dying console ring, the usage ring once more with drops, and the page
-/// marked unmapped for every later drain. The exactly-once index then
-/// forgets the worker, since no record can arrive from a page no drain
-/// reads. The reaper calls it, and the exiting thread at teardown, after the
-/// worker's exit (`Record.awaitExit`), so the rings hold their last records.
+/// marked unmapped for every later drain. The reaper calls it, and the
+/// exiting thread at teardown, after the worker's exit (`Record.awaitExit`)
+/// and after the last of its requests ended, so the rings hold their last
+/// records and every one of them can be settled. The worker's request table
+/// is left as it is: no record can arrive from a page no drain reads, and
+/// the next worker of the record starts with a table of its own.
 pub fn drainFinal(ctx: UsageDrain, worker: *WorkerRecord) void {
     _ = drainWorkerFlushing(ctx, worker);
     finalHold(ctx, worker);
-    ctx.usage.forgetWorker(worker.id, worker.generation);
 }
 
 /// The part of `drainFinal` under `worker.metrics_mutex`.
@@ -243,13 +249,22 @@ fn finalHold(ctx: UsageDrain, worker: *WorkerRecord) void {
     // A ring that already failed is never read again
     // (`Record.log_ring_failed`).
     if (!worker.log_ring_failed) {
-        if (worker.handle.metrics) |*view|
-            analytics.logs.drainDyingRing(
+        if (worker.handle.metrics) |*view| {
+            // A line keeps its request id only when the worker's own table
+            // confirms the request, as the metrics thread's drain does.
+            var requests: analytics.logs.WorkerRequests(request_table.RequestTable, config.Route) = .{
+                .table = &worker.requests,
+                .routes = ctx.routes.definition(worker.definition_index).routes,
+            };
+            const refused = analytics.logs.drainDyingRing(
                 view,
+                &requests,
                 analytics.Identity.ofWorker(worker),
                 &worker.log_drops_reported,
                 ctx.usage.sink,
             );
+            _ = ctx.counters.console_ids_refused.fetchAdd(refused, .monotonic);
+        }
     }
     _ = drainLocked(ctx, worker, null, .drop, "final drain");
     worker.page_mapped = false;
@@ -261,35 +276,31 @@ fn drainWorkerOnFull(ctx: UsageDrain, worker: *WorkerRecord, on_full: usage_log.
     return drainLocked(ctx, worker, null, on_full, "drain");
 }
 
-/// Settles the usage of the request `request_id` that ended on `worker`, as
-/// `outcome` says, and frees or parks its request table entry. The lane that
-/// finishes the request calls it while it still holds the request's pool
-/// slot, before `Pool.release`, which keeps the worker's page mapped for
-/// the call. It takes only the worker's request table lock and, when it
-/// drains or writes a floor, `worker.metrics_mutex`, and it never writes the
-/// usage stream out. It never fails: a floor the exactly-once index cannot
-/// take is counted (`Counters.floors_unindexed`), and the entry then keeps
-/// expecting the worker's record.
+/// Settles the usage of the request `request_id` that ended on `worker` at
+/// `ended_mono_ns`, the lane's CLOCK_MONOTONIC end of it, as `outcome` says,
+/// and frees or parks its request table entry. The end is noted first
+/// (`RequestTable.noteEnded`), so the worker's record, which a drain writes
+/// only for a request the server ended, carries the server's end, and so does
+/// a floor. The lane that finishes the request calls it while it still holds
+/// the request's pool slot, before `Pool.release`, which keeps the worker's
+/// page mapped for the call. It takes only the worker's request table lock
+/// and, when it drains or writes a floor, `worker.metrics_mutex`, and it
+/// never writes the usage stream out. It never fails.
 pub fn settleRequest(
     ctx: UsageDrain,
     worker: *WorkerRecord,
     request_id: u64,
     outcome: SettleOutcome,
+    ended_mono_ns: u64,
 ) void {
     switch (outcome) {
-        .completed => settleTable(ctx, worker, request_id, true),
+        .completed => {
+            worker.requests.noteEnded(request_id, ended_mono_ns);
+            settleTable(ctx, worker, request_id, true);
+        },
         .abandoned => worker.requests.remove(request_id),
         .floor => |floor| {
-            const synthesis = synthesizeFinalAccountingForLifecycle(ctx, worker, request_id, floor) catch |err| switch (err) {
-                error.OutOfMemory => blk: {
-                    _ = ctx.counters.floors_unindexed.fetchAdd(1, .monotonic);
-                    std.log.warn("usage floor not written for request_id={d} worker_id={d}: the exactly-once index could not grow", .{
-                        request_id,
-                        worker.id,
-                    });
-                    break :blk SynthesisOutcome.awaits_worker_record;
-                },
-            };
+            const synthesis = synthesizeFinalAccountingForLifecycle(ctx, worker, request_id, floor, ended_mono_ns);
             settleTable(ctx, worker, request_id, synthesis.expectsWorkerRecord());
         },
     }
@@ -302,13 +313,13 @@ pub fn settleRequest(
 /// completion, or synthesis left that record expected
 /// (`SynthesisOutcome.awaits_worker_record`).
 ///
-/// When `request_table.awaiting_record_max` entries already wait, this drains
-/// the worker first: an honest worker appended every awaited record before
-/// its completion, so the drain settles them, written or dropped by a full
-/// usage stream, and frees their entries. If the table is still full, the
-/// worker published completions without their records: the oldest waiting
-/// entry is evicted, and a record for that request that shows up later is
-/// refused.
+/// When `request_table.parked_max` entries already stay and none is a floor
+/// that may go first, this drains the worker: an honest worker appended every
+/// awaited record before its completion, so the drain settles them, written
+/// or dropped by a full usage stream, and frees their entries. If the table
+/// is still full, the worker published completions without their records:
+/// the oldest waiting entry is evicted, and a record for that request that
+/// shows up later is refused.
 fn settleTable(
     ctx: UsageDrain,
     worker: *WorkerRecord,
@@ -316,13 +327,13 @@ fn settleTable(
     expects_worker_record: bool,
 ) void {
     switch (worker.requests.settle(request_id, expects_worker_record)) {
-        .freed, .awaiting_record => return,
-        .awaiting_full => {},
+        .freed, .parked => return,
+        .parked_full => {},
     }
     _ = drainWorker(ctx, worker);
     switch (worker.requests.settle(request_id, expects_worker_record)) {
-        .freed, .awaiting_record => return,
-        .awaiting_full => {},
+        .freed, .parked => return,
+        .parked_full => {},
     }
     const evicted_request_id = worker.requests.settleEvictingOldest(request_id) orelse return;
     std.log.warn("usage record never arrived for request_id={d} worker_id={d}; its entry was evicted", .{
@@ -331,9 +342,8 @@ fn settleTable(
     });
 }
 
-/// Outcome of claiming an identity for synthesis.
+/// Outcome of claiming a request for synthesis.
 pub const SynthesisClaim = struct {
-    reservation: usage_log.Reservation,
     /// The worker already authored a record for this request, still in its
     /// ring or already settled by a drain, written or dropped, so no floor
     /// may be written.
@@ -343,48 +353,39 @@ pub const SynthesisClaim = struct {
     deep_scanned: bool,
 };
 
-/// Claims `identity` for a synthesized record and answers, within the same
-/// hold of `worker.metrics_mutex`, whether the worker already authored one.
+/// Answers, within one hold of `worker.metrics_mutex`, whether the worker
+/// already authored a record for the request `identity` names, and claims
+/// the request for the server's floor when it did not.
 ///
-/// No drain of this worker can run between the reservation and the answer. A
-/// drain that comes after the reservation stops at the reserved record, which
-/// blocks consumption, so the worker's record stays in the ring until the
-/// claim resolves. A drain that finished before the reservation already
-/// settled the worker's record, written or dropped, and marked it in the
-/// worker's request table, which is why the table is asked before the ring
-/// and again after the claim's own drain. A claim that finds no worker
-/// record moves the request's entry to `synthesizing`, so a worker record
-/// that shows up while the floor is written is refused whatever identity
-/// fields it carries.
-///
-/// An inactive reservation means another caller owns this attempt, and the
-/// caller writes nothing. A `worker_authored` claim is the caller's to roll
-/// back, which releases a record still in the ring to the next drain.
+/// The claim's own drain runs first: the request is already ended
+/// (`settleRequest` noted it), so a worker record for it in the ring is
+/// written and settled now, which the table then reports. A drain that
+/// finished earlier already settled the record and marked the request in the
+/// table. A record the drain could not reach, behind another request's
+/// record that waits, is found by the scan, and the request stays the
+/// worker's. A claim that finds no worker record moves the request's entry
+/// to `synthesizing`, so a worker record that shows up while the floor is
+/// written waits in the ring whatever identity fields it carries.
 pub fn claimSynthesisForLifecycle(
     ctx: UsageDrain,
     worker: *WorkerRecord,
     identity: worker_shared_page.LifecycleIdentity,
-) error{OutOfMemory}!SynthesisClaim {
+) SynthesisClaim {
     worker.metrics_mutex.lock();
     defer worker.metrics_mutex.unlock();
 
-    const reservation = try ctx.usage.reserveSynthesis(identity);
-    if (!reservation.active)
-        return .{ .reservation = reservation, .worker_authored = false, .deep_scanned = false };
-
     const request_id = identity.external_request_id;
     if (worker.requests.usageRecorded(request_id))
-        return .{ .reservation = reservation, .worker_authored = true, .deep_scanned = false };
+        return .{ .worker_authored = true, .deep_scanned = false };
     const result = drainLocked(ctx, worker, identity, .drop, "find drain");
     // A record found in the ring counts only when the table would keep it;
     // otherwise the drain refuses it and the request would end with no
     // record at all.
     const worker_authored = worker.requests.usageRecorded(request_id) or
-        (result.found and worker.requests.expected(request_id) != null);
+        (result.found and worker.requests.expectsRecord(request_id));
     if (!worker_authored)
         worker.requests.beginSynthesis(request_id);
     return .{
-        .reservation = reservation,
         .worker_authored = worker_authored,
         .deep_scanned = result.deep_scanned,
     };
@@ -410,14 +411,16 @@ fn drainLocked(
     return drainRingLocked(ctx, worker, metrics, target_identity, on_full, warn_label);
 }
 
-/// The ring scan itself. Records are keyed by `worker`'s key, kept only when
-/// `worker.requests`, the table of the worker the ring belongs to, vouches
-/// for them, and stamped with the identity of the request the table
-/// recorded; the table receives the marks of what was settled. With
-/// `on_full` `.hold`, the scan stops at the first batch the usage stream has
-/// no room for and leaves it in the ring. Such a stop leaves the rest of the
-/// ring unsearched, so only a scan that looks for no identity may hold;
-/// synthesis, the one caller that looks, scans with `.drop`.
+/// The ring scan itself. Records are kept only when `worker.requests`, the
+/// table of the worker the ring belongs to, says so (`RequestTable.verdict`),
+/// and stamped with the identity and times of the request the table
+/// recorded; the table receives the marks of what was settled. A record the
+/// table says to leave stops consumption, since the ring advances by a
+/// contiguous prefix. With `on_full` `.hold`, the scan stops at the first
+/// batch the usage stream has no room for and leaves it in the ring. Such a
+/// stop leaves the rest of the ring unsearched, so only a scan that looks for
+/// no identity may hold; synthesis, the one caller that looks, scans with
+/// `.drop`.
 fn drainRingLocked(
     ctx: UsageDrain,
     worker: *WorkerRecord,
@@ -435,7 +438,7 @@ fn drainRingLocked(
     var records: [batch_len]CompletedRecord = undefined;
     var appended: [batch_len]usage.UsageRecord = undefined;
     var appended_request_ids: [batch_len]u64 = undefined;
-    var skipped_keys: [batch_len]UsageKey = undefined;
+    var skipped_request_ids: [batch_len]u64 = undefined;
     var total_seen: usize = 0;
     // Counts only batches the ring advanced past, and is reported on every
     // exit.
@@ -450,7 +453,7 @@ fn drainRingLocked(
             });
         }
     }
-    var stopped_on_reserved_synthesis = false;
+    var stopped_on_waiting_record = false;
     while (total_seen < worker_shared_page.RECORD_RING_COUNT) {
         const peeked = cursor.peek(metrics.header) orelse {
             failUsageRing(worker, warn_label);
@@ -465,52 +468,55 @@ fn drainRingLocked(
         var skipped_count: usize = 0;
         var rejected_count: usize = 0;
         var advance_count: usize = 0;
-        var blocked_by_reserved_synthesis = false;
+        var blocked_by_waiting_record = false;
         for (records[0..count]) |record| {
             if (target_identity) |identity| {
                 if (accounting.usage.recordMatchesLifecycle(record, worker_key, identity))
                     result.found = true;
             }
-            // A record whose synthesis is still reserved stops consumption but
-            // not the scan. The ring advances by a contiguous prefix, so
-            // nothing past the block may be taken; but a caller asking whether
-            // the worker authored a record gets a wrong `false` if the answer
-            // sits behind the block, and that `false` writes a floor over a
-            // record the worker already wrote.
-            if (blocked_by_reserved_synthesis)
+            // A record that must wait stops consumption but not the scan. The
+            // ring advances by a contiguous prefix, so nothing past the block
+            // may be taken; but a caller asking whether the worker authored a
+            // record gets a wrong `false` if the answer sits behind the
+            // block, and that `false` writes a floor over a record the worker
+            // already wrote.
+            if (blocked_by_waiting_record)
                 continue;
-            const key = accounting.usage.keyFromRecord(record, worker_key);
-            if (ctx.usage.synthesisState(key)) |state_for_key| {
-                switch (state_for_key) {
-                    .reserved => {
-                        blocked_by_reserved_synthesis = true;
-                        continue;
-                    },
-                    .written => {
-                        skipped_keys[skipped_count] = key;
-                        skipped_count += 1;
-                        advance_count += 1;
-                        continue;
-                    },
-                }
-            }
             // The table answers per request, so a second record for a request
-            // already taken in this batch is checked against the batch.
-            const dispatched = worker.requests.expected(record.request_id) orelse {
-                rejected_count += 1;
-                advance_count += 1;
-                continue;
-            };
-            if (std.mem.indexOfScalar(u64, appended_request_ids[0..appended_count], dispatched.request_id) != null) {
+            // already settled in this batch is checked against the batch.
+            if (std.mem.indexOfScalar(u64, appended_request_ids[0..appended_count], record.request_id) != null or
+                std.mem.indexOfScalar(u64, skipped_request_ids[0..skipped_count], record.request_id) != null)
+            {
                 rejected_count += 1;
                 advance_count += 1;
                 continue;
             }
-            appended[appended_count] = usage.fromCompleted(requestIdentity(ctx, worker, dispatched.route), .worker, record, clock);
-            appended[appended_count].request_id = dispatched.request_id;
-            appended_request_ids[appended_count] = dispatched.request_id;
-            appended_count += 1;
-            advance_count += 1;
+            switch (worker.requests.verdict(record.request_id)) {
+                .write => |ended| {
+                    appended[appended_count] = usage.fromCompleted(
+                        requestIdentity(ctx, worker, ended.dispatched.route),
+                        .worker,
+                        record,
+                        usageDispatch(ended.dispatched),
+                        ended.ended_mono_ns,
+                        clock,
+                    );
+                    appended[appended_count].request_id = ended.dispatched.request_id;
+                    appended_request_ids[appended_count] = ended.dispatched.request_id;
+                    appended_count += 1;
+                    advance_count += 1;
+                },
+                .wait => blocked_by_waiting_record = true,
+                .skip => {
+                    skipped_request_ids[skipped_count] = record.request_id;
+                    skipped_count += 1;
+                    advance_count += 1;
+                },
+                .refuse => {
+                    rejected_count += 1;
+                    advance_count += 1;
+                },
+            }
         }
         // Appended, then marked, then advanced: the ring lets go of a record
         // only once the log holds it, or a full stream dropped it, and the
@@ -529,12 +535,12 @@ fn drainRingLocked(
             },
         }
         worker.requests.markUsageRecorded(appended_request_ids[0..appended_count]);
+        worker.requests.skipFloors(skipped_request_ids[0..skipped_count]);
         cursor.advance(metrics.header, peeked, advance_count);
-        ctx.usage.forgetWritten(skipped_keys[0..skipped_count]);
         total_seen += advance_count;
         total_rejected += rejected_count;
-        stopped_on_reserved_synthesis = blocked_by_reserved_synthesis;
-        if (blocked_by_reserved_synthesis or advance_count == 0)
+        stopped_on_waiting_record = blocked_by_waiting_record;
+        if (blocked_by_waiting_record or advance_count == 0)
             break;
     }
     // The consume loop stopped at the blocked record, so everything past it is
@@ -548,10 +554,10 @@ fn drainRingLocked(
     // here would be counted twice and skip live records. Re-examining records
     // this call already checked is free, since the sweep consumes nothing and
     // only ever turns `found` true.
-    if (stopped_on_reserved_synthesis)
+    if (stopped_on_waiting_record)
         _ = ctx.counters.drains_blocked.fetchAdd(1, .monotonic);
     if (target_identity) |identity| {
-        if (stopped_on_reserved_synthesis and !result.found) {
+        if (stopped_on_waiting_record and !result.found) {
             result.deep_scanned = true;
             result.found = ringHoldsLifecycle(worker, metrics, identity, records[0..], warn_label);
         }
@@ -651,44 +657,17 @@ pub fn classifyWorkerDeath(ctx: UsageDrain, worker: *WorkerRecord) worker_shared
     return .crash;
 }
 
-/// Logs a dying worker's cgroup CPU usage without putting it on any record.
-/// Kernel cgroup accounting survives SIGKILL and covers a single turn that
-/// never ends, which the per-turn live-slot flush cannot see, but it spans
-/// the worker's whole life, so it also holds the CPU the worker's earlier
-/// records already carry; recording it would charge that CPU twice. Reads a
-/// cgroup file, so it belongs on the reaper, once per worker that died,
-/// before its teardown removes the cgroup.
-pub fn noteWorkerDeathBurn(
-    ctx: UsageDrain,
-    worker: *WorkerRecord,
-    status: worker_shared_page.CompletedStatus,
-) void {
-    const usage_usec = cgroup.cpu.readStatUsageUsec(ctx.allocator, worker.handle.cgroup_dir) catch |err| {
-        std.log.debug("worker death: cpu.stat read failed for worker_id={d}: {s}", .{
-            worker.id,
-            @errorName(err),
-        });
-        return;
-    };
-    std.log.warn("worker death burn: worker_id={d} status={s} cgroup_cpu_usage_usec={d}", .{
-        worker.id,
-        @tagName(status),
-        usage_usec,
-    });
-}
-
 /// What a synthesis leaves the request's entry in the worker's request table
 /// to wait for, which `settleRequest` passes on to the table.
 pub const SynthesisOutcome = enum {
     /// Nothing: the server wrote the floor, a drain settled the worker's
-    /// record, another caller owns the attempt, or the table holds no entry
-    /// for the request.
+    /// record, or the table holds no entry for the request.
     settled,
     /// No record of the request is settled, and the worker's own may still
-    /// come: it sits in the ring behind another attempt's reservation, or the
-    /// floor was dropped and a worker that is still alive may yet append one.
-    /// The entry must keep expecting it, or the drain that finds it refuses
-    /// the request's only record.
+    /// come: it sits in the ring behind another request's record that
+    /// waits, or the floor was dropped and a worker that is still alive may
+    /// yet append one. The entry must keep expecting it, or the drain that
+    /// finds it refuses the request's only record.
     awaits_worker_record,
 
     pub fn expectsWorkerRecord(self: SynthesisOutcome) bool {
@@ -697,62 +676,56 @@ pub const SynthesisOutcome = enum {
 };
 
 /// Writes the floor usage record of `request_id`, a request the server
-/// ended without a completion from `worker`, as `floor` says, unless the
-/// worker already authored a record for it (`claimSynthesisForLifecycle`).
-/// The floor's identity, route and flags come from the request's entry in
-/// `worker.requests`, and so does its start when no live slot matches the
-/// request (`synthesizeRecordForLifecycle`). A full usage stream never fails
-/// the caller: a floor that finds no room is dropped and counted
+/// ended at `ended_mono_ns` without a completion from `worker`, as `floor`
+/// says, unless the worker already authored a record for it
+/// (`claimSynthesisForLifecycle`). The end is noted first
+/// (`RequestTable.noteEnded`), as `settleRequest` does. The floor's identity,
+/// route, flags and times come from the request's entry in
+/// `worker.requests`, and its CPU from what the worker measured
+/// (`synthesizeRecordForLifecycle`). A full usage stream never fails the
+/// caller: a floor that finds no room is dropped and counted
 /// (`UsageLog.appendFloor`), and a worker record the request may still get
-/// is then left expected (`SynthesisOutcome.awaits_worker_record`). Fails
-/// with `error.OutOfMemory`, writing nothing, when the exactly-once index
-/// cannot grow.
+/// is then left expected (`SynthesisOutcome.awaits_worker_record`).
 pub fn synthesizeFinalAccountingForLifecycle(
     ctx: UsageDrain,
     worker: *WorkerRecord,
     request_id: u64,
     floor: Floor,
-) error{OutOfMemory}!SynthesisOutcome {
+    ended_mono_ns: u64,
+) SynthesisOutcome {
+    worker.requests.noteEnded(request_id, ended_mono_ns);
     const dispatched = worker.requests.dispatchedFor(request_id) orelse return .settled;
     const identity = lifecycleIdentity(worker, dispatched);
-    const claim = try claimSynthesisForLifecycle(ctx, worker, identity);
-    if (!claim.reservation.active)
-        return .settled;
+    const claim = claimSynthesisForLifecycle(ctx, worker, identity);
     if (claim.worker_authored) {
-        // Dropping the claim releases a worker record still in the ring: while
-        // the attempt is reserved no drain may consume it, including the scan
-        // that just found it. It is drained here rather than left for the
-        // periodic drain because a floor is written for a request whose
-        // worker is usually dying, and its page goes with the teardown.
-        ctx.usage.rollbackSynthesis(claim.reservation);
-        // Settled by this drain, written or dropped, unless another attempt's
-        // reservation still blocks it; the table below answers which.
-        _ = drainWorker(ctx, worker);
         if (worker.requests.usageRecorded(request_id))
             return .settled;
-        // A later drain settles it: the periodic one, or for a dying worker
+        // The record sits behind another request's record that waits; a
+        // later drain settles it: the periodic one, or for a dying worker
         // its teardown's (`drainFinal`).
         return .awaits_worker_record;
     }
 
     const clock = analytics.Clock.capture();
-    const record = synthesizeRecordForLifecycle(worker, dispatched, identity, floor.status, clock.mono_now_ns);
-    var floor_record = usage.fromCompleted(requestIdentity(ctx, worker, dispatched.route), .server, record, clock);
+    const record = synthesizeRecordForLifecycle(worker, identity, floor.status);
+    var floor_record = usage.fromCompleted(
+        requestIdentity(ctx, worker, dispatched.route),
+        .server,
+        record,
+        usageDispatch(dispatched),
+        ended_mono_ns,
+        clock,
+    );
     floor_record.worker_fault = floor.worker_fault;
     switch (ctx.usage.appendFloor(&floor_record)) {
         .taken => {},
         .dropped => {
-            // Rolled back rather than committed: no floor exists, so a worker
-            // record for this attempt that still shows up is the one to keep.
-            // The entry leaves `synthesizing` before the reservation goes: a
-            // drain between the two then stops at the reserved record instead
-            // of refusing it for a request whose floor is being written.
+            // No floor exists, so a worker record for the request that still
+            // shows up is the one to keep.
             worker.requests.finishSynthesis(request_id, false);
-            ctx.usage.rollbackSynthesis(claim.reservation);
             return .awaits_worker_record;
         },
     }
-    ctx.usage.commitSynthesis(claim.reservation);
     worker.requests.finishSynthesis(request_id, true);
     // Counted only on the deep-scan path: there the answer that the worker
     // never authored a record came from a walk of the whole ring rather than
@@ -772,45 +745,49 @@ fn lifecycleIdentity(worker: *const WorkerRecord, dispatched: request_table.Disp
         .request_generation = dispatched.request_key.generation,
         .worker_id = worker.id,
         .worker_generation = worker.generation,
-        .billing_sequence = dispatched.request_id,
     };
 }
 
-/// The request id is always the server's. A live slot for the request
-/// supplies what the worker measured before it died, from the one copy the
-/// identity matched; without one the record is a floor that starts when the
-/// server dispatched the request.
+/// What the request table holds about `dispatched` that its usage record
+/// takes its times and cold start from.
+fn usageDispatch(dispatched: request_table.Dispatched) usage.Dispatch {
+    return .{
+        .started_mono_ns = dispatched.started_mono_ns,
+        .accounting_flags = dispatched.accounting_flags,
+    };
+}
+
+/// The request id is always the server's. The CPU is what the worker
+/// measured before the request ended: its live slot's, written by the VM
+/// thread between owner windows, or, when the worker's sentinel last saw the
+/// request running (`RunningOwnerSnapshot`), the larger of that and the
+/// sentinel's count of the window that was running, which the stuck or
+/// dying VM thread never wrote. The two count the same CPU, so they never
+/// add. Without either the floor carries no CPU, and a death the server
+/// caused (`internal_error`) carries none either. The record's times are the
+/// server's in every case (`usage.fromCompleted`).
 fn synthesizeRecordForLifecycle(
     worker: *WorkerRecord,
-    dispatched: request_table.Dispatched,
     identity: worker_shared_page.LifecycleIdentity,
     status: worker_shared_page.CompletedStatus,
-    finished_mono_ns: u64,
 ) CompletedRecord {
-    if (worker.handle.metrics) |*metrics| {
-        if (worker_shared_page.LiveSlotSnapshot.find(metrics.live_slots, identity)) |snapshot| {
-            var record = worker_metrics_state.synthesizeDeathRecord(snapshot, finished_mono_ns, status);
-            record.request_id = identity.external_request_id;
-            record.flags = dispatched.accounting_flags;
-            // A death the server caused (`internal_error`) carries no CPU;
-            // one the workload caused (crash, memory, deadline) carries the
-            // CPU the live slot flushed turn by turn.
-            if (status == .internal_error)
-                record.cpu_time_ns = 0;
-            return record;
-        }
-    }
-
-    return std.mem.zeroInit(CompletedRecord, .{
+    var record: CompletedRecord = .{
         .request_id = identity.external_request_id,
         .request_generation = identity.request_generation,
-        .worker_id = identity.worker_id,
-        .worker_generation = identity.worker_generation,
-        .started_mono_ns = dispatched.started_mono_ns,
-        .finished_mono_ns = finished_mono_ns,
         .request_slot = identity.request_slot,
         .request_lane_id = identity.request_lane_id,
         .status = @intFromEnum(status),
-        .flags = dispatched.accounting_flags,
-    });
+    };
+    const metrics = if (worker.handle.metrics) |*metrics| metrics else return record;
+    if (worker_shared_page.LiveSlotSnapshot.find(metrics.live_slots, identity)) |snapshot| {
+        record = worker_metrics_state.synthesizeDeathRecord(snapshot, status);
+        record.request_id = identity.external_request_id;
+    }
+    if (worker_shared_page.RunningOwnerSnapshot.load(metrics.header)) |running| {
+        if (running.owner_id == identity.external_request_id)
+            record.cpu_ns = @max(record.cpu_ns, running.cpu_ns);
+    }
+    if (status == .internal_error)
+        record.cpu_ns = 0;
+    return record;
 }

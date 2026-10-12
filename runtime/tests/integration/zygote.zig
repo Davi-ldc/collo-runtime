@@ -1,10 +1,14 @@
 //! The zygote and its workers against the real kernel (lane
 //! `zygote-integration`, inside the delegated cgroup subtree): zygote boot and
-//! fork, cgroup placement and adoption, the WorkerInit handoff and its
-//! failures, the sandboxed worker's boot order and idle cost, the node fs
-//! tree and the fs fault channel, module evaluation at init with its
-//! deadline, a worker that loses its egress gateway and is attached to a new
-//! one, wasm after seccomp, and the host's bounded response reader.
+//! fork, cgroup placement and adoption with every limit on the live leaf, the
+//! WorkerInit handoff and its failures, the sandboxed worker's boot order, its
+//! threads asleep when idle, the footprint its engine reads from its leaf and
+//! its mapped shared objects, a worker with no egress descriptor, workers that
+//! share their host's mount point, the runtime's log lines in a worker's
+//! console ring, the node fs tree and the fs fault channel, module evaluation
+//! at init with its deadline, a worker that loses its egress gateway and is
+//! attached to a new one, wasm after seccomp, and the host's bounded response
+//! reader.
 //!
 //! The test thread plays the host against a zygote spawned from the installed
 //! `collo` binary. Most tests launch through `host.launch` and dispatch
@@ -25,6 +29,7 @@ const zygote = support.zygote;
 const fs_index = zygote.ipc.fs_index;
 const host = support.host;
 const worker_cgroup = zygote.worker_boot.cgroup;
+const worker_page = zygote.worker_state.page;
 const rt = @import("collo_test_harness");
 const worker_memory_limit_bytes: u64 = 1024 * 1024 * 1024;
 
@@ -181,16 +186,22 @@ test "worker adopts a host-prepared worker-<job_id> cgroup and deletes it on tea
     defer wake_set.deinit();
     var egress_shared = try zygote.ipc.egress_shared.createSessionForWorker(&wake_set);
     defer egress_shared.deinit();
+    var tmp_mount: host.TmpMountPoint = undefined;
+    try tmp_mount.init(host.tmp_mount.default_parent_dir);
+    defer tmp_mount.deinit();
 
     var handle = try host.runToReady(
         std.testing.allocator,
         &spawned,
         &worker,
         worker_memory_limit_bytes,
-        .{ .egress = .{ .attached = .{
-            .shared_fds = egress_shared.rawForWorker(),
-            .boot = rt.localBootEgress(),
-        } } },
+        .{
+            .egress = .{ .attached = .{
+                .shared_fds = egress_shared.rawForWorker(),
+                .boot = rt.localBootEgress(),
+            } },
+            .tmp_mount_point_fd = tmp_mount.fd(),
+        },
     );
     var handle_armed = true;
     defer if (handle_armed) handle.deinit();
@@ -231,6 +242,17 @@ test "worker adopts a host-prepared worker-<job_id> cgroup and deletes it on tea
         worker_cgroup.memory.maxBytes(worker_memory_limit_bytes),
         try support.readUnsignedFile(memory_max_path),
     );
+    // A worker never swaps: the leaf's `memory.swap.max` is 0 wherever the
+    // kernel accounts swap, and the file is absent where it does not.
+    const swap_max_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/memory.swap.max", .{handle.cgroup_dir});
+    defer std.testing.allocator.free(swap_max_path);
+    if (support.readFileAlloc(swap_max_path, std.testing.allocator)) |swap_max| {
+        defer std.testing.allocator.free(swap_max);
+        try std.testing.expectEqualStrings("0", std.mem.trim(u8, swap_max, &std.ascii.whitespace));
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
 
     const worker_pidfd = try std.posix.dup(handle.pidfd);
     defer std.posix.close(worker_pidfd);
@@ -303,6 +325,9 @@ test "independent runtime gate: prepared cgroup child serves sealed hello-world 
     defer std.posix.close(route_fd);
     var route = try rt.SingleRoute.init(route_fd, route_specifier);
     defer route.deinit();
+    var tmp_mount: host.TmpMountPoint = undefined;
+    try tmp_mount.init(host.tmp_mount.default_parent_dir);
+    defer tmp_mount.deinit();
 
     var gate_handle = try host.runToReady(
         std.testing.allocator,
@@ -314,19 +339,25 @@ test "independent runtime gate: prepared cgroup child serves sealed hello-world 
                 .shared_fds = egress_shared.rawForWorker(),
                 .boot = rt.localBootEgress(),
             } },
+            .tmp_mount_point_fd = tmp_mount.fd(),
             .routes = route.launchRoutes(),
         },
     );
     var handle_armed = true;
     defer if (handle_armed) gate_handle.deinit();
 
+    // The live leaf carries every limit the launch set, `memory.swap.max` 0
+    // included where the kernel accounts swap.
     try std.testing.expectEqualStrings(expected_cgroup_dir, gate_handle.cgroup_dir);
-    try worker_cgroup.worker.validateLimits(
-        std.testing.allocator,
-        gate_handle.cgroup_dir,
-        .{ .memory_limit_bytes = worker_memory_limit_bytes },
-        .require_configured,
-    );
+    {
+        const leaf_fd = try std.posix.open(gate_handle.cgroup_dir, .{
+            .ACCMODE = .RDONLY,
+            .DIRECTORY = true,
+            .CLOEXEC = true,
+        }, 0);
+        defer std.posix.close(leaf_fd);
+        try worker_cgroup.worker.validateLimitsAt(leaf_fd, .{ .memory_limit_bytes = worker_memory_limit_bytes });
+    }
 
     const cgroup_procs_path = try std.fmt.allocPrint(
         std.testing.allocator,
@@ -459,8 +490,6 @@ test "valid worker init reseeds immediately, applies sandbox, starts poll loop, 
     var launched = try launchOrSkip(&spawned, fork_job_id, .{});
     defer launched.deinit();
     const handle = &launched.handle;
-    const tmp_root_copy = try std.testing.allocator.dupe(u8, handle.tmp_root);
-    defer std.testing.allocator.free(tmp_root_copy);
     // The worker lives in the leaf prepared for its fork job under the root.
     const expected_cgroup_dir = try std.fmt.allocPrint(
         std.testing.allocator,
@@ -477,8 +506,6 @@ test "valid worker init reseeds immediately, applies sandbox, starts poll loop, 
     try std.testing.expectEqual(zygote.worker_state.page.VERSION, metrics.header.version);
     try std.testing.expectEqual(@intFromEnum(zygote.worker_state.page.State.ready), metrics.header.state);
     try std.testing.expectEqual(@intFromEnum(zygote.worker_state.page.TerminationReason.none), metrics.header.termination_reason);
-    try std.testing.expectEqual(handle.pid, metrics.header.pid);
-    try std.testing.expectEqual(worker_memory_limit_bytes, metrics.header.memory_limit_bytes);
     for (metrics.live_slots) |slot|
         try std.testing.expectEqual(@intFromEnum(zygote.worker_state.page.LiveSlotState.empty), slot.state);
 
@@ -496,10 +523,12 @@ test "valid worker init reseeds immediately, applies sandbox, starts poll loop, 
     defer std.testing.allocator.free(pid_string);
     try std.testing.expect(std.mem.containsAtLeast(u8, cgroup_procs, 1, pid_string));
 
+    // The worker's tmpfs lived in its own mount namespace, so its teardown
+    // leaves the host's mount point as empty as it found it.
     launched.stopWorker();
     try support.waitForPidFdExit(worker_pidfd);
-    try std.testing.expectError(error.FileNotFound, std.fs.accessAbsolute(tmp_root_copy, .{}));
     try std.testing.expectError(error.FileNotFound, std.fs.accessAbsolute(expected_cgroup_dir, .{}));
+    try support.expectDirEmpty(launched.tmp_mount_point.?.fd());
 
     spawned.shutdown();
     try support.expectChildExitStatus(spawned.pid, 0);
@@ -549,11 +578,67 @@ test "valid worker init reseeds immediately, applies sandbox, starts poll loop, 
     try std.testing.expectEqual(worker_cgroup.memory.gcHeapLimitBytes(worker_memory_limit_bytes), gc_value);
 }
 
-/// CPU an idle worker may spend, in thousandths of one core. Its only
-/// periodic work is the allocator scavenger's poll, far below this; a
-/// scavenger that never sleeps holds the whole core.
-const idle_worker_cpu_budget_per_mille: u64 = 50;
-const idle_worker_window_ns: u64 = std.time.ns_per_s;
+/// How long a worker gets after its last turn before its threads must all
+/// sleep: the allocator cache release `limits.worker.thread_cache_idle_release_ns`
+/// after the last turn (500 ms), then the scavenger, which that release
+/// wakes, returning the pages it was handed once they are older than its
+/// epoch delay (300 ms off macOS) and sleeping again after two empty passes
+/// 100 ms apart, rounded up.
+const idle_worker_settle_ns: u64 = 1500 * std.time.ns_per_ms;
+/// A bound, counted from ready, on the wake the sentinel of a worker that
+/// evaluated routes at boot may still have planned: the init window
+/// `limits.process.WORKER_INIT_TIMEOUT_MS`, which began when WorkerInit was
+/// sent, before ready. The boot evaluation's window publishes the init
+/// deadline less `WORKER_INIT_CLEANUP_RESERVE_NS`, and the sentinel plans a
+/// wake for it. Closing the window publishes no owner, which never wakes the
+/// sentinel to drop the plan (`Sentinel.publish` wakes it only for an
+/// earlier expiry), so it wakes at that deadline, finds no owner and blocks
+/// again.
+const idle_worker_boot_wake_ns: u64 = @as(u64, @intCast(limits.process.WORKER_INIT_TIMEOUT_MS)) * std.time.ns_per_ms;
+/// The window over which no thread of an idle worker may run. A later
+/// window can leave the sentinel a plan too, at its owner's deadline: a
+/// request's (`forkedDeadlineNs`; the launch sets no CPU budget) or the
+/// worker owner's (`WorkerInit.default_unowned_time_limit_ns` past the
+/// window's start). Both lie far past the end of this window, so only the
+/// boot evaluation's needs a wait.
+const idle_worker_window_ns: u64 = 2 * std.time.ns_per_s;
+/// CPU an idle worker may spend over the window, in microseconds: the
+/// measurement's own noise, since none of its threads runs.
+const idle_worker_cpu_noise_usec: u64 = 2_000;
+
+comptime {
+    std.debug.assert(limits.worker.thread_cache_idle_release_ns < idle_worker_settle_ns);
+}
+
+/// The context switches of every thread of process `pid` so far, voluntary
+/// and not: a thread that sleeps without waking adds none.
+fn readContextSwitches(pid: u32) !u64 {
+    var path_buffer: [64]u8 = undefined;
+    const task_path = try std.fmt.bufPrint(&path_buffer, "/proc/{d}/task", .{pid});
+    var task_dir = try std.fs.openDirAbsolute(task_path, .{ .iterate = true });
+    defer task_dir.close();
+    var total: u64 = 0;
+    var tasks = task_dir.iterate();
+    while (try tasks.next()) |task| {
+        var status_path_buffer: [96]u8 = undefined;
+        const status_path = try std.fmt.bufPrint(&status_path_buffer, "{s}/{s}/status", .{ task_path, task.name });
+        // A thread that ended between the listing and the read has no status
+        // left and no more switches to add.
+        const status = support.readFileAlloc(status_path, std.testing.allocator) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        defer std.testing.allocator.free(status);
+        var lines = std.mem.splitScalar(u8, status, '\n');
+        while (lines.next()) |line| {
+            inline for (.{ "voluntary_ctxt_switches:", "nonvoluntary_ctxt_switches:" }) |prefix| {
+                if (std.mem.startsWith(u8, line, prefix))
+                    total += try std.fmt.parseUnsigned(u64, std.mem.trim(u8, line[prefix.len..], &std.ascii.whitespace), 10);
+            }
+        }
+    }
+    return total;
+}
 
 fn readThreadCount(pid: u32) !u64 {
     var path_buffer: [64]u8 = undefined;
@@ -569,14 +654,29 @@ fn readThreadCount(pid: u32) !u64 {
     return error.MissingThreadCount;
 }
 
-test "an idle worker spends almost no CPU and keeps every thread" {
+test "an idle worker's threads all sleep and none retires" {
     var spawned = try support.spawnZygote();
     defer spawned.deinit();
 
-    const route_specifier = "/__collo_route/test/idle-hello.js";
+    // The handler gets a function hot enough for an optimizing compile,
+    // allocates, and awaits a digest of more than `inlineDigestByteLimit`
+    // bytes, which runs on the crypto pool, so the VM thread, a compiler
+    // thread and a crypto thread all hold allocator caches.
+    const route_specifier = "/__collo_route/test/idle-busy.js";
     const route_fd = try rt.createModulePackFd(route_specifier,
-        \\export default function handle() {
-        \\  return new Response("idle");
+        \\function mix(seed) {
+        \\  let value = seed | 0;
+        \\  for (let i = 0; i < 64; i++) value = (value * 31 + i) | 0;
+        \\  return value;
+        \\}
+        \\
+        \\export default async function handle() {
+        \\  let total = 0;
+        \\  for (let i = 0; i < 200000; i++) total = (total + mix(i)) | 0;
+        \\  const blocks = [];
+        \\  for (let i = 0; i < 256; i++) blocks.push(new Uint8Array(4096).fill(i));
+        \\  const digest = await crypto.subtle.digest("SHA-256", blocks[255]);
+        \\  return new Response(`${total}:${digest.byteLength}:${blocks.length}`);
         \\}
     );
     defer std.posix.close(route_fd);
@@ -586,11 +686,288 @@ test "an idle worker spends almost no CPU and keeps every thread" {
         .routes = route.launchRoutes(),
     });
     defer launched.deinit();
+    const ready_ns = try process.monotonicNowNs();
     const handle = &launched.handle;
 
-    // A served request leaves the allocator holding the caches and freed
-    // pages of a worker that has done real work.
-    const request_id: u64 = 90_018;
+    for (0..3) |index| {
+        const request_id: u64 = 90_018 + index;
+        var dispatch = try rt.initDispatchWork(std.testing.allocator, .{
+            .request_id = request_id,
+            .deadline_monotonic_ns = try forkedDeadlineNs(),
+        });
+        defer dispatch.deinit();
+        try rt.sendIngressRoute(handle.control_fd, &dispatch, 1, .{});
+        var response = try readForkedIngressResponse(handle, request_id, 8_000);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 200), response.status);
+    }
+
+    // Nothing in the worker wakes once the caches are released, the
+    // scavenger has returned what they held and the sentinel's wake for the
+    // boot evaluation has passed: every helper thread waits on a condition,
+    // and the sentinel sleeps with no timeout, or until a wake it planned
+    // for a deadline past the window (`idle_worker_window_ns`).
+    const settle_start_ns = try process.monotonicNowNs();
+    const quiet_from_ns = @max(settle_start_ns + idle_worker_settle_ns, ready_ns + idle_worker_boot_wake_ns);
+    std.Thread.sleep(quiet_from_ns - settle_start_ns);
+    const threads_before = try readThreadCount(handle.pid);
+    const window_start_ns = try process.monotonicNowNs();
+    const switches_before = try readContextSwitches(handle.pid);
+    // The worker is the only process in its cgroup, so the cgroup's CPU
+    // total is the worker's, every thread included.
+    const usage_before_usec = try host.cgroup.cpu.readStatUsageUsec(std.testing.allocator, handle.cgroup_dir);
+    std.Thread.sleep(idle_worker_window_ns);
+    const usage_after_usec = try host.cgroup.cpu.readStatUsageUsec(std.testing.allocator, handle.cgroup_dir);
+    const switches_after = try readContextSwitches(handle.pid);
+    const window_end_ns = try process.monotonicNowNs();
+    const threads_after = try readThreadCount(handle.pid);
+    const window_ms = (window_end_ns - window_start_ns) / std.time.ns_per_ms;
+
+    // Seccomp denies clone, so a thread that retired while idle could never
+    // come back, and its context switches leave the total with it.
+    if (threads_after != threads_before) {
+        std.debug.print("an idle worker went from {d} to {d} threads in {d} ms\n", .{
+            threads_before,
+            threads_after,
+            window_ms,
+        });
+        return error.IdleWorkerThreadRetired;
+    }
+    if (switches_after != switches_before) {
+        std.debug.print("an idle worker's threads went from {d} to {d} context switches in {d} ms\n", .{
+            switches_before,
+            switches_after,
+            window_ms,
+        });
+        return error.IdleWorkerThreadWoke;
+    }
+    // The cgroup's CPU total never decreases.
+    const cpu_usec = usage_after_usec - usage_before_usec;
+    if (cpu_usec > idle_worker_cpu_noise_usec) {
+        std.debug.print("an idle worker spent {d} us of CPU in {d} ms\n", .{ cpu_usec, window_ms });
+        return error.IdleWorkerSpentCpu;
+    }
+}
+
+test "a worker's engine reads its footprint from its own cgroup leaf, within the leaf's memory.current" {
+    var spawned = try support.spawnZygote();
+    defer spawned.deinit();
+
+    var launched = try launchOrSkip(&spawned, 90_024, .{});
+    defer launched.deinit();
+    // The child read its footprint, its leaf's memory.current, before it
+    // mapped its fs index, built its ring and started its sentinel, crypto
+    // pool and compiler threads, and its heap gives a freed page back only
+    // once the page has sat empty for the scavenger's epoch delay
+    // (`pas_scavenger_max_epoch_delta`, 300 ms off macOS), so the leaf holds
+    // at least as much once the worker is ready.
+    var memory_current_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const memory_current_path = try std.fmt.bufPrint(
+        &memory_current_path_buffer,
+        "{s}/memory.current",
+        .{launched.handle.cgroup_dir},
+    );
+    const memory_current = try support.readUnsignedFile(memory_current_path);
+
+    launched.stopWorker();
+    spawned.shutdown();
+    try support.expectChildExitStatus(spawned.pid, 0);
+    var trace = try support.drainTrace(&spawned, std.testing.allocator);
+    defer trace.deinit();
+
+    const prefix = "child.memory_status=";
+    const event = trace.messages[trace.indexOfPrefix(prefix) orelse return error.MissingTraceEvent];
+    var fields = std.mem.splitScalar(u8, event[prefix.len..], ',');
+    const footprint_bytes = try std.fmt.parseUnsigned(u64, fields.next() orelse return error.InvalidTraceEvent, 10);
+    const limit_bytes = try std.fmt.parseUnsigned(u64, fields.next() orelse return error.InvalidTraceEvent, 10);
+    try std.testing.expect(footprint_bytes != 0);
+    try std.testing.expect(footprint_bytes <= memory_current);
+    try std.testing.expectEqual(worker_memory_limit_bytes, limit_bytes);
+}
+
+test "a worker of a definition without a network grant boots through its filter and ring with no egress descriptor and serves" {
+    var spawned = try support.spawnZygote();
+    defer spawned.deinit();
+
+    const route_specifier = "/__collo_route/test/no-grant-hello.js";
+    const route_fd = try rt.createModulePackFd(route_specifier,
+        \\export default function handle() {
+        \\  return new Response("no grant");
+        \\}
+    );
+    defer std.posix.close(route_fd);
+    var route = try rt.SingleRoute.init(route_fd, route_specifier);
+    defer route.deinit();
+    // `.none` sends WorkerInit without `flag_egress` and without the wake
+    // descriptors, so the worker registers its ring with the egress slots
+    // empty, which only a kernel that accepts sparse fixed files admits.
+    var launched = try launchOrSkip(&spawned, 90_025, .{
+        .egress = .none,
+        .routes = route.launchRoutes(),
+    });
+    defer launched.deinit();
+    const handle = &launched.handle;
+
+    const request_id: u64 = 90_025;
+    var dispatch = try rt.initDispatchWork(std.testing.allocator, .{
+        .request_id = request_id,
+        .deadline_monotonic_ns = try forkedDeadlineNs(),
+        .egress_token = zygote.ipc.egress_token.none,
+    });
+    defer dispatch.deinit();
+    try rt.sendIngressRoute(handle.control_fd, &dispatch, 1, .{});
+    var response = try readForkedIngressResponse(handle, request_id, 8_000);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status);
+    try std.testing.expectEqualStrings("no grant", response.body);
+
+    launched.stopWorker();
+    spawned.shutdown();
+    try support.expectChildExitStatus(spawned.pid, 0);
+    var trace = try support.drainTrace(&spawned, std.testing.allocator);
+    defer trace.deinit();
+
+    // The trace prints an empty slot as its descriptor,
+    // `restricted_uring.empty_slot` (-1).
+    const ring_event = trace.messages[trace.indexOfPrefix("child.worker_ring.fixed_files=") orelse return error.MissingTraceEvent];
+    if (std.mem.indexOf(u8, ring_event, ",egress_completion:-1,egress_liveness:-1,") == null) {
+        std.debug.print("expected both egress slots of the ring empty, found {s}\n", .{ring_event});
+        return error.EgressSlotsNotEmpty;
+    }
+}
+
+test "two workers of one host share its mount point, each sees only its own /tmp, and the mount point stays empty" {
+    var spawned = try support.spawnZygote();
+    defer spawned.deinit();
+    var tmp_mount: host.TmpMountPoint = undefined;
+    try tmp_mount.init(host.tmp_mount.default_parent_dir);
+    defer tmp_mount.deinit();
+
+    const route_specifier = "/__collo_route/test/tmp-isolation.js";
+    const route_fd = try rt.createModulePackFd(route_specifier,
+        \\import fs from "node:fs";
+        \\
+        \\export default function handle(request) {
+        \\  const name = request.query.get("name");
+        \\  fs.writeFileSync(`/tmp/${name}.txt`, name);
+        \\  return new Response(fs.readdirSync("/tmp").sort().join(","));
+        \\}
+    );
+    defer std.posix.close(route_fd);
+    var route = try rt.SingleRoute.init(route_fd, route_specifier);
+    defer route.deinit();
+
+    var first = try launchOrSkip(&spawned, 90_026, .{
+        .tmp_mount_point_fd = tmp_mount.fd(),
+        .routes = route.launchRoutes(),
+    });
+    defer first.deinit();
+    var second = try launchOrSkip(&spawned, 90_027, .{
+        .tmp_mount_point_fd = tmp_mount.fd(),
+        .routes = route.launchRoutes(),
+    });
+    defer second.deinit();
+
+    const workers = [_]struct { handle: *host.WorkerHandle, name: []const u8, request_id: u64 }{
+        .{ .handle = &first.handle, .name = "first", .request_id = 90_026 },
+        .{ .handle = &second.handle, .name = "second", .request_id = 90_027 },
+    };
+    for (workers) |worker| {
+        var query_buffer: [32]u8 = undefined;
+        var dispatch = try rt.initDispatchWork(std.testing.allocator, .{
+            .request_id = worker.request_id,
+            .deadline_monotonic_ns = try forkedDeadlineNs(),
+            .request = .{ .raw_query = try std.fmt.bufPrint(&query_buffer, "name={s}", .{worker.name}) },
+        });
+        defer dispatch.deinit();
+        try rt.sendIngressRoute(worker.handle.control_fd, &dispatch, 1, .{});
+        var response = try readForkedIngressResponse(worker.handle, worker.request_id, 8_000);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 200), response.status);
+        var expected_buffer: [32]u8 = undefined;
+        try std.testing.expectEqualStrings(
+            try std.fmt.bufPrint(&expected_buffer, "{s}.txt", .{worker.name}),
+            response.body,
+        );
+    }
+    // Each worker mounted its tmpfs in its own mount namespace, so the host's
+    // directory never sees a file.
+    try support.expectDirEmpty(tmp_mount.fd());
+}
+
+/// One line drained from a worker's console ring, its text copied out of the
+/// drain's scratch.
+const ConsoleLine = struct {
+    header: worker_page.LogFrameHeader,
+    text: []u8,
+};
+
+/// Drains every line the console ring of `view`, the host's mapping of a
+/// worker's page, holds now, in ring order; the caller frees the result with
+/// `freeConsoleLines`. The test must be the ring's only consumer.
+fn drainConsoleLines(allocator: std.mem.Allocator, view: *worker_page.WorkerWriterView) ![]ConsoleLine {
+    var lines: std.ArrayList(ConsoleLine) = .empty;
+    errdefer {
+        for (lines.items) |line|
+            allocator.free(line.text);
+        lines.deinit(allocator);
+    }
+    var scratch: [worker_page.LOG_LINE_BYTES_MAX]u8 = undefined;
+    var batch: [16]worker_page.DrainedLogLine = undefined;
+    // The scratch fits any line, so a drain of a ring that holds a line takes
+    // at least one, and the ring holds at most one line per frame header that
+    // fits in it: a ring its worker no longer writes is empty within this
+    // many drains.
+    const drain_count_max = worker_page.LOG_RING_BYTES / @sizeOf(worker_page.LogFrameHeader) + 1;
+    for (0..drain_count_max) |_| {
+        const count = try view.drainLogLinesChecked(&scratch, &batch);
+        if (count == 0)
+            return try lines.toOwnedSlice(allocator);
+        for (batch[0..count]) |drained| {
+            const text = try allocator.dupe(u8, drained.payload);
+            errdefer allocator.free(text);
+            try lines.append(allocator, .{ .header = drained.header, .text = text });
+        }
+    }
+    return error.ConsoleRingNotEmptied;
+}
+
+fn freeConsoleLines(allocator: std.mem.Allocator, lines: []ConsoleLine) void {
+    for (lines) |line|
+        allocator.free(line.text);
+    allocator.free(lines);
+}
+
+test "a worker's runtime log line lands in its console ring flagged runtime, apart from the tenant's exception line" {
+    // A handler that throws makes the worker log the exception twice: the
+    // tenant's line with the exception's text under the request's id, and
+    // the runtime's `std.log` warning about it. The worker's standard error
+    // is /dev/null, so the warning reaches the host only through the log
+    // sink (`zygote/log_sink.zig`), which publishes it into the same ring
+    // under request id 0. The zygote is the installed `collo`, so its workers
+    // log through that binary's `std_options.logFn` (`runtime/src/main.zig`).
+    var spawned = try support.spawnZygote();
+    defer spawned.deinit();
+
+    const thrown_message = "handler failed on purpose";
+    const route_specifier = "/__collo_route/test/runtime-log-line.js";
+    const route_source = "export default function handle() {\n" ++
+        "  throw new Error(\"" ++ thrown_message ++ "\");\n" ++
+        "}\n";
+    const route_fd = try rt.createModulePackFd(route_specifier, route_source);
+    defer std.posix.close(route_fd);
+    var route = try rt.SingleRoute.init(route_fd, route_specifier);
+    defer route.deinit();
+    // The default boot options leave `flag_log_full_js_exceptions` off, so
+    // the runtime's line names the exception by its length and a digest
+    // prefix, never by its text.
+    var launched = try launchOrSkip(&spawned, 90_028, .{
+        .routes = route.launchRoutes(),
+    });
+    defer launched.deinit();
+    const handle = &launched.handle;
+
+    const request_id: u64 = 90_028;
     var dispatch = try rt.initDispatchWork(std.testing.allocator, .{
         .request_id = request_id,
         .deadline_monotonic_ns = try forkedDeadlineNs(),
@@ -599,31 +976,88 @@ test "an idle worker spends almost no CPU and keeps every thread" {
     try rt.sendIngressRoute(handle.control_fd, &dispatch, 1, .{});
     var response = try readForkedIngressResponse(handle, request_id, 8_000);
     defer response.deinit();
-    try std.testing.expectEqual(@as(u16, 200), response.status);
+    try std.testing.expectEqual(@as(u16, 500), response.status);
+    try std.testing.expectEqual(zygote.ipc.RequestDoneStatus.js_exception, response.doneStatus());
 
-    // The worker is the only process in its cgroup, so the cgroup's CPU
-    // total is the worker's, every thread included.
-    const threads_before = try readThreadCount(handle.pid);
-    const usage_before_usec = try host.cgroup.cpu.readStatUsageUsec(std.testing.allocator, handle.cgroup_dir);
-    const started_ns = try process.monotonicNowNs();
-    std.Thread.sleep(idle_worker_window_ns);
-    const usage_after_usec = try host.cgroup.cpu.readStatUsageUsec(std.testing.allocator, handle.cgroup_dir);
-    const elapsed_ns = (try process.monotonicNowNs()) - started_ns;
-    const threads_after = try readThreadCount(handle.pid);
+    // The VM thread publishes both lines before it writes the 500
+    // (`answerException` in `worker/serve/termination.zig`), so the ring
+    // holds them once the response is read.
+    const lines = try drainConsoleLines(std.testing.allocator, &handle.metrics.?);
+    defer freeConsoleLines(std.testing.allocator, lines);
 
-    const used_usec = usage_after_usec - usage_before_usec;
-    const budget_usec = elapsed_ns / std.time.ns_per_us * idle_worker_cpu_budget_per_mille / 1000;
-    if (used_usec > budget_usec) {
-        std.debug.print("idle worker used {d} us of CPU in {d} us (budget {d} us)\n", .{
-            used_usec,
-            elapsed_ns / std.time.ns_per_us,
-            budget_usec,
+    var named_buffer: [48]u8 = undefined;
+    const named = try std.fmt.bufPrint(&named_buffer, " request_id={d}", .{request_id});
+    var tenant_count: usize = 0;
+    var tenant_line: ConsoleLine = undefined;
+    var runtime_count: usize = 0;
+    var runtime_line: ConsoleLine = undefined;
+    for (lines) |line| {
+        if (line.header.request_id == request_id) {
+            tenant_count += 1;
+            tenant_line = line;
+        } else if (std.mem.indexOf(u8, line.text, named) != null) {
+            runtime_count += 1;
+            runtime_line = line;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), tenant_count);
+    try std.testing.expectEqual(@as(usize, 1), runtime_count);
+
+    // The tenant's line is the whole text, uncut, and not the runtime's.
+    try std.testing.expectEqual(@intFromEnum(worker_page.LogLevel.err), tenant_line.header.level);
+    try std.testing.expectEqual(worker_page.LogLineFlags.js_exception, tenant_line.header.flags);
+    try std.testing.expect(std.mem.indexOf(u8, tenant_line.text, thrown_message) != null);
+
+    try std.testing.expectEqual(@as(u64, 0), runtime_line.header.request_id);
+    try std.testing.expectEqual(@intFromEnum(worker_page.LogLevel.warn), runtime_line.header.level);
+    try std.testing.expectEqual(worker_page.LogLineFlags.runtime, runtime_line.header.flags);
+    try std.testing.expect(std.mem.indexOf(u8, runtime_line.text, thrown_message) == null);
+    // `logFormatted` in `worker/js/jsc/exception_log.zig` names the text the
+    // tenant got by its length and a prefix of its SHA-256 in hex.
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(tenant_line.text, &digest, .{});
+    const digest_hex = std.fmt.bytesToHex(digest, .lower);
+    var expected_buffer: [96]u8 = undefined;
+    const expected = try std.fmt.bufPrint(&expected_buffer, "{s} message_len={d} digest=", .{
+        named,
+        tenant_line.text.len,
+    });
+    const expected_index = std.mem.indexOf(u8, runtime_line.text, expected) orelse {
+        std.debug.print("the runtime's line does not name the exception's length and digest: {s}\n", .{
+            runtime_line.text,
         });
         return error.TestUnexpectedResult;
+    };
+    const named_digest = runtime_line.text[expected_index + expected.len ..];
+    try std.testing.expect(named_digest.len != 0);
+    try std.testing.expect(std.mem.startsWith(u8, &digest_hex, named_digest));
+}
+
+/// File-name prefixes of the shared objects for libraries the binary links
+/// statically: zlib, brotli, zstd and ICU.
+const linked_library_prefixes = [_][]const u8{ "libz.so", "libbrotli", "libzstd", "libicu" };
+
+/// Bound on a `/proc/<pid>/maps` read; a worker's maps are a few thousand
+/// lines.
+const worker_maps_bytes_max: usize = 4 * 1024 * 1024;
+
+test "a forked worker maps no zlib, brotli, zstd or ICU shared object" {
+    var spawned = try support.spawnZygote();
+    defer spawned.deinit();
+
+    var launched = try launchOrSkip(&spawned, 90_023, .{});
+    defer launched.deinit();
+
+    var path_buffer: [32]u8 = undefined;
+    const maps_path = try std.fmt.bufPrint(&path_buffer, "/proc/{d}/maps", .{launched.handle.pid});
+    const maps = try std.fs.cwd().readFileAlloc(std.testing.allocator, maps_path, worker_maps_bytes_max);
+    defer std.testing.allocator.free(maps);
+    inline for (linked_library_prefixes) |prefix| {
+        if (std.mem.indexOf(u8, maps, "/" ++ prefix) != null) {
+            std.debug.print("the worker maps a shared object starting with {s}\n", .{prefix});
+            return error.TestUnexpectedResult;
+        }
     }
-    // Seccomp denies clone, so a thread that retired while idle could
-    // never come back.
-    try std.testing.expectEqual(threads_before, threads_after);
 }
 
 test "worker node fs round trip stays inside chroot tmpfs" {
@@ -1597,7 +2031,7 @@ test "a worker that loses its egress gateway keeps serving, refuses fetch with a
     defer launched.deinit();
     const handle = &launched.handle;
 
-    const before_body = try forkedRequestBody(handle,90_020, 1, "/before");
+    const before_body = try forkedRequestBody(handle, 90_020, 1, "/before");
     defer std.testing.allocator.free(before_body);
     try std.testing.expectEqualStrings("fetched:200", before_body);
     var starts: [2]rt.FetchStartIdentity = undefined;
@@ -1609,7 +2043,7 @@ test "a worker that loses its egress gateway keeps serving, refuses fetch with a
     // and the worker keeps serving.
     first_gateway_alive = false;
     first_gateway.deinit();
-    const during_body = try forkedRequestBody(handle,90_021, 3, "/during");
+    const during_body = try forkedRequestBody(handle, 90_021, 3, "/during");
     defer std.testing.allocator.free(during_body);
     try std.testing.expectEqualStrings("TypeError", during_body);
     try std.testing.expect(!process.pidFdHasExited(handle.pidfd));
@@ -1620,7 +2054,7 @@ test "a worker that loses its egress gateway keeps serving, refuses fetch with a
     var second_gateway = try attachToNewGateway(handle, &wake_set);
     defer second_gateway.deinit();
 
-    const after_body = try forkedRequestBody(handle,90_022, 5, "/after");
+    const after_body = try forkedRequestBody(handle, 90_022, 5, "/after");
     defer std.testing.allocator.free(after_body);
     try std.testing.expectEqualStrings("fetched:200", after_body);
     try std.testing.expectEqual(@as(usize, 1), second_gateway.recordedFetchStarts(&starts));
@@ -1683,7 +2117,7 @@ test "an egress_attach to a worker still attached fails its fetch in flight with
     defer launched.deinit();
     const handle = &launched.handle;
 
-    try sendForkedRequest(handle,90_021, 1, "/hang");
+    try sendForkedRequest(handle, 90_021, 1, "/hang");
     try waitForFetchStarts(first_gateway, 1, 8_000);
 
     // The worker still holds the first gateway's session when the host
@@ -1700,7 +2134,7 @@ test "an egress_attach to a worker still attached fails its fetch in flight with
     // gateway's end, so the first one's exit does not detach the worker.
     first_gateway_alive = false;
     first_gateway.deinit();
-    const after_body = try forkedRequestBody(handle,90_022, 3, "/after");
+    const after_body = try forkedRequestBody(handle, 90_022, 3, "/after");
     defer std.testing.allocator.free(after_body);
     try std.testing.expectEqualStrings("fetched:200", after_body);
     var starts: [2]rt.FetchStartIdentity = undefined;
@@ -1776,7 +2210,7 @@ fn forkedRequestBody(
     stream_id: u32,
     path: []const u8,
 ) ![]u8 {
-    try sendForkedRequest(handle,request_id, stream_id, path);
+    try sendForkedRequest(handle, request_id, stream_id, path);
     return readForkedBody(handle, request_id);
 }
 
@@ -2184,7 +2618,7 @@ test "worker init with non-directory tmp root fd fails and marks init_failed" {
     defer std.posix.close(ingress_payload_credit_eventfd);
     var metrics = try zygote.worker_state.page.mapReadWrite(metrics_fd);
     defer metrics.deinit();
-    metrics.initializeCrashDefault(worker.pid, worker_memory_limit_bytes, try process.monotonicNowNs());
+    metrics.initializeCrashDefault();
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2261,7 +2695,7 @@ test "worker init with ordinary cgroup dir fd fails and marks init_failed" {
     defer std.posix.close(ingress_payload_credit_eventfd);
     var metrics = try zygote.worker_state.page.mapReadWrite(metrics_fd);
     defer metrics.deinit();
-    metrics.initializeCrashDefault(worker.pid, worker_memory_limit_bytes, try process.monotonicNowNs());
+    metrics.initializeCrashDefault();
 
     const tmp_root_path = try support.makeTempPath(std.testing.allocator, "collo-valid-tmp-root");
     defer std.testing.allocator.free(tmp_root_path);
@@ -2343,7 +2777,7 @@ test "worker init rejects invalid runtime boot options" {
     defer std.posix.close(ingress_payload_credit_eventfd);
     var metrics = try zygote.worker_state.page.mapReadWrite(metrics_fd);
     defer metrics.deinit();
-    metrics.initializeCrashDefault(worker.pid, worker_memory_limit_bytes, try process.monotonicNowNs());
+    metrics.initializeCrashDefault();
 
     var tmp_root = std.testing.tmpDir(.{});
     defer tmp_root.cleanup();
@@ -2455,7 +2889,7 @@ test "post-fork invalid init flushes exit probe before _exit" {
     defer std.posix.close(ingress_payload_credit_eventfd);
     var metrics = try zygote.worker_state.page.mapReadWrite(metrics_fd);
     defer metrics.deinit();
-    metrics.initializeCrashDefault(worker.pid, worker_memory_limit_bytes, try process.monotonicNowNs());
+    metrics.initializeCrashDefault();
 
     var tmp_root = std.testing.tmpDir(.{});
     defer tmp_root.cleanup();
@@ -2577,7 +3011,7 @@ fn expectBootDiesAtInitDeadline(route_count: usize, fork_job_id: u64) !void {
     defer egress_shared.deinit();
     var metrics = try zygote.worker_state.page.mapReadWrite(metrics_fd);
     defer metrics.deinit();
-    metrics.initializeCrashDefault(worker.pid, worker_memory_limit_bytes, try process.monotonicNowNs());
+    metrics.initializeCrashDefault();
 
     const fs_index_fd = try zygote.ipc.zygote_worker.createPlaceholderFsIndexMemfd();
     defer std.posix.close(fs_index_fd);
@@ -2677,7 +3111,7 @@ fn expectBootDiesAtInitDeadline(route_count: usize, fork_job_id: u64) !void {
     defer trace.deinit();
     // The child died in the evaluation: every native phase completed, and
     // the evaluation never did.
-    try std.testing.expect(trace.containsPrefix("child.boot_context.installed"));
+    try std.testing.expect(trace.containsPrefix("child.node_fs.enabled"));
     try std.testing.expect(!trace.containsPrefix("child.routes.evaluated"));
     try std.testing.expect(!trace.containsPrefix("child.worker_ready"));
 }

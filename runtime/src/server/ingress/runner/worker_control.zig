@@ -1,22 +1,33 @@
 //! A worker's control socket, read on the ingress lane thread that is the
-//! worker's reader (`server/supervisor/pool.zig`). A worker sends only
-//! ingress descriptors on it. The drain decodes each packet with the reader's
-//! account of the worker's ring (`Registration.ring_payloads`), so a ring
-//! payload decodes from the end of the last one even while earlier ones wait
-//! for another lane, and hands the descriptors to `h2_worker_ipc.zig`, which
-//! queues those of this lane's requests and forwards the rest. The loop's
-//! drains receive a packet only while the worker's forwarding window has
-//! room for its descriptors (`h2_worker_ipc.windowHasRoom`); a full window
-//! stops them until the release that makes room wakes the lane.
+//! worker's reader (`server/supervisor/pool.zig`). A worker sends two kinds
+//! of packet on it: ingress descriptors, and once at most the notice that it
+//! asks to be retired (`ipc.worker_retiring`). The drain decodes each
+//! descriptor packet with the reader's account of the worker's ring
+//! (`Registration.ring_payloads`), so a ring payload decodes from the end of
+//! the last one even while earlier ones wait for another lane, and hands the
+//! descriptors to `h2_worker_ipc.zig`, which queues those of this lane's
+//! requests and forwards the rest. The loop's drains receive a packet only
+//! while the worker's forwarding window has room for its descriptors
+//! (`h2_worker_ipc.windowHasRoom`); a full window stops them until the
+//! release that makes room wakes the lane.
+//!
+//! A retiring notice takes the worker out of service with no death: the
+//! pool stops handing its slots out, the requests it holds finish on it, and
+//! the reaper retires it once no lane holds a slot of it or reads it
+//! (`Pool.retireOnNotice`). The notice comes after every descriptor the
+//! worker sent before it, and the drain goes on past it, since the worker
+//! keeps answering what it holds.
 //!
 //! Every receive and decode error, and every packet the channel never
 //! carries, is the worker's fault (`fault.classifyWorkerError`), which the
 //! drain returns for the caller to act on; only the lane's own errors
 //! (`fault.LaneFault`) leave it as errors.
 
+const std = @import("std");
 const ipc = @import("collo_ipc");
 const completions = @import("../completions.zig");
 const fault = @import("../fault.zig");
+const admission = @import("admission.zig");
 const h2_worker_ipc = @import("h2_worker_ipc.zig");
 
 const LaneFault = fault.LaneFault;
@@ -41,6 +52,7 @@ pub const Pace = enum {
 
 pub fn Methods(comptime Self: type) type {
     return struct {
+        const Admission = admission.Methods(Self);
         const WorkerIpc = h2_worker_ipc.Methods(Self);
 
         /// Reads the control socket of the worker that the registration at
@@ -103,6 +115,13 @@ pub fn Methods(comptime Self: type) type {
                 packet.deinit();
                 return .{ .outcome = try fault.classifyWorkerError(.{ .ingress_decode = err }) };
             };
+            if (kind == .worker_retiring) {
+                defer packet.deinit();
+                const reason = ipc.worker_retiring.decode(packet) catch |err|
+                    return .{ .outcome = try fault.classifyWorkerError(.{ .retiring_decode = err }) };
+                try retireOnNotice(self, registration, reason);
+                return .{ .outcome = .ok };
+            }
             if (kind != .ingress_channel) {
                 packet.deinit();
                 return faulted(.unknown_kind);
@@ -128,6 +147,42 @@ pub fn Methods(comptime Self: type) type {
             ) catch |err| return .{ .outcome = try fault.classifyWorkerError(.{ .ingress_decode = err }) };
             defer received.deinit();
             return WorkerIpc.handleWorkerDescriptor(self, registration, &received);
+        }
+
+        /// Acts on the worker's notice that it asks to be retired for
+        /// `reason`: its pool takes it out of service without a death
+        /// (`Pool.retireOnNotice`), and the lanes that hold its slots finish
+        /// their requests on it. When nothing holds a slot any more, the
+        /// worker's reader, this lane, gives its role up through its own
+        /// queue (`release_worker`), after the drain that read the notice,
+        /// and the reaper retires the worker. The definition's waiters get a
+        /// replacement launch or 503 (`Admission.growOrStrand`).
+        fn retireOnNotice(
+            self: *Self,
+            registration: *completions.Registration,
+            reason: ipc.WorkerRetiringReason,
+        ) LaneFault!void {
+            const worker = registration.worker orelse return error.InvalidCompletionRegistration;
+            const definition = worker.definition_index;
+            self.lane.counters.retirement_notices += 1;
+            std.log.info("worker asks to be retired worker_id={d} reason={s}", .{ worker.id, @tagName(reason) });
+            switch (self.service.supervisor.poolFor(definition).retireOnNotice(worker, registration.worker_key)) {
+                // A notice after the worker left service, or a repeat, which
+                // an honest worker never sends.
+                .stale => return,
+                .draining => {},
+                .retire => self.service.queueRetirement(worker),
+                .release_reader => |tenure| {
+                    // A refused post leaves the release to the reaper's retry
+                    // (`Reaper.retryReleases`).
+                    if (!try self.postToLane(tenure.lane, .{ .release_worker = .{
+                        .worker_key = registration.worker_key,
+                        .epoch = tenure.epoch,
+                    } }))
+                        self.lane.counters.release_worker_refusals += 1;
+                },
+            }
+            try Admission.growOrStrand(self, definition, .replacement);
         }
 
         /// Whether the reader may receive the worker's next packet: its

@@ -12,7 +12,8 @@
 namespace Collo::HostFunctions {
 
 // One port in a transfer list: `source` is the port being transferred, `clone` the new port that takes over its
-// entanglement and queued messages when the transfer commits. Both are raw cell pointers and root nothing.
+// entanglement and queued messages when the transfer commits. Both are raw cell pointers: the structured clone that
+// records a transfer roots both cells and commits the transfer before it ends (structured_clone.cpp).
 struct WebApiMessagePortTransfer {
     JSC::JSObject* source { nullptr };
     JSC::JSObject* clone { nullptr };
@@ -27,7 +28,8 @@ void webApiMessagePortDidAddListener(WebApiEventTargetHandle, const WTF::String&
 bool webApiMessagePortIsValue(JSC::JSValue);
 bool webApiMessagePortIsDetached(JSC::JSValue);
 // Converts the ports given to the MessageEvent constructor or initMessageEvent (undefined or an iterable of
-// MessagePorts) into a frozen array. Returns null with an exception on the ThrowScope on failure.
+// MessagePorts) into a frozen array. More than WebApiMessageEventPortsMax ports throw a QuotaExceededError. Returns
+// null with an exception on the ThrowScope on failure.
 JSC::JSObject* webApiNormalizeMessagePortsArray(JSC::JSGlobalObject*, JSC::ThrowScope&, JSC::JSValue);
 // Allocates the port that will replace the value when its transfer commits. Throws a DataCloneError and returns null
 // unless the value is a MessagePort that is attached, open and entangled with a peer.

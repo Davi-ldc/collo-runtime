@@ -104,39 +104,6 @@ pub const SpawnedZygote = struct {
     }
 };
 
-const SpawnCleanup = struct {
-    pid: u32,
-    pidfd: ?std.posix.fd_t = null,
-    active: bool = true,
-
-    fn disarm(self: *SpawnCleanup) void {
-        self.active = false;
-    }
-
-    fn cleanup(self: *SpawnCleanup) void {
-        if (!self.active)
-            return;
-        self.active = false;
-
-        if (self.pidfd) |pidfd| {
-            process.pidFdSendSignal(pidfd, std.posix.SIG.KILL) catch |err| switch (err) {
-                error.ProcessNotFound => {},
-                else => std.log.warn("failed to SIGKILL spawned zygote pid={d}: {s}", .{ self.pid, @errorName(err) }),
-            };
-            _ = process.waitForPidFdExit(pidfd, process_limits.PROCESS_EXIT_WAIT_MS) catch |err| blk: {
-                std.log.warn("failed to wait for spawned zygote pid={d}: {s}", .{ self.pid, @errorName(err) });
-                break :blk false;
-            };
-        } else {
-            std.posix.kill(@intCast(self.pid), std.posix.SIG.KILL) catch |err| switch (err) {
-                error.ProcessNotFound => {},
-                else => std.log.warn("failed to SIGKILL spawned zygote by pid={d}: {s}", .{ self.pid, @errorName(err) }),
-            };
-        }
-        reapZygoteBestEffort(self.pid);
-    }
-};
-
 fn reapZygoteBestEffort(pid: u32) void {
     var status: c_int = 0;
     var checks: u32 = 0;
@@ -247,44 +214,39 @@ pub fn spawnZygote(options: state.ZygoteOptions) !SpawnedZygote {
             .target_fd = inherited_trace_fd,
         },
     };
-    const pid = try process.spawnInternal(.{
+    // The pidfd comes with the child, so from here on every failure can kill
+    // and reap the zygote through it.
+    var spawned = try process.spawnInternal(.{
         .exe_path_z = exe_path_z.ptr,
         .argv = &argv,
         .envp = zygote_env.ptr(),
         .fd_map = &fd_map,
     });
-
-    control_write.deinit();
-    const zygote_pid: u32 = @intCast(pid);
-    var spawn_cleanup = SpawnCleanup{ .pid = zygote_pid };
-    errdefer spawn_cleanup.cleanup();
-    var pidfd = fd_mod.OwnedFd.fromRaw(try process.openPidFd(zygote_pid));
-    spawn_cleanup.pidfd = pidfd.fd();
+    const zygote_pid = spawned.pid;
     errdefer {
-        process.pidFdSendSignal(pidfd.fd(), std.posix.SIG.KILL) catch |err| switch (err) {
+        process.pidFdSendSignal(spawned.pidfd.fd(), std.posix.SIG.KILL) catch |err| switch (err) {
             error.ProcessNotFound => {},
             else => std.log.warn("failed to SIGKILL zygote after spawn failure pid={d}: {s}", .{ zygote_pid, @errorName(err) }),
         };
-        _ = process.waitForPidFdExit(pidfd.fd(), process_limits.PROCESS_EXIT_WAIT_MS) catch |err| blk: {
+        _ = process.waitForPidFdExit(spawned.pidfd.fd(), process_limits.PROCESS_EXIT_WAIT_MS) catch |err| blk: {
             std.log.warn("failed to wait for zygote after spawn failure pid={d}: {s}", .{ zygote_pid, @errorName(err) });
             break :blk false;
         };
-        pidfd.deinit();
-        spawn_cleanup.pidfd = null;
+        spawned.pidfd.deinit();
         reapZygoteBestEffort(zygote_pid);
-        spawn_cleanup.disarm();
     }
-    // The zygote inherits the host's oom_score_adj. Raising it places the
-    // zygote after workers and before the gateway and the host in the kernel's
-    // OOM order. This ordering is defense in depth, so a failed write only
-    // warns.
+    control_write.deinit();
+    // The zygote inherits the host's oom_score_adj. Raising it to
+    // `OOM_SCORE_ADJ_ZYGOTE` places the zygote after the workers and the
+    // gateway and before the host in the kernel's OOM order
+    // (`common/limits/process.zig`). This ordering is defense in depth, so a
+    // failed write only warns.
     process.writeOomScoreAdj(zygote_pid, process_limits.OOM_SCORE_ADJ_ZYGOTE) catch |err|
         std.log.warn("failed to set zygote oom_score_adj pid={d}: {s}", .{ zygote_pid, @errorName(err) });
     _ = try recvZygoteReadyBeforeTimeout(control_read.fd(), trace_write.fd(), ZYGOTE_READY_TIMEOUT_MS);
-    spawn_cleanup.disarm();
     return .{
         .pid = zygote_pid,
-        .pidfd = pidfd.release(),
+        .pidfd = spawned.pidfd.release(),
         .control_fd = control_read.release(),
         .trace_read_fd = trace_read.release(),
         .trace_write_fd = trace_write.release(),
@@ -347,7 +309,7 @@ const OwnedZygoteEnv = struct {
             strings,
             &len,
             zygote_env_vm_flags,
-            try std.fmt.bufPrint(&flags_buffer, "{d}", .{options.vm_options.flags}),
+            try std.fmt.bufPrint(&flags_buffer, "{d}", .{options.vm_options.flags()}),
         );
         if (options.postfork_exit_probe_path) |path| {
             try appendEnvEntry(

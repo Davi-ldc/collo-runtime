@@ -1,7 +1,8 @@
 //! Tests of the readiness driver the HTTP/2 pool waits on: a wake through the
 //! eventfd, deadline expiry on the poll and io_uring backends, readable and
 //! writable reports, and one poll entry per fd when several streams share it.
-//! The io_uring tests return early when the kernel refuses a ring.
+//! The io_uring tests skip when the kernel or its policy offers no io_uring
+//! (`initUringDriver`), and fail on any other setup error.
 
 const std = @import("std");
 const test_support = @import("support.zig");
@@ -21,6 +22,15 @@ const test_alpn_h2 = test_support.test_alpn_h2;
 const routableLocalIpv4 = test_support.routableLocalIpv4;
 const FakeWriteTransport = test_support.FakeWriteTransport;
 
+/// The io_uring backend, or a skip when this kernel or its policy offers no
+/// usable ring; any other failure fails the test.
+fn initUringDriver() !readiness.Driver {
+    return readiness.Driver.initWithBackend(std.testing.allocator, .io_uring) catch |err| switch (err) {
+        error.UnsupportedKernel, error.PermissionDenied => return error.SkipZigTest,
+        else => |other| return other,
+    };
+}
+
 test "http2 egress pool readiness can be woken by owner eventfd" {
     var driver = try readiness.Driver.initWithBackend(std.testing.allocator, .poll);
     defer driver.deinit();
@@ -36,7 +46,7 @@ test "http2 egress pool readiness can be woken by owner eventfd" {
 }
 
 test "http2 egress readiness can use io_uring when supported" {
-    var driver = readiness.Driver.initWithBackend(std.testing.allocator, .io_uring) catch return;
+    var driver = try initUringDriver();
     defer driver.deinit();
     try std.testing.expectEqual(readiness.Backend.io_uring, driver.backendKind());
     const fd = try std.posix.eventfd(0, std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK);
@@ -60,7 +70,7 @@ test "http2 egress readiness can use io_uring when supported" {
 }
 
 test "http2 egress io_uring readiness expires without falling back to poll" {
-    var driver = readiness.Driver.initWithBackend(std.testing.allocator, .io_uring) catch return;
+    var driver = try initUringDriver();
     defer driver.deinit();
     var context: u8 = 0;
     const now = try readiness.monotonicNowNs();

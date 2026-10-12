@@ -1,6 +1,6 @@
 // ClassInfo and visitChildren of the ReadableStream cells declared in readable_stream_private.h. visitChildren runs on
-// collector threads concurrently with the VM thread and must visit every WriteBarrier field of its class, including
-// those inside the stream's vectors: a field missed here leaves its target to be collected while still referenced.
+// collector threads concurrently with the VM thread and must visit every WriteBarrier field of its class and every
+// list and native source it owns: a field missed here leaves its target to be collected while still referenced.
 
 #include "host_functions/webapi/streams/readable_stream_private.h"
 
@@ -32,24 +32,10 @@ template <typename Visitor> void JSColloReadableStream::visitChildrenImpl(JSCell
     visitor.append(this_object->m_default_tee_state);
     visitor.append(this_object->m_native_pull_fulfilled);
     visitor.append(this_object->m_native_pull_rejected);
-    // The cell lock keeps the buffers of the queue and both request vectors in place while the marker walks them, and
-    // keeps the native source alive while it is visited. The VM thread takes it around every change that moves or
-    // frees those buffers and around detaching the source.
-    WTF::Locker locker { this_object->cellLock() };
-    if (auto* native_source = this_object->m_native_source.get())
-        native_source->visitAggregate(visitor);
-    for (size_t index = this_object->m_queue_start; index < this_object->m_queue.size(); ++index)
-        visitor.append(this_object->m_queue[index].value);
-    for (size_t index = this_object->m_read_request_start; index < this_object->m_read_requests.size(); ++index) {
-        visitor.append(this_object->m_read_requests[index].promise);
-        visitor.append(this_object->m_read_requests[index].resolve);
-        visitor.append(this_object->m_read_requests[index].reject);
-    }
-    for (size_t index = this_object->m_byob_read_request_start; index < this_object->m_byob_read_requests.size();
-        ++index) {
-        visitor.append(this_object->m_byob_read_requests[index].promise);
-        visitor.append(this_object->m_byob_read_requests[index].view);
-    }
+    this_object->m_native_source.visit(this_object, visitor);
+    this_object->m_queue.visit(this_object, visitor);
+    this_object->m_read_requests.visit(this_object, visitor);
+    this_object->m_byob_read_requests.visit(this_object, visitor);
 }
 
 template <typename Visitor> void JSColloReadableStreamDefaultReader::visitChildrenImpl(JSCell* cell, Visitor& visitor)

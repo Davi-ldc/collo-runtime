@@ -312,6 +312,7 @@ pub fn Methods(comptime Self: type) type {
                 .{
                     .lane_id = self.listener_index,
                     .definition_count = self.service.routes.definitionCount(),
+                    .slots_per_worker_total = self.service.routes.slotsPerWorkerTotal(),
                     .max_requests = self.table_capacities.requests,
                 },
                 self.monotonicNowNs(),

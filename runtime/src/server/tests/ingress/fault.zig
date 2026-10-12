@@ -36,6 +36,7 @@ test "every connection error classifies as its table row expects" {
 test "every worker error classifies as its table row expects" {
     try expectTable(receive_table);
     try expectTable(ingress_decode_table);
+    try expectTable(retiring_decode_table);
     try expectTable(fs_fault_decode_table);
     try expectTable(wake_table);
     try expectTable(completion_table);
@@ -136,6 +137,7 @@ test "the lane fault set names no error a client or a worker produces" {
         "InvalidH2StreamIdentity",
         "WorkerCompletionSequenceMismatch",
         "InvalidWorkerCompletionRecord",
+        "InvalidWorkerRetiringReason",
     };
     inline for (client_or_worker_errors) |name| {
         if (comptime setHas(fault.LaneFault, name)) {
@@ -190,6 +192,7 @@ test "every error the classified callees return today is in their table or is a 
         assertCovered(ErrorsOf(ipc.ingress_channel.decodeReceivedBatchPacket), fault.IngressDecodeError, "IngressDecodeError");
         assertCovered(ErrorsOf(ipc.ingress_channel.decodeReceivedBatchPacketWithSharedPayload), fault.IngressDecodeError, "IngressDecodeError");
 
+        assertCovered(ErrorsOf(ipc.worker_retiring.decode), fault.RetiringDecodeError, "RetiringDecodeError");
         assertCovered(ErrorsOf(ipc.fs_fault.decodeRequest), fault.FsFaultDecodeError, "FsFaultDecodeError");
 
         assertCovered(ErrorsOf(page.drainCompletionEventfd), fault.WakeError, "WakeError");
@@ -375,7 +378,6 @@ const request_head_table = struct {
     }
     const rows = [_]Row(Set, Outcome){
         .{ .expected = .{ .outcome = .keep }, .errors = &.{
-            error.RequestTooLarge,
             error.TooManyRequestHeaders,
             error.InvalidHeaderLine,
             error.Http2UppercaseHeaderName,
@@ -472,6 +474,21 @@ const ingress_decode_table = struct {
             error.ShortRead,
         } },
         .{ .expected = workerFault(.allocation_failed), .errors = &.{error.OutOfMemory} },
+    };
+};
+
+const retiring_decode_table = struct {
+    const Set = fault.RetiringDecodeError;
+    const Outcome = fault.WorkerOutcome;
+    fn classify(err: (fault.LaneFault || Set)) fault.LaneFault!Outcome {
+        return fault.classifyWorkerError(.{ .retiring_decode = err });
+    }
+    const rows = [_]Row(Set, Outcome){
+        .{ .expected = workerFault(.unknown_kind), .errors = &.{error.InvalidMessageKind} },
+        .{ .expected = workerFault(.retiring_notice_invalid), .errors = &.{
+            error.InvalidPacket,
+            error.InvalidWorkerRetiringReason,
+        } },
     };
 };
 
@@ -644,9 +661,11 @@ const worker_fault_labels = [_]Label(fault.WorkerFaultReason){
     .{ .peer_closed, "peer_closed" },
     .{ .exited, "exited" },
     .{ .deadline_grace_expired, "deadline_grace_expired" },
+    .{ .owner_overran, "owner_overran" },
     .{ .usage_record_protocol, "usage_record_protocol" },
     .{ .log_ring_corrupt, "log_ring_corrupt" },
     .{ .egress_session_failed, "egress_session_failed" },
+    .{ .retiring_notice_invalid, "retiring_notice_invalid" },
 };
 
 const connection_close_labels = [_]Label(fault.ConnectionCloseReason){
@@ -837,6 +856,12 @@ const StubLane = struct {
 
     pub fn startDynamicH2(_: *StubLane, _: *Slot, _: u32, _: *const request_head.ParsedHead) error{}!bool {
         return true;
+    }
+
+    pub fn refuseH2Stream(_: *StubLane, _: *Slot, _: u32, _: *const request_head.RefusedHead) error{}!void {}
+
+    pub fn monotonicNowNs(_: *const StubLane) u64 {
+        return 0;
     }
 
     pub fn handleH2DataFrame(_: *StubLane, _: *Slot, _: u32, _: []const u8, _: bool, _: usize) error{}!connection.DataFrameHandling {

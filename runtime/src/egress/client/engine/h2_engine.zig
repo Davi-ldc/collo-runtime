@@ -308,10 +308,6 @@ pub fn Methods(
             return H2Lifecycle.failFetchBodyBestEffort(body, allocator, message, context);
         }
 
-        fn h2LimitsEqual(a: http2.Limits, b: http2.Limits) bool {
-            return H2Lifecycle.h2LimitsEqual(a, b);
-        }
-
         pub fn h2ConnectMain(self: *Engine, connector_index: usize) void {
             const readiness_driver = self.h2ReadinessDriver(connector_index);
             const data_driver = self.h2DataDriver(connector_index + 1);
@@ -827,18 +823,15 @@ pub fn Methods(
             }
         }
 
+        /// A command joins the group already connecting to its origin without
+        /// allocating; only a new group builds the key, which the group owns.
         fn enqueueH2ConnectOrWait(
             engine: *Engine,
             connecting: *std.array_list.Aligned(H2ConnectGroup, null),
             command: Command,
         ) !void {
-            var key = try H2ConnectKey.init(engine.allocator, command);
-            var key_owned = true;
-            errdefer if (key_owned)
-                key.deinit(engine.allocator);
-
             const joined_mono_ns = readiness.monotonicNowNs() catch 0;
-            if (findH2ConnectGroupIndexByKey(connecting.items, key)) |index| {
+            if (findH2ConnectGroupIndex(connecting.items, command)) |index| {
                 try connecting.items[index].commands.append(engine.allocator, .{
                     .command = command,
                     .joined_mono_ns = joined_mono_ns,
@@ -846,8 +839,10 @@ pub fn Methods(
                 return;
             }
 
-            var group = H2ConnectGroup{ .key = key, .dispatched = command };
-            key_owned = false;
+            var group = H2ConnectGroup{
+                .key = try H2ConnectKey.init(engine.allocator, command),
+                .dispatched = command,
+            };
             var group_owned = true;
             errdefer if (group_owned)
                 group.deinit(engine.allocator);
@@ -869,22 +864,6 @@ pub fn Methods(
             for (groups, 0..) |group, index|
                 if (group.key.matchesCommand(command))
                     return index;
-            return null;
-        }
-
-        fn findH2ConnectGroupIndexByKey(groups: []const H2ConnectGroup, key: H2ConnectKey) ?usize {
-            for (groups, 0..) |group, index| {
-                if (group.key.port == key.port and
-                    group.key.insecure_tls == key.insecure_tls and
-                    group.key.allow_private_networks == key.allow_private_networks and
-                    h2LimitsEqual(group.key.h2_limits, key.h2_limits) and
-                    group.key.max_outgoing_buffer_bytes == key.max_outgoing_buffer_bytes and
-                    group.key.tls_ciphertext_buffer_bytes == key.tls_ciphertext_buffer_bytes and
-                    std.mem.eql(u8, &group.key.pool_security_cell_id, &key.pool_security_cell_id) and
-                    std.mem.eql(u8, &group.key.pool_policy_id, &key.pool_policy_id) and
-                    std.mem.eql(u8, group.key.authority_host_lower, key.authority_host_lower))
-                    return index;
-            }
             return null;
         }
 
@@ -1697,7 +1676,6 @@ pub fn Methods(
                         item.command.task.url,
                         item.command.task.method,
                         item.command.task.headers,
-                        item.command.task.body,
                         head.result.status_code,
                         head.result.headers,
                         .{
@@ -2921,11 +2899,7 @@ pub fn Methods(
                 return;
             };
             defer plan.deinit();
-            const policy = transport.EgressPolicy{
-                .allow_plain_http = command.config.allow_plain_http,
-                .allow_private_networks = command.config.allow_private_networks,
-            };
-            var target = policy.resolveRequestTargetUntil(
+            var target = transport.resolveRequestTargetUntil(
                 engine.allocator,
                 &engine.dns_cache,
                 plan.target,

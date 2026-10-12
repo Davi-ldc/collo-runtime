@@ -10,9 +10,12 @@
 //! `ready.zig` settles readers from the ready queue, `cleanup.zig` cancels and
 //! releases, and `common.zig` holds the lookups they share.
 //!
-//! `State.bodies` holds one reference on each body, keyed by body id. Before
-//! that reference goes, every queued chunk is released and every tee link
-//! detached, as `fetch_body.zig` asserts, and the body's decoder in
+//! `State.bodies` holds one reference on each body, keyed by body id, and it
+//! is the only lasting one: a reader stored on a body takes none, and the
+//! settlement that runs a reader's JavaScript holds one of its own for its
+//! run (`ready.zig`). Before the table's reference goes, every queued chunk
+//! is released and every tee link detached, as `fetch_body.zig` asserts, and
+//! the body's decoder in
 //! `State.body_decoders` is removed in the same step. Releasing a body-pool
 //! extent only queues it; whoever drives the pass then calls
 //! `gateway_control.flushBodyPoolReleases`, so the gateway gets one wake per

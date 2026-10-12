@@ -6,6 +6,7 @@
 comptime {
     _ = @import("fs_fault.zig");
     _ = @import("fs_index.zig");
+    _ = @import("host/crypto.zig");
     _ = @import("scheduler.zig");
     _ = @import("sentinel.zig");
     _ = @import("request/all.zig");

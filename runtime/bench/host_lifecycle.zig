@@ -133,6 +133,11 @@ pub fn main() !void {
     // delegated subtree there is no worker to measure.
     var cgroup_root = try host.WorkerCgroupRoot.init(allocator, cgroupPlacement());
     defer cgroup_root.deinit(allocator);
+    // The one directory every worker of this host mounts its tmpfs over, as
+    // a server holds one for its life.
+    var tmp_mount: host.TmpMountPoint = undefined;
+    try tmp_mount.init(host.tmp_mount.default_parent_dir);
+    defer tmp_mount.deinit();
 
     // The machine before anything of ours exists: the zygote's own
     // system-wide cost is measured over this reading.
@@ -162,6 +167,7 @@ pub fn main() !void {
         .allocator = allocator,
         .spawned = &spawned,
         .cgroup_root = &cgroup_root,
+        .tmp_mount_point_fd = tmp_mount.fd(),
         .ids = &ids,
         .pack_fd = pack_fd,
         .route_table = route_table,
@@ -330,6 +336,8 @@ const Context = struct {
     allocator: std.mem.Allocator,
     spawned: *zygote.host_client.SpawnedZygote,
     cgroup_root: *host.WorkerCgroupRoot,
+    /// The host's mount point (`host.TmpMountPoint.fd`), borrowed.
+    tmp_mount_point_fd: std.posix.fd_t,
     ids: *Ids,
     pack_fd: std.posix.fd_t,
     route_table: ipc.route_table.Sealed,
@@ -603,6 +611,7 @@ fn launchWorker(ctx: Context, routes: host.launch.LaunchRoutes) !Worker {
                 .shared_fds = egress.rawForWorker(),
                 .boot = bench_boot_egress,
             } },
+            .tmp_mount_point_fd = ctx.tmp_mount_point_fd,
             .routes = routes,
         },
     );

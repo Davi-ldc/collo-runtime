@@ -7,9 +7,10 @@
 //!   table is shared by the whole connection, so a head rejected here leaves
 //!   it as the client's decoder expects.
 //! - A name must be a lowercase token and not a connection-specific field
-//!   (RFC 9113 §8.2.2). A colon is not a token byte, so a worker's headers can
-//!   never add a pseudo-header, and `:status` comes only from the status the
-//!   caller passes.
+//!   (RFC 9113 §8.2.2), `te` included, which only a request may carry. A
+//!   colon is not a token byte, so a worker's headers can never add a
+//!   pseudo-header, and `:status` comes only from the status the caller
+//!   passes.
 
 const std = @import("std");
 
@@ -45,7 +46,7 @@ pub fn encodeResponseHeadersScratch(
 fn validateResponseHeader(header: ipc.ingress_channel.ResponseHeader) !void {
     if (!http.headers.isLowercaseTokenName(header.name))
         return error.InvalidHttp2ResponseHeader;
-    if (http.headers.isConnectionSpecificName(header.name))
+    if (http.headers.isConnectionSpecificField(header.name, header.value, .response))
         return error.InvalidHttp2ResponseHeader;
     http.headers.validateValue(header.value) catch return error.InvalidHttp2ResponseHeader;
 }

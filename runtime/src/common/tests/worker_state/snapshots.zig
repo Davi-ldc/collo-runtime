@@ -1,6 +1,7 @@
 //! The host's snapshots of a worker's page (`common/worker_state/page/snapshots.zig`): a live
 //! slot's raw state compared and never cast, its identity matched on the copy the caller keeps,
-//! the lifecycle tags converted only when their enums name them, and the usage record ring's
+//! the lifecycle tags converted only when their enums name them, the owner section's pairs, the
+//! running owner's refused while its sequence is odd, and the usage record ring's
 //! cursor, which keeps the host's tail in host memory, refuses a head no append can produce and
 //! never reloads the head between a peek and its advance. The server's use of them, the death
 //! record and the fault a corrupt ring raises, is covered by the server-supervisor lane.
@@ -27,8 +28,7 @@ fn claimedSlot(state: u32) page.LiveRequestSlot {
     slot.request_generation = identity.request_generation;
     slot.worker_id = identity.worker_id;
     slot.worker_generation = identity.worker_generation;
-    slot.started_mono_ns = 1_000;
-    slot.cpu_time_ns = 250;
+    slot.cpu_ns = 250;
     slot.state = state;
     return slot;
 }
@@ -62,18 +62,19 @@ test "a live slot snapshot is matched on every identity field and keeps what it 
     other = identity;
     other.request_lane_id += 1;
     try std.testing.expect(!snapshot.matches(other));
-    // `billing_sequence` is a correlation copy, not part of the key.
     other = identity;
-    other.billing_sequence = 99;
-    try std.testing.expect(snapshot.matches(other));
+    other.request_slot += 1;
+    try std.testing.expect(!snapshot.matches(other));
+    other = identity;
+    other.worker_id += 1;
+    try std.testing.expect(!snapshot.matches(other));
 
     // The worker rewrites the slot after the load; the copy is unchanged.
     slot.request_id = 999;
-    slot.cpu_time_ns = 1 << 40;
+    slot.cpu_ns = 1 << 40;
     slot.state = @intFromEnum(page.LiveSlotState.empty);
     try std.testing.expect(snapshot.matches(identity));
-    try std.testing.expectEqual(@as(u64, 250), snapshot.cpu_time_ns);
-    try std.testing.expectEqual(@as(u64, 1_000), snapshot.started_mono_ns);
+    try std.testing.expectEqual(@as(u64, 250), snapshot.cpu_ns);
 }
 
 test "a lifecycle tag outside its enum reads as null" {
@@ -84,26 +85,61 @@ test "a lifecycle tag outside its enum reads as null" {
     try std.testing.expectEqual(page.State.dead, known.knownState().?);
     try std.testing.expectEqual(page.TerminationReason.memory, known.knownTerminationReason().?);
 
+    header.termination_reason = @intFromEnum(page.TerminationReason.sentinel);
+    try std.testing.expectEqual(page.TerminationReason.sentinel, page.LifecycleSnapshot.load(&header).knownTerminationReason().?);
+
     header.state = 0;
-    header.termination_reason = 6;
+    header.termination_reason = 7;
     const unknown = page.LifecycleSnapshot.load(&header);
     try std.testing.expect(unknown.knownState() == null);
     try std.testing.expect(unknown.knownTerminationReason() == null);
-    try std.testing.expectEqual(@as(u32, 6), unknown.termination_reason);
+    try std.testing.expectEqual(@as(u32, 7), unknown.termination_reason);
 
     header.termination_reason = std.math.maxInt(u32);
     try std.testing.expect(page.LifecycleSnapshot.load(&header).knownTerminationReason() == null);
 }
 
+test "a running owner load refuses a pair the sentinel is still storing, and a pair that names no owner" {
+    var header = std.mem.zeroes(page.Header);
+    header.running_owner_id = 41;
+    header.running_owner_cpu_ns = 100;
+
+    // Odd: the sentinel is between its two stores.
+    header.running_owner_sequence = 3;
+    try std.testing.expect(page.RunningOwnerSnapshot.load(&header) == null);
+    header.running_owner_sequence = std.math.maxInt(u32);
+    try std.testing.expect(page.RunningOwnerSnapshot.load(&header) == null);
+
+    header.running_owner_sequence = 2;
+    const stable = page.RunningOwnerSnapshot.load(&header) orelse return error.TestExpectedRunningOwner;
+    try std.testing.expectEqual(@as(u64, 41), stable.owner_id);
+    try std.testing.expectEqual(@as(u64, 100), stable.cpu_ns);
+
+    // A pair under owner id 0 names no owner.
+    header.running_owner_id = 0;
+    try std.testing.expect(page.RunningOwnerSnapshot.load(&header) == null);
+}
+
+test "the owner snapshot keeps the raw id and deadline the page holds" {
+    var header = std.mem.zeroes(page.Header);
+    const idle = page.OwnerSnapshot.load(&header);
+    try std.testing.expectEqual(@as(u64, 0), idle.owner_id);
+    try std.testing.expectEqual(@as(u64, 0), idle.deadline_mono_ns);
+
+    header.owner_id = std.math.maxInt(u64);
+    header.owner_deadline_mono_ns = 12_345;
+    const owned = page.OwnerSnapshot.load(&header);
+    // The copy keeps what it loaded after the worker rewrites the page.
+    header.owner_deadline_mono_ns = 0;
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), owned.owner_id);
+    try std.testing.expectEqual(@as(u64, 12_345), owned.deadline_mono_ns);
+}
+
 fn record(request_id: u64) page.CompletedRecord {
     return .{
         .request_id = request_id,
-        .started_mono_ns = request_id * 10,
-        .finished_mono_ns = request_id * 10 + 5,
-        .cpu_time_ns = request_id,
-        .io_time_ns = 0,
+        .cpu_ns = request_id,
         .status = @intFromEnum(page.CompletedStatus.done),
-        .flags = 0,
     };
 }
 

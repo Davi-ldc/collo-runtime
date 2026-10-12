@@ -1,9 +1,10 @@
 //! The launcher: the node's one thread that turns a pool's claim for a worker
 //! into a published worker, and that attaches live workers to a new egress
 //! gateway when the one they had is lost. A cold start is fork, launch,
-//! deliver. For each launch the launcher creates the worker's egress wake set
-//! and its cgroup leaf, attaches its egress session when its definition has a
-//! grant (`worker_factory.zig`), runs the fork RPC, sends `WorkerInit` and
+//! deliver. For each launch the launcher creates the worker's cgroup leaf
+//! and, when its definition has a `network` grant (`worker_factory.zig`), its
+//! egress wake set and session, runs the fork RPC, sends `WorkerInit` with
+//! the definition's limits and
 //! waits for `WorkerReady` in one `poll` set over every launch in flight,
 //! then hands the ready worker to `Deps.publish`, whose pool handoffs carry
 //! its slots to the lanes of the waiting requests. The zygote serves one fork
@@ -31,7 +32,10 @@
 //! (`ipc.egress_shared.WakeSet`), because the worker's io_uring registers the
 //! set's completion eventfd and liveness pipe at boot and no other file
 //! afterwards. The launch's set goes to the worker's record at the publish,
-//! which keeps it for the worker's life.
+//! which keeps it for the worker's life. A worker of a definition without a
+//! grant has no set, gets `WorkerInit` without egress descriptors, attaches
+//! nothing and is never named by the reattach pass, so no gateway is spawned
+//! on its account.
 //!
 //! A gateway loss (`gatewayLost`) starts a reattach pass on the launcher
 //! thread: a gateway spawn, then one live worker per turn, each of a
@@ -132,10 +136,10 @@ pub const egress_prewarm_interval_ms: i32 = 1_000;
 
 /// Session loss reports (`Launcher.egressSessionLost`) waiting for the
 /// launcher thread. A gateway reports each session once and holds at most
-/// `sizing.workers_max` of them, and the reports of a gateway that was
+/// `sizing.sessions_max` of them, and the reports of a gateway that was
 /// retired may still arrive beside the current one's, so a correct gateway
 /// never fills this.
-const lost_sessions_max: usize = 2 * egress_sizing.workers_max;
+const lost_sessions_max: usize = 2 * egress_sizing.sessions_max;
 
 /// Finished launches `takeTraces` can return; older ones are dropped first.
 pub const trace_capacity: usize = 256;
@@ -196,7 +200,7 @@ pub const LaunchState = enum {
 /// Why a launch produced no worker.
 pub const LaunchFailure = enum {
     /// The cgroup leaf could not be created or configured, or the launcher
-    /// has no worker cgroup root to create it under.
+    /// has no worker host to create it under (`WorkerHost`).
     cgroup_leaf,
     /// The worker's egress wake set could not be created
     /// (`ipc.egress_shared.WakeSet.create`), or a detached launch could not
@@ -223,11 +227,6 @@ pub const LaunchFailure = enum {
     egress_gateway_required,
     /// The child came without the cgroup leaf it must be born in.
     worker_cgroup_not_prepared,
-    /// The worker's tmp root came back with another mode than the launch
-    /// created it with.
-    invalid_worker_tmp_root_mode,
-    /// The worker's tmp root came back owned by another user.
-    invalid_worker_tmp_root_owner,
     /// The boot options failed `WorkerRuntimeBootOptions.validate`.
     invalid_boot_options,
     /// The child reported init failure or ended before `WorkerReady`. The
@@ -249,8 +248,6 @@ pub const LaunchFailure = enum {
     pub fn fromLaunchError(err: host.launch.LaunchError) LaunchFailure {
         return switch (err) {
             error.WorkerCgroupNotPrepared => .worker_cgroup_not_prepared,
-            error.InvalidWorkerTmpRootMode => .invalid_worker_tmp_root_mode,
-            error.InvalidWorkerTmpRootOwner => .invalid_worker_tmp_root_owner,
             error.InvalidBootOptions => .invalid_boot_options,
             error.EgressWakeUnavailable => .egress_wake_set,
             error.WorkerInitTimeout => .child_window_expired,
@@ -280,8 +277,6 @@ pub const LaunchFailure = enum {
             .egress_attach,
             .egress_gateway_required,
             .worker_cgroup_not_prepared,
-            .invalid_worker_tmp_root_mode,
-            .invalid_worker_tmp_root_owner,
             .invalid_boot_options,
             .worker_init_failed,
             .child_window_expired,
@@ -376,7 +371,8 @@ pub const ReattachTarget = struct {
 pub const ReadyWorker = struct {
     handle: host.WorkerHandle,
     /// The worker's wake set, which every later session of the worker is
-    /// built on (`worker_table.Record.egress_wake_set`).
+    /// built on (`worker_table.Record.egress_wake_set`); empty for a
+    /// definition without a grant.
     egress_wake_set: ipc.egress_shared.WakeSet,
     /// The worker's egress session, 0 for a definition without a grant. It
     /// is of the current gateway unless that gateway failed under the
@@ -463,6 +459,16 @@ pub const Deps = struct {
     dropEgressSession: *const fn (ctx: *anyopaque, generation: u64, session_id: u64) bool,
 };
 
+/// What the host prepared at boot for every worker it launches, both
+/// borrowed until the launcher and every worker are gone: the delegated
+/// cgroup subtree each worker's leaf is created under (`host/cgroup_root.zig`)
+/// and the one directory every worker mounts its tmpfs over, whose descriptor
+/// each `WorkerInit` carries (`host/tmp_mount.zig`). Every launch needs both.
+pub const WorkerHost = struct {
+    cgroup_root: *host.WorkerCgroupRoot,
+    tmp_mount_point: *const host.TmpMountPoint,
+};
+
 pub const Options = struct {
     deps: Deps,
     /// Borrowed; outlives the launcher. The launcher thread alone sends fork
@@ -471,10 +477,10 @@ pub const Options = struct {
     /// Borrowed: a launch hands its child the definition's limits and route
     /// artifacts (pack, bindings, fs index).
     routes: *const routes_mod.Routes,
-    /// Borrowed; null only in fixtures that never fork, since a worker is
-    /// born only into a prepared leaf and a launch without a root fails with
+    /// Null only in fixtures that never fork, since a worker is born only
+    /// into a prepared leaf and a launch without a worker host fails with
     /// `cgroup_leaf`.
-    worker_cgroup_root: ?*host.WorkerCgroupRoot,
+    worker_host: ?WorkerHost,
     /// What every launch sends, read once at boot
     /// (`resolveWorkerRuntimeBootOptions`, `resolveWorkerTmpfsSizeBytes`).
     boot: ipc.WorkerRuntimeBootOptions,
@@ -571,7 +577,8 @@ const Launch = struct {
     /// The worker's wake set, from `startFork` until the publish hands it to
     /// the worker's record or `endFailed` closes it: the launch's session is
     /// built on it, and a launch without one sends `WorkerInit` the worker's
-    /// wake descriptors from it.
+    /// wake descriptors from it. Never created for a definition without a
+    /// grant.
     wake_set: ipc.egress_shared.WakeSet = .{},
     /// From the attach until `Machine.start` sent `WorkerInit`, after which
     /// the child holds its own copies of the session's descriptors; null for
@@ -649,7 +656,7 @@ pub const Launcher = struct {
     deps: Deps,
     zygote_process: *zygote.host_client.SpawnedZygote,
     routes: *const routes_mod.Routes,
-    worker_cgroup_root: ?*host.WorkerCgroupRoot,
+    worker_host: ?WorkerHost,
     boot: ipc.WorkerRuntimeBootOptions,
     tmpfs_size_bytes: ?u64,
     /// `definitionCount() * launches_per_definition_max` entries, allocated
@@ -660,8 +667,8 @@ pub const Launcher = struct {
     pollfds: []std.posix.pollfd,
     poll_launches: []u32,
     /// Guards `submitted`, `submitted_ns`, `egress_lost_generation`,
-    /// `lost_sessions` with its length and `counters`. A leaf, never held
-    /// across a call.
+    /// `lost_sessions` with its length, its swap with `lost_sessions_taken`,
+    /// and `counters`. A leaf, never held across a call.
     mutex: std.Thread.Mutex,
     /// A bit per definition submitted since the thread last looked. A second
     /// submit before then adds nothing, so submissions never queue beyond one
@@ -674,9 +681,14 @@ pub const Launcher = struct {
     /// since one pass serves them all.
     egress_lost_generation: u64,
     /// Session loss reports the thread has not taken yet, in arrival order;
-    /// the first `lost_sessions_len` are set.
-    lost_sessions: [lost_sessions_max]LostSession,
+    /// the first `lost_sessions_len` are set. `lost_sessions_max` entries,
+    /// allocated at `init`.
+    lost_sessions: []LostSession,
     lost_sessions_len: usize,
+    /// The reports the thread took last, as many entries as `lost_sessions`,
+    /// with which `takeSessionLosses` swaps it, so the thread walks what it
+    /// took with no copy while new reports fill the other buffer.
+    lost_sessions_taken: []LostSession,
     counters: Counters,
     /// Failed launches whose leftovers hold a child or a leaf that the
     /// reaper has not torn down yet (`leftoversReaped`).
@@ -712,7 +724,8 @@ pub const Launcher = struct {
     egress: EgressPass,
 
     /// Prepares the launcher in place: the launch table, the poll set, the
-    /// trace ring and the wake eventfd. The thread starts at `start`. `gpa`
+    /// trace ring, the session loss buffers and the wake eventfd. The thread
+    /// starts at `start`. `gpa`
     /// must be the supervisor's allocator, since every worker's send scratch
     /// comes from it and its record frees it. Fails with
     /// `error.InvalidLauncherOptions` for a table that could hold no launch
@@ -738,6 +751,10 @@ pub const Launcher = struct {
         errdefer gpa.free(poll_launches);
         const trace_entries = try gpa.alloc(LaunchTrace, trace_capacity);
         errdefer gpa.free(trace_entries);
+        const lost_sessions = try gpa.alloc(LostSession, lost_sessions_max);
+        errdefer gpa.free(lost_sessions);
+        const lost_sessions_taken = try gpa.alloc(LostSession, lost_sessions_max);
+        errdefer gpa.free(lost_sessions_taken);
         const wake = try std.posix.eventfd(0, std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK);
 
         self.* = .{
@@ -745,7 +762,7 @@ pub const Launcher = struct {
             .deps = options.deps,
             .zygote_process = options.zygote_process,
             .routes = options.routes,
-            .worker_cgroup_root = options.worker_cgroup_root,
+            .worker_host = options.worker_host,
             .boot = options.boot,
             .tmpfs_size_bytes = options.tmpfs_size_bytes,
             .launches = launches,
@@ -755,8 +772,9 @@ pub const Launcher = struct {
             .submitted = .initEmpty(),
             .submitted_ns = @splat(0),
             .egress_lost_generation = 0,
-            .lost_sessions = undefined,
+            .lost_sessions = lost_sessions,
             .lost_sessions_len = 0,
+            .lost_sessions_taken = lost_sessions_taken,
             .counters = .{},
             .leftovers_held = .init(0),
             .wake = fd_mod.OwnedFd.fromRaw(wake),
@@ -877,6 +895,8 @@ pub const Launcher = struct {
         for (self.launches) |launch|
             std.debug.assert(launch == null);
         std.debug.assert(self.egress.sending == null);
+        self.gpa.free(self.lost_sessions_taken);
+        self.gpa.free(self.lost_sessions);
         self.gpa.free(self.traces.entries);
         self.gpa.free(self.poll_launches);
         self.gpa.free(self.pollfds);
@@ -1041,13 +1061,14 @@ pub const Launcher = struct {
     /// Takes the sessions reported lost since the last turn off the launches
     /// and live workers that hold them.
     fn takeSessionLosses(self: *Launcher) void {
-        var taken: [lost_sessions_max]LostSession = undefined;
         self.mutex.lock();
-        const count = self.lost_sessions_len;
-        @memcpy(taken[0..count], self.lost_sessions[0..count]);
+        const taken = self.lost_sessions[0..self.lost_sessions_len];
+        std.mem.swap([]LostSession, &self.lost_sessions, &self.lost_sessions_taken);
         self.lost_sessions_len = 0;
         self.mutex.unlock();
-        for (taken[0..count]) |lost|
+        // `taken` lies in `lost_sessions_taken` now, which only this thread
+        // swaps back, on its next turn.
+        for (taken) |lost|
             self.dropLostSession(lost);
     }
 
@@ -1284,32 +1305,37 @@ pub const Launcher = struct {
         return oldest;
     }
 
-    /// The send scratch, the wake set, the cgroup leaf, the egress session
-    /// when the definition has a grant, then the fork request: everything the
-    /// fork needs, cheapest first, so a launch that cannot get one of them
-    /// never forks. Leaves `forking` set when the request went out; ends the
-    /// launch otherwise.
+    /// The send scratch, the wake set when the definition has a grant, the
+    /// cgroup leaf, the egress session when the definition has a grant, then
+    /// the fork request: everything the fork needs, cheapest first, so a
+    /// launch that cannot get one of them never forks. Leaves `forking` set
+    /// when the request went out; ends the launch otherwise.
     fn startFork(self: *Launcher, index: u32) void {
         const launch = &self.launches[index].?;
         std.debug.assert(launch.state == .queued);
         if (self.zygote_dead)
             return self.endFailed(index, .zygote_died);
-        const root = self.worker_cgroup_root orelse
+        const worker_host = self.worker_host orelse
             return self.endFailed(index, .cgroup_leaf);
 
         launch.dispatch_send_scratch = self.gpa.alloc(u8, ipc.max_message_bytes) catch
             return self.endFailed(index, .out_of_memory);
 
         const definition = self.routes.definition(launch.definition);
-        launch.wake_set = ipc.egress_shared.WakeSet.create() catch |err| {
-            std.log.warn("egress wake set for {s} failed: {s}", .{ definition.name, @errorName(err) });
-            return self.endFailed(index, .egress_wake_set);
-        };
+        // A worker of a definition without a grant gets no egress path at
+        // all: no wake set, no session, and so no gateway on its account.
+        const granted = self.routes.network.definitionGranted(launch.definition);
+        if (granted) {
+            launch.wake_set = ipc.egress_shared.WakeSet.create() catch |err| {
+                std.log.warn("egress wake set for {s} failed: {s}", .{ definition.name, @errorName(err) });
+                return self.endFailed(index, .egress_wake_set);
+            };
+        }
 
         const fork_job_id = self.zygote_process.next_fork_job_id;
         self.zygote_process.next_fork_job_id += 1;
         launch.fork_job_id = fork_job_id;
-        const leaf_fd = root.createWorkerDir(fork_job_id, .{
+        const leaf_fd = worker_host.cgroup_root.createWorkerDir(fork_job_id, .{
             .memory_limit_bytes = definition.settings.limits.memoryBytes(),
             .cpu_max_cores = launch_cpu_max_cores,
         }) catch |err| {
@@ -1318,8 +1344,10 @@ pub const Launcher = struct {
         };
         launch.cgroup_dir = fd_mod.OwnedFd.fromRaw(leaf_fd);
 
-        if (self.attachForLaunch(index)) |failure|
-            return self.endFailed(index, failure);
+        if (granted) {
+            if (self.attachForLaunch(index)) |failure|
+                return self.endFailed(index, failure);
+        }
 
         zygote.host_client.sendForkRequest(self.zygote_process, fork_job_id, leaf_fd) catch |err|
             return self.endFailed(index, LaunchFailure.fromForkError(err));
@@ -1330,8 +1358,8 @@ pub const Launcher = struct {
         self.forking = index;
     }
 
-    /// Attaches the egress session of launch `index` when its definition has
-    /// a grant, and returns the launch's failure when the gateway refused the
+    /// Attaches the egress session of launch `index`, whose definition has a
+    /// grant, and returns the launch's failure when the gateway refused the
     /// session or none is wired. The launch boots detached instead, to be
     /// attached by the pass after its publish, while the pass waits to spawn
     /// a gateway and when the attach fails for any other reason, which starts
@@ -1362,7 +1390,10 @@ pub const Launcher = struct {
                 return null;
             },
         };
-        const attach = attached orelse return null;
+        // The launcher asks only for a granted definition, which always
+        // attaches; a null answer would publish a worker the reattach pass
+        // then keeps asking about, so the launch fails instead.
+        const attach = attached orelse return .egress_gateway_required;
         launch.egress = attach;
         launch.egress_generation = attach.attachment.generation;
         launch.egress_session_id = attach.attachment.session_id;
@@ -1564,17 +1595,21 @@ pub const Launcher = struct {
         // Every worker of the definition serves all of its routes, so every
         // launch carries the definition's whole route table and pack.
         const artifact = self.routes.artifact(launch.definition);
-        // WorkerInit carries the worker's wake descriptors always, and the
-        // session with its boot token or neither (`LaunchEgress` in
+        // WorkerInit carries no egress descriptor for a definition without a
+        // grant; for a granted one it carries the worker's wake descriptors,
+        // and the session with its boot token or neither (`LaunchEgress` in
         // `host/launch.zig`). A session whose gateway was gone when its key
         // was read has no token, so the child boots detached and gets a
         // session of the current gateway at `WorkerReady`.
-        var launch_egress: host.launch.LaunchEgress = .{ .detached = &launch.wake_set };
+        var launch_egress: host.launch.LaunchEgress = if (launch.wake_set.isValid())
+            .{ .detached = &launch.wake_set }
+        else
+            .none;
         // The machine takes a copy of the boot grant, which it scrubs once
         // the token is minted, and this frame keeps none.
         defer switch (launch_egress) {
             .attached => |*attached| std.crypto.secureZero(u8, &attached.boot.key.bytes),
-            .detached => {},
+            .detached, .none => {},
         };
         if (launch.egress) |*attached| {
             if (attached.boot) |*boot| {
@@ -1584,10 +1619,14 @@ pub const Launcher = struct {
                 } };
             }
         }
+        const definition_limits = definition.settings.limits;
+        // `startFork` ends every launch of a launcher without a worker host
+        // before its fork request goes out.
+        const worker_host = self.worker_host.?;
         launch.machine = host.launch.Machine.init(
             self.gpa,
             self.zygote_process,
-            definition.settings.limits.memoryBytes(),
+            definition_limits.memoryBytes(),
             .{
                 .egress = launch_egress,
                 .routes = .{
@@ -1596,9 +1635,14 @@ pub const Launcher = struct {
                     .isolate_realm = definition.settings.isolate_realm,
                 },
                 .tmpfs_size_bytes = self.tmpfs_size_bytes,
+                .tmp_mount_point_fd = worker_host.tmp_mount_point.fd(),
                 .cpu_max_cores = launch_cpu_max_cores,
                 .boot = self.boot,
                 .fs_index_memfd = artifact.fs_index.fd(),
+                .request_cpu_budget_ns = definition_limits.cpuBudgetNs(),
+                // No JavaScript in the worker runs longer than a request
+                // could without its owner's deadline stopping it.
+                .unowned_time_limit_ns = definition_limits.timeoutNs(),
             },
         );
         const result = launch.machine.?.start(&forked);
@@ -1856,10 +1900,6 @@ pub fn resolveWorkerRuntimeBootOptions() error{InvalidBootOptions}!ipc.WorkerRun
         "COLLO_WORKER_CRYPTO_THREADS",
         options.crypto_thread_count,
     );
-    options.crypto_thread_stack_bytes = envU64(
-        "COLLO_WORKER_CRYPTO_THREAD_STACK_KIB",
-        options.crypto_thread_stack_bytes / 1024,
-    ) *| 1024;
     options.crypto_max_in_flight_per_request = envU64(
         "COLLO_WORKER_CRYPTO_MAX_PENDING_PER_REQUEST",
         options.crypto_max_in_flight_per_request,

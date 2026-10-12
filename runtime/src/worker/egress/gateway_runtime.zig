@@ -1,8 +1,9 @@
 //! The worker's side of its egress gateway session: it reads packets from the
 //! shared completion ring and applies each one (fetch head, body chunk batch,
-//! body end, fetch error, abort ack) to the tasks and bodies it names, and it
-//! attaches the worker to a session and detaches it. Runs on the worker's
-//! event loop thread.
+//! body end, fetch error, abort ack) to the tasks, bodies and upload
+//! reservations it names (`State.releaseUpload`: a fetch error, body end or
+//! abort ack ends the fetch at the gateway), and it attaches the worker to a
+//! session and detaches it. Runs on the worker's event loop thread.
 //!
 //! Every packet is adversarial input. A packet that does not decode, or whose
 //! ids contradict live worker state, detaches the worker, while data the
@@ -327,6 +328,9 @@ fn handleBodyChunk(runtime: *egress_context.Context, chunk: ipc.EgressBodyChunkV
 }
 
 fn handleBodyEnd(runtime: *egress_context.Context, end: ipc.EgressBodyEndView) !void {
+    // The gateway sent the whole response, so the fetch is over there but
+    // for the extents the worker still holds.
+    runtime.egress_state.releaseUpload(end.fetch_id);
     const body = runtime.egress_state.bodies.get(end.body_id) orelse {
         _ = runtime.egress_state.removeBodyDecoder(runtime.allocator, end.body_id);
         return;
@@ -364,6 +368,7 @@ fn handleBodyEnd(runtime: *egress_context.Context, end: ipc.EgressBodyEndView) !
 }
 
 fn handleError(runtime: *egress_context.Context, failure: ipc.EgressFetchErrorView) !void {
+    runtime.egress_state.releaseUpload(failure.fetch_id);
     // The gateway sends no more chunks, so the decoder goes and returns its
     // pending encoded extents to the pool.
     _ = runtime.egress_state.removeBodyDecoder(runtime.allocator, failure.body_id);
@@ -393,6 +398,7 @@ fn handleError(runtime: *egress_context.Context, failure: ipc.EgressFetchErrorVi
     task_runtime.publishResult(runtime, task, .{ .failure = .{
         .message = message,
         .owned = true,
+        .cause = failure.cause,
     } });
 }
 
@@ -416,6 +422,7 @@ fn setBodyMetersFromGateway(
 /// view drops its decoder and fails as aborted, and a task still waiting fails
 /// as aborted.
 fn handleAbortAck(runtime: *egress_context.Context, ack: ipc.egress.AbortAckView) void {
+    runtime.egress_state.releaseUpload(ack.fetch_id);
     if (ack.body_id != 0) {
         if (runtime.egress_state.bodies.get(ack.body_id)) |body| {
             if (body.identity.fetch_id == ack.fetch_id) {

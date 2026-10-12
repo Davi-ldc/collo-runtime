@@ -5,7 +5,8 @@ const beforeEachHooks = [];
 const afterEachHooks = [];
 const nameStack = [];
 let pendingExpectations = [];
-const testTimeoutMs = 1500;
+// Bun's default, and the same in `harness.js`.
+const testTimeoutMs = 5000;
 
 function format(value) {
   try {
@@ -112,6 +113,19 @@ export function describe(name, fn) {
   }
 }
 
+// A skipped or pending case registers as a failure that names it. A strict
+// run fails on any skip, and a case hidden inside a fixture would escape that
+// rule; a known defect is fixed, or its case removed, instead.
+function registerSkipped(kind, name) {
+  registerTest(`${String(name)} (${kind})`, () => {
+    fail(`${kind} hides this case; fix the defect it covers or remove the case`);
+  });
+}
+
+describe.skip = function skip(name) {
+  registerSkipped("describe.skip", name);
+};
+
 function registerTest(name, fn) {
   const registeredName = fullName(String(name));
   const filter = globalThis.__colloWebApiTestFilter;
@@ -140,8 +154,12 @@ export function test(name, fn) {
   registerTest(name, fn);
 }
 
-test.skip = function skip() {};
-test.todo = function todo() {};
+test.skip = function skip(name) {
+  registerSkipped("test.skip", name);
+};
+test.todo = function todo(name) {
+  registerSkipped("test.todo", name);
+};
 test.each = each;
 test.concurrent = test;
 test.concurrent.each = each;
@@ -408,27 +426,44 @@ async function drainPendingExpectations() {
   return null;
 }
 
-function timeoutPromise(name) {
-  return new Promise((_, reject) => {
-    setTimeout(() => reject(new Error(`test timed out after ${testTimeoutMs}ms: ${name}`)), testTimeoutMs);
+// Settles `run`'s promise, or fails after `testTimeoutMs`, and clears its
+// timer either way, so a finished test leaves no timer behind to count against
+// the worker's timer budget. The runner moves its fake clock while the loop
+// waits (`executeUntilRequestDoneOnFakeClock`), so the timer fires.
+async function withTimeout(name, run) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`test timed out after ${testTimeoutMs}ms: ${name}`)), testTimeoutMs);
   });
+  try {
+    return await Promise.race([run(), timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
+// Every hook and the drain of a test's pending expectations run under the
+// same timeout as the test, so whatever hangs fails by name.
 export async function __colloRunWebApiTests() {
   const failures = [];
-  for (const hook of beforeAllHooks) await hook();
+  for (const hook of beforeAllHooks) await withTimeout("beforeAll", hook);
   try {
     for (const entry of tests) {
       let failure = null;
       try {
         pendingExpectations = [];
-        for (const hook of beforeEachHooks) await hook();
-        await Promise.race([entry.fn(), timeoutPromise(entry.name)]);
+        for (const hook of beforeEachHooks) await withTimeout(`${entry.name} (beforeEach)`, hook);
+        await withTimeout(entry.name, entry.fn);
       } catch (err) {
         failure = err;
       }
 
-      const pendingFailure = await drainPendingExpectations();
+      let pendingFailure;
+      try {
+        pendingFailure = await withTimeout(`${entry.name} (pending expectations)`, drainPendingExpectations);
+      } catch (err) {
+        pendingFailure = err;
+      }
       if (pendingFailure !== null) {
         failure = failure
           ? new Error(`${errorText(failure)}\npending expectation failed: ${errorText(pendingFailure)}`)
@@ -436,7 +471,7 @@ export async function __colloRunWebApiTests() {
       }
 
       try {
-        for (const hook of afterEachHooks) await hook();
+        for (const hook of afterEachHooks) await withTimeout(`${entry.name} (afterEach)`, hook);
       } catch (err) {
         failure = failure
           ? new Error(`${errorText(failure)}\nafterEach failed: ${errorText(err)}`)
@@ -451,7 +486,7 @@ export async function __colloRunWebApiTests() {
       }
     }
   } finally {
-    for (const hook of afterAllHooks) await hook();
+    for (const hook of afterAllHooks) await withTimeout("afterAll", hook);
   }
   return {
     ok: failures.length === 0,

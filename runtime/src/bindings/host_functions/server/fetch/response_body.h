@@ -162,7 +162,7 @@ public:
             return resolvedDoneReadResult(global_object);
 
         if (response->body().source() == BodyState::Source::FetchStream) {
-            if (!response->body().beginStreamRead(global_object, scope, bodyStreamAlreadyUsedMessage()))
+            if (!response->beginStreamRead(global_object, scope, bodyStreamAlreadyUsedMessage()))
                 return {};
             RETURN_IF_EXCEPTION(scope, {});
             return fetchBodyPullForIdentity(global_object, scope, response->body().fetchBodyIdentity());
@@ -172,7 +172,7 @@ public:
             return resolvedDoneReadResult(global_object);
 
         WTF::RefPtr<ColloSharedBytes> bytes;
-        if (!response->body().consumeToSharedBytes(global_object, scope, bodyStreamAlreadyUsedMessage(), bytes))
+        if (!response->consumeToSharedBytes(global_object, scope, bodyStreamAlreadyUsedMessage(), bytes))
             return {};
         RETURN_IF_EXCEPTION(scope, {});
         m_static_delivered = true;
@@ -189,7 +189,7 @@ public:
         auto* response = m_response.get();
         if (response) {
             auto scope = DECLARE_THROW_SCOPE(global_object->vm());
-            if (!response->body().cancelStream(global_object, scope, bodyStreamAlreadyUsedMessage()))
+            if (!response->cancelStream(global_object, scope, bodyStreamAlreadyUsedMessage()))
                 return rejectedTypeError(global_object, scope, bodyStreamAlreadyUsedMessage());
         }
         m_static_delivered = true;
@@ -222,7 +222,7 @@ public:
             RETURN_IF_EXCEPTION(scope, false);
 
             ColloVm& owner = uncheckedDowncast<Collo::GlobalObject>(global_object)->owner();
-            ColloFetchBodyIdentity original_identity = response->body().transferFetchStreamForHostResponse();
+            ColloFetchBodyIdentity original_identity = response->transferFetchStreamForHostResponse();
             auto first = FetchBodyIdentitySource::create(owner, original_identity);
             if (!first) {
                 fetchBodyReleaseForIdentity(owner, original_identity);
@@ -250,7 +250,7 @@ public:
             return false;
         }
         WTF::RefPtr<ColloSharedBytes> bytes;
-        if (!response->body().consumeToSharedBytes(global_object, scope, bodyStreamAlreadyUsedMessage(), bytes))
+        if (!response->consumeToSharedBytes(global_object, scope, bodyStreamAlreadyUsedMessage(), bytes))
             return false;
         RETURN_IF_EXCEPTION(scope, false);
         m_static_delivered = true;

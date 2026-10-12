@@ -7,8 +7,12 @@
 //! server creates nothing on the host's filesystem for it. Its environment holds only the libc
 //! variables in `inherited_environment`; nothing configures the gateway through the environment or
 //! its arguments. What it enforces arrives in the hello, which `spawn` sends right after the ready
-//! report, so the hello is the first packet the server sends on the control socket
+//! report, so the hello is the first packet the server sends on the control socket: the token key
+//! and the sealed memfd of the policy image `server/routes/network.zig` compiled at boot
 //! (`control.HelloHeader`).
+//!
+//! The spawn returns the child's pidfd with its pid (`process.spawnInternal`, CLONE_PIDFD), so no
+//! moment exists in which the gateway runs without a handle that can kill and reap it.
 
 const std = @import("std");
 const fd_mod = @import("collo_os").fd;
@@ -17,7 +21,6 @@ const process_limits = @import("collo_limits").process;
 const ipc = @import("collo_ipc");
 const control = @import("collo_egress_gateway").control;
 const launch = @import("collo_egress_gateway").launch;
-const policy = @import("collo_egress_gateway").policy;
 
 const egress_token = ipc.egress_token;
 const process_name = launch.process_name;
@@ -38,14 +41,23 @@ const GATEWAY_READY_TIMEOUT_MS: i32 = 2_000;
 /// closely, and the bound keeps the launcher, which destroys retired gateways, from stalling.
 const REAP_NO_WAIT_MS: i32 = 200;
 
+/// The sealed read-only memfd of the configuration's policy image and its exact length
+/// (`common/network/table.zig`), which every hello carries.
+pub const PolicyImage = struct {
+    fd: fd_mod.FdRef,
+    /// At least one byte; the gateway refuses a memfd of any other size.
+    bytes: u32,
+};
+
 pub const SpawnConfig = struct {
     /// The binary to run as the gateway; null runs this one.
     executable_path: ?[]const u8 = null,
     /// The key the gateway verifies egress tokens with, drawn for this gateway alone; not the zero
     /// key.
     key: egress_token.Key,
-    /// The network policies the gateway enforces, at least one; borrowed for the call.
-    table: *const policy.PolicyTable,
+    /// The network policies the gateway enforces; borrowed for the call. The hello sends a
+    /// duplicate the kernel makes, so the image stays the server's.
+    policy_image: PolicyImage,
 };
 
 /// A gateway that reported ready and took its hello. It owns the pidfd and the server's end of the
@@ -97,14 +109,15 @@ pub const GatewayProcess = struct {
 };
 
 /// Spawns the gateway, waits until it reports ready and sends it the hello with `config.key` and
-/// `config.table`. A gateway that exits first fails the spawn with `error.PeerClosed` when the
-/// exit lands while the server waits on the control socket and with
+/// `config.policy_image`. A gateway that exits first fails the spawn with `error.PeerClosed` when
+/// the exit lands while the server waits on the control socket and with
 /// `error.EgressGatewayExitedBeforeReady` otherwise; one that stays silent past
 /// `GATEWAY_READY_TIMEOUT_MS` fails it with `error.EgressGatewayReadyTimeout`. A hello the socket
-/// refuses fails it with the send's error. Every failure kills and reaps the gateway.
+/// refuses fails it with the send's error. Every failure after the spawn kills and reaps the
+/// gateway.
 pub fn spawn(allocator: std.mem.Allocator, config: SpawnConfig) !GatewayProcess {
     std.debug.assert(!config.key.isZero());
-    std.debug.assert(config.table.count >= 1);
+    std.debug.assert(config.policy_image.bytes >= 1);
 
     const exe_path = if (config.executable_path) |path|
         try allocator.dupe(u8, path)
@@ -131,19 +144,14 @@ pub fn spawn(allocator: std.mem.Allocator, config: SpawnConfig) !GatewayProcess 
     var environment = [_:null]?[*:0]const u8{null} ** inherited_environment.len;
     inheritEnvironment(&environment);
 
-    const pid = try process.spawnInternal(.{
+    const spawned = try process.spawnInternal(.{
         .exe_path_z = exe_path_z.ptr,
         .argv = &argv,
         .envp = &environment,
         .fd_map = &fd_map,
     });
-    // The server keeps none of the child's descriptors: with every copy of the child's control end
-    // closed, a gateway that dies before ready shows up as end of stream on the server's end.
-    child_control.deinit();
-    control_spawn_source.deinit();
-
-    const gateway_pid: u32 = pid;
-    var pidfd = fd_mod.OwnedFd.fromRaw(try process.openPidFd(gateway_pid));
+    const gateway_pid: u32 = spawned.pid;
+    var pidfd = spawned.pidfd;
     errdefer {
         process.pidFdSendSignal(pidfd.fd(), std.posix.SIG.KILL) catch |err|
             std.log.warn("failed to SIGKILL egress gateway after spawn failure pid={d}: {s}", .{ gateway_pid, @errorName(err) });
@@ -151,11 +159,15 @@ pub fn spawn(allocator: std.mem.Allocator, config: SpawnConfig) !GatewayProcess 
         reapBestEffort(gateway_pid, pidfd.fd(), REAP_NO_WAIT_MS);
         pidfd.deinit();
     }
+    // The server keeps none of the child's descriptors: with every copy of the child's control end
+    // closed, a gateway that dies before ready shows up as end of stream on the server's end.
+    child_control.deinit();
+    control_spawn_source.deinit();
 
     // The gateway inherited the server's oom_score_adj across the spawn; this gives it its own
     // score (`OOM_SCORE_ADJ_EGRESS_GATEWAY` in `common/limits/process.zig` says where that places
-    // it and when the write fails). The order backs up the cgroup limits and is no boot condition,
-    // so a failed write only warns.
+    // it). The order backs up the cgroup limits and is no boot condition, so a failed write only
+    // warns.
     process.writeOomScoreAdj(gateway_pid, process_limits.OOM_SCORE_ADJ_EGRESS_GATEWAY) catch |err|
         std.log.warn("failed to set egress gateway oom_score_adj pid={d}: {s}", .{ gateway_pid, @errorName(err) });
 
@@ -165,9 +177,9 @@ pub fn spawn(allocator: std.mem.Allocator, config: SpawnConfig) !GatewayProcess 
     // (`Gateway.run` in `egress/gateway/runtime/root.zig`), so a gateway this returns is fully
     // sandboxed, and no attach spends its control deadline waiting on the gateway's boot.
     try recvGatewayReadyBeforeTimeout(parent_control.fd(), pidfd.fd());
-    // The socket is new and the gateway has read nothing yet, so the hello finds the whole send
-    // buffer free and a nonblocking send takes it at once.
-    try control.sendHello(parent_control.fd(), &config.key, config.table);
+    // The socket is new and the gateway has read nothing yet, so the hello, a fixed header and
+    // one descriptor, finds the send buffer free and a nonblocking send takes it at once.
+    try control.sendHello(parent_control.fd(), &config.key, config.policy_image.fd.fd(), config.policy_image.bytes);
 
     return .{
         .pid = gateway_pid,

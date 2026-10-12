@@ -10,22 +10,27 @@
 //!
 //! A `Vm` and its realms are used on the thread that owns the VM;
 //! `requestTermination` is the one call made from another thread. A `Realm`
-//! creates objects in its own globals and lives as long as its VM, while
-//! operations on an existing value run in that value's realm through the
-//! `Vm`. A `Value` owns its handle and releases it once with `deinit`. A
+//! creates objects in its own globals and lives as long as its VM. An
+//! operation on an existing value runs in that value's realm and goes through
+//! the `Realm` of the caller, which serves a value with no realm of its own,
+//! such as a primitive, so an error raised for it belongs to the caller's
+//! realm. A `Value` owns its handle and releases it once with `deinit`. A
 //! JavaScript exception, and on some calls an unsupported operation, comes
 //! back as a result variant that owns its value; `turnExit` is the one
 //! wrapper that releases the exception and returns `error.JsException`
 //! instead. Any other failing status becomes a Zig error through
 //! `statusToError`. The worker exports the `collo_runtime_*` functions the
-//! bridge calls (`worker/host/`), except `collo_runtime_mapping_release`,
-//! which lives here with the mappings it ends.
+//! bridge calls (`worker/host/`, `worker/fs/index.zig`), returning the
+//! `status_*` values below, except `collo_runtime_mapping_release`, which
+//! lives here with the mappings it ends.
+//!
+//! The bridge reads no clock: which `ExecCtx` owns the running JavaScript is
+//! decided in the bridge (`collo_vm_set_turnless_exec_ctx` in `abi.h`), and
+//! what an owner spends is measured by its caller at the turn boundaries and
+//! the owner transition hook.
 
 const std = @import("std");
-
-/// Equals `COLLO_ABI_VERSION` in `abi.h`; `collo_vm_create` refuses options
-/// that carry another version.
-pub const ABI_VERSION: u32 = 1;
+const limits = @import("collo_limits");
 
 pub const RawStatus = i32;
 pub const Error = error{
@@ -39,25 +44,53 @@ pub const Error = error{
     ResponseBodyTooLarge,
     ResponseHeaderCountTooLarge,
     ResponseHeaderBytesTooLarge,
+    NotFound,
 };
 
-// The `COLLO_STATUS_*` values of `abi.h`.
-const status_ok: RawStatus = 0;
-const status_error: RawStatus = 1;
-const status_invalid_argument: RawStatus = 2;
-const status_js_exception: RawStatus = 3;
-const status_unsupported: RawStatus = 4;
-const status_out_of_memory: RawStatus = 5;
-const status_already_exists: RawStatus = 6;
-const status_response_body_too_large: RawStatus = 7;
-const status_response_header_count_too_large: RawStatus = 8;
-const status_response_header_bytes_too_large: RawStatus = 9;
+// The `COLLO_STATUS_*` values of `abi.h`, which the worker's `collo_runtime_*`
+// exports return.
+pub const status_ok: RawStatus = 0;
+pub const status_error: RawStatus = 1;
+pub const status_invalid_argument: RawStatus = 2;
+pub const status_js_exception: RawStatus = 3;
+pub const status_unsupported: RawStatus = 4;
+pub const status_out_of_memory: RawStatus = 5;
+pub const status_already_exists: RawStatus = 6;
+pub const status_response_body_too_large: RawStatus = 7;
+pub const status_response_header_count_too_large: RawStatus = 8;
+pub const status_response_header_bytes_too_large: RawStatus = 9;
 /// Module evaluation reached a top-level await: the bridge keeps the
 /// evaluation promise and reports its settlement through
 /// `collo_runtime_module_eval_settled`.
-const status_pending: RawStatus = 10;
+pub const status_pending: RawStatus = 10;
+/// The thing asked for does not exist: a file the fs fault's host does not
+/// have, or no further entry of a listing.
+pub const status_not_found: RawStatus = 11;
 
-pub const vm_option_disable_webapis: u32 = 1 << 0;
+/// `COLLO_OWNER_SLOT_COUNT` in `abi.h`: the owners a worker's VM can hold
+/// microtask owner tokens for at once, every request a worker runs at once,
+/// at most one module evaluation per route and the worker owner.
+pub const owner_slot_count: usize = 81;
+
+/// `COLLO_REQUEST_ID_MAX` in `abi.h`: the largest id a dispatched request
+/// carries. The ids above it name the owners that are not requests, one per
+/// module evaluation and, at `maxInt(u64)`, the worker owner; the console
+/// charges them no per-request budget.
+pub const request_id_max: u64 = std.math.maxInt(u64) - 65;
+
+comptime {
+    // abi.h derives both from its copies of these two limits, so a change to
+    // either edits abi.h and the literals above with it.
+    const concurrency_max: usize = limits.server.worker_concurrency_max;
+    const routes_max: usize = limits.server.routes_per_definition_max;
+    if (owner_slot_count != concurrency_max + routes_max + 1)
+        @compileError("owner_slot_count must cover worker_concurrency_max requests, routes_per_definition_max evaluations and the worker owner");
+    if (request_id_max != std.math.maxInt(u64) - routes_max - 1)
+        @compileError("request_id_max must leave routes_per_definition_max evaluation ids and the worker owner's id above it");
+}
+
+/// `COLLO_VM_CREATE_DISABLE_WEB_APIS` in `abi.h`.
+const vm_create_disable_web_apis: u32 = 1 << 0;
 
 /// The `COLLO_TERMINATION_*` values that `ExecCtx.termination_reason` holds.
 pub const TerminationReason = enum(u8) {
@@ -76,6 +109,7 @@ pub const RawPromiseDeferred = opaque {};
 pub const RawCryptoJob = opaque {};
 pub const RawOwnedByteSegments = opaque {};
 pub const RawOwnedHeaderBlock = opaque {};
+pub const RawResponseBodyStream = opaque {};
 
 pub const RawString = extern struct {
     ptr: ?[*]const u8,
@@ -154,37 +188,47 @@ pub const FetchInit = extern struct {
     reserved0: u32,
 };
 
-/// Mirror of `ColloExecCtx`; `abi.h` documents each field.
+/// Mirror of `ColloExecCtx`, the execution context of one owner of
+/// JavaScript; `abi.h` documents each field. The bridge reads `request_id`
+/// and keys the owner by this struct's address, so it must not move while
+/// the VM holds it: from its first turn or turnless installation until
+/// `Vm.releaseExecCtx`.
 pub const ExecCtx = extern struct {
     request_id: u64,
-    deadline_monotonic_ns: u64,
-    cpu_used_ns_total: u64,
-    turn_cpu_start_ns: u64,
-    termination_reason: u8,
-    _reserved: [7]u8,
+    deadline_monotonic_ns: u64 = 0,
+    termination_reason: u8 = @intFromEnum(TerminationReason.none),
+    reserved0: [7]u8 = @splat(0),
 
     pub fn init(request_id: u64) ExecCtx {
-        return .{
-            .request_id = request_id,
-            .deadline_monotonic_ns = 0,
-            .cpu_used_ns_total = 0,
-            .turn_cpu_start_ns = 0,
-            .termination_reason = @intFromEnum(TerminationReason.none),
-            ._reserved = .{ 0, 0, 0, 0, 0, 0, 0 },
-        };
+        return .{ .request_id = request_id };
     }
 };
 
-pub const VmOptions = extern struct {
-    abi_version: u32 = ABI_VERSION,
-    flags: u32 = 0,
+/// What `Vm.create` installs. A Zig convenience, not an ABI struct:
+/// `collo_vm_create` takes the `COLLO_VM_CREATE_*` flags it maps to.
+pub const VmOptions = struct {
+    web_apis: bool = true,
 
     pub fn init() VmOptions {
         return .{};
     }
 
     pub fn withoutWebApis() VmOptions {
-        return .{ .flags = vm_option_disable_webapis };
+        return .{ .web_apis = false };
+    }
+
+    /// The `COLLO_VM_CREATE_*` word `collo_vm_create` takes. The zygote's
+    /// environment carries the options in this form.
+    pub fn flags(self: VmOptions) u32 {
+        return if (self.web_apis) 0 else vm_create_disable_web_apis;
+    }
+
+    /// The options a `flags` word names. A bit `collo_vm_create` does not
+    /// define is refused here, where the word is read, rather than at VM
+    /// creation.
+    pub fn fromFlags(word: u32) error{UnsupportedVmFlags}!VmOptions {
+        if (word & ~vm_create_disable_web_apis != 0) return error.UnsupportedVmFlags;
+        return .{ .web_apis = word & vm_create_disable_web_apis == 0 };
     }
 };
 
@@ -206,21 +250,10 @@ pub const RequestIdentity = extern struct {
     request_generation: u64,
 };
 
+/// The `COLLO_MODULE_LIFETIME_*` values of `ColloModuleLifetime`.
 pub const ModuleLifetime = enum(u8) {
     evictable = 0,
     permanent = 1,
-};
-
-pub const ModuleType = enum(u8) {
-    esm = 0,
-};
-
-pub const ModuleRegisterOptions = extern struct {
-    abi_size: u32 = @sizeOf(ModuleRegisterOptions),
-    lifetime: u8 = @intFromEnum(ModuleLifetime.evictable),
-    module_type: u8 = @intFromEnum(ModuleType.esm),
-    reserved0: u16 = 0,
-    flags: u32 = 0,
 };
 
 pub const ModuleEvictStats = extern struct {
@@ -289,6 +322,21 @@ pub const extracted_response_body_empty: u32 = 0;
 pub const extracted_response_body_bytes: u32 = 1;
 pub const extracted_response_body_byte_segments: u32 = 2;
 pub const extracted_response_body_fetch_stream: u32 = 3;
+pub const extracted_response_body_readable_stream: u32 = 4;
+
+/// The `COLLO_RESPONSE_BODY_STREAM_RESULT_*` values a read of a
+/// `ResponseBodyStream` reports to `collo_runtime_response_body_stream_settled`.
+pub const response_body_stream_result_chunk: u32 = 0;
+pub const response_body_stream_result_done: u32 = 1;
+pub const response_body_stream_result_error: u32 = 2;
+
+/// The `COLLO_RESPONSE_BODY_STREAM_CANCEL_*` reasons `ResponseBodyStream.cancel`
+/// gives the stream.
+pub const ResponseBodyStreamCancel = enum(u32) {
+    client_reset = 0,
+    response_failed = 1,
+    invalid_chunk = 2,
+};
 
 pub const ByteSegment = extern struct {
     bytes: RawBuffer = .{ .ptr = null, .len = 0 },
@@ -300,7 +348,7 @@ pub const ByteSegment = extern struct {
 
 pub const ExtractedResponseBody = extern struct {
     kind: u32 = extracted_response_body_empty,
-    flags: u32 = 0,
+    reserved0: u32 = 0,
     total_len: usize = 0,
     segments: ?[*]const ByteSegment = null,
     segments_len: usize = 0,
@@ -311,12 +359,26 @@ pub const ExtractedResponseBody = extern struct {
         .fetch_id = 0,
         .body_id = 0,
     },
+    body_stream: ?*RawResponseBodyStream = null,
 
     pub fn deinit(self: *ExtractedResponseBody) void {
         if (self.owner) |owner| {
             collo_owned_byte_segments_destroy(owner);
         }
+        if (self.body_stream) |body_stream| {
+            collo_response_body_stream_destroy(body_stream);
+        }
         self.* = .{};
+    }
+
+    /// Takes a ReadableStream body out; the caller owns it. Null for any
+    /// other kind.
+    pub fn takeBodyStream(self: *ExtractedResponseBody) ?ResponseBodyStream {
+        if (self.kind != extracted_response_body_readable_stream)
+            return null;
+        const raw = self.body_stream orelse return null;
+        self.body_stream = null;
+        return .{ .raw = raw };
     }
 
     pub fn segmentsSlice(self: ExtractedResponseBody) []const ByteSegment {
@@ -340,7 +402,6 @@ pub const HeaderView = extern struct {
     name_len: u32 = 0,
     value_offset: u32 = 0,
     value_len: u32 = 0,
-    flags: u32 = 0,
 };
 
 pub const ExtractedHeaderBlock = extern struct {
@@ -425,7 +486,136 @@ pub const ResponseExtractLimits = extern struct {
     max_header_bytes: usize,
 };
 
-extern fn collo_vm_create(options: *const VmOptions, out_vm: *?*RawVm) RawStatus;
+/// Mirror of `ColloResponseBodyChunk`.
+pub const ResponseBodyChunk = extern struct {
+    bytes: RawBuffer = .{ .ptr = null, .len = 0 },
+    owner: ?*RawOwnedByteSegments = null,
+
+    pub fn slice(self: ResponseBodyChunk) []const u8 {
+        return rawBufferSlice(self.bytes);
+    }
+
+    pub fn deinit(self: *ResponseBodyChunk) void {
+        if (self.owner) |owner| {
+            collo_owned_byte_segments_destroy(owner);
+        }
+        self.* = .{};
+    }
+};
+
+pub const ResponseBodyChunkResult = union(enum) {
+    success: ResponseBodyChunk,
+    exception: Value,
+};
+
+/// A Response's ReadableStream body, which the bridge locked at extraction
+/// (`collo_response_body_stream_*` in `abi.h`). Its owner calls `deinit`
+/// once.
+pub const ResponseBodyStream = struct {
+    raw: *RawResponseBodyStream,
+
+    pub fn deinit(self: *ResponseBodyStream) void {
+        collo_response_body_stream_destroy(self.raw);
+        self.* = undefined;
+    }
+
+    /// Starts one read for request `request_id`, inside a turn of that request.
+    pub fn read(self: ResponseBodyStream, request_id: u64) Error!VoidResult {
+        var exception: ?*RawValue = null;
+        return switch (collo_response_body_stream_read(self.raw, request_id, &exception)) {
+            status_ok => .success,
+            status_js_exception => .{ .exception = try Value.fromRawOwned(exception) },
+            else => |status| {
+                try statusToError(status);
+                unreachable;
+            },
+        };
+    }
+
+    /// The bytes of `value`, a read's chunk; lent bytes stay valid until the
+    /// next call into the VM.
+    pub fn chunk(self: ResponseBodyStream, value: *const Value) Error!ResponseBodyChunkResult {
+        var out_chunk = ResponseBodyChunk{};
+        var exception: ?*RawValue = null;
+        return switch (collo_response_body_stream_chunk(self.raw, try value.ptrConst(), &out_chunk, &exception)) {
+            status_ok => .{ .success = out_chunk },
+            status_js_exception => .{ .exception = try Value.fromRawOwned(exception) },
+            else => |status| {
+                try statusToError(status);
+                unreachable;
+            },
+        };
+    }
+
+    /// Cancels the stream with `reason`, inside a turn of the request that reads it.
+    pub fn cancel(self: ResponseBodyStream, reason: ResponseBodyStreamCancel) Error!VoidResult {
+        var exception: ?*RawValue = null;
+        return switch (collo_response_body_stream_cancel(self.raw, @intFromEnum(reason), &exception)) {
+            status_ok => .success,
+            status_js_exception => .{ .exception = try Value.fromRawOwned(exception) },
+            else => |status| {
+                try statusToError(status);
+                unreachable;
+            },
+        };
+    }
+};
+
+/// Mirror of `ColloMemoryStatus`: what the engine measures its memory
+/// against (`memoryStatus`).
+pub const MemoryStatus = extern struct {
+    footprint_bytes: u64 = 0,
+    /// The footprint's share of the limit, capped at one million.
+    in_use_per_million: u32 = 0,
+    reserved0: u32 = 0,
+};
+
+/// Mirror of `ColloHeapStats` (`Vm.heapStats`).
+pub const HeapStats = extern struct {
+    /// Bytes of the cells the last collection marked plus
+    /// `extra_memory_bytes`; cells allocated since count from the next
+    /// collection on.
+    size_bytes: u64 = 0,
+    /// Memory outside the heap that cells report, ArrayBuffer contents
+    /// included.
+    extra_memory_bytes: u64 = 0,
+};
+
+/// The `COLLO_FS_ROUTE_*` values of `ColloFsRouteClass`: the namespace
+/// `collo_runtime_fs_route` sorts a path into.
+pub const FsRouteClass = enum(u8) {
+    none = 0,
+    tmp = 1,
+    deploy_file = 2,
+    deploy_dir = 3,
+};
+
+/// Mirror of `ColloFsRoute`, the output of `collo_runtime_fs_route`, which
+/// the worker implements. Cleared, it names no namespace.
+pub const FsRoute = extern struct {
+    size: u64 = 0,
+    mtime_ms: u64 = 0,
+    normalized_len: u32 = 0,
+    /// A `FsRouteClass`.
+    route_class: u8 = @intFromEnum(FsRouteClass.none),
+    reserved0: u8 = 0,
+    reserved1: u16 = 0,
+};
+
+/// `COLLO_FS_PATH_BYTES_MAX`: a normalized path buffer with its trailing NUL,
+/// PATH_MAX.
+pub const fs_path_bytes_max: usize = 4096;
+/// `COLLO_FS_NAME_BYTES_MAX`: the longest name a listing of the tree returns.
+pub const fs_name_bytes_max: usize = 1024;
+/// `COLLO_FS_READDIR_CURSOR_START`: the cursor that starts a listing.
+pub const fs_readdir_cursor_start: u64 = std.math.maxInt(u64);
+
+comptime {
+    if (fs_path_bytes_max != std.posix.PATH_MAX)
+        @compileError("COLLO_FS_PATH_BYTES_MAX is PATH_MAX");
+}
+
+extern fn collo_vm_create(flags: u32, out_vm: *?*RawVm) RawStatus;
 extern fn collo_vm_destroy(vm: *RawVm) void;
 extern fn collo_vm_main_realm(vm: *RawVm) ?*RawRealm;
 extern fn collo_realm_create(vm: *RawVm, out_realm: *?*RawRealm) RawStatus;
@@ -436,10 +626,10 @@ extern fn collo_vm_reseed_after_fork(vm: *RawVm, seeds: *const RandomSeeds) RawS
 extern fn collo_vm_prespawn_compiler_threads(vm: *RawVm) RawStatus;
 extern fn collo_vm_collect_full_gc_and_trim(vm: *RawVm) RawStatus;
 extern fn collo_vm_collect_eden_gc(vm: *RawVm) RawStatus;
+extern fn collo_vm_heap_stats(vm: *RawVm, out: *HeapStats) RawStatus;
 extern fn collo_vm_request_termination(vm: *RawVm) RawStatus;
 extern fn collo_vm_set_host_runtime(vm: *RawVm, runtime: ?*anyopaque) RawStatus;
-extern fn collo_vm_set_boot_exec_ctx(vm: *RawVm, request_id: u64) RawStatus;
-extern fn collo_vm_clear_boot_exec_ctx(vm: *RawVm) RawStatus;
+extern fn collo_vm_set_turnless_exec_ctx(vm: *RawVm, exec_ctx: ?*ExecCtx) RawStatus;
 extern fn collo_vm_release_exec_ctx(vm: *RawVm, exec_ctx: *ExecCtx) RawStatus;
 extern fn collo_vm_owner_crossings(vm: *RawVm) u64;
 extern fn collo_vm_set_owner_transition_hook(
@@ -459,9 +649,14 @@ extern fn collo_vm_install_process(vm: *RawVm) RawStatus;
 extern fn collo_vm_enable_node_fs_for_worker(vm: *RawVm) RawStatus;
 extern fn collo_prepare_process_for_fork() RawStatus;
 extern fn collo_set_helper_threads_timeout_override_ns(timeout_ns: u64) RawStatus;
-extern fn collo_clear_helper_threads_timeout_override() void;
+extern fn collo_set_helper_threads_cache_release_ns(idle_ns: u64) RawStatus;
+extern fn collo_clear_helper_threads_overrides() void;
+extern fn collo_allocator_release_thread_cache() void;
 extern fn collo_set_gc_max_heap_size_override_bytes(bytes: u64) RawStatus;
 extern fn collo_clear_gc_max_heap_size_override() void;
+extern fn collo_set_memory_status_override(limit_bytes: u64, memory_current_fd: i32) RawStatus;
+extern fn collo_clear_memory_status_override() void;
+extern fn collo_memory_status(out: *MemoryStatus) RawStatus;
 
 extern fn collo_tool_generate_module_bytecode(
     source: RawBuffer,
@@ -471,14 +666,14 @@ extern fn collo_tool_generate_module_bytecode(
 ) RawStatus;
 extern fn collo_tool_bytecode_release(bytes: ?[*]u8) void;
 
-extern fn collo_module_register_pack(vm: *RawVm, pack: Mapping, options: *const ModuleRegisterOptions) RawStatus;
+extern fn collo_module_register_pack(vm: *RawVm, pack: Mapping, lifetime: u8) RawStatus;
 extern fn collo_module_evict_specifier(vm: *RawVm, specifier: RawString, out_stats: *ModuleEvictStats) RawStatus;
 extern fn collo_module_evict_lifetime(vm: *RawVm, lifetime: u8, out_stats: *ModuleEvictStats) RawStatus;
 extern fn collo_module_evaluate(realm: *RawRealm, specifier: RawString, out_exception: *?*RawValue) RawStatus;
 extern fn collo_module_get_export(realm: *RawRealm, specifier: RawString, export_name: RawString, out_value: *?*RawValue, out_exception: *?*RawValue) RawStatus;
 
 extern fn collo_turn_enter(vm: *RawVm, exec_ctx: *ExecCtx) RawStatus;
-extern fn collo_invoke(vm: *RawVm, expected_ctx: *const ExecCtx, callable: *const RawValue, this_value: ?*const RawValue, argv: ?[*]const ?*const RawValue, argc: usize, out_result: *?*RawValue, out_exception: *?*RawValue, out_call_started_ns: ?*u64) RawStatus;
+extern fn collo_invoke(realm: *RawRealm, expected_ctx: *const ExecCtx, callable: *const RawValue, this_value: ?*const RawValue, argv: ?[*]const ?*const RawValue, argc: usize, out_result: *?*RawValue, out_exception: *?*RawValue, out_call_started_ns: ?*u64) RawStatus;
 extern fn collo_turn_exit_ex(vm: *RawVm, out_exception: *?*RawValue) RawStatus;
 extern fn collo_vm_deferred_work_scheduled(vm: *RawVm) u32;
 extern fn collo_vm_set_deferred_work_wakeup_fd(vm: *RawVm, wakeup_fd: i32) RawStatus;
@@ -487,13 +682,13 @@ extern fn collo_vm_pump_deferred_work(vm: *RawVm, exec_ctx: *ExecCtx, out_state:
 extern fn collo_value_retain(value: *RawValue, out_value: *?*RawValue) RawStatus;
 extern fn collo_value_release(value: *RawValue) void;
 extern fn collo_value_is_callable(vm: *RawVm, value: *const RawValue, out_is_callable: *u8) RawStatus;
-extern fn collo_value_is_thenable(vm: *RawVm, value: *const RawValue, out_is_thenable: *u8, out_exception: *?*RawValue) RawStatus;
-extern fn collo_promise_await_sync(vm: *RawVm, promise: *const RawValue, out_value: *?*RawValue, out_exception: *?*RawValue) RawStatus;
+extern fn collo_value_is_thenable(realm: *RawRealm, value: *const RawValue, out_is_thenable: *u8, out_exception: *?*RawValue) RawStatus;
+extern fn collo_promise_await_sync(realm: *RawRealm, promise: *const RawValue, out_value: *?*RawValue, out_exception: *?*RawValue) RawStatus;
 extern fn collo_promise_deferred_resolve(vm: *RawVm, deferred: *RawPromiseDeferred, value: *const RawValue, out_exception: *?*RawValue) RawStatus;
 extern fn collo_promise_deferred_reject(vm: *RawVm, deferred: *RawPromiseDeferred, reason: *const RawValue, out_exception: *?*RawValue) RawStatus;
 extern fn collo_promise_deferred_realm(deferred: *const RawPromiseDeferred) ?*RawRealm;
 extern fn collo_promise_deferred_release(deferred: *RawPromiseDeferred) void;
-extern fn collo_request_task_settle_thenable(vm: *RawVm, token: *const RequestCompletionToken, value: *const RawValue, out_exception: *?*RawValue) RawStatus;
+extern fn collo_request_task_settle_thenable(realm: *RawRealm, token: *const RequestCompletionToken, value: *const RawValue, out_exception: *?*RawValue) RawStatus;
 extern fn collo_crypto_job_run(job: *RawCryptoJob) void;
 extern fn collo_crypto_job_settle(vm: *RawVm, job: *RawCryptoJob, out_exception: *?*RawValue) RawStatus;
 extern fn collo_crypto_job_destroy(job: *RawCryptoJob) void;
@@ -531,20 +726,24 @@ extern fn collo_array_new(realm: *RawRealm, out_value: *?*RawValue) RawStatus;
 extern fn collo_global_this(realm: *RawRealm, out_value: *?*RawValue) RawStatus;
 extern fn collo_env_object_new(realm: *RawRealm, entries: ?[*]const NameValuePair, entry_count: usize, out_value: *?*RawValue) RawStatus;
 
-extern fn collo_object_get_utf8(vm: *RawVm, object: *const RawValue, key: RawString, out_value: *?*RawValue, out_exception: *?*RawValue) RawStatus;
-extern fn collo_object_set_utf8(vm: *RawVm, object: *const RawValue, key: RawString, value: *const RawValue, out_exception: *?*RawValue) RawStatus;
-extern fn collo_array_set(vm: *RawVm, array: *const RawValue, index: usize, value: *const RawValue, out_exception: *?*RawValue) RawStatus;
+extern fn collo_object_get_utf8(realm: *RawRealm, object: *const RawValue, key: RawString, out_value: *?*RawValue, out_exception: *?*RawValue) RawStatus;
+extern fn collo_object_set_utf8(realm: *RawRealm, object: *const RawValue, key: RawString, value: *const RawValue, out_exception: *?*RawValue) RawStatus;
+extern fn collo_array_set(realm: *RawRealm, array: *const RawValue, index: usize, value: *const RawValue, out_exception: *?*RawValue) RawStatus;
 
-extern fn collo_value_to_utf8_copy(vm: *RawVm, value: *const RawValue, out_string: *RawString, out_exception: *?*RawValue) RawStatus;
+extern fn collo_value_to_utf8_copy(realm: *RawRealm, value: *const RawValue, out_string: *RawString, out_exception: *?*RawValue) RawStatus;
 extern fn collo_exception_format(vm: *RawVm, exception: *const RawValue, out_string: *RawString) RawStatus;
 extern fn collo_free_buffer(ptr: ?*const anyopaque) void;
 extern fn collo_request_new(realm: *RawRealm, init: *const RequestInit, out_value: *?*RawValue, out_exception: *?*RawValue) RawStatus;
 extern fn collo_response_new(realm: *RawRealm, init: *const ResponseInit, out_value: *?*RawValue, out_exception: *?*RawValue) RawStatus;
 extern fn collo_fetch_response_new(realm: *RawRealm, init: *const FetchResponseInit, out_value: *?*RawValue, out_exception: *?*RawValue) RawStatus;
-extern fn collo_response_extract(vm: *RawVm, value: *const RawValue, limits: *const ResponseExtractLimits, out_response: *ExtractedResponse, out_exception: *?*RawValue) RawStatus;
+extern fn collo_response_extract(realm: *RawRealm, value: *const RawValue, extract_limits: *const ResponseExtractLimits, out_response: *ExtractedResponse, out_exception: *?*RawValue) RawStatus;
 extern fn collo_response_extract_free(response: *ExtractedResponse) void;
 extern fn collo_owned_byte_segments_destroy(owner: *RawOwnedByteSegments) void;
 extern fn collo_owned_header_block_destroy(owner: *RawOwnedHeaderBlock) void;
+extern fn collo_response_body_stream_read(stream: *RawResponseBodyStream, request_id: u64, out_exception: *?*RawValue) RawStatus;
+extern fn collo_response_body_stream_chunk(stream: *RawResponseBodyStream, chunk: *const RawValue, out_chunk: *ResponseBodyChunk, out_exception: *?*RawValue) RawStatus;
+extern fn collo_response_body_stream_cancel(stream: *RawResponseBodyStream, reason: u32, out_exception: *?*RawValue) RawStatus;
+extern fn collo_response_body_stream_destroy(stream: *RawResponseBodyStream) void;
 extern fn collo_webapi_cleanup_request(vm: *RawVm, request_id: u64) RawStatus;
 extern fn collo_webapi_immediate_mark_destroyed(vm: *RawVm, value: *const RawValue) RawStatus;
 
@@ -555,26 +754,16 @@ comptime {
         @compileError("Mapping.ptr offset mismatch");
     if (@offsetOf(Mapping, "len") != 8)
         @compileError("Mapping.len offset mismatch");
-    if (@sizeOf(ExecCtx) != 40)
+    if (@sizeOf(ExecCtx) != 24)
         @compileError("ExecCtx ABI size mismatch");
     if (@offsetOf(ExecCtx, "request_id") != 0)
         @compileError("ExecCtx.request_id offset mismatch");
     if (@offsetOf(ExecCtx, "deadline_monotonic_ns") != 8)
         @compileError("ExecCtx.deadline_monotonic_ns offset mismatch");
-    if (@offsetOf(ExecCtx, "cpu_used_ns_total") != 16)
-        @compileError("ExecCtx.cpu_used_ns_total offset mismatch");
-    if (@offsetOf(ExecCtx, "turn_cpu_start_ns") != 24)
-        @compileError("ExecCtx.turn_cpu_start_ns offset mismatch");
-    if (@offsetOf(ExecCtx, "termination_reason") != 32)
+    if (@offsetOf(ExecCtx, "termination_reason") != 16)
         @compileError("ExecCtx.termination_reason offset mismatch");
-    if (@offsetOf(ExecCtx, "_reserved") != 33)
-        @compileError("ExecCtx._reserved offset mismatch");
-    if (@sizeOf(VmOptions) != 8)
-        @compileError("VmOptions ABI size mismatch");
-    if (@offsetOf(VmOptions, "abi_version") != 0)
-        @compileError("VmOptions.abi_version offset mismatch");
-    if (@offsetOf(VmOptions, "flags") != 4)
-        @compileError("VmOptions.flags offset mismatch");
+    if (@offsetOf(ExecCtx, "reserved0") != 17)
+        @compileError("ExecCtx.reserved0 offset mismatch");
     if (@sizeOf(RandomSeeds) != 12)
         @compileError("RandomSeeds ABI size mismatch");
     if (@sizeOf(RequestCompletionToken) != 24)
@@ -593,18 +782,6 @@ comptime {
         @compileError("RequestIdentity.request_id offset mismatch");
     if (@offsetOf(RequestIdentity, "request_generation") != 8)
         @compileError("RequestIdentity.request_generation offset mismatch");
-    if (@sizeOf(ModuleRegisterOptions) != 12)
-        @compileError("ModuleRegisterOptions ABI size mismatch");
-    if (@offsetOf(ModuleRegisterOptions, "abi_size") != 0)
-        @compileError("ModuleRegisterOptions.abi_size offset mismatch");
-    if (@offsetOf(ModuleRegisterOptions, "lifetime") != 4)
-        @compileError("ModuleRegisterOptions.lifetime offset mismatch");
-    if (@offsetOf(ModuleRegisterOptions, "module_type") != 5)
-        @compileError("ModuleRegisterOptions.module_type offset mismatch");
-    if (@offsetOf(ModuleRegisterOptions, "reserved0") != 6)
-        @compileError("ModuleRegisterOptions.reserved0 offset mismatch");
-    if (@offsetOf(ModuleRegisterOptions, "flags") != 8)
-        @compileError("ModuleRegisterOptions.flags offset mismatch");
     if (@sizeOf(ModuleEvictStats) != 16)
         @compileError("ModuleEvictStats ABI size mismatch");
     if (@offsetOf(ModuleEvictStats, "sources_removed") != 0)
@@ -699,12 +876,12 @@ comptime {
         @compileError("ByteSegment ABI size mismatch");
     if (@offsetOf(ByteSegment, "bytes") != 0)
         @compileError("ByteSegment.bytes offset mismatch");
-    if (@sizeOf(ExtractedResponseBody) != 72)
+    if (@sizeOf(ExtractedResponseBody) != 80)
         @compileError("ExtractedResponseBody ABI size mismatch");
     if (@offsetOf(ExtractedResponseBody, "kind") != 0)
         @compileError("ExtractedResponseBody.kind offset mismatch");
-    if (@offsetOf(ExtractedResponseBody, "flags") != 4)
-        @compileError("ExtractedResponseBody.flags offset mismatch");
+    if (@offsetOf(ExtractedResponseBody, "reserved0") != 4)
+        @compileError("ExtractedResponseBody.reserved0 offset mismatch");
     if (@offsetOf(ExtractedResponseBody, "total_len") != 8)
         @compileError("ExtractedResponseBody.total_len offset mismatch");
     if (@offsetOf(ExtractedResponseBody, "segments") != 16)
@@ -715,7 +892,9 @@ comptime {
         @compileError("ExtractedResponseBody.owner offset mismatch");
     if (@offsetOf(ExtractedResponseBody, "stream_identity") != 40)
         @compileError("ExtractedResponseBody.stream_identity offset mismatch");
-    if (@sizeOf(HeaderView) != 20)
+    if (@offsetOf(ExtractedResponseBody, "body_stream") != 72)
+        @compileError("ExtractedResponseBody.body_stream offset mismatch");
+    if (@sizeOf(HeaderView) != 16)
         @compileError("HeaderView ABI size mismatch");
     if (@offsetOf(HeaderView, "name_offset") != 0)
         @compileError("HeaderView.name_offset offset mismatch");
@@ -725,8 +904,6 @@ comptime {
         @compileError("HeaderView.value_offset offset mismatch");
     if (@offsetOf(HeaderView, "value_len") != 12)
         @compileError("HeaderView.value_len offset mismatch");
-    if (@offsetOf(HeaderView, "flags") != 16)
-        @compileError("HeaderView.flags offset mismatch");
     if (@sizeOf(ExtractedHeaderBlock) != 40)
         @compileError("ExtractedHeaderBlock ABI size mismatch");
     if (@offsetOf(ExtractedHeaderBlock, "storage") != 0)
@@ -737,17 +914,17 @@ comptime {
         @compileError("ExtractedHeaderBlock.headers_len offset mismatch");
     if (@offsetOf(ExtractedHeaderBlock, "owner") != 32)
         @compileError("ExtractedHeaderBlock.owner offset mismatch");
-    if (@sizeOf(ExtractedResponse) != 120)
+    if (@sizeOf(ExtractedResponse) != 128)
         @compileError("ExtractedResponse ABI size mismatch");
     if (@offsetOf(ExtractedResponse, "body") != 0)
         @compileError("ExtractedResponse.body offset mismatch");
-    if (@offsetOf(ExtractedResponse, "headers") != 72)
+    if (@offsetOf(ExtractedResponse, "headers") != 80)
         @compileError("ExtractedResponse.headers offset mismatch");
-    if (@offsetOf(ExtractedResponse, "status") != 112)
+    if (@offsetOf(ExtractedResponse, "status") != 120)
         @compileError("ExtractedResponse.status offset mismatch");
-    if (@offsetOf(ExtractedResponse, "reserved0") != 114)
+    if (@offsetOf(ExtractedResponse, "reserved0") != 122)
         @compileError("ExtractedResponse.reserved0 offset mismatch");
-    if (@offsetOf(ExtractedResponse, "reserved1") != 116)
+    if (@offsetOf(ExtractedResponse, "reserved1") != 124)
         @compileError("ExtractedResponse.reserved1 offset mismatch");
     if (@sizeOf(ResponseExtractLimits) != 24)
         @compileError("ResponseExtractLimits ABI size mismatch");
@@ -757,6 +934,40 @@ comptime {
         @compileError("ResponseExtractLimits.max_header_count offset mismatch");
     if (@offsetOf(ResponseExtractLimits, "max_header_bytes") != 16)
         @compileError("ResponseExtractLimits.max_header_bytes offset mismatch");
+    if (@sizeOf(ResponseBodyChunk) != 24)
+        @compileError("ResponseBodyChunk ABI size mismatch");
+    if (@offsetOf(ResponseBodyChunk, "bytes") != 0)
+        @compileError("ResponseBodyChunk.bytes offset mismatch");
+    if (@offsetOf(ResponseBodyChunk, "owner") != 16)
+        @compileError("ResponseBodyChunk.owner offset mismatch");
+    if (@sizeOf(MemoryStatus) != 16)
+        @compileError("MemoryStatus ABI size mismatch");
+    if (@offsetOf(MemoryStatus, "footprint_bytes") != 0)
+        @compileError("MemoryStatus.footprint_bytes offset mismatch");
+    if (@offsetOf(MemoryStatus, "in_use_per_million") != 8)
+        @compileError("MemoryStatus.in_use_per_million offset mismatch");
+    if (@offsetOf(MemoryStatus, "reserved0") != 12)
+        @compileError("MemoryStatus.reserved0 offset mismatch");
+    if (@sizeOf(HeapStats) != 16)
+        @compileError("HeapStats ABI size mismatch");
+    if (@offsetOf(HeapStats, "size_bytes") != 0)
+        @compileError("HeapStats.size_bytes offset mismatch");
+    if (@offsetOf(HeapStats, "extra_memory_bytes") != 8)
+        @compileError("HeapStats.extra_memory_bytes offset mismatch");
+    if (@sizeOf(FsRoute) != 24)
+        @compileError("FsRoute ABI size mismatch");
+    if (@offsetOf(FsRoute, "size") != 0)
+        @compileError("FsRoute.size offset mismatch");
+    if (@offsetOf(FsRoute, "mtime_ms") != 8)
+        @compileError("FsRoute.mtime_ms offset mismatch");
+    if (@offsetOf(FsRoute, "normalized_len") != 16)
+        @compileError("FsRoute.normalized_len offset mismatch");
+    if (@offsetOf(FsRoute, "route_class") != 20)
+        @compileError("FsRoute.route_class offset mismatch");
+    if (@offsetOf(FsRoute, "reserved0") != 21)
+        @compileError("FsRoute.reserved0 offset mismatch");
+    if (@offsetOf(FsRoute, "reserved1") != 22)
+        @compileError("FsRoute.reserved1 offset mismatch");
 }
 
 pub const OwnedString = struct {
@@ -894,10 +1105,13 @@ pub const ConsoleLevel = enum(u8) {
 pub const console_line_flag_truncated: u8 = 1 << 0;
 pub const console_line_flag_budget_dropped: u8 = 1 << 1;
 
-/// Called in pairs whenever a microtask drain hands execution from one
-/// request to another and back. Either side may be null, which is turnless
-/// execution: module evaluation, or an owner whose request already ended.
-/// Runs on the VM thread with the JS lock held and must not re-enter the VM.
+/// Called in pairs around each restored continuation whose owner differs
+/// from the owner it interrupts: (interrupted, restored), then (restored,
+/// interrupted). A side is the owner `collo_vm_set_turnless_exec_ctx` in
+/// `abi.h` defines, so a turnless drain's side is the turnless context; null
+/// is no owner, such as a continuation whose registrant was released. Runs on
+/// the VM thread with the JS lock held and must not re-enter the VM. The
+/// bridge reads no clock, so this is where CPU windows move.
 pub const OwnerTransitionHook = *const fn (
     ctx: ?*anyopaque,
     leaving: ?*ExecCtx,
@@ -921,7 +1135,7 @@ pub const Vm = struct {
 
     pub fn create(options: VmOptions) Error!Vm {
         var raw_vm: ?*RawVm = null;
-        try statusToError(collo_vm_create(&options, &raw_vm));
+        try statusToError(collo_vm_create(options.flags(), &raw_vm));
         return .{ .raw = raw_vm orelse return error.Internal };
     }
 
@@ -979,6 +1193,14 @@ pub const Vm = struct {
         try statusToError(collo_vm_collect_eden_gc(self.ptr()));
     }
 
+    /// The heap's size and the extra memory its cells report, inside or
+    /// outside a turn.
+    pub fn heapStats(self: *Vm) Error!HeapStats {
+        var stats: HeapStats = .{};
+        try statusToError(collo_vm_heap_stats(self.ptr(), &stats));
+        return stats;
+    }
+
     /// Asks the VM to stop running JavaScript, from any thread. The caller
     /// keeps the VM alive across the call; once its destruction began, the
     /// call fails with `error.InvalidArgument`.
@@ -990,25 +1212,23 @@ pub const Vm = struct {
         try statusToError(collo_vm_set_host_runtime(self.ptr(), runtime));
     }
 
-    /// Installs the boot identity that turnless JavaScript, module evaluation
-    /// and its drains, resolves to. Workers only; the zygote's warmup VM
-    /// never calls it.
-    pub fn setBootExecCtx(self: *Vm, request_id: u64) Error!void {
-        try statusToError(collo_vm_set_boot_exec_ctx(self.ptr(), request_id));
+    /// Installs `exec_ctx` as the owner of JavaScript that runs outside every
+    /// turn and every restored continuation, module evaluation and the
+    /// drains inside it, so a reaction such code registers runs under it
+    /// whoever settles its promise later. Null uninstalls. `exec_ctx` stays
+    /// borrowed until `releaseExecCtx`, even after it is replaced or
+    /// uninstalled (`collo_vm_set_turnless_exec_ctx` in `abi.h`). Idempotent.
+    pub fn setTurnlessExecCtx(self: *Vm, exec_ctx: ?*ExecCtx) Error!void {
+        try statusToError(collo_vm_set_turnless_exec_ctx(self.ptr(), exec_ctx));
     }
 
-    /// Uninstalls the boot identity when the boot context closes, so turnless
-    /// JavaScript finds no context from then on. Idempotent, so it is safe
-    /// after an install that failed.
-    pub fn clearBootExecCtx(self: *Vm) Error!void {
-        try statusToError(collo_vm_clear_boot_exec_ctx(self.ptr()));
-    }
-
-    /// Drops the microtask-owner registration for `exec_ctx`, which must
-    /// happen before its storage dies: a promise reaction this request
-    /// registered can outlive it, as when a later request settles a
-    /// module-scope promise, and a released token resolves to "no owner"
-    /// instead of reading freed memory. Idempotent.
+    /// Drops the microtask-owner registration for `exec_ctx`, and its
+    /// installation as the current or turnless context, which must happen
+    /// before its storage dies: a promise reaction this owner registered can
+    /// outlive it, as when a later request settles a module-scope promise,
+    /// and a released token resolves to no owner instead of reading freed
+    /// memory. Called between turns, never from inside JavaScript or the
+    /// owner-transition hook, where it ends the process. Idempotent.
     pub fn releaseExecCtx(self: *Vm, exec_ctx: *ExecCtx) Error!void {
         try statusToError(collo_vm_release_exec_ctx(self.ptr(), exec_ctx));
     }
@@ -1022,8 +1242,8 @@ pub const Vm = struct {
     }
 
     /// Microtasks this VM ran under a restored owner: promise reactions whose
-    /// registrant was not the request draining the queue. Monotonic and
-    /// never reset, it counts how often the owner hand-over runs.
+    /// registrant was not the owner draining the queue. Monotonic and never
+    /// reset, it counts how often the owner hand-over runs.
     pub fn ownerCrossings(self: *Vm) u64 {
         return collo_vm_owner_crossings(self.ptr());
     }
@@ -1068,8 +1288,10 @@ pub const Vm = struct {
         try statusToError(collo_vm_enable_node_fs_for_worker(self.ptr()));
     }
 
+    /// Registers a pack of evictable ES modules held in memory, as
+    /// `registerModulePackWithLifetime` does.
     pub fn registerModulePack(self: *Vm, pack: []const u8) Error!void {
-        try self.registerModulePackWithOptions(pack, .{});
+        try self.registerModulePackWithLifetime(pack, .evictable);
     }
 
     /// Registers the modules of a pack mapping and consumes `pack` on every
@@ -1080,17 +1302,15 @@ pub const Vm = struct {
     /// read the mapping in place keep those pages in the shared page cache. The
     /// `local-e2e` benchmark "private bytes per byte of module pack" measures
     /// what a worker pays per pack byte.
-    pub fn registerModulePackMapping(self: *Vm, pack: Mapping, options: ModuleRegisterOptions) Error!void {
-        var raw_options = options;
-        raw_options.abi_size = @sizeOf(ModuleRegisterOptions);
-        try statusToError(collo_module_register_pack(self.ptr(), pack, &raw_options));
+    pub fn registerModulePackMapping(self: *Vm, pack: Mapping, lifetime: ModuleLifetime) Error!void {
+        try statusToError(collo_module_register_pack(self.ptr(), pack, @intFromEnum(lifetime)));
     }
 
     /// Registers a pack held in memory by sealing it into a memfd and mapping
     /// that, so the bridge sees one representation of a pack wherever it came
     /// from. For callers that own bytes rather than an fd: the zygote's warmup
     /// pack and tests.
-    pub fn registerModulePackWithOptions(self: *Vm, pack: []const u8, options: ModuleRegisterOptions) Error!void {
+    pub fn registerModulePackWithLifetime(self: *Vm, pack: []const u8, lifetime: ModuleLifetime) Error!void {
         if (pack.len == 0) return error.InvalidArgument;
         const fd = try sealedMemfdFromBytes(pack);
         defer std.posix.close(fd);
@@ -1098,7 +1318,7 @@ pub const Vm = struct {
             error.OutOfMemory => error.OutOfMemory,
             else => error.Internal,
         };
-        try self.registerModulePackMapping(mapping, options);
+        try self.registerModulePackMapping(mapping, lifetime);
     }
 
     pub fn evictModuleSpecifier(self: *Vm, specifier: []const u8) Error!ModuleEvictStats {
@@ -1185,101 +1405,10 @@ pub const Vm = struct {
         };
     }
 
-    pub fn invoke(
-        self: *Vm,
-        allocator: std.mem.Allocator,
-        exec_ctx: *const ExecCtx,
-        callable: *const Value,
-        this_value: ?*const Value,
-        args: []const *const Value,
-    ) Error!ValueResult {
-        return self.invokeWithTiming(allocator, exec_ctx, callable, this_value, args, null);
-    }
-
-    /// `invoke` that can also record when the handler started: a non-null
-    /// `out_call_started_ns` receives the monotonic stamp the benchmark
-    /// fixture's first-statement marker takes, which includes the engine's
-    /// call preparation and the marker's own dispatch, or 0 when no marker
-    /// ran (`collo_invoke` in `abi.h`).
-    pub fn invokeWithTiming(
-        self: *Vm,
-        allocator: std.mem.Allocator,
-        exec_ctx: *const ExecCtx,
-        callable: *const Value,
-        this_value: ?*const Value,
-        args: []const *const Value,
-        out_call_started_ns: ?*u64,
-    ) Error!ValueResult {
-        if (out_call_started_ns) |out| out.* = 0;
-        var stack_args: [8]?*const RawValue = undefined;
-        var heap_args: ?[]?*const RawValue = null;
-        const raw_args = if (args.len <= stack_args.len)
-            stack_args[0..args.len]
-        else blk: {
-            const allocated = try allocator.alloc(?*const RawValue, args.len);
-            heap_args = allocated;
-            break :blk allocated;
-        };
-        defer if (heap_args) |allocated| allocator.free(allocated);
-
-        for (args, 0..) |arg, index|
-            raw_args[index] = try arg.ptrConst();
-
-        const raw_this_value = if (this_value) |value| try value.ptrConst() else null;
-
-        var result: ?*RawValue = null;
-        var exception: ?*RawValue = null;
-        return switch (collo_invoke(
-            self.ptr(),
-            exec_ctx,
-            try callable.ptrConst(),
-            raw_this_value,
-            if (raw_args.len == 0) null else raw_args.ptr,
-            raw_args.len,
-            &result,
-            &exception,
-            out_call_started_ns,
-        )) {
-            status_ok => .{ .success = try Value.fromRawOwned(result) },
-            status_js_exception => .{ .exception = try Value.fromRawOwned(exception) },
-            else => |status| {
-                try statusToError(status);
-                unreachable;
-            },
-        };
-    }
-
     pub fn isCallable(self: *Vm, value: *const Value) Error!bool {
         var out_is_callable: u8 = 0;
         try statusToError(collo_value_is_callable(self.ptr(), try value.ptrConst(), &out_is_callable));
         return out_is_callable != 0;
-    }
-
-    pub fn isThenable(self: *Vm, value: *const Value) Error!BoolResult {
-        var out_is_thenable: u8 = 0;
-        var exception: ?*RawValue = null;
-        return switch (collo_value_is_thenable(self.ptr(), try value.ptrConst(), &out_is_thenable, &exception)) {
-            status_ok => .{ .success = out_is_thenable != 0 },
-            status_js_exception => .{ .exception = try Value.fromRawOwned(exception) },
-            else => |status| {
-                try statusToError(status);
-                unreachable;
-            },
-        };
-    }
-
-    pub fn promiseAwaitSync(self: *Vm, promise: *const Value) Error!PromiseResult {
-        var value: ?*RawValue = null;
-        var exception: ?*RawValue = null;
-        return switch (collo_promise_await_sync(self.ptr(), try promise.ptrConst(), &value, &exception)) {
-            status_ok => .{ .success = try Value.fromRawOwned(value) },
-            status_js_exception => .{ .exception = try Value.fromRawOwned(exception) },
-            status_unsupported => .{ .unsupported = Value.fromRawOwnedNonNull(exception orelse return error.Unsupported) },
-            else => |status| {
-                try statusToError(status);
-                unreachable;
-            },
-        };
     }
 
     pub fn promiseDeferredResolve(self: *Vm, deferred: *RawPromiseDeferred, value: *const Value) Error!VoidResult {
@@ -1297,18 +1426,6 @@ pub const Vm = struct {
     pub fn promiseDeferredReject(self: *Vm, deferred: *RawPromiseDeferred, reason: *const Value) Error!VoidResult {
         var exception: ?*RawValue = null;
         return switch (collo_promise_deferred_reject(self.ptr(), deferred, try reason.ptrConst(), &exception)) {
-            status_ok => .success,
-            status_js_exception => .{ .exception = try Value.fromRawOwned(exception) },
-            else => |status| {
-                try statusToError(status);
-                unreachable;
-            },
-        };
-    }
-
-    pub fn requestTaskSettleThenable(self: *Vm, token: RequestCompletionToken, value: *const Value) Error!VoidResult {
-        var exception: ?*RawValue = null;
-        return switch (collo_request_task_settle_thenable(self.ptr(), &token, try value.ptrConst(), &exception)) {
             status_ok => .success,
             status_js_exception => .{ .exception = try Value.fromRawOwned(exception) },
             else => |status| {
@@ -1358,77 +1475,12 @@ pub const Vm = struct {
         return try Value.fromRawOwned(raw_value);
     }
 
-    pub fn extractResponse(self: *Vm, value: *const Value, limits: ResponseExtractLimits) Error!ExtractResponseResult {
-        var extracted = ExtractedResponse{};
-        var exception: ?*RawValue = null;
-        return switch (collo_response_extract(self.ptr(), try value.ptrConst(), &limits, &extracted, &exception)) {
-            status_ok => .{ .success = extracted },
-            status_js_exception => .{ .exception = try Value.fromRawOwned(exception) },
-            else => |status| {
-                try statusToError(status);
-                unreachable;
-            },
-        };
-    }
-
     pub fn cleanupWebApiRequest(self: *Vm, request_id: u64) Error!void {
         try statusToError(collo_webapi_cleanup_request(self.ptr(), request_id));
     }
 
     pub fn markImmediateDestroyed(self: *Vm, value: *const Value) Error!void {
         try statusToError(collo_webapi_immediate_mark_destroyed(self.ptr(), try value.ptrConst()));
-    }
-
-    pub fn objectGetUtf8(self: *Vm, object: *const Value, key: []const u8) Error!ValueResult {
-        var value: ?*RawValue = null;
-        var exception: ?*RawValue = null;
-        return switch (collo_object_get_utf8(self.ptr(), try object.ptrConst(), borrowedString(key), &value, &exception)) {
-            status_ok => .{ .success = try Value.fromRawOwned(value) },
-            status_js_exception => .{ .exception = try Value.fromRawOwned(exception) },
-            else => |status| {
-                try statusToError(status);
-                unreachable;
-            },
-        };
-    }
-
-    pub fn objectSetUtf8(self: *Vm, object: *const Value, key: []const u8, value: *const Value) Error!VoidResult {
-        var exception: ?*RawValue = null;
-        return switch (collo_object_set_utf8(self.ptr(), try object.ptrConst(), borrowedString(key), try value.ptrConst(), &exception)) {
-            status_ok => .success,
-            status_js_exception => .{ .exception = try Value.fromRawOwned(exception) },
-            else => |status| {
-                try statusToError(status);
-                unreachable;
-            },
-        };
-    }
-
-    pub fn arraySet(self: *Vm, array: *const Value, index: usize, value: *const Value) Error!VoidResult {
-        var exception: ?*RawValue = null;
-        return switch (collo_array_set(self.ptr(), try array.ptrConst(), index, try value.ptrConst(), &exception)) {
-            status_ok => .success,
-            status_js_exception => .{ .exception = try Value.fromRawOwned(exception) },
-            else => |status| {
-                try statusToError(status);
-                unreachable;
-            },
-        };
-    }
-
-    pub fn valueToUtf8Copy(self: *Vm, value: *const Value) Error!StringResult {
-        var out_string = OwnedString{};
-        var exception: ?*RawValue = null;
-        return switch (collo_value_to_utf8_copy(self.ptr(), try value.ptrConst(), &out_string.raw, &exception)) {
-            status_ok => .{ .success = out_string },
-            status_js_exception => .{ .exception = try Value.fromRawOwned(exception) },
-            else => |status| {
-                if (out_string.raw.ptr) |raw_ptr|
-                    collo_free_buffer(@ptrCast(raw_ptr));
-                try statusToError(status);
-                unreachable;
-            },
-        };
     }
 
     pub fn exceptionFormat(self: *Vm, exception: *const Value) Error!OwnedString {
@@ -1664,6 +1716,194 @@ pub const Realm = struct {
             },
         };
     }
+
+    // The operations below act on a value Zig already holds. Each runs in
+    // the value's own realm; this realm serves only a value with none, such
+    // as a primitive, so an error raised for it belongs to this realm.
+
+    /// Calls `callable` with `this_value` and `args`, all borrowed, inside
+    /// the turn `exec_ctx` owns; `allocator` holds the argument array when it
+    /// outgrows a stack buffer of eight.
+    pub fn invoke(
+        self: Realm,
+        allocator: std.mem.Allocator,
+        exec_ctx: *const ExecCtx,
+        callable: *const Value,
+        this_value: ?*const Value,
+        args: []const *const Value,
+    ) Error!ValueResult {
+        return self.invokeWithTiming(allocator, exec_ctx, callable, this_value, args, null);
+    }
+
+    /// `invoke` that can also record when the handler started: a non-null
+    /// `out_call_started_ns` receives the monotonic stamp the benchmark
+    /// fixture's first-statement marker takes, which includes the engine's
+    /// call preparation and the marker's own dispatch, or 0 when no marker
+    /// ran (`collo_invoke` in `abi.h`).
+    pub fn invokeWithTiming(
+        self: Realm,
+        allocator: std.mem.Allocator,
+        exec_ctx: *const ExecCtx,
+        callable: *const Value,
+        this_value: ?*const Value,
+        args: []const *const Value,
+        out_call_started_ns: ?*u64,
+    ) Error!ValueResult {
+        if (out_call_started_ns) |out| out.* = 0;
+        var stack_args: [8]?*const RawValue = undefined;
+        var heap_args: ?[]?*const RawValue = null;
+        const raw_args = if (args.len <= stack_args.len)
+            stack_args[0..args.len]
+        else blk: {
+            const allocated = try allocator.alloc(?*const RawValue, args.len);
+            heap_args = allocated;
+            break :blk allocated;
+        };
+        defer if (heap_args) |allocated| allocator.free(allocated);
+
+        for (args, 0..) |arg, arg_index|
+            raw_args[arg_index] = try arg.ptrConst();
+
+        const raw_this_value = if (this_value) |value| try value.ptrConst() else null;
+
+        var result: ?*RawValue = null;
+        var exception: ?*RawValue = null;
+        return switch (collo_invoke(
+            self.raw,
+            exec_ctx,
+            try callable.ptrConst(),
+            raw_this_value,
+            if (raw_args.len == 0) null else raw_args.ptr,
+            raw_args.len,
+            &result,
+            &exception,
+            out_call_started_ns,
+        )) {
+            status_ok => .{ .success = try Value.fromRawOwned(result) },
+            status_js_exception => .{ .exception = try Value.fromRawOwned(exception) },
+            else => |status| {
+                try statusToError(status);
+                unreachable;
+            },
+        };
+    }
+
+    /// Whether `value` is an object with a callable `then`. Reading `then`
+    /// can run a getter, which can throw.
+    pub fn isThenable(self: Realm, value: *const Value) Error!BoolResult {
+        var out_is_thenable: u8 = 0;
+        var exception: ?*RawValue = null;
+        return switch (collo_value_is_thenable(self.raw, try value.ptrConst(), &out_is_thenable, &exception)) {
+            status_ok => .{ .success = out_is_thenable != 0 },
+            status_js_exception => .{ .exception = try Value.fromRawOwned(exception) },
+            else => |status| {
+                try statusToError(status);
+                unreachable;
+            },
+        };
+    }
+
+    /// The result of an already-settled promise, outside any turn; a pending
+    /// one comes back as `.unsupported` with a TypeError.
+    pub fn promiseAwaitSync(self: Realm, promise: *const Value) Error!PromiseResult {
+        var value: ?*RawValue = null;
+        var exception: ?*RawValue = null;
+        return switch (collo_promise_await_sync(self.raw, try promise.ptrConst(), &value, &exception)) {
+            status_ok => .{ .success = try Value.fromRawOwned(value) },
+            status_js_exception => .{ .exception = try Value.fromRawOwned(exception) },
+            status_unsupported => .{ .unsupported = Value.fromRawOwnedNonNull(exception orelse return error.Unsupported) },
+            else => |status| {
+                try statusToError(status);
+                unreachable;
+            },
+        };
+    }
+
+    /// Reports `value`, a handler's result, to the request task `token` names
+    /// once it settles (`collo_request_task_settle_thenable` in `abi.h`).
+    pub fn requestTaskSettleThenable(self: Realm, token: RequestCompletionToken, value: *const Value) Error!VoidResult {
+        var exception: ?*RawValue = null;
+        return switch (collo_request_task_settle_thenable(self.raw, &token, try value.ptrConst(), &exception)) {
+            status_ok => .success,
+            status_js_exception => .{ .exception = try Value.fromRawOwned(exception) },
+            else => |status| {
+                try statusToError(status);
+                unreachable;
+            },
+        };
+    }
+
+    /// Converts a handler's result into a native response within
+    /// `extract_limits` (`collo_response_extract` in `abi.h`).
+    pub fn extractResponse(
+        self: Realm,
+        value: *const Value,
+        extract_limits: ResponseExtractLimits,
+    ) Error!ExtractResponseResult {
+        var extracted = ExtractedResponse{};
+        var exception: ?*RawValue = null;
+        return switch (collo_response_extract(self.raw, try value.ptrConst(), &extract_limits, &extracted, &exception)) {
+            status_ok => .{ .success = extracted },
+            status_js_exception => .{ .exception = try Value.fromRawOwned(exception) },
+            else => |status| {
+                try statusToError(status);
+                unreachable;
+            },
+        };
+    }
+
+    pub fn objectGetUtf8(self: Realm, object: *const Value, key: []const u8) Error!ValueResult {
+        var value: ?*RawValue = null;
+        var exception: ?*RawValue = null;
+        return switch (collo_object_get_utf8(self.raw, try object.ptrConst(), borrowedString(key), &value, &exception)) {
+            status_ok => .{ .success = try Value.fromRawOwned(value) },
+            status_js_exception => .{ .exception = try Value.fromRawOwned(exception) },
+            else => |status| {
+                try statusToError(status);
+                unreachable;
+            },
+        };
+    }
+
+    pub fn objectSetUtf8(self: Realm, object: *const Value, key: []const u8, value: *const Value) Error!VoidResult {
+        var exception: ?*RawValue = null;
+        return switch (collo_object_set_utf8(self.raw, try object.ptrConst(), borrowedString(key), try value.ptrConst(), &exception)) {
+            status_ok => .success,
+            status_js_exception => .{ .exception = try Value.fromRawOwned(exception) },
+            else => |status| {
+                try statusToError(status);
+                unreachable;
+            },
+        };
+    }
+
+    pub fn arraySet(self: Realm, array: *const Value, element_index: usize, value: *const Value) Error!VoidResult {
+        var exception: ?*RawValue = null;
+        return switch (collo_array_set(self.raw, try array.ptrConst(), element_index, try value.ptrConst(), &exception)) {
+            status_ok => .success,
+            status_js_exception => .{ .exception = try Value.fromRawOwned(exception) },
+            else => |status| {
+                try statusToError(status);
+                unreachable;
+            },
+        };
+    }
+
+    /// ToString of `value` as UTF-8, which the caller owns.
+    pub fn valueToUtf8Copy(self: Realm, value: *const Value) Error!StringResult {
+        var out_string = OwnedString{};
+        var exception: ?*RawValue = null;
+        return switch (collo_value_to_utf8_copy(self.raw, try value.ptrConst(), &out_string.raw, &exception)) {
+            status_ok => .{ .success = out_string },
+            status_js_exception => .{ .exception = try Value.fromRawOwned(exception) },
+            else => |status| {
+                if (out_string.raw.ptr) |raw_ptr|
+                    collo_free_buffer(@ptrCast(raw_ptr));
+                try statusToError(status);
+                unreachable;
+            },
+        };
+    }
 };
 
 /// The realm the deferred's promise belongs to, where the value that settles
@@ -1685,16 +1925,39 @@ pub fn destroyCryptoJob(raw: *RawCryptoJob) void {
     collo_crypto_job_destroy(raw);
 }
 
+// Process-wide engine settings, not scoped to a `Vm`; `abi.h` says which
+// thread may call each one.
+
+/// Replaces the idle timeout of every engine helper thread: short in the
+/// zygote so they retire before a fork, longer than a worker's life in a
+/// worker so they never retire after its filter.
 pub fn setHelperThreadsTimeoutOverrideNs(timeout_ns: u64) Error!void {
     try statusToError(collo_set_helper_threads_timeout_override_ns(timeout_ns));
 }
 
-pub fn prepareProcessForFork() Error!void {
-    try statusToError(collo_prepare_process_for_fork());
+/// Makes a helper thread idle for `idle_ns` release its allocator cache once
+/// and go on waiting. A worker sets it after `Vm.postForkChild` and before
+/// `Vm.prespawnCompilerThreads`, since threads parked before it never see it.
+/// Fails with `error.InvalidArgument` for 0.
+pub fn setHelperThreadsCacheReleaseNs(idle_ns: u64) Error!void {
+    try statusToError(collo_set_helper_threads_cache_release_ns(idle_ns));
 }
 
-pub fn clearHelperThreadsTimeoutOverride() void {
-    collo_clear_helper_threads_timeout_override();
+/// Clears the helper-thread timeout and cache release.
+pub fn clearHelperThreadsOverrides() void {
+    collo_clear_helper_threads_overrides();
+}
+
+/// Stops the calling thread's allocators and returns its cache, as an idle
+/// helper thread does after its cache release; any thread, no `Vm`. Never
+/// called between `Vm.prepareForFork` and a fork, which only the zygote
+/// reaches and which must fork the memory as prepared.
+pub fn releaseThreadAllocatorCache() void {
+    collo_allocator_release_thread_cache();
+}
+
+pub fn prepareProcessForFork() Error!void {
+    try statusToError(collo_prepare_process_for_fork());
 }
 
 pub fn setGcMaxHeapSizeOverrideBytes(bytes: u64) Error!void {
@@ -1703,6 +1966,28 @@ pub fn setGcMaxHeapSizeOverrideBytes(bytes: u64) Error!void {
 
 pub fn clearGcMaxHeapSizeOverride() void {
     collo_clear_gc_max_heap_size_override();
+}
+
+/// Makes the engine measure its memory as the decimal at offset 0 of
+/// `memory_current_fd`, a cgroup's `memory.current`, against `limit_bytes`.
+/// The descriptor stays borrowed until `clearMemoryStatusOverride` returns;
+/// a worker keeps it for its life. Fails with `error.InvalidArgument` for a
+/// zero limit or a negative descriptor.
+pub fn setMemoryStatusOverride(limit_bytes: u64, memory_current_fd: std.posix.fd_t) Error!void {
+    try statusToError(collo_set_memory_status_override(limit_bytes, memory_current_fd));
+}
+
+/// Returns the engine to its own memory reading; afterwards no thread reads
+/// the override's descriptor.
+pub fn clearMemoryStatusOverride() void {
+    collo_clear_memory_status_override();
+}
+
+/// The memory status the engine's critical-memory decisions read now.
+pub fn memoryStatus() Error!MemoryStatus {
+    var status: MemoryStatus = .{};
+    try statusToError(collo_memory_status(&status));
+    return status;
 }
 
 /// Serializes one ESM module's CachedBytecode blob, for a module pack's
@@ -1800,6 +2085,7 @@ fn statusToError(status: RawStatus) Error!void {
         status_response_body_too_large => return error.ResponseBodyTooLarge,
         status_response_header_count_too_large => return error.ResponseHeaderCountTooLarge,
         status_response_header_bytes_too_large => return error.ResponseHeaderBytesTooLarge,
+        status_not_found => return error.NotFound,
         else => return error.Internal,
     }
 }

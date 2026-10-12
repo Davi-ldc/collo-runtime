@@ -7,6 +7,7 @@
 #include "host_functions/runtime/bridge.h"
 #include "host_functions/runtime/timers.h"
 #include "host_functions/webapi/dom/dom_exception.h"
+#include "host_functions/webapi/limits.h"
 
 #include <JavaScriptCore/Error.h>
 #include <JavaScriptCore/IdentifierInlines.h>
@@ -17,8 +18,6 @@
 #include <JavaScriptCore/JSString.h>
 #include <JavaScriptCore/SlotVisitorMacros.h>
 #include <JavaScriptCore/WeakInlines.h>
-#include <wtf/HashSet.h>
-#include <wtf/Locker.h>
 #include <wtf/Scope.h>
 #include <wtf/Vector.h>
 #include <wtf/text/MakeString.h>
@@ -321,9 +320,10 @@ namespace {
         if (iterator_method.isUndefinedOrNull())
             return JSC::throwVMTypeError(global_object, scope, "AbortSignal.any requires an iterable"_s);
 
-        // Strong: past eight entries the buffer is on the heap, out of the conservative stack scan's reach, and the
-        // iteration runs script that can trigger a collection.
-        WTF::Vector<Strong<Unknown>, 8> sources;
+        // The iteration runs script that can trigger a collection, so the signals it yields are rooted here. A signal
+        // the iterable repeats is kept once, which also bounds the list by the distinct signals.
+        JSC::MarkedVector<JSColloAbortSignal*, 8, WTF::RecordOverflow> sources;
+        unsigned yielded = 0;
         bool failed = false;
         JSC::forEachInIterable(global_object, iterable_value, [&](JSC::VM&, JSC::JSGlobalObject*, JSValue value) {
             if (failed)
@@ -333,68 +333,28 @@ namespace {
                 failed = true;
                 return;
             }
-            sources.append(Strong<Unknown>(vm, source));
+            if (++yielded > WebApiAbortSignalAnySourcesMax) {
+                failed = true;
+                JSC::throwException(global_object, scope,
+                    createDOMException(global_object, DOMExceptionCode::QuotaExceededError,
+                        "AbortSignal.any input limit exceeded"_s));
+                return;
+            }
+            for (auto* seen : sources) {
+                if (seen == source)
+                    return;
+            }
+            sources.append(source);
+            if (sources.hasOverflowed()) {
+                failed = true;
+                JSC::throwOutOfMemoryError(global_object, scope);
+            }
         });
         RETURN_IF_EXCEPTION(scope, {});
-
-        auto* collo_global = uncheckedDowncast<Collo::GlobalObject>(global_object);
-        JSValue first_abort_reason = JSC::jsUndefined();
-        bool first_aborted = false;
-        for (auto& source_handle : sources) {
-            auto* source = uncheckedDowncast<JSColloAbortSignal>(source_handle.get().asCell());
-            if (source->aborted()) {
-                first_abort_reason = source->reason();
-                first_aborted = true;
-                break;
-            }
-        }
-
-        if (first_aborted) {
-            // DOM standard, create a dependent abort signal: an input that is already aborted makes the result born
-            // aborted with that input's reason, so no abort event fires and no listener can have been registered.
-            auto* result = JSColloAbortSignal::create(
-                vm, collo_global, collo_global->abortSignalStructure(), /* aborted */ true, first_abort_reason);
-            return JSValue::encode(result);
-        }
-
-        auto* result = JSColloAbortSignal::create(vm, collo_global, collo_global->abortSignalStructure());
-        // DOM standard, create a dependent abort signal: a dependent input contributes its sources rather than
-        // itself, and the source and dependent lists are ordered sets, so each actual source is linked once even when
-        // the iterable repeats a signal or two inputs share a source. A signal counts as dependent here when it has
-        // sources.
-        WTF::HashSet<JSColloAbortSignal*> linked_sources;
-        auto linkSource = [&](JSColloAbortSignal* actual_source) -> bool {
-            if (!linked_sources.add(actual_source).isNewEntry)
-                return true;
-            // The weak dependent edge goes first. If the strong source edge then fails, the result is dropped with an
-            // OutOfMemoryError and becomes unreachable, and the weak edge clears itself once the result is collected,
-            // so no source points at a reachable dependent that does not list it as a source.
-            if (!actual_source->addDependentSignal(vm, result))
-                return false;
-            return result->addSourceSignal(vm, actual_source);
-        };
-        bool linked = true;
-        for (auto& source_handle : sources) {
-            if (!linked)
-                break;
-            auto* source = uncheckedDowncast<JSColloAbortSignal>(source_handle.get().asCell());
-            ASSERT(!source->aborted());
-            auto& source_signals = source->sourceSignals();
-            if (source_signals.isEmpty()) {
-                linked = linkSource(source);
-                continue;
-            }
-            for (auto& source_signal : source_signals) {
-                if (auto* actual_source = source_signal.get()) {
-                    if (!linkSource(actual_source)) {
-                        linked = false;
-                        break;
-                    }
-                }
-            }
-        }
-        if (!linked)
-            return JSValue::encode(JSC::throwOutOfMemoryError(global_object, scope));
+        if (failed)
+            return {};
+        auto* result = createDependentAbortSignal(global_object, scope, sources.span());
+        RETURN_IF_EXCEPTION(scope, {});
         return JSValue::encode(result);
     }
 
@@ -486,25 +446,10 @@ template <typename Visitor> void JSColloAbortSignal::visitChildrenImpl(JSC::JSCe
     Base::visitChildren(this_object, visitor);
     appendWebApiUnknown(visitor, this_object->m_reason);
     appendWebApiUnknown(visitor, this_object->m_onabort);
-    // The cell lock keeps these vector buffers stable while the concurrent
-    // marker walks them; mutators take the same lock around buffer-moving
-    // operations.
-    WTF::Locker locker { this_object->cellLock() };
-    this_object->m_event_target.visitChildren(visitor);
-    if (this_object->m_cleanup_records) {
-        for (auto& cleanup : *this_object->m_cleanup_records) {
-            appendWebApiUnknown(visitor, cleanup.target);
-            appendWebApiUnknown(visitor, cleanup.callback);
-        }
-    }
-    if (this_object->m_abort_algorithms) {
-        for (auto& algorithm : *this_object->m_abort_algorithms)
-            appendWebApiUnknown(visitor, algorithm.callback);
-    }
-    if (this_object->m_source_signals) {
-        for (auto& source : *this_object->m_source_signals)
-            visitor.append(source);
-    }
+    this_object->m_event_target.visit(this_object, visitor);
+    this_object->m_cleanup_records.visit(this_object, visitor);
+    this_object->m_abort_algorithms.visit(this_object, visitor);
+    this_object->m_source_signals.visit(this_object, visitor);
 }
 
 DEFINE_VISIT_CHILDREN(JSColloAbortSignal);
@@ -519,9 +464,9 @@ JSC::JSValue JSColloAbortSignal::normalizedAbortReason(JSC::JSGlobalObject* glob
 static void removeAbortAttributeHandler(JSColloAbortSignal* signal, JSC::JSValue callback)
 {
     auto& data = signal->eventTargetData();
-    auto& listeners = data.listeners();
-    for (unsigned index = 0; index < listeners.size(); index++) {
-        auto& listener = listeners[index];
+    const auto& listeners = data.listeners();
+    for (size_t index = 0; index < listeners.size(); index++) {
+        const auto& listener = listeners.at(index);
         if (listener.removed || !listener.attribute_handler || listener.type != "abort"_s)
             continue;
         if (!JSC::JSValue::strictEqual(nullptr, listener.callback.get(), callback))
@@ -529,37 +474,46 @@ static void removeAbortAttributeHandler(JSColloAbortSignal* signal, JSC::JSValue
         data.markRemoved(index);
         break;
     }
-    WTF::Locker locker { signal->cellLock() };
-    data.compactRemovedIfIdle();
+    data.compactRemovedIfIdle(signal);
 }
 
+// The previous handler's record goes before the new one is added, so replacing the handler on a signal at the
+// listener cap succeeds; a new record that cannot be stored leaves onabort null.
 bool JSColloAbortSignal::setOnAbort(
     JSC::VM& vm, JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSC::JSValue value)
 {
     auto previous = m_onabort.get();
     auto call_data = JSC::getCallData(value);
     JSValue normalized = call_data.type == JSC::CallData::Type::None ? JSC::jsNull() : value;
-    if (!normalized.isNull()) {
-        WebApiEventListenerRecord record;
-        record.type = "abort"_s;
-        record.callback.set(vm, this, normalized);
-        record.attribute_handler = true;
-        WTF::Locker locker { cellLock() };
-        record.order = eventTargetData().allocateListenerOrder();
-        if (!eventTargetData().listeners().tryAppend(WTF::move(record))) {
-            throwException(global_object, scope, createOutOfMemoryError(global_object));
-            return false;
-        }
-        eventTargetData().noteListenerAppended();
-    }
     if (!previous.isNull())
         removeAbortAttributeHandler(this, previous);
-    m_onabort.set(vm, this, normalized);
-    return true;
+    m_onabort.set(vm, this, JSC::jsNull());
+    if (normalized.isNull())
+        return true;
+
+    WebApiEventListenerRecord record;
+    record.type = "abort"_s;
+    record.callback.setWithoutWriteBarrier(normalized);
+    record.order = m_event_target.allocateListenerOrder();
+    record.attribute_handler = true;
+    switch (m_event_target.appendListener(vm, this, WTF::move(record))) {
+    case WebApiEventTargetData::AppendResult::Appended:
+        m_onabort.set(vm, this, normalized);
+        return true;
+    case WebApiEventTargetData::AppendResult::LimitReached:
+        JSC::throwException(global_object, scope,
+            createDOMException(
+                global_object, DOMExceptionCode::QuotaExceededError, "AbortSignal listener limit exceeded"_s));
+        return false;
+    case WebApiEventTargetData::AppendResult::OutOfMemory:
+        JSC::throwOutOfMemoryError(global_object, scope);
+        return false;
+    }
+    return false;
 }
 
 void JSColloAbortSignal::collectAbortSteps(JSC::VM& vm, JSC::JSGlobalObject* global_object, JSC::JSValue reason,
-    WTF::Vector<JSC::Strong<JSC::Unknown>, 8>& dispatch_targets)
+    JSC::MarkedVector<JSColloAbortSignal*>& dispatch_targets)
 {
     if (m_aborted)
         return;
@@ -573,29 +527,20 @@ void JSColloAbortSignal::collectAbortSteps(JSC::VM& vm, JSC::JSGlobalObject* glo
         m_timeout_timer_id = 0;
         Runtime::clearTimer(global_object, timer_id);
     }
-    // The lists the marker walks are moved out under the cell lock, so the marker never walks a vector being freed.
-    // m_dependent_signals is not walked and moves without it.
-    std::unique_ptr<SourceSignalVector> sources;
-    std::unique_ptr<CleanupVector> cleanup_records;
-    {
-        WTF::Locker locker { cellLock() };
-        sources = WTF::move(m_source_signals);
-        cleanup_records = WTF::move(m_cleanup_records);
+    for (auto& source : m_source_signals) {
+        if (auto* signal = source.signal.get())
+            signal->removeDependentSignal(this);
     }
-    if (sources) {
-        for (auto& source : *sources) {
-            if (auto* signal = source.get())
-                signal->removeDependentSignal(this);
-        }
+    m_source_signals.clear(this);
+
+    // Each record leaves the list before its listener is removed, so the removal, which looks for that record on this
+    // signal, finds nothing to change in the list being drained.
+    while (!m_cleanup_records.isEmpty()) {
+        auto cleanup = m_cleanup_records.takeFirst(this);
+        removeWebApiEventTargetListener(cleanup.target.get(), cleanup.type, cleanup.callback.get(), cleanup.capture);
     }
 
-    if (cleanup_records) {
-        for (auto& cleanup : *cleanup_records)
-            removeWebApiEventTargetListener(
-                cleanup.target.get(), cleanup.type, cleanup.callback.get(), cleanup.capture);
-    }
-
-    dispatch_targets.append(JSC::Strong<JSC::Unknown>(vm, this));
+    dispatch_targets.append(this);
 
     auto dependents = WTF::move(m_dependent_signals);
     if (dependents) {
@@ -610,20 +555,19 @@ void JSColloAbortSignal::collectAbortSteps(JSC::VM& vm, JSC::JSGlobalObject* glo
 
 void JSColloAbortSignal::signalAbort(JSC::VM& vm, JSC::JSGlobalObject* global_object, JSC::JSValue reason)
 {
-    // Strong, because a source reaches its dependents only through weak edges, and the abort steps run script that
-    // can trigger a collection.
-    WTF::Vector<JSC::Strong<JSC::Unknown>, 8> dispatch_targets;
+    // A source reaches its dependents only through weak edges, and the abort steps run script that can trigger a
+    // collection, so the signals whose steps run are rooted here.
+    JSC::MarkedVector<JSColloAbortSignal*> dispatch_targets;
     // DOM standard, signal abort: every dependent is marked aborted before any signal runs its abort steps.
     collectAbortSteps(vm, global_object, reason, dispatch_targets);
     if (dispatch_targets.isEmpty())
         return;
 
     auto scope = DECLARE_THROW_SCOPE(vm);
-    for (auto& target_value : dispatch_targets) {
-        auto* signal = dynamicDowncast<JSColloAbortSignal>(target_value.get());
-        if (!signal)
-            continue;
+    for (auto* signal : dispatch_targets) {
+        // runInternalAbortAlgorithms clears every exception except a termination, which ends the walk.
         signal->runInternalAbortAlgorithms(vm, global_object);
+        RETURN_IF_EXCEPTION(scope, void());
         auto* event = createWebApiEvent(global_object, "abort"_s);
         WebApiEventTargetHandle target { signal, signal, &signal->m_event_target };
         dispatchWebApiEvent(global_object, scope, target, event);
@@ -641,82 +585,58 @@ bool JSColloAbortSignal::addEventTargetCleanup(
     JSC::VM& vm, JSC::JSObject* target, WTF::String type, JSC::JSValue callback, bool capture)
 {
     EventTargetCleanup cleanup;
-    cleanup.target.set(vm, this, target);
+    cleanup.target.setWithoutWriteBarrier(target);
     cleanup.type = WTF::move(type);
-    cleanup.callback.set(vm, this, callback);
+    cleanup.callback.setWithoutWriteBarrier(callback);
     cleanup.capture = capture;
-    // The marker walks m_cleanup_records, so a move of its buffer happens under the cell lock.
-    WTF::Locker locker { cellLock() };
-    auto* records = ensureCleanupRecords();
-    if (!records)
-        return false;
-    return records->tryAppend(WTF::move(cleanup));
+    return m_cleanup_records.tryAppend(vm, this, WTF::move(cleanup));
+}
+
+static bool cleanupTargets(const JSC::WriteBarrier<JSC::Unknown>& cleanup_target, const JSC::JSObject* target)
+{
+    JSC::JSValue value = cleanup_target.get();
+    return value && value.isObject() && value.getObject() == target;
 }
 
 void JSColloAbortSignal::removeEventTargetCleanup(
     JSC::JSObject* target, const WTF::String& type, JSC::JSValue callback, bool capture)
 {
-    if (!m_cleanup_records)
-        return;
-    auto& records = *m_cleanup_records;
-    for (unsigned index = 0; index < records.size(); index++) {
-        auto& cleanup = records[index];
-        if (cleanup.capture != capture || cleanup.type != type)
-            continue;
-        JSC::JSValue cleanup_target = cleanup.target.get();
-        if (!cleanup_target || !cleanup_target.isObject() || cleanup_target.getObject() != target)
-            continue;
-        if (!JSC::JSValue::strictEqual(nullptr, cleanup.callback.get(), callback))
-            continue;
-        WTF::Locker locker { cellLock() };
-        records.removeAt(index);
-        return;
+    auto matches = [&](const EventTargetCleanup& cleanup) {
+        return cleanup.capture == capture && cleanup.type == type && cleanupTargets(cleanup.target, target)
+            && JSC::JSValue::strictEqual(nullptr, cleanup.callback.get(), callback);
+    };
+    // Listeners are unique per (type, callback, capture) on a target, so at most one record matches.
+    bool found = false;
+    for (auto& cleanup : m_cleanup_records) {
+        if (matches(cleanup)) {
+            found = true;
+            break;
+        }
     }
+    if (found)
+        m_cleanup_records.removeIf(this, matches);
 }
 
 void JSColloAbortSignal::removeEventTargetCleanupsForTarget(JSC::JSObject* target)
 {
-    if (!target || !m_cleanup_records)
+    if (!target)
         return;
-
-    WTF::Locker locker { cellLock() };
-    auto& records = *m_cleanup_records;
-    unsigned write = 0;
-    for (unsigned read = 0; read < records.size(); read++) {
-        auto& cleanup = records[read];
-        JSC::JSValue cleanup_target = cleanup.target.get();
-        const bool remove = cleanup_target && cleanup_target.isObject() && cleanup_target.getObject() == target;
-        if (remove)
-            continue;
-        if (write != read)
-            records[write] = WTF::move(cleanup);
-        write++;
-    }
-    records.shrink(write);
+    m_cleanup_records.removeIf(
+        this, [target](const EventTargetCleanup& cleanup) { return cleanupTargets(cleanup.target, target); });
 }
 
 bool JSColloAbortSignal::addInternalAbortAlgorithm(
     JSC::VM& vm, JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSC::JSValue callback)
 {
     ASSERT(JSC::getCallData(callback).type != JSC::CallData::Type::None);
-    if (m_abort_algorithms) {
-        for (auto& algorithm : *m_abort_algorithms) {
-            if (algorithm.removed)
-                continue;
-            if (JSC::JSValue::strictEqual(nullptr, algorithm.callback.get(), callback))
-                return true;
-        }
+    for (auto& algorithm : m_abort_algorithms) {
+        if (!algorithm.removed && JSC::JSValue::strictEqual(nullptr, algorithm.callback.get(), callback))
+            return true;
     }
 
     InternalAbortAlgorithm algorithm;
-    algorithm.callback.set(vm, this, callback);
-    bool appended = false;
-    {
-        WTF::Locker locker { cellLock() };
-        if (auto* algorithms = ensureAbortAlgorithms())
-            appended = algorithms->tryAppend(WTF::move(algorithm));
-    }
-    if (!appended) {
+    algorithm.callback.setWithoutWriteBarrier(callback);
+    if (!m_abort_algorithms.tryAppend(vm, this, WTF::move(algorithm))) {
         JSC::throwOutOfMemoryError(global_object, scope);
         return false;
     }
@@ -725,50 +645,35 @@ bool JSColloAbortSignal::addInternalAbortAlgorithm(
 
 void JSColloAbortSignal::removeInternalAbortAlgorithm(JSC::JSValue callback)
 {
-    if (!m_abort_algorithms)
-        return;
-    auto& algorithms = *m_abort_algorithms;
     if (m_dispatching_internal_abort_algorithms) {
-        for (auto& algorithm : algorithms) {
+        for (auto& algorithm : m_abort_algorithms) {
             if (JSC::JSValue::strictEqual(nullptr, algorithm.callback.get(), callback))
                 algorithm.removed = true;
         }
         return;
     }
-
-    WTF::Locker locker { cellLock() };
-    unsigned write = 0;
-    for (unsigned read = 0; read < algorithms.size(); read++) {
-        auto& algorithm = algorithms[read];
-        if (algorithm.removed || JSC::JSValue::strictEqual(nullptr, algorithm.callback.get(), callback))
-            continue;
-        if (write != read)
-            algorithms[write] = WTF::move(algorithm);
-        write++;
-    }
-    algorithms.shrink(write);
+    m_abort_algorithms.removeIf(this, [callback](const InternalAbortAlgorithm& algorithm) {
+        return algorithm.removed || JSC::JSValue::strictEqual(nullptr, algorithm.callback.get(), callback);
+    });
 }
 
 void JSColloAbortSignal::runInternalAbortAlgorithms(JSC::VM& vm, JSC::JSGlobalObject* global_object)
 {
-    if (!m_abort_algorithms)
+    if (m_abort_algorithms.isEmpty())
         return;
     m_dispatching_internal_abort_algorithms = true;
     auto cleanup = WTF::makeScopeExit([this] {
         m_dispatching_internal_abort_algorithms = false;
-        // Freeing the buffer must not race the concurrent marker.
-        WTF::Locker locker { cellLock() };
-        m_abort_algorithms = nullptr;
+        m_abort_algorithms.clear(this);
     });
 
     // Only the algorithms present when the run starts are invoked; one added during the run is dropped with the list
     // afterwards. That matches the DOM standard, where adding an algorithm to an aborted signal does nothing. The loop
-    // indexes the live buffer on every iteration because a re-entrant append may reallocate it. The buffer only grows
-    // during the run, so indices below algorithm_count stay valid, and m_abort_algorithms stays non-null until the
-    // scope exit runs after the loop.
-    const unsigned algorithm_count = m_abort_algorithms->size();
-    for (unsigned index = 0; index < algorithm_count; index++) {
-        auto& algorithm = (*m_abort_algorithms)[index];
+    // indexes the list on every iteration because a re-entrant append may move its storage. During the run entries
+    // only join the end, since a removal only marks them, so indices below algorithm_count stay valid.
+    const size_t algorithm_count = m_abort_algorithms.size();
+    for (size_t index = 0; index < algorithm_count; index++) {
+        auto& algorithm = m_abort_algorithms.at(index);
         if (algorithm.removed)
             continue;
         JSValue callback = algorithm.callback.get();
@@ -806,31 +711,34 @@ bool JSColloAbortSignal::addDependentSignal(JSC::VM& vm, JSColloAbortSignal* sig
 
 bool JSColloAbortSignal::addSourceSignal(JSC::VM& vm, JSColloAbortSignal* signal)
 {
-    JSC::WriteBarrier<JSColloAbortSignal> barrier;
-    barrier.set(vm, this, signal);
-    // The marker walks m_source_signals, so a move of its buffer happens under the cell lock.
-    WTF::Locker locker { cellLock() };
-    auto* sources = ensureSourceSignals();
-    if (!sources)
-        return false;
-    return sources->tryAppend(WTF::move(barrier));
+    SourceSignal source;
+    source.signal.setWithoutWriteBarrier(signal);
+    return m_source_signals.tryAppend(vm, this, WTF::move(source));
+}
+
+bool JSColloAbortSignal::hasSourceSignal(const JSColloAbortSignal* signal) const
+{
+    for (auto& source : m_source_signals) {
+        if (source.signal.get() == signal)
+            return true;
+    }
+    return false;
 }
 
 void JSColloAbortSignal::removeSourceSignal(JSColloAbortSignal* signal)
 {
-    if (!m_source_signals)
-        return;
-    WTF::Locker locker { cellLock() };
-    auto& sources = *m_source_signals;
-    unsigned write = 0;
-    for (unsigned read = 0; read < sources.size(); read++) {
-        if (sources[read].get() == signal)
-            continue;
-        if (write != read)
-            sources[write] = WTF::move(sources[read]);
-        write++;
+    m_source_signals.removeIf(this, [signal](const SourceSignal& source) { return source.signal.get() == signal; });
+}
+
+JSColloAbortSignal::DependentVector* JSColloAbortSignal::ensureDependentSignals()
+{
+    if (!m_dependent_signals) {
+        void* storage = nullptr;
+        if (!WTF::tryFastMalloc(sizeof(DependentVector)).getValue(storage))
+            return nullptr;
+        m_dependent_signals.reset(new (NotNull, storage) DependentVector());
     }
-    sources.shrink(write);
+    return m_dependent_signals.get();
 }
 
 void JSColloAbortSignal::removeDependentSignal(JSColloAbortSignal* signal)
@@ -870,6 +778,62 @@ void JSColloAbortSignal::compactDependentSignals()
 JSColloAbortSignal* webApiAbortSignalFromValue(JSC::JSValue value)
 {
     return dynamicDowncast<JSColloAbortSignal>(value);
+}
+
+JSColloAbortSignal* createDependentAbortSignal(
+    JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, std::span<JSColloAbortSignal* const> inputs)
+{
+    auto& vm = global_object->vm();
+    auto* collo_global = uncheckedDowncast<Collo::GlobalObject>(global_object);
+    for (auto* input : inputs) {
+        // An input that is already aborted makes the result born aborted with that input's reason, so no abort event
+        // fires and no listener can have been registered.
+        if (input->aborted()) {
+            return JSColloAbortSignal::create(
+                vm, collo_global, collo_global->abortSignalStructure(), /* aborted */ true, input->reason());
+        }
+    }
+
+    auto* result = JSColloAbortSignal::create(vm, collo_global, collo_global->abortSignalStructure());
+    // Each link checks the sources linked so far, so the links one result takes are bounded to keep that check cheap.
+    unsigned links = 0;
+    bool limit_reached = false;
+    auto link = [&](JSColloAbortSignal* source) -> bool {
+        if (++links > WebApiAbortSignalAnySourcesMax) {
+            limit_reached = true;
+            return false;
+        }
+        if (result->hasSourceSignal(source))
+            return true;
+        // The weak dependent edge goes first. If the strong source edge then fails, the result is dropped and
+        // becomes unreachable, and the weak edge clears itself once the result is collected, so no source points at
+        // a reachable dependent that does not list it as a source.
+        return source->addDependentSignal(vm, result) && result->addSourceSignal(vm, source);
+    };
+    bool linked = true;
+    for (auto* input : inputs) {
+        const auto& input_sources = input->sourceSignals();
+        if (input_sources.isEmpty()) {
+            linked = link(input);
+        } else {
+            for (size_t index = 0; linked && index < input_sources.size(); index++) {
+                if (auto* actual_source = input_sources.at(index).signal.get())
+                    linked = link(actual_source);
+            }
+        }
+        if (!linked)
+            break;
+    }
+    if (linked)
+        return result;
+    if (limit_reached) {
+        JSC::throwException(global_object, scope,
+            createDOMException(
+                global_object, DOMExceptionCode::QuotaExceededError, "AbortSignal.any input limit exceeded"_s));
+    } else {
+        JSC::throwOutOfMemoryError(global_object, scope);
+    }
+    return nullptr;
 }
 
 void installWebApiAbort(Collo::GlobalObject* global_object, JSC::VM& vm)

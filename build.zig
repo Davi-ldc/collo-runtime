@@ -1,6 +1,7 @@
-//! Root build: parse options, assemble the toolchain/JSC/bridge once, build
-//! the two module graphs, then hand step wiring to build/{tests,smoke,bench}.zig.
-//! Production artifacts live behind the `release`/`release-x86` steps.
+//! Root build: parse options, assemble the toolchain, the pinned native
+//! dependencies, the engine and the bridge once, build the two module graphs,
+//! then hand step wiring to build/{tests,smoke,bench}.zig. Production
+//! artifacts live behind the `release`/`release-x86` steps.
 const std = @import("std");
 const options_mod = @import("runtime/build/options.zig");
 const toolchain_mod = @import("runtime/build/toolchain.zig");
@@ -13,7 +14,10 @@ const tests_mod = @import("runtime/build/tests.zig");
 const smoke_mod = @import("runtime/build/smoke.zig");
 const bench_mod = @import("runtime/build/bench.zig");
 const release_mod = @import("runtime/build/release.zig");
-const zstd_mod = @import("runtime/build/zstd.zig");
+const codecs_mod = @import("runtime/build/codecs.zig");
+const deps_mod = @import("runtime/build/deps.zig");
+const pins = @import("runtime/build/pins.zig");
+const tool_mod = @import("runtime/build/tool.zig");
 const cachefs = @import("runtime/build/cachefs.zig");
 
 pub fn build(b: *std.Build) void {
@@ -35,61 +39,69 @@ pub fn build(b: *std.Build) void {
     );
     const libc_file = toolchain_mod.createLibcConfig(b, toolchain);
 
-    // `auto` collapses against the discovered toolchain (static when
-    // libzstd.a exists, else system-dynamic); explicit choices pass through.
-    // The release steps stay pinned to an explicit static (release.zig).
-    const zstd_link = zstd_mod.resolveChoice(b, toolchain, opts.zstd_link);
+    const tool = b.allocator.create(tool_mod.Tool) catch @panic("OOM");
+    tool.* = tool_mod.create(b);
+    // ICU is an input of the engine, so -Djsc-prebuilt admits every ICU
+    // build with the engine instead of building it.
+    const native = deps_mod.Native.create(b, tool, if (opts.jsc_prebuilt) .admit else .build);
+    addDependencySteps(b, tool);
+
+    // ICU and BoringSSL for this target, built or admitted by their stamps.
+    const native_target: deps_mod.Target = .{
+        .target = opts.target,
+        .cxx_sysroot = opts.cxx_sysroot,
+        .mcpu = toolchain.target_mcpu,
+    };
+    const icu = native.icu(native_target);
+    const boringssl = native.boringssl(native_target);
+    b.step("icu", "Build (or admit, with -Djsc-prebuilt) the pinned ICU and its data for this target")
+        .dependOn(&icu.step.step);
+    b.step("boringssl", "Build the pinned BoringSSL with runtime/patches/boringssl for this target")
+        .dependOn(&boringssl.step.step);
+    const verify_trees = &native.verifyCompiledTrees().step;
+    const codecs = b.allocator.create(codecs_mod.Codecs) catch @panic("OOM");
+    codecs.* = codecs_mod.build(b, opts.target, verify_trees);
+    codecs_mod.addCheckTo(b.step("codecs", "Compile the pinned zlib, brotli and zstd and translate their headers for this target"), codecs);
 
     const jsc_cmake_build_type = options_mod.jscCmakeBuildType(opts.jsc_profile);
+    const engine_inputs: jsc_mod.EngineInputs = .{
+        .target = opts.target,
+        .cmake_build_type = jsc_cmake_build_type,
+        .jsc_build_dir = opts.jsc_build_dir,
+        .webkit_source_dir = opts.webkit_source_dir,
+        .cxx_sysroot = opts.cxx_sysroot,
+        .mcpu = toolchain.target_mcpu,
+        .icu = icu,
+    };
     const jsc = jsc_mod.JscBuild{
         .cmake_build_type = jsc_cmake_build_type,
         .build_dir = opts.jsc_build_dir,
         .webkit_source_dir = opts.webkit_source_dir,
         .step = if (opts.jsc_prebuilt)
-            jsc_mod.addPrebuiltValidationStep(
-                b,
-                opts.target,
-                jsc_cmake_build_type,
-                opts.jsc_build_dir,
-                opts.webkit_source_dir,
-                opts.cxx_sysroot,
-                toolchain.target_mcpu,
-            )
+            jsc_mod.addPrebuiltValidationStep(b, tool, engine_inputs)
         else
-            jsc_mod.addBuildStep(
-                b,
-                opts.target,
-                jsc_cmake_build_type,
-                opts.jsc_build_dir,
-                opts.webkit_source_dir,
-                opts.cxx_sysroot,
-                toolchain.target_mcpu,
-            ),
+            jsc_mod.addBuildStep(b, tool, engine_inputs),
     };
     if (jsc.step) |step|
         b.step("jsc", "Build (or admit, with -Djsc-prebuilt) the pinned, patched engine for this target and -Djsc-profile").dependOn(&step.step);
-    b.step("webkit-provision", "Clone oven-sh/WebKit at the pin into runtime/deps/WebKit")
-        .dependOn(&jsc_mod.addWebkitStep(b, "webkit-provision").step);
     b.step("webkit-authoring", "Create runtime/deps/webkit-authoring on branch collo-patches with the series applied")
-        .dependOn(&jsc_mod.addWebkitStep(b, "webkit-authoring").step);
+        .dependOn(&jsc_mod.addWebkitStep(b, tool, "webkit-authoring").step);
     b.step("webkit-export", "Regenerate runtime/patches/webkit from the collo-patches branch")
-        .dependOn(&jsc_mod.addWebkitStep(b, "webkit-export").step);
+        .dependOn(&jsc_mod.addWebkitStep(b, tool, "webkit-export").step);
 
-    const patched_ls_hpack = shims.addPatchedLsHpackSourceStep(b);
+    const patched_ls_hpack = shims.addPatchedLsHpackSourceStep(b, tool, verify_trees);
 
     const jsc_set = modules_mod.buildModuleGraph(b, .{
         .target = opts.target,
         .optimize = opts.optimize,
         .bindings = .jsc,
-        .toolchain = toolchain,
-        .zstd_link = zstd_link,
+        .codecs = codecs,
     });
     const stub_set = modules_mod.buildModuleGraph(b, .{
         .target = opts.target,
         .optimize = opts.optimize,
         .bindings = .h2_stub,
-        .toolchain = toolchain,
-        .zstd_link = zstd_link,
+        .codecs = codecs,
     });
 
     const bridge_module = b.createModule(.{
@@ -113,6 +125,7 @@ pub fn build(b: *std.Build) void {
         jsc.cmake_build_type,
         jsc.build_dir,
         jsc.webkit_source_dir,
+        .{ .icu = icu.headers(b), .boringssl = boringssl.headers(), .codecs = codecs },
         opts.sanitizer,
     );
 
@@ -120,8 +133,9 @@ pub fn build(b: *std.Build) void {
         .toolchain = toolchain,
         .jsc_build_dir = jsc.build_dir,
         .jsc_step = jsc.step,
-        .boringssl_build_dir = opts.boringssl_build_dir,
-        .zstd_link = zstd_link,
+        .icu = icu,
+        .boringssl = boringssl,
+        .codecs = codecs,
         .link_quadmath = opts.target.result.cpu.arch == .x86_64,
         .compiler_rt_carrier = link_mod.addCompilerRtCarrier(b, opts.target, opts.optimize),
     };
@@ -131,7 +145,7 @@ pub fn build(b: *std.Build) void {
         .root_module = jsc_set.get(.main),
     });
     shims.configureBindingsTestObject(collo_object, libc_file);
-    shims.configureBoringSslShim(b, collo_object, toolchain, opts.sanitizer);
+    shims.configureBoringSslShim(b, collo_object, toolchain, boringssl.headers(), opts.sanitizer);
     shims.configureHpackShim(b, collo_object, patched_ls_hpack);
     const linked_collo = link_mod.addJscLink(b, link_ctx, .{
         .name = "collo",
@@ -173,9 +187,6 @@ pub fn build(b: *std.Build) void {
     jsc_set.importInto(zygote_support_module, &.{ .bindings, .zygote, .os, .worker, .host, .ipc });
     zygote_support_module.addImport("collo_process_options", process_options_module);
 
-    const test_options = b.addOptions();
-    test_options.addOption(bool, "include_webapi_compat", opts.webapi_compat);
-
     const validate_tool = b.addExecutable(.{
         .name = "validate-webapi",
         .root_module = b.createModule(.{
@@ -186,16 +197,23 @@ pub fn build(b: *std.Build) void {
     });
     const validate_run = b.addRunArtifact(validate_tool);
     validate_run.addDirectoryArg(b.path("runtime/tests/webapi"));
-    validate_run.addFileArg(b.path("runtime/bench/webapi.zig"));
-    validate_run.addFileArg(b.path("runtime/build/bench.zig"));
     _ = validate_run.addOutputFileArg("webapi-contracts.ok");
+    validate_run.addPrefixedFileArg("--bench=", b.path("runtime/bench/webapi.zig"));
+    validate_run.addPrefixedFileArg("--bench=", b.path("runtime/build/bench.zig"));
+    validate_run.addPrefixedFileArg("--suite=", b.path("runtime/tests/webapi/suites.zig"));
+    validate_run.addPrefixedFileArg("--suite=", b.path("runtime/tests/webapi/forked.zig"));
+    // The cache knows a directory argument by its path alone, so a cached
+    // verdict would miss a fixture added to or edited in the tree. The check
+    // reads a few hundred kilobytes, so it runs every time.
+    validate_run.has_side_effects = true;
 
     const check_step = b.step("check", "Type-check every test and bench root (no link, no run)");
     const ctx = context_mod.Context{
         .opts = &opts,
-        .zstd_link = zstd_link,
         .toolchain = toolchain,
         .libc_file = libc_file,
+        .codecs = codecs,
+        .boringssl = boringssl,
         .jsc = jsc,
         .link_ctx = link_ctx,
         .bridge = bridge,
@@ -204,7 +222,6 @@ pub fn build(b: *std.Build) void {
         .stub_set = stub_set,
         .bindings_support_module = bindings_support_module,
         .zygote_support_module = zygote_support_module,
-        .test_build_options_module = test_options.createModule(),
         .process_options_module = process_options_module,
         .collo_bin = linked_collo.executable,
         .install_collo_step = &install_collo.step,
@@ -215,7 +232,11 @@ pub fn build(b: *std.Build) void {
     const smoke_preflight = smoke_mod.addPreflight(b);
     const test_lanes = tests_mod.addAll(b, &ctx, smoke_preflight);
     bench_mod.addAll(b, &ctx);
-    release_mod.addReleaseSteps(b, &opts, patched_ls_hpack);
+    release_mod.addReleaseSteps(b, &opts, .{
+        .tool = tool,
+        .native = native,
+        .patched_ls_hpack = patched_ls_hpack,
+    });
     addCommentTools(b, &ctx, test_lanes.aggregate, check_step);
 
     const cgroup_env_exe = b.addExecutable(.{
@@ -248,6 +269,31 @@ pub fn build(b: *std.Build) void {
         .lanes = test_lanes,
         .install_wsl_config = &install_wsl_config.step,
     });
+}
+
+/// `deps-provision` fetches every pinned tree (runtime/build/pins.zig) at its
+/// pin into runtime/deps, and `webkit-provision` only the engine's, through
+/// the same run, so asking for both never fetches one tree twice at once.
+/// Neither replaces a tree that exists, so both are safe to run again.
+fn addDependencySteps(b: *std.Build, tool: *const tool_mod.Tool) void {
+    const all = comptime std.enums.values(pins.Dependency);
+    const besides_webkit = comptime blk: {
+        var list: [all.len - 1]pins.Dependency = undefined;
+        var count: usize = 0;
+        for (all) |dependency| {
+            if (dependency == .webkit) continue;
+            list[count] = dependency;
+            count += 1;
+        }
+        break :blk list;
+    };
+    const webkit = deps_mod.addProvisionStep(b, tool, "provision webkit", &.{.webkit});
+    const others = deps_mod.addProvisionStep(b, tool, "provision pinned trees", &besides_webkit);
+    b.step("webkit-provision", "Fetch oven-sh/WebKit at the pin into runtime/deps/WebKit")
+        .dependOn(&webkit.step);
+    const provision = b.step("deps-provision", "Fetch every pinned dependency tree at its pin into runtime/deps");
+    provision.dependOn(&webkit.step);
+    provision.dependOn(&others.step);
 }
 
 /// The comment tools in dev/comments run on the build host for any target.

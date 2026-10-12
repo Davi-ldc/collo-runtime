@@ -29,13 +29,14 @@ const request_mod = @import("request.zig");
 const response = @import("response.zig");
 const session_mod = @import("session.zig");
 
-// A stream the client resets stays remembered until the peer ends it,
-// because frames the peer sent before seeing the reset still arrive: their
-// header blocks must be decoded to keep the HPACK table in sync, and their
-// DATA still counts against the connection window (RFC 9113 §5.1). A peer
-// that saw the reset before answering sends nothing more, so its entry stays
-// until the connection ends. This bounds that memory, and
-// `rememberLocalResetStream` states what happens at the bound.
+// A stream the client resets before the peer ended it stays remembered until
+// the peer ends it, because frames the peer sent before seeing the reset
+// still arrive: their header blocks must be decoded to keep the HPACK table
+// in sync, and their DATA still counts against the connection window
+// (RFC 9113 §5.1). A peer that saw the reset before answering sends nothing
+// more, so its entry stays until the connection ends. A stream the peer had
+// already ended leaves no entry (`resetStreamAt`). This bounds that memory,
+// and `rememberLocalResetStream` states what happens at the bound.
 pub const max_local_reset_tombstones: usize = 1024;
 // Bounds the frames one read may consume without producing an event, so a
 // peer flooding PING, SETTINGS or unknown frames fails the connection
@@ -641,16 +642,14 @@ pub const Connection = struct {
         return null;
     }
 
-    /// Resets an active stream with CANCEL and drops it, returning the body
-    /// credit its consumer still held to the connection window. Frames the
-    /// peer sent before it saw the reset are still consumed, including the
-    /// rest of a header block the stream had begun.
+    /// Drops an active stream, resetting it with CANCEL while either side is
+    /// still open (`resetStreamAt`), and returns the body credit its consumer
+    /// still held to the connection window. Frames the peer sent before it
+    /// saw the reset are still consumed, including the rest of a header
+    /// block the stream had begun.
     pub fn cancelStream(self: *Connection, writer: *std.Io.Writer, stream_id: u32) !void {
         const index = self.findStreamIndex(stream_id) orelse return error.Http2UnknownStream;
-        try self.restorePendingConnectionCreditBeforeReset(writer, index);
-        self.rememberLocalResetStream(stream_id);
-        try self.sendCancel(writer, stream_id);
-        self.active_streams.items[index].wire_bytes.addSent(h2.frame_header_len + 4);
+        try self.resetStreamAt(writer, index, false);
         // A header block this stream began stays pending, and
         // `endPendingHeaderBlock` decodes and drops it at END_HEADERS.
         var stream = self.active_streams.orderedRemove(index);
@@ -926,29 +925,58 @@ pub const Connection = struct {
         return null;
     }
 
-    fn cancelFailedStreamAt(self: *Connection, writer: *std.Io.Writer, index: usize, err: anyerror, remote_complete: bool) !Event {
-        const stream_id = self.active_streams.items[index].id;
-        try self.restorePendingConnectionCreditBeforeReset(writer, index);
-        if (!remote_complete)
-            self.rememberLocalResetStream(stream_id);
-        try self.sendCancel(writer, stream_id);
-        self.active_streams.items[index].wire_bytes.addSent(h2.frame_header_len + 4);
+    /// `frame_ended_remote` is the END_STREAM flag of the frame that failed
+    /// the stream, which the accumulator may not have recorded.
+    fn cancelFailedStreamAt(self: *Connection, writer: *std.Io.Writer, index: usize, err: anyerror, frame_ended_remote: bool) !Event {
+        try self.resetStreamAt(writer, index, frame_ended_remote);
         return self.failStreamAt(index, err);
     }
 
+    /// Ends the stream at `index` on the wire as its RFC 9113 §5.1 state
+    /// requires, before the caller drops it from the table, and returns the
+    /// body credit its consumer still held to the connection window. A
+    /// stream stays in the table after the peer's END_STREAM until its last
+    /// credit is acked, so being in the table does not mean being open. The
+    /// remote side has ended once END_STREAM arrived: on `frame_ended_remote`,
+    /// in the accumulator, or on the header block still pending for the
+    /// stream. The local side has ended once the upload's last DATA, or the
+    /// HEADERS of a request without a body, carried END_STREAM. RST_STREAM
+    /// goes out while either side is open; reset tracking is kept only while
+    /// the remote side is open, since a peer that ended the stream may still
+    /// send WINDOW_UPDATE, RST_STREAM or PRIORITY for it, which the codec
+    /// accepts for streams it no longer tracks, but never DATA or HEADERS.
+    fn resetStreamAt(self: *Connection, writer: *std.Io.Writer, index: usize, frame_ended_remote: bool) !void {
+        const stream = &self.active_streams.items[index];
+        const stream_id = stream.id;
+        const remote_ended = frame_ended_remote or stream.accumulator.complete or
+            (self.pending_header_stream_id == stream_id and self.pending_headers_end_stream);
+        const local_ended = stream.upload.offset == stream.upload.body.len;
+        try self.restorePendingConnectionCreditBeforeReset(writer, index);
+        if (remote_ended) {
+            if (local_ended) {
+                // Closed on both sides: nothing to tell the peer, and nothing
+                // of it can arrive any more but what RFC 9113 §5.1 allows
+                // above.
+                try writer.flush();
+                return;
+            }
+        } else {
+            self.rememberLocalResetStream(stream_id);
+        }
+        try self.sendCancel(writer, stream_id);
+        self.active_streams.items[index].wire_bytes.addSent(h2.frame_header_len + 4);
+    }
+
     /// Decodes a reset stream's header block only to keep the HPACK dynamic
-    /// table in step with the peer's encoder, then drops it. Returns whether
-    /// the block ended the stream.
+    /// table in step with the peer's encoder, then drops it. Nothing is kept,
+    /// so no header cap applies: a block over the caps of a kept response
+    /// still leaves the table in step, and only an error that leaves it out
+    /// of step fails the connection. Returns whether the block ended the
+    /// stream.
     fn discardPendingHeaderBlock(self: *Connection) !bool {
         defer self.clearPendingHeaderBlock();
         const end_stream = self.pending_headers_end_stream;
-        var decoded = try self.session.decoder.decodeBlock(
-            self.allocator,
-            self.pending_header_block.items,
-            response.max_response_header_count,
-            collo_limits.headers.EGRESS_RESPONSE_HEADER_BYTES_MAX,
-        );
-        defer decoded.deinit(self.allocator);
+        try self.session.decoder.skipBlock(self.allocator, self.pending_header_block.items);
         return end_stream;
     }
 

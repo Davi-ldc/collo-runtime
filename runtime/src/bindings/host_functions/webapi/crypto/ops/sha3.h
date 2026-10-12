@@ -9,7 +9,6 @@
 #include "host_functions/webapi/crypto/types.h"
 
 #include <openssl/digest.h>
-#include <wtf/Vector.h>
 
 #include <array>
 #include <cstdint>
@@ -18,7 +17,8 @@
 namespace Collo::HostFunctions::WebCrypto {
 
 bool isSha3Hash(WebCryptoHash);
-bool sha3DigestBytes(const HashSpec&, std::span<const uint8_t> data, WTF::Vector<uint8_t>& out);
+// `out` must be empty, and comes back empty on failure.
+bool sha3DigestBytes(const HashSpec&, std::span<const uint8_t> data, SecretBytes& out);
 bool sha3DigestRaw(const HashSpec&, std::span<const uint8_t> data, std::span<uint8_t> out);
 bool sha3HmacRaw(const HashSpec&, std::span<const uint8_t> key, std::span<const uint8_t> data,
     std::array<uint8_t, EVP_MAX_MD_SIZE>& out, unsigned& out_len);

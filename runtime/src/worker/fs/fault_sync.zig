@@ -30,9 +30,10 @@ const copies = @import("copies.zig");
 /// is copied now and its waiters settle on the loop after this read
 /// returns. A timeout, a closed channel or a non-ok response fails the
 /// read, and the wait never outlives the deadline, so an uncaught timeout
-/// reaches `writeException` past the deadline and the request answers 504.
-/// A context without a deadline, such as the boot context when the host
-/// set no init deadline, waits at most `modules_routes.module_eval_budget_ns`.
+/// reaches `answerException` (`serve/termination.zig`) past the deadline
+/// and the request answers 504.
+/// A context without a deadline, such as an evaluation the boot opened with
+/// no init deadline, waits at most `modules_routes.module_eval_budget_ns`.
 pub fn faultSync(runtime: anytype, request_id: u64, normalized: []const u8) !void {
     const state: *fault.State = &runtime.fs_fault;
     const view = worker_fs.indexView() orelse return error.FsFaultUnavailable;

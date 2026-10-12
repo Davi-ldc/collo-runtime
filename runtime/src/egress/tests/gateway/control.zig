@@ -1,22 +1,24 @@
 //! The control wire between the server and the gateway (`egress/gateway/control.zig`): an attach
 //! carries its session's descriptors and comes back as an attach ack, and a removal report names
 //! a session, never 0, the two packets the gateway sends after its ready report; the hello carries
-//! the token key and every policy entry in id
-//! order; a `request_ended` batch fills to its bound and leaves as one packet; shutdown carries no
-//! descriptor. Each decoder refuses a packet whose length, reserved bytes, counts, ids, flags or
+//! the token key and exactly one descriptor, the policy image's memfd, with the image's length; a
+//! `request_ended` batch fills to its bound and leaves as one packet; shutdown carries no
+//! descriptor. Each decoder refuses a packet whose length, reserved bytes, counts, ids, key or
 //! descriptors break the wire's rules, a kind only the other side sends, and the numbers of
-//! retired kinds. The order the gateway takes packets in, the hello first and once, is its control
-//! flow's (`runtime/control_flow.zig`), and the attach ack's session rule and the server's control
-//! client are covered in `server/tests/gateway/` (lane server-gateway-control-test). Lane:
-//! egress-gateway-test.
+//! retired kinds. The order the gateway takes packets in, the hello first and once, and its checks
+//! of the image the hello lends are its control flow's (`runtime/control_flow.zig`), and the
+//! attach ack's session rule and the server's control client are covered in
+//! `server/tests/gateway/` (lane server-gateway-control-test). Lane: egress-gateway-test.
 
 const std = @import("std");
 const os = @import("collo_os");
 const gateway = @import("collo_egress_gateway");
 const ipc = @import("collo_ipc");
+const network = @import("collo_egress_client").network;
+
+const policy_image = @import("support/policy_image.zig");
 
 const control = gateway.control;
-const policy = gateway.policy;
 const egress_token = ipc.egress_token;
 
 const test_key = keyFrom(0x21);
@@ -95,127 +97,90 @@ test "a removal report carries the session it names and never session 0" {
     }
 }
 
-test "the hello carries the key and every policy entry in id order" {
+test "a hello round-trips its key and the policy image's memfd and length" {
     const control_pair = try os.fd.socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
     defer std.posix.close(control_pair[0]);
     defer std.posix.close(control_pair[1]);
 
-    // Each entry's flags differ from its neighbors', so an entry read at another index would not
-    // match.
-    var table: policy.PolicyTable = .{ .count = 3 };
-    table.entries[0] = policy.public_https;
-    table.entries[1] = .{ .kind = .any_host, .allow_private_networks = true, .allow_http = false };
-    table.entries[2] = .{ .kind = .any_host, .allow_private_networks = false, .allow_http = true };
-    try control.sendHello(control_pair[0], &test_key, &table);
+    const image = try policy_image.standard(std.testing.allocator);
+    defer std.testing.allocator.free(image);
+    var memfd = try policy_image.memfdHolding(image, os.fd.memfd_readonly_seals);
+    defer memfd.deinit();
+    try control.sendHello(control_pair[0], &test_key, memfd.fd(), @intCast(image.len));
 
-    var scratch: [control.hello_bytes_max]u8 = undefined;
+    var scratch: [256]u8 = undefined;
     var packet = try ipc.recvPacketWithFdsScratch(std.testing.allocator, control_pair[1], &scratch);
     defer packet.deinit();
-    try std.testing.expectEqual(helloBytes(3), packet.bytes.len);
+    try std.testing.expectEqual(control.hello_bytes, packet.bytes.len);
     const hello = switch (try control.decode(&packet)) {
         .hello => |hello| hello,
         else => return error.UnexpectedControlMessage,
     };
+    var table_fd = hello.table_fd;
+    defer table_fd.deinit();
     try std.testing.expectEqualSlices(u8, &test_key.bytes, &hello.key.bytes);
-    try expectTablesEqual(&table, &hello.table);
+    try std.testing.expectEqual(@as(u32, @intCast(image.len)), hello.table_bytes);
+    // The descriptor names the server's memfd itself, seals included, not a copy of its bytes.
+    const sent = try std.posix.fstat(memfd.fd());
+    const received = try std.posix.fstat(table_fd.fd());
+    try std.testing.expectEqual(sent.dev, received.dev);
+    try std.testing.expectEqual(sent.ino, received.ino);
+    try os.fd.requireSeals(table_fd.fd(), os.fd.memfd_readonly_seals);
 }
 
-test "a hello with every entry a table holds fills the largest hello exactly" {
-    const control_pair = try os.fd.socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
-    defer std.posix.close(control_pair[0]);
-    defer std.posix.close(control_pair[1]);
+test "a hello without its one descriptor, with a zero key, or with an image length of 0 or past the largest image is refused" {
+    const fixed = control.HelloHeader{ .key = test_key, .table_bytes = 64 };
+    var buffer: [control.hello_bytes + 1]u8 = undefined;
 
-    var table: policy.PolicyTable = .{ .count = policy.policies_max };
-    for (table.entries[0..policy.policies_max], 0..) |*entry, index| {
-        entry.* = .{
-            .kind = .any_host,
-            .allow_private_networks = index % 2 == 1,
-            .allow_http = index % 3 == 1,
-        };
-    }
-    try control.sendHello(control_pair[0], &test_key, &table);
-
-    var scratch: [control.hello_bytes_max]u8 = undefined;
-    var packet = try ipc.recvPacketWithFdsScratch(std.testing.allocator, control_pair[1], &scratch);
-    defer packet.deinit();
-    try std.testing.expectEqual(control.hello_bytes_max, packet.bytes.len);
-    const hello = switch (try control.decode(&packet)) {
-        .hello => |hello| hello,
-        else => return error.UnexpectedControlMessage,
-    };
-    try expectTablesEqual(&table, &hello.table);
-}
-
-test "a hello that breaks the wire's rules is refused" {
-    const entries = [_]control.PolicyEntry{
-        policyEntry(0, 0, 0),
-        policyEntry(1, 1, 1),
-    };
-    const fixed = control.HelloHeader{ .key = test_key, .policy_count = entries.len };
-    var buffer: [helloBytes(policy.policies_max + 1)]u8 = undefined;
-
-    // The hello every case below breaks in one place decodes.
-    {
-        var packet = receivedFrom(writeHello(&buffer, fixed, &entries));
+    // The hello every case below breaks in one place decodes and hands its descriptor over, and
+    // so does one that names the largest image.
+    for ([_]u32{ fixed.table_bytes, @intCast(network.table.image_bytes_max) }) |table_bytes| {
+        var sized = fixed;
+        sized.table_bytes = table_bytes;
+        var packet = try receivedWithDescriptors(writeHello(&buffer, sized), 1);
+        defer packet.deinit();
         const hello = switch (try control.decode(&packet)) {
             .hello => |hello| hello,
             else => return error.UnexpectedControlMessage,
         };
-        try std.testing.expectEqual(@as(u16, entries.len), hello.table.count);
+        var table_fd = hello.table_fd;
+        defer table_fd.deinit();
+        try std.testing.expect(table_fd.isValid());
+        try std.testing.expectEqual(table_bytes, hello.table_bytes);
     }
 
-    {
-        var packet = try receivedWithDescriptor(writeHello(&buffer, fixed, &entries));
+    // No descriptor, and two.
+    for ([_]usize{ 0, 2 }) |descriptor_count| {
+        var packet = try receivedWithDescriptors(writeHello(&buffer, fixed), descriptor_count);
         defer packet.deinit();
         try std.testing.expectError(error.InvalidEgressGatewayControl, control.decode(&packet));
     }
 
-    // A length other than the count gives: a byte short, a byte over, and short of the fixed part.
-    const whole = writeHello(&buffer, fixed, &entries);
-    try expectRefused(buffer[0 .. whole.len - 1]);
+    // A length other than the hello's: a byte short and a byte over.
+    const whole = writeHello(&buffer, fixed);
+    try expectHelloRefused(buffer[0 .. whole.len - 1]);
     buffer[whole.len] = 0;
-    try expectRefused(buffer[0 .. whole.len + 1]);
-    try expectRefused(buffer[0 .. helloBytes(0) - 1]);
+    try expectHelloRefused(buffer[0 .. whole.len + 1]);
 
-    {
-        var broken = fixed;
-        broken._reserved0 = 1;
-        try expectRefused(writeHello(&buffer, broken, &entries));
-    }
     {
         var broken = fixed;
         broken.key = .{ .bytes = @splat(0) };
-        try expectRefused(writeHello(&buffer, broken, &entries));
+        try expectHelloRefused(writeHello(&buffer, broken));
     }
     {
         var broken = fixed;
-        broken.policy_count = 0;
-        try expectRefused(writeHello(&buffer, broken, &.{}));
+        broken._reserved0 = 1;
+        try expectHelloRefused(writeHello(&buffer, broken));
     }
     {
-        var many: [policy.policies_max + 1]control.PolicyEntry = undefined;
-        for (&many, 0..) |*entry, index|
-            entry.* = policyEntry(@intCast(index), 0, 0);
         var broken = fixed;
-        broken.policy_count = many.len;
-        try expectRefused(writeHello(&buffer, broken, &many));
+        broken.table_bytes = 0;
+        try expectHelloRefused(writeHello(&buffer, broken));
     }
-
-    // One entry broken at a time: an id other than its index, either way round, an unknown kind,
-    // a flag other than 0 or 1, and a nonzero reserved byte.
-    var first_id_one = entries;
-    first_id_one[0].id = 1;
-    try expectRefused(writeHello(&buffer, fixed, &first_id_one));
-    var second_breaks: [6]control.PolicyEntry = @splat(entries[1]);
-    second_breaks[0].id = 0;
-    second_breaks[1].kind = 0;
-    second_breaks[2].kind = control.policy_kind_any_host + 1;
-    second_breaks[3].allow_private_networks = 2;
-    second_breaks[4].allow_http = 0xff;
-    second_breaks[5]._reserved0[2] = 1;
-    for (second_breaks) |broken| {
-        const pair = [_]control.PolicyEntry{ entries[0], broken };
-        try expectRefused(writeHello(&buffer, fixed, &pair));
+    {
+        var broken = fixed;
+        broken.table_bytes = @intCast(network.table.image_bytes_max + 1);
+        try expectHelloRefused(writeHello(&buffer, broken));
     }
 }
 
@@ -359,7 +324,7 @@ test "a request_ended packet that breaks the wire's rules is refused" {
     }
 
     {
-        var packet = try receivedWithDescriptor(writeRequestEnded(&buffer, fixed, &entries));
+        var packet = try receivedWithDescriptors(writeRequestEnded(&buffer, fixed, &entries), 1);
         defer packet.deinit();
         try std.testing.expectError(error.InvalidEgressGatewayControl, control.decode(&packet));
     }
@@ -460,7 +425,7 @@ test "the server takes nothing from the gateway but attach acks and removal repo
             error.InvalidEgressGatewayControl,
             control.decodeGatewayToServerPacket(&ack_sized),
         );
-        var with_descriptor = try receivedWithDescriptor(writeSessionRemoved(&buffer, 9));
+        var with_descriptor = try receivedWithDescriptors(writeSessionRemoved(&buffer, 9), 1);
         defer with_descriptor.deinit();
         try std.testing.expectError(
             error.InvalidEgressGatewayControl,
@@ -468,7 +433,7 @@ test "the server takes nothing from the gateway but attach acks and removal repo
         );
     }
     {
-        var packet = try receivedWithDescriptor(writeAck(&buffer, ack_kind));
+        var packet = try receivedWithDescriptors(writeAck(&buffer, ack_kind), 1);
         defer packet.deinit();
         try std.testing.expectError(
             error.InvalidEgressGatewayControl,
@@ -522,7 +487,7 @@ test "the gateway refuses the packets only it sends and malformed headers" {
     buffer[@sizeOf(control.Header)] = 0;
     var with_body = receivedFrom(buffer[0 .. @sizeOf(control.Header) + 1]);
     try std.testing.expectError(error.InvalidEgressGatewayControl, control.decode(&with_body));
-    var with_descriptor = try receivedWithDescriptor(writeHeader(&buffer, @intFromEnum(control.Kind.shutdown)));
+    var with_descriptor = try receivedWithDescriptors(writeHeader(&buffer, @intFromEnum(control.Kind.shutdown)), 1);
     defer with_descriptor.deinit();
     try std.testing.expectError(error.InvalidEgressGatewayControl, control.decode(&with_descriptor));
 }
@@ -554,32 +519,9 @@ fn keyFrom(seed: u8) egress_token.Key {
     return key;
 }
 
-fn expectTablesEqual(expected: *const policy.PolicyTable, actual: *const policy.PolicyTable) !void {
-    try std.testing.expectEqual(expected.count, actual.count);
-    for (expected.slice(), actual.slice()) |want, got| {
-        try std.testing.expectEqual(want.kind, got.kind);
-        try std.testing.expectEqual(want.allow_private_networks, got.allow_private_networks);
-        try std.testing.expectEqual(want.allow_http, got.allow_http);
-    }
-}
-
-fn helloBytes(entry_count: usize) usize {
-    return @sizeOf(control.Header) + @sizeOf(control.HelloHeader) +
-        entry_count * @sizeOf(control.PolicyEntry);
-}
-
 fn requestEndedBytes(entry_count: usize) usize {
     return @sizeOf(control.Header) + @sizeOf(control.RequestEndedHeader) +
         entry_count * @sizeOf(control.RequestEndedEntry);
-}
-
-fn policyEntry(id: u16, allow_private_networks: u8, allow_http: u8) control.PolicyEntry {
-    return .{
-        .id = id,
-        .kind = control.policy_kind_any_host,
-        .allow_private_networks = allow_private_networks,
-        .allow_http = allow_http,
-    };
 }
 
 /// Entry `index` of a run whose entries all differ, every one a request's.
@@ -592,11 +534,9 @@ fn endedEntryAt(index: usize) control.RequestEndedEntry {
 }
 
 /// A hello written field by field, so a test can break any of them.
-fn writeHello(buffer: []u8, fixed: control.HelloHeader, entries: []const control.PolicyEntry) []u8 {
+fn writeHello(buffer: []u8, fixed: control.HelloHeader) []u8 {
     var cursor = writeHeader(buffer, @intFromEnum(control.Kind.hello)).len;
     cursor += ipc.packet.writeStruct(buffer[cursor..], &fixed);
-    for (entries) |*entry|
-        cursor += ipc.packet.writeStruct(buffer[cursor..], entry);
     return buffer[0..cursor];
 }
 
@@ -657,15 +597,27 @@ fn receivedFrom(bytes: []u8) ipc.ReceivedPacket {
     };
 }
 
-/// `receivedFrom` with one descriptor, an eventfd that the packet's `deinit` closes.
-fn receivedWithDescriptor(bytes: []u8) !ipc.ReceivedPacket {
+/// `receivedFrom` with `count` descriptors, eventfds that the packet's `deinit` closes unless a
+/// decoder took them.
+fn receivedWithDescriptors(bytes: []u8, count: usize) !ipc.ReceivedPacket {
     var packet = receivedFrom(bytes);
-    packet.fds[0] = os.fd.OwnedFd.fromRaw(try std.posix.eventfd(0, std.os.linux.EFD.CLOEXEC));
-    packet.fd_count = 1;
+    errdefer packet.deinit();
+    for (0..count) |index| {
+        packet.fds[index] = os.fd.OwnedFd.fromRaw(try std.posix.eventfd(0, std.os.linux.EFD.CLOEXEC));
+        packet.fd_count = index + 1;
+    }
     return packet;
 }
 
 fn expectRefused(bytes: []u8) !void {
     var packet = receivedFrom(bytes);
+    try std.testing.expectError(error.InvalidEgressGatewayControl, control.decode(&packet));
+}
+
+/// A hello is refused whatever it carries once it breaks a rule, so each case carries the one
+/// descriptor a hello must.
+fn expectHelloRefused(bytes: []u8) !void {
+    var packet = try receivedWithDescriptors(bytes, 1);
+    defer packet.deinit();
     try std.testing.expectError(error.InvalidEgressGatewayControl, control.decode(&packet));
 }

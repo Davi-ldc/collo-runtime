@@ -13,6 +13,7 @@
 #include "host_functions/webapi/limits.h"
 #include "host_functions/webapi/dom/dom_exception.h"
 
+#include <JavaScriptCore/ArgList.h>
 #include <JavaScriptCore/ArrayBuffer.h>
 #include <JavaScriptCore/DateInstance.h>
 #include <JavaScriptCore/Error.h>
@@ -39,8 +40,13 @@
 #include <JavaScriptCore/TypedArrayType.h>
 #include <wtf/HashMap.h>
 #include <wtf/HashSet.h>
+#include <wtf/RefPtr.h>
 #include <wtf/Scope.h>
 #include <wtf/text/WTFString.h>
+
+#include <bit>
+#include <cstdint>
+#include <optional>
 
 namespace Collo::HostFunctions {
 namespace {
@@ -50,11 +56,40 @@ namespace {
     using WTF::String;
     using namespace JSC;
 
-    // FIXME: The keys of m_seen and m_transfer_ports, the buffers in m_transfer_buffers and the sources in
-    // m_port_transfers are raw pointers that root nothing. A source that only a getter's result or a generator's
-    // yield referenced can be collected during the clone. A new cell at the same address then maps to the wrong
-    // clone, and a freed ArrayBuffer is read by validateTransfers() and detached at commit.
+    // Checks every buffer, then detaches them all, so a buffer that became detached, shared or resizable since the
+    // clone throws a DataCloneError and leaves the others attached. Returns false with an exception on the ThrowScope
+    // on failure.
+    static bool commitArrayBufferTransfers(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope,
+        const WTF::HashSet<WTF::RefPtr<JSC::ArrayBuffer>>& transfers)
+    {
+        for (auto& buffer : transfers) {
+            if (!buffer || buffer->isDetached() || buffer->isShared() || buffer->isResizableOrGrowableShared()) {
+                throwException(global_object, scope,
+                    createDOMException(
+                        global_object, DOMExceptionCode::DataCloneError, "ArrayBuffer could not be transferred"_s));
+                return false;
+            }
+        }
+
+        auto& vm = global_object->vm();
+        // FIXME: A buffer the engine has locked or pinned, such as a WebAssembly.Memory buffer, passes the checks
+        // above and those in StructuredCloneContext. transferTo() copies such a buffer and returns true, so the source
+        // stays attached where HTML's DetachArrayBuffer would throw.
+        for (auto& buffer : transfers) {
+            ArrayBufferContents detached_contents;
+            if (!buffer->transferTo(vm, detached_contents)) {
+                throwException(global_object, scope,
+                    createDOMException(
+                        global_object, DOMExceptionCode::DataCloneError, "ArrayBuffer could not be transferred"_s));
+                return false;
+            }
+        }
+        return true;
+    }
+
     class StructuredCloneContext {
+        WTF_FORBID_HEAP_ALLOCATION;
+
     public:
         StructuredCloneContext(
             JSGlobalObject* global_object, ThrowScope& scope, JSC::JSObject* blocked_sender = nullptr)
@@ -95,15 +130,14 @@ namespace {
 
                 auto* buffer_object = dynamicDowncast<JSArrayBuffer>(value);
                 if (buffer_object) {
-                    auto* buffer = buffer_object->impl();
+                    RefPtr<ArrayBuffer> buffer = buffer_object->impl();
                     if (!buffer || buffer->isDetached() || buffer->isShared()
                         || buffer->isResizableOrGrowableShared()) {
                         throwDataClone("ArrayBuffer could not be transferred"_s);
                         return;
                     }
 
-                    auto add_result = m_transfer_buffers.add(buffer);
-                    if (!add_result.isNewEntry)
+                    if (!m_transfer_buffers.add(buffer).isNewEntry)
                         throwDataClone("Transfer list contains duplicate ArrayBuffer"_s);
                     return;
                 }
@@ -114,15 +148,22 @@ namespace {
                         throwDataClone("MessagePort could not be transferred"_s);
                         return;
                     }
-                    auto* clone = webApiCreateMessagePortTransferClone(m_global_object, m_scope, value);
-                    if (!clone)
-                        return;
-                    auto add_result = m_transfer_ports.add(value.asCell(), Strong<Unknown>(m_vm, clone));
-                    if (!add_result.isNewEntry) {
+                    // A port listed twice is refused before a second clone is made for it.
+                    if (m_transfer_ports.contains(cellKey(value.asCell()))) {
                         throwDataClone("Transfer list contains duplicate MessagePort"_s);
                         return;
                     }
-                    m_port_transfers.append({ value.getObject(), clone });
+                    auto* clone = webApiCreateMessagePortTransferClone(m_global_object, m_scope, value);
+                    if (!clone)
+                        return;
+                    if (!root(value))
+                        return;
+                    auto clone_index = root(clone);
+                    if (!clone_index)
+                        return;
+                    m_transfer_ports.add(cellKey(value.asCell()), *clone_index);
+                    if (!m_port_transfers.tryAppend(WebApiMessagePortTransfer { value.getObject(), clone }))
+                        throwException(m_global_object, m_scope, createOutOfMemoryError(m_global_object));
                     return;
                 }
 
@@ -147,8 +188,8 @@ namespace {
                 return value;
 
             auto* cell = value.asCell();
-            if (auto seen = m_seen.find(cell); seen != m_seen.end())
-                return seen->value.get();
+            if (auto seen = m_seen.find(cellKey(cell)); seen != m_seen.end())
+                return m_roots.at(seen->value);
 
             if (!value.isObject()) {
                 throwDataClone("Value could not be cloned"_s);
@@ -167,12 +208,12 @@ namespace {
             auto* object = asObject(value);
 
             if (webApiMessagePortIsValue(object)) {
-                auto found = m_transfer_ports.find(object);
+                auto found = m_transfer_ports.find(cellKey(object));
                 if (found == m_transfer_ports.end()) {
                     throwDataClone("MessagePort could not be cloned"_s);
                     return {};
                 }
-                return found->value.get();
+                return m_roots.at(found->value);
             }
 
             if (auto* buffer = dynamicDowncast<JSArrayBuffer>(object))
@@ -199,8 +240,8 @@ namespace {
 
         bool validateTransfers()
         {
-            for (auto* buffer : m_transfer_buffers) {
-                if (!isValidTransferBuffer(buffer)) {
+            for (auto& buffer : m_transfer_buffers) {
+                if (!isValidTransferBuffer(buffer.get())) {
                     throwDataClone("ArrayBuffer could not be transferred"_s);
                     return false;
                 }
@@ -215,27 +256,40 @@ namespace {
 
         JSC::JSObject* transferredPortsArray()
         {
+            // Every transferred port consumed a clone entry, so the size is bounded by WebApiStructuredCloneEntriesMax.
             auto* array = JSC::constructEmptyArray(m_global_object, nullptr, m_port_transfers.size());
-            for (unsigned index = 0; index < m_port_transfers.size(); index++)
+            RETURN_IF_EXCEPTION(m_scope, nullptr);
+            for (unsigned index = 0; index < m_port_transfers.size(); index++) {
                 array->putDirectIndex(m_global_object, index, m_port_transfers[index].clone);
+                RETURN_IF_EXCEPTION(m_scope, nullptr);
+            }
             JSC::objectConstructorFreeze(m_global_object, array);
             RETURN_IF_EXCEPTION(m_scope, nullptr);
             return array;
         }
 
-        WTF::Vector<ArrayBuffer*> takeArrayBufferTransfers()
+        // Revalidates every transfer, then detaches the ArrayBuffers and moves each MessagePort to its clone. A source
+        // that stopped being transferable since the clone throws a DataCloneError before anything is detached.
+        bool commitTransfers()
         {
-            WTF::Vector<ArrayBuffer*> transfers;
-            transfers.reserveInitialCapacity(m_transfer_buffers.size());
-            for (auto* buffer : m_transfer_buffers)
-                transfers.append(buffer);
-            m_transfer_buffers.clear();
-            return transfers;
+            if (!commitArrayBufferTransfers(m_global_object, m_scope, m_transfer_buffers))
+                return false;
+            return webApiCommitMessagePortTransfers(m_global_object, m_scope, m_port_transfers);
         }
 
-        WTF::Vector<WebApiMessagePortTransfer> takePortTransfers() { return WTF::move(m_port_transfers); }
-
     private:
+        static uintptr_t cellKey(const JSCell* cell) { return std::bit_cast<uintptr_t>(cell); }
+
+        // Roots `value` and returns its index in m_roots, or throws an OutOfMemoryError and returns nullopt.
+        std::optional<unsigned> root(JSValue value)
+        {
+            m_roots.append(value);
+            if (m_roots.hasOverflowed()) {
+                throwException(m_global_object, m_scope, createOutOfMemoryError(m_global_object));
+                return std::nullopt;
+            }
+            return static_cast<unsigned>(m_roots.size() - 1);
+        }
         void throwDataClone(WTF::ASCIILiteral message)
         {
             throwException(m_global_object, m_scope,
@@ -284,10 +338,20 @@ namespace {
             return buffer && !buffer->isDetached() && !buffer->isShared() && !buffer->isResizableOrGrowableShared();
         }
 
-        // Each object, array, Map and Set clone is remembered before its contents are copied, so a cycle back to
-        // `source` finds the clone. A view is remembered after its buffer, because cloning a buffer copies only bytes
-        // and cannot reach the view.
-        void remember(JSCell* source, JSValue clone) { m_seen.set(source, Strong<Unknown>(m_vm, clone)); }
+        // Records that `source` clones to `clone`. Returns false with an OutOfMemoryError thrown when either cannot
+        // be rooted. Each object, array, Map and Set clone is remembered before its contents are copied, so a cycle
+        // back to `source` finds the clone. A view is remembered after its buffer, because cloning a buffer copies
+        // only bytes and cannot reach the view.
+        bool remember(JSCell* source, JSValue clone)
+        {
+            if (!root(source))
+                return false;
+            auto index = root(clone);
+            if (!index)
+                return false;
+            m_seen.set(cellKey(source), *index);
+            return true;
+        }
 
         JSValue cloneArrayBuffer(JSArrayBuffer* source)
         {
@@ -305,7 +369,8 @@ namespace {
 
             auto* result = JSArrayBuffer::create(
                 m_vm, m_global_object->arrayBufferStructure(ArrayBufferSharingMode::Default), WTF::move(clone_buffer));
-            remember(source, result);
+            if (!remember(source, result))
+                return {};
             return result;
         }
 
@@ -397,7 +462,8 @@ namespace {
                 break;
             }
             RETURN_IF_EXCEPTION(m_scope, {});
-            remember(source, result);
+            if (!remember(source, result))
+                return {};
             return result;
         }
 
@@ -406,7 +472,8 @@ namespace {
             auto* result
                 = JSColloBlob::create(m_vm, uncheckedDowncast<Collo::GlobalObject>(m_global_object)->blobStructure(),
                     source->storageRef(), source->byteOffset(), source->size(), source->type());
-            remember(source, result);
+            if (!remember(source, result))
+                return {};
             return result;
         }
 
@@ -415,14 +482,16 @@ namespace {
             auto* result = JSColloFile::createFromBlob(m_vm,
                 uncheckedDowncast<Collo::GlobalObject>(m_global_object)->fileStructure(), *source, source->name(),
                 source->lastModified());
-            remember(source, result);
+            if (!remember(source, result))
+                return {};
             return result;
         }
 
         JSValue cloneDate(DateInstance* source)
         {
             auto* result = DateInstance::create(m_vm, m_global_object->dateStructure(), source->internalNumber());
-            remember(source, result);
+            if (!remember(source, result))
+                return {};
             return result;
         }
 
@@ -435,16 +504,27 @@ namespace {
                 return {};
             }
             auto* result = RegExpObject::create(m_vm, m_global_object->regExpStructure(), regexp, 0);
-            remember(source, result);
+            if (!remember(source, result))
+                return {};
             return result;
         }
 
+        // The clone starts empty, gains only the indexes the source has, and takes the source's length last. A sparse
+        // source therefore stays sparse, and its clone costs what its entries cost instead of what its length implies.
+        // The length is read before any getter runs, as HTML reads it before it serializes the properties.
         JSValue cloneArray(JSArray* source)
         {
-            auto* result = constructEmptyArray(m_global_object, nullptr, source->length());
-            remember(source, result);
+            const unsigned length = source->length();
+            auto* result = constructEmptyArray(m_global_object, nullptr);
+            RETURN_IF_EXCEPTION(m_scope, {});
+            if (!remember(source, result))
+                return {};
             if (!copyEnumerableOwnProperties(source, result))
                 return {};
+            if (result->length() < length) {
+                result->setLength(m_global_object, length, true);
+                RETURN_IF_EXCEPTION(m_scope, {});
+            }
             return result;
         }
 
@@ -454,7 +534,8 @@ namespace {
         JSValue cloneObject(JSObject* source)
         {
             auto* result = constructEmptyObject(m_global_object);
-            remember(source, result);
+            if (!remember(source, result))
+                return {};
             if (!copyEnumerableOwnProperties(source, result))
                 return {};
             return result;
@@ -463,7 +544,8 @@ namespace {
         JSValue cloneMap(JSMap* source)
         {
             auto* result = JSMap::create(m_vm, m_global_object->mapStructure());
-            remember(source, result);
+            if (!remember(source, result))
+                return {};
 
             if (!source->storage())
                 return result;
@@ -492,7 +574,8 @@ namespace {
         JSValue cloneSet(JSSet* source)
         {
             auto* result = JSSet::create(m_vm, m_global_object->setStructure());
-            remember(source, result);
+            if (!remember(source, result))
+                return {};
 
             if (!source->storage())
                 return result;
@@ -558,11 +641,15 @@ namespace {
         VM& m_vm;
         ThrowScope& m_scope;
         JSC::JSObject* m_blocked_sender { nullptr };
-        // The Strong handles keep each clone alive until the call returns. The context lives on the stack, so nothing
-        // they root can reach back to it.
-        WTF::HashMap<JSCell*, Strong<Unknown>> m_seen;
-        WTF::HashSet<ArrayBuffer*> m_transfer_buffers;
-        WTF::HashMap<JSCell*, Strong<Unknown>> m_transfer_ports;
+        // Every cell the clone records: each source with its clone, and each transferred port with its clone. The
+        // maps key a source by its address, which names one live cell for the whole clone because the source is
+        // rooted here too, and give the index of its clone in m_roots.
+        JSC::MarkedArgumentBuffer m_roots;
+        WTF::HashMap<uintptr_t, unsigned> m_seen;
+        WTF::HashMap<uintptr_t, unsigned> m_transfer_ports;
+        // Held by reference, so a buffer whose JSArrayBuffer is collected stays valid until the commit detaches it.
+        WTF::HashSet<WTF::RefPtr<ArrayBuffer>> m_transfer_buffers;
+        // Both cells of each entry are rooted in m_roots.
         WTF::Vector<WebApiMessagePortTransfer> m_port_transfers;
         unsigned m_depth { 0 };
         unsigned m_entry_count { 0 };
@@ -570,38 +657,9 @@ namespace {
 
 } // namespace
 
-bool webApiCommitArrayBufferTransfers(
-    JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, WTF::Vector<JSC::ArrayBuffer*>& transfers)
-{
-    for (auto* buffer : transfers) {
-        if (!buffer || buffer->isDetached() || buffer->isShared() || buffer->isResizableOrGrowableShared()) {
-            throwException(global_object, scope,
-                createDOMException(
-                    global_object, DOMExceptionCode::DataCloneError, "ArrayBuffer could not be transferred"_s));
-            return false;
-        }
-    }
-
-    auto& vm = global_object->vm();
-    // FIXME: A buffer the engine has locked or pinned, such as a WebAssembly.Memory buffer, passes the checks above and
-    // those in StructuredCloneContext. transferTo() copies such a buffer and returns true, so the source stays
-    // attached where HTML's DetachArrayBuffer would throw.
-    for (auto* buffer : transfers) {
-        ArrayBufferContents detached_contents;
-        if (!buffer->transferTo(vm, detached_contents)) {
-            throwException(global_object, scope,
-                createDOMException(
-                    global_object, DOMExceptionCode::DataCloneError, "ArrayBuffer could not be transferred"_s));
-            return false;
-        }
-    }
-    return true;
-}
-
-bool structuredCloneForWebApiMessage(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSC::JSValue message,
-    JSC::JSValue transfer, JSC::JSObject* blocked_sender, JSC::JSValue& out_value, JSC::JSObject*& out_ports,
-    WTF::Vector<JSC::ArrayBuffer*>& out_array_buffer_transfers,
-    WTF::Vector<WebApiMessagePortTransfer>& out_port_transfers)
+bool structuredCloneAndCommitForWebApiMessage(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope,
+    JSC::JSValue message, JSC::JSValue transfer, JSC::JSObject* blocked_sender,
+    const WTF::ScopedLambda<bool()>& before_commit, JSC::JSValue& out_value, JSC::JSObject*& out_ports)
 {
     StructuredCloneContext context(global_object, scope, blocked_sender);
     if (!transfer.isUndefined()) {
@@ -609,18 +667,21 @@ bool structuredCloneForWebApiMessage(JSC::JSGlobalObject* global_object, JSC::Th
             return false;
         RETURN_IF_EXCEPTION(scope, false);
     }
-
-    out_value = context.cloneRoot(message);
+    JSC::JSValue value = context.cloneRoot(message);
     RETURN_IF_EXCEPTION(scope, false);
-
     if (!context.validateTransfers())
         return false;
     RETURN_IF_EXCEPTION(scope, false);
-
-    out_ports = context.transferredPortsArray();
+    auto* ports = context.transferredPortsArray();
     RETURN_IF_EXCEPTION(scope, false);
-    out_array_buffer_transfers = context.takeArrayBufferTransfers();
-    out_port_transfers = context.takePortTransfers();
+    if (!before_commit())
+        return false;
+    RETURN_IF_EXCEPTION(scope, false);
+    if (!context.commitTransfers())
+        return false;
+    RETURN_IF_EXCEPTION(scope, false);
+    out_value = value;
+    out_ports = ports;
     return true;
 }
 
@@ -643,13 +704,7 @@ JSC_DEFINE_HOST_FUNCTION(structuredClone, (JSGlobalObject * global_object, CallF
         return JSValue::encode(jsUndefined());
     RETURN_IF_EXCEPTION(scope, {});
 
-    auto array_buffer_transfers = context.takeArrayBufferTransfers();
-    if (!webApiCommitArrayBufferTransfers(global_object, scope, array_buffer_transfers))
-        return JSValue::encode(jsUndefined());
-    RETURN_IF_EXCEPTION(scope, {});
-
-    auto port_transfers = context.takePortTransfers();
-    if (!webApiCommitMessagePortTransfers(global_object, scope, port_transfers))
+    if (!context.commitTransfers())
         return JSValue::encode(jsUndefined());
     RETURN_IF_EXCEPTION(scope, {});
 

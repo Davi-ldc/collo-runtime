@@ -7,8 +7,9 @@
 // new CryptoKey and return true. Only the caller's stack roots that cell, so the caller keeps it in a local until it
 // is published. On failure they return false with `out_error` holding the value to reject with: a DOMException, a
 // TypeError, an OutOfMemoryError, or an exception moved out of the scope by takePendingException. `out_key` can be set
-// on a false return, so callers test the return value. Buffers that held secret key bytes are zeroed before they are
-// freed; the known gaps carry a FIXME in jwk.cpp and unwrap.cpp.
+// on a false return, so callers test the return value. Every buffer that holds secret key bytes, from the copied
+// argument or the decoded base64url text to the key's own material, is a `SecretBytes`, which zeroes it before it is
+// freed.
 
 #pragma once
 
@@ -91,15 +92,23 @@ bool evpGetRawPublic(EVP_PKEY*, WTF::Vector<uint8_t>& out);
 
 // Each fills `out`, which must be empty, with the key in the named format. A key of the wrong type for the format, a
 // private key for raw or spki or a public key for pkcs8, is an InvalidAccessError, and a BoringSSL failure is an
-// OperationError. A pkcs8 export holds the private key, so the caller zeroes `out`.
-bool exportEcRaw(JSC::JSGlobalObject*, JSColloCryptoKey*, WTF::Vector<uint8_t>& out, JSC::JSValue& out_error);
-bool exportOkpRaw(JSC::JSGlobalObject*, JSColloCryptoKey*, WTF::Vector<uint8_t>& out, JSC::JSValue& out_error);
-bool exportAsymmetricSpki(JSC::JSGlobalObject*, JSColloCryptoKey*, WTF::Vector<uint8_t>& out, JSC::JSValue& out_error);
-bool exportAsymmetricPkcs8(JSC::JSGlobalObject*, JSColloCryptoKey*, WTF::Vector<uint8_t>& out, JSC::JSValue& out_error);
+// OperationError. They share wrapKey's `SecretBytes` output, since a pkcs8 export holds the private key.
+bool exportEcRaw(JSC::JSGlobalObject*, JSColloCryptoKey*, SecretBytes& out, JSC::JSValue& out_error);
+bool exportOkpRaw(JSC::JSGlobalObject*, JSColloCryptoKey*, SecretBytes& out, JSC::JSValue& out_error);
+bool exportAsymmetricSpki(JSC::JSGlobalObject*, JSColloCryptoKey*, SecretBytes& out, JSC::JSValue& out_error);
+bool exportAsymmetricPkcs8(JSC::JSGlobalObject*, JSColloCryptoKey*, SecretBytes& out, JSC::JSValue& out_error);
+
+// Decodes a base64url JWK member, with or without padding and with no whitespace, straight into `out`, which must be
+// empty. The decoded length is computed before anything is allocated, so `out` is allocated once at its exact size and
+// no other buffer ever holds the decoded bytes. Returns false, with `out` empty, for text outside the base64url
+// alphabet, misplaced padding or a length that cannot encode whole bytes, and when allocation fails, which
+// `out_allocation_failed` reports.
+bool decodeSecretBase64Url(const WTF::String&, SecretBytes& out, bool& out_allocation_failed);
+bool decodeSecretBase64Url(std::span<const uint8_t>, SecretBytes& out, bool& out_allocation_failed);
 
 // Encodes secret key material, a JWK d, p, q, dp, dq, qi or k member, as a base64url JSString. The intermediate
-// encoded buffer is zeroed before it is freed, so the returned string is the only copy of the encoded secret. Use it
-// for every private or secret JWK member.
+// encoded text lives in a `SecretBytes`, so the returned string is the only copy of the encoded secret left. Use it
+// for every private or secret JWK member. Null, with nothing thrown, when the encoded text cannot be allocated.
 JSC::JSString* secretBase64UrlJsString(JSC::VM&, std::span<const uint8_t> bytes);
 
 // Each builds the JWK object exportKey returns for an RSA, EC or OKP key. On failure it returns null with `out_error`
@@ -108,14 +117,11 @@ JSC::JSObject* createRsaJwkObject(JSC::JSGlobalObject*, JSC::VM&, JSColloCryptoK
 JSC::JSObject* createEcJwkObject(JSC::JSGlobalObject*, JSC::VM&, JSColloCryptoKey*, JSC::JSValue& out_error);
 JSC::JSObject* createOkpJwkObject(JSC::JSGlobalObject*, JSC::VM&, JSColloCryptoKey*, JSC::JSValue& out_error);
 
-// Serializes `key` in `format` into `out`, which must be empty, for wrapKey to encrypt; a JWK becomes its JSON text. A
-// nonextractable key is an InvalidAccessError, and PBKDF2 and HKDF keys or a format the key type lacks are a
-// NotSupportedError. `out` can hold secret key material, so the caller zeroes it.
-bool exportKeyBytesForWrap(JSC::JSGlobalObject*, const WTF::String& format, JSColloCryptoKey*,
-    WTF::Vector<uint8_t>& out, JSC::JSValue& out_error);
-
-bool makeDerivedKeyFromMaterial(JSC::JSGlobalObject*, JSC::TopExceptionScope&, WTF::Vector<uint8_t>&& material,
-    const DerivedKeySpec&, bool extractable, uint8_t usages, JSColloCryptoKey*& out_key, JSC::JSValue& out_error);
+// Serializes `key` in `format` into `out`, which must be empty, for wrapKey to encrypt; a JWK becomes its JSON text,
+// measured first so `out` is allocated once at its exact length. A nonextractable key is an InvalidAccessError, and
+// PBKDF2 and HKDF keys or a format the key type lacks are a NotSupportedError.
+bool exportKeyBytesForWrap(
+    JSC::JSGlobalObject*, const WTF::String& format, JSColloCryptoKey*, SecretBytes& out, JSC::JSValue& out_error);
 
 // The import parameters of the key unwrapKey will produce, read when unwrapKey is called so the job carries no
 // JavaScript value. `hash` applies to HMAC and RSA, `curve` to EC and OKP, and `length_bits` to HMAC when
@@ -139,6 +145,6 @@ bool normalizeUnwrappedKeyImportSpec(JSC::JSGlobalObject*, JSC::TopExceptionScop
 // Imports the decrypted `bytes` as a `format` key under `spec` when the unwrap job settles. The bytes end up in the
 // new key or are zeroed.
 bool importUnwrappedKeyBytesWithSpec(JSC::JSGlobalObject*, JSC::TopExceptionScope&, const WTF::String& format,
-    WTF::Vector<uint8_t>&& bytes, const UnwrappedKeyImportSpec&, JSColloCryptoKey*& out_key, JSC::JSValue& out_error);
+    SecretBytes&& bytes, const UnwrappedKeyImportSpec&, JSColloCryptoKey*& out_key, JSC::JSValue& out_error);
 
 }

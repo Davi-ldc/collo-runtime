@@ -38,6 +38,10 @@ const LaneFault = fault.LaneFault;
 const Http2Failure = connection.Http2Failure;
 const Slot = connection_slot.Slot;
 
+/// An answer the lane writes alone (`server_responses.zig`), as
+/// `queueServerResponse` and `answerStreamAlone` take it.
+pub const ServerResponse = server_responses.Response;
+
 /// Queued segments one writev covers; `flushPendingWrite` loops for the rest.
 const max_writev_segments: usize = 16;
 // Caps on decoding a worker's response head. They must admit every head the
@@ -156,6 +160,31 @@ pub fn queueServerResponse(
     };
     _ = runtime.h2CloseStreamIfDone(worker.service.allocator, stream_id);
     return true;
+}
+
+/// Answers `stream_id`, a stream the table holds that no request took, with
+/// `server_response` and ends the stream there: the response is queued whole
+/// (`queueServerResponse`), the stream drains its tail or leaves the table,
+/// and a client still sending its request, `request_ended` false, is asked
+/// to stop with RST_STREAM NO_ERROR once the response's END_STREAM is queued
+/// (RFC 9113 §8.1). Returns whether the response was queued; a stream that
+/// took none leaves the table all the same. Only lane faults return.
+pub fn answerStreamAlone(
+    comptime Worker: type,
+    worker: *Worker,
+    runtime: *Slot,
+    stream_id: u32,
+    server_response: server_responses.Response,
+    request_ended: bool,
+) LaneFault!bool {
+    const queued = try queueServerResponse(Worker, worker, runtime, stream_id, server_response);
+    // A tail the send windows hold back carries the END_STREAM, which the
+    // reset must not overtake.
+    const tail_pending = runtime.h2HasPendingResponse(stream_id);
+    _ = runtime.h2FinishLocalResponse(worker.service.allocator, stream_id);
+    if (queued and !tail_pending and !request_ended)
+        try queueRstStream(Worker, worker, runtime, stream_id, .no_error);
+    return queued;
 }
 
 fn queueServerResponseFrames(

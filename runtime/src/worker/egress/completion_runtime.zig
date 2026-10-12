@@ -21,7 +21,7 @@ const Result = task_mod.Result;
 
 /// Runs the `fetch_completion` item of `fetch_id`: removes the task and
 /// settles its promise. Fails with `error.FetchCompletionNotFound` when the
-/// task is already gone, as after the boot context's reap
+/// task is already gone, as after an evaluation's reap
 /// (`task_runtime.reapForRequest`).
 pub fn execute(runtime: *egress_context.Context, fetch_id: u64) !void {
     const removed = runtime.egress_state.tasks.fetchRemove(fetch_id) orelse return error.FetchCompletionNotFound;
@@ -138,8 +138,10 @@ pub fn handleFailure(runtime: *egress_context.Context, fetch_id: u64, err: anyer
 /// Settles the promise from `result`: a success resolves it with a `Response`
 /// that takes over the response body view, and a failure releases that view
 /// and rejects with a TypeError carrying the failure's message, which is how
-/// the Fetch standard reports a network error. `task` is not canceled:
-/// `execute` settles a canceled task in `rejectCanceledTask`.
+/// the Fetch standard reports a network error. A failure the network setting
+/// caused also writes that message once to the tenant's log, so a denial
+/// the handler swallows still shows. `task` is not canceled: `execute`
+/// settles a canceled task in `rejectCanceledTask`.
 fn deliver(runtime: *egress_context.Context, task: *Task, result: *Result) !void {
     const request = runtime.requests.get(task.request_id) orelse return error.RequestNotFound;
     const exec_ctx_ptr: *bindings.ExecCtx = &request.exec;
@@ -151,6 +153,10 @@ fn deliver(runtime: *egress_context.Context, task: *Task, result: *Result) !void
             try turn.resolvePromise(runtime.vm, exec_ctx_ptr, &task.deferred, &response);
         },
         .failure => |failure| {
+            switch (failure.cause) {
+                .network_denied => runtime.logNetworkDenial(task.request_id, failure.message),
+                .failed => {},
+            }
             _ = fetch_body_runtime.release(runtime, task.response_body_identity);
             const realm = try task.deferred.realm();
             var error_value = try realm.typeErrorValueUtf8(failure.message);

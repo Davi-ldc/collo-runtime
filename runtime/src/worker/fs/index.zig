@@ -1,9 +1,10 @@
 //! The worker's view of its read-only file tree: the binary fs index
-//! (`common/ipc/fs_index.zig`), the path routing the C++ fs binding
-//! (`bindings/host_functions/node/fs.cpp`) calls through the
-//! `collo_worker_fs_*` C ABI, and the worker-global state `fault.zig` uses
-//! to copy files of the tree into the tmpfs. Everything runs on the worker's
-//! VM thread, and the state is one process global installed per worker child.
+//! (`common/ipc/fs_index.zig`), the path routing, listing and copy lookup
+//! the C++ fs binding (`bindings/host_functions/node/fs.cpp`) calls through
+//! the `collo_runtime_fs_*` exports below, and the worker-global state
+//! `fault.zig` uses to copy files of the tree into the tmpfs. Everything runs
+//! on the worker's VM thread, and the state is one process global installed
+//! per worker child.
 //!
 //! `initWorker` runs in the worker child after the chroot, so the directories
 //! it creates and the cwd it captures are the sandbox's, and before seccomp,
@@ -26,12 +27,15 @@
 //!   the chroot root.
 //! - anything else: invisible, ENOENT on a read and EROFS on a mutation.
 //!
-//! The binding declares its own copies of the route constants, of
-//! `readdir_cursor_start` and of `RouteInfo`, so a change to any of them
-//! edits `fs.cpp` too.
+//! abi.h states the exports' contract: their statuses, the `ColloFsRoute`
+//! they fill and the path, name and cursor constants the binding sizes its
+//! buffers and starts its listings with, all mirrored in `bindings/root.zig`.
+//! The comptime block below keeps this file's bounds equal to those
+//! constants.
 
 const std = @import("std");
 const builtin = @import("builtin");
+const bindings = @import("collo_bindings");
 const fd_mod = @import("collo_os").fd;
 const ipc = @import("collo_ipc");
 const copies = @import("copies.zig");
@@ -57,31 +61,13 @@ comptime {
     // Every index path, joined under the root with a separator and the NUL
     // the binding's syscalls need, fits a normalized path buffer.
     std.debug.assert(deploy_root.len + 1 + fs_index.path_bytes_max + 1 <= max_normalized_bytes);
+    // The binding's normalized-path buffer holds `bindings.fs_path_bytes_max`
+    // bytes, which `collo_runtime_fs_route` requires, and its listing-name
+    // buffer `bindings.fs_name_bytes_max`. A listed name is a segment of an
+    // index path, so an equal bound means no listing fails for want of room.
+    std.debug.assert(bindings.fs_path_bytes_max == max_normalized_bytes);
+    std.debug.assert(bindings.fs_name_bytes_max == fs_index.path_bytes_max);
 }
-
-// Return values of `collo_worker_fs_route` and `collo_worker_fs_readdir_next`.
-// The binding's copies are the `routeClass*` and `routeError*` constants in
-// `fs.cpp`.
-pub const route_class_tmp: i32 = 0;
-pub const route_class_deploy_file: i32 = 1;
-pub const route_class_deploy_dir: i32 = 2;
-pub const route_class_none: i32 = 3;
-pub const route_error_too_long: i32 = -1;
-pub const route_error_internal: i32 = -2;
-
-/// Initial cursor of `collo_worker_fs_readdir_next`, `readdirCursorStart` in
-/// the binding. A cursor the call returns is an index position or a virtual
-/// directory's ordinal, both far below it.
-pub const readdir_cursor_start: u64 = std.math.maxInt(u64);
-
-/// Out-parameter of `collo_worker_fs_route`, laid out like
-/// `ColloWorkerFsRouteInfo` in `fs.cpp`.
-pub const RouteInfo = extern struct {
-    size: u64 = 0,
-    mtime_ms: u64 = 0,
-    normalized_len: u32 = 0,
-    reserved: u32 = 0,
-};
 
 const GlobalState = struct {
     /// The private mapping of the index memfd made by `initWorker`; null
@@ -543,7 +529,7 @@ pub const DirIter = struct {
 
     /// `dir_normalized` is relative to `deploy_root` with a leading '/': "/"
     /// for the root of the tree, "/a/b" below it.
-    /// `collo_worker_fs_readdir_next` strips `deploy_root` before iterating.
+    /// `collo_runtime_fs_readdir_next` strips `deploy_root` before iterating.
     pub fn init(view: *const IndexView, dir_normalized: []const u8) DirIter {
         var self = initAt(view, dir_normalized, 0);
         self.cursor = lowerBound(view, self.prefix());
@@ -603,150 +589,162 @@ pub const DirIter = struct {
     }
 };
 
-/// Normalizes and classifies one path for the binding. Writes the
-/// NUL-terminated normalized path into `out_path`, whose capacity must be at
-/// least `max_normalized_bytes`, for the binding's own syscalls, and fills
-/// `out_info`: the normalized length always, the size for `deploy_file`, and
-/// the index's `mtime_ms` for `deploy_file` and `deploy_dir`. Returns a
-/// `route_class_*` value, `route_error_too_long`, or `route_error_internal`
-/// for a null argument, a short buffer or no installed index.
-pub export fn collo_worker_fs_route(
-    path_ptr: ?[*]const u8,
-    path_len: usize,
+/// The bytes of a path an fs export receives, borrowed for the call, or null
+/// for a null pointer with a nonzero length. The binding passes an empty
+/// path with a null pointer.
+pub fn abiPath(raw: bindings.RawString) ?[]const u8 {
+    if (raw.len == 0)
+        return "";
+    const ptr = raw.ptr orelse return null;
+    return ptr[0..raw.len];
+}
+
+/// `collo_runtime_fs_route`, whose contract abi.h states: `normalizePath`
+/// resolves `path` against the cwd and `classify` sorts the result. A file
+/// of the tree reports its index entry's size, and a file or directory of
+/// the tree reports the index's `mtime_ms`.
+pub export fn collo_runtime_fs_route(
+    path_raw: bindings.RawString,
     out_path: ?[*]u8,
     out_path_cap: usize,
-    out_info: ?*RouteInfo,
-) i32 {
-    const state = if (global_state) |*existing| existing else return route_error_internal;
-    const info = out_info orelse return route_error_internal;
-    const out = out_path orelse return route_error_internal;
+    out_route: ?*bindings.FsRoute,
+) bindings.RawStatus {
+    if (out_route) |cleared| cleared.* = .{};
+    if (out_path) |cleared| {
+        if (out_path_cap > 0) cleared[0] = 0;
+    }
+    const route = out_route orelse return bindings.status_error;
+    const out = out_path orelse return bindings.status_error;
     if (out_path_cap < max_normalized_bytes)
-        return route_error_internal;
-    const path = (path_ptr orelse return route_error_internal)[0..path_len];
-    info.* = .{};
+        return bindings.status_error;
+    const state = if (global_state) |*existing| existing else return bindings.status_error;
+    const path = abiPath(path_raw) orelse return bindings.status_invalid_argument;
 
     const normalized = normalizePath(state.cwd(), path, out[0 .. out_path_cap - 1]) catch
-        return route_error_too_long;
+        return bindings.status_invalid_argument;
     out[normalized.len] = 0;
-    info.normalized_len = @intCast(normalized.len);
+    route.normalized_len = @intCast(normalized.len);
 
     const routed = classify(&state.view, normalized);
     switch (routed.class) {
-        .tmp => return route_class_tmp,
+        .tmp => route.route_class = @intFromEnum(bindings.FsRouteClass.tmp),
         .deploy_file => {
-            info.size = state.view.entrySizeAt(routed.entry);
-            info.mtime_ms = state.view.mtime_ms;
-            return route_class_deploy_file;
+            route.size = state.view.entrySizeAt(routed.entry);
+            route.mtime_ms = state.view.mtime_ms;
+            route.route_class = @intFromEnum(bindings.FsRouteClass.deploy_file);
         },
         .deploy_dir => {
-            info.mtime_ms = state.view.mtime_ms;
-            return route_class_deploy_dir;
+            route.mtime_ms = state.view.mtime_ms;
+            route.route_class = @intFromEnum(bindings.FsRouteClass.deploy_dir);
         },
-        .none => return route_class_none,
+        .none => route.route_class = @intFromEnum(bindings.FsRouteClass.none),
     }
+    return bindings.status_ok;
 }
 
-/// Stateless iterator over the immediate children of a directory that
-/// `collo_worker_fs_route` classified as `deploy_dir`; `dir` is its
-/// normalized path. The binding starts `cursor` at `readdir_cursor_start`
-/// and calls until 0. Returns 1 with one name copied into `out_name` without
-/// a NUL, its length in `out_name_len`; 0 when exhausted; or
-/// `route_error_internal` for a null argument, a path outside the tree, a
-/// cursor out of range or a name longer than `out_name_cap`.
-pub export fn collo_worker_fs_readdir_next(
-    dir_ptr: ?[*]const u8,
-    dir_len: usize,
+/// `collo_runtime_fs_readdir_next`, whose contract abi.h states. The cursor
+/// it leaves is the index position of the next entry for a directory of the
+/// tree, and the ordinal of the next entry for a virtual ancestor of
+/// `deploy_root`; both stay far below `bindings.fs_readdir_cursor_start`.
+pub export fn collo_runtime_fs_readdir_next(
+    dir_raw: bindings.RawString,
     cursor: ?*u64,
     out_name: ?[*]u8,
     out_name_cap: usize,
     out_name_len: ?*u32,
     out_is_dir: ?*u8,
-) i32 {
-    const state = if (global_state) |*existing| existing else return route_error_internal;
-    const cursor_ptr = cursor orelse return route_error_internal;
-    const name_out = out_name orelse return route_error_internal;
-    const name_len_out = out_name_len orelse return route_error_internal;
-    const is_dir_out = out_is_dir orelse return route_error_internal;
-    const dir = (dir_ptr orelse return route_error_internal)[0..dir_len];
+) bindings.RawStatus {
+    if (out_name_len) |cleared| cleared.* = 0;
+    if (out_is_dir) |cleared| cleared.* = 0;
+    const cursor_ptr = cursor orelse return bindings.status_error;
+    const name_out = out_name orelse return bindings.status_error;
+    const name_len_out = out_name_len orelse return bindings.status_error;
+    const is_dir_out = out_is_dir orelse return bindings.status_error;
+    const state = if (global_state) |*existing| existing else return bindings.status_error;
+    const dir = abiPath(dir_raw) orelse return bindings.status_error;
     if (dir.len == 0 or dir[0] != '/')
-        return route_error_internal;
+        return bindings.status_error;
+    // The listing is stateless, so every call checks that `dir` is a
+    // directory `collo_runtime_fs_route` would sort into DEPLOY_DIR. Without
+    // the check a file or a missing path of the tree lists as empty.
+    if (classify(&state.view, dir).class != .deploy_dir)
+        return bindings.status_error;
 
     // A virtual ancestor of `deploy_root` lists the namespace roots; its
     // cursor is the ordinal of the next entry.
     if (virtualDirEntries(dir)) |entries| {
-        const ordinal: u64 = if (cursor_ptr.* == readdir_cursor_start) 0 else cursor_ptr.*;
+        const ordinal: u64 = if (cursor_ptr.* == bindings.fs_readdir_cursor_start) 0 else cursor_ptr.*;
         if (ordinal > entries.len)
-            return route_error_internal;
+            return bindings.status_error;
         if (ordinal >= entries.len) {
             cursor_ptr.* = ordinal;
-            return 0;
+            return bindings.status_not_found;
         }
         const entry_name = entries[@intCast(ordinal)];
         cursor_ptr.* = ordinal + 1;
         if (entry_name.len > out_name_cap)
-            return route_error_internal;
+            return bindings.status_error;
         @memcpy(name_out[0..entry_name.len], entry_name);
         name_len_out.* = @intCast(entry_name.len);
         is_dir_out.* = 1;
-        return 1;
+        return bindings.status_ok;
     }
 
-    // A directory of the tree iterates the index relative to `deploy_root`.
-    // Any other path never classifies as `deploy_dir`, so reaching here with
-    // one is a misuse of the ABI.
-    const key = deployKey(dir) orelse return route_error_internal;
+    // Any other directory is one of the tree, which iterates the index
+    // relative to `deploy_root`.
+    const key = deployKey(dir) orelse return bindings.status_error;
     const iter_dir: []const u8 = if (key.len == 0) "/" else dir[deploy_root.len..];
 
-    var iter = if (cursor_ptr.* == readdir_cursor_start)
+    var iter = if (cursor_ptr.* == bindings.fs_readdir_cursor_start)
         DirIter.init(&state.view, iter_dir)
     else if (cursor_ptr.* <= state.view.entry_count)
         DirIter.initAt(&state.view, iter_dir, @intCast(cursor_ptr.*))
     else
-        return route_error_internal;
+        return bindings.status_error;
 
     const entry = iter.next() orelse {
         cursor_ptr.* = iter.cursor;
-        return 0;
+        return bindings.status_not_found;
     };
     cursor_ptr.* = iter.cursor;
     if (entry.name.len > out_name_cap)
-        return route_error_internal;
+        return bindings.status_error;
     @memcpy(name_out[0..entry.name.len], entry.name);
     name_len_out.* = @intCast(entry.name.len);
     is_dir_out.* = @intFromBool(entry.is_dir);
-    return 1;
+    return bindings.status_ok;
 }
 
-/// Writes where a file's faulted bytes are copied, the materialize root
-/// joined with the index key as `physicalPath` in `copies.zig` builds it,
-/// into `out_path` with a trailing NUL, and returns its length without the
-/// NUL. `path` is a normalized absolute path under `deploy_root`. Returns
-/// `route_error_internal` for a null argument, a path outside the tree or
-/// equal to its root, or a short buffer. In a worker the materialize root is
-/// `deploy_root`, so the result equals `path`; only the in-process test
-/// install copies files elsewhere, which is why the binding's read after an
-/// async fault settles resolves the copy through this call.
-pub export fn collo_worker_fs_materialized_path(
-    path_ptr: ?[*]const u8,
-    path_len: usize,
+/// `collo_runtime_fs_materialized_path`, whose contract abi.h states: the
+/// materialize root (`GlobalState.materialize_root_buf`) joined with the
+/// index key, as `physicalPath` in `copies.zig` builds it.
+pub export fn collo_runtime_fs_materialized_path(
+    path_raw: bindings.RawString,
     out_path: ?[*]u8,
     out_path_cap: usize,
-) i32 {
-    const state = if (global_state) |*existing| existing else return route_error_internal;
-    const out = out_path orelse return route_error_internal;
-    const path = (path_ptr orelse return route_error_internal)[0..path_len];
+    out_len: ?*usize,
+) bindings.RawStatus {
+    if (out_len) |cleared| cleared.* = 0;
+    if (out_path) |cleared| {
+        if (out_path_cap > 0) cleared[0] = 0;
+    }
+    const len_out = out_len orelse return bindings.status_error;
+    const out = out_path orelse return bindings.status_error;
+    const state = if (global_state) |*existing| existing else return bindings.status_error;
+    const path = abiPath(path_raw) orelse return bindings.status_error;
     if (path.len == 0 or path[0] != '/')
-        return route_error_internal;
-    const key = deployKey(path) orelse return route_error_internal;
+        return bindings.status_error;
+    const key = deployKey(path) orelse return bindings.status_error;
     if (key.len == 0)
-        return route_error_internal;
+        return bindings.status_error;
     const root = state.materializeRoot();
     const total = root.len + 1 + key.len;
-    if (total + 1 > out_path_cap or total > std.math.maxInt(i32))
-        return route_error_internal;
+    if (total >= out_path_cap)
+        return bindings.status_error;
     @memcpy(out[0..root.len], root);
     out[root.len] = '/';
     @memcpy(out[root.len + 1 ..][0..key.len], key);
     out[total] = 0;
-    return @intCast(total);
+    len_out.* = total;
+    return bindings.status_ok;
 }

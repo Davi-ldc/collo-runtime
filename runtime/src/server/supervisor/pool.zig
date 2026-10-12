@@ -39,13 +39,20 @@
 //! even when it can no longer use the slot, and a handoff whose lane never
 //! sees it goes back with its grant through `returnHandoff`.
 //!
-//! A worker leaves through `markDead`, `retireForEgress` or `retireIdle`,
-//! which its entry records (`Departure`), and no slot of it is handed out
-//! afterwards. It is finished once no lane holds a slot of it or reads it.
-//! Exactly one call observes that and says so: `.retire` from `release`,
-//! `returnHandoff`, `transferReader` or `retireIdle`, or `retire` in a
+//! A worker leaves through `markDead`, `retireForEgress`, `retireIdle` or
+//! `retireOnNotice`, which its entry records (`Departure`), and no slot of it
+//! is handed out afterwards. A worker that announced it is retiring
+//! (`worker_retiring`) keeps the slots its lanes hold and its reader, which
+//! goes on forwarding its output, until those requests finish: every begin
+//! it ever receives was sent while a slot was held, so its teardown, which
+//! comes only after the last slot is released, never races a begin. It is
+//! finished once no lane holds a slot of it or reads it. Exactly one call
+//! observes that and says so: `.retire` from `release`, `returnHandoff`,
+//! `transferReader`, `retireIdle` or `retireOnNotice`, or `retire` in a
 //! `Death`. Its caller queues the retirement to the reaper, which calls
-//! `remove` after the teardown.
+//! `remove` after the teardown. A retiring worker whose last slot is released
+//! while a lane still reads it answers `.release_reader` instead, so the
+//! releasing lane asks the reader to give its role up.
 //!
 //! The mutex also guards the record fields `worker_table.zig` names, which
 //! change while their worker serves: `findLive` and `visitWorker` run a
@@ -80,6 +87,11 @@ pub const entries_max: u32 = std.math.maxInt(u8);
 comptime {
     std.debug.assert(@FieldType(RequestKey, "lane_id") == LaneId);
     std.debug.assert(slots_per_worker_max >= 1);
+    // `SlotSet` stays one machine word, so every count and search over a
+    // worker's slots is a single instruction.
+    std.debug.assert(slots_per_worker_max <= 64);
+    // `Death` lists every slot's holder and the reader in `u8` counts.
+    std.debug.assert(@as(usize, slots_per_worker_max) + 1 <= std.math.maxInt(u8));
 }
 
 /// The slots of one worker, a bit per slot that a request holds.
@@ -90,10 +102,11 @@ pub const Options = struct {
     /// `slots_per_worker_max`.
     concurrency: u8,
     /// Table entries, from 1 to `entries_max`: `pool_workers_max` in
-    /// `server/supervisor/scheduler_limits.zig`.
+    /// `common/limits/pool.zig`.
     workers_max: u32,
     /// Launches in flight at once, from 1 to `workers_max`:
-    /// `pool_cold_starts_in_flight_max` there.
+    /// `pool_cold_starts_in_flight_max` in
+    /// `server/supervisor/scheduler_limits.zig`.
     launches_max: u32,
     /// The waiter FIFO's capacity, at least 1: `pool_waiters_max` in
     /// `common/limits/pool.zig`.
@@ -141,7 +154,9 @@ pub const EntryState = enum {
     empty,
     launching,
     live,
-    /// Idle and leaving: `retireIdle` took it out of service.
+    /// Leaving in good order: `retireIdle` took it out of service idle, or
+    /// `retireOnNotice` with whatever requests it holds, which finish on it.
+    /// Its reader stays while a slot is held.
     retiring,
     /// `markDead` or `retireForEgress` took it out of service.
     dead,
@@ -157,6 +172,9 @@ pub const Departure = enum {
     /// `retireForEgress`: its gateway was lost and no other one could give
     /// it a session.
     egress,
+    /// `retireOnNotice`: the worker announced `worker_retiring`, because its
+    /// routes failed or its VM was terminated, and asked for no more work.
+    recycled,
 };
 
 /// What a reader that calls `transferReader` still holds of the worker's
@@ -199,6 +217,24 @@ pub const RetireIdle = union(enum) {
     release_reader: ReaderTenure,
 };
 
+/// How `retireOnNotice` took a worker that announced its retirement out of
+/// service.
+pub const RetireOnNotice = union(enum) {
+    /// The worker already left service, is not in the table, or its record
+    /// holds another worker by now. Nothing changed.
+    stale,
+    /// Lanes hold slots of it: their requests finish on it, and the release
+    /// of the last slot finishes it (`Released.retire` or
+    /// `Released.release_reader`).
+    draining,
+    /// No lane holds or reads it: the caller queues its retirement now.
+    retire,
+    /// No lane holds a slot and a lane reads it: the caller posts
+    /// `release_worker` with this tenure to that lane, whose
+    /// `transferReader` returns `.retire` and queues the retirement.
+    release_reader: ReaderTenure,
+};
+
 /// Monotonic counts since `init`.
 pub const Counters = struct {
     acquired: u64 = 0,
@@ -220,14 +256,17 @@ pub const Counters = struct {
     egress_retirements: u64 = 0,
     /// Idle retirements `retireIdle` started.
     idle_retirements: u64 = 0,
+    /// Workers `retireOnNotice` took out of service.
+    notice_retirements: u64 = 0,
     /// `.retire` results, one per worker that left service and finished.
     retirements: u64 = 0,
     removed: u64 = 0,
 };
 
 /// The pool under one lock hold. `slots_held + slots_free` equals
-/// `slot_capacity`, the live workers' slots; a dead worker's slots count in
-/// `slots_held_dead` until its lanes release them.
+/// `slot_capacity`, the live workers' slots; a retiring worker's slots count
+/// in `slots_held_retiring` and a dead worker's in `slots_held_dead` until
+/// their lanes release them.
 pub const Snapshot = struct {
     workers_live: u32 = 0,
     workers_retiring: u32 = 0,
@@ -237,6 +276,7 @@ pub const Snapshot = struct {
     slot_capacity: u32 = 0,
     slots_held: u32 = 0,
     slots_free: u32 = 0,
+    slots_held_retiring: u32 = 0,
     slots_held_dead: u32 = 0,
     counters: Counters = .{},
 };
@@ -282,12 +322,20 @@ pub fn Pool(comptime Record: type) type {
         };
 
         pub const Released = union(enum) {
-            /// Nothing more to do: the slot is free, or on a dead worker gone.
+            /// Nothing more to do: the slot is free, or on a worker out of
+            /// service gone.
             idle,
             handed_to: Handoff,
-            /// The worker is dead and this was the last hold on it: the
-            /// caller queues its retirement to the reaper.
+            /// The worker is out of service and this was the last hold on
+            /// it: the caller queues its retirement to the reaper.
             retire,
+            /// The worker is retiring, this was its last slot, and the lane
+            /// of this tenure still reads it without knowing it is done: the
+            /// caller asks that lane to give its role up (`release_worker`,
+            /// or `transferReader` directly when the caller is that lane),
+            /// whose `transferReader` then answers `.retire`. The reaper asks
+            /// again on its idle passes while the worker keeps a reader.
+            release_reader: ReaderTenure,
         };
 
         /// The handoffs of one `publish`, oldest waiter first.
@@ -326,6 +374,12 @@ pub fn Pool(comptime Record: type) type {
             worker: *Record,
             idle_since_ns: u64,
             reader: ?ReaderTenure,
+        };
+
+        /// A retiring worker that holds no request and still has a reader.
+        pub const RetiringReader = struct {
+            worker: *Record,
+            tenure: ReaderTenure,
         };
 
         pub const WorkerView = struct {
@@ -458,8 +512,9 @@ pub fn Pool(comptime Record: type) type {
         /// the head waiter, and the caller posts `dispatch_ready` with it to
         /// the waiter's lane, or runs the dispatch itself when that lane is
         /// its own. `.retire`: the caller queues the worker's retirement to
-        /// the reaper. Fails with `error.SlotNotHeld`, changing nothing, when
-        /// `worker` is not in the table or `slot` is not held.
+        /// the reaper. `.release_reader`: the caller asks the reader to give
+        /// its role up. Fails with `error.SlotNotHeld`, changing nothing,
+        /// when `worker` is not in the table or `slot` is not held.
         pub fn release(
             self: *Self,
             worker: *Record,
@@ -566,7 +621,10 @@ pub fn Pool(comptime Record: type) type {
         /// service for good: no slot of it is handed out again. Null when an
         /// earlier call already took it out of service, whose path finishes
         /// it, when it is not in the table, or when the record holds another
-        /// worker by now. Otherwise each lane in the result holds a slot of
+        /// worker by now. A retiring worker that still holds requests is
+        /// taken again, now as dead, so a worker that dies while it drains
+        /// still has the lanes of its requests told. Otherwise each lane in
+        /// the result holds a slot of
         /// the worker or reads it, the caller's own lane included when it is
         /// one. The caller posts `worker_died` to the others, and each lane
         /// finishes its requests on the worker, gives its slots back with
@@ -592,6 +650,37 @@ pub fn Pool(comptime Record: type) type {
             const death = self.leaveService(worker, worker_key, .egress) orelse return null;
             self.counters.egress_retirements += 1;
             return death;
+        }
+
+        /// Takes the worker `worker_key` names, held in `worker`, out of
+        /// service because it announced its retirement (`worker_retiring`):
+        /// no slot of it is handed out again, no lane is told of a death,
+        /// and the requests it holds finish on it, its reader forwarding
+        /// their output. The worker's reader lane calls it when it reads the
+        /// notice, and the reaper when the control socket of an idle worker
+        /// no lane reads turns readable, since such a worker writes nothing
+        /// else there. `RetireOnNotice` says who finishes the worker.
+        pub fn retireOnNotice(self: *Self, worker: *Record, worker_key: lifecycle.WorkerKey) RetireOnNotice {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            const entry = self.occupiedEntry(worker) orelse return .stale;
+            // A record's key is written only while its entry is launching,
+            // when the table does not point at it, so it is stable here.
+            if (!worker.key().eql(worker_key)) return .stale;
+            if (entry.state != .live) return .stale;
+            entry.state = .retiring;
+            entry.departure = .recycled;
+            entry.release_requested = false;
+            self.counters.notice_retirements += 1;
+            if (entry.held.count() != 0) return .draining;
+            if (entry.reader) |lane| {
+                entry.release_requested = true;
+                self.counters.reader_releases_requested += 1;
+                return .{ .release_reader = .{ .lane = lane, .epoch = entry.reader_epoch } };
+            }
+            self.counters.retirements += 1;
+            return .retire;
         }
 
         /// The first live worker, in table order, that `visitor.visit(worker)`
@@ -630,12 +719,19 @@ pub fn Pool(comptime Record: type) type {
         /// `markDead` and `retireForEgress` under the mutex; the caller counts
         /// the departure.
         fn leaveService(self: *Self, worker: *Record, worker_key: lifecycle.WorkerKey, departure: Departure) ?Death {
-            std.debug.assert(departure != .idle);
+            std.debug.assert(departure == .died or departure == .egress);
             const entry = self.occupiedEntry(worker) orelse return null;
             // A record's key is written only while its entry is launching,
             // when the table does not point at it, so it is stable here.
             if (!worker.key().eql(worker_key)) return null;
-            if (entry.state != .live) return null;
+            switch (entry.state) {
+                .live => {},
+                // A retiring worker with requests still holds lanes that wait
+                // on it. One with none already has its retirement queued or
+                // asked of its reader, which finishes it.
+                .retiring => if (entry.held.count() == 0) return null,
+                .empty, .launching, .dead => return null,
+            }
             entry.state = .dead;
             entry.departure = departure;
             entry.release_requested = false;
@@ -675,15 +771,23 @@ pub fn Pool(comptime Record: type) type {
             const entry = self.occupiedEntry(worker) orelse return .stale;
             if (!isReader(entry, tenure)) return .stale;
             entry.release_requested = false;
-            if (entry.state == .live) {
-                if (entry.held.count() != 0) return .kept;
-                switch (holds) {
-                    .nothing => {},
-                    .ring_payloads => return .free_held_payloads,
-                }
-                entry.reader = null;
-                self.counters.readers_released += 1;
-                return .vacated;
+            switch (entry.state) {
+                .live => {
+                    if (entry.held.count() != 0) return .kept;
+                    switch (holds) {
+                        .nothing => {},
+                        .ring_payloads => return .free_held_payloads,
+                    }
+                    entry.reader = null;
+                    self.counters.readers_released += 1;
+                    return .vacated;
+                },
+                // A retiring worker still serves the requests it holds, whose
+                // output only its reader forwards.
+                .retiring => if (entry.held.count() != 0) return .kept,
+                .dead => {},
+                // An occupied entry is live, retiring or dead.
+                .empty, .launching => unreachable,
             }
             entry.reader = null;
             self.counters.readers_released += 1;
@@ -842,6 +946,30 @@ pub fn Pool(comptime Record: type) type {
             return out[0..len];
         }
 
+        /// Fills `out` with the retiring workers that hold no request but
+        /// still have a reader, whose `release_worker` may have been refused
+        /// or overtaken by a newer tenure, and returns the filled part; an
+        /// `out` of `workers_max` entries holds them all. The reaper asks each
+        /// reader again on its idle passes.
+        pub fn retiringReaders(self: *Self, out: []RetiringReader) []RetiringReader {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            var len: usize = 0;
+            for (self.entries) |*entry| {
+                if (len == out.len) break;
+                if (entry.state != .retiring) continue;
+                if (entry.held.count() != 0) continue;
+                const lane = entry.reader orelse continue;
+                out[len] = .{
+                    .worker = entry.record.?,
+                    .tenure = .{ .lane = lane, .epoch = entry.reader_epoch },
+                };
+                len += 1;
+            }
+            return out[0..len];
+        }
+
         /// Gauges and counters under one lock hold, for the health answer and
         /// the tests.
         pub fn snapshot(self: *Self) Snapshot {
@@ -862,7 +990,10 @@ pub fn Pool(comptime Record: type) type {
                         result.slots_held += held;
                         result.slots_free += self.concurrency - held;
                     },
-                    .retiring => result.workers_retiring += 1,
+                    .retiring => {
+                        result.workers_retiring += 1;
+                        result.slots_held_retiring += held;
+                    },
                     .dead => {
                         result.workers_dead += 1;
                         result.slots_held_dead += held;
@@ -903,11 +1034,29 @@ pub fn Pool(comptime Record: type) type {
             entry.held.unset(slot);
             self.counters.released += 1;
 
-            if (entry.state != .live) {
-                // Only a dead worker still has slots held, and they leave
-                // with it.
-                if (self.finished(entry)) return .retire;
-                return .idle;
+            switch (entry.state) {
+                .live => {},
+                // A slot of a worker out of service never goes to a waiter.
+                .retiring => {
+                    if (entry.held.count() != 0) return .idle;
+                    const reader = entry.reader orelse {
+                        self.counters.retirements += 1;
+                        return .retire;
+                    };
+                    // The reader learns that the worker is done only from
+                    // this request; its role ends through `transferReader`.
+                    entry.release_requested = true;
+                    self.counters.reader_releases_requested += 1;
+                    return .{ .release_reader = .{ .lane = reader, .epoch = entry.reader_epoch } };
+                },
+                // The lanes of a dead worker were each told of its death,
+                // its reader included.
+                .dead => {
+                    if (self.finished(entry)) return .retire;
+                    return .idle;
+                },
+                // A held slot belongs to a live, retiring or dead entry.
+                .empty, .launching => unreachable,
             }
             if (self.popLiveWaiter(now_ns)) |waiter| {
                 const reader = self.holdSlot(entry, slot, waiter.lane);

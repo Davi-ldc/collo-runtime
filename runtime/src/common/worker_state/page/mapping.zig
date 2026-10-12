@@ -5,9 +5,9 @@
 //! header's `VERSION`, so a descriptor that is not a page `createMemfd` made
 //! fails the map. A new page reads zero everywhere, and a zero-filled section
 //! reads as an empty one. The worker maps a `WorkerWriterView` at boot and
-//! writes through it from its VM thread; the host maps one at launch and
-//! reads every section through it, keeping its own cursors of the rings it
-//! drains in the view (`HostCursors`).
+//! writes through it; the host maps one at launch and reads every section
+//! through it, keeping its own cursors of the rings it drains in the view
+//! (`HostCursors`).
 
 const std = @import("std");
 const fd_mod = @import("collo_os").fd;
@@ -42,16 +42,23 @@ const RECORD_RING_COUNT = @import("usage_records.zig").RECORD_RING_COUNT;
 /// page `createMemfd` never initialized.
 pub const VERSION: u32 = 1;
 
+/// The page's sections, ordered so that what every worker writes for its
+/// first requests shares the fewest memory pages: the header and the live
+/// slots, the completion ring, the console ring's header, the boot stamps and
+/// the benchmark record fill the first two 4 KiB pages, which the comptime
+/// block at the end of this file pins, and the host's launch already touches
+/// the first. The two large rings come last, and a worker touches each only
+/// as far as it has written into it.
 pub const Page = extern struct {
     header: Header,
     live_slots: [LIVE_SLOT_COUNT]LiveRequestSlot,
-    records: [RECORD_RING_COUNT]CompletedRecord,
     completion_header: WorkerCompletionRingHeader,
     completion_records: [COMPLETION_RING_COUNT]WorkerCompletionRecord,
     log_header: LogRingHeader,
-    log_bytes: [LOG_RING_BYTES]u8,
     boot_phase_stamps_mono_ns: [BOOT_PHASE_COUNT]u64,
     bench_handler: BenchHandlerRecord,
+    records: [RECORD_RING_COUNT]CompletedRecord,
+    log_bytes: [LOG_RING_BYTES]u8,
 };
 
 /// The host's own positions in the three rings it drains. Each drain starts
@@ -104,43 +111,64 @@ pub const WorkerWriterView = struct {
         @atomicStore(u32, &self.header.state, @intFromEnum(state), .release);
     }
 
+    /// Worker side, from the VM thread at every owner change: the owner the
+    /// VM thread now works for and that owner's wall deadline
+    /// (CLOCK_MONOTONIC), both 0 while it works for none. The two are stored
+    /// one after the other; `OwnerSnapshot` says what a host load of them
+    /// may see.
+    pub fn publishOwner(self: *WorkerWriterView, owner_id: u64, deadline_mono_ns: u64) void {
+        @atomicStore(u64, &self.header.owner_deadline_mono_ns, deadline_mono_ns, .release);
+        @atomicStore(u64, &self.header.owner_id, owner_id, .release);
+    }
+
+    /// Worker side, from the sentinel thread only: the CPU the owner
+    /// `owner_id` has used, its CPU before the window that runs plus that
+    /// window so far. The sequence is odd across the two stores and even
+    /// after them, so a host load that finds the same even sequence before
+    /// and after it read the pair read both from one call
+    /// (`RunningOwnerSnapshot.load`).
+    pub fn publishRunningOwnerCpu(self: *WorkerWriterView, owner_id: u64, cpu_ns: u64) void {
+        const odd = @atomicLoad(u32, &self.header.running_owner_sequence, .monotonic) | 1;
+        @atomicStore(u32, &self.header.running_owner_sequence, odd, .monotonic);
+        // Release orders the odd sequence before each value, so a host that
+        // loads a value of this call also loads a sequence other than the
+        // even one it started from.
+        @atomicStore(u64, &self.header.running_owner_id, owner_id, .release);
+        @atomicStore(u64, &self.header.running_owner_cpu_ns, cpu_ns, .release);
+        @atomicStore(u32, &self.header.running_owner_sequence, odd +% 1, .release);
+    }
+
     /// Host side, at launch. Writes the whole header of a page `createMemfd`
     /// just made, with state `forked` and reason `crash`: a worker that dies
     /// before it stores a state of its own reads as crashed. A path that
     /// recycles a page memfd has to zero it first.
-    pub fn initializeCrashDefault(
-        self: *WorkerWriterView,
-        pid: u32,
-        memory_limit_bytes: u64,
-        worker_started_mono_ns: u64,
-    ) void {
+    pub fn initializeCrashDefault(self: *WorkerWriterView) void {
         // A freshly truncated memfd reads zero everywhere, so only the header
         // is written. Zeroing the page instead would commit all `byteSize()`
         // bytes as shmem per worker, which never shows in the worker's
         // Private_Dirty because the mapping is shared.
         self.header.* = .{
             .version = VERSION,
-            .pid = pid,
             .state = @intFromEnum(State.forked),
             .termination_reason = @intFromEnum(TerminationReason.crash),
-            .memory_limit_bytes = memory_limit_bytes,
-            .worker_started_mono_ns = worker_started_mono_ns,
-            .metrics_dropped_count = 0,
+            .running_owner_sequence = 0,
             .records_head = 0,
             .records_tail = 0,
-            ._reserved0 = 0,
+            .owner_id = 0,
+            .owner_deadline_mono_ns = 0,
+            .running_owner_id = 0,
+            .running_owner_cpu_ns = 0,
         };
     }
 
     /// Worker side, from the VM thread. Writes the record, then moves `head`
-    /// past it. A full ring counts the overflow, turns fatal and fails with
+    /// past it. A full ring turns fatal and fails with
     /// `error.WorkerCompletionRingOverflow`; a record the host's drain would
     /// refuse fails without being published.
     pub fn publishWorkerCompletion(self: *WorkerWriterView, completion: WorkerCompletionPublish) !void {
         const head = @atomicLoad(u64, &self.completion_header.head, .acquire);
         const tail = @atomicLoad(u64, &self.completion_header.tail, .acquire);
         if (head -% tail >= COMPLETION_RING_COUNT) {
-            _ = @atomicRmw(u64, &self.completion_header.overflow_count, .Add, 1, .release);
             @atomicStore(u32, &self.completion_header.fatal, 1, .release);
             return error.WorkerCompletionRingOverflow;
         }
@@ -162,12 +190,12 @@ pub const WorkerWriterView = struct {
         );
     }
 
-    /// Lossy append from the VM thread, the ring's only producer. A payload
-    /// above `LOG_LINE_BYTES_MAX` is cut at a UTF-8 boundary and flagged
-    /// truncated, and flag bits outside `LogLineFlags` are dropped. A full
-    /// ring drops the line and counts it; a fatal ring drops it uncounted. It
-    /// never fails, so writing a console line carries no error back into user
-    /// code.
+    /// Lossy append. Any thread may call it: producers serialize on the
+    /// ring's lock. A payload above `LOG_LINE_BYTES_MAX` is cut at a UTF-8
+    /// boundary and flagged truncated, and flag bits outside `LogLineFlags`
+    /// are dropped. A full ring drops the line and counts it; a fatal ring
+    /// drops it uncounted. It never fails, so writing a console line carries
+    /// no error back into user code.
     pub fn publishLogLine(
         self: *WorkerWriterView,
         level: LogLevel,
@@ -194,7 +222,7 @@ pub const WorkerWriterView = struct {
 
     /// Counts one line the per-request console budget suppressed, in the
     /// counter the ring's own drops use, so the host's drop marker reports
-    /// both causes. VM thread only, like `publishLogLine`.
+    /// both causes.
     pub fn countBudgetDroppedLogLine(self: *WorkerWriterView) void {
         _ = @atomicRmw(u64, &self.log_header.dropped_lines, .Add, 1, .release);
     }
@@ -331,11 +359,47 @@ fn writerViewFromBytes(bytes: []align(std.heap.page_size_min) u8) !WorkerWriterV
     };
 }
 
+/// The memory page size the first-touch pins below count in: the smallest
+/// either target uses.
+const first_touch_page_bytes: usize = 4096;
+
+/// The 4 KiB page that holds `field`'s first byte, or with `last` its last.
+fn pageOf(comptime field: []const u8, comptime last: bool) usize {
+    const offset = @offsetOf(Page, field);
+    const end = offset + @sizeOf(@FieldType(Page, field));
+    return (if (last) end - 1 else offset) / first_touch_page_bytes;
+}
+
 comptime {
-    if (@sizeOf(Page) != 288_544)
+    if (@sizeOf(Page) != 234_360)
         @compileError("worker_state.page.Page size mismatch");
-    if (@offsetOf(Page, "completion_records") != 155_936)
+    if (@offsetOf(Page, "completion_header") != 1_088)
+        @compileError("worker_state.page completion header offset mismatch");
+    if (@offsetOf(Page, "completion_records") != 1_152)
         @compileError("worker_state.page completion records offset mismatch");
-    if (@offsetOf(Page, "log_bytes") <= @offsetOf(Page, "log_header"))
-        @compileError("worker_state.page log bytes must follow the log ring header");
+    if (@offsetOf(Page, "log_header") != 4_736)
+        @compileError("worker_state.page log header offset mismatch");
+    if (@offsetOf(Page, "records") != 4_984)
+        @compileError("worker_state.page usage records offset mismatch");
+    if (@offsetOf(Page, "log_bytes") != 103_288)
+        @compileError("worker_state.page log bytes offset mismatch");
+
+    // The first touches. Page 0, which the host's launch writes: the header,
+    // every live slot, the completion ring's header and its first record.
+    if (pageOf("live_slots", true) != 0)
+        @compileError("worker_state.page every live slot must sit in the first 4 KiB page");
+    if (pageOf("completion_header", true) != 0)
+        @compileError("worker_state.page the completion ring header must sit in the first 4 KiB page");
+    if ((@offsetOf(Page, "completion_records") + @sizeOf(WorkerCompletionRecord) - 1) / first_touch_page_bytes != 0)
+        @compileError("worker_state.page the first completion must sit in the first 4 KiB page");
+    // Page 1: the rest of the completion ring, the console ring's header, the
+    // boot stamps, the benchmark record and the first usage record.
+    if (pageOf("completion_records", true) != 1)
+        @compileError("worker_state.page the completion ring must end in the second 4 KiB page");
+    if (pageOf("log_header", false) != 1 or pageOf("log_header", true) != 1)
+        @compileError("worker_state.page the console ring header must sit in the second 4 KiB page");
+    if (pageOf("bench_handler", true) != 1)
+        @compileError("worker_state.page the boot stamps and benchmark record must end in the second 4 KiB page");
+    if ((@offsetOf(Page, "records") + @sizeOf(CompletedRecord) - 1) / first_touch_page_bytes != 1)
+        @compileError("worker_state.page the first usage record must sit in the second 4 KiB page");
 }

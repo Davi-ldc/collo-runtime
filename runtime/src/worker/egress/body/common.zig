@@ -12,6 +12,22 @@ pub const FetchBodyWaiter = egress_core.fetch_body.Waiter;
 pub const FetchBodyPullWaiter = egress_core.fetch_body.PullWaiter;
 pub const ResponseStreamDrain = FetchBody.PullDrain;
 
+/// The request whose JavaScript may start a read, pull or clone of the view
+/// `identity` names: active under the view's generation and accepting work
+/// (`RequestContext.acceptsWork`). Fails with
+/// `error.FetchBodyOutsideActiveRequest` otherwise.
+pub fn acceptingRequest(
+    runtime: *egress_context.Context,
+    identity: bindings.FetchBodyIdentity,
+) !*request_context.RequestContext {
+    const request = runtime.requests.get(identity.request_id) orelse return error.FetchBodyOutsideActiveRequest;
+    if (request.request_generation != identity.request_generation)
+        return error.FetchBodyOutsideActiveRequest;
+    if (!request.acceptsWork())
+        return error.FetchBodyOutsideActiveRequest;
+    return request;
+}
+
 /// The identity of a new body of `fetch_id`, under `request`'s id and
 /// generation.
 pub fn nextIdentity(

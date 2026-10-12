@@ -204,7 +204,12 @@ test "deadline wheel insert after time advance expires at absolute deadline" {
 }
 
 test "a request's deadline handle cancels its wheel entry once, and a second cancel finds nothing" {
-    var lane = try ingress.lane.IngressLane.init(std.testing.allocator, .{ .lane_id = 1, .definition_count = 0, .max_requests = 1 }, 0);
+    var lane = try ingress.lane.IngressLane.init(std.testing.allocator, .{
+        .lane_id = 1,
+        .definition_count = 0,
+        .slots_per_worker_total = 0,
+        .max_requests = 1,
+    }, 0);
     defer lane.deinit();
     const conn = lifecycle.ConnectionKey{ .lane_id = 1, .slot = 0, .generation = 1 };
     const worker = lifecycle.WorkerKey{ .worker_id = 1, .worker_generation = 1 };
@@ -223,7 +228,12 @@ test "a request's deadline handle cancels its wheel entry once, and a second can
 }
 
 test "re-arming a request's deadline moves its one wheel entry, and the old handle goes stale" {
-    var lane = try ingress.lane.IngressLane.init(std.testing.allocator, .{ .lane_id = 1, .definition_count = 0, .max_requests = 1 }, 0);
+    var lane = try ingress.lane.IngressLane.init(std.testing.allocator, .{
+        .lane_id = 1,
+        .definition_count = 0,
+        .slots_per_worker_total = 0,
+        .max_requests = 1,
+    }, 0);
     defer lane.deinit();
     const conn = lifecycle.ConnectionKey{ .lane_id = 1, .slot = 0, .generation = 1 };
     const worker = lifecycle.WorkerKey{ .worker_id = 1, .worker_generation = 1 };

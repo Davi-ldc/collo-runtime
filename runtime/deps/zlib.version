@@ -1,0 +1,9 @@
+Source: https://github.com/madler/zlib.git
+Tag: v1.3.2
+Commit: da607da739fa6047df13e66a2af6b8bec7c2a498
+Patches: none
+
+Upstream zlib, consumed as a shallow checkout of this commit
+(`zig build deps-provision`). `runtime/build/codecs.zig` compiles its
+inflate and deflate sources into a static library for each target; the gz*
+file API is left out because nothing calls it.

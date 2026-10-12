@@ -7,9 +7,10 @@
 //!
 //! Every path is relative to the repository root, so the gates must run from
 //! there; a scan root that does not open fails its gate instead of passing
-//! with nothing read. Each gate reads text without parsing it, so it catches
-//! only the exact shapes its code searches for. When a gate and its rule
-//! disagree, conventions.md requires fixing one of them in the same change.
+//! with nothing read. Each gate reads text, at most split into tokens by
+//! `CLexer`, without parsing it, so it catches only the exact shapes its code
+//! searches for. When a gate and its rule disagree, conventions.md requires
+//! fixing one of them in the same change.
 
 const std = @import("std");
 const provenance = @import("collo_comments").provenance;
@@ -311,6 +312,57 @@ test "the socket option gate catches a listener option set outside the helper an
     }
 }
 
+test "the socket option gate refuses a raw option call in production source, whatever option it names" {
+    const raw_sites = [_]struct { path: []const u8, source: []const u8 }{
+        .{
+            .path = "runtime/src/common/tls/ktls.zig",
+            .source = "const rc = linux.setsockopt(fd, sol_tls, optname, bytes.ptr, @intCast(bytes.len));",
+        },
+        .{
+            .path = "runtime/src/common/tls/ktls.zig",
+            .source = "const rc = std.c.getsockopt(fd, std.posix.IPPROTO.TCP, tcp_ulp, &name, &name_len);",
+        },
+        .{
+            .path = "runtime/src/server/net/reuseport_bpf.zig",
+            .source = "try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.ATTACH_REUSEPORT_EBPF, std.mem.asBytes(&program_fd));",
+        },
+        .{
+            .path = "runtime/src/zygote/child_boot.zig",
+            .source = "try std.posix.getsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.TYPE, std.mem.asBytes(&socket_type));",
+        },
+        .{
+            .path = "runtime/src/egress/client/transport/connect.zig",
+            .source = "std.posix.getsockoptError(attempt.fd) catch |err| return err; // the connect's result",
+        },
+    };
+    for (raw_sites) |site| {
+        var failures: FailureList = .empty;
+        defer deinitFailures(&failures);
+        try checkTcpSocketOptionsCentralized(site.path, site.source, &failures);
+        if (failures.items.len == 0) {
+            std.debug.print("the gate passed a raw socket option call in {s}:\n{s}\n", .{ site.path, site.source });
+            return error.TestUnexpectedResult;
+        }
+    }
+
+    // The helper itself, its tests, a test or benchmark that builds what it
+    // probes, and a comment that names the call all pass.
+    const allowed = [_]struct { path: []const u8, source: []const u8 }{
+        .{ .path = "runtime/src/common/os.zig", .source = "const rc = linux.setsockopt(fd, level, optname, value.ptr, len);" },
+        .{ .path = "runtime/src/common/tests/os.zig", .source = "try std.posix.getsockopt(fd, level, optname, &value);" },
+        .{ .path = "runtime/tests/support/tls/probe.zig", .source = "try std.posix.setsockopt(fd, level, optname, &value);" },
+        .{ .path = "runtime/bench/egress_tls.zig", .source = "try std.posix.setsockopt(fd, level, optname, &value);" },
+        .{ .path = "runtime/src/common/tls/ktls.zig", .source = "// The kernel takes the crypto state through setsockopt(SOL_TLS)." },
+        .{ .path = "runtime/src/common/tls/ktls.zig", .source = "try os_socket.setTlsCryptoInfo(fd, .tx, bytes); // not a raw setsockopt" },
+    };
+    for (allowed) |site| {
+        var failures: FailureList = .empty;
+        defer deinitFailures(&failures);
+        try checkTcpSocketOptionsCentralized(site.path, site.source, &failures);
+        try expectNoFailures(&failures, error.TestUnexpectedResult);
+    }
+}
+
 test "fetch body release paths stay callback-only" {
     var failures: FailureList = .empty;
     defer deinitFailures(&failures);
@@ -427,6 +479,86 @@ test "C ABI surface stays POD-shaped" {
     try expectNotContains(abi, "collo__");
 }
 
+// `abi.h` is the one declaration of the C ABI between Zig and the bridge, and
+// `contracts/abi.zig` pins its shapes. C linkage anywhere else under the
+// bindings declares or defines functions that header never names, so
+// neither side's compiler checks them against the other's.
+test "the bindings give C linkage only to definitions of functions their C contract declares" {
+    var failures: FailureList = .empty;
+    defer deinitFailures(&failures);
+
+    try scanTree("runtime/src/bindings", &failures, checkExternC);
+
+    try expectNoFailures(&failures, error.ExternCOutsideContract);
+}
+
+test "the extern C gate fails a block, a declaration and an undeclared definition in any spelling" {
+    const contract: CContract = .{
+        .path = abi_header_path,
+        .text = "ColloStatus collo_x(ColloVm* vm);\n/* collo_unknown( is only a comment */\n",
+        .language = .c,
+    };
+    const refused = [_][]const u8{
+        "extern \"C\" {\nColloStatus collo_x(void);\n}\n",
+        "namespace Collo {\nextern \"C\"\n{\nvoid collo_y(void);\n}\n}\n",
+        "int a;\n    extern \"C\"   {\n",
+        "extern  \"C\" {\n",
+        "extern\t\"C\"\t{\n",
+        "extern \"C\" /* linkage */ {\n",
+        "extern \"C\" // linkage\n{\n",
+        "extern \"C\" ColloStatus collo_x(ColloVm* vm);\n",
+        "extern \"C\" int collo_flag;\n",
+        "extern \"C\" int collo_flag = 1;\n",
+        "extern \"C\" ColloStatus collo_unknown(void)\n{\n    return COLLO_STATUS_OK;\n}\n",
+    };
+    for (refused) |source| {
+        var failures: FailureList = .empty;
+        defer deinitFailures(&failures);
+        try checkExternCAgainst("runtime/src/bindings/x.cpp", source, contract, &failures);
+        if (failures.items.len != 1)
+            std.debug.print("expected one failure for: {s}\n", .{source});
+        try std.testing.expectEqual(@as(usize, 1), failures.items.len);
+    }
+    const clean = [_][]const u8{
+        "extern \"C\" ColloStatus collo_x(ColloVm* vm)\n{\n    return COLLO_STATUS_OK;\n}\n",
+        "extern \"C\" __attribute__((used)) ColloStatus\ncollo_x(ColloVm* vm) noexcept { return COLLO_STATUS_OK; }\n",
+        "// extern \"C\" { is declared only in abi.h\n",
+        "/*\n * an extern \"C\" { block elsewhere\n */\n",
+        "const char* text = \"extern \\\"C\\\" {\";\n",
+        "auto text = R\"js(extern \"C\" {)js\";\n",
+        "extern \"C++\" {\n}\n",
+    };
+    for (clean) |source| {
+        var failures: FailureList = .empty;
+        defer deinitFailures(&failures);
+        try checkExternCAgainst("runtime/src/bindings/x.cpp", source, contract, &failures);
+        if (failures.items.len != 0)
+            std.debug.print("expected no failure for: {s}\n", .{source});
+        try std.testing.expectEqual(@as(usize, 0), failures.items.len);
+    }
+
+    // The BoringSSL shim's contract is the Zig side's `extern fn` list.
+    const shim_contract: CContract = .{
+        .path = boringssl_contract_path,
+        .text = "pub extern fn collo_shim_x(handle: *Handle) i32;\n// extern fn collo_shim_y(\n",
+        .language = .zig,
+    };
+    var shim_failures: FailureList = .empty;
+    defer deinitFailures(&shim_failures);
+    try checkExternCAgainst(
+        "runtime/src/bindings/boringssl/shim.cc",
+        "extern \"C\" int collo_shim_x(Handle* handle) { return 0; }\nextern \"C\" int collo_shim_y(void) { return 0; }\n",
+        shim_contract,
+        &shim_failures,
+    );
+    try std.testing.expectEqual(@as(usize, 1), shim_failures.items.len);
+
+    var header_failures: FailureList = .empty;
+    defer deinitFailures(&header_failures);
+    try checkExternC(abi_header_path, refused[0], &header_failures);
+    try std.testing.expectEqual(@as(usize, 0), header_failures.items.len);
+}
+
 test "C++ bindings keep allocation and IO policy explicit" {
     var failures: FailureList = .empty;
     defer deinitFailures(&failures);
@@ -434,6 +566,147 @@ test "C++ bindings keep allocation and IO policy explicit" {
     try scanTree("runtime/src/bindings", &failures, checkBindingSource);
 
     try expectNoFailures(&failures, error.BindingConventionViolation);
+}
+
+test "bridge cells change their containers under the cell lock only through cell_edges.h" {
+    var failures: FailureList = .empty;
+    defer deinitFailures(&failures);
+    try scanTree("runtime/src/bindings", &failures, checkCellLockOnlyInCellEdges);
+    try expectNoFailures(&failures, error.CellLockOutsideCellEdges);
+}
+
+test "the bridge uses the result of every exception clear" {
+    var failures: FailureList = .empty;
+    defer deinitFailures(&failures);
+    try scanTree("runtime/src/bindings", &failures, checkExceptionClearResultUsed);
+    try expectNoFailures(&failures, error.DiscardedExceptionClear);
+}
+
+test "no bridge cell holds a Strong root or a ColloPromiseDeferred" {
+    var failures: FailureList = .empty;
+    defer deinitFailures(&failures);
+    try scanTree("runtime/src/bindings", &failures, checkNoStrongRootInCells);
+    try expectNoFailures(&failures, error.StrongRootInCell);
+}
+
+test "no WTF container in the bridge holds a raw cell, a JSValue or a raw ArrayBuffer" {
+    var failures: FailureList = .empty;
+    defer deinitFailures(&failures);
+    try scanTree("runtime/src/bindings", &failures, checkNoCellsInWtfContainers);
+    try expectNoFailures(&failures, error.CellInWtfContainer);
+}
+
+test "WebCrypto keeps secret bytes only in SecretBytes" {
+    var failures: FailureList = .empty;
+    defer deinitFailures(&failures);
+    try scanTree("runtime/src/bindings/host_functions/webapi/crypto", &failures, checkCryptoSecretBuffers);
+    try expectNoFailures(&failures, error.CryptoSecretBufferViolation);
+}
+
+test "the bridge's cell and secret gates catch each pattern they forbid and pass the forms they allow" {
+    const Case = struct {
+        check: fn ([]const u8, []const u8, *FailureList) anyerror!void,
+        path: []const u8,
+        source: []const u8,
+        refused: bool,
+    };
+    const stream_path = "runtime/src/bindings/host_functions/webapi/streams/stream_common.cpp";
+    const hand_locked_append =
+        \\    WTF::Locker locker { owner->cellLock() };
+        \\    m_queue.append(WTF::move(entry));
+    ;
+    const strong_in_nested_request =
+        \\class JSColloWritableStream final : public JSC::JSNonFinalObject {
+        \\    struct WriteRequest {
+        \\        JSC::Strong<JSC::Unknown> chunk;
+        \\    };
+        \\};
+    ;
+    const deferred_in_cell =
+        \\class JSColloReadableStreamReader : public JSC::JSNonFinalObject {
+        \\    ColloPromiseDeferred* m_closed;
+        \\};
+    ;
+    const strong_outside_cells =
+        \\class JSColloReadableStreamReader;
+        \\class PendingNativeWork {
+        \\    JSC::Strong<JSC::Unknown> m_value;
+        \\};
+        \\class JSColloReadableStreamReader : public JSC::JSNonFinalObject {
+        \\    JSC::WriteBarrier<JSC::JSPromise> m_closed; // not a Strong<JSC::JSPromise>
+        \\};
+    ;
+    const cases = [_]Case{
+        // A lock taken by hand around a container change, and the same in a
+        // header; cell_edges.h itself, a ported WebCore file and a comment pass.
+        .{ .check = checkCellLockOnlyInCellEdges, .path = stream_path, .refused = true, .source = hand_locked_append },
+        .{ .check = checkCellLockOnlyInCellEdges, .path = "runtime/src/bindings/host_functions/webapi/events/event_target.h", .refused = true, .source = "Locker locker { cell->cellLock() };" },
+        .{ .check = checkCellLockOnlyInCellEdges, .path = "runtime/src/bindings/jsc/runtime/cell_edges.h", .refused = false, .source = "WTF::Locker locker { owner->cellLock() };" },
+        .{ .check = checkCellLockOnlyInCellEdges, .path = "runtime/src/bindings/host_functions/webapi/url/pattern/webcore_port/URLPattern.cpp", .refused = false, .source = "Locker locker { cellLock() };" },
+        .{ .check = checkCellLockOnlyInCellEdges, .path = stream_path, .refused = false, .source = "// cellLock() is taken inside CellEdgeList." },
+        .{ .check = checkCellLockOnlyInCellEdges, .path = stream_path, .refused = false, .source = "const char* reason = \"cellLock() held\";" },
+        // A clear whose result nobody reads, as a statement of its own after
+        // any receiver chain, an `if` head or a line break; a read, a return,
+        // an explicit discard and a comment pass.
+        .{ .check = checkExceptionClearResultUsed, .path = stream_path, .refused = true, .source = "    scope.clearExceptionExceptTermination();" },
+        .{ .check = checkExceptionClearResultUsed, .path = stream_path, .refused = true, .source = "    throwScope->tryClearException();" },
+        .{ .check = checkExceptionClearResultUsed, .path = stream_path, .refused = true, .source = "void f() { if (x) scope.clearExceptionExceptTermination(); }" },
+        .{ .check = checkExceptionClearResultUsed, .path = stream_path, .refused = true, .source = "    this->m_scope.clearExceptionExceptTermination();" },
+        .{ .check = checkExceptionClearResultUsed, .path = stream_path, .refused = true, .source = "    scope\n        .tryClearException();" },
+        .{ .check = checkExceptionClearResultUsed, .path = stream_path, .refused = false, .source = "    if (!scope.clearExceptionExceptTermination())" },
+        .{ .check = checkExceptionClearResultUsed, .path = stream_path, .refused = false, .source = "    (void)scope.clearExceptionExceptTermination();" },
+        .{ .check = checkExceptionClearResultUsed, .path = stream_path, .refused = false, .source = "    const bool cleared = scope.tryClearException();" },
+        .{ .check = checkExceptionClearResultUsed, .path = stream_path, .refused = false, .source = "bool f() { (void)scope.tryClearException(); return !scope.clearExceptionExceptTermination(); }" },
+        .{ .check = checkExceptionClearResultUsed, .path = stream_path, .refused = false, .source = "    return scope.tryClearException();" },
+        .{ .check = checkExceptionClearResultUsed, .path = stream_path, .refused = false, .source = "    // scope.clearExceptionExceptTermination(); would drop its result." },
+        // A Strong or a deferred inside a cell, nested struct included, and in
+        // a cell declared as a struct; the same field in a type that is not a
+        // cell, or a WriteBarrier, passes.
+        .{ .check = checkNoStrongRootInCells, .path = stream_path, .refused = true, .source = strong_in_nested_request },
+        .{ .check = checkNoStrongRootInCells, .path = stream_path, .refused = true, .source = deferred_in_cell },
+        .{ .check = checkNoStrongRootInCells, .path = stream_path, .refused = true, .source = "struct JSColloTimerRecord { JSC::Strong<JSC::JSObject> callback; };" },
+        .{ .check = checkNoStrongRootInCells, .path = stream_path, .refused = false, .source = strong_outside_cells },
+        // Raw cells, JSValues and raw ArrayBuffers in WTF containers, a map's
+        // value and an argument list over two lines included; marked lists,
+        // strong and counted handles and plain keys pass.
+        .{ .check = checkNoCellsInWtfContainers, .path = stream_path, .refused = true, .source = "WTF::Vector<JSC::JSObject*> seen;" },
+        .{ .check = checkNoCellsInWtfContainers, .path = stream_path, .refused = true, .source = "Vector<JSValue, 8> values;" },
+        .{ .check = checkNoCellsInWtfContainers, .path = stream_path, .refused = true, .source = "HashMap<JSC::JSObject*, uint32_t> m_seen;" },
+        .{ .check = checkNoCellsInWtfContainers, .path = stream_path, .refused = true, .source = "HashMap<uint32_t,\n    JSColloMessagePort*> ports;" },
+        .{ .check = checkNoCellsInWtfContainers, .path = stream_path, .refused = true, .source = "HashSet<JSCell*> visited;" },
+        .{ .check = checkNoCellsInWtfContainers, .path = stream_path, .refused = true, .source = "ListHashSet<JSC::JSObject*> order;" },
+        .{ .check = checkNoCellsInWtfContainers, .path = stream_path, .refused = true, .source = "UncheckedKeyHashMap<JSC::JSString*, unsigned> names;" },
+        .{ .check = checkNoCellsInWtfContainers, .path = stream_path, .refused = true, .source = "Deque<JSC::ArrayBuffer*> buffers;" },
+        .{ .check = checkNoCellsInWtfContainers, .path = stream_path, .refused = false, .source = "JSC::MarkedVector<JSC::JSObject*> seen;" },
+        .{ .check = checkNoCellsInWtfContainers, .path = stream_path, .refused = false, .source = "WTF::Vector<WTF::RefPtr<JSC::ArrayBuffer>> buffers;" },
+        .{ .check = checkNoCellsInWtfContainers, .path = stream_path, .refused = false, .source = "Vector<JSC::Strong<JSC::JSObject>> roots;" },
+        .{ .check = checkNoCellsInWtfContainers, .path = stream_path, .refused = false, .source = "HashMap<uintptr_t, unsigned> seen;" },
+        .{ .check = checkNoCellsInWtfContainers, .path = stream_path, .refused = false, .source = "Vector<uint8_t> bytes; // not a Vector<JSValue>" },
+        .{ .check = checkNoCellsInWtfContainers, .path = "runtime/src/bindings/host_functions/webapi/url/pattern/webcore_port/URLPattern.cpp", .refused = false, .source = "Vector<JSValue> values;" },
+        // Decoding or zeroing secret bytes outside SecretBytes anywhere in
+        // WebCrypto; a comment, a string and the SecretBytes decoders pass.
+        .{ .check = checkCryptoSecretBuffers, .path = "runtime/src/bindings/host_functions/webapi/crypto/key_io/jwk.cpp", .refused = true, .source = "auto bytes = WTF::base64URLDecode(*member);" },
+        .{ .check = checkCryptoSecretBuffers, .path = "runtime/src/bindings/host_functions/webapi/crypto/jobs.h", .refused = true, .source = "secureZeroVector(m_key);" },
+        .{ .check = checkCryptoSecretBuffers, .path = "runtime/src/bindings/host_functions/webapi/crypto/key_io/raw.cpp", .refused = true, .source = "auto decoded = base64Decode(text);" },
+        .{ .check = checkCryptoSecretBuffers, .path = "runtime/src/bindings/host_functions/webapi/crypto/crypto.cpp", .refused = true, .source = "SecureBytes secret;" },
+        .{ .check = checkCryptoSecretBuffers, .path = "runtime/src/bindings/host_functions/webapi/crypto/jobs.cpp", .refused = true, .source = "SecureVectorGuard guard { bytes };" },
+        .{ .check = checkCryptoSecretBuffers, .path = "runtime/src/bindings/host_functions/webapi/crypto/key_io/jwk.cpp", .refused = false, .source = "// base64URLDecode leaves bytes past the size it shrinks to." },
+        .{ .check = checkCryptoSecretBuffers, .path = "runtime/src/bindings/host_functions/webapi/crypto/key_io/jwk.cpp", .refused = false, .source = "throwTypeError(\"base64Decode failed\");" },
+        .{ .check = checkCryptoSecretBuffers, .path = "runtime/src/bindings/host_functions/webapi/crypto/key_io/jwk.cpp", .refused = false, .source = "auto secret = decodeSecretBase64Url(member);" },
+    };
+    inline for (cases) |case| {
+        var failures: FailureList = .empty;
+        defer deinitFailures(&failures);
+        try case.check(case.path, case.source, &failures);
+        if ((failures.items.len != 0) != case.refused) {
+            std.debug.print("{s} {s}:\n{s}\n", .{
+                if (case.refused) "the gate passed" else "the gate refused",
+                case.path,
+                case.source,
+            });
+            return error.TestUnexpectedResult;
+        }
+    }
 }
 
 test "raw syscall returns are not decoded with std.posix.errno" {
@@ -444,6 +717,100 @@ test "raw syscall returns are not decoded with std.posix.errno" {
         try scanTree(root, &failures, checkRawSyscallErrnoDecode);
 
     try expectNoFailures(&failures, error.RawSyscallErrnoDecode);
+}
+
+// main.md: Collo loads no native code at run time, and everything it runs is
+// linked into its one binary. The tests and benches link the same way, so
+// what they measure and check is the code the binary runs. This gate reads
+// only Collo's sources; the binary's dynamic dependencies and the loader
+// functions linked code imports are pinned by
+// runtime/tests/contracts/binary_dependencies.zig.
+test "runtime code loads no native code at run time" {
+    var failures: FailureList = .empty;
+    defer deinitFailures(&failures);
+
+    for (scan_roots) |root|
+        try scanSourceTree(root, &failures, checkNoNativeLoading, isNativeLoadingCandidate);
+    for (build_source_roots) |root|
+        try scanTree(root, &failures, checkBuildLinksNoLoader);
+    const build_script = try readFile("build.zig", 1024 * 1024);
+    defer std.testing.allocator.free(build_script);
+    try checkBuildLinksNoLoader("build.zig", build_script, &failures);
+
+    try expectNoFailures(&failures, error.NativeLoadingConventionViolation);
+}
+
+test "the native loading gate catches dlopen, dlsym, std.DynLib and -ldl, and passes comments and lookalike names" {
+    const bypasses = [_][]const u8{
+        \\if (std.c.dlopen(name.ptr, .{ .LAZY = true })) |handle| return handle;
+        ,
+        \\const symbol = @call(.never_tail, std.c.dlsym, .{ handle, name.ptr });
+        ,
+        \\var library = try std.DynLib.open("libz.so.1");
+        ,
+        \\#include <dlfcn.h>
+        ,
+        \\    if (void* handle = dlopen(name, RTLD_LAZY | RTLD_LOCAL))
+        ,
+        \\*slot = dlsym(handle, "inflate");
+        ,
+        \\/* The loader is used below. */
+        \\auto* symbol = dlsym(handle, "inflate");
+    };
+    for (bypasses) |source| {
+        var failures: FailureList = .empty;
+        defer deinitFailures(&failures);
+        try checkNoNativeLoading("runtime/src/egress/core/decompress.zig", source, &failures);
+        if (failures.items.len == 0) {
+            std.debug.print("the gate passed native loading:\n{s}\n", .{source});
+            return error.TestUnexpectedResult;
+        }
+    }
+    const link_bypasses = [_][]const u8{
+        \\link.addArg("-ldl");
+        ,
+        \\link.addArg("-Wl,--no-as-needed,-ldl");
+        ,
+        \\artifact.root_module.linkSystemLibrary("dl", .{});
+    };
+    for (link_bypasses) |source| {
+        var failures: FailureList = .empty;
+        defer deinitFailures(&failures);
+        try checkBuildLinksNoLoader("runtime/build/link.zig", source, &failures);
+        if (failures.items.len == 0) {
+            std.debug.print("the gate passed a link of the dynamic loader library:\n{s}\n", .{source});
+            return error.TestUnexpectedResult;
+        }
+    }
+
+    const clean = [_][]const u8{
+        \\// The decoders are linked in, so nothing calls dlopen at run time.
+        ,
+        \\/// Unlike std.DynLib, this reads a file the process already mapped.
+        ,
+        \\/* The codecs are linked in:
+        \\ * dlsym is never called.
+        \\ */
+        ,
+        \\const dlopen_calls_max: u32 = 0;
+        \\const model = "dlopenable";
+    };
+    for (clean) |source| {
+        var failures: FailureList = .empty;
+        defer deinitFailures(&failures);
+        try checkNoNativeLoading("runtime/src/egress/core/decompress.zig", source, &failures);
+        try expectNoFailures(&failures, error.TestUnexpectedResult);
+    }
+    {
+        var failures: FailureList = .empty;
+        defer deinitFailures(&failures);
+        try checkBuildLinksNoLoader("runtime/build/link.zig",
+            \\// No -ldl: nothing loads code at run time.
+            \\link.addArg("-lm");
+            \\link.addArg("-ldlfoo");
+        , &failures);
+        try expectNoFailures(&failures, error.TestUnexpectedResult);
+    }
 }
 
 // A comment states what the code guarantees; plan identifiers, dates, section
@@ -641,6 +1008,7 @@ const registered_test_roots = [_][]const u8{
     "runtime/src/bindings/tests/smoke.zig",
     // Stub suite roots (the stub_suites table).
     "runtime/src/common/tests/http.zig",
+    "runtime/src/common/tests/network/all.zig",
     "runtime/src/common/tests/ipc.zig",
     "runtime/src/server/tests/http2/request.zig",
     "runtime/src/server/tests/http2/connection.zig",
@@ -1029,13 +1397,23 @@ fn scanTree(
     failures: *FailureList,
     comptime check: fn ([]const u8, []const u8, *FailureList) anyerror!void,
 ) !void {
+    try scanSourceTree(root, failures, check, isCheckedSource);
+}
+
+/// `scanTree` over the files `accepts` selects instead of `isCheckedSource`.
+fn scanSourceTree(
+    root: []const u8,
+    failures: *FailureList,
+    comptime check: fn ([]const u8, []const u8, *FailureList) anyerror!void,
+    comptime accepts: fn ([]const u8) bool,
+) !void {
     // A missing root fails the gate instead of scanning nothing. The roots are
     // relative to the repository root, so from any other directory none of
     // them opens, and a check that sees no file reports no violation: every
     // gate in this file would pass without reading anything.
     var dir = try std.fs.cwd().openDir(root, .{ .iterate = true });
     defer dir.close();
-    try walkChecked(dir, root, "", failures, check, 8 * 1024 * 1024);
+    try walkChecked(dir, root, "", failures, check, accepts, 8 * 1024 * 1024);
 }
 
 fn scanRequiredTree(
@@ -1045,20 +1423,21 @@ fn scanRequiredTree(
 ) !void {
     var dir = try std.fs.cwd().openDir(root, .{ .iterate = true });
     defer dir.close();
-    try walkChecked(dir, root, "", failures, check, 1024 * 1024);
+    try walkChecked(dir, root, "", failures, check, isCheckedSource, 1024 * 1024);
 }
 
-/// Runs `check` on every checked source file under `dir`, never entering a
-/// directory `isPrunedDir` names. `std.fs.Dir.Walker` cannot prune: it
-/// descends into every subtree and only lets the caller skip files. `rel` is
-/// the path from `root` to `dir`, empty at the top, and `check` receives each
-/// file's path joined to `root`.
+/// Runs `check` on every file under `dir` that `accepts` selects, never
+/// entering a directory `isPrunedDir` names. `std.fs.Dir.Walker` cannot
+/// prune: it descends into every subtree and only lets the caller skip files.
+/// `rel` is the path from `root` to `dir`, empty at the top, and `check`
+/// receives each file's path joined to `root`.
 fn walkChecked(
     dir: std.fs.Dir,
     root: []const u8,
     rel: []const u8,
     failures: *FailureList,
     comptime check: fn ([]const u8, []const u8, *FailureList) anyerror!void,
+    comptime accepts: fn ([]const u8) bool,
     max_bytes: usize,
 ) !void {
     var it = dir.iterate();
@@ -1078,10 +1457,10 @@ fn walkChecked(
                     else => return err,
                 };
                 defer sub.close();
-                try walkChecked(sub, root, entry_rel, failures, check, max_bytes);
+                try walkChecked(sub, root, entry_rel, failures, check, accepts, max_bytes);
             },
             .file => {
-                if (!isCheckedSource(entry_rel))
+                if (!accepts(entry_rel))
                     continue;
                 const path = try std.fs.path.join(std.testing.allocator, &.{ root, entry_rel });
                 defer std.testing.allocator.free(path);
@@ -1208,6 +1587,293 @@ fn checkForbiddenRuntimeImports(path: []const u8, bytes: []const u8, failures: *
     }
 }
 
+const abi_header_path = "runtime/src/bindings/include/collo/abi.h";
+const boringssl_shim_directory = "runtime/src/bindings/boringssl/";
+/// The BoringSSL shim has no C header: the Zig side's `extern fn`
+/// declarations are its whole contract.
+const boringssl_contract_path = "runtime/src/bindings/boringssl/root.zig";
+
+/// Fails every use of C linkage under the bindings that is not the
+/// definition of a function its C contract declares: `abi.h` for the bridge,
+/// and `boringssl/root.zig` for the BoringSSL shim. `abi.h` itself is the
+/// contract and passes.
+fn checkExternC(path: []const u8, bytes: []const u8, failures: *FailureList) !void {
+    if (std.mem.endsWith(u8, path, abi_header_path)) return;
+    if (!std.mem.endsWith(u8, path, ".cpp") and
+        !std.mem.endsWith(u8, path, ".cc") and
+        !std.mem.endsWith(u8, path, ".c") and
+        !std.mem.endsWith(u8, path, ".h"))
+        return;
+    if (std.mem.indexOf(u8, bytes, "extern") == null) return;
+    const shim = std.mem.indexOf(u8, path, boringssl_shim_directory) != null;
+    const contract_path = if (shim) boringssl_contract_path else abi_header_path;
+    const contract_text = try readFile(contract_path, 4 * 1024 * 1024);
+    defer std.testing.allocator.free(contract_text);
+    const language: CContract.Language = if (shim) .zig else .c;
+    const contract: CContract = .{ .path = contract_path, .text = contract_text, .language = language };
+    try checkExternCAgainst(path, bytes, contract, failures);
+}
+
+/// `checkExternC` against `contract`. The source is read as tokens, so
+/// spacing, line breaks, comments and literals around `extern "C"` change
+/// nothing: a block, a declaration and the definition of a name the
+/// contract lacks each fail.
+fn checkExternCAgainst(path: []const u8, bytes: []const u8, contract: CContract, failures: *FailureList) !void {
+    var lexer: CLexer = .{ .source = bytes };
+    var previous: ?CToken = null;
+    while (lexer.next()) |token| {
+        defer previous = token;
+        const before = previous orelse continue;
+        if (!before.isIdentifier("extern")) continue;
+        if (token.kind != .string or !std.mem.eql(u8, token.text, "\"C\"")) continue;
+        switch (readExternCUse(&lexer)) {
+            .block => try appendLineFailure(failures, path, token.line, "an extern \"C\" block declares C ABI outside include/collo/abi.h; declare it there"),
+            .declaration => try appendLineFailure(failures, path, token.line, "an extern \"C\" declaration declares C ABI outside include/collo/abi.h; declare it there and only define it here"),
+            .definition => |name| {
+                if (!contract.declares(name))
+                    try appendFailureMessage(failures, "{s}:{d}: `{s}` has C linkage, but {s} declares no such function", .{
+                        path, token.line, name, contract.path,
+                    });
+            },
+        }
+    }
+}
+
+/// What follows one `extern "C"`.
+const ExternCUse = union(enum) {
+    block,
+    declaration,
+    /// A function definition, with its name.
+    definition: []const u8,
+};
+
+/// Reads from just after `extern "C"` to the `{` or `;` that ends what it
+/// applies to. The name is the identifier before the first parenthesis that
+/// does not belong to an attribute.
+fn readExternCUse(lexer: *CLexer) ExternCUse {
+    var previous: ?CToken = null;
+    var name: ?[]const u8 = null;
+    while (lexer.next()) |token| {
+        defer previous = token;
+        if (token.isPunct('{')) {
+            if (previous == null) return .block;
+            if (name) |found| return .{ .definition = found };
+            return .declaration;
+        }
+        if (token.isPunct(';') or token.isPunct('='))
+            return .declaration;
+        if (token.isPunct('(')) {
+            if (previous) |before| {
+                if (name == null and before.kind == .identifier and !isAttributeKeyword(before.text))
+                    name = before.text;
+            }
+            lexer.skipBalanced();
+        }
+    }
+    return .declaration;
+}
+
+fn isAttributeKeyword(text: []const u8) bool {
+    for ([_][]const u8{ "__attribute__", "__declspec", "alignas", "noexcept" }) |keyword| {
+        if (std.mem.eql(u8, text, keyword)) return true;
+    }
+    return false;
+}
+
+/// A file that declares C functions: `abi.h` as C prototypes, or a Zig file
+/// as `extern fn` declarations.
+const CContract = struct {
+    path: []const u8,
+    text: []const u8,
+    language: Language,
+
+    const Language = enum { c, zig };
+
+    /// Whether the contract declares function `name`, outside comments and
+    /// literals.
+    fn declares(contract: CContract, name: []const u8) bool {
+        var lexer: CLexer = .{ .source = contract.text };
+        var window: [3]?CToken = .{ null, null, null };
+        while (lexer.next()) |token| {
+            defer window = .{ window[1], window[2], token };
+            if (!token.isPunct('(')) continue;
+            const named = window[2] orelse continue;
+            if (!named.isIdentifier(name)) continue;
+            switch (contract.language) {
+                .c => return true,
+                .zig => {
+                    const extern_token = window[0] orelse continue;
+                    const fn_token = window[1] orelse continue;
+                    if (extern_token.isIdentifier("extern") and fn_token.isIdentifier("fn"))
+                        return true;
+                },
+            }
+        }
+        return false;
+    }
+};
+
+const CToken = struct {
+    kind: Kind,
+    text: []const u8,
+    line: usize,
+
+    const Kind = enum { identifier, string, character, number, punctuation };
+
+    fn isPunct(token: CToken, byte: u8) bool {
+        return token.kind == .punctuation and token.text[0] == byte;
+    }
+
+    fn isIdentifier(token: CToken, text: []const u8) bool {
+        return token.kind == .identifier and std.mem.eql(u8, token.text, text);
+    }
+};
+
+/// A lexer for C, C++ and the declarations of a Zig file, deep enough to
+/// find what `extern "C"` applies to: it skips whitespace, line
+/// continuations and comments, and yields identifiers, string and character
+/// literals (raw strings included), numbers and single punctuation bytes.
+const CLexer = struct {
+    source: []const u8,
+    index: usize = 0,
+    /// The line of `counted_index`, which trails `index`.
+    line: usize = 1,
+    counted_index: usize = 0,
+
+    fn next(lexer: *CLexer) ?CToken {
+        lexer.skipBlank();
+        if (lexer.index >= lexer.source.len) return null;
+        const start = lexer.index;
+        lexer.line += std.mem.count(u8, lexer.source[lexer.counted_index..start], "\n");
+        lexer.counted_index = start;
+        const byte = lexer.source[start];
+        var kind: CToken.Kind = .punctuation;
+        if (std.ascii.isAlphabetic(byte) or byte == '_') {
+            kind = .identifier;
+            lexer.index += 1;
+            while (lexer.index < lexer.source.len and isIdentifierByte(lexer.source[lexer.index]))
+                lexer.index += 1;
+            const word = lexer.source[start..lexer.index];
+            if (lexer.peekByte() == '"' and isRawStringPrefix(word)) {
+                kind = .string;
+                lexer.skipRawString();
+            }
+        } else if (byte == '"' or byte == '\'') {
+            kind = if (byte == '"') .string else .character;
+            lexer.skipQuoted(byte);
+        } else if (std.ascii.isDigit(byte)) {
+            kind = .number;
+            lexer.skipNumber();
+        } else {
+            lexer.index += 1;
+        }
+        return .{ .kind = kind, .text = lexer.source[start..lexer.index], .line = lexer.line };
+    }
+
+    /// Consumes tokens through the `)` that closes a `(` just read.
+    fn skipBalanced(lexer: *CLexer) void {
+        var depth: usize = 1;
+        while (lexer.next()) |token| {
+            if (token.isPunct('(')) depth += 1;
+            if (token.isPunct(')')) {
+                depth -= 1;
+                if (depth == 0) return;
+            }
+        }
+    }
+
+    fn peekByte(lexer: *const CLexer) u8 {
+        if (lexer.index < lexer.source.len) return lexer.source[lexer.index];
+        return 0;
+    }
+
+    fn skipBlank(lexer: *CLexer) void {
+        const source = lexer.source;
+        while (lexer.index < source.len) {
+            const byte = source[lexer.index];
+            if (std.ascii.isWhitespace(byte)) {
+                lexer.index += 1;
+            } else if (byte == '\\' and lexer.index + 1 < source.len and source[lexer.index + 1] == '\n') {
+                lexer.index += 2;
+            } else if (std.mem.startsWith(u8, source[lexer.index..], "//")) {
+                lexer.index = std.mem.indexOfScalarPos(u8, source, lexer.index, '\n') orelse source.len;
+            } else if (std.mem.startsWith(u8, source[lexer.index..], "/*")) {
+                const end = std.mem.indexOfPos(u8, source, lexer.index + 2, "*/");
+                lexer.index = if (end) |at| at + 2 else source.len;
+            } else {
+                return;
+            }
+        }
+    }
+
+    /// Past the literal that opens at `index` with `quote`, escapes
+    /// included; an unterminated one ends at its line's end.
+    fn skipQuoted(lexer: *CLexer, quote: u8) void {
+        const source = lexer.source;
+        lexer.index += 1;
+        while (lexer.index < source.len) {
+            const byte = source[lexer.index];
+            if (byte == '\\') {
+                lexer.index += 2;
+            } else if (byte == quote) {
+                lexer.index += 1;
+                return;
+            } else if (byte == '\n') {
+                return;
+            } else {
+                lexer.index += 1;
+            }
+        }
+        lexer.index = source.len;
+    }
+
+    /// Past `"delimiter( ... )delimiter"`, from its opening quote.
+    fn skipRawString(lexer: *CLexer) void {
+        const source = lexer.source;
+        const open = std.mem.indexOfScalarPos(u8, source, lexer.index, '(') orelse {
+            lexer.index = source.len;
+            return;
+        };
+        const delimiter = source[lexer.index + 1 .. open];
+        var at = open + 1;
+        while (std.mem.indexOfScalarPos(u8, source, at, ')')) |close| {
+            const rest = source[close + 1 ..];
+            if (std.mem.startsWith(u8, rest, delimiter) and rest.len > delimiter.len and rest[delimiter.len] == '"') {
+                lexer.index = close + 1 + delimiter.len + 1;
+                return;
+            }
+            at = close + 1;
+        }
+        lexer.index = source.len;
+    }
+
+    /// Past a number, digit separators and exponent signs included.
+    fn skipNumber(lexer: *CLexer) void {
+        const source = lexer.source;
+        lexer.index += 1;
+        while (lexer.index < source.len) {
+            const byte = source[lexer.index];
+            const previous = source[lexer.index - 1];
+            if (isIdentifierByte(byte) or byte == '.') {
+                lexer.index += 1;
+            } else if (byte == '\'' and lexer.index + 1 < source.len and std.ascii.isAlphanumeric(source[lexer.index + 1])) {
+                lexer.index += 2;
+            } else if ((byte == '+' or byte == '-') and (previous == 'e' or previous == 'E' or previous == 'p' or previous == 'P')) {
+                lexer.index += 1;
+            } else {
+                return;
+            }
+        }
+    }
+
+    fn isRawStringPrefix(word: []const u8) bool {
+        for ([_][]const u8{ "R", "u8R", "uR", "UR", "LR" }) |prefix| {
+            if (std.mem.eql(u8, word, prefix)) return true;
+        }
+        return false;
+    }
+};
+
 fn checkBindingSource(path: []const u8, bytes: []const u8, failures: *FailureList) !void {
     if (!std.mem.endsWith(u8, path, ".cpp") and
         !std.mem.endsWith(u8, path, ".cc") and
@@ -1266,6 +1932,253 @@ fn checkBindingSource(path: []const u8, bytes: []const u8, failures: *FailureLis
         (!is_node_fs_facade and std.mem.indexOf(u8, bytes, "fstat(") != null))
     {
         try appendFailure(failures, path, "binding layer must not own fd mapping policy");
+    }
+}
+
+/// Whether `path` is C++ of the bridge that Collo writes in its own style:
+/// ported WebCore files keep WebKit's code as it is upstream.
+fn isColloBridgeCpp(path: []const u8) bool {
+    if (!std.mem.endsWith(u8, path, ".cpp") and !std.mem.endsWith(u8, path, ".h"))
+        return false;
+    return std.mem.indexOf(u8, path, "/webcore_port/") == null;
+}
+
+/// The tokens of `bytes` in order, without comments or whitespace, so a gate
+/// reads code that spans lines and never a name inside a comment or a string.
+fn lexTokens(bytes: []const u8, tokens: *std.ArrayList(CToken)) !void {
+    var lexer: CLexer = .{ .source = bytes };
+    while (lexer.next()) |token| try tokens.append(std.testing.allocator, token);
+}
+
+const cell_edges_header = "runtime/src/bindings/jsc/runtime/cell_edges.h";
+
+/// A cell's container that the collector visits concurrently changes only
+/// under the cell's lock, and `Collo::CellEdgeList` and `CellNativeRef`
+/// (`jsc/runtime/cell_edges.h`) take it for every change and every visit, so
+/// no other code names the lock: a container written by hand is where a
+/// barrier or the lock slips. A container that takes no lock at all is a
+/// review rule (cpp.md).
+fn checkCellLockOnlyInCellEdges(path: []const u8, bytes: []const u8, failures: *FailureList) !void {
+    if (!isColloBridgeCpp(path)) return;
+    if (std.mem.eql(u8, path, cell_edges_header)) return;
+    var lexer: CLexer = .{ .source = bytes };
+    while (lexer.next()) |token| {
+        if (token.isIdentifier("cellLock"))
+            try appendLineFailure(failures, path, token.line, "`cellLock` outside jsc/runtime/cell_edges.h: change a cell's container through Collo::CellEdgeList or CellNativeRef");
+    }
+}
+
+/// Clearing an exception fails when the pending one is a termination, which
+/// must keep unwinding, so the bridge reads the result of every clear and
+/// stops entering JavaScript when it fails. A deliberate discard is written
+/// `(void)`. A clear can drop its result only as a statement of its own,
+/// `clear();` after its receiver chain (`scope.`, `this->m_scope.`), where
+/// the chain starts a statement: after `;`, a brace, the `)` of an `if` or
+/// `while` head, a label's `:`, `else` or `do`.
+fn checkExceptionClearResultUsed(path: []const u8, bytes: []const u8, failures: *FailureList) !void {
+    if (!isColloBridgeCpp(path)) return;
+    var tokens: std.ArrayList(CToken) = .empty;
+    defer tokens.deinit(std.testing.allocator);
+    try lexTokens(bytes, &tokens);
+    const items = tokens.items;
+    for (items, 0..) |token, index| {
+        if (!token.isIdentifier("clearExceptionExceptTermination") and !token.isIdentifier("tryClearException"))
+            continue;
+        if (index + 3 >= items.len) continue;
+        if (!items[index + 1].isPunct('(') or !items[index + 2].isPunct(')') or !items[index + 3].isPunct(';'))
+            continue;
+        const start = receiverChainStart(items, index);
+        if (isVoidCastBefore(items, start)) continue;
+        if (startsStatement(items, start))
+            try appendLineFailure(failures, path, token.line, "an exception clear's result is discarded: return when it fails, or write (void) where a termination stays pending on purpose");
+    }
+}
+
+/// The index of the first token of the receiver chain before the call at
+/// `call`, such as `scope.` or `this->m_scope.`, or `call` without one.
+fn receiverChainStart(items: []const CToken, call: usize) usize {
+    var start = call;
+    while (start >= 2) {
+        if (items[start - 1].isPunct('.') and items[start - 2].kind == .identifier) {
+            start -= 2;
+        } else if (start >= 3 and items[start - 1].isPunct('>') and items[start - 2].isPunct('-') and
+            items[start - 3].kind == .identifier)
+        {
+            start -= 3;
+        } else {
+            break;
+        }
+    }
+    return start;
+}
+
+/// Whether `(void)` stands right before `items[start]`.
+fn isVoidCastBefore(items: []const CToken, start: usize) bool {
+    if (start < 3) return false;
+    return items[start - 3].isPunct('(') and items[start - 2].isIdentifier("void") and items[start - 1].isPunct(')');
+}
+
+/// Whether `items[start]` begins a statement.
+fn startsStatement(items: []const CToken, start: usize) bool {
+    if (start == 0) return true;
+    const before = items[start - 1];
+    return before.isPunct(';') or before.isPunct('{') or before.isPunct('}') or before.isPunct(')') or
+        before.isPunct(':') or before.isIdentifier("else") or before.isIdentifier("do");
+}
+
+/// A cell that held a `JSC::Strong` would root its target for the cell's
+/// whole life, and any path from the target back to the cell would be a
+/// cycle the collector cannot see; a `ColloPromiseDeferred` is two Strongs.
+/// Cells in the bridge are named `JSCollo...`, and the structs of their
+/// pending requests are declared inside them, so every such class or struct
+/// body, nested types included, is read; a forward declaration has none.
+fn checkNoStrongRootInCells(path: []const u8, bytes: []const u8, failures: *FailureList) !void {
+    if (!isColloBridgeCpp(path)) return;
+    var lexer: CLexer = .{ .source = bytes };
+    while (lexer.next()) |token| {
+        if (!token.isIdentifier("class") and !token.isIdentifier("struct")) continue;
+        const name = lexer.next() orelse return;
+        if (name.kind != .identifier or !std.mem.startsWith(u8, name.text, "JSCollo")) continue;
+        if (!skipToBody(&lexer)) continue;
+        try checkCellBody(&lexer, path, failures);
+    }
+}
+
+/// Consumes tokens through the `{` that opens the body of a type whose name
+/// was just read, past its base clause, and says whether one opened; a `;`
+/// first means a declaration without a body.
+fn skipToBody(lexer: *CLexer) bool {
+    while (lexer.next()) |token| {
+        if (token.isPunct(';')) return false;
+        if (token.isPunct('{')) return true;
+    }
+    return false;
+}
+
+/// Reads a cell's body, from just after its `{` through the matching `}`.
+fn checkCellBody(lexer: *CLexer, path: []const u8, failures: *FailureList) !void {
+    var depth: usize = 1;
+    var previous: ?CToken = null;
+    while (lexer.next()) |token| {
+        if (token.isPunct('{')) depth += 1;
+        if (token.isPunct('}')) {
+            depth -= 1;
+            if (depth == 0) return;
+        }
+        if (token.isIdentifier("ColloPromiseDeferred"))
+            try appendLineFailure(failures, path, token.line, "`ColloPromiseDeferred` inside a cell: a cell holds a pending promise as WriteBarrier<JSPromise>");
+        if (previous) |prior| {
+            if (prior.isIdentifier("Strong") and token.isPunct('<'))
+                try appendLineFailure(failures, path, token.line, "`Strong` inside a cell: hold the edge as a WriteBarrier the cell visits, or JSC::Weak");
+        }
+        previous = token;
+    }
+}
+
+/// The WTF containers the collector cannot see into.
+const wtf_container_names = [_][]const u8{
+    "Vector",  "Deque",          "HashSet",             "ListHashSet",
+    "HashMap", "HashCountedSet", "UncheckedKeyHashSet", "UncheckedKeyHashMap",
+};
+
+/// A WTF container is invisible to the collector, so a cell pointer, a
+/// `JSValue` or a raw `ArrayBuffer*` in one dies once script or an
+/// allocation lets a collection run while the container still names it. A
+/// list of cells that lives across either is a `JSC::MarkedVector` or a
+/// `MarkedArgumentBuffer`, and a buffer is held as `RefPtr<JSC::ArrayBuffer>`.
+/// Every top-level template argument is read, a map's key and value alike.
+fn checkNoCellsInWtfContainers(path: []const u8, bytes: []const u8, failures: *FailureList) !void {
+    if (!isColloBridgeCpp(path)) return;
+    var tokens: std.ArrayList(CToken) = .empty;
+    defer tokens.deinit(std.testing.allocator);
+    try lexTokens(bytes, &tokens);
+    const items = tokens.items;
+    for (items, 0..) |token, index| {
+        if (token.kind != .identifier or !isWtfContainerName(token.text)) continue;
+        if (index + 1 >= items.len or !items[index + 1].isPunct('<')) continue;
+        var depth: usize = 0;
+        var argument_start = index + 2;
+        var cursor = index + 1;
+        while (cursor < items.len) : (cursor += 1) {
+            const item = items[cursor];
+            if (item.isPunct('<')) {
+                depth += 1;
+            } else if (item.isPunct('>')) {
+                depth -= 1;
+                if (depth == 0) {
+                    try checkContainerArgument(items[argument_start..cursor], path, token, failures);
+                    break;
+                }
+            } else if (item.isPunct(',') and depth == 1) {
+                try checkContainerArgument(items[argument_start..cursor], path, token, failures);
+                argument_start = cursor + 1;
+            }
+        }
+    }
+}
+
+fn isWtfContainerName(text: []const u8) bool {
+    for (wtf_container_names) |name| {
+        if (std.mem.eql(u8, text, name)) return true;
+    }
+    return false;
+}
+
+fn checkContainerArgument(argument: []const CToken, path: []const u8, container: CToken, failures: *FailureList) !void {
+    if (!isUnrootedCellArgument(argument)) return;
+    try appendFailureMessage(failures, "{s}:{d}: a cell, a JSValue or a raw ArrayBuffer in a WTF {s}: use JSC::MarkedVector or MarkedArgumentBuffer for cells and values, RefPtr<JSC::ArrayBuffer> for buffers", .{
+        path,
+        container.line,
+        container.text,
+    });
+}
+
+/// Whether a template argument names a type no WTF container may hold:
+/// `JSValue`, a pointer to a cell type (`JS` and a capital: `JSObject`,
+/// `JSCell`, `JSColloMessagePort`) or a raw `ArrayBuffer*`, `const` and a
+/// `JSC::` or `WTF::` qualifier aside.
+fn isUnrootedCellArgument(argument: []const CToken) bool {
+    var rest = argument;
+    while (rest.len > 0) {
+        if (rest[0].isIdentifier("const")) {
+            rest = rest[1..];
+        } else if (rest.len >= 3 and (rest[0].isIdentifier("JSC") or rest[0].isIdentifier("WTF")) and
+            rest[1].isPunct(':') and rest[2].isPunct(':'))
+        {
+            rest = rest[3..];
+        } else {
+            break;
+        }
+    }
+    if (rest.len == 0 or rest[0].kind != .identifier) return false;
+    const type_name = rest[0].text;
+    if (rest.len == 1) return std.mem.eql(u8, type_name, "JSValue");
+    if (!rest[1].isPunct('*')) return false;
+    if (std.mem.eql(u8, type_name, "ArrayBuffer")) return true;
+    return type_name.len >= 3 and std.mem.startsWith(u8, type_name, "JS") and std.ascii.isUpper(type_name[2]);
+}
+
+/// WebCrypto keeps secret bytes only in `SecretBytes`
+/// (`crypto/secret_bytes.h`), which allocates its exact size and zeroes
+/// every buffer it frees over its whole capacity, so no path, an early
+/// return included, frees a secret unzeroed. These names keep bytes outside
+/// it: WTF's base64 decoders leave decoded bytes past the size of the
+/// buffer they shrink, and the other three are zeroing helpers that stop at
+/// a buffer's size and leave its spare capacity.
+fn checkCryptoSecretBuffers(path: []const u8, bytes: []const u8, failures: *FailureList) !void {
+    if (!isColloBridgeCpp(path)) return;
+    const forbidden = [_][]const u8{ "base64URLDecode", "base64Decode", "secureZeroVector", "SecureVectorGuard", "SecureBytes" };
+    var lexer: CLexer = .{ .source = bytes };
+    while (lexer.next()) |token| {
+        if (token.kind != .identifier) continue;
+        for (forbidden) |name| {
+            if (std.mem.eql(u8, token.text, name))
+                try appendFailureMessage(failures, "{s}:{d}: `{s}`: WebCrypto keeps secret bytes in SecretBytes, which zeroes what it frees", .{
+                    path,
+                    token.line,
+                    name,
+                });
+        }
     }
 }
 
@@ -1499,6 +2412,40 @@ fn checkTcpSocketOptionsCentralized(path: []const u8, bytes: []const u8, failure
             });
         }
     }
+    if (isProductionSourcePath(path))
+        try checkNoRawSocketOptionCalls(path, bytes, failures);
+}
+
+/// Production source reads and sets every socket option through a helper of
+/// `collo_os.socket`, which names its option and maps its errors once, so no
+/// raw call outside `common/os.zig` remains, whatever option it names, an
+/// option nobody added yet included. Tests and benchmarks may call the raw
+/// functions to build what they probe. Comments may name them.
+fn checkNoRawSocketOptionCalls(path: []const u8, bytes: []const u8, failures: *FailureList) !void {
+    const raw_calls = [_][]const u8{ "setsockopt", "getsockopt", "getsockoptError" };
+    var comments: CommentScanner = .{};
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    var line_no: usize = 0;
+    while (lines.next()) |line| {
+        line_no += 1;
+        if (comments.isCommentOnly(line))
+            continue;
+        const code = line[0 .. std.mem.indexOf(u8, line, "//") orelse line.len];
+        for (raw_calls) |name| {
+            if (containsIdentifier(code, name))
+                try appendFailureMessage(failures, "{s}:{d}: `{s}`: socket options go through a helper of collo_os.socket (runtime/src/common/os.zig)", .{
+                    path,
+                    line_no,
+                    name,
+                });
+        }
+    }
+}
+
+/// A file of the product: under `runtime/src/` and outside every module's
+/// `tests/` tree.
+fn isProductionSourcePath(path: []const u8) bool {
+    return std.mem.startsWith(u8, path, "runtime/src/") and !isModuleTestPath(path);
 }
 
 fn isImportOrIncludeLine(line: []const u8) bool {
@@ -1632,6 +2579,118 @@ fn checkRawSyscallErrnoDecode(path: []const u8, bytes: []const u8, failures: *Fa
         if (!has_libc_context)
             try appendLineFailure(failures, path, line_no, "raw syscall return decoded with std.posix.errno; use collo_os.linux.syscallErrno or std.os.linux.E.init");
     }
+}
+
+/// Every source language that could load a library: Zig, C and C++.
+fn isNativeLoadingCandidate(path: []const u8) bool {
+    const extensions = [_][]const u8{ ".zig", ".c", ".cc", ".cpp", ".h" };
+    for (extensions) |extension| {
+        if (std.mem.endsWith(u8, path, extension))
+            return true;
+    }
+    return false;
+}
+
+/// The names through which Zig, C or C++ code reaches the dynamic loader,
+/// matched as whole identifiers so a longer name that merely contains one
+/// passes. Comment lines are not read: a comment may say what the code does
+/// not do.
+fn checkNoNativeLoading(path: []const u8, bytes: []const u8, failures: *FailureList) !void {
+    // This file names the loader's API to forbid it, and the binary contract
+    // names the loader functions the installed binary imports to pin them.
+    if (std.mem.eql(u8, path, "runtime/tests/conventions.zig"))
+        return;
+    if (std.mem.eql(u8, path, "runtime/tests/contracts/binary_dependencies.zig"))
+        return;
+    const forbidden = [_][]const u8{ "dlopen", "dlmopen", "dlsym", "dlvsym", "dlfcn", "DynLib", "ElfDynLib" };
+    var comments: CommentScanner = .{};
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    var line_no: usize = 0;
+    while (lines.next()) |line| {
+        line_no += 1;
+        if (comments.isCommentOnly(line))
+            continue;
+        for (forbidden) |name| {
+            if (containsIdentifier(line, name))
+                try appendFailureMessage(failures, "{s}:{d}: `{s}`: Collo loads no native code at run time; link the library instead", .{
+                    path,
+                    line_no,
+                    name,
+                });
+        }
+    }
+}
+
+/// The build links no `libdl`, whose only use is loading code at run time:
+/// no `-ldl` flag, alone or inside a linker option such as `-Wl,-ldl`, and
+/// no system library named `dl`.
+fn checkBuildLinksNoLoader(path: []const u8, bytes: []const u8, failures: *FailureList) !void {
+    if (!std.mem.endsWith(u8, path, ".zig"))
+        return;
+    var comments: CommentScanner = .{};
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    var line_no: usize = 0;
+    while (lines.next()) |line| {
+        line_no += 1;
+        if (comments.isCommentOnly(line))
+            continue;
+        if (containsFlag(line, "-ldl") or
+            std.mem.indexOf(u8, line, "linkSystemLibrary(\"dl\"") != null)
+            try appendLineFailure(failures, path, line_no, "the build links no libdl: nothing loads code at run time");
+    }
+}
+
+/// Whether `flag` occurs in `line` not followed by an identifier byte, so
+/// `-ldl` matches in `"-ldl"` and `"-Wl,-ldl"` but not in `-ldlfoo`.
+fn containsFlag(line: []const u8, flag: []const u8) bool {
+    var search: usize = 0;
+    while (std.mem.indexOfPos(u8, line, search, flag)) |at| : (search = at + flag.len) {
+        const after = at + flag.len;
+        if (after == line.len or !isIdentifierByte(line[after]))
+            return true;
+    }
+    return false;
+}
+
+/// Reads a Zig, C or C++ file line by line and says which lines hold only a
+/// comment: a line starting with `//`, and a line inside or opening a
+/// `/* */` block with no code after its close. A line starting with `*`
+/// outside a block is code, as in C's `*slot = value;`.
+const CommentScanner = struct {
+    in_block: bool = false,
+
+    fn isCommentOnly(scanner: *CommentScanner, line: []const u8) bool {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (scanner.in_block)
+            return scanner.afterBlockClose(trimmed);
+        if (std.mem.startsWith(u8, trimmed, "//"))
+            return true;
+        if (std.mem.startsWith(u8, trimmed, "/*")) {
+            scanner.in_block = true;
+            return scanner.afterBlockClose(trimmed["/*".len..]);
+        }
+        return false;
+    }
+
+    /// `text` lies inside a block comment; closes the block if `text` does,
+    /// and says whether nothing but the comment is on the line.
+    fn afterBlockClose(scanner: *CommentScanner, text: []const u8) bool {
+        const close = std.mem.indexOf(u8, text, "*/") orelse return true;
+        scanner.in_block = false;
+        return std.mem.trim(u8, text[close + "*/".len ..], " \t\r").len == 0;
+    }
+};
+
+fn containsIdentifier(line: []const u8, name: []const u8) bool {
+    var search: usize = 0;
+    while (std.mem.indexOfPos(u8, line, search, name)) |at| : (search = at + name.len) {
+        const before_ok = at == 0 or !isIdentifierByte(line[at - 1]);
+        const after = at + name.len;
+        const after_ok = after == line.len or !isIdentifierByte(line[after]);
+        if (before_ok and after_ok)
+            return true;
+    }
+    return false;
 }
 
 fn appendLineFailure(failures: *FailureList, path: []const u8, line_no: usize, reason: []const u8) !void {

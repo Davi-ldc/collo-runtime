@@ -310,7 +310,7 @@ test "exception lines reach the owning runtime with a second runtime attached" {
     defer std.posix.close(page_fd);
     var view = try worker_shared_page.mapReadWrite(page_fd);
     defer view.deinit();
-    view.initializeCrashDefault(1, 64 * 1024 * 1024, 1);
+    view.initializeCrashDefault();
 
     var now_a: u64 = 1_000;
     var runtime_a = try worker.Runtime.init(std.testing.allocator, &vm_a, pair_a[0], &view, try rt.createCompletionEventfd(), .{
@@ -365,7 +365,7 @@ test "per-request line cap drops the 257th line into the ring counter and resets
     defer std.posix.close(page_fd);
     var view = try worker_shared_page.mapReadWrite(page_fd);
     defer view.deinit();
-    view.initializeCrashDefault(1, 64 * 1024 * 1024, 1);
+    view.initializeCrashDefault();
 
     var now_mono_ns: u64 = 9_000;
     var runtime = try worker.Runtime.init(std.testing.allocator, &vm, control_pair[0], &view, try rt.createCompletionEventfd(), .{
@@ -489,7 +489,7 @@ test "console and uncaught exception lines land in the shared page log ring" {
     defer std.posix.close(page_fd);
     var view = try worker_shared_page.mapReadWrite(page_fd);
     defer view.deinit();
-    view.initializeCrashDefault(1, 64 * 1024 * 1024, 1);
+    view.initializeCrashDefault();
 
     var now_mono_ns: u64 = 7_000;
     var runtime = try worker.Runtime.init(std.testing.allocator, &vm, control_pair[0], &view, try rt.createCompletionEventfd(), .{

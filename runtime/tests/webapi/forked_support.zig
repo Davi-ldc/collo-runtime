@@ -2,7 +2,8 @@
 //! and booted through its sandbox. The suite's module, `support/collo_test.js`
 //! and an entry route that runs the suite and answers with its JSON result
 //! travel as one module pack in WorkerInit, with a one-route table naming
-//! that entry, and the response to one request must report `"ok":true`. The worker launches attached to an
+//! that entry, and the response to one request must report `ok` with at least
+//! one test. The worker launches attached to an
 //! in-process egress gateway (`rt.LocalEgressGateway`) with a boot token, as
 //! a launch with an egress grant does, and the suite's fetches run under
 //! `rt.local_origin_network`, plain HTTP to private addresses; the test thread
@@ -17,6 +18,7 @@ const zygote_support = @import("zygote_support");
 const host = zygote_support.host;
 
 const rt = @import("collo_test_harness");
+const webapi = @import("support.zig");
 
 const worker_memory_limit_bytes: u64 = 1024 * 1024 * 1024;
 // Every prefixed specifier in the pack shares this hash segment, because the
@@ -29,9 +31,9 @@ const collo_test_entry_specifier = "/__collo_route/" ++ deploy_hash ++ "/webapi-
 const collo_test_import = "collo" ++ ":test";
 
 /// Runs the suite module `source`, registered at `specifier` below the pack's
-/// hash segment. Fails with `error.ForkedWebApiSuiteFailed`, after printing
-/// the response body, when the suite does not report `"ok":true`, and skips
-/// when this environment cannot place workers.
+/// hash segment. Fails as `support.zig`'s `expectSuiteResult` does, after
+/// printing the response body, unless the suite reports `ok` with at least one
+/// test, and skips when this environment cannot place workers.
 pub fn runCompatSuite(source: []const u8, specifier: []const u8) !void {
     var spawned = try zygote_support.spawnZygote();
     defer spawned.deinit();
@@ -124,10 +126,8 @@ pub fn runCompatSuite(source: []const u8, specifier: []const u8) !void {
         },
     );
     defer response.deinit();
-    if (!std.mem.containsAtLeast(u8, response.body, 1, "\"ok\":true")) {
-        std.debug.print("forked webapi suite failed for {s}\n{s}\n", .{ specifier, response.body });
-        return error.ForkedWebApiSuiteFailed;
-    }
+    // The forked pack carries no filter, so every test registers.
+    try webapi.expectSuiteResult(specifier, response.body, .complete);
 }
 
 /// A nonzero id derived from the suite's specifier. It doubles as the fork

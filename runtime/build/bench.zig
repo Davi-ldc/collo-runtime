@@ -7,6 +7,7 @@
 //! someone runs it, so without that dependency a root rots behind a green
 //! gate until the next measurement needs it.
 const std = @import("std");
+const codecs_mod = @import("codecs.zig");
 const context_mod = @import("context.zig");
 const link_mod = @import("link.zig");
 const modules_mod = @import("modules.zig");
@@ -151,7 +152,7 @@ fn addVmBenches(b: *std.Build, ctx: *const context_mod.Context, bench_step: *std
         // `check` takes that very object: type-check, no link, no run.
         ctx.check_step.dependOn(&bench_object.step);
         shims.configureBindingsTestObject(bench_object, ctx.libc_file);
-        shims.configureBoringSslShim(b, bench_object, ctx.toolchain, ctx.opts.sanitizer);
+        shims.configureBoringSslShim(b, bench_object, ctx.toolchain, ctx.boringssl.headers(), ctx.opts.sanitizer);
         shims.configureHpackShim(b, bench_object, ctx.patched_ls_hpack);
 
         const linked_bench = link_mod.addJscLink(b, ctx.link_ctx, .{
@@ -185,12 +186,13 @@ fn addSandboxBench(b: *std.Build, ctx: *const context_mod.Context) void {
     module.addImport("collo_bench_build_options", benchOptionsModule(b, ctx, ctx.opts.optimize));
     ctx.jsc_set.importInto(module, &.{
         .host,          .zygote,        .os,                .cgroup,         .server_main,
-        .server_config, .server_routes, .server_supervisor, .egress_gateway,
+        .server_config, .server_routes, .server_supervisor, .egress_gateway, .network,
+        .limits,
     });
     const object = b.addObject(.{ .name = "sandbox-bench", .root_module = module });
     ctx.check_step.dependOn(&object.step);
     shims.configureBindingsTestObject(object, ctx.libc_file);
-    shims.configureBoringSslShim(b, object, ctx.toolchain, ctx.opts.sanitizer);
+    shims.configureBoringSslShim(b, object, ctx.toolchain, ctx.boringssl.headers(), ctx.opts.sanitizer);
     shims.configureHpackShim(b, object, ctx.patched_ls_hpack);
     object.root_module.addCSourceFiles(.{
         .files = &.{"runtime/bench/sandbox/client.cc"},
@@ -215,6 +217,8 @@ fn addSandboxBench(b: *std.Build, ctx: *const context_mod.Context) void {
     inline for (.{
         .{ "bench-cold-start", "cold", "Measure local HTTP send through fresh sandbox handler entry" },
         .{ "bench-memory", "memory", "Measure cgroup marginal cost and per-process shared/private memory" },
+        .{ "bench-idle", "idle", "Measure an idle loaded worker's CPU, wakeups and Private_Dirty over a window" },
+        .{ "bench-regions", "regions", "Measure every shared region after each workload step and after idle" },
     }) |entry| {
         const run = link_mod.runLinkedExecutable(b, linked, ctx.opts.sanitizer, &.{entry[1]});
         run.setEnvironmentVariable("COLLO_BENCH_WSL_CONFIG", b.getInstallPath(.bin, "wsl-config"));
@@ -242,9 +246,12 @@ fn addCheckObject(
     ctx.check_step.dependOn(&object.step);
 }
 
+/// The codec bench measures the codecs Collo links, through their binding
+/// modules, never a library found on the machine.
 fn compressionBenchModule(
     b: *std.Build,
     ctx: *const context_mod.Context,
+    stub_release: *const modules_mod.ModuleSet,
     bench_options_module: *std.Build.Module,
 ) *std.Build.Module {
     const module = b.createModule(.{
@@ -255,6 +262,7 @@ fn compressionBenchModule(
         .link_libcpp = false,
     });
     module.addImport("collo_bench_build_options", bench_options_module);
+    stub_release.importInto(module, &.{ .brotli, .zstd });
     addJsWorkloadImports(b, module);
     return module;
 }
@@ -275,6 +283,9 @@ fn egressBenchModule(
     });
     module.addImport("collo_bench_build_options", bench_options_module);
     module.addImport(modules_mod.importName(bench.import), stub_release.get(bench.import));
+    // `local_origin.zig` builds the policy naming the bench's own origins
+    // from the same module the transport matches with.
+    module.addImport("collo_network", stub_release.get(.network));
     if (bench.import_bindings)
         module.addImport("collo_bindings", stub_release.get(.bindings));
     if (bench.tls_test_shim)
@@ -328,8 +339,7 @@ fn addEgressBenches(b: *std.Build, ctx: *const context_mod.Context, bench_step: 
         .target = ctx.opts.target,
         .optimize = .ReleaseFast,
         .bindings = .h2_stub,
-        .toolchain = ctx.toolchain,
-        .zstd_link = ctx.zstd_link,
+        .codecs = ctx.codecs,
     });
     const bench_options_module = benchOptionsModule(b, ctx, .ReleaseFast);
 
@@ -337,12 +347,13 @@ fn addEgressBenches(b: *std.Build, ctx: *const context_mod.Context, bench_step: 
         b,
         ctx,
         "compression_codecs",
-        compressionBenchModule(b, ctx, bench_options_module),
+        compressionBenchModule(b, ctx, &stub_release, bench_options_module),
     );
     const compression_exe = b.addExecutable(.{
         .name = "compression_codecs",
-        .root_module = compressionBenchModule(b, ctx, bench_options_module),
+        .root_module = compressionBenchModule(b, ctx, &stub_release, bench_options_module),
     });
+    codecs_mod.linkInto(compression_exe, ctx.codecs);
     const compression_run = b.addRunArtifact(compression_exe);
     compression_run.setCwd(b.path("."));
     const compression_step = b.step(
@@ -363,11 +374,12 @@ fn addEgressBenches(b: *std.Build, ctx: *const context_mod.Context, bench_step: 
             .name = bench.name,
             .root_module = egressBenchModule(b, ctx, bench, &stub_release, bench_options_module),
         });
-        shims.configureBoringSslShim(b, bench_exe, ctx.toolchain, .{});
+        shims.configureBoringSslShim(b, bench_exe, ctx.toolchain, ctx.boringssl.headers(), .{});
         if (bench.tls_test_shim)
             shims.configureBoringSslTestShim(b, bench_exe, ctx.toolchain, .{});
         shims.configureHpackShim(b, bench_exe, ctx.patched_ls_hpack);
-        shims.linkBoringSslArchives(b, bench_exe, ctx.opts.boringssl_build_dir);
+        ctx.boringssl.linkArchives(b, bench_exe);
+        codecs_mod.linkInto(bench_exe, ctx.codecs);
 
         const single_step = b.step(bench.step_name, bench.step_desc);
         if (bench.install)

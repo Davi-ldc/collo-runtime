@@ -9,11 +9,13 @@
 //! fetch_limits' module does not, but pulling it in would break the leaf
 //! design and give the file two homes:
 //! - runtime/src/server/supervisor/scheduler_limits.zig — scheduler policy
-//!   (memory ladder, pool capacity).
+//!   (memory ladder, launches in flight per pool); the pool's own bounds are
+//!   in pool.zig here.
 //! - runtime/src/egress/gateway/supervisor_limits.zig — shard
 //!   containment (restart backstop, memory budget).
 //! - runtime/src/common/ipc/fetch_limits.zig — fetch IPC wire shape
-//!   (packet/url/header caps, 32 MiB pooled request-body ceiling).
+//!   (packet/url/header caps, the pooled request-body ceiling and the pooled
+//!   bytes one session may have in flight).
 //! - runtime/src/egress/gateway/policy.zig — per-fetch gateway policy
 //!   defaults (cite http_body and fetch_limits).
 //! - runtime/src/egress/gateway/sizing.zig — the gateway's worker cap
@@ -37,6 +39,10 @@
 //! - runtime/src/server/routes/table.zig (`node_count_max`,
 //!   `match_visits_max`) and imports.zig (`imports_max`, `nesting_max`) —
 //!   the route trie and the scan of a module's imports.
+//! - runtime/src/common/network/table.zig (`grants_max`, `policies_max`,
+//!   `rules_max`, `members_max` and the image's byte bounds) — the policy
+//!   table the server hands each gateway, sized from the `network_*` bounds
+//!   in server.zig here.
 //! - runtime/src/common/ipc/fs_index.zig (`path_bytes_max`, `entries_max`)
 //!   and route_bindings.zig (`bytes_max`, `entries_max`, both equal to
 //!   server.zig's per-route binding bounds) — the WorkerInit memfds.

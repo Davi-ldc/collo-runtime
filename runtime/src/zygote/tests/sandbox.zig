@@ -2,8 +2,8 @@
 //! clearing, tmp root validation, and the seccomp policy, checked both in the
 //! emitted program and by installing it in forked children that probe what it
 //! allows, denies and filters by argument, and whether a thread created before
-//! it can still start under it. The `zygote-integration` lane covers a real
-//! worker booting into the sandbox.
+//! it can still start, and name itself, under it. The `zygote-integration`
+//! lane covers a real worker booting into the sandbox.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -153,6 +153,7 @@ test "worker direct-egress seccomp policy denies unexpected syscalls with narrow
     try std.testing.expect(security.denyDirectEgressFiltersMkdirAtArgs());
     try std.testing.expect(security.denyDirectEgressFiltersUnlinkAtArgs());
     try std.testing.expect(security.denyDirectEgressFiltersRenameAt2Args());
+    try std.testing.expect(security.denyDirectEgressFiltersPrctlName());
     try std.testing.expect(!security.denyDirectEgressFiltersCloseRingFds());
 
     const expected_runtime_syscalls = [_][]const u8{
@@ -196,6 +197,7 @@ test "worker direct-egress seccomp policy denies unexpected syscalls with narrow
 
     const argument_filtered_syscalls = [_][]const u8{
         "fcntl",
+        "prctl",
     };
     inline for (argument_filtered_syscalls) |name|
         try std.testing.expect(!security.denyDirectEgressAllowsSyscall(name));
@@ -224,6 +226,32 @@ test "worker direct-egress emitted seccomp filters AT_FDCWD by its low int word"
         try expectAtFdcwdAllowed(filter, variadic_cpp);
         try expectAtFdcwdAllowed(filter, arbitrary_high);
         try expectAtFdcwdDenied(filter, wrong_low);
+    }
+}
+
+test "worker seccomp admits prctl only for PR_SET_NAME, with a zero high word" {
+    // Evaluates the emitted program, so every option is checked even where
+    // the host cannot install a filter.
+    const linux = std.os.linux;
+    const program = sandbox.security.denyDirectEgressFilterInstructions();
+    const set_name = prctlOption(.SET_NAME);
+    try std.testing.expectEqual(linux.SECCOMP.RET.ALLOW, try evaluatePrctl(program, set_name));
+
+    const denied = linux.SECCOMP.RET.ERRNO | @as(u32, @intFromEnum(linux.E.PERM));
+    try std.testing.expectEqual(denied, try evaluatePrctl(program, set_name | (1 << 32)));
+    const denied_options = [_]linux.PR{
+        .GET_NAME,
+        .SET_DUMPABLE,
+        .SET_SECCOMP,
+        .SET_MM,
+        .SET_NO_NEW_PRIVS,
+        .CAP_AMBIENT,
+    };
+    for (denied_options) |option| {
+        const action = try evaluatePrctl(program, prctlOption(option));
+        if (action != denied)
+            std.debug.print("prctl option {s} passed the worker filter: action=0x{x}\n", .{ @tagName(option), action });
+        try std.testing.expectEqual(denied, action);
     }
 }
 
@@ -449,11 +477,82 @@ test "worker direct-egress seccomp pins stat-at syscalls to safe cwd paths" {
     try std.testing.expectEqual(expected_result, result[0]);
 }
 
+test "worker direct-egress seccomp lets a thread rename itself and denies every other prctl" {
+    const skip_result: u8 = 0xff;
+    const expected_result: u8 = 0b0000_0111;
+    const thread_name = "collo-sandbox";
+    const pipe_pair = try std.posix.pipe2(.{ .CLOEXEC = true });
+    defer std.posix.close(pipe_pair[0]);
+
+    const pid = try std.posix.fork();
+    if (pid == 0) {
+        std.posix.close(pipe_pair[0]);
+
+        const ring_fd = std.posix.eventfd(
+            0,
+            std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK,
+        ) catch childExit(181);
+        const timer_fd = std.posix.eventfd(
+            0,
+            std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK,
+        ) catch childExit(182);
+        // Opened before the filter, as a worker has no /proc after its
+        // chroot. The forked child has one thread, the one renamed below.
+        const comm_fd = std.posix.openZ(
+            "/proc/thread-self/comm",
+            .{ .ACCMODE = .RDONLY, .CLOEXEC = true },
+            0,
+        ) catch childExit(183);
+
+        if (!enableNoNewPrivsForSeccompTest()) {
+            writeSeccompSmokeResult(pipe_pair[1], skip_result) catch childExit(184);
+            childExit(0);
+        }
+        sandbox.applySeccomp(.{
+            .mode = .deny_direct_egress,
+            .allowed_io_uring_enter_fd = ring_fd,
+            .allowed_timer_fd = timer_fd,
+        }) catch |err| switch (err) {
+            error.PermissionDenied,
+            error.UnsupportedKernel,
+            => {
+                writeSeccompSmokeResult(pipe_pair[1], skip_result) catch childExit(185);
+                childExit(0);
+            },
+            else => childExit(185),
+        };
+
+        var result: u8 = 0;
+        if (prctlSetNameAllowedBySeccomp(thread_name))
+            result |= @as(u8, 1) << 0;
+        if (threadCommReads(comm_fd, thread_name))
+            result |= @as(u8, 1) << 1;
+        if (prctlSetDumpableDeniedBySeccomp())
+            result |= @as(u8, 1) << 2;
+
+        writeSeccompSmokeResult(pipe_pair[1], result) catch childExit(186);
+        childExit(0);
+    }
+
+    std.posix.close(pipe_pair[1]);
+    var result: [1]u8 = undefined;
+    const read_len = try std.posix.read(pipe_pair[0], &result);
+
+    const wait = std.posix.waitpid(pid, 0);
+    try std.testing.expect(std.c.W.IFEXITED(wait.status));
+    try std.testing.expectEqual(@as(u32, 0), std.c.W.EXITSTATUS(wait.status));
+    try std.testing.expectEqual(@as(usize, 1), read_len);
+    if (result[0] == skip_result)
+        return error.SkipZigTest;
+    try std.testing.expectEqual(expected_result, result[0]);
+}
+
 test "worker seccomp lets a thread created before the filter start after it" {
     // Creating a thread does not run it. glibc registers a new thread's rseq
     // area when the thread first runs and aborts the whole process if that
-    // fails, so a thread a worker creates before its filter but the scheduler
-    // first picks after it must still be able to start.
+    // fails, and WTF names every thread it starts with prctl(PR_SET_NAME), so
+    // a thread a worker creates before its filter but the scheduler first
+    // picks after it must still be able to start and name itself.
     //
     // The child makes that order certain. glibc starts a thread whose
     // affinity it must set behind a lock it takes before the clone and drops
@@ -489,7 +588,8 @@ test "worker seccomp lets a thread created before the filter start after it" {
     if (result[0] == skip_result)
         return error.SkipZigTest;
     // 0 means the thread ran before the worker filter, so the creator was
-    // never parked and the test proved nothing.
+    // never parked and the test proved nothing; 2 means it started under the
+    // filter but could not name itself.
     try std.testing.expectEqual(@as(u8, 1), result[0]);
 }
 
@@ -534,11 +634,13 @@ const WorkerFilterInstaller = struct {
 const LateStartThread = struct {
     installer: *const WorkerFilterInstaller,
     started_under_filter: bool = false,
+    named: bool = false,
 };
 
 fn lateStartThreadMain(context: ?*anyopaque) callconv(.c) ?*anyopaque {
     const state: *LateStartThread = @ptrCast(@alignCast(context.?));
     state.started_under_filter = state.installer.installed.load(.acquire);
+    state.named = prctlSetNameAllowedBySeccomp("collo-late");
     return null;
 }
 
@@ -611,7 +713,7 @@ fn startThreadUnderWorkerFilterChild(result_fd: std.posix.fd_t, skip_result: u8)
     const result: u8 = switch (installer.outcome) {
         .not_signaled => childExit(155),
         .unsupported => skip_result,
-        .installed => if (state.started_under_filter) 1 else 0,
+        .installed => if (!state.started_under_filter) 0 else if (state.named) 1 else 2,
     };
     writeSeccompSmokeResult(result_fd, result) catch childExit(156);
     childExit(0);
@@ -742,6 +844,26 @@ fn atFdcwdSeccompData(filter: AtFdcwdFilter, argument: u64) std.os.linux.SECCOMP
         setSeccompArgument(&data, peer_index, 0xffff_ffff_ffff_ff9c);
     }
     return data;
+}
+
+fn evaluatePrctl(program: []const sandbox.security.FilterInstruction, option: u64) !u32 {
+    const data = std.os.linux.SECCOMP.data{
+        .nr = @intCast(syscallNumber("prctl")),
+        .arch = auditArchCurrent(),
+        .instruction_pointer = 0,
+        .arg0 = option,
+        .arg1 = 0,
+        .arg2 = 0,
+        .arg3 = 0,
+        .arg4 = 0,
+        .arg5 = 0,
+    };
+    return evaluateSeccompFilter(program, &data);
+}
+
+/// The option as glibc and Zig pass a positive `int`: zero-extended.
+fn prctlOption(option: std.os.linux.PR) u64 {
+    return @intCast(@intFromEnum(option));
 }
 
 fn setSeccompArgument(data: *std.os.linux.SECCOMP.data, index: u3, value: u64) void {
@@ -897,6 +1019,29 @@ fn timerFdSetTimeDeniedBySeccomp(fd: std.posix.fd_t) bool {
     };
     const rc = std.os.linux.timerfd_settime(fd, .{}, &spec, null);
     return std.os.linux.E.init(rc) == .PERM;
+}
+
+fn prctlSetNameAllowedBySeccomp(name: [*:0]const u8) bool {
+    const linux = std.os.linux;
+    const rc = linux.prctl(@intFromEnum(linux.PR.SET_NAME), @intFromPtr(name), 0, 0, 0);
+    return linux.E.init(rc) == .SUCCESS;
+}
+
+fn prctlSetDumpableDeniedBySeccomp() bool {
+    const linux = std.os.linux;
+    const rc = linux.prctl(@intFromEnum(linux.PR.SET_DUMPABLE), 1, 0, 0, 0);
+    return linux.E.init(rc) == .PERM;
+}
+
+/// Whether the thread `comm_fd` names now reads as `expected`. The kernel
+/// renders the name with a trailing newline.
+fn threadCommReads(comm_fd: std.posix.fd_t, expected: []const u8) bool {
+    var buffer: [32]u8 = undefined;
+    const rc = std.os.linux.pread(comm_fd, &buffer, buffer.len, 0);
+    if (std.os.linux.E.init(rc) != .SUCCESS)
+        return false;
+    const comm = std.mem.trimEnd(u8, buffer[0..rc], "\n");
+    return std.mem.eql(u8, comm, expected);
 }
 
 fn openByHandleAtDeniedBySeccomp() bool {

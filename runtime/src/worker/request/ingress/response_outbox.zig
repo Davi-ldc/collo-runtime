@@ -41,10 +41,13 @@ pub const BufferedBody = struct {
     http_status: u16,
 };
 
-/// One chunk of a streamed fetch body, with the credits that return to the
-/// gateway once the chunk is sent.
+/// One chunk of a streamed body and how much of it went out: a fetch body's,
+/// with the credits that return to the gateway once all of it is sent, or the
+/// unsent rest of a body stream's chunk, with none.
 pub const StreamChunk = struct {
     bytes: ByteLease = .empty,
+    /// The bytes of `bytes` already sent; the flush resumes here.
+    offset: usize = 0,
     credits: PullCredits = .{},
     done: bool,
 
@@ -64,8 +67,8 @@ pub const Pending = union(enum) {
     /// A streamed response's end; the request finishes once it is sent.
     stream_end,
     /// The reset of a committed response that cannot go on, with its HTTP/2
-    /// error code. Once it is sent, the request finishes with
-    /// `internal_error` and the status in `RequestContext.response_http_status`.
+    /// error code. Once it is sent, the request finishes with the statuses
+    /// in `RequestContext.response_done_status` and `response_http_status`.
     stream_reset: u32,
 };
 

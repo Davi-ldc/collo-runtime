@@ -22,19 +22,7 @@
 const std = @import("std");
 const bindings = @import("collo_bindings");
 const os_process = @import("collo_os").process;
-
-// Defaults for a `Config` that leaves a field unset. The worker sets every
-// field from its `RuntimeLimits`, whose defaults come from
-// `ipc.WorkerRuntimeBootOptions` in `common/ipc/messages.zig`.
-//
-// glibc places static TLS on the thread stack and pthread_create rejects a
-// stack smaller than static TLS + guard + PTHREAD_STACK_MIN with a synchronous
-// EINVAL, which std.Thread.spawn treats as unreachable. The default leaves
-// room for the static TLS, the guard page and BoringSSL's frames while
-// staying below glibc's usual 8 MiB default.
-const default_thread_stack_bytes: usize = 4 * 1024 * 1024;
-const default_max_in_flight_per_request: usize = 6;
-const default_max_in_flight_per_worker: usize = 64 * default_max_in_flight_per_request;
+const worker_limits = @import("collo_limits").worker;
 
 pub const Entry = struct {
     request_id: u64,
@@ -44,27 +32,29 @@ pub const Entry = struct {
     /// instant, so its I/O time ends when the work ended rather than when the
     /// VM thread noticed.
     completed_at_ns: u64 = 0,
+    /// The CPU the pool thread spent running the job, from its own
+    /// CLOCK_THREAD_CPUTIME_ID around the run, 0 when the clock failed. The
+    /// settlement adds it to the owner's CPU (`runtime.zig`).
+    cpu_ns: u64 = 0,
 };
 
+/// The pool's shape. The worker sets every field: the counts from its
+/// `RuntimeLimits`, the stack from `common/limits/worker.zig`.
 pub const Config = struct {
     /// Zero builds a disabled pool that accepts no job.
-    thread_count: usize = 0,
-    thread_stack_bytes: usize = default_thread_stack_bytes,
+    thread_count: usize,
+    /// Each thread's stack. glibc places static TLS, the thread descriptor
+    /// and the guard inside it and refuses a stack below
+    /// `PTHREAD_STACK_MIN`, which `std.Thread.spawn` would treat as
+    /// unreachable, so the value is the binary's measured constant
+    /// (`worker_limits.crypto_thread_stack_bytes`), never operator input; a
+    /// test passes half of it to pin the margin.
+    thread_stack_bytes: usize,
     /// Jobs one request may have from submission until the VM thread pops
     /// them.
-    max_in_flight_per_request: usize = default_max_in_flight_per_request,
+    max_in_flight_per_request: usize,
     /// The same bound across every request; it sizes each queue.
-    max_in_flight_per_worker: usize = default_max_in_flight_per_worker,
-
-    /// Returns a config with two threads whatever `allowed_cpus` is. Extra
-    /// crypto work waits in the bounded queue instead of starting threads that
-    /// would compete with request JavaScript.
-    pub fn withAutoThreads(allowed_cpus: usize) Config {
-        _ = allowed_cpus;
-        return .{
-            .thread_count = 2,
-        };
-    }
+    max_in_flight_per_worker: usize,
 };
 
 /// A handle to the pool. The state lives on the heap because the pool threads
@@ -358,15 +348,27 @@ const State = struct {
     }
 
     fn threadMain(self: *State) void {
+        // A new thread has filled no allocator cache yet.
+        var idle: IdleCache = .{ .released = true, .since_ns = 0 };
         while (true) {
-            var entry = self.takeRunnable() orelse return;
+            var entry = self.takeRunnable(&idle) orelse return;
+            const cpu_start_ns = threadCpuNs();
             bindings.runCryptoJob(entry.job);
+            entry.cpu_ns = jobCpuNs(cpu_start_ns, threadCpuNs());
             entry.completed_at_ns = os_process.monotonicNowNsOrZero();
+            idle = .{ .released = false, .since_ns = entry.completed_at_ns };
             self.complete(entry);
         }
     }
 
-    fn takeRunnable(self: *State) ?Entry {
+    /// Waits for a runnable job; null once the pool stops. A thread that ran
+    /// a job releases its allocator cache after `thread_cache_idle_release_ns`
+    /// with no job, once per idle stretch: `CryptoJob::run` fills that cache
+    /// through `fastMalloc`, and the worker's seccomp filter denies the
+    /// signals libpas would otherwise suspend an idle thread with, so its
+    /// scavenger would keep polling for the worker's life
+    /// (`common/limits/worker.zig`).
+    fn takeRunnable(self: *State, idle: *IdleCache) ?Entry {
         self.mutex.lock();
         defer self.mutex.unlock();
 
@@ -391,7 +393,26 @@ const State = struct {
                 return entry;
             }
 
-            self.condition.wait(&self.mutex);
+            if (idle.released) {
+                self.condition.wait(&self.mutex);
+                continue;
+            }
+            // The release time is fixed when the thread went idle, so wakes
+            // for other threads' jobs do not push it back.
+            const release_at_ns = idle.since_ns +| worker_limits.thread_cache_idle_release_ns;
+            const now_ns = os_process.monotonicNowNsOrZero();
+            if (now_ns >= release_at_ns) {
+                // Released without the pool's lock, which a submit must
+                // never wait behind.
+                self.mutex.unlock();
+                bindings.releaseThreadAllocatorCache();
+                self.mutex.lock();
+                idle.released = true;
+                continue;
+            }
+            self.condition.timedWait(&self.mutex, release_at_ns - now_ns) catch |err| switch (err) {
+                error.Timeout => {},
+            };
         }
     }
 
@@ -437,6 +458,13 @@ const State = struct {
     }
 };
 
+/// A pool thread's allocator cache between jobs: whether it was released
+/// since the thread's last job, and when that job finished.
+const IdleCache = struct {
+    released: bool,
+    since_ns: u64,
+};
+
 /// A fixed-capacity FIFO over a slice its owner allocates and frees.
 const EntryRing = struct {
     items: []Entry,
@@ -478,6 +506,20 @@ fn swapRemove(items: []Entry, len: *usize, index: usize) void {
     len.* -= 1;
     if (index != len.*)
         items[index] = items[len.*];
+}
+
+/// The calling thread's CPU time, null when the clock cannot be read.
+fn threadCpuNs() ?u64 {
+    const ts = std.posix.clock_gettime(std.posix.CLOCK.THREAD_CPUTIME_ID) catch return null;
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
+/// The CPU between two readings of one thread's clock; a reading that
+/// failed charges the job nothing rather than the thread's whole life.
+fn jobCpuNs(start_ns: ?u64, end_ns: ?u64) u64 {
+    const start = start_ns orelse return 0;
+    const end = end_ns orelse return 0;
+    return end -| start;
 }
 
 /// Wakes the VM thread's loop. A full eventfd counter means a wake is already

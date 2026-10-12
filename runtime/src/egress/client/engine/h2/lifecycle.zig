@@ -11,7 +11,6 @@ const std = @import("std");
 const bindings = @import("collo_bindings");
 const core = @import("collo_egress_core");
 const data_io = @import("collo_egress_data_io");
-const http2 = @import("collo_egress_http2");
 const pool_mod = @import("collo_egress_pool");
 
 const body_credit = core.body_credit;
@@ -179,15 +178,6 @@ pub fn Methods(comptime H2Pending: type) type {
                 );
                 _ = body.failNoAlloc();
             };
-        }
-
-        pub fn h2LimitsEqual(a: http2.Limits, b: http2.Limits) bool {
-            return a.max_active_streams == b.max_active_streams and
-                a.stream_receive_window == b.stream_receive_window and
-                a.connection_receive_window == b.connection_receive_window and
-                a.receive_window_update_threshold == b.receive_window_update_threshold and
-                a.max_pending_body_credit_per_stream == b.max_pending_body_credit_per_stream and
-                a.max_pending_body_credit_per_connection == b.max_pending_body_credit_per_connection;
         }
     };
 }

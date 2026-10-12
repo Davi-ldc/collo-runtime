@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const bench_metadata = @import("metadata.zig");
+const local_origin = @import("local_origin.zig");
 const egress_client = @import("collo_egress_client");
 
 const transport = egress_client.transport;
@@ -83,9 +84,10 @@ fn runSample(allocator: std.mem.Allocator, scenario: Scenario, requests: usize) 
     var pool = transport.Http1Pool.init(allocator);
     defer pool.deinit();
 
+    var grant: local_origin.LocalGrant = undefined;
+    try grant.init(origin.address, &.{origin.port});
     const config = transport.Config{
-        .allow_plain_http = true,
-        .allow_private_networks = true,
+        .network = grant.policy(),
         .max_response_body_bytes = 64 * 1024,
         .http1_pool_max_entries = 1,
         .http1_pool_max_requests_per_connection = if (scenario.keepAlive()) requests + 1 else 1,
@@ -207,11 +209,7 @@ fn dial(
 ) !transport.HttpConnection {
     var plan = try transport.prepareRequest(allocator, url, "GET", &.{}, config);
     defer plan.deinit();
-    const policy = transport.EgressPolicy{
-        .allow_plain_http = config.allow_plain_http,
-        .allow_private_networks = config.allow_private_networks,
-    };
-    var target = try policy.resolveRequestTargetUntil(
+    var target = try transport.resolveRequestTargetUntil(
         allocator,
         dns,
         plan.target,
@@ -269,7 +267,10 @@ fn bodyHoldsExactly(body_pipe: *fetch_body.Body, expected: []const u8) bool {
 
 const LocalHttp1Origin = struct {
     server: std.net.Server,
-    host_buffer: [64]u8,
+    /// The default route's source address, where the origin is dialed
+    /// (`local_origin.zig`).
+    address: [4]u8,
+    host_buffer: [15]u8,
     host_len: usize,
     port: u16,
     thread: std.Thread,
@@ -280,14 +281,16 @@ const LocalHttp1Origin = struct {
     stopping: std.atomic.Value(bool),
 
     fn start(allocator: std.mem.Allocator, scenario: Scenario, expected_requests: usize) !*LocalHttp1Origin {
-        var host_buffer: [64]u8 = undefined;
-        const host_len = try routableLocalIpv4(&host_buffer);
+        const routable = try local_origin.routableLocalIpv4();
+        var host_buffer: [15]u8 = undefined;
+        const host_len = local_origin.formatIpv4(routable, &host_buffer).len;
         var address = try std.net.Address.parseIp4("0.0.0.0", 0);
         var server = try address.listen(.{ .reuse_address = true });
         errdefer server.deinit();
         const origin = try allocator.create(LocalHttp1Origin);
         origin.* = .{
             .server = server,
+            .address = routable,
             .host_buffer = host_buffer,
             .host_len = host_len,
             .port = server.listen_address.getPort(),
@@ -367,34 +370,6 @@ fn readHttpRequest(stream: std.net.Stream, buffer: []u8) ![]const u8 {
             break;
     }
     return buffer[0..received_len];
-}
-
-// The egress policy denies loopback whatever allow_private_networks says, so
-// the client reaches the origin, which listens on every address, through the
-// default-route source address, as runtime/tests/support/net/local_address.zig
-// does for the tests. Connecting a UDP socket asks the kernel which source
-// address a routed connection would use and sends no packet.
-fn routableLocalIpv4(out: *[64]u8) !usize {
-    const remote = try std.net.Address.parseIp4("1.1.1.1", 9);
-    const socket = try std.posix.socket(
-        std.posix.AF.INET,
-        std.posix.SOCK.DGRAM | std.posix.SOCK.CLOEXEC,
-        0,
-    );
-    defer std.posix.close(socket);
-    try std.posix.connect(socket, &remote.any, remote.getOsSockLen());
-
-    var storage: std.posix.sockaddr.storage = undefined;
-    var storage_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
-    try std.posix.getsockname(socket, @ptrCast(&storage), &storage_len);
-    if (storage.family != std.posix.AF.INET)
-        return error.NoRoutableLocalIpv4;
-
-    const socket_address: *align(4) const std.posix.sockaddr = @ptrCast(&storage);
-    const address = std.net.Address.initPosix(socket_address);
-    const bytes = transport.ipv4Bytes(address);
-    const host = try std.fmt.bufPrint(out, "{d}.{d}.{d}.{d}", .{ bytes[0], bytes[1], bytes[2], bytes[3] });
-    return host.len;
 }
 
 const ProcessMemory = struct {

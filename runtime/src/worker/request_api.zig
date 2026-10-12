@@ -8,7 +8,8 @@
 //! `body_read.zig` serves the lazy body reads of the handler's `Request`.
 //! `completion.zig` queues a handler's settled result, and
 //! `response_model.zig` defines the response the serve side writes, with its
-//! bounds and checks. In `ingress/`, `runtime.zig` turns the host's
+//! bounds and checks. `response_stream.zig` holds the source a streamed
+//! response pulls from. In `ingress/`, `runtime.zig` turns the host's
 //! ingress-channel packets into live requests and `response_outbox.zig`
 //! keeps response bytes that wait for room in the payload region; `http2/`
 //! validates and plans the channel's descriptors.
@@ -25,6 +26,7 @@ pub const context = @import("request/context.zig");
 pub const head = @import("request/head.zig");
 pub const incoming_body_pipe = @import("request/incoming_body/pipe.zig");
 pub const response_model = @import("request/response_model.zig");
+pub const response_stream = @import("request/response_stream.zig");
 pub const task = @import("request/task.zig");
 
 pub const http2 = struct {

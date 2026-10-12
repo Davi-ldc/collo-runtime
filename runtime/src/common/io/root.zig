@@ -5,7 +5,8 @@
 //! `restricted_uring.zig` the worker's restricted ring plus the restriction
 //! helpers the other sandboxed rings use. Every instance belongs to one
 //! thread; the only process-wide state is `uring.zig`'s count of undecodable
-//! completions. The module links no libc.
+//! completions. The worker ring's checks read socket options through
+//! `collo_os.socket`, the module's only import that links libc.
 
 pub const heap = @import("heap.zig");
 pub const buffer = @import("buffer.zig");

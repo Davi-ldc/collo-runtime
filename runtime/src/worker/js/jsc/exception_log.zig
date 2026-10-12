@@ -1,7 +1,9 @@
 //! Logs the JavaScript exceptions the worker catches at its turn boundaries,
-//! for two readers. The tenant gets the full formatted exception, message and
-//! stack, through the sink its VM registered; the worker runtime publishes it
-//! to the log ring of the worker's shared page. The operator's `std.log` line
+//! and the lines the worker writes about a tenant's code, such as a returned
+//! Response it refused, for two readers. The tenant gets the full text, an
+//! exception's message and stack, through the sink its VM registered; the
+//! worker runtime publishes it to the log ring of the worker's shared page.
+//! The operator's `std.log` line
 //! carries only the text's length and a digest prefix, so tenant data in an
 //! exception message stays out of the operator's log, unless the worker was
 //! started with full exception logging. Runs in the worker on the VM thread.
@@ -110,6 +112,20 @@ pub fn logException(
     defer formatted.deinit();
     emitToSink(vm, request_id, formatted.slice());
     logFormatted(request_id, context, formatted.slice());
+}
+
+/// Sends `message`, a line the worker wrote about the tenant's code under
+/// `request_id`, such as the check a returned Response failed, to the sink
+/// registered for `vm` and logs it under `context`, as an exception's text
+/// is. Must run on `vm`'s thread.
+pub fn logMessage(
+    vm: *bindings.Vm,
+    request_id: u64,
+    context: []const u8,
+    message: []const u8,
+) void {
+    emitToSink(vm, request_id, message);
+    logFormatted(request_id, context, message);
 }
 
 /// Logs already formatted exception text to `std.log`: in full when

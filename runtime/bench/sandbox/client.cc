@@ -1,4 +1,7 @@
-// Persistent loopback client; transport setup and /__collo/healthz precede measured GETs.
+// The controller's HTTP/2 client over loopback TLS: one connection per trial, opened and checked with a
+// /__collo/healthz preflight, then sequential exchanges, each a GET or a POST whose body is generated from the
+// block pattern. A response body is checked byte for byte, against the caller's bytes or the pattern. Flow control
+// follows the peer's windows in both directions, and any frame the exchange cannot account for fails it.
 #include "client.h"
 #include <arpa/inet.h>
 #include <lshpack.h>
@@ -14,10 +17,20 @@
 #include <time.h>
 #include <unistd.h>
 
+static_assert(sizeof(ColloBenchExchange) == 40, "protocol.zig ClientExchange mirrors this layout");
+static_assert(sizeof(ColloBenchReply) == 32, "protocol.zig ClientReply mirrors this layout");
+
 namespace {
 constexpr size_t frameLimit = 16384;
-constexpr size_t bodyLimit = 1 << 20;
-constexpr unsigned frameCountLimit = 4096;
+// A body the caller spells out in full.
+constexpr uint64_t exactBodyLimit = 1 << 20;
+// A patterned response or request body.
+constexpr uint64_t patternedBodyLimit = 64ULL << 20;
+// The preflight's body is bounded, not compared.
+constexpr uint64_t uncheckedBodyLimit = 4096;
+// Frames an exchange may read besides one per KiB of its bodies: settings, pings, window updates and headers. A peer
+// that sends more never ends the exchange, so it fails instead.
+constexpr uint64_t frameCountBase = 4096;
 
 uint64_t monotonicNs()
 {
@@ -48,21 +61,46 @@ void frameHeader(uint8_t* bytes, size_t length, uint8_t type, uint8_t flags, uin
     write32(bytes + 5, stream);
 }
 
+uint8_t patternByte(uint64_t offset, uint32_t blockBytes) { return static_cast<uint8_t>(offset / blockBytes); }
+
+// An HPACK integer (RFC 7541, section 5.1) with a prefix of `prefixBits` bits; `first` holds the bits above it.
+uint8_t* hpackInteger(uint8_t* out, uint8_t first, unsigned prefixBits, uint64_t value)
+{
+    uint64_t prefixMax = (uint64_t(1) << prefixBits) - 1;
+    if (value < prefixMax) {
+        *out++ = static_cast<uint8_t>(first | value);
+        return out;
+    }
+    *out++ = static_cast<uint8_t>(first | prefixMax);
+    value -= prefixMax;
+    while (value >= 128) {
+        *out++ = static_cast<uint8_t>((value & 127) | 128);
+        value >>= 7;
+    }
+    *out++ = static_cast<uint8_t>(value);
+    return out;
+}
+
+// A literal field without indexing whose name is static table entry `nameIndex`, with a raw value.
 uint8_t* literal(uint8_t* out, uint8_t nameIndex, const char* value, size_t length)
 {
-    *out++ = nameIndex;
-    size_t remaining = length;
-    *out++ = static_cast<uint8_t>(remaining < 127 ? remaining : 127);
-    if (remaining >= 127) {
-        remaining -= 127;
-        while (remaining >= 128) {
-            *out++ = static_cast<uint8_t>((remaining & 127) | 128);
-            remaining >>= 7;
-        }
-        *out++ = static_cast<uint8_t>(remaining);
-    }
+    out = hpackInteger(out, 0, 4, nameIndex);
+    out = hpackInteger(out, 0, 7, length);
     memcpy(out, value, length);
     return out + length;
+}
+
+size_t decimal(char* out, uint64_t value)
+{
+    char reversed[20];
+    size_t count = 0;
+    do {
+        reversed[count++] = static_cast<char>('0' + value % 10);
+        value /= 10;
+    } while (value);
+    for (size_t i = 0; i < count; ++i)
+        out[i] = reversed[count - 1 - i];
+    return count;
 }
 
 // MSG_NOSIGNAL keeps peer disconnects local without changing process signal policy.
@@ -77,6 +115,37 @@ int socketRead(BIO* bio, char* bytes, int length)
 }
 
 long socketControl(BIO*, int command, long, void*) { return command == BIO_CTRL_FLUSH ? 1 : 0; }
+
+// The response body an exchange accepts.
+struct Expected {
+    enum class Kind { unchecked, exact, patterned };
+    Kind kind;
+    const uint8_t* bytes;
+    // The exact length, or the bound of an unchecked body.
+    uint64_t length;
+    uint32_t blockBytes;
+
+    bool accepts(uint64_t offset, const uint8_t* body, size_t count) const
+    {
+        if (count > length - offset)
+            return false;
+        switch (kind) {
+        case Kind::unchecked:
+            return true;
+        case Kind::exact:
+            return !memcmp(bytes + offset, body, count);
+        case Kind::patterned:
+            for (size_t i = 0; i < count; ++i) {
+                if (body[i] != patternByte(offset + i, blockBytes))
+                    return false;
+            }
+            return true;
+        }
+        return false;
+    }
+
+    bool complete(uint64_t received) const { return kind == Kind::unchecked || received == length; }
+};
 }
 
 struct ColloBenchClient {
@@ -88,6 +157,7 @@ struct ColloBenchClient {
     char authority[256] {};
     uint8_t payload[frameLimit];
     uint8_t block[32768];
+    uint8_t outgoing[9 + frameLimit];
     uint32_t nextStream { 1 };
     uint32_t connectionWindow { 65535 };
     uint32_t streamWindow { 65535 };
@@ -229,33 +299,48 @@ struct ColloBenchClient {
         }
         return cursor == end && (trailers || status);
     }
-    bool get(const char* path, const char* expected, ColloBenchReply& reply)
+    // Sends the request body as DATA frames within the peer's windows. While both are open no frame is read; once
+    // either is exhausted, frames are read until credit arrives, and a response or reset before the body ends fails.
+    bool sendBody(uint32_t stream, uint64_t length, uint32_t blockBytes, uint64_t& frameBudget)
     {
-        size_t pathLength = strnlen(path, 2049);
-        size_t expectedLength = expected ? strnlen(expected, bodyLimit + 1) : 0;
-        if (!ssl || !pathLength || path[0] != '/' || pathLength > 2048 || expectedLength > bodyLimit
-            || nextStream > 0x7fffffff)
-            return false;
-        uint8_t request[4096];
-        uint8_t* end = request + 9;
-        *end++ = 0x82; // Indexed GET and https from the HPACK static table.
-        *end++ = 0x87;
-        end = literal(end, 1, authority, strlen(authority));
-        end = literal(end, 4, path, pathLength);
-        reply.stream_id = nextStream;
-        nextStream += 2;
-        streamWindow = initialWindow;
-        frameHeader(request, end - request - 9, 1, 5, reply.stream_id);
+        uint64_t sent = 0;
+        while (sent < length) {
+            uint32_t window = connectionWindow < streamWindow ? connectionWindow : streamWindow;
+            if (!window) {
+                if (!frameBudget)
+                    return false;
+                --frameBudget;
+                Frame frame;
+                if (!readFrame(frame) || frame.type == 0 || frame.type == 1 || frame.type == 9 || !control(frame))
+                    return false;
+                continue;
+            }
+            uint64_t chunk = length - sent;
+            if (chunk > window)
+                chunk = window;
+            if (chunk > frameLimit)
+                chunk = frameLimit;
+            for (uint64_t i = 0; i < chunk; ++i)
+                outgoing[9 + i] = patternByte(sent + i, blockBytes);
+            bool last = sent + chunk == length;
+            frameHeader(outgoing, chunk, 0, last ? 1 : 0, stream);
+            if (!write(outgoing, 9 + chunk))
+                return false;
+            connectionWindow -= static_cast<uint32_t>(chunk);
+            streamWindow -= static_cast<uint32_t>(chunk);
+            sent += chunk;
+        }
+        return true;
+    }
+    bool receive(const Expected& expected, uint64_t& frameBudget, ColloBenchReply& reply)
+    {
         size_t blockLength = 0;
+        uint64_t received = 0;
         bool headers = false;
         bool continuation = false;
         bool endStream = false;
-        ERR_clear_error();
-        // The entire HEADERS frame is encoded before this first transport write.
-        reply.sent_ns = monotonicNs();
-        if (!reply.sent_ns || SSL_write(ssl.get(), request, static_cast<int>(end - request)) != end - request)
-            return false;
-        for (unsigned count = 0; count < frameCountLimit; ++count) {
+        while (frameBudget) {
+            --frameBudget;
             Frame frame;
             if (!readFrame(frame))
                 return false;
@@ -280,10 +365,9 @@ struct ColloBenchClient {
                 }
                 size_t length = finish - begin;
                 if (frame.type == 0) {
-                    if (!headers || length > (expected ? expectedLength : 4096) - reply.body_len
-                        || (expected && memcmp(expected + reply.body_len, payload + begin, length)))
+                    if (!headers || !expected.accepts(received, payload + begin, length))
                         return false;
-                    reply.body_len += static_cast<uint32_t>(length);
+                    received += length;
                     done = frame.flags & 1;
                     if (done)
                         reply.response_ns = monotonicNs();
@@ -317,21 +401,56 @@ struct ColloBenchClient {
             } else if (!control(frame))
                 return false;
             if (done) {
+                if (received > UINT32_MAX)
+                    return false;
                 reply.status = 200;
+                reply.body_len = static_cast<uint32_t>(received);
                 return headers && reply.response_ns >= reply.sent_ns && reply.response_ns
-                    && (!expected || reply.body_len == expectedLength);
+                    && expected.complete(received);
             }
         }
         return false;
     }
+    bool exchange(const char* path, uint64_t uploadLength, uint32_t blockBytes, const Expected& expected,
+        ColloBenchReply& reply)
+    {
+        size_t pathLength = strnlen(path, 2049);
+        if (!ssl || !pathLength || path[0] != '/' || pathLength > 2048 || nextStream > 0x7fffffff
+            || uploadLength > patternedBodyLimit || (uploadLength && !blockBytes))
+            return false;
+        uint8_t request[4096];
+        uint8_t* end = request + 9;
+        *end++ = uploadLength ? 0x83 : 0x82; // Indexed :method POST or GET from the HPACK static table.
+        *end++ = 0x87; // Indexed :scheme https.
+        end = literal(end, 1, authority, strlen(authority));
+        end = literal(end, 4, path, pathLength);
+        if (uploadLength) {
+            char digits[20];
+            end = literal(end, 28, digits, decimal(digits, uploadLength)); // content-length
+        }
+        reply.stream_id = nextStream;
+        nextStream += 2;
+        streamWindow = initialWindow;
+        // END_HEADERS, and END_STREAM only when no body follows.
+        frameHeader(request, end - request - 9, 1, uploadLength ? 4 : 5, reply.stream_id);
+        uint64_t frameBudget = frameCountBase + (uploadLength + expected.length) / 1024;
+        ERR_clear_error();
+        // The entire HEADERS frame is encoded before this first transport write.
+        reply.sent_ns = monotonicNs();
+        if (!reply.sent_ns || !write(request, end - request))
+            return false;
+        if (uploadLength && !sendBody(reply.stream_id, uploadLength, blockBytes, frameBudget))
+            return false;
+        return receive(expected, frameBudget, reply);
+    }
 };
 
-extern "C" int collo_bench_client_open(uint16_t port, const char* hostname, ColloBenchClient** out)
+extern "C" int collo_bench_client_open(uint16_t port, const char* hostname, uint32_t timeout_ms, ColloBenchClient** out)
 {
     if (!out)
         return -1;
     *out = nullptr;
-    if (!port || !hostname || !hostname[0] || strnlen(hostname, 256) >= 256)
+    if (!port || !hostname || !hostname[0] || strnlen(hostname, 256) >= 256 || !timeout_ms)
         return -1;
     ERR_clear_error();
     std::unique_ptr<ColloBenchClient> client(new (std::nothrow) ColloBenchClient);
@@ -339,7 +458,7 @@ extern "C" int collo_bench_client_open(uint16_t port, const char* hostname, Coll
         return -1;
     strcpy(client->authority, hostname);
     client->fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    timeval timeout { 10, 0 };
+    timeval timeout { static_cast<time_t>(timeout_ms / 1000), static_cast<suseconds_t>(timeout_ms % 1000 * 1000) };
     int noDelay = 1;
     if (client->fd < 0 || setsockopt(client->fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout))
         || setsockopt(client->fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout))
@@ -387,21 +506,34 @@ extern "C" int collo_bench_client_open(uint16_t port, const char* hostname, Coll
             return -1;
     }
     ColloBenchReply health {};
-    if (!client->peerSettings || !client->settingsAck || !client->get("/__collo/healthz", nullptr, health))
+    const Expected unchecked { Expected::Kind::unchecked, nullptr, uncheckedBodyLimit, 0 };
+    if (!client->peerSettings || !client->settingsAck || !client->exchange("/__collo/healthz", 0, 0, unchecked, health))
         return -1;
     *out = client.release();
     return 0;
 }
 
-extern "C" int collo_bench_client_get(
-    ColloBenchClient* client, const char* path, const char* expected, ColloBenchReply* out)
+extern "C" int collo_bench_client_exchange(
+    ColloBenchClient* client, const ColloBenchExchange* request, ColloBenchReply* out)
 {
     if (out)
         *out = {};
     if (!client)
         return -1;
     ColloBenchReply reply {};
-    if (!out || !path || !expected || !client->get(path, expected, reply)) {
+    bool valid = out && request && request->path && !request->reserved;
+    if (valid) {
+        Expected expected { Expected::Kind::exact, request->expected_body, request->expected_body_len,
+            request->pattern_block_bytes };
+        if (!request->expected_body) {
+            expected.kind = Expected::Kind::patterned;
+            valid = request->pattern_block_bytes && request->expected_body_len <= patternedBodyLimit;
+        } else
+            valid = request->expected_body_len <= exactBodyLimit;
+        valid = valid
+            && client->exchange(request->path, request->request_body_len, request->pattern_block_bytes, expected, reply);
+    }
+    if (!valid) {
         client->disconnect();
         return -1;
     }

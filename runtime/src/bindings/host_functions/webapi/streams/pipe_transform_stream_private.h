@@ -2,10 +2,9 @@
 // cells. They run on the VM thread; their visitChildren, in
 // pipe_transform_stream_objects.cpp, runs on collector threads at the same time.
 //
-// The cells reference each other, the transformer and its methods only through
-// WriteBarrier fields. A transform stream owns the ColloPromiseDeferred of its
-// one parked write until that write settles or the destructor releases it. A
-// pipe state holds the locks on its source and destination until it settles.
+// The cells reference each other, the transformer, its methods and the promises
+// they will settle only through WriteBarrier fields. A pipe state holds the
+// locks on its source and destination until it settles.
 #pragma once
 
 #include "host_functions/webapi/streams/readable_stream_private.h"
@@ -29,13 +28,17 @@ JSC_DECLARE_HOST_FUNCTION(transformControllerDesiredSize);
 JSColloTransformStream* requireTransformStream(JSC::JSGlobalObject*, JSC::ThrowScope&, JSValue);
 JSColloTransformStreamDefaultController* requireTransformStreamDefaultController(
     JSC::JSGlobalObject*, JSC::ThrowScope&, JSValue);
-// Locks both streams and starts ReadableStreamPipeTo, returning its promise. A
-// locked stream yields a promise rejected with a TypeError. Invalid options
-// become a rejected promise when reject_option_errors is set, as Web IDL does
-// for the promise-returning pipeTo, and a thrown exception otherwise, as
-// pipeThrough needs.
+// How startReadablePipeTo reports invalid options and a locked stream: as a
+// rejected promise, as Web IDL and the standard do for pipeTo, or as a thrown
+// exception, as pipeThrough does.
+enum class PipeToErrors : uint8_t {
+    Reject,
+    Throw,
+};
+// Converts the options, then locks both streams and starts ReadableStreamPipeTo,
+// returning its promise.
 EncodedJSValue startReadablePipeTo(JSC::JSGlobalObject*, JSC::ThrowScope&, JSColloReadableStream*,
-    JSColloWritableStream*, JSValue, bool reject_option_errors);
+    JSColloWritableStream*, JSValue options, PipeToErrors);
 
 class JSColloTransformStreamDefaultController final : public JSC::JSDestructibleObject {
     using Base = JSC::JSDestructibleObject;
@@ -151,10 +154,13 @@ public:
     bool backpressure() const { return m_backpressure; }
     void setBackpressure(bool value) { m_backpressure = value; }
     EncodedJSValue performTransform(JSC::JSGlobalObject*, JSC::ThrowScope&, JSValue chunk);
+    // Parks a write while backpressure is set and returns the promise the
+    // writable side waits on, which readablePulled settles.
     EncodedJSValue deferWrite(JSC::JSGlobalObject*, JSC::ThrowScope&, JSValue chunk);
     void readablePulled(JSC::JSGlobalObject*);
     void errorWritableAndUnblockWrite(JSC::JSGlobalObject*, JSValue reason);
-    void rejectPendingWrite(JSC::JSGlobalObject*, JSValue reason);
+    // Returns false when a termination is pending.
+    bool rejectPendingWrite(JSC::JSGlobalObject*, JSValue reason);
 
 private:
     JSColloTransformStream(JSC::VM& vm, JSC::Structure* structure)
@@ -162,7 +168,7 @@ private:
     {
     }
 
-    ~JSColloTransformStream();
+    ~JSColloTransformStream() = default;
 
     void finishCreation(JSC::VM& vm)
     {
@@ -178,11 +184,10 @@ private:
     JSC::WriteBarrier<JSC::Unknown> m_transform;
     JSC::WriteBarrier<JSC::Unknown> m_flush;
     JSC::WriteBarrier<JSC::Unknown> m_cancel;
+    // The parked write: its chunk, and the promise the writable side waits on,
+    // empty while no write is parked.
     JSC::WriteBarrier<JSC::Unknown> m_pending_write_chunk;
-    JSC::WriteBarrier<JSC::Unknown> m_pending_write_promise;
-    // Can keep this cell alive until VM teardown: see the FIXME in stream_common_private.h.
-    ColloPromiseDeferred* m_pending_write_deferred { nullptr };
-    bool m_has_pending_write { false };
+    JSC::WriteBarrier<JSC::JSPromise> m_pending_write_promise;
     bool m_backpressure { false };
 };
 
@@ -209,8 +214,8 @@ public:
     DECLARE_INFO;
     DECLARE_VISIT_CHILDREN;
 
-    bool finishCreation(JSC::VM&, JSC::JSGlobalObject*, JSC::ThrowScope&, JSColloReadableStream*,
-        JSColloWritableStream*, JSColloReadableStreamDefaultReader*, JSColloWritableStreamDefaultWriter*);
+    void finishCreation(JSC::VM&, JSC::JSGlobalObject*, JSColloReadableStream*, JSColloWritableStream*,
+        JSColloReadableStreamDefaultReader*, JSColloWritableStreamDefaultWriter*);
     JSValue promise() const { return m_promise.get(); }
     void setOptions(bool prevent_close, bool prevent_abort, bool prevent_cancel)
     {
@@ -247,7 +252,7 @@ private:
     void cleanupLocks(JSC::JSGlobalObject*);
     void detachSignal();
     void clearPromiseOwner(JSC::JSGlobalObject*);
-    void settlePromise(JSC::JSGlobalObject*, JSValue value, bool is_rejection);
+    void settlePipePromise(JSC::JSGlobalObject*, JSValue value, bool is_rejection);
     void shutdownAndSettle(
         JSC::JSGlobalObject*, JSValue reason, bool is_rejection, bool abort_destination, bool cancel_source);
     void performShutdownActions(
@@ -262,9 +267,8 @@ private:
     JSC::WriteBarrier<JSColloWritableStream> m_destination;
     JSC::WriteBarrier<JSColloReadableStreamDefaultReader> m_reader;
     JSC::WriteBarrier<JSColloWritableStreamDefaultWriter> m_writer;
-    JSC::WriteBarrier<JSC::Unknown> m_promise;
-    JSC::WriteBarrier<JSC::Unknown> m_resolve;
-    JSC::WriteBarrier<JSC::Unknown> m_reject;
+    // The promise pipeTo returned, empty once the pipe settles.
+    JSC::WriteBarrier<JSC::JSPromise> m_promise;
     JSC::WriteBarrier<JSC::Unknown> m_signal;
     JSC::WriteBarrier<JSC::JSFunction> m_read_fulfilled;
     JSC::WriteBarrier<JSC::JSFunction> m_read_rejected;

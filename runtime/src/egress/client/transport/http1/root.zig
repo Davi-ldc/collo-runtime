@@ -136,7 +136,7 @@ pub const Http1Pool = struct {
                 .port = plan.target.port,
                 .protocol = plan.target.protocol,
                 .insecure_tls = config.insecure_tls,
-                .allow_private_networks = config.allow_private_networks,
+                .allow_private_networks = plan.target.admission.allow_private_networks,
                 .socket_timeout_ms = config.socket_timeout_ms,
                 .pool_security_cell_id = config.pool_security_cell_id,
                 .pool_policy_id = config.pool_policy_id,
@@ -152,7 +152,7 @@ pub const Http1Pool = struct {
             return self.port == plan.target.port and
                 self.protocol == plan.target.protocol and
                 self.insecure_tls == config.insecure_tls and
-                self.allow_private_networks == config.allow_private_networks and
+                self.allow_private_networks == plan.target.admission.allow_private_networks and
                 self.socket_timeout_ms == config.socket_timeout_ms and
                 std.mem.eql(u8, &self.pool_security_cell_id, &config.pool_security_cell_id) and
                 std.mem.eql(u8, &self.pool_policy_id, &config.pool_policy_id) and

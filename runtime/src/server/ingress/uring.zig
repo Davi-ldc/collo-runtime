@@ -9,8 +9,9 @@
 //!   handler can try the accept decode first.
 //! - Arming an inactive registration takes a new generation. A completion
 //!   whose generation is not the current one, or that arrives while the
-//!   registration is not active, only counts as stale; the lane closes any
-//!   socket it carries.
+//!   registration is not active, only counts as stale here and changes no
+//!   state; a socket it carries is a client the kernel accepted, which the
+//!   lane serves (`runner/accept_flow.zig`).
 //! - EMFILE or ENFILE on a terminal completion parks the registration in
 //!   backoff instead of re-arming at once, since a re-arm would fail again
 //!   while the descriptor table stays full.

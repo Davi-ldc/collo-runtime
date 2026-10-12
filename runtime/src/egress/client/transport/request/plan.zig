@@ -1,5 +1,7 @@
 //! Request plan shared by the HTTP/1 and HTTP/2 egress paths: the target
-//! parsed under the egress policy, the canonical method, validated headers
+//! parsed and admitted under the fetch's network policy, which makes this
+//! the one place every hop's target is decided, the canonical method,
+//! validated headers
 //! with a default accept-encoding, the origin-form request target and the
 //! authority, which omits a port equal to the scheme's default.
 //!
@@ -20,7 +22,6 @@ const http2 = @import("collo_egress_http2");
 
 const decompress = core.decompress;
 const Config = config_mod.Config;
-const EgressPolicy = policy_mod.EgressPolicy;
 const Header = headers_mod.Header;
 const ParsedHeaders = headers_mod.ParsedHeaders;
 const RequestTarget = policy_mod.RequestTarget;
@@ -67,11 +68,7 @@ pub fn prepareRequest(
     headers: []const Header,
     config: Config,
 ) !RequestPlan {
-    const policy = EgressPolicy{
-        .allow_plain_http = config.allow_plain_http,
-        .allow_private_networks = config.allow_private_networks,
-    };
-    const target = try policy.parseTarget(url);
+    const target = try policy_mod.parseTarget(config.network, url);
 
     const method = try canonicalHttpMethod(method_text);
     var parsed_headers = try parseFetchHeaders(allocator, headers);
@@ -159,7 +156,7 @@ fn ensureDefaultAcceptEncoding(allocator: std.mem.Allocator, parsed_headers: *Pa
     }
     const header = try cloneHeader(allocator, .{
         .name = "accept-encoding",
-        .value = decompress.defaultAcceptEncoding(),
+        .value = decompress.default_accept_encoding,
     });
     parsed_headers.headers.append(allocator, header) catch |err| {
         allocator.free(header.name);

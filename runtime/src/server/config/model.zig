@@ -10,13 +10,15 @@
 //! thread need no lock.
 //!
 //! Every value here is final: defaults are filled in, relative paths are
-//! absolute (resolved against the configuration file's directory), and a
+//! absolute (resolved against the configuration file's directory), a
 //! definition's `settings` already merge the global defaults with its own
-//! overrides. A configured limit is enforced by the runtime; a limit with no
-//! enforcing mechanism is rejected by the parser and has no field here.
+//! overrides, and a route's `network` is already the value it runs under.
+//! A configured limit is enforced by the runtime; a limit with no enforcing
+//! mechanism is rejected by the parser and has no field here.
 
 const std = @import("std");
 const server_limits = @import("collo_limits").server;
+const collo_network = @import("collo_network");
 
 pub const Config = struct {
     arena: *std.heap.ArenaAllocator,
@@ -82,7 +84,19 @@ pub const Settings = struct {
     /// state, not trust: a worker's routes share its process and its limits.
     isolate_realm: bool,
     limits: Limits,
+    /// The outbound access a route's `fetch()` has, or null for none. Unlike
+    /// the fields above, which merge key by key, a level that names
+    /// `network` replaces the inherited value whole: allow lists never
+    /// merge, so a level grants exactly what it lists. A route reads its own
+    /// effective value from `Route.network`, never from here.
+    network: ?Network,
 };
+
+/// One `network` value: its allow entries in canonical form, in
+/// configuration order, and its two flags. Names point into the `Config`
+/// arena. An empty list with neither flag grants nothing, which is how a
+/// level drops the value it would inherit.
+pub const Network = collo_network.Setting;
 
 pub const Limits = struct {
     /// Memory limit of one worker process, shared by its routes.
@@ -94,6 +108,12 @@ pub const Limits = struct {
     /// server admits it: time spent waiting for a worker or for a cold start
     /// counts against it, and the handler gets what remains.
     timeout_ms: u32,
+    /// CPU budget of one request, from 1 to `request_cpu_ms_max`, or null
+    /// for none: the worker's VM thread while the request owns it plus the
+    /// crypto pool's CPU for the request's jobs. It is independent of
+    /// `timeout_ms` and the first limit reached ends the request; since
+    /// crypto jobs run beside the VM thread, it may exceed the deadline.
+    cpu_ms: ?u32,
 
     pub fn memoryBytes(self: Limits) u64 {
         return @as(u64, self.memory_mib) * 1024 * 1024;
@@ -101,6 +121,13 @@ pub const Limits = struct {
 
     pub fn timeoutNs(self: Limits) u64 {
         return @as(u64, self.timeout_ms) * std.time.ns_per_ms;
+    }
+
+    /// The CPU budget in nanoseconds, 0 for none, as `WorkerInit` carries
+    /// it.
+    pub fn cpuBudgetNs(self: Limits) u64 {
+        const cpu_ms = self.cpu_ms orelse return 0;
+        return @as(u64, cpu_ms) * std.time.ns_per_ms;
     }
 };
 
@@ -121,6 +148,11 @@ pub const Route = struct {
     entry_path: []const u8,
     /// Names are unique within the route, in file order.
     bindings: []const Binding,
+    /// The value the route's requests fetch under: the route's own when it
+    /// names `network`, else its definition's `settings.network`, which
+    /// already holds the global value when the definition names none. Null
+    /// or an empty list grants nothing.
+    network: ?Network,
 };
 
 pub const Binding = struct {
@@ -147,13 +179,17 @@ pub const RouteKey = struct {
 
 pub const default_listen = "127.0.0.1:8443";
 
+/// The defaults of a configuration file. A file that names no `network`
+/// grants no route any outbound access.
 pub const default_settings: Settings = .{
     .isolate_realm = true,
     .limits = .{
         .memory_mib = 128,
         .concurrency = 2,
         .timeout_ms = 30_000,
+        .cpu_ms = null,
     },
+    .network = null,
 };
 
 comptime {
@@ -162,6 +198,7 @@ comptime {
     std.debug.assert(server_limits.routes_max <= std.math.maxInt(u16));
     std.debug.assert(default_settings.limits.memory_mib >= server_limits.worker_memory_mib_min);
     std.debug.assert(default_settings.limits.memory_mib <= server_limits.worker_memory_mib_max);
+    std.debug.assert(default_settings.limits.concurrency >= 1);
     std.debug.assert(default_settings.limits.concurrency <= server_limits.worker_concurrency_max);
     std.debug.assert(default_settings.limits.timeout_ms <= server_limits.request_timeout_ms_max);
 }

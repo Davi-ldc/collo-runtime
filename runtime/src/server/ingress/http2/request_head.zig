@@ -11,13 +11,15 @@
 //! request headers, derived from what a dispatch carries
 //! (`ipc.max_request_header_count`): the HPACK decoder refuses a longer list
 //! and `parse` refuses one too, so the fields a worker receives always fit.
+//!
+//! A field is connection-specific by `http.headers.isConnectionSpecificField`
+//! as a request carries it, so `te` passes only as `trailers`.
 
 const std = @import("std");
 
 const hpack = @import("collo_hpack");
 const http = @import("collo_http");
 const ipc = @import("collo_ipc");
-const limits = @import("collo_limits");
 
 /// The pseudo-header fields of a request head `parse` accepts (RFC 9113
 /// §8.3.1): `:method`, `:scheme`, `:authority` and `:path`, each once.
@@ -59,12 +61,21 @@ pub const ParsedHead = struct {
     authority_len: usize,
     headers: []const hpack.Header,
     body_framing: ipc.RequestBodyFraming,
+    /// The declared `content-length`, which `parse` leaves unbounded: the
+    /// lane answers one over `limits.http_body.MATERIALIZED_BODY_BYTES_MAX`
+    /// with 413 once it matched the route (`runner/admission.zig`), so the
+    /// answer's record names the route.
     content_length: ?usize,
     end_stream: bool,
     /// The client announced a body and waits for 100 (Continue) before it
     /// sends it: an `expect: 100-continue` field, a head without END_STREAM
     /// and no content-length of 0. The field still reaches the worker.
     expects_continue: bool,
+    /// When the head arrived: the lane's CLOCK_MONOTONIC at the socket read
+    /// that completed its block (`reading.readAndProcess`). The request's
+    /// deadline, its wait for a cold start and its access record's duration
+    /// count from it, so the lane's own decode time is inside them.
+    received_ns: u64,
 
     /// The request's normalized authority, which the worker receives as the
     /// dispatch's `authority` and as its `host` header. Borrows the head.
@@ -75,15 +86,14 @@ pub const ParsedHead = struct {
 
 /// Checks a decoded request head as RFC 9113 §8.3 requires, splits `:path`
 /// into path and query, and normalizes the authority. `end_stream` is the
-/// END_STREAM flag of the frame that opened the header block. The result
-/// borrows `headers`, except for the authority, which it holds. Every
-/// error rejects the request: `error.TooManyRequestHeaders` means more than
-/// `max_header_count` fields, which the caller answers with 431,
-/// `error.RequestTooLarge` a declared content-length above
-/// `limits.http_body.MATERIALIZED_BODY_BYTES_MAX`, answered with 413, and
-/// every other one a malformed request, answered with RST_STREAM
-/// PROTOCOL_ERROR.
-pub fn parse(headers: []const hpack.Header, end_stream: bool) !ParsedHead {
+/// END_STREAM flag of the frame that opened the header block, and
+/// `received_ns` when the head arrived (`ParsedHead.received_ns`). The
+/// result borrows `headers`, except for the authority, which it holds.
+/// Every error rejects the request: `error.TooManyRequestHeaders` means more
+/// than `max_header_count` fields, which the lane answers with 431, and
+/// every other one a malformed request, answered with 400
+/// (`RefusedHead.Reason`).
+pub fn parse(headers: []const hpack.Header, end_stream: bool, received_ns: u64) !ParsedHead {
     if (headers.len > max_header_count)
         return error.TooManyRequestHeaders;
     var method: ?[]const u8 = null;
@@ -169,7 +179,6 @@ pub fn parse(headers: []const hpack.Header, end_stream: bool) !ParsedHead {
     else
         .ingress_channel;
     if (content_length) |length| {
-        try http.framing.validateContentLength(length, limits.http_body.MATERIALIZED_BODY_BYTES_MAX);
         if (end_stream and length != 0)
             return error.Http2ContentLengthMismatch;
     }
@@ -185,8 +194,61 @@ pub fn parse(headers: []const hpack.Header, end_stream: bool) !ParsedHead {
         .content_length = content_length,
         .end_stream = end_stream,
         .expects_continue = continue_expected and !end_stream and (content_length orelse 1) != 0,
+        .received_ns = received_ns,
     };
 }
+
+/// A request head the HTTP/2 layer refused before the lane saw it
+/// (`reading.processRequestHead`), as the lane's `refuseH2Stream` takes it
+/// to answer the stream and record the answer. The strings borrow the
+/// decoded block for the call and are the client's unchecked bytes, "" when
+/// the block kept no field.
+pub const RefusedHead = struct {
+    reason: Reason,
+    /// The END_STREAM flag of the frame that opened the head's block.
+    request_ended: bool,
+    /// When the head arrived, as `ParsedHead.received_ns` says.
+    received_ns: u64,
+    method: []const u8 = "",
+    /// The `:path` field's target before any query.
+    path: []const u8 = "",
+    user_agent: []const u8 = "",
+
+    pub const Reason = enum {
+        /// More fields or bytes than a head may hold: 431.
+        fields_too_large,
+        /// A block that decoded into a head RFC 9113 §8.3 calls malformed:
+        /// 400.
+        malformed,
+    };
+
+    /// The refusal of the head decoded as `headers`, with the first
+    /// `:method`, `:path` and `user-agent` it carried, for the record.
+    pub fn of(headers: []const hpack.Header, reason: Reason, request_ended: bool, received_ns: u64) RefusedHead {
+        var refused: RefusedHead = .{
+            .reason = reason,
+            .request_ended = request_ended,
+            .received_ns = received_ns,
+        };
+        var method_seen = false;
+        var path_seen = false;
+        var user_agent_seen = false;
+        for (headers) |header| {
+            if (!method_seen and std.mem.eql(u8, header.name, ":method")) {
+                refused.method = header.value;
+                method_seen = true;
+            } else if (!path_seen and std.mem.eql(u8, header.name, ":path")) {
+                const question_mark = std.mem.indexOfScalar(u8, header.value, '?');
+                refused.path = if (question_mark) |index| header.value[0..index] else header.value;
+                path_seen = true;
+            } else if (!user_agent_seen and std.mem.eql(u8, header.name, "user-agent")) {
+                refused.user_agent = header.value;
+                user_agent_seen = true;
+            }
+        }
+        return refused;
+    }
+};
 
 /// Whether an `expect` value is the 100-continue expectation. A field value
 /// may keep the whitespace around it (`http.headers.validateValue`).
@@ -231,7 +293,7 @@ fn validateH2HeaderName(name: []const u8) !void {
 }
 
 fn validateH2RegularHeader(header: hpack.Header) !void {
-    if (http.headers.isConnectionSpecificName(header.name))
+    if (http.headers.isConnectionSpecificField(header.name, header.value, .request))
         return error.Http2ConnectionSpecificHeader;
     try http.headers.validateValue(header.value);
 }

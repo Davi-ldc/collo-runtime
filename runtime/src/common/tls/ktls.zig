@@ -3,24 +3,16 @@
 //! KeyUpdate. Once keys are installed the kernel encrypts and decrypts on the
 //! socket, so application data moves with plain reads and writes, and only
 //! control records need the helpers here. Nothing here keeps global state; a
-//! socket and its `RekeyState` belong to one thread at a time.
+//! socket and its `RekeyState` belong to one thread at a time. The socket
+//! options themselves (the ULP and each direction's key) go through
+//! `collo_os.socket`, the one place production code sets or reads one.
 
 const std = @import("std");
 const cmsg = @import("collo_os").cmsg;
+const socket = @import("collo_os").socket;
 
-const linux = std.os.linux;
-
-pub const Direction = enum {
-    rx,
-    tx,
-
-    fn optname(self: Direction) u32 {
-        return switch (self) {
-            .rx => tls_rx,
-            .tx => tls_tx,
-        };
-    }
-};
+/// The direction a key serves, as the kernel names it (TLS_RX, TLS_TX).
+pub const Direction = socket.TlsDirection;
 
 pub const RecordType = enum(u8) {
     change_cipher_spec = 20,
@@ -167,10 +159,10 @@ pub const InitialState = struct {
 /// it again.
 pub fn enableKernelRxTx(fd: std.posix.fd_t, info: CryptoInfo) !void {
     if (std.debug.runtime_safety)
-        std.debug.assert(!tlsUlpAlreadyAttached(fd));
-    try attachTlsUlp(fd);
-    try setKernelCryptoInfo(fd, tls_rx, info.rx);
-    try setKernelCryptoInfo(fd, tls_tx, info.tx);
+        std.debug.assert(!socket.tlsUlpAttached(fd));
+    try socket.attachTlsUlp(fd);
+    try setKernelCryptoInfo(fd, .rx, info.rx);
+    try setKernelCryptoInfo(fd, .tx, info.tx);
 }
 
 /// Derives the next traffic secret for `direction` and installs its key on
@@ -186,7 +178,7 @@ pub fn installUpdatedTrafficKey(fd: std.posix.fd_t, direction: Direction, state:
     const secret_len = @as(usize, state.secret_len);
     var next = try deriveNextDirectionCrypto(direction, state, next_secret[0..secret_len]);
     defer std.crypto.secureZero(u8, std.mem.asBytes(&next));
-    try setKernelCryptoInfo(fd, direction.optname(), next);
+    try setKernelCryptoInfo(fd, direction, next);
     commitDirectionSecret(direction, state, next_secret[0..secret_len]);
 }
 
@@ -471,7 +463,7 @@ fn tls13SecretLen(cipher_id: u32) !usize {
     };
 }
 
-fn setKernelCryptoInfo(fd: std.posix.fd_t, optname: u32, info: DirectionCryptoInfo) !void {
+fn setKernelCryptoInfo(fd: std.posix.fd_t, direction: Direction, info: DirectionCryptoInfo) !void {
     switch (info) {
         .aes_gcm_128 => |aes| {
             var kernel = KernelTls12CryptoInfoAesGcm128{
@@ -484,7 +476,7 @@ fn setKernelCryptoInfo(fd: std.posix.fd_t, optname: u32, info: DirectionCryptoIn
                 .salt = aes.salt,
                 .rec_seq = aes.rec_seq,
             };
-            try setTlsDirection(fd, optname, std.mem.asBytes(&kernel));
+            try socket.setTlsCryptoInfo(fd, direction, std.mem.asBytes(&kernel));
         },
         .aes_gcm_256 => |aes| {
             var kernel = KernelTls12CryptoInfoAesGcm256{
@@ -497,7 +489,7 @@ fn setKernelCryptoInfo(fd: std.posix.fd_t, optname: u32, info: DirectionCryptoIn
                 .salt = aes.salt,
                 .rec_seq = aes.rec_seq,
             };
-            try setTlsDirection(fd, optname, std.mem.asBytes(&kernel));
+            try socket.setTlsCryptoInfo(fd, direction, std.mem.asBytes(&kernel));
         },
         .chacha20_poly1305 => |chacha| {
             var kernel = KernelTls12CryptoInfoChacha20Poly1305{
@@ -510,51 +502,8 @@ fn setKernelCryptoInfo(fd: std.posix.fd_t, optname: u32, info: DirectionCryptoIn
                 .salt = .{},
                 .rec_seq = chacha.rec_seq,
             };
-            try setTlsDirection(fd, optname, std.mem.asBytes(&kernel));
+            try socket.setTlsCryptoInfo(fd, direction, std.mem.asBytes(&kernel));
         },
-    }
-}
-
-fn attachTlsUlp(fd: std.posix.fd_t) !void {
-    while (true) {
-        const value = "tls";
-        const rc = std.c.setsockopt(fd, std.posix.IPPROTO.TCP, tcp_ulp, value.ptr, @intCast(value.len));
-        switch (std.posix.errno(rc)) {
-            .SUCCESS => return,
-            .INTR => continue,
-            .BADF, .NOTSOCK => return error.InvalidHandle,
-            .NOENT, .NOPROTOOPT, .NODEV, .OPNOTSUPP => return error.OperationNotSupported,
-            .INVAL => return error.InvalidProtocolOption,
-            else => return error.Unexpected,
-        }
-    }
-}
-
-fn tlsUlpAlreadyAttached(fd: std.posix.fd_t) bool {
-    var name: [32]u8 = undefined;
-    @memset(&name, 0);
-    var name_len: std.c.socklen_t = @intCast(name.len);
-    const rc = std.c.getsockopt(fd, std.posix.IPPROTO.TCP, tcp_ulp, &name, &name_len);
-    return switch (std.posix.errno(rc)) {
-        .SUCCESS => name_len != 0 and name[0] != 0,
-        else => false,
-    };
-}
-
-fn setTlsDirection(fd: std.posix.fd_t, optname: u32, bytes: []const u8) !void {
-    while (true) {
-        const rc = linux.setsockopt(fd, sol_tls, optname, bytes.ptr, @intCast(bytes.len));
-        switch (linux.E.init(rc)) {
-            .SUCCESS => return,
-            .INTR => continue,
-            .BADF, .NOTSOCK => return error.InvalidHandle,
-            // Linux reports ENOENT when the requested kTLS cipher/provider is
-            // not available even though the TLS ULP itself exists.
-            .NOENT, .NOPROTOOPT, .NODEV, .OPNOTSUPP => return error.OperationNotSupported,
-            .INVAL => return error.InvalidKernelCryptoInfo,
-            .NOMEM, .NOBUFS => return error.SystemResources,
-            else => return error.Unexpected,
-        }
     }
 }
 
@@ -642,10 +591,8 @@ pub const tls13_aes_256_gcm_sha384: u32 = 0x1302;
 pub const tls13_chacha20_poly1305_sha256: u32 = 0x1303;
 pub const max_tls13_secret_len: usize = 64;
 
-const tcp_ulp: u32 = 31;
+/// SOL_TLS, the level of the record-type control messages.
 const sol_tls: i32 = 282;
-const tls_tx: u32 = 1;
-const tls_rx: u32 = 2;
 const tls_set_record_type: c_int = 1;
 const tls_get_record_type: c_int = 2;
 

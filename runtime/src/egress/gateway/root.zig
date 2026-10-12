@@ -3,10 +3,11 @@
 //! both processes compile, `control.zig`, `launch.zig`, `policy.zig` and `sizing.zig`, and never
 //! the gateway's loop, shards or engines (`runtime/tests/conventions.zig` checks it).
 //!
-//! `control.zig` is the wire between the server and the gateway, and `launch.zig` the gateway's
-//! arg0 and inherited descriptor. `policy.zig` holds the limits both sides share and the network
-//! policy table the server sends in its hello, and `sizing.zig` the numbers both sides must
-//! agree on.
+//! `control.zig` is the wire between the server and the gateway, with the hello that hands over
+//! the server's network policy image, and `launch.zig` the gateway's arg0 and inherited
+//! descriptor. `policy.zig` holds the limits both sides share and the isolation ids of policies,
+//! and `sizing.zig` the gateway's plan and the most sessions any gateway holds, which the server
+//! reads.
 //!
 //! Everything else runs only in the gateway. `runtime/` is its boot and event loop on the
 //! process's main thread, `readiness.zig` the loop's io_uring wait, and `sandbox.zig` the sandbox
@@ -66,8 +67,8 @@ pub const testing = if (builtin.is_test) struct {
     pub const worker_flow = @import("runtime/worker_flow.zig");
     pub const upload_flow = @import("runtime/upload_flow.zig");
     /// The control socket's flow as a comptime mixin: the admission and control suites feed a
-    /// harness gateway its hello through the real flow, so the key, the policy table and each
-    /// entry's isolation id are the ones fetch admission reads.
+    /// harness gateway its hello through the real flow, so the key, the decoded policies and each
+    /// policy's isolation id are the ones fetch admission reads.
     pub const control_flow = @import("runtime/control_flow.zig");
 } else struct {};
 

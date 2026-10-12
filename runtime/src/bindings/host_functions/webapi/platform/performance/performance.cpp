@@ -12,7 +12,6 @@
 #include <JavaScriptCore/JSFunction.h>
 #include <JavaScriptCore/JSObject.h>
 #include <JavaScriptCore/JSString.h>
-#include <wtf/Locker.h>
 #include <wtf/text/WTFString.h>
 
 namespace Collo::HostFunctions {
@@ -65,22 +64,15 @@ template <typename Visitor> void JSColloPerformance::visitChildrenImpl(JSC::JSCe
     auto* this_object = static_cast<JSColloPerformance*>(cell);
     ASSERT_GC_OBJECT_INHERITS(this_object, info());
     Base::visitChildren(this_object, visitor);
-    // The cell lock keeps the listener vectors from being reallocated while the concurrent marker walks them; the
-    // mutators in `event_target.cpp` take the owning cell's lock around every reallocation.
-    WTF::Locker locker { this_object->cellLock() };
-    this_object->m_event_target.visitChildren(visitor);
     visitor.append(this_object->m_mark_structure);
     visitor.append(this_object->m_measure_structure);
     visitor.append(this_object->m_observer_structure);
     visitor.append(this_object->m_observer_entry_list_structure);
     visitor.append(this_object->m_timing);
     visitor.append(this_object->m_on_resource_timing_buffer_full);
-    for (unsigned index = this_object->m_entries_head; index < this_object->m_entries.size(); index++) {
-        auto& entry = this_object->m_entries[index];
-        visitor.append(entry);
-    }
-    for (auto& observer : this_object->m_observers)
-        visitor.append(observer);
+    this_object->m_event_target.visit(this_object, visitor);
+    this_object->m_entries.visit(this_object, visitor);
+    this_object->m_observers.visit(this_object, visitor);
 }
 
 DEFINE_VISIT_CHILDREN(JSColloPerformance);

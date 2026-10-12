@@ -48,7 +48,7 @@ std::span<const uint8_t> sharedBytesSpan(const WTF::RefPtr<ColloSharedBytes>&);
 // instead of reaching WTF's RELEASE_ASSERT.
 bool ensureDecodedStringSize(JSC::JSGlobalObject*, JSC::ThrowScope&, size_t byte_size);
 // Parses the text as JSON after dropping a leading U+FEFF, as json() parses bytes after a UTF-8 decode that drops the
-// BOM. A parse error rejects the promise, and a termination stays pending.
+// BOM. A parse error rejects the promise. A termination stays pending, and the result is then empty, with no promise.
 JSC::EncodedJSValue parseBodyJsonTextToPromise(JSC::JSGlobalObject*, const WTF::String&);
 // Parse a form body with the parser `content_type` selects. An unsupported type or a malformed body rejects with a
 // TypeError, and a body over one of the parser's caps rejects with a QuotaExceededError DOMException.

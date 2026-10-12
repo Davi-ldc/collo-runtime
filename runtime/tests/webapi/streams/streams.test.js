@@ -975,6 +975,85 @@ describe("WritableStream core", () => {
       error,
     );
   });
+
+  test("releaseLock rejects the pending ready and closed promises in place", async () => {
+    const writable = new WritableStream({}, { highWaterMark: 0 });
+    const writer = writable.getWriter();
+    const ready = writer.ready;
+    const closed = writer.closed;
+    writer.releaseLock();
+    assert.equal(writer.ready, ready);
+    assert.equal(writer.closed, closed);
+    await assertRejects(ready, TypeError);
+    await assertRejects(closed, TypeError);
+  });
+
+  test("a second abort while the sink's abort is pending returns the same promise", async () => {
+    let finishAbort;
+    const writable = new WritableStream({
+      abort() {
+        return new Promise(resolve => {
+          finishAbort = resolve;
+        });
+      },
+    });
+    const first = writable.abort(new Error("first"));
+    const second = writable.abort(new Error("second"));
+    assert.equal(second, first);
+    let settled = false;
+    second.then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.equal(settled, false);
+    finishAbort();
+    await first;
+    assert.equal(settled, true);
+  });
+
+  test("a writer taken while the sink's abort runs gets its closed promise rejected", async () => {
+    for (const outcome of ["throws", "returns a value"]) {
+      const reason = new Error("abort reason");
+      let writer;
+      const writable = new WritableStream({
+        abort() {
+          writer = writable.getWriter();
+          if (outcome === "throws") throw new Error("abort failed");
+          return "not a promise";
+        },
+      });
+      const abort = writable.abort(reason).then(
+        () => "resolved",
+        () => "rejected",
+      );
+      assert(writer instanceof WritableStreamDefaultWriter);
+      assert.equal(
+        await writer.closed.then(
+          () => "resolved",
+          error => error,
+        ),
+        reason,
+      );
+      assert.equal(await abort, outcome === "throws" ? "rejected" : "resolved");
+    }
+  });
+
+  test("a write the sink issues through the stream's own writer queues behind the current one", async () => {
+    const written = [];
+    let writer;
+    const writable = new WritableStream({
+      write(chunk) {
+        written.push(chunk);
+        if (chunk === "first") void writer.write("second");
+      },
+    });
+    writer = writable.getWriter();
+    await writer.write("first");
+    await writer.ready;
+    await writer.close();
+    assert.deepEqual(written, ["first", "second"]);
+  });
 });
 
 describe("ReadableStream.prototype.pipeTo", () => {
@@ -1031,14 +1110,18 @@ describe("ReadableStream.prototype.pipeTo", () => {
     const events = [];
     const releases = [];
     let pull_count = 0;
-    const readable = new ReadableStream({
-      pull(controller) {
-        pull_count += 1;
-        events.push(`pull:${pull_count}`);
-        controller.enqueue(String(pull_count));
-        if (pull_count === 3) controller.close();
+    // The source pulls only for a pending read, so each pull is the pipe reading.
+    const readable = new ReadableStream(
+      {
+        pull(controller) {
+          pull_count += 1;
+          events.push(`pull:${pull_count}`);
+          controller.enqueue(String(pull_count));
+          if (pull_count === 3) controller.close();
+        },
       },
-    });
+      { highWaterMark: 0 },
+    );
     const writable = new WritableStream(
       {
         write(chunk) {
@@ -1051,15 +1134,22 @@ describe("ReadableStream.prototype.pipeTo", () => {
       { highWaterMark: 2 },
     );
 
+    // The sink runs one write at a time, and while it runs the pipe reads the
+    // next chunk into the destination's queue, which has room for two.
     const piping = readable.pipeTo(writable);
-    await waitForMicrotaskCondition("pipeTo first two writes", () => releases.length === 2);
-    assert.deepEqual(events, ["pull:1", "write:1", "pull:2", "write:2"]);
+    await waitForMicrotaskCondition("pipeTo reading ahead of the first write", () => events.includes("pull:2"));
+    assert.deepEqual(events, ["pull:1", "write:1", "pull:2"]);
+    assert.equal(releases.length, 1);
 
     releases.shift()();
-    await waitForMicrotaskCondition("pipeTo third write", () => releases.length === 2);
-    assert.deepEqual(events, ["pull:1", "write:1", "pull:2", "write:2", "pull:3", "write:3"]);
-    while (releases.length) releases.shift()();
+    await waitForMicrotaskCondition("pipeTo second write", () => events.includes("write:2") && events.includes("pull:3"));
+    assert.equal(releases.length, 1);
+
+    releases.shift()();
+    await waitForMicrotaskCondition("pipeTo third write", () => events.includes("write:3"));
+    releases.shift()();
     await piping;
+    assert.deepEqual(events.filter(event => event.startsWith("write:")), ["write:1", "write:2", "write:3"]);
   });
 
   test("preventClose leaves destination writable open", async () => {
@@ -1430,6 +1520,35 @@ describe("ReadableStream.prototype.pipeTo", () => {
       error => error,
     ), "stop");
   });
+
+  test("returns its promise when the pipe settles before pipeTo returns", async () => {
+    const broken = new Error("broken");
+    const destination = new WritableStream({
+      start(controller) {
+        controller.error(broken);
+      },
+    });
+    const promise = new ReadableStream().pipeTo(destination, { preventCancel: true });
+    assert(promise instanceof Promise);
+    assert.equal(await promise.then(
+      () => "resolved",
+      error => error,
+    ), broken);
+  });
+
+  test("converts its options before it checks the locks", async () => {
+    const source = new ReadableStream();
+    source.getReader();
+    let read = false;
+    const options = {
+      get preventAbort() {
+        read = true;
+        return false;
+      },
+    };
+    await assertRejects(source.pipeTo(new WritableStream(), options), TypeError);
+    assert.equal(read, true);
+  });
 });
 
 describe("TransformStream core", () => {
@@ -1496,6 +1615,26 @@ describe("TransformStream core", () => {
     await pendingWrite;
     await pendingClose;
   });
+
+  test("a transform that writes through the stream's own writer gets both chunks out in order", async () => {
+    let writer;
+    const stream = new TransformStream(
+      {
+        transform(chunk, controller) {
+          controller.enqueue(chunk);
+          if (chunk === "first") void writer.write("second");
+        },
+      },
+      undefined,
+      { highWaterMark: 1 },
+    );
+    writer = stream.writable.getWriter();
+    const reader = stream.readable.getReader();
+    const first = writer.write("first");
+    assert.deepEqual(await reader.read(), { value: "first", done: false });
+    assert.deepEqual(await reader.read(), { value: "second", done: false });
+    await first;
+  });
 });
 
 describe("ReadableStream.prototype.pipeThrough", () => {
@@ -1518,6 +1657,33 @@ describe("ReadableStream.prototype.pipeThrough", () => {
     const output = [];
     for await (const chunk of piped) output.push(chunk);
     assert.equal(output.join(""), "AB");
+  });
+
+  test("throws a TypeError when the source or the transform's writable is locked", () => {
+    const lockedSource = new ReadableStream();
+    lockedSource.getReader();
+    assert.throws(() => lockedSource.pipeThrough(new TransformStream()), TypeError);
+
+    const transform = new TransformStream();
+    transform.writable.getWriter();
+    assert.throws(() => new ReadableStream().pipeThrough(transform), TypeError);
+  });
+
+  test("reads the pair's readable before its writable", () => {
+    const order = [];
+    const transform = new TransformStream();
+    const pair = {
+      get writable() {
+        order.push("writable");
+        return transform.writable;
+      },
+      get readable() {
+        order.push("readable");
+        return transform.readable;
+      },
+    };
+    new ReadableStream().pipeThrough(pair);
+    assert.deepEqual(order, ["readable", "writable"]);
   });
 });
 
@@ -1706,7 +1872,8 @@ describe("CompressionStream and DecompressionStream", () => {
   });
 
   test("large decompression write waits for readable demand", async () => {
-    const compressed = await compressedBytes("gzip", "A".repeat(512 * 1024));
+    const expectedLength = 512 * 1024;
+    const compressed = await compressedBytes("gzip", "A".repeat(expectedLength));
     const stream = new DecompressionStream("gzip");
     const writer = stream.writable.getWriter();
     let writeSettled = false;
@@ -1718,16 +1885,104 @@ describe("CompressionStream and DecompressionStream", () => {
     await Promise.resolve();
     assert.equal(writeSettled, false);
 
+    // The last chunk can reach a read in the same step that completes the
+    // write, so the loop reads the known length instead of waiting for the
+    // write to settle.
     const reader = stream.readable.getReader();
     let decodedLength = 0;
-    while (!writeSettled) {
+    let reads = 0;
+    while (decodedLength < expectedLength) {
       const { done, value } = await reader.read();
-      if (done) break;
+      assert.equal(done, false);
       decodedLength += value.byteLength;
+      reads += 1;
     }
     await writePromise;
-    assert(decodedLength > 64 * 1024);
+    assert.equal(decodedLength, expectedLength);
+    assert(reads > 1);
     await writer.close();
+    assert.deepEqual(await reader.read(), { value: undefined, done: true });
+  });
+
+  // Resolving a pending read looks up `then` on the read result, so a getter
+  // on Object.prototype runs script in the middle of a delivery. The getter
+  // matches only read results and is removed before the test awaits anything
+  // else.
+  function onReadResult(callback) {
+    Object.defineProperty(Object.prototype, "then", {
+      configurable: true,
+      get() {
+        if (this !== null && typeof this === "object" && Object.hasOwn(this, "done") && Object.hasOwn(this, "value"))
+          callback(this);
+        return undefined;
+      },
+    });
+  }
+
+  test("a then getter that cancels during a delivery settles the read and the cancel", async () => {
+    for (const format of ["brotli", "gzip", "deflate", "deflate-raw"]) {
+      const compressed = await compressedBytes(format, "A".repeat(256 * 1024));
+      const stream = new DecompressionStream(format);
+      const reader = stream.readable.getReader();
+      const writer = stream.writable.getWriter();
+      const read = reader.read();
+      let cancel = null;
+      let write = null;
+      onReadResult(() => {
+        if (cancel === null) cancel = reader.cancel("stop");
+      });
+      try {
+        write = writer.write(compressed).then(
+          () => "resolved",
+          error => error,
+        );
+        const result = await read;
+        assert.equal(result.done, false);
+        assert(result.value instanceof Uint8Array);
+      } finally {
+        delete Object.prototype.then;
+      }
+      assert(cancel !== null, "the getter cancelled the stream");
+      assert.equal(await cancel, undefined);
+      assert.equal(await write, "stop");
+    }
+  });
+
+  test("a then getter that reads during a delivery gets the output once and in order", async () => {
+    const text = "0123456789abcdef".repeat(16 * 1024);
+    for (const format of ["brotli", "gzip", "deflate", "deflate-raw"]) {
+      const compressed = await compressedBytes(format, text);
+      const stream = new DecompressionStream(format);
+      const reader = stream.readable.getReader();
+      const writer = stream.writable.getWriter();
+      const reads = [reader.read()];
+      onReadResult(result => {
+        if (result.done === false && reads.length < 1024) reads.push(reader.read());
+      });
+      try {
+        await writer.write(compressed);
+      } finally {
+        delete Object.prototype.then;
+      }
+      const closing = writer.close();
+      const chunks = [];
+      let done = false;
+      for (const pending of reads) {
+        const result = await pending;
+        if (result.done) {
+          done = true;
+          break;
+        }
+        chunks.push(result.value);
+      }
+      while (!done) {
+        const result = await reader.read();
+        done = result.done;
+        if (!done) chunks.push(result.value);
+      }
+      await closing;
+      assert.equal(new TextDecoder().decode(concatUint8(chunks)), text);
+    }
   });
 
   test("readable cancel rejects a backpressured compression write", async () => {
@@ -1844,6 +2099,23 @@ describe("Stream lock lifecycle", () => {
     assert.equal(canceled.locked, false);
   });
 
+  test("releaseLock rejects a reader's pending closed promise in place", async () => {
+    const reader = new ReadableStream().getReader();
+    const closed = reader.closed;
+    reader.releaseLock();
+    assert.equal(reader.closed, closed);
+    await assertRejects(closed, TypeError);
+  });
+
+  test("a pending read's promise exposes no property of the stream's own", () => {
+    const reader = new ReadableStream().getReader();
+    const read = reader.read();
+    assert.deepEqual(Object.getOwnPropertyNames(read), []);
+    assert.deepEqual(Object.getOwnPropertySymbols(read), []);
+    const byobRead = new ReadableStream({ type: "bytes" }).getReader({ mode: "byob" }).read(new Uint8Array(4));
+    assert.deepEqual(Object.getOwnPropertyNames(byobRead), []);
+    assert.deepEqual(Object.getOwnPropertySymbols(byobRead), []);
+  });
 });
 
 describe("Body stream integration", () => {

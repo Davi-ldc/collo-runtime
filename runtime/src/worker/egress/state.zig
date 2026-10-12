@@ -1,20 +1,33 @@
 //! A worker's egress state: its fetch tasks, its fetch body views and their
-//! decoders, the per-request fetch counts, the pending-upload queue, the
-//! mapped gateway endpoint and the callbacks that return body-pool extents.
-//! `runtime/egress.zig` holds it beside the scheduler, request and VM state
-//! the worker runtime owns, and only the worker's event loop thread touches
-//! it.
+//! decoders, the per-request fetch counts, the pending-upload queue and the
+//! upload reservations, the mapped gateway endpoint and the callbacks that
+//! return body-pool extents. `runtime/egress.zig` holds it beside the
+//! scheduler, request and VM state the worker runtime owns, and only the
+//! worker's event loop thread touches it.
 //!
 //! The worker is attached while it holds an endpoint and detached otherwise.
 //! It boots attached when WorkerInit carries a session's regions, detaches
 //! when its gateway closes (`gateway_runtime.disconnect`), and attaches again
-//! when the server sends the half of a new session (`attach`). Every
-//! WorkerInit carries the worker's wake descriptors, and the worker ring polls
-//! their completion eventfd and liveness pipe from fixed slots for the
-//! worker's whole life, because a restricted ring can never register another
-//! file (`common/io/restricted_uring.zig`). The server builds every session of
-//! the worker on the same wake set (`egress_shared.WakeSet`), and `attach`
-//! takes only a half whose liveness pipe is the one WorkerInit carried.
+//! when the server sends the half of a new session (`attach`). A worker whose
+//! definition grants some route network access (`Grant.granted`) gets its
+//! wake descriptors with WorkerInit, and the worker ring polls their
+//! completion eventfd and liveness pipe from fixed slots for the worker's
+//! whole life, because a restricted ring can never register another file
+//! (`common/io/restricted_uring.zig`). The server builds every session of the
+//! worker on the same wake set (`egress_shared.WakeSet`), and `attach` takes
+//! only a half whose liveness pipe is the one WorkerInit carried. A worker
+//! without a grant gets no egress descriptor at all: it never holds a
+//! session, refuses every fetch before anything leaves
+//! (`fetch_runtime.refusal`), and its ring leaves both egress slots empty.
+//!
+//! The upload reservations mirror what the gateway counts against the
+//! session's `ipc.fetch_limits.request_body_pooled_in_flight_bytes_max`: the
+//! announced length of each pooled start the worker sent, from that start
+//! until the worker sees the gateway end its fetch (an error, the body's end
+//! or the abort acknowledgment). The gateway lets an upload go only when the
+//! fetch retires there, which after the body's end waits for the worker to
+//! return the body's last extent, so a pooled start sent in between can be
+//! refused by the gateway, without a strike.
 //!
 //! Teardown runs in a fixed order: `deinitTasks`, which drops each task's
 //! reference on its response body, then the release of every body
@@ -96,19 +109,36 @@ pub const PipeIdentity = struct {
     }
 };
 
+/// Whether the worker's definition grants some route network access, which
+/// WorkerInit's `flag_egress` says and its wake descriptors show
+/// (`State.grant`).
+pub const Grant = enum { granted, none };
+
 pub const State = struct {
     /// The mapped gateway endpoint while the worker is attached. It owns the
     /// session's wake descriptors along with its mappings.
     shared: ?ipc.egress_shared.Endpoint = null,
     /// The wake descriptors WorkerInit carried for a launch without a
     /// session, held until the first `attach` gives the endpoint a session's
-    /// own; null once the worker has had an endpoint, and in a state built
-    /// without them.
+    /// own; null once the worker has had an endpoint, and for a worker
+    /// without a grant.
     detached_wake: ?ipc.egress_shared.WakeFds = null,
     /// The liveness pipe of the wake descriptors WorkerInit carried, which
-    /// the worker ring watches for the worker's whole life; null in a state
-    /// built without them. `attach` takes only a half built on it.
+    /// the worker ring watches for the worker's whole life; null exactly for
+    /// a worker without a grant. `attach` takes only a half built on it.
     boot_liveness_pipe: ?PipeIdentity = null,
+    /// The announced length of each pooled start sent on the current
+    /// session, by fetch id, until the gateway ends that fetch
+    /// (`reserveUpload`, `releaseUpload`).
+    upload_reservations: std.AutoHashMapUnmanaged(u64, u64) = .{},
+    /// The sum of `upload_reservations`, never above
+    /// `ipc.fetch_limits.request_body_pooled_in_flight_bytes_max`.
+    upload_reserved_bytes: u64 = 0,
+    /// A pooled start parked because the reservations had no room for it, so
+    /// a later pooled start parks behind it instead of taking room first.
+    /// The upload pump clears it before each pass, and each start that still
+    /// finds no room sets it again (`upload_runtime.zig`).
+    upload_room_waiter: bool = false,
     body_pool_release_context: BodyPoolReleaseContext = .{},
     body_credit_release_context: BodyCreditReleaseContext = .{},
     tasks: std.AutoHashMapUnmanaged(u64, *Task) = .{},
@@ -142,16 +172,17 @@ pub const State = struct {
     fetch_task_rescan_needed: bool = false,
     fetch_body_rescan_needed: bool = false,
 
-    /// Takes the worker's egress descriptors WorkerInit carried, when
-    /// `shared_fds` is given: records the liveness pipe of its wake
-    /// descriptors, maps the session's endpoint when the regions came and
-    /// holds the wake descriptors in `detached_wake` when none did. It
-    /// reserves the task table for `limits.max_fetches_per_worker`.
-    /// The descriptors leave `shared_fds` once they check out, and a later
-    /// failure closes them. Fails with `error.InvalidEgressSharedEndpoint`
-    /// for missing wake descriptors or some regions without the rest, as
-    /// `attach` does when `fstat` fails on the liveness pipe or the endpoint
-    /// cannot be mapped, with `error.CapacityTooLarge`, or with
+    /// Takes the worker's egress descriptors WorkerInit carried. None, as
+    /// `shared_fds` null or empty brings, makes a worker without a grant.
+    /// Otherwise it records the liveness pipe of the wake descriptors, maps
+    /// the session's endpoint when the regions came and holds the wake
+    /// descriptors in `detached_wake` when none did. It reserves the task
+    /// table for `limits.max_fetches_per_worker`. The descriptors leave
+    /// `shared_fds` once they check out, and a later failure closes them.
+    /// Fails with `error.InvalidEgressSharedEndpoint` for regions without
+    /// wake descriptors, an incomplete wake set or some regions without the
+    /// rest, as `attach` does when `fstat` fails on the liveness pipe or the
+    /// endpoint cannot be mapped, with `error.CapacityTooLarge`, or with
     /// `error.OutOfMemory`.
     pub fn init(
         allocator: std.mem.Allocator,
@@ -161,7 +192,11 @@ pub const State = struct {
         var boot_liveness_pipe: ?PipeIdentity = null;
         var shared: ?ipc.egress_shared.Endpoint = null;
         var detached_wake: ?ipc.egress_shared.WakeFds = null;
-        if (shared_fds) |fds| {
+        const granted_fds: ?*ipc.egress_shared.RawFds = if (shared_fds) |fds|
+            (if (fds.isEmpty()) null else fds)
+        else
+            null;
+        if (granted_fds) |fds| {
             if (!fds.wakeFds().isValid())
                 return error.InvalidEgressSharedEndpoint;
             boot_liveness_pipe = try PipeIdentity.of(fds.liveness_fd);
@@ -204,8 +239,8 @@ pub const State = struct {
     /// succeeds; on failure `fds` keeps every descriptor. The half brings the
     /// session's own wake descriptors, so the ones a detached boot held
     /// close. The worker must be detached. Fails with
-    /// `error.EgressAttachWithoutWakeSet` in a state built without wake
-    /// descriptors, since its ring watches no liveness pipe, with
+    /// `error.EgressNotGranted` for a worker without a grant, whose ring
+    /// watches no liveness pipe, with
     /// `error.EgressAttachLivenessPipeMismatch` when the half's liveness pipe
     /// is not the one WorkerInit carried, with the error of `fstat` on it, or
     /// when the endpoint cannot be mapped or its rings disagree on the
@@ -214,7 +249,7 @@ pub const State = struct {
     pub fn attach(self: *State, fds: *ipc.egress_shared.RawFds) !void {
         std.debug.assert(self.shared == null);
         std.debug.assert(self.body_decoders.count() == 0);
-        const boot_pipe = self.boot_liveness_pipe orelse return error.EgressAttachWithoutWakeSet;
+        const boot_pipe = self.boot_liveness_pipe orelse return error.EgressNotGranted;
         // The completion eventfd cannot be checked the same way: every
         // eventfd shares one anonymous inode.
         const pipe = try PipeIdentity.of(fds.liveness_fd);
@@ -226,11 +261,17 @@ pub const State = struct {
         self.detached_wake = null;
     }
 
+    /// Whether the worker's definition grants some route network access: it
+    /// does exactly when WorkerInit brought the wake descriptors.
+    pub fn grant(self: *const State) Grant {
+        return if (self.boot_liveness_pipe != null) .granted else .none;
+    }
+
     /// The wake descriptors the worker holds now: its endpoint's while
-    /// attached, `detached_wake` while it has had no session, null in a state
-    /// built without them. The worker ring registers their completion eventfd
-    /// and liveness pipe once, at boot (`scheduler/resources.zig`), and every
-    /// later session of the worker carries the same two files.
+    /// attached, `detached_wake` while it has had no session, null for a
+    /// worker without a grant. The worker ring registers their completion
+    /// eventfd and liveness pipe once, at boot (`scheduler/resources.zig`),
+    /// and every later session of the worker carries the same two files.
     pub fn wakeFds(self: *const State) ?ipc.egress_shared.WakeFds {
         if (self.shared) |*endpoint| {
             return .{
@@ -247,12 +288,44 @@ pub const State = struct {
     /// worker. Closing the worker's end of the peer liveness pipe tells the
     /// gateway, as the worker's exit would. Decoders must be gone first,
     /// since they return their extents into the body pool's release queue.
+    /// The upload reservations go with the session: the gateway of the next
+    /// one counts from nothing.
     pub fn releaseEndpoint(self: *State) void {
         std.debug.assert(self.body_decoders.count() == 0);
         if (self.shared) |*endpoint|
             endpoint.deinit();
         self.shared = null;
         self.releases_need_notify = false;
+        self.upload_reservations.clearRetainingCapacity();
+        self.upload_reserved_bytes = 0;
+        self.upload_room_waiter = false;
+    }
+
+    /// The pooled bytes a start may still announce on this session.
+    pub fn uploadRoom(self: *const State) u64 {
+        const in_flight_max: u64 = ipc.fetch_limits.request_body_pooled_in_flight_bytes_max;
+        std.debug.assert(self.upload_reserved_bytes <= in_flight_max);
+        return in_flight_max - self.upload_reserved_bytes;
+    }
+
+    /// Records that the pooled start of `fetch_id` announcing `bytes` left
+    /// the worker. `bytes` must fit in `uploadRoom`, and the caller made room
+    /// for the entry first (`ensureUnusedCapacity` on
+    /// `upload_reservations`), so recording cannot fail after the start is
+    /// on the wire.
+    pub fn reserveUpload(self: *State, fetch_id: u64, bytes: u64) void {
+        std.debug.assert(bytes <= self.uploadRoom());
+        self.upload_reservations.putAssumeCapacityNoClobber(fetch_id, bytes);
+        self.upload_reserved_bytes += bytes;
+    }
+
+    /// Gives back the reservation of `fetch_id` once the gateway ended that
+    /// fetch; a fetch that holds none, as an inline start or an id a hostile
+    /// packet names, changes nothing.
+    pub fn releaseUpload(self: *State, fetch_id: u64) void {
+        const removed = self.upload_reservations.fetchRemove(fetch_id) orelse return;
+        std.debug.assert(removed.value <= self.upload_reserved_bytes);
+        self.upload_reserved_bytes -= removed.value;
     }
 
     pub fn deinitTasks(self: *State, allocator: std.mem.Allocator) void {
@@ -291,6 +364,7 @@ pub const State = struct {
         self.body_decoders.deinit(allocator);
         self.bodies.deinit(allocator);
         self.pending_uploads.deinit(allocator);
+        self.upload_reservations.deinit(allocator);
     }
 
     /// Drops the decoder of `body_id`, returning its pending pool extents

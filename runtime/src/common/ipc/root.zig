@@ -18,6 +18,7 @@
 //!   and the gateway verifies at fetch admission.
 //! - `egress_attach.zig`: the worker half of a new egress session, sent to a
 //!   live worker after its gateway was replaced.
+//! - `worker_retiring.zig`: a worker's request to be retired.
 //! - `module_pack.zig`: the module pack format.
 //! - `fs_index.zig`, `fs_fault.zig`: a worker's file index and its file
 //!   requests.
@@ -43,6 +44,7 @@ pub const egress = @import("egress.zig");
 pub const egress_shared = @import("egress_shared.zig");
 pub const egress_token = @import("egress_token.zig");
 pub const egress_attach = @import("egress_attach.zig");
+pub const worker_retiring = @import("worker_retiring.zig");
 pub const fetch_limits = @import("fetch_limits.zig");
 
 pub const max_message_bytes = messages.max_message_bytes;
@@ -52,6 +54,7 @@ pub const max_fds_per_message = messages.max_fds_per_message;
 
 pub const MessageKind = messages.MessageKind;
 pub const WorkerInitFailedReason = messages.WorkerInitFailedReason;
+pub const WorkerRetiringReason = messages.WorkerRetiringReason;
 pub const RequestDoneStatus = messages.RequestDoneStatus;
 pub const RouteCapture = messages.RouteCapture;
 pub const RequestHeader = messages.RequestHeader;
@@ -64,6 +67,7 @@ pub const WorkerRuntimeBootOptions = messages.WorkerRuntimeBootOptions;
 pub const WorkerInit = messages.WorkerInit;
 pub const WorkerReady = messages.WorkerReady;
 pub const WorkerInitFailed = messages.WorkerInitFailed;
+pub const WorkerRetiring = messages.WorkerRetiring;
 pub const DispatchPacketHeader = messages.DispatchPacketHeader;
 pub const FsFaultResponseStatus = messages.FsFaultResponseStatus;
 pub const FsFaultRequestHeader = messages.FsFaultRequestHeader;
@@ -79,6 +83,7 @@ pub const EgressUploadChunkBatchHeader = messages.EgressUploadChunkBatchHeader;
 pub const EgressUploadChunkBatchDescriptor = messages.EgressUploadChunkBatchDescriptor;
 pub const EgressBodyEnd = messages.EgressBodyEnd;
 pub const EgressFetchErrorHeader = messages.EgressFetchErrorHeader;
+pub const EgressFetchErrorCause = messages.EgressFetchErrorCause;
 pub const EgressAbortAck = messages.EgressAbortAck;
 pub const EgressAttach = messages.EgressAttach;
 pub const InitOutcome = messages.InitOutcome;
@@ -90,6 +95,7 @@ pub const valid_egress_fetch_head_flags = messages.valid_egress_fetch_head_flags
 pub const decodeRequestBodyFraming = messages.decodeRequestBodyFraming;
 pub const decodeMessageKind = messages.decodeMessageKind;
 pub const decodeWorkerInitFailedReason = messages.decodeWorkerInitFailedReason;
+pub const decodeWorkerRetiringReason = messages.decodeWorkerRetiringReason;
 pub const decodeFsFaultResponseStatus = messages.decodeFsFaultResponseStatus;
 
 pub const ReceivedPacket = packet.ReceivedPacket;

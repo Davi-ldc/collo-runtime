@@ -15,6 +15,7 @@
 const std = @import("std");
 const bench_common = @import("common.zig");
 const bench_metadata = @import("metadata.zig");
+const local_origin = @import("local_origin.zig");
 const bindings = @import("collo_bindings");
 const egress = @import("collo_egress_client");
 
@@ -140,13 +141,17 @@ const H2Window = struct {
     }
 };
 
-/// The egress policy always denies loopback, so that a fetch cannot reach
-/// services on the gateway's own machine. The bench therefore reaches the
-/// test origins, which listen on INADDR_ANY, through the machine's
-/// default-route source address, as runtime/tests/support/net/local_address.zig
-/// does for the tests.
-var origin_host_buffer: [64]u8 = undefined;
+/// Where the test origins, which listen on every address, are dialed: the
+/// default route's source address (`local_origin.zig`), since every grant
+/// refuses loopback.
+var origin_address: [4]u8 = undefined;
+var origin_host_buffer: [15]u8 = undefined;
 var origin_host: []const u8 = &.{};
+
+comptime {
+    // One engine's origins fit one policy.
+    std.debug.assert(max_origins_per_engine <= local_origin.origins_max);
+}
 
 pub fn main() !void {
     // Several engine threads allocate at once, and DebugAllocator's single
@@ -154,7 +159,8 @@ pub fn main() !void {
     // smp_allocator keeps a freelist per thread.
     const allocator = std.heap.smp_allocator;
     try bench_metadata.print(allocator, "egress_h2_engine");
-    origin_host = try routableLocalIpv4(&origin_host_buffer);
+    origin_address = try local_origin.routableLocalIpv4();
+    origin_host = local_origin.formatIpv4(origin_address, &origin_host_buffer);
 
     const engines_list = try bench_common.parseCommaSeparatedUsizeList(allocator, "COLLO_BENCH_H2_ENGINE_ENGINES", &default_engines);
     defer allocator.free(engines_list);
@@ -427,7 +433,10 @@ fn cellConfig(cell: Cell) egress.Config {
     const stream_window: u32 = @intCast(window_target);
     const conn_window: u32 = @intCast(@max(conn_target, window_target));
     return .{
-        .allow_private_networks = true,
+        // Each engine starts its own origins on ports the kernel picks, so
+        // `runEngine` replaces this with the policy that names them before
+        // any task runs.
+        .network = egress.network.deny_all,
         .insecure_tls = true,
         .enable_http2 = true,
         .socket_timeout_ms = 30_000,
@@ -720,6 +729,15 @@ fn runEngine(context: *EngineContext) !void {
             origin.url = try std.fmt.allocPrint(allocator, "https://{s}:{d}/bench", .{ origin_host, port });
         }
     }
+
+    // The engine below, and every task it runs, ends before this returns,
+    // so the grant outlives every hop that reads it.
+    var origin_ports: [max_origins_per_engine]u16 = undefined;
+    for (origins, 0..) |origin, index|
+        origin_ports[index] = origin.port;
+    var grant: local_origin.LocalGrant = undefined;
+    try grant.init(origin_address, origin_ports[0..origin_count]);
+    context.config.network = grant.policy();
 
     // Binding each slot to one origin up front keeps an origin's concurrency
     // within the HTTP/2 stream limit, so the engine never opens a second
@@ -1235,41 +1253,6 @@ fn printJsonSample(cell: Cell, iteration: usize, sample: Sample) void {
             );
         }
     }
-}
-
-const route_probe_ipv4 = "1.1.1.1";
-const route_probe_port: u16 = 9;
-
-fn routableLocalIpv4(out: *[64]u8) ![]const u8 {
-    const address = try defaultRouteSourceAddress();
-    (egress.EgressPolicy{ .allow_private_networks = true }).validateResolvedAddress(address) catch {
-        std.debug.print("egress_h2_engine: default-route source address is not egress-permitted\n", .{});
-        return error.BenchNoRoutableLocalAddress;
-    };
-    const bytes = egress.ipv4Bytes(address);
-    return std.fmt.bufPrint(out, "{d}.{d}.{d}.{d}", .{ bytes[0], bytes[1], bytes[2], bytes[3] });
-}
-
-fn defaultRouteSourceAddress() !std.net.Address {
-    const remote = try std.net.Address.parseIp4(route_probe_ipv4, route_probe_port);
-    const socket = try std.posix.socket(
-        std.posix.AF.INET,
-        std.posix.SOCK.DGRAM | std.posix.SOCK.CLOEXEC,
-        0,
-    );
-    defer std.posix.close(socket);
-
-    // UDP connect does not send a packet; it only asks the kernel which source
-    // address would be used for a normal routed connection.
-    try std.posix.connect(socket, &remote.any, remote.getOsSockLen());
-
-    var storage: std.posix.sockaddr.storage = undefined;
-    var storage_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
-    try std.posix.getsockname(socket, @ptrCast(&storage), &storage_len);
-    if (storage.family != std.posix.AF.INET)
-        return error.BenchNoRoutableLocalAddress;
-    const socket_address: *align(4) const std.posix.sockaddr = @ptrCast(&storage);
-    return std.net.Address.initPosix(socket_address);
 }
 
 fn monotonicNowNs() !u64 {

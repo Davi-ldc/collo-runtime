@@ -5,11 +5,17 @@
 //! The drivers stand in for the owner loop (drive, park on poll(2), resume)
 //! and for a connector thread (policy resolve and dial on `.connect`), and
 //! follow redirects as the engine's followH1Redirect does: the hop's meters
-//! go into the cross-hop base and a fresh exchange starts.
+//! go into the cross-hop base and a fresh exchange starts, whose plan
+//! decides the new hop under the same network policy.
+//!
+//! The origin serves on this host's routable address, and its `policy`
+//! admits that address on the origin's port alone, so a redirect to any
+//! other port or host is refused before a connection opens.
 
 const std = @import("std");
 const local_address = @import("collo_test_net");
 const egress_client = @import("collo_egress_client");
+const network_policy = @import("../network_policy.zig");
 pub const transport = egress_client.transport;
 pub const decompress = transport.decompress;
 pub const fetch_body = egress_client.fetch_body;
@@ -201,7 +207,10 @@ pub fn runExchange(
                     current_url = redirect.url;
                     current_method = redirect.method;
                     current_headers = redirect.headers;
-                    current_body = redirect.body;
+                    switch (redirect.body) {
+                        .keep => {},
+                        .drop => current_body = "",
+                    }
                     redirect_count += 1;
                     continue :hop;
                 },
@@ -343,8 +352,9 @@ pub fn driveContinuationOwnerShaped(
 }
 
 /// What a connector thread does for an HTTP/1 dial (completeH1Connect):
-/// resolve under the policy, then connect. Every hop dials through here, so
-/// the policy is checked again on each one.
+/// plan the hop under the network policy, resolve it with every answer
+/// checked against the hop's admission, then connect. Every hop dials
+/// through here, so the policy is checked again on each one.
 fn dialForExchange(
     allocator: std.mem.Allocator,
     dns: *transport.DnsCache,
@@ -355,11 +365,7 @@ fn dialForExchange(
 ) !transport.HttpConnection {
     var plan = try transport.prepareRequest(allocator, url, method, headers, config);
     defer plan.deinit();
-    const policy = transport.EgressPolicy{
-        .allow_plain_http = config.allow_plain_http,
-        .allow_private_networks = config.allow_private_networks,
-    };
-    var target = try policy.resolveRequestTargetUntil(
+    var target = try transport.resolveRequestTargetUntil(
         allocator,
         dns,
         plan.target,
@@ -414,6 +420,9 @@ pub const LocalHttp1Origin = struct {
     /// counter is the client's recorded park count and pacing never depends
     /// on a sleep.
     paced_gate: std.atomic.Value(usize),
+    /// Backs `policy`, which points into it; the origin's heap address keeps
+    /// it in place.
+    origins: network_policy.Origins,
 
     pub fn start(allocator: std.mem.Allocator) !*LocalHttp1Origin {
         var host_buffer: [64]u8 = undefined;
@@ -434,13 +443,21 @@ pub const LocalHttp1Origin = struct {
             .response_wire = std.atomic.Value(u64).init(0),
             .stopping = std.atomic.Value(bool).init(false),
             .paced_gate = std.atomic.Value(usize).init(0),
+            .origins = .{},
         };
+        try origin.origins.init(origin.host(), &.{origin.port});
         origin.thread = try std.Thread.spawn(.{}, LocalHttp1Origin.threadMain, .{origin});
         return origin;
     }
 
     pub fn host(self: *const LocalHttp1Origin) []const u8 {
         return self.host_buffer[0..self.host_len];
+    }
+
+    /// Plain HTTP and HTTPS to this origin's address and port, and nowhere
+    /// else. Valid until `stop`.
+    pub fn policy(self: *const LocalHttp1Origin) transport.network.Policy {
+        return self.origins.policy();
     }
 
     pub fn stop(self: *LocalHttp1Origin, allocator: std.mem.Allocator) void {
@@ -714,6 +731,17 @@ pub const LocalHttp1Origin = struct {
                 stream.writeAll(response_wire) catch return;
                 return;
             }
+            if (redirectPort(received)) |target_port| {
+                var response: [192]u8 = undefined;
+                const response_wire = std.fmt.bufPrint(
+                    &response,
+                    "HTTP/1.1 302 Found\r\nlocation: http://{s}:{d}/one\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                    .{ self.host(), target_port },
+                ) catch return;
+                _ = self.response_wire.fetchAdd(@intCast(response_wire.len), .acq_rel);
+                stream.writeAll(response_wire) catch return;
+                return;
+            }
             const stall_body = [_]u8{'s'} ** 64;
             const body = if (is_gzip)
                 gzip_body[0..]
@@ -790,6 +818,17 @@ pub const LocalHttp1Origin = struct {
             }
         }
         return buffer[0..received_len];
+    }
+
+    /// The port of a `GET /redirect-port/<port>` request, which the origin
+    /// answers with a 302 to `/one` on that port of its own address.
+    fn redirectPort(request: []const u8) ?u16 {
+        const prefix = "GET /redirect-port/";
+        if (!std.mem.startsWith(u8, request, prefix))
+            return null;
+        const rest = request[prefix.len..];
+        const end = std.mem.indexOfScalar(u8, rest, ' ') orelse return null;
+        return std.fmt.parseInt(u16, rest[0..end], 10) catch null;
     }
 
     fn parseContentLength(headers: []const u8) usize {

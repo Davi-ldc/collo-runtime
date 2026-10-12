@@ -18,12 +18,14 @@ pub const ResponseStreamDrain = common.ResponseStreamDrain;
 
 /// Registers a whole-body read of `kind` on the view `identity` names and
 /// returns its body id. Takes ownership of `deferred` on every path. On
-/// success the body owns the promise and holds an extra reference until
-/// `ready.executeReady` settles it. Fails with
-/// `error.FetchBodyOutsideActiveRequest` when the request is gone or its
-/// generation moved on, `error.FetchBodyNotFound`, `error.InvalidPromiseDeferred`
-/// for an empty `deferred`, `error.FetchBodyAlreadyUsed` when the view was read
-/// or released, or `error.OutOfMemory`.
+/// success the body owns the promise until `ready.executeReady` settles it;
+/// the stored reader takes no reference, since the table's covers it until
+/// the settlement takes its own (`ready.zig`). Fails with
+/// `error.FetchBodyOutsideActiveRequest` when the request is gone, its
+/// generation moved on or its finish started (`common.acceptingRequest`),
+/// `error.FetchBodyNotFound`, `error.InvalidPromiseDeferred` for an empty
+/// `deferred`, `error.FetchBodyAlreadyUsed` when the view was read or
+/// released, or `error.OutOfMemory`.
 pub fn scheduleConsume(
     runtime: *egress_context.Context,
     identity: bindings.FetchBodyIdentity,
@@ -33,14 +35,8 @@ pub fn scheduleConsume(
 ) !u64 {
     var owned_deferred = deferred;
     errdefer owned_deferred.deinit();
-    const request = runtime.requests.get(identity.request_id) orelse return error.FetchBodyOutsideActiveRequest;
-    if (request.request_generation != identity.request_generation)
-        return error.FetchBodyOutsideActiveRequest;
+    _ = try common.acceptingRequest(runtime, identity);
     const body = common.ptr(runtime, identity) orelse return error.FetchBodyNotFound;
-    body.retain();
-    var body_retained = true;
-    errdefer if (body_retained)
-        body.releaseAfterQueuedResourcesReleased(runtime.allocator);
 
     const owned_content_type = try runtime.allocator.dupe(u8, content_type);
     var content_type_moved = false;
@@ -63,7 +59,6 @@ pub fn scheduleConsume(
 
     if (should_queue)
         try common.pushClaimedReady(runtime, body);
-    body_retained = false;
     return identity.body_id;
 }
 
@@ -78,14 +73,8 @@ pub fn schedulePull(
 ) !u64 {
     var owned_deferred = deferred;
     errdefer owned_deferred.deinit();
-    const request = runtime.requests.get(identity.request_id) orelse return error.FetchBodyOutsideActiveRequest;
-    if (request.request_generation != identity.request_generation)
-        return error.FetchBodyOutsideActiveRequest;
+    _ = try common.acceptingRequest(runtime, identity);
     const body = common.ptr(runtime, identity) orelse return error.FetchBodyNotFound;
-    body.retain();
-    var body_retained = true;
-    errdefer if (body_retained)
-        body.releaseAfterQueuedResourcesReleased(runtime.allocator);
 
     const raw_deferred = try owned_deferred.take();
     var waiter = FetchBodyPullWaiter{ .deferred = raw_deferred };
@@ -99,12 +88,13 @@ pub fn schedulePull(
 
     if (should_queue)
         try common.pushClaimedReady(runtime, body);
-    body_retained = false;
     return identity.body_id;
 }
 
 /// Registers a pull without a promise for the response stream that forwards
-/// this body as the request's response, taking no extra reference. When the
+/// this body as the request's response, taking no extra reference. It is the
+/// worker's own pull of a response already decided, so it needs no
+/// `acceptsWork`, only the request under the body's generation. When the
 /// body turns ready, `serve/response.zig` takes the chunk through
 /// `drainResponseStreamReady`. Fails as `schedulePull` does.
 pub fn beginResponseStreamPull(
@@ -155,9 +145,7 @@ pub fn borrow(runtime: *egress_context.Context, identity: bindings.FetchBodyIden
 /// `error.FetchBodyNotReadable` for a view failed without a message, or
 /// `error.OutOfMemory`.
 pub fn clone(runtime: *egress_context.Context, identity: bindings.FetchBodyIdentity) !bindings.FetchBodyIdentity {
-    const request = runtime.requests.get(identity.request_id) orelse return error.FetchBodyOutsideActiveRequest;
-    if (request.request_generation != identity.request_generation)
-        return error.FetchBodyOutsideActiveRequest;
+    const request = try common.acceptingRequest(runtime, identity);
     const body = common.ptr(runtime, identity) orelse return error.FetchBodyNotFound;
     const cloned_identity = common.nextIdentity(runtime, request, identity.fetch_id);
     const branch = try body.cloneBranch(runtime.allocator, cloned_identity);

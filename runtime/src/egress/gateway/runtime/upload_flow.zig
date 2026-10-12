@@ -1,24 +1,29 @@
 //! Assembly of the request bodies a worker sends through its upload pool, as a comptime mixin
 //! over the gateway run on its loop thread. A fetch start with the body-pooled flag is admitted
-//! in full (its token verified, a fetch taken from the token's budget, its route and counts
-//! recorded; `runtime/worker_flow.zig`) and then waits here, with the submit options admission
-//! chose for it, while the worker streams its body as upload-pool extents. Each extent is copied
-//! into the fetch's assembly buffer and released to the pool at once, so the pool only carries
-//! bytes in transit and no fetch holds pool space while it waits; `Policy.max_request_body_bytes`
-//! bounds a body, not the pool's size. Once the announced length has arrived, the fetch goes to
-//! its shard engine with the buffer handed over without a copy, and the task keeps it, so a
-//! redirect replays the body as it does an inline one.
+//! in full (its shape checked, its token verified, a fetch taken from the token's budget, its
+//! route, counts and upload bytes recorded; `runtime/worker_flow.zig`) and then waits here, with
+//! the submit options and the response cap admission chose for it, while the worker streams its
+//! body as upload-pool extents. Each extent is copied into the fetch's assembly buffer and
+//! released to the pool at once, so the pool only carries bytes in transit and no fetch holds
+//! pool space while it waits. Once the announced length has arrived, the fetch goes to its shard
+//! engine with the buffer handed over without a copy, and the task keeps it, so a redirect that
+//! keeps the body replays it as it does an inline one.
 //!
-//! The buffer comes from the gateway's allocator and goes back to it, never through the shard's
-//! counting allocator, so the shard's memory count and budget never see it. The task may drop it
-//! on an engine thread, which is safe because every shard's counting allocator forwards to that
-//! same allocator (`shard.Shard.init`), and engine threads already free through it.
+//! Three bounds hold the buffers. Each session holds at most
+//! `ipc.fetch_limits.request_body_pooled_in_flight_bytes_max` of announced lengths (admission).
+//! Every buffer comes from the gateway's upload allocator, a counting allocator with
+//! `supervisor_limits.upload_memory`'s budget, so a full budget fails the next pooled start's
+//! allocation and that fetch alone; the buffer goes back to it wherever the task that holds it
+//! ends, an engine thread included, since the counting allocator is thread safe. And an upload
+//! still assembling at its token's deadline fails and frees its buffer at the next loop pass
+//! (`expirePendingUploads`), so a worker that never sends its extents holds nothing past the
+//! request it belongs to. The shards' counting allocators never see an assembly buffer.
 //!
 //! Assembly state never outlives the fetch's route: whatever removes the route, a cancel, the
-//! worker's removal, a failure or the `request_ended` of the request whose token admitted the
-//! fetch, also drops it (`retireRoute` in `runtime/worker_flow.zig`). Only a failure gives the
-//! fetch back to the token's budget; a canceled fetch stays spent, and the other two take the
-//! budget away with the session or the request.
+//! worker's removal, a failure, the deadline or the `request_ended` of the request whose token
+//! admitted the fetch, also drops it (`retireRoute` in `runtime/worker_flow.zig`). A failure and
+//! the deadline give the fetch back to the token's budget; a canceled fetch stays spent, and the
+//! other two take the budget away with the session or the request.
 
 const std = @import("std");
 const ipc = @import("collo_ipc");
@@ -41,6 +46,9 @@ pub const PendingUpload = struct {
     /// whose budget it took a fetch from (`budget_key`). Submission adds the assembled body as
     /// `owned_body`, which is null until then.
     options: engine_mod.SubmitOptions,
+    /// The response cap admission resolved from the start (`engine.validateStart`), which the
+    /// submission passes on.
+    max_response_body_bytes: usize,
     /// Wire flags minus the pooled bit, so the engine task stores the same
     /// flags an inline submission would.
     flags: u32,
@@ -49,33 +57,49 @@ pub const PendingUpload = struct {
     /// Flat name/value byte storage `headers` slices point into.
     header_bytes: []u8,
     headers: []ipc.RequestHeader,
-    /// The assembly buffer, sized to the announced length, from the gateway's allocator.
-    /// Submission hands it to the engine with that allocator and empties this field, so `deinit`
-    /// frees it only for a fetch that never reached the engine.
+    /// The assembly buffer, sized to the announced length, from `buffer_allocator`, the
+    /// gateway's upload allocator. Submission hands it to the engine with that allocator and
+    /// empties this field, so `deinit` frees it only for a fetch that never reached the engine.
     buffer: []u8,
+    buffer_allocator: std.mem.Allocator,
     /// Bytes assembled so far. Extents arrive in order, each announcing the running total.
     received: u64,
     /// Links the uploads of one request (`PendingUploads.by_request`).
     request_node: std.DoublyLinkedList.Node = .{},
+    /// Links every upload in deadline order (`PendingUploads.by_deadline`).
+    deadline_node: std.DoublyLinkedList.Node = .{},
 
+    /// Frees what the upload owns: its strings with `allocator`, the gateway's, and a buffer it
+    /// still holds with `buffer_allocator`.
     pub fn deinit(self: *PendingUpload, allocator: std.mem.Allocator) void {
         allocator.free(self.method);
         allocator.free(self.url);
         allocator.free(self.headers);
         allocator.free(self.header_bytes);
         if (self.buffer.len != 0)
-            allocator.free(self.buffer);
+            self.buffer_allocator.free(self.buffer);
         self.* = undefined;
+    }
+
+    /// The instant from which the upload's token admits nothing; no deadline, which only a
+    /// test's token has, sorts last.
+    fn deadline(self: *const PendingUpload) u64 {
+        const value = self.options.request_deadline_mono_ns;
+        return if (value == 0) std.math.maxInt(u64) else value;
     }
 };
 
-/// The gateway's uploads still assembling, by the fetch the worker's extents name and by the
+/// The gateway's uploads still assembling, by the fetch the worker's extents name, by the
 /// request whose token admitted them, so `request_ended` finds a request's uploads without a
-/// scan. An upload is in both indexes or in neither, and a request has an entry in `by_request`
-/// only while its list holds an upload. The indexes own the uploads.
+/// scan, and in deadline order, so a loop pass finds the expired ones at the front. An upload is
+/// in all three or in none, and a request has an entry in `by_request` only while its list holds
+/// an upload. The indexes own the uploads.
 pub const PendingUploads = struct {
     by_fetch: std.AutoHashMapUnmanaged(PendingKey, *PendingUpload) = .empty,
     by_request: std.AutoHashMapUnmanaged(budgets.BudgetKey, std.DoublyLinkedList) = .empty,
+    /// Earliest deadline first. Tokens are minted with later deadlines as time passes, so an
+    /// insertion walks back from the tail and usually stops at once.
+    by_deadline: std.DoublyLinkedList = .{},
 
     /// Frees every upload still assembling.
     pub fn deinit(self: *PendingUploads, allocator: std.mem.Allocator) void {
@@ -121,9 +145,34 @@ pub const PendingUploads = struct {
         if (!entry.found_existing)
             entry.value_ptr.* = .{};
         entry.value_ptr.append(&pending.request_node);
+        self.insertByDeadline(pending);
     }
 
-    /// Takes the upload of `key` out of both indexes and returns it, or null when there is none;
+    /// Links `pending` after the last upload whose deadline is not later than its own, so
+    /// uploads of one deadline keep their arrival order.
+    fn insertByDeadline(self: *PendingUploads, pending: *PendingUpload) void {
+        const deadline = pending.deadline();
+        var cursor = self.by_deadline.last;
+        while (cursor) |node| : (cursor = node.prev) {
+            const other: *PendingUpload = @fieldParentPtr("deadline_node", node);
+            if (other.deadline() <= deadline) {
+                self.by_deadline.insertAfter(node, &pending.deadline_node);
+                return;
+            }
+        }
+        self.by_deadline.prepend(&pending.deadline_node);
+    }
+
+    /// The upload with the earliest deadline when that deadline is at or before `now_ns`.
+    pub fn firstExpired(self: *const PendingUploads, now_ns: u64) ?*PendingUpload {
+        const node = self.by_deadline.first orelse return null;
+        const pending: *PendingUpload = @fieldParentPtr("deadline_node", node);
+        if (pending.deadline() <= now_ns)
+            return pending;
+        return null;
+    }
+
+    /// Takes the upload of `key` out of every index and returns it, or null when there is none;
     /// the caller owns the upload afterwards.
     fn remove(self: *PendingUploads, key: PendingKey) ?*PendingUpload {
         const removed = self.by_fetch.fetchRemove(key) orelse return null;
@@ -133,30 +182,31 @@ pub const PendingUploads = struct {
         uploads.remove(&pending.request_node);
         if (uploads.first == null)
             std.debug.assert(self.by_request.remove(budget_key));
+        self.by_deadline.remove(&pending.deadline_node);
         return pending;
     }
 };
 
 pub fn Methods(comptime Gateway: type) type {
     return struct {
-        /// Holds an admitted body-pooled fetch until its body has arrived, then submits it on
-        /// shard `shard_index` with the options admission chose. The caller keeps the admission
-        /// and undoes it when this fails: with `error.EgressGatewayRequestBodyLimitExceeded` for an
-        /// announced length of zero or above the policy, with
+        /// Holds an admitted body-pooled fetch, whose shape admission checked
+        /// (`engine.validateStart`), until its body has arrived, then submits it on shard
+        /// `shard_index` with the options and the response cap admission chose. The caller keeps
+        /// the admission and undoes it when this fails: with
         /// `error.EgressGatewayDuplicateFetchIdentity` for a fetch id already assembling, or with
-        /// `error.OutOfMemory`.
+        /// `error.OutOfMemory`, which a full upload budget also gives.
         pub fn registerPendingUpload(
             self: *Gateway,
             worker: *sessions.Worker,
             fetch: ipc.EgressFetchStartView,
             shard_index: usize,
             options: engine_mod.SubmitOptions,
+            max_response_body_bytes: usize,
         ) !void {
             std.debug.assert(options.owned_body == null);
             std.debug.assert(options.budget_key.session_id == worker.session_id);
-            if (fetch.pooled_body_len == 0 or
-                fetch.pooled_body_len > self.policy.max_request_body_bytes)
-                return error.EgressGatewayRequestBodyLimitExceeded;
+            std.debug.assert(fetch.pooled_body_len != 0);
+            std.debug.assert(fetch.pooled_body_len <= self.policy.max_request_body_bytes);
             const key = PendingKey{
                 .worker_session_id = worker.session_id,
                 .fetch_id = fetch.fetch_id,
@@ -188,8 +238,9 @@ pub fn Methods(comptime Gateway: type) type {
                 offset += header.value.len;
                 headers[index] = .{ .name = name, .value = value };
             }
-            const buffer = try self.allocator.alloc(u8, @intCast(fetch.pooled_body_len));
-            errdefer self.allocator.free(buffer);
+            const buffer_allocator = self.upload_memory.allocator();
+            const buffer = try buffer_allocator.alloc(u8, @intCast(fetch.pooled_body_len));
+            errdefer buffer_allocator.free(buffer);
 
             pending.* = .{
                 .route_key = .{
@@ -199,15 +250,37 @@ pub fn Methods(comptime Gateway: type) type {
                 },
                 .shard_index = shard_index,
                 .options = options,
+                .max_response_body_bytes = max_response_body_bytes,
                 .flags = fetch.flags & ~ipc.egress_fetch_start_flag_body_pooled,
                 .method = method,
                 .url = url,
                 .header_bytes = header_bytes,
                 .headers = headers,
                 .buffer = buffer,
+                .buffer_allocator = buffer_allocator,
                 .received = 0,
             };
             self.pending_uploads.putAssumeCapacity(key, pending);
+        }
+
+        /// Fails every upload still assembling whose token's deadline has come by `now_ns`,
+        /// without a strike, since only a slow worker or a slow loop gets there: each frees its
+        /// buffer and route, and its worker gets the fetch's error. The loop runs it on every
+        /// pass, at least once per `readiness.wait_tick_ns`.
+        pub fn expirePendingUploads(self: *Gateway, now_ns: u64) void {
+            while (self.pending_uploads.firstExpired(now_ns)) |pending| {
+                const key = PendingKey{
+                    .worker_session_id = pending.route_key.worker_session_id,
+                    .fetch_id = pending.route_key.fetch_id,
+                };
+                if (self.workers.bySession(key.worker_session_id)) |worker| {
+                    self.failPendingUpload(worker, key, "egress upload deadline exceeded");
+                } else {
+                    // Removing a worker removes its routes and their uploads with them, so this
+                    // branch keeps the loop advancing should that ever not hold.
+                    self.retirePendingUpload(key.worker_session_id, key.fetch_id);
+                }
+            }
         }
 
         /// Applies a batch of upload extents and returns false when the worker must be dropped:
@@ -282,7 +355,7 @@ pub fn Methods(comptime Gateway: type) type {
             // succeeds or fails, and frees it with the allocator that
             // allocated it (`engine.SubmitOptions.owned_body`).
             var options = pending.options;
-            options.owned_body = .{ .bytes = pending.buffer, .allocator = self.allocator };
+            options.owned_body = .{ .bytes = pending.buffer, .allocator = pending.buffer_allocator };
             pending.buffer = &.{};
             self.shards.get(pending.shard_index).engine.submit(worker.session_id, .{
                 .fetch_id = key.fetch_id,
@@ -290,7 +363,7 @@ pub fn Methods(comptime Gateway: type) type {
                 .egress_token = ipc.egress_token.none,
                 .body_id = pending.route_key.body_id,
                 .flags = pending.flags,
-                .max_body_bytes = 0,
+                .max_body_bytes = pending.max_response_body_bytes,
                 .method = pending.method,
                 .url = pending.url,
                 .headers = pending.headers,

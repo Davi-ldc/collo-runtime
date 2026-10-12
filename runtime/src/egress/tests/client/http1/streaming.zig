@@ -1,13 +1,14 @@
 //! Tests for the HTTP/1 exchange and body continuation against the local
-//! origin in support.zig, covering pooling, replay, framing, redirects,
-//! drive budgets, would-block parks and billing. The support drivers stand in
-//! for the owner loop, parking on poll(2) between drives, and for a connector
-//! thread, dialing on `.connect`. Paced tests hold the origin on parks the
-//! client recorded instead of on sleeps. Behavior that needs the real owner
-//! and connector threads, such as fairness between fetches, is tested in
-//! client/all.zig.
+//! origin in support.zig, covering pooling, replay, framing, redirects and
+//! the network policy on each redirect hop, drive budgets, would-block parks
+//! and billing. The support drivers stand in for the owner loop, parking on
+//! poll(2) between drives, and for a connector thread, dialing on
+//! `.connect`. Paced tests hold the origin on parks the client recorded
+//! instead of on sleeps. Behavior that needs the real owner and connector
+//! threads, such as fairness between fetches, is tested in client/all.zig.
 
 const std = @import("std");
+const network_policy = @import("../network_policy.zig");
 const test_support = @import("support.zig");
 const transport = test_support.transport;
 const decompress = test_support.decompress;
@@ -31,7 +32,7 @@ test "egress request plan does not resolve network addresses" {
         "https://does-not-exist.invalid/hello",
         "GET",
         &.{},
-        .{},
+        .{ .network = network_policy.public_https },
     );
     defer plan.deinit();
 
@@ -63,8 +64,7 @@ test "egress http1 streaming path publishes headers before body" {
         "payload",
         &headers,
         .{
-            .allow_plain_http = true,
-            .allow_private_networks = true,
+            .network = origin.policy(),
             .max_response_body_bytes = 64,
         },
         .{},
@@ -83,9 +83,6 @@ test "egress http1 streaming path publishes headers before body" {
 }
 
 test "egress http1 compressed response decodes through streaming body path" {
-    if (!decompress.supportsZlib())
-        return error.SkipZigTest;
-
     var origin = try LocalHttp1Origin.start(std.testing.allocator);
     defer origin.stop(std.testing.allocator);
 
@@ -108,8 +105,7 @@ test "egress http1 compressed response decodes through streaming body path" {
         "payload",
         &.{},
         .{
-            .allow_plain_http = true,
-            .allow_private_networks = true,
+            .network = origin.policy(),
             .max_response_body_bytes = 64,
         },
         .{},
@@ -135,8 +131,7 @@ test "egress http1 pool caps requests per connection" {
     defer pool.deinit();
 
     const config = transport.Config{
-        .allow_plain_http = true,
-        .allow_private_networks = true,
+        .network = origin.policy(),
         .max_response_body_bytes = 64,
         .http1_pool_max_requests_per_connection = 2,
     };
@@ -176,8 +171,7 @@ test "egress http1 retries idempotent request when pooled connection was half cl
     defer pool.deinit();
 
     const config = transport.Config{
-        .allow_plain_http = true,
-        .allow_private_networks = true,
+        .network = origin.policy(),
         .max_response_body_bytes = 64,
     };
 
@@ -216,8 +210,7 @@ test "egress http1 pool evicts connections past max age" {
     defer pool.deinit();
 
     const config = transport.Config{
-        .allow_plain_http = true,
-        .allow_private_networks = true,
+        .network = origin.policy(),
         .max_response_body_bytes = 64,
         .http1_pool_max_connection_age_ns = 1,
     };
@@ -269,8 +262,7 @@ test "egress http1 empty-body POST sends explicit content-length zero" {
         "",
         &.{},
         .{
-            .allow_plain_http = true,
-            .allow_private_networks = true,
+            .network = origin.policy(),
             .max_response_body_bytes = 64,
         },
         .{},
@@ -294,8 +286,7 @@ test "egress http1 does not replay pooled request after read timeout" {
     defer pool.deinit();
 
     const config = transport.Config{
-        .allow_plain_http = true,
-        .allow_private_networks = true,
+        .network = origin.policy(),
         .max_response_body_bytes = 64,
         .socket_timeout_ms = 100,
     };
@@ -351,8 +342,7 @@ test "egress http1 liveness probe discards dead pooled connections before non-re
     defer pool.deinit();
 
     const config = transport.Config{
-        .allow_plain_http = true,
-        .allow_private_networks = true,
+        .network = origin.policy(),
         .max_response_body_bytes = 64,
     };
 
@@ -393,8 +383,7 @@ test "egress http1 honors server keep-alive timeout hint" {
     defer pool.deinit();
 
     const config = transport.Config{
-        .allow_plain_http = true,
-        .allow_private_networks = true,
+        .network = origin.policy(),
         .max_response_body_bytes = 64,
     };
 
@@ -435,8 +424,7 @@ test "egress http1 caps consecutive interim responses" {
     defer pool.deinit();
 
     const config = transport.Config{
-        .allow_plain_http = true,
-        .allow_private_networks = true,
+        .network = origin.policy(),
         .max_response_body_bytes = 64,
     };
 
@@ -502,8 +490,7 @@ test "egress http1 accepts bare-LF response heads from the wire" {
         "",
         &.{},
         .{
-            .allow_plain_http = true,
-            .allow_private_networks = true,
+            .network = origin.policy(),
             .max_response_body_bytes = 64,
         },
         .{},
@@ -535,8 +522,7 @@ test "egress http1 does not pool lenient bare-LF keep-alive responses" {
     var pool = transport.Http1Pool.init(std.testing.allocator);
     defer pool.deinit();
     const config = transport.Config{
-        .allow_plain_http = true,
-        .allow_private_networks = true,
+        .network = origin.policy(),
         .max_response_body_bytes = 64,
     };
 
@@ -663,8 +649,7 @@ test "egress http1 rejects ambiguous response framing before publishing body" {
         "",
         &.{},
         .{
-            .allow_plain_http = true,
-            .allow_private_networks = true,
+            .network = origin.policy(),
             .max_response_body_bytes = 64,
         },
         .{},
@@ -674,10 +659,11 @@ test "egress http1 rejects ambiguous response framing before publishing body" {
     try std.testing.expect(!context.published);
 }
 
-test "egress http1 redirect revalidates SSRF policy on every hop" {
+test "egress http1 redirect to a loopback address fails with EgressReservedAddressDenied" {
     var origin = try LocalHttp1Origin.start(std.testing.allocator);
     defer origin.stop(std.testing.allocator);
 
+    // The origin redirects to 127.0.0.1 on its own port.
     const url = try std.fmt.allocPrint(std.testing.allocator, "http://{s}:{d}/redirect-loopback", .{ origin.host(), origin.port });
     defer std.testing.allocator.free(url);
 
@@ -689,7 +675,7 @@ test "egress http1 redirect revalidates SSRF policy on every hop" {
     defer test_support.releaseBodyPipe(body_pipe, std.testing.allocator);
     var context = Http1HeaderContext{ .expected_url = url };
 
-    try std.testing.expectError(error.EgressDenied, fetchViaExchange(
+    try std.testing.expectError(error.EgressReservedAddressDenied, fetchViaExchange(
         std.testing.allocator,
         &pool,
         &dns_cache,
@@ -698,8 +684,7 @@ test "egress http1 redirect revalidates SSRF policy on every hop" {
         "",
         &.{},
         .{
-            .allow_plain_http = true,
-            .allow_private_networks = true,
+            .network = origin.policy(),
             .max_response_body_bytes = 64,
         },
         .{},
@@ -707,6 +692,50 @@ test "egress http1 redirect revalidates SSRF policy on every hop" {
         &context,
     ));
     try std.testing.expect(!context.published);
+    try std.testing.expectEqual(@as(usize, 1), origin.accepted.load(.acquire));
+}
+
+test "egress http1 redirect to a port the policy does not name fails with EgressPortDenied and connects nowhere" {
+    var origin = try LocalHttp1Origin.start(std.testing.allocator);
+    defer origin.stop(std.testing.allocator);
+    // Serves on the same address as `origin`, on a port its policy omits.
+    var unnamed = try LocalHttp1Origin.start(std.testing.allocator);
+    defer unnamed.stop(std.testing.allocator);
+
+    const url = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "http://{s}:{d}/redirect-port/{d}",
+        .{ origin.host(), origin.port, unnamed.port },
+    );
+    defer std.testing.allocator.free(url);
+
+    var dns_cache = transport.DnsCache.init(std.testing.allocator, .{});
+    defer dns_cache.deinit();
+    var pool = transport.Http1Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    const body_pipe = try test_support.makeBodyPipe(std.testing.allocator, default_body_pipe_capacity);
+    defer test_support.releaseBodyPipe(body_pipe, std.testing.allocator);
+    var context = Http1HeaderContext{ .expected_url = url };
+
+    try std.testing.expectError(error.EgressPortDenied, fetchViaExchange(
+        std.testing.allocator,
+        &pool,
+        &dns_cache,
+        url,
+        "GET",
+        "",
+        &.{},
+        .{
+            .network = origin.policy(),
+            .max_response_body_bytes = 64,
+        },
+        .{},
+        body_pipe,
+        &context,
+    ));
+    try std.testing.expect(!context.published);
+    try std.testing.expectEqual(@as(usize, 1), origin.accepted.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), unnamed.accepted.load(.acquire));
 }
 
 test "egress http1 detached body completion returns connection to the pool" {
@@ -721,8 +750,7 @@ test "egress http1 detached body completion returns connection to the pool" {
     var pool = transport.Http1Pool.init(std.testing.allocator);
     defer pool.deinit();
     const config = transport.Config{
-        .allow_plain_http = true,
-        .allow_private_networks = true,
+        .network = origin.policy(),
         .max_response_body_bytes = 64,
     };
 
@@ -781,8 +809,7 @@ test "egress http1 body continuation yields on the drive budget" {
     // Ample credit everywhere: the pump never pauses, so only the drive
     // budget can stop the transfer mid-body.
     const config = transport.Config{
-        .allow_plain_http = true,
-        .allow_private_networks = true,
+        .network = origin.policy(),
         .max_response_body_bytes = big_len * 2,
         .max_encoded_response_bytes = big_len * 2,
         .max_pending_decoded_body_bytes = big_len * 2,
@@ -856,8 +883,7 @@ test "egress http1 body continuation re-parks through the would_block probe" {
     defer pool.deinit();
     const body_len = test_support.paced_body_bytes;
     const config = transport.Config{
-        .allow_plain_http = true,
-        .allow_private_networks = true,
+        .network = origin.policy(),
         .max_response_body_bytes = body_len * 2,
         .max_encoded_response_bytes = body_len * 2,
         .max_pending_decoded_body_bytes = body_len * 2,
@@ -914,8 +940,7 @@ test "egress http1 owner-shaped stall window expires a silent mid-body origin" {
     var pool = transport.Http1Pool.init(std.testing.allocator);
     defer pool.deinit();
     const config = transport.Config{
-        .allow_plain_http = true,
-        .allow_private_networks = true,
+        .network = origin.policy(),
         .max_response_body_bytes = 1024,
         .socket_timeout_ms = 150,
     };
@@ -1007,8 +1032,7 @@ test "egress http1 would_block park records TLS mask changes per re-park" {
     var pool = transport.Http1Pool.init(std.testing.allocator);
     defer pool.deinit();
     const config = transport.Config{
-        .allow_plain_http = true,
-        .allow_private_networks = true,
+        .network = network_policy.public_https,
         .insecure_tls = true,
         .max_response_body_bytes = 4096,
         .socket_timeout_ms = 300,
@@ -1135,8 +1159,7 @@ test "egress http1 redirect chain sums billed bytes across hops" {
     var pool = transport.Http1Pool.init(std.testing.allocator);
     defer pool.deinit();
     const config = transport.Config{
-        .allow_plain_http = true,
-        .allow_private_networks = true,
+        .network = origin.policy(),
         .max_response_body_bytes = 64,
     };
 

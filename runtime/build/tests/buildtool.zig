@@ -346,6 +346,33 @@ test "buildtool archiveMatchesArch validates every object member" {
     );
 }
 
+test "buildtool archiveMatchesArch admits ICU's .ao object members and refuses other suffixes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const elf_header = syntheticElfHeader(x86_64_machine);
+
+    const icu_style = try tmp.dir.createFile("libicuuc.a", .{});
+    try icu_style.writeAll(archive_magic);
+    try writeMemberHeader(icu_style, "uchar.ao/", elf_header.len);
+    try icu_style.writeAll(&elf_header);
+    icu_style.close();
+    const icu_path = try tmp.dir.realpathAlloc(std.testing.allocator, "libicuuc.a");
+    defer std.testing.allocator.free(icu_path);
+    try std.testing.expect(try buildtool.archiveMatchesArch(std.testing.allocator, icu_path, "x86_64"));
+
+    const shared_member = try tmp.dir.createFile("libshared-member.a", .{});
+    try shared_member.writeAll(archive_magic);
+    try writeMemberHeader(shared_member, "libz.so/", elf_header.len);
+    try shared_member.writeAll(&elf_header);
+    shared_member.close();
+    const shared_path = try tmp.dir.realpathAlloc(std.testing.allocator, "libshared-member.a");
+    defer std.testing.allocator.free(shared_path);
+    try std.testing.expectError(
+        error.ArchiveMemberNameInvalid,
+        buildtool.archiveMatchesArch(std.testing.allocator, shared_path, "x86_64"),
+    );
+}
+
 test "buildtool archiveMatchesArch rejects noncanonical size trailer and padding" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

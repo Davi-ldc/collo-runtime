@@ -8,12 +8,19 @@
 
 const std = @import("std");
 const build_options = @import("collo_bench_build_options");
+const bench_common = @import("common.zig");
+
+const release_fast_required_env = "COLLO_BENCH_REQUIRE_RELEASEFAST";
 
 /// Prints the metadata line for `bench_name`. A /proc file that cannot be
-/// read prints as "unknown". Fails with `error.BenchmarkRequiresReleaseFast`
-/// for a non-ReleaseFast build when COLLO_BENCH_REQUIRE_RELEASEFAST is 1, and
-/// with `error.OutOfMemory`.
+/// read prints as "unknown". Fails with `error.InvalidEnvironmentSwitch`
+/// before printing when COLLO_BENCH_REQUIRE_RELEASEFAST holds anything but 1,
+/// 0 or nothing, in any build mode, so a misspelled gate never lets a slower
+/// build's numbers through; with `error.BenchmarkRequiresReleaseFast` for a
+/// non-ReleaseFast build when the variable is 1; and with
+/// `error.OutOfMemory`.
 pub fn print(allocator: std.mem.Allocator, bench_name: []const u8) !void {
+    const release_fast_required = try bench_common.envSwitch(release_fast_required_env);
     const final = std.mem.eql(u8, build_options.optimize_mode_name, "ReleaseFast");
     const machine = try readTrimmedOrUnknown(allocator, "/proc/sys/kernel/hostname", 256);
     defer allocator.free(machine);
@@ -38,17 +45,8 @@ pub fn print(allocator: std.mem.Allocator, bench_name: []const u8) !void {
 
     if (!final)
         std.debug.print("NOT FINAL: benchmark was not built with ReleaseFast\n", .{});
-    if (!final and releaseFastRequired(allocator))
+    if (!final and release_fast_required)
         return error.BenchmarkRequiresReleaseFast;
-}
-
-fn releaseFastRequired(allocator: std.mem.Allocator) bool {
-    const raw = std.process.getEnvVarOwned(allocator, "COLLO_BENCH_REQUIRE_RELEASEFAST") catch |err| switch (err) {
-        error.EnvironmentVariableNotFound => return false,
-        else => return false,
-    };
-    defer allocator.free(raw);
-    return std.mem.eql(u8, std.mem.trim(u8, raw, " \t\r\n"), "1");
 }
 
 fn readTrimmedOrUnknown(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {

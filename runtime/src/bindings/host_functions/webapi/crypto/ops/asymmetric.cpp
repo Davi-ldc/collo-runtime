@@ -24,21 +24,20 @@
 
 namespace Collo::HostFunctions::WebCrypto {
 
-static bool clearOutputAndFail(WTF::Vector<uint8_t>& out)
+static bool clearOutputAndFail(SecretBytes& out)
 {
-    secureZeroVector(out);
     out.clear();
     return false;
 }
 
 bool rsaSignDigestNative(EVP_PKEY* key, WebCryptoHash hash_id, std::span<const uint8_t> data, int padding,
-    std::optional<uint32_t> salt_length, WTF::Vector<uint8_t>& out)
+    std::optional<uint32_t> salt_length, SecretBytes& out)
 {
     const auto& hash = hashSpec(hash_id);
     auto* evp = hashEvp(hash);
     if (!evp)
         return false;
-    WTF::Vector<uint8_t> digest;
+    SecretBytes digest;
     if (!digestBytes(hash, data, digest))
         return false;
 
@@ -61,9 +60,8 @@ bool rsaSignDigestNative(EVP_PKEY* key, WebCryptoHash hash_id, std::span<const u
     size_t signature_len = 0;
     if (EVP_PKEY_sign(ctx.get(), nullptr, &signature_len, digest.span().data(), digest.size()) <= 0)
         return false;
-    if (!out.tryReserveInitialCapacity(signature_len))
+    if (!out.tryGrow(signature_len))
         return false;
-    out.grow(signature_len);
     auto fail = [&]() -> bool { return clearOutputAndFail(out); };
     if (EVP_PKEY_sign(ctx.get(), out.mutableSpan().data(), &signature_len, digest.span().data(), digest.size()) <= 0)
         return fail();
@@ -78,7 +76,7 @@ bool rsaVerifyDigestNative(EVP_PKEY* key, WebCryptoHash hash_id, std::span<const
     auto* evp = hashEvp(hash);
     if (!evp)
         return false;
-    WTF::Vector<uint8_t> digest;
+    SecretBytes digest;
     if (!digestBytes(hash, data, digest))
         return false;
 
@@ -130,7 +128,7 @@ static bool configureRsaOaep(EVP_PKEY_CTX* ctx, const HashSpec& hash, std::span<
 }
 
 bool rsaOaepEncryptNative(EVP_PKEY* key, WebCryptoHash hash, std::span<const uint8_t> label,
-    std::span<const uint8_t> plaintext, WTF::Vector<uint8_t>& out)
+    std::span<const uint8_t> plaintext, SecretBytes& out)
 {
     bssl::UniquePtr<EVP_PKEY_CTX> ctx(EVP_PKEY_CTX_new(key, nullptr));
     if (!ctx || EVP_PKEY_encrypt_init(ctx.get()) <= 0)
@@ -141,9 +139,8 @@ bool rsaOaepEncryptNative(EVP_PKEY* key, WebCryptoHash hash, std::span<const uin
     size_t ciphertext_len = 0;
     if (EVP_PKEY_encrypt(ctx.get(), nullptr, &ciphertext_len, plaintext.data(), plaintext.size()) <= 0)
         return false;
-    if (!out.tryReserveInitialCapacity(ciphertext_len))
+    if (!out.tryGrow(ciphertext_len))
         return false;
-    out.grow(ciphertext_len);
     auto fail = [&]() -> bool { return clearOutputAndFail(out); };
     if (EVP_PKEY_encrypt(ctx.get(), out.mutableSpan().data(), &ciphertext_len, plaintext.data(), plaintext.size()) <= 0)
         return fail();
@@ -152,7 +149,7 @@ bool rsaOaepEncryptNative(EVP_PKEY* key, WebCryptoHash hash, std::span<const uin
 }
 
 bool rsaOaepDecryptNative(EVP_PKEY* key, WebCryptoHash hash, std::span<const uint8_t> label,
-    std::span<const uint8_t> ciphertext, WTF::Vector<uint8_t>& out)
+    std::span<const uint8_t> ciphertext, SecretBytes& out)
 {
     bssl::UniquePtr<EVP_PKEY_CTX> ctx(EVP_PKEY_CTX_new(key, nullptr));
     if (!ctx || EVP_PKEY_decrypt_init(ctx.get()) <= 0)
@@ -163,9 +160,8 @@ bool rsaOaepDecryptNative(EVP_PKEY* key, WebCryptoHash hash, std::span<const uin
     size_t plaintext_len = 0;
     if (EVP_PKEY_decrypt(ctx.get(), nullptr, &plaintext_len, ciphertext.data(), ciphertext.size()) <= 0)
         return false;
-    if (!out.tryReserveInitialCapacity(plaintext_len))
+    if (!out.tryGrow(plaintext_len))
         return false;
-    out.grow(plaintext_len);
     auto fail = [&]() -> bool { return clearOutputAndFail(out); };
     if (EVP_PKEY_decrypt(ctx.get(), out.mutableSpan().data(), &plaintext_len, ciphertext.data(), ciphertext.size())
         <= 0)
@@ -174,7 +170,7 @@ bool rsaOaepDecryptNative(EVP_PKEY* key, WebCryptoHash hash, std::span<const uin
     return true;
 }
 
-bool rsaPkcs1EncryptNative(EVP_PKEY* key, std::span<const uint8_t> plaintext, WTF::Vector<uint8_t>& out)
+bool rsaPkcs1EncryptNative(EVP_PKEY* key, std::span<const uint8_t> plaintext, SecretBytes& out)
 {
     bssl::UniquePtr<EVP_PKEY_CTX> ctx(EVP_PKEY_CTX_new(key, nullptr));
     if (!ctx || EVP_PKEY_encrypt_init(ctx.get()) <= 0)
@@ -185,9 +181,8 @@ bool rsaPkcs1EncryptNative(EVP_PKEY* key, std::span<const uint8_t> plaintext, WT
     size_t ciphertext_len = 0;
     if (EVP_PKEY_encrypt(ctx.get(), nullptr, &ciphertext_len, plaintext.data(), plaintext.size()) <= 0)
         return false;
-    if (!out.tryReserveInitialCapacity(ciphertext_len))
+    if (!out.tryGrow(ciphertext_len))
         return false;
-    out.grow(ciphertext_len);
     auto fail = [&]() -> bool { return clearOutputAndFail(out); };
     if (EVP_PKEY_encrypt(ctx.get(), out.mutableSpan().data(), &ciphertext_len, plaintext.data(), plaintext.size()) <= 0)
         return fail();
@@ -195,7 +190,7 @@ bool rsaPkcs1EncryptNative(EVP_PKEY* key, std::span<const uint8_t> plaintext, WT
     return true;
 }
 
-bool rsaPkcs1DecryptNative(EVP_PKEY* key, std::span<const uint8_t> ciphertext, WTF::Vector<uint8_t>& out)
+bool rsaPkcs1DecryptNative(EVP_PKEY* key, std::span<const uint8_t> ciphertext, SecretBytes& out)
 {
     bssl::UniquePtr<EVP_PKEY_CTX> ctx(EVP_PKEY_CTX_new(key, nullptr));
     if (!ctx || EVP_PKEY_decrypt_init(ctx.get()) <= 0)
@@ -206,9 +201,8 @@ bool rsaPkcs1DecryptNative(EVP_PKEY* key, std::span<const uint8_t> ciphertext, W
     size_t plaintext_len = 0;
     if (EVP_PKEY_decrypt(ctx.get(), nullptr, &plaintext_len, ciphertext.data(), ciphertext.size()) <= 0)
         return false;
-    if (!out.tryReserveInitialCapacity(plaintext_len))
+    if (!out.tryGrow(plaintext_len))
         return false;
-    out.grow(plaintext_len);
     auto fail = [&]() -> bool { return clearOutputAndFail(out); };
     if (EVP_PKEY_decrypt(ctx.get(), out.mutableSpan().data(), &plaintext_len, ciphertext.data(), ciphertext.size())
         <= 0)
@@ -230,7 +224,7 @@ static size_t ecdsaComponentBytes(const EC_KEY* ec)
     return (static_cast<size_t>(order_bits) + 7) / 8;
 }
 
-bool ecdsaSignNative(EVP_PKEY* key, WebCryptoHash hash_id, std::span<const uint8_t> data, WTF::Vector<uint8_t>& out)
+bool ecdsaSignNative(EVP_PKEY* key, WebCryptoHash hash_id, std::span<const uint8_t> data, SecretBytes& out)
 {
     auto* ec = EVP_PKEY_get0_EC_KEY(key);
     if (!ec)
@@ -238,7 +232,7 @@ bool ecdsaSignNative(EVP_PKEY* key, WebCryptoHash hash_id, std::span<const uint8
     const size_t component_bytes = ecdsaComponentBytes(ec);
     if (!component_bytes)
         return false;
-    WTF::Vector<uint8_t> digest;
+    SecretBytes digest;
     if (!digestBytes(hashSpec(hash_id), data, digest))
         return false;
 
@@ -252,9 +246,8 @@ bool ecdsaSignNative(EVP_PKEY* key, WebCryptoHash hash_id, std::span<const uint8
         return false;
 
     const size_t signature_len = component_bytes * 2;
-    if (!out.tryReserveInitialCapacity(signature_len))
+    if (!out.tryGrow(signature_len))
         return false;
-    out.grow(signature_len);
     auto fail = [&]() -> bool { return clearOutputAndFail(out); };
     if (BN_bn2bin_padded(out.mutableSpan().data(), component_bytes, r) != 1
         || BN_bn2bin_padded(out.mutableSpan().data() + component_bytes, component_bytes, s) != 1)
@@ -279,7 +272,7 @@ bool ecdsaVerifyNative(
         return true;
     }
 
-    WTF::Vector<uint8_t> digest;
+    SecretBytes digest;
     if (!digestBytes(hashSpec(hash_id), data, digest))
         return false;
 
@@ -301,7 +294,7 @@ bool ecdsaVerifyNative(
     return result >= 0;
 }
 
-bool ed25519SignNative(EVP_PKEY* key, std::span<const uint8_t> data, WTF::Vector<uint8_t>& out)
+bool ed25519SignNative(EVP_PKEY* key, std::span<const uint8_t> data, SecretBytes& out)
 {
     bssl::UniquePtr<EVP_MD_CTX> ctx(EVP_MD_CTX_new());
     if (!ctx || EVP_DigestSignInit(ctx.get(), nullptr, nullptr, nullptr, key) != 1)
@@ -310,9 +303,8 @@ bool ed25519SignNative(EVP_PKEY* key, std::span<const uint8_t> data, WTF::Vector
     size_t signature_len = 0;
     if (EVP_DigestSign(ctx.get(), nullptr, &signature_len, data.data(), data.size()) != 1 || !signature_len)
         return false;
-    if (!out.tryReserveInitialCapacity(signature_len))
+    if (!out.tryGrow(signature_len))
         return false;
-    out.grow(signature_len);
     auto fail = [&]() -> bool { return clearOutputAndFail(out); };
     if (EVP_DigestSign(ctx.get(), out.mutableSpan().data(), &signature_len, data.data(), data.size()) != 1)
         return fail();
@@ -330,7 +322,7 @@ bool ed25519VerifyNative(EVP_PKEY* key, std::span<const uint8_t> signature, std:
     return result >= 0;
 }
 
-bool ecdhDeriveBitsNative(EVP_PKEY* private_key, EVP_PKEY* public_key, size_t length_bits, WTF::Vector<uint8_t>& out)
+bool ecdhDeriveBitsNative(EVP_PKEY* private_key, EVP_PKEY* public_key, size_t length_bits, SecretBytes& out)
 {
     // The ECDH shared secret is the x coordinate of the shared point, a big-endian integer left-padded to the byte
     // width of the curve's field. Some backends strip leading zero bytes from the derive output. BoringSSL writes the
@@ -373,7 +365,7 @@ bool ecdhDeriveBitsNative(EVP_PKEY* private_key, EVP_PKEY* public_key, size_t le
     return ok;
 }
 
-bool x25519DeriveBitsNative(EVP_PKEY* private_key, EVP_PKEY* public_key, size_t length_bits, WTF::Vector<uint8_t>& out)
+bool x25519DeriveBitsNative(EVP_PKEY* private_key, EVP_PKEY* public_key, size_t length_bits, SecretBytes& out)
 {
     bssl::UniquePtr<EVP_PKEY_CTX> ctx(EVP_PKEY_CTX_new(private_key, nullptr));
     if (!ctx || EVP_PKEY_derive_init(ctx.get()) <= 0)

@@ -1,13 +1,16 @@
-//! The page as a whole (`common/worker_state/page/`): its layout, the
-//! memfd's creation, seals and zero state, the benchmark record and the
-//! lifecycle tags read across two mappings, and the completion and console
-//! rings from the worker's publish to the host's drain, which starts from
-//! the host's own tail and validates the one copy it hands on. The host's
+//! The page as a whole (`common/worker_state/page/`): its layout and the
+//! pages a worker's first request touches, the memfd's creation, seals and
+//! zero state, the benchmark record, the lifecycle tags and the owner
+//! section read across two mappings, and the completion and console rings
+//! from the worker's publish to the host's drain, which starts from the
+//! host's own tail and validates the one copy it hands on. The host's
 //! snapshots are covered in `snapshots.zig`, and the lane that drains
 //! completions by the server-ingress lane.
 
 const std = @import("std");
+const limits = @import("collo_limits");
 const page = @import("collo_worker_state").page;
+const metrics = @import("collo_worker_state").metrics;
 
 /// A page memfd and one mapping of it, with the header the host writes at
 /// launch.
@@ -19,7 +22,7 @@ const MappedPage = struct {
         const fd = try page.createMemfd(name);
         errdefer std.posix.close(fd);
         var view = try page.mapReadWrite(fd);
-        view.initializeCrashDefault(1, 4096, 1);
+        view.initializeCrashDefault();
         return .{ .fd = fd, .view = view };
     }
 
@@ -38,8 +41,7 @@ fn validCompletion(request_id: u64) page.WorkerCompletionPublish {
         .worker_id = 4,
         .worker_generation = 5,
         .status = 0,
-        .http_status = 200,
-        .cpu_time_ns = request_id * 3,
+        .http_status = 200 + @as(u16, @intCast(request_id % 100)),
     };
 }
 
@@ -80,30 +82,41 @@ test "benchmark handler record publishes once across page views" {
     try std.testing.expectEqualDeep(first, reader.loadBenchHandler().?);
 }
 
-test "worker shared page layout is fixed size" {
-    try std.testing.expectEqual(@as(usize, 2), page.LIVE_SLOT_COUNT);
+test "every worker's page has a live slot per request the largest concurrency allows and a completion ring twice that" {
+    try std.testing.expectEqual(@as(usize, limits.server.worker_concurrency_max), page.LIVE_SLOT_COUNT);
     try std.testing.expectEqual(@as(usize, 1024), page.RECORD_RING_COUNT);
-    try std.testing.expectEqual(@as(usize, 16), page.COMPLETION_RING_COUNT);
+    // A lane may give a slot back before it drains that request's
+    // completion, so twice the slots' completions can wait at once.
+    try std.testing.expect(page.COMPLETION_RING_COUNT >= 2 * page.LIVE_SLOT_COUNT);
+    try std.testing.expect(std.math.isPowerOfTwo(page.COMPLETION_RING_COUNT));
     try std.testing.expectEqual(@as(usize, @sizeOf(page.Page)), page.byteSize());
+
+    var mapped = try MappedPage.init("worker-page-slot-count");
+    defer mapped.deinit();
+    try std.testing.expectEqual(page.LIVE_SLOT_COUNT, mapped.view.live_slots.len);
+    try std.testing.expectEqual(page.COMPLETION_RING_COUNT, mapped.view.completion_records.len);
 }
 
-test "worker shared page initializeCrashDefault starts in crash-safe mode" {
+test "worker shared page initializeCrashDefault starts in crash-safe mode with no owner" {
     const fd = try page.createMemfd("work-state-default");
     defer std.posix.close(fd);
 
     var view = try page.mapReadWrite(fd);
     defer view.deinit();
 
-    view.initializeCrashDefault(77, 4096, 1234);
+    // A page the worker already wrote to: the header comes back whole.
+    view.publishOwner(5, 500);
+    view.publishRunningOwnerCpu(5, 50);
+    view.initializeCrashDefault();
     try std.testing.expectEqual(@as(u32, page.VERSION), view.header.version);
     try std.testing.expectEqual(@intFromEnum(page.State.forked), view.header.state);
     try std.testing.expectEqual(@intFromEnum(page.TerminationReason.crash), view.header.termination_reason);
-    try std.testing.expectEqual(@as(u32, 77), view.header.pid);
-    try std.testing.expectEqual(@as(u64, 0), view.header.metrics_dropped_count);
     try std.testing.expectEqual(@as(u64, 0), view.header.records_head);
     try std.testing.expectEqual(@as(u64, 0), view.header.records_tail);
-    try std.testing.expectEqual(@as(u64, 4096), view.header.memory_limit_bytes);
-    try std.testing.expectEqual(@as(u64, 1234), view.header.worker_started_mono_ns);
+    const owner = page.OwnerSnapshot.load(view.header);
+    try std.testing.expectEqual(@as(u64, 0), owner.owner_id);
+    try std.testing.expectEqual(@as(u64, 0), owner.deadline_mono_ns);
+    try std.testing.expect(page.RunningOwnerSnapshot.load(view.header) == null);
 }
 
 // `WorkerWriterView.initializeCrashDefault` writes only the header and relies
@@ -116,13 +129,11 @@ test "worker shared page initializeCrashDefault leaves a fresh memfd zero outsid
     var view = try page.mapReadWrite(fd);
     defer view.deinit();
 
-    view.initializeCrashDefault(7, 8192, 4567);
+    view.initializeCrashDefault();
 
     try std.testing.expectEqual(@as(u32, page.VERSION), view.header.version);
     try std.testing.expectEqual(@intFromEnum(page.State.forked), view.header.state);
     try std.testing.expectEqual(@intFromEnum(page.TerminationReason.crash), view.header.termination_reason);
-    try std.testing.expectEqual(@as(u64, 8192), view.header.memory_limit_bytes);
-    try std.testing.expectEqual(@as(u64, 4567), view.header.worker_started_mono_ns);
     try std.testing.expectEqual(@as(u64, 0), view.live_slots[0].request_id);
     try std.testing.expectEqual(@as(u64, 0), view.completed_records[0].request_id);
     try std.testing.expectEqual(@as(u64, 0), view.completion_records[0].external_request_id);
@@ -132,6 +143,44 @@ test "worker shared page initializeCrashDefault leaves a fresh memfd zero outsid
         if (byte != 0) non_zero += 1;
     }
     try std.testing.expectEqual(@as(usize, 0), non_zero);
+}
+
+test "a worker's first request writes only the page's first two 4 KiB pages until it logs a console line" {
+    var mapped = try MappedPage.init("worker-page-first-touch");
+    defer mapped.deinit();
+    const view = &mapped.view;
+
+    const stamps: [page.BOOT_PHASE_COUNT]u64 = @splat(7);
+    view.storeBootPhaseStamps(&stamps);
+    view.publishBenchHandler(.{ .request_id = 1, .worker_id = 2, .worker_generation = 3, .handler_started_ns = 4 });
+    view.publishOwner(1, 99);
+    view.publishRunningOwnerCpu(1, 5);
+    var work_state = metrics.WorkState.init(view);
+    const slot = try work_state.allocateLiveSlot(.{
+        .external_request_id = 1,
+        .request_lane_id = 1,
+        .request_slot = 1,
+        .request_generation = 1,
+        .worker_id = 2,
+        .worker_generation = 3,
+    });
+    try work_state.updateLiveSlotCpu(slot, 5);
+    try work_state.appendCompletedRecord(.{ .request_id = 1, .cpu_ns = 5, .status = 0 });
+    try view.publishWorkerCompletion(validCompletion(1));
+
+    const first_two_pages: usize = 2 * 4096;
+    var written_past: usize = 0;
+    for (view.bytes[first_two_pages..]) |byte| {
+        if (byte != 0) written_past += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), written_past);
+
+    // A console line is the first write past them.
+    view.publishLogLine(.info, 0, 1, 1, "x");
+    for (view.bytes[first_two_pages..]) |byte| {
+        if (byte != 0) written_past += 1;
+    }
+    try std.testing.expect(written_past != 0);
 }
 
 test "worker shared page zeroed mapping is rejected after memfd creation contract" {
@@ -157,7 +206,7 @@ test "the host's lifecycle snapshot reads the tags the worker's setState stored"
     defer std.posix.close(fd);
     var host_view = try page.mapReadWrite(fd);
     defer host_view.deinit();
-    host_view.initializeCrashDefault(1, 0, 0);
+    host_view.initializeCrashDefault();
     var worker_view = try page.mapReadWrite(fd);
     defer worker_view.deinit();
 
@@ -170,10 +219,48 @@ test "the host's lifecycle snapshot reads the tags the worker's setState stored"
     try std.testing.expectEqual(page.State.dead, died.knownState().?);
     try std.testing.expectEqual(page.TerminationReason.memory, died.knownTerminationReason().?);
 
+    // A sentinel that can no longer watch the worker names itself.
+    worker_view.setState(.dead, .sentinel);
+    const unwatched = page.LifecycleSnapshot.load(host_view.header);
+    try std.testing.expectEqual(page.TerminationReason.sentinel, unwatched.knownTerminationReason().?);
+    try std.testing.expectEqual(@as(u32, 6), unwatched.termination_reason);
+
     @atomicStore(u32, &worker_view.header.state, 999, .release);
     const unknown = page.LifecycleSnapshot.load(host_view.header);
     try std.testing.expect(unknown.knownState() == null);
     try std.testing.expectEqual(@as(u32, 999), unknown.state);
+}
+
+test "the host reads the owner the worker's VM thread published and the CPU its sentinel published" {
+    const fd = try page.createMemfd("worker-owner-section");
+    defer std.posix.close(fd);
+    var host_view = try page.mapReadWrite(fd);
+    defer host_view.deinit();
+    host_view.initializeCrashDefault();
+    var worker_view = try page.mapReadWrite(fd);
+    defer worker_view.deinit();
+
+    worker_view.publishOwner(41, 9_000);
+    const owner = page.OwnerSnapshot.load(host_view.header);
+    try std.testing.expectEqual(@as(u64, 41), owner.owner_id);
+    try std.testing.expectEqual(@as(u64, 9_000), owner.deadline_mono_ns);
+    worker_view.publishOwner(0, 0);
+    const idle = page.OwnerSnapshot.load(host_view.header);
+    try std.testing.expectEqual(@as(u64, 0), idle.owner_id);
+    try std.testing.expectEqual(@as(u64, 0), idle.deadline_mono_ns);
+
+    // No owner's CPU was ever read: nothing to report.
+    try std.testing.expect(page.RunningOwnerSnapshot.load(host_view.header) == null);
+    worker_view.publishRunningOwnerCpu(41, 40_000_000);
+    const running = page.RunningOwnerSnapshot.load(host_view.header) orelse return error.TestExpectedRunningOwner;
+    try std.testing.expectEqual(@as(u64, 41), running.owner_id);
+    try std.testing.expectEqual(@as(u64, 40_000_000), running.cpu_ns);
+    worker_view.publishRunningOwnerCpu(42, 7);
+    const next = page.RunningOwnerSnapshot.load(host_view.header) orelse return error.TestExpectedRunningOwner;
+    try std.testing.expectEqual(@as(u64, 42), next.owner_id);
+    try std.testing.expectEqual(@as(u64, 7), next.cpu_ns);
+    // Two publications moved the sequence by two each, and it is even again.
+    try std.testing.expectEqual(@as(u32, 4), @atomicLoad(u32, &host_view.header.running_owner_sequence, .acquire));
 }
 
 test "worker completion ring publishes many records with one eventfd wake" {
@@ -200,7 +287,7 @@ test "a completion drain starts from the host's own tail, whatever the worker st
     defer std.posix.close(fd);
     var host_view = try page.mapReadWrite(fd);
     defer host_view.deinit();
-    host_view.initializeCrashDefault(1, 0, 0);
+    host_view.initializeCrashDefault();
     var worker_view = try page.mapReadWrite(fd);
     defer worker_view.deinit();
 
@@ -209,7 +296,7 @@ test "a completion drain starts from the host's own tail, whatever the worker st
     var out: [page.COMPLETION_RING_COUNT]page.WorkerCompletionRecord = undefined;
     try std.testing.expectEqual(@as(usize, 2), try host_view.drainWorkerCompletions(&out));
     try std.testing.expectEqual(@as(u64, 2), out[1].external_request_id);
-    try std.testing.expectEqual(@as(u64, 6), out[1].cpu_time_ns);
+    try std.testing.expectEqual(@as(u16, 202), out[1].http_status);
     try std.testing.expectEqual(@as(u64, 2), host_view.host_cursors.completion_tail);
     // The worker's room check reads the tail the host stored.
     try std.testing.expectEqual(@as(u64, 2), @atomicLoad(u64, &worker_view.completion_header.tail, .acquire));
@@ -231,7 +318,7 @@ fn corruptCompletion(record: *page.WorkerCompletionRecord, corruption: Completio
         .sequence => record.sequence = 99,
         .http_status_low => record.http_status = 199,
         .http_status_high => record.http_status = 600,
-        .status_past_last_tag => record.status = 7,
+        .status_past_last_tag => record.status = page.worker_completion_status_max + 1,
         .padding => record._reserved0 = 1,
     }
 }
@@ -290,7 +377,7 @@ test "the worker publishes no completion the host's drain would refuse" {
     invalid.http_status = 0;
     try std.testing.expectError(error.InvalidWorkerCompletionStatus, view.publishWorkerCompletion(invalid));
     invalid = validCompletion(1);
-    invalid.status = 7;
+    invalid.status = page.worker_completion_status_max + 1;
     try std.testing.expectError(error.InvalidWorkerCompletionStatus, view.publishWorkerCompletion(invalid));
     try std.testing.expectEqual(@as(u64, 0), @atomicLoad(u64, &view.completion_header.head, .acquire));
     try std.testing.expectEqual(@as(u32, 0), @atomicLoad(u32, &view.completion_header.fatal, .acquire));
@@ -300,6 +387,13 @@ test "the worker publishes no completion the host's drain would refuse" {
     try std.testing.expectEqual(@as(usize, 1), try view.drainWorkerCompletions(&out));
     try std.testing.expectEqual(@as(u64, 2), out[0].external_request_id);
     try std.testing.expectEqual(@as(u64, 1), out[0].sequence);
+
+    // The last status the worker may publish passes both ends.
+    var last_status = validCompletion(3);
+    last_status.status = page.worker_completion_status_max;
+    try view.publishWorkerCompletion(last_status);
+    try std.testing.expectEqual(@as(usize, 1), try view.drainWorkerCompletions(&out));
+    try std.testing.expectEqual(page.worker_completion_status_max, out[0].status);
 }
 
 test "worker completion ring overflow marks shared page fatal" {
@@ -311,7 +405,6 @@ test "worker completion ring overflow marks shared page fatal" {
         try view.publishWorkerCompletion(validCompletion(index + 1));
     try std.testing.expectError(error.WorkerCompletionRingOverflow, view.publishWorkerCompletion(validCompletion(9999)));
     try std.testing.expectEqual(@as(u32, 1), @atomicLoad(u32, &view.completion_header.fatal, .acquire));
-    try std.testing.expectEqual(@as(u64, 1), @atomicLoad(u64, &view.completion_header.overflow_count, .acquire));
 
     var out: [1]page.WorkerCompletionRecord = undefined;
     try std.testing.expectError(error.WorkerCompletionRingFatal, view.drainWorkerCompletions(&out));
@@ -378,6 +471,24 @@ test "worker log ring publishes and drains lines with attribution" {
     try std.testing.expectEqual(page.LogLineFlags.js_exception, out[1].header.flags);
     try std.testing.expectEqual(@as(u64, 43), out[1].header.request_id);
     try std.testing.expectEqual(@as(usize, 0), try view.drainLogLinesChecked(&scratch, &out));
+}
+
+test "a runtime line keeps its flag through the console ring, and a bit outside LogLineFlags is dropped" {
+    var mapped = try MappedPage.init("worker-log-ring-runtime");
+    defer mapped.deinit();
+    const view = &mapped.view;
+
+    const unknown_bit: u8 = 1 << 7;
+    view.publishLogLine(.warn, page.LogLineFlags.runtime, 0, 10, "worker event loop failed");
+    view.publishLogLine(.info, page.LogLineFlags.runtime | unknown_bit, 0, 11, "second");
+
+    var scratch: [page.LOG_LINE_BYTES_MAX]u8 = undefined;
+    var out: [2]page.DrainedLogLine = undefined;
+    try std.testing.expectEqual(@as(usize, 2), try view.drainLogLinesChecked(&scratch, &out));
+    try std.testing.expectEqual(page.LogLineFlags.runtime, out[0].header.flags);
+    try std.testing.expectEqual(@as(u64, 0), out[0].header.request_id);
+    try std.testing.expectEqualStrings("worker event loop failed", out[0].payload);
+    try std.testing.expectEqual(page.LogLineFlags.runtime, out[1].header.flags);
 }
 
 test "the console ring's drain starts from the host's own tail" {

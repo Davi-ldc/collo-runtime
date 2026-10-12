@@ -1,5 +1,5 @@
 // `SubtleCrypto.deriveBits` and `deriveKey` for PBKDF2, HKDF, ECDH and X25519. Arguments are validated on the VM
-// thread; a base key's bytes are copied into `SecureBytes` and the two ECDH or X25519 keys are retained through
+// thread; a base key's bytes are copied into `SecretBytes` and the two ECDH or X25519 keys are retained through
 // `retainSharedPkey`, so the derivation on the crypto pool never reads a CryptoKey cell. deriveKey builds the derived
 // AES or HMAC key when its job settles (`SecretKeyCryptoJob`).
 
@@ -146,7 +146,7 @@ JSC_DEFINE_HOST_FUNCTION(subtleDeriveBits, (JSC::JSGlobalObject * global_object,
     } else if (!parseDeriveBitsLength(global_object, scope, call_frame->argument(2), length_bits, error))
         return rejectedPromise(global_object, error);
 
-    SecureBytes base_material;
+    SecretBytes base_material;
     WTF::Vector<uint8_t> salt;
     WTF::Vector<uint8_t> info;
     std::shared_ptr<EVP_PKEY> private_pkey;
@@ -182,8 +182,7 @@ JSC_DEFINE_HOST_FUNCTION(subtleDeriveBits, (JSC::JSGlobalObject * global_object,
 
     auto job = std::unique_ptr<CryptoJob>(new (std::nothrow) BytesCryptoJob(context.value.owner, context.value.deferred,
         [expected_algorithm, length_bits, hash_id, iterations, base_material = WTF::move(base_material),
-            salt = WTF::move(salt), info = WTF::move(info), private_pkey,
-            public_pkey](WTF::Vector<uint8_t>& out) mutable {
+            salt = WTF::move(salt), info = WTF::move(info), private_pkey, public_pkey](SecretBytes& out) mutable {
             if (expected_algorithm == CryptoKeyAlgorithm::Pbkdf2)
                 return derivePbkdf2BitsNative(base_material.span(), salt.span(), iterations, hash_id, length_bits, out);
             if (expected_algorithm == CryptoKeyAlgorithm::Hkdf)
@@ -192,7 +191,7 @@ JSC_DEFINE_HOST_FUNCTION(subtleDeriveBits, (JSC::JSGlobalObject * global_object,
                 return ecdhDeriveBitsNative(private_pkey.get(), public_pkey.get(), length_bits, out);
             return x25519DeriveBitsNative(private_pkey.get(), public_pkey.get(), length_bits, out);
         }));
-    return enqueueCryptoJobPromise(global_object, scope, context.value, WTF::move(job));
+    return enqueueCryptoJobPromise(global_object, context.value, WTF::move(job));
 }
 
 JSC_DEFINE_HOST_FUNCTION(subtleDeriveKey, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
@@ -264,7 +263,7 @@ JSC_DEFINE_HOST_FUNCTION(subtleDeriveKey, (JSC::JSGlobalObject * global_object, 
     if (!validateRequiredUsages(usages, error, global_object))
         return rejectedPromise(global_object, error);
 
-    SecureBytes base_material;
+    SecretBytes base_material;
     WTF::Vector<uint8_t> salt;
     WTF::Vector<uint8_t> info;
     std::shared_ptr<EVP_PKEY> private_pkey;
@@ -302,27 +301,26 @@ JSC_DEFINE_HOST_FUNCTION(subtleDeriveKey, (JSC::JSGlobalObject * global_object, 
     const auto output_algorithm = derived_spec.algorithm;
     const auto output_hash = derived_spec.hash ? derived_spec.hash->id : WebCryptoHash::SHA256;
     const size_t output_bits = derived_spec.length_bits;
-    auto job = std::unique_ptr<CryptoJob>(new (std::nothrow) SecretKeyCryptoJob(context.value.owner,
-        context.value.deferred,
-        [expected_algorithm, output_algorithm, output_hash, output_bits, extractable, usages, hash_id, iterations,
-            base_material = WTF::move(base_material), salt = WTF::move(salt), info = WTF::move(info), private_pkey,
-            public_pkey](SecretKeyResult& result) mutable {
-            result.algorithm = output_algorithm;
-            result.hash = output_hash;
-            result.extractable = extractable;
-            result.usages = usages;
-            if (expected_algorithm == CryptoKeyAlgorithm::Pbkdf2)
-                return derivePbkdf2BitsNative(
-                    base_material.span(), salt.span(), iterations, hash_id, output_bits, result.material.vector());
-            if (expected_algorithm == CryptoKeyAlgorithm::Hkdf)
-                return deriveHkdfBitsNative(
-                    base_material.span(), salt.span(), info.span(), hash_id, output_bits, result.material.vector());
-            if (expected_algorithm == CryptoKeyAlgorithm::Ecdh)
-                return ecdhDeriveBitsNative(
-                    private_pkey.get(), public_pkey.get(), output_bits, result.material.vector());
-            return x25519DeriveBitsNative(private_pkey.get(), public_pkey.get(), output_bits, result.material.vector());
-        }));
-    return enqueueCryptoJobPromise(global_object, scope, context.value, WTF::move(job));
+    auto job
+        = std::unique_ptr<CryptoJob>(new (std::nothrow) SecretKeyCryptoJob(context.value.owner, context.value.deferred,
+            [expected_algorithm, output_algorithm, output_hash, output_bits, extractable, usages, hash_id, iterations,
+                base_material = WTF::move(base_material), salt = WTF::move(salt), info = WTF::move(info), private_pkey,
+                public_pkey](SecretKeyResult& result) mutable {
+                result.algorithm = output_algorithm;
+                result.hash = output_hash;
+                result.extractable = extractable;
+                result.usages = usages;
+                if (expected_algorithm == CryptoKeyAlgorithm::Pbkdf2)
+                    return derivePbkdf2BitsNative(
+                        base_material.span(), salt.span(), iterations, hash_id, output_bits, result.material);
+                if (expected_algorithm == CryptoKeyAlgorithm::Hkdf)
+                    return deriveHkdfBitsNative(
+                        base_material.span(), salt.span(), info.span(), hash_id, output_bits, result.material);
+                if (expected_algorithm == CryptoKeyAlgorithm::Ecdh)
+                    return ecdhDeriveBitsNative(private_pkey.get(), public_pkey.get(), output_bits, result.material);
+                return x25519DeriveBitsNative(private_pkey.get(), public_pkey.get(), output_bits, result.material);
+            }));
+    return enqueueCryptoJobPromise(global_object, context.value, WTF::move(job));
 }
 
 } // namespace Collo::HostFunctions

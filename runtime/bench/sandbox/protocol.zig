@@ -4,10 +4,15 @@
 //! command only after the reply to the previous one. The only worker
 //! identities the daemon returns are the ones it reads from the supervisor.
 //! The file also holds the record writer of the controller's own output and
-//! the C ABI of the loopback HTTP/2 client in `client.cc`.
+//! the C ABI of the loopback HTTP/2 client in `client.cc`, and names the
+//! workload and node definitions both sides share, which the contract tests
+//! in `runtime/tests/contracts/` reach through this module.
 
 const std = @import("std");
-const Workload = @import("workload.zig").Workload;
+pub const workload = @import("workload.zig");
+pub const node = @import("node.zig");
+
+const Workload = workload.Workload;
 
 /// Sampler routes, one worker definition each in the daemon's configuration;
 /// the daemon never reports more workers than this.
@@ -43,9 +48,14 @@ pub const Command = struct {
 pub const Ready = struct {
     port: u16,
     zygote_pid: u32,
-    gateway_pid: u32,
-    /// The fixture every route installed; the controller rejects a mismatch.
+    /// Null exactly when `network` is `none`: with no grant the server
+    /// spawns no gateway.
+    gateway_pid: ?u32,
+    /// The knobs the daemon configured its node with; the controller rejects
+    /// any that differs from what it asked for.
     workload: Workload,
+    network: node.Network,
+    concurrency: u8,
     /// Recorded in the run's metadata: every route's pack is built at boot
     /// and stays resident, and the packs hold the same source under distinct
     /// specifiers (`writeConfig` in `daemon.zig`).
@@ -147,6 +157,18 @@ pub fn writeRecord(file: std.fs.File, value: anytype) !void {
 /// The loopback HTTP/2 client of `client.cc`; `client.h` states its
 /// ownership, threading and failure rules.
 pub const Client = opaque {};
+/// `ColloBenchExchange` in `client.h`, field for field.
+pub const ClientExchange = extern struct {
+    path: [*:0]const u8,
+    /// The exact response body, or null for `expected_body_len` bytes of the
+    /// block pattern.
+    expected_body: ?[*]const u8,
+    expected_body_len: u64,
+    /// A POST of this many bytes of the block pattern, or 0 for a GET.
+    request_body_len: u64,
+    pattern_block_bytes: u32,
+    reserved: u32 = 0,
+};
 /// `ColloBenchReply` in `client.h`, field for field.
 pub const ClientReply = extern struct {
     sent_ns: u64,
@@ -157,15 +179,21 @@ pub const ClientReply = extern struct {
     reserved: u32,
 };
 
+comptime {
+    // `client.cc` asserts the same sizes on its side.
+    std.debug.assert(@sizeOf(ClientExchange) == 40);
+    std.debug.assert(@sizeOf(ClientReply) == 32);
+}
+
 pub extern "c" fn collo_bench_client_open(
     port: u16,
     server_name: [*:0]const u8,
+    timeout_ms: u32,
     out: *?*Client,
 ) c_int;
-pub extern "c" fn collo_bench_client_get(
+pub extern "c" fn collo_bench_client_exchange(
     client: *Client,
-    path: [*:0]const u8,
-    body: [*:0]const u8,
+    request: *const ClientExchange,
     out: *ClientReply,
 ) c_int;
 pub extern "c" fn collo_bench_client_close(client: ?*Client) void;

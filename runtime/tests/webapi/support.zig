@@ -1,8 +1,9 @@
 //! The in-process runners behind `suites.zig`. Each run creates its own VM and
 //! `worker.Runtime` on the test thread, with a fake monotonic clock and a
 //! socket pair standing in for the host's control channel, serves the fixture
-//! as a route, and expects the JSON result to report `ok`. No zygote, sandbox
-//! or egress gateway takes part; `forked.zig` covers a forked worker.
+//! as a route, and expects the JSON result to report `ok` with at least one
+//! test. No zygote, sandbox or egress gateway takes part; `forked.zig` covers a
+//! forked worker.
 //!
 //! A Collo contract fixture is appended to `support/harness.js` and runs as one
 //! route module. An exact Bun or WPT port keeps its own module: its `bun:test`,
@@ -11,7 +12,15 @@
 //! registered as permanent modules of one pack. A leak fixture runs as a count
 //! request, then, for each test, a setup request, full collections and a check
 //! request. Except in `runLeakSuite`, `COLLO_WEBAPI_TEST_FILTER` keeps only the
-//! tests whose names contain its value.
+//! tests whose names contain its value, and only a filtered suite may end up
+//! with no test.
+//!
+//! Every request runs on the fake clock through
+//! `executeUntilRequestDoneOnFakeClock`, which moves it while the suite works
+//! and while it waits, so timers fire, and with them each harness's timeout,
+//! which fails a hung test, hook or leak step by name. A suite still running
+//! after `suite_budget_ns` of fake time, a request that neither finishes nor
+//! is ended by its own timers, fails without a result.
 
 const std = @import("std");
 const bindings_support = @import("bindings_support");
@@ -32,12 +41,21 @@ const compat_harness_source = @embedFile("support/compat_harness.js");
 const deploy_hash = "test";
 const collo_test_specifier = "/__collo_route/" ++ deploy_hash ++ "/collo-test.js";
 const compat_harness_specifier = "/__collo_route/" ++ deploy_hash ++ "/harness.js";
-const compat_leak_harness_specifier = "/__collo_route/" ++ deploy_hash ++ "/leak-harness.js";
 const collo_test_entry_specifier = "/__collo_route/" ++ deploy_hash ++ "/webapi-compat-entry.js";
 const collo_test_import = "collo" ++ ":test";
 const bun_test_import = "bun" ++ ":test";
 const compat_harness_import = "harness";
 const webapi_test_filter_env = "COLLO_WEBAPI_TEST_FILTER";
+
+/// The fake time one request of a suite may take. Each harness gives a test,
+/// a hook and a leak step 5 s of it before failing it by name
+/// (`support/harness.js`, `support/collo_test.js`), so a suite reaches this
+/// bound only through work outside every harness timeout: work that keeps the
+/// ready queue full, or a wait on something that never arrives.
+const suite_budget_ns: u64 = 120 * std.time.ns_per_s;
+/// How far past the budget the request's deadline lies, so the loop's bound,
+/// and not a 504, ends a suite that never finishes.
+const suite_deadline_margin_ns: u64 = std.time.ns_per_s;
 
 const runner_source =
     \\
@@ -106,11 +124,15 @@ pub fn runSuiteWithPrelude(prelude: []const u8, source: []const u8, specifier: [
     });
     defer std.testing.allocator.free(combined);
 
-    const request_id = requestIdForSpecifier(specifier);
-    const response = try rt.runRouteAndReadBody(&runtime, control_pair[1], combined, request_id, specifier);
+    const route_index = try registerSuiteRoute(&runtime, specifier, combined);
+    const response = try runSuiteRequest(&runtime, control_pair[1], &now_mono_ns, .{
+        .specifier = specifier,
+        .route_index = route_index,
+        .request_id = requestIdForSpecifier(specifier),
+    });
     defer std.testing.allocator.free(response);
 
-    try expectSuiteOk(specifier, response);
+    try expectSuiteResult(specifier, response, .filterable);
 }
 
 pub fn runLeakSuite(source: []const u8, specifier: []const u8) !void {
@@ -139,17 +161,15 @@ pub fn runLeakSuite(source: []const u8, specifier: []const u8) !void {
     });
     defer std.testing.allocator.free(combined);
 
-    const count_request_id = requestIdForSpecifierWithSalt(specifier, 0xC017);
-    const count_response = try rt.runRouteAndReadBodyWithRequest(
-        &runtime,
-        control_pair[1],
-        combined,
-        count_request_id,
-        specifier,
-        .{ .path = "/count" },
-    );
+    const route_index = try registerSuiteRoute(&runtime, specifier, combined);
+    const count_response = try runSuiteRequest(&runtime, control_pair[1], &now_mono_ns, .{
+        .specifier = specifier,
+        .route_index = route_index,
+        .request_id = requestIdForSpecifierWithSalt(specifier, 0xC017),
+        .request = .{ .path = "/count" },
+    });
     defer std.testing.allocator.free(count_response);
-    try expectSuiteOk(specifier, count_response);
+    try expectSuiteResult(specifier, count_response, .complete);
     const test_count = try leakSuiteTotal(count_response);
 
     for (0..test_count) |test_index| {
@@ -157,16 +177,14 @@ pub fn runLeakSuite(source: []const u8, specifier: []const u8) !void {
             const setup_path = try std.fmt.allocPrint(std.testing.allocator, "/setup/{d}", .{test_index});
             defer std.testing.allocator.free(setup_path);
 
-            const setup_response = try rt.runRouteAndReadBodyWithRequest(
-                &runtime,
-                control_pair[1],
-                combined,
-                requestIdForSpecifierWithSalt(specifier, 0x5E7A9 + test_index),
-                specifier,
-                .{ .path = setup_path },
-            );
+            const setup_response = try runSuiteRequest(&runtime, control_pair[1], &now_mono_ns, .{
+                .specifier = specifier,
+                .route_index = route_index,
+                .request_id = requestIdForSpecifierWithSalt(specifier, 0x5E7A9 + test_index),
+                .request = .{ .path = setup_path },
+            });
             defer std.testing.allocator.free(setup_response);
-            try expectSuiteOk(specifier, setup_response);
+            try expectSuiteResult(specifier, setup_response, .complete);
         }
 
         // A WeakRef keeps its target alive until the current job ends
@@ -179,16 +197,14 @@ pub fn runLeakSuite(source: []const u8, specifier: []const u8) !void {
         }
 
         {
-            const check_response = try rt.runRouteAndReadBodyWithRequest(
-                &runtime,
-                control_pair[1],
-                combined,
-                requestIdForSpecifierWithSalt(specifier, 0xC0A11EC7 + test_index),
-                specifier,
-                .{ .path = "/check" },
-            );
+            const check_response = try runSuiteRequest(&runtime, control_pair[1], &now_mono_ns, .{
+                .specifier = specifier,
+                .route_index = route_index,
+                .request_id = requestIdForSpecifierWithSalt(specifier, 0xC0A11EC7 + test_index),
+                .request = .{ .path = "/check" },
+            });
             defer std.testing.allocator.free(check_response);
-            try expectSuiteOk(specifier, check_response);
+            try expectSuiteResult(specifier, check_response, .complete);
         }
     }
 }
@@ -260,134 +276,64 @@ pub fn runCompatSuiteWithPrelude(prelude: []const u8, source: []const u8, specif
     };
     const route_fd = try rt.createModulePackGraphFd(&modules, 3);
     defer std.posix.close(route_fd);
-    _ = try rt.registerRoutePack(&runtime, route_fd, collo_test_entry_specifier);
+    const route_index = try rt.registerRoutePack(&runtime, route_fd, collo_test_entry_specifier);
 
-    const request_id = requestIdForSpecifier(specifier);
-    const response = try rt.runRegisteredRouteAndReadBody(
-        &runtime,
-        control_pair[1],
-        request_id,
-        collo_test_entry_specifier,
-        .{},
-    );
+    const response = try runSuiteRequest(&runtime, control_pair[1], &now_mono_ns, .{
+        .specifier = specifier,
+        .route_index = route_index,
+        .request_id = requestIdForSpecifier(specifier),
+    });
     defer std.testing.allocator.free(response);
 
-    try expectSuiteOk(specifier, response);
+    try expectSuiteResult(specifier, response, .filterable);
 }
 
-pub fn runCompatLeakSuite(source: []const u8, specifier: []const u8) !void {
-    try runCompatLeakSuiteWithPrelude("", source, specifier);
+/// Registers `source` as the suite's route at `specifier` (`rt.routeSpecifier`)
+/// unless the runtime already holds it, and returns its index.
+fn registerSuiteRoute(runtime: *worker.Runtime, specifier: []const u8, source: []const u8) !u16 {
+    const route_specifier = try rt.routeSpecifier(std.testing.allocator, specifier);
+    defer std.testing.allocator.free(route_specifier);
+    return rt.registerRoute(runtime, route_specifier, source);
 }
 
-pub fn runCompatLeakSuiteWithPrelude(prelude: []const u8, source: []const u8, specifier: []const u8) !void {
-    var vm = try bindings_support.createVm();
-    defer vm.deinit();
+const SuiteRequest = struct {
+    /// Names the suite in a failure.
+    specifier: []const u8,
+    route_index: u16,
+    request_id: u64,
+    request: rt.RequestParts = .{},
+};
 
-    const control_pair = try rt.socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
-    defer std.posix.close(control_pair[0]);
-    defer std.posix.close(control_pair[1]);
-
-    var now_mono_ns: u64 = 0;
-    var completion_fixture = try rt.CompletionFixture.init();
-    defer completion_fixture.deinit();
-    var runtime = try initRuntime(&vm, control_pair[0], &completion_fixture, &now_mono_ns);
-    defer runtime.deinit();
-    try runtime.attachHostRuntime();
-
-    const test_specifier = try normalizedCompatSpecifier(std.testing.allocator, specifier);
-    defer std.testing.allocator.free(test_specifier);
-    const filter_prelude = try webApiTestFilterPrelude(std.testing.allocator);
-    defer std.testing.allocator.free(filter_prelude);
-    const source_with_prelude = try std.mem.concat(
-        std.testing.allocator,
-        u8,
-        &.{ filter_prelude, "\n", prelude, "\n", source },
-    );
-    defer std.testing.allocator.free(source_with_prelude);
-    const rewritten_source = try rewriteColloTestImports(std.testing.allocator, source_with_prelude);
-    defer std.testing.allocator.free(rewritten_source);
-    const entry_source = try compatLeakEntrySource(std.testing.allocator, test_specifier);
-    defer std.testing.allocator.free(entry_source);
-
-    const empty_deps = [_]ipc.module_pack.Dependency{};
-    const test_deps = [_]ipc.module_pack.Dependency{
-        .{ .specifier = collo_test_specifier },
-        .{ .specifier = compat_harness_specifier },
+/// Runs one request of a suite to completion on the runtime's fake clock at
+/// `now_mono_ns` and returns the response body, which the caller owns.
+fn runSuiteRequest(
+    runtime: *worker.Runtime,
+    server_control_fd: std.posix.fd_t,
+    now_mono_ns: *u64,
+    suite_request: SuiteRequest,
+) ![]u8 {
+    var dispatch = try rt.initDispatchWork(std.testing.allocator, .{
+        .request_id = suite_request.request_id,
+        .route_index = suite_request.route_index,
+        .deadline_monotonic_ns = now_mono_ns.* + suite_budget_ns + suite_deadline_margin_ns,
+        .request = suite_request.request,
+    });
+    defer dispatch.deinit();
+    try rt.enqueueIngressRoute(runtime, &dispatch, 1, suite_request.request);
+    try rt.executeQueuedBegin(runtime);
+    rt.executeUntilRequestDoneOnFakeClock(runtime, now_mono_ns, suite_request.request_id, .{
+        .budget_ns = suite_budget_ns,
+    }) catch |err| switch (err) {
+        error.RequestDidNotComplete => {
+            std.debug.print(
+                "webapi suite {s} sent no result within {d} s of fake time; a hung test, hook or leak step fails by name at its harness timeout, so work outside every timeout keeps the ready queue full or waits on something that never arrives\n",
+                .{ suite_request.specifier, suite_budget_ns / std.time.ns_per_s },
+            );
+            return error.WebApiSuiteDidNotComplete;
+        },
+        else => return err,
     };
-    const entry_deps = [_]ipc.module_pack.Dependency{
-        .{ .specifier = compat_leak_harness_specifier },
-        .{ .specifier = test_specifier },
-    };
-    const modules = [_]ipc.module_pack.Module{
-        .{
-            .specifier = collo_test_specifier,
-            .source = collo_test_source,
-            .dependencies = &empty_deps,
-        },
-        .{
-            .specifier = compat_harness_specifier,
-            .source = compat_harness_source,
-            .dependencies = &empty_deps,
-        },
-        .{
-            .specifier = compat_leak_harness_specifier,
-            .source = leak_harness_source,
-            .dependencies = &empty_deps,
-        },
-        .{
-            .specifier = test_specifier,
-            .source = rewritten_source,
-            .dependencies = &test_deps,
-        },
-        .{
-            .specifier = collo_test_entry_specifier,
-            .source = entry_source,
-            .dependencies = &entry_deps,
-        },
-    };
-    const route_fd = try rt.createModulePackGraphFd(&modules, 4);
-    defer std.posix.close(route_fd);
-    _ = try rt.registerRoutePack(&runtime, route_fd, collo_test_entry_specifier);
-
-    const count_response = try rt.runRegisteredRouteAndReadBody(
-        &runtime,
-        control_pair[1],
-        requestIdForSpecifierWithSalt(specifier, 0xC017),
-        collo_test_entry_specifier,
-        .{ .path = "/count" },
-    );
-    defer std.testing.allocator.free(count_response);
-    try expectSuiteOk(specifier, count_response);
-    const test_count = try leakSuiteTotal(count_response);
-
-    for (0..test_count) |test_index| {
-        const setup_path = try std.fmt.allocPrint(std.testing.allocator, "/setup/{d}", .{test_index});
-        defer std.testing.allocator.free(setup_path);
-
-        const setup_response = try rt.runRegisteredRouteAndReadBody(
-            &runtime,
-            control_pair[1],
-            requestIdForSpecifierWithSalt(specifier, 0x5E7A9 + test_index),
-            collo_test_entry_specifier,
-            .{ .path = setup_path },
-        );
-        defer std.testing.allocator.free(setup_response);
-        try expectSuiteOk(specifier, setup_response);
-
-        for (0..3) |_| {
-            try vm.collectFullGCAndTrim();
-        }
-
-        const check_response = try rt.runRegisteredRouteAndReadBody(
-            &runtime,
-            control_pair[1],
-            requestIdForSpecifierWithSalt(specifier, 0xC0A11EC7 + test_index),
-            collo_test_entry_specifier,
-            .{ .path = "/check" },
-        );
-        defer std.testing.allocator.free(check_response);
-        try expectSuiteOk(specifier, check_response);
-    }
+    return rt.readIngressResponseBody(runtime, server_control_fd, suite_request.request_id);
 }
 
 fn requestIdForSpecifier(specifier: []const u8) u64 {
@@ -429,7 +375,20 @@ fn initRuntime(
     });
 }
 
-fn expectSuiteOk(specifier: []const u8, response: []const u8) !void {
+/// Whether `COLLO_WEBAPI_TEST_FILTER` reaches a suite's registrations.
+pub const FilterScope = enum {
+    /// The filter selects the suite's tests, so while it is set the suite may
+    /// select none.
+    filterable,
+    /// Every test registers, so a suite with none is broken.
+    complete,
+};
+
+/// Fails, printing the response, unless `response` is a suite result that
+/// reports `ok` with at least one test. A suite with no test passes only when
+/// the filter variable is set and reaches it: an empty suite otherwise means a
+/// fixture that lost its tests, or a filter that matches nothing.
+pub fn expectSuiteResult(specifier: []const u8, response: []const u8, scope: FilterScope) !void {
     const result = parseSuiteResult(response) catch {
         std.debug.print("webapi suite failed for {s}\n{s}\n", .{ specifier, response });
         return error.WebApiSuiteFailed;
@@ -438,8 +397,21 @@ fn expectSuiteOk(specifier: []const u8, response: []const u8) !void {
         std.debug.print("webapi suite failed for {s}\n{s}\n", .{ specifier, response });
         return error.WebApiSuiteFailed;
     }
+    if (result.total != 0) return;
+    switch (scope) {
+        .filterable => if (webApiTestFilterIsSet()) return,
+        .complete => {},
+    }
+    std.debug.print("webapi suite {s} registered no test\n{s}\n", .{ specifier, response });
+    return error.WebApiSuiteEmpty;
 }
 
+fn webApiTestFilterIsSet() bool {
+    const filter = std.posix.getenv(webapi_test_filter_env) orelse return false;
+    return filter.len != 0;
+}
+
+/// A result without `total` reads as an empty suite.
 const SuiteResult = struct {
     ok: bool,
     total: usize = 0,
@@ -485,34 +457,6 @@ fn compatEntrySource(allocator: std.mem.Allocator, test_specifier: []const u8) !
     });
 }
 
-fn compatLeakEntrySource(allocator: std.mem.Allocator, test_specifier: []const u8) ![]u8 {
-    return std.mem.concat(allocator, u8, &.{
-        "import \"",
-        compat_leak_harness_specifier,
-        "\";\n",
-        "import \"",
-        test_specifier,
-        "\";\n",
-        "export default async function handle(req) {\n",
-        "  let result;\n",
-        "  if (req.path === \"/count\") {\n",
-        "    result = { ok: true, total: globalThis.__colloWebApiLeakTestCount(), failures: [] };\n",
-        "  } else if (req.path === \"/check\") {\n",
-        "    result = await globalThis.__colloRunWebApiLeakChecks();\n",
-        "  } else {\n",
-        "    const match = /^\\/setup\\/(\\d+)$/.exec(req.path);\n",
-        "    result = match\n",
-        "      ? await globalThis.__colloRunWebApiLeakSetup(Number(match[1]))\n",
-        "      : { ok: false, total: globalThis.__colloWebApiLeakTestCount(), failures: [{ name: \"leak route\", message: \"unknown leak route\" }] };\n",
-        "  }\n",
-        "  return new Response(JSON.stringify(result), {\n",
-        "    status: result.ok ? 200 : 500,\n",
-        "    headers: { \"content-type\": \"application/json\" },\n",
-        "  });\n",
-        "}\n",
-    });
-}
-
 fn rewriteColloTestImports(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
     const replacements = [_]struct { needle: []const u8, replacement: []const u8 }{
         .{ .needle = "from \"" ++ collo_test_import ++ "\"", .replacement = "from \"" ++ collo_test_specifier ++ "\"" },
@@ -545,6 +489,26 @@ fn replaceAll(allocator: std.mem.Allocator, source: []const u8, needle: []const 
     }
     try out.appendSlice(allocator, remaining);
     return out.toOwnedSlice(allocator);
+}
+
+test "a suite result passes only when it reports ok with at least one test" {
+    try expectSuiteResult("/webapi/unit.test.js", "{\"ok\":true,\"total\":3,\"failures\":[]}", .complete);
+    try std.testing.expectError(
+        error.WebApiSuiteEmpty,
+        expectSuiteResult("/webapi/unit.test.js", "{\"ok\":true,\"total\":0,\"failures\":[]}", .complete),
+    );
+    try std.testing.expectError(
+        error.WebApiSuiteEmpty,
+        expectSuiteResult("/webapi/unit.test.js", "{\"ok\":true}", .complete),
+    );
+    try std.testing.expectError(
+        error.WebApiSuiteFailed,
+        expectSuiteResult("/webapi/unit.test.js", "{\"ok\":false,\"total\":3,\"failures\":[]}", .complete),
+    );
+    try std.testing.expectError(
+        error.WebApiSuiteFailed,
+        expectSuiteResult("/webapi/unit.test.js", "504 deadline", .complete),
+    );
 }
 
 test "webapi compat import rewriting accepts Bun test and harness imports" {

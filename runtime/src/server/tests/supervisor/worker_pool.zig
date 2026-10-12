@@ -1,7 +1,8 @@
 //! The pools and worker records as the supervisor builds and keeps them
 //! (`Supervisor.init` in `server/supervisor/supervisor.zig`): one pool
-//! per worker definition, sized from that definition's `concurrency` and the
-//! pool caps of `scheduler_limits.zig`; the record storage each launch ticket
+//! per worker definition, sized from that definition's `concurrency`, the
+//! pool's table bound in `common/limits/pool.zig` and its launch cap in
+//! `scheduler_limits.zig`; the record storage each launch ticket
 //! names, which holds one worker at a time from the build for its publish to
 //! its teardown (`worker_registry.zig`); the cap on launches in flight; the
 //! memory gate, which refuses growth at the node's memory ceiling and wakes
@@ -47,7 +48,7 @@ fn expectAcquired(worker_pool: *WorkerPool, lane: pool_mod.LaneId, request: u32)
 fn expectHandoff(released: WorkerPool.Released) !WorkerPool.Handoff {
     return switch (released) {
         .handed_to => |handoff| handoff,
-        .idle, .retire => error.TestExpectedHandoff,
+        .idle, .retire, .release_reader => error.TestExpectedHandoff,
     };
 }
 
@@ -104,7 +105,7 @@ test "the supervisor builds one pool per definition from that definition's concu
         try testing.expect(supervisor.poolFor(definition) == worker_pool);
         try testing.expectEqual(supervisor.routes.definition(definition).settings.limits.concurrency, worker_pool.concurrency);
         try testing.expectEqual(@as(u8, 1), worker_pool.concurrency);
-        try testing.expectEqual(@as(usize, capacity.pool_workers_max), worker_pool.entries.len);
+        try testing.expectEqual(@as(usize, limits.pool.pool_workers_max), worker_pool.entries.len);
         try testing.expectEqual(capacity.pool_cold_starts_in_flight_max, worker_pool.launches_max);
         try testing.expectEqual(@as(usize, limits.pool.pool_waiters_max), worker_pool.waiters.len);
         const snapshot = worker_pool.snapshot();
@@ -115,9 +116,9 @@ test "the supervisor builds one pool per definition from that definition's concu
 
     // Every entry of every pool has its record storage from the start, vacant
     // and fixed to the entry's definition, so a launch never allocates one.
-    try testing.expectEqual(definition_count * capacity.pool_workers_max, supervisor.records.len);
+    try testing.expectEqual(definition_count * limits.pool.pool_workers_max, supervisor.records.len);
     for (supervisor.records, 0..) |*record, index| {
-        const definition: config.DefinitionIndex = @intCast(index / capacity.pool_workers_max);
+        const definition: config.DefinitionIndex = @intCast(index / limits.pool.pool_workers_max);
         try testing.expectEqual(definition, record.definition_index);
         try testing.expectEqualStrings(fixture.definition_names[definition], record.name);
         try testing.expectEqual(@as(u64, 0), record.id);
@@ -126,8 +127,8 @@ test "the supervisor builds one pool per definition from that definition's concu
     for (0..definition_count) |index| {
         const definition: config.DefinitionIndex = @intCast(index);
         const records = supervisor.recordsOf(definition);
-        try testing.expectEqual(@as(usize, capacity.pool_workers_max), records.len);
-        try testing.expect(&records[0] == &supervisor.records[index * capacity.pool_workers_max]);
+        try testing.expectEqual(@as(usize, limits.pool.pool_workers_max), records.len);
+        try testing.expect(&records[0] == &supervisor.records[index * limits.pool.pool_workers_max]);
     }
 }
 
@@ -152,7 +153,7 @@ test "a launch ticket names the record storage its worker is built in" {
     try testing.expect(beta_pool.acquire(1, requestKey(1, 7), far_ns) == .wait);
     const ticket = beta_pool.launchStarted(true) orelse return error.TestExpectedLaunch;
     const storage = supervisor.ticketRecord(beta, ticket);
-    try testing.expect(storage == &supervisor.records[@as(usize, beta) * capacity.pool_workers_max + ticket.entry]);
+    try testing.expect(storage == &supervisor.records[@as(usize, beta) * limits.pool.pool_workers_max + ticket.entry]);
     try testing.expect(storage == fixture.recordFor(&supervisor, beta, ticket.entry));
     try testing.expectEqual(beta, storage.definition_index);
     try testing.expectEqual(@as(u64, 0), storage.id);
@@ -196,7 +197,7 @@ test "a record holds one worker at a time, built under a fresh key and torn down
     // vacant, and only then does the pool let the entry go.
     try fixture.publishCompletedRecord(first, 61);
     try testing.expect(demo_pool.retireIdle(first) == .retire);
-    worker_registry.teardown(&supervisor, first);
+    worker_registry.teardown(&supervisor, first, .idle);
     try testing.expectEqual(@as(u64, 0), first.id);
     try testing.expect(!first.page_mapped);
     try demo_pool.remove(first);
@@ -288,10 +289,11 @@ test "a settle takes no pool lock, so it finishes while its worker's pool is loc
     // settle that took the mutex would deadlock here, which a Debug build
     // reports as a panic.
     demo_pool.mutex.lock();
-    supervisor.settleRequest(worker, 1, .{ .floor = .{ .status = .crash } });
+    supervisor.settleRequest(worker, 1, .{ .floor = .{ .status = .crash } }, fixture.request_ended_ns);
     demo_pool.mutex.unlock();
 
-    try testing.expect(worker.requests.dispatchedFor(1) == null);
+    // The floor is written and its entry parked for a late record of it.
+    try testing.expect(worker.requests.verdict(1) == .skip);
     try testing.expect((try demo_pool.release(worker, served.slot, 1)) == .idle);
 }
 

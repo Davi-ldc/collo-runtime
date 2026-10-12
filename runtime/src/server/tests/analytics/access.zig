@@ -101,9 +101,6 @@ test "an access record encodes every field as one valid JSON line" {
     });
     facts.worker_id = 5;
     facts.worker_generation = 2;
-    facts.cpu_time_ns = 1_500_000;
-    facts.io_time_ns = 2_500_000;
-    facts.waiting_ns = 3_500_000;
     facts.cold_start_ns = 4_000_000;
     facts.cold_start_blocked_ns = 3_000_000;
     facts.first_byte_mono_ns = 1_100_000_000;
@@ -134,16 +131,17 @@ test "an access record encodes every field as one valid JSON line" {
     try std.testing.expect(object.get("cold_start").?.bool);
     try std.testing.expectEqual(@as(i64, 750), object.get("duration_ms").?.integer);
     try std.testing.expectEqual(@as(i64, 100), object.get("ttfb_ms").?.integer);
-    try std.testing.expectEqual(@as(i64, 1_500_000), object.get("cpu_time_ns").?.integer);
-    try std.testing.expectEqual(@as(i64, 2_500_000), object.get("io_time_ns").?.integer);
-    try std.testing.expectEqual(@as(i64, 3_500_000), object.get("waiting_ns").?.integer);
     try std.testing.expectEqual(@as(i64, 4), object.get("cold_start_ms").?.integer);
     try std.testing.expectEqual(@as(i64, 3), object.get("cold_start_blocked_ms").?.integer);
     try std.testing.expectEqualStrings("deadline", object.get("error_code").?.string);
     try std.testing.expectEqualStrings("deadline_grace_expired", object.get("worker_fault").?.string);
     try std.testing.expectEqualStrings("2001:db8::1", object.get("client_ip").?.string);
     try std.testing.expectEqualStrings("Bot/1.\xef\xbf\xbd0", object.get("user_agent").?.string);
-    try std.testing.expectEqual(@as(usize, 22), object.count());
+    // What the request used is the usage record's alone: the access line
+    // carries no resource measure.
+    for ([_][]const u8{ "cpu_time_ns", "io_time_ns", "waiting_ns", "cpu_ns", "io_ns", "exec_ns" }) |key|
+        try std.testing.expect(object.get(key) == null);
+    try std.testing.expectEqual(@as(usize, 19), object.count());
 }
 
 test "a worst-case access record fits its encoded bound" {
@@ -167,9 +165,6 @@ test "a worst-case access record fits its encoded bound" {
     facts.worker_id = widest;
     facts.worker_generation = widest;
     facts.first_byte_mono_ns = widest;
-    facts.cpu_time_ns = widest;
-    facts.io_time_ns = widest;
-    facts.waiting_ns = widest;
     facts.cold_start_ns = widest;
     facts.cold_start_blocked_ns = widest;
     facts.error_code = comptime std.meta.stringToEnum(CompletedStatus, analytics.record.longestTagName(CompletedStatus)).?;

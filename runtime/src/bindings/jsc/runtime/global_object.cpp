@@ -12,6 +12,9 @@ namespace Collo {
 
 VmClientData::VmClientData(ColloVm* owner)
     : owner(owner)
+    , global_object_space("ColloGlobalObject"_s, owner->vm->heap, owner->vm->heap.globalObjectHeapCellType,
+          sizeof(GlobalObject), GlobalObject::numberOfLowerTierPreciseCells)
+    , global_object_allocator(global_object_space)
 {
 }
 
