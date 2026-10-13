@@ -99,7 +99,8 @@ pub const Owners = struct {
     budget_overrun_pending: bool,
     /// When the VM thread last stopped working for any owner, on the
     /// runtime's clock: the start of its idle time, from which the loop
-    /// releases the thread's allocator cache (`scheduler/loop.zig`).
+    /// times its allocator cache release and its idle collection
+    /// (`scheduler/idle.zig`).
     idle_since_mono_ns: u64,
     /// The VM thread released its allocator cache and has run no owner's
     /// work since.

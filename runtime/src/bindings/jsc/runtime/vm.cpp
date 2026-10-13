@@ -716,6 +716,7 @@ extern "C" ColloStatus collo_vm_heap_stats(ColloVm* vm, ColloHeapStats* out)
     JSC::JSLockHolder locker(*vm->vm);
     out->size_bytes = vm->vm->heap.size();
     out->extra_memory_bytes = vm->vm->heap.extraMemorySize();
+    out->capacity_bytes = vm->vm->heap.capacity();
     return COLLO_STATUS_OK;
 }
 

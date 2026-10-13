@@ -8,7 +8,9 @@
 //! item's JavaScript, and one a window took past its budget is answered
 //! after the item (`serve/termination.zig`). The deferred-work pump always
 //! runs under the worker owner. The loop waits in `ppoll`
-//! (`poll_backend.zig`).
+//! (`poll_backend.zig`), and after a wait that blocked it does the VM
+//! thread's idle work, the allocator cache release and the collection of a
+//! worker that went quiet (`idle.zig`).
 //!
 //! Each tick starts with the retirement check (`runtime/retirement.zig`): a
 //! sentinel fire, a worker none of whose routes can serve, or one that
@@ -30,9 +32,9 @@
 const std = @import("std");
 const bindings = @import("collo_bindings");
 const ipc = @import("collo_ipc");
-const worker_limits = @import("collo_limits").worker;
 const state = @import("../runtime/root.zig");
 const runtime_owner = @import("../runtime/owner.zig");
+const idle = @import("idle.zig");
 const poll_backend = @import("poll_backend.zig");
 const ready_queue = @import("queue.zig");
 const immediates = @import("immediates.zig");
@@ -145,14 +147,14 @@ pub fn run(runtime: *state.Runtime) !void {
             else => return err,
         };
         runtime.detachEgressAfterFailedRelease();
-        backend.idle_cache_release_deadline_ns = idleCacheReleaseDeadline(runtime);
+        backend.idle_deadline_ns = idle.deadlineNs(runtime);
         var events: [poll_backend.events_max]poll_backend.Event = undefined;
         const ready = backend.wait(runtime, &events) catch |err| switch (err) {
             error.ControlPeerClosed => return,
             else => return err,
         };
-        releaseIdleThreadCache(runtime);
-        backend.idle_cache_release_deadline_ns = 0;
+        idle.runDue(runtime, events[0..ready]);
+        backend.idle_deadline_ns = 0;
         if (ready == 0)
             continue;
 
@@ -164,31 +166,6 @@ pub fn run(runtime: *state.Runtime) !void {
         if (!runtime.core.running)
             break;
     }
-}
-
-/// When the blocked loop must wake to release the VM thread's allocator
-/// cache: `thread_cache_idle_release_ns` after its last owner window ended,
-/// or 0 when the cache is already released. The worker's seccomp filter
-/// denies the signals libpas suspends an idle thread with, so the thread
-/// stops its own allocators after the same idle time; otherwise the
-/// scavenger polls for the worker's life (`common/limits/worker.zig`). Idle
-/// means no owner's work, not no live request: a request parked on a slow
-/// fetch leaves the thread just as idle.
-fn idleCacheReleaseDeadline(runtime: *const state.Runtime) u64 {
-    if (runtime.owners.thread_cache_released)
-        return 0;
-    return runtime.owners.idle_since_mono_ns +| worker_limits.thread_cache_idle_release_ns;
-}
-
-/// Releases the VM thread's allocator cache once it has been idle long
-/// enough (`idleCacheReleaseDeadline`), at most once per idle stretch.
-fn releaseIdleThreadCache(runtime: *state.Runtime) void {
-    if (runtime.owners.thread_cache_released or runtime.owners.current_id != 0)
-        return;
-    if (runtime.nowMonoNs() < idleCacheReleaseDeadline(runtime))
-        return;
-    bindings.releaseThreadAllocatorCache();
-    runtime.owners.thread_cache_released = true;
 }
 
 fn handleEvent(

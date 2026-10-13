@@ -4,7 +4,8 @@
 //! cgroup placement with every limit on the live leaf and the child's check
 //! of it, the WorkerInit handoff and its failures with the page left as the
 //! host wrote it, the sandboxed worker's boot order and its trace pipe closed
-//! before tenant code, its threads asleep when idle, the footprint its engine
+//! before tenant code, its threads asleep when idle, the garbage it gives
+//! back once it goes quiet, the footprint its engine
 //! reads from its leaf and its mapped shared objects, a worker with no egress
 //! descriptor, workers whose `/tmp` the host never sees, a root read-only but
 //! for `/tmp` as `node:fs` sees it, the runtime's log lines and the tenant's
@@ -616,12 +617,15 @@ test "a worker holds no pipe once its boot ends, its zygote's trace pipe least o
 }
 
 /// How long a worker gets after its last turn before its threads must all
-/// sleep: the allocator cache release `limits.worker.thread_cache_idle_release_ns`
-/// after the last turn (500 ms), then the scavenger, which that release
-/// wakes, returning the pages it was handed once they are older than its
-/// epoch delay (300 ms off macOS) and sleeping again after two empty passes
-/// 100 ms apart, rounded up.
-const idle_worker_settle_ns: u64 = 1500 * std.time.ns_per_ms;
+/// sleep: its idle collection `limits.worker.idle_collection_delay_ns` after
+/// the last turn (500 ms), which keeps the collector thread working while it
+/// runs; that thread's allocator cache release
+/// `limits.worker.thread_cache_idle_release_ns` after its last work (500
+/// ms); then the scavenger, which that release wakes, returning the pages it
+/// was handed once they are older than its epoch delay (300 ms off macOS)
+/// and sleeping again after two empty passes 100 ms apart; with a second
+/// for the collection itself on a loaded machine.
+const idle_worker_settle_ns: u64 = 2500 * std.time.ns_per_ms;
 /// A bound, counted from ready, on the wake the sentinel of a worker that
 /// evaluated routes at boot may still have planned: the init window
 /// `limits.process.WORKER_INIT_TIMEOUT_MS`, which began when WorkerInit was
@@ -644,7 +648,7 @@ const idle_worker_window_ns: u64 = 2 * std.time.ns_per_s;
 const idle_worker_cpu_noise_usec: u64 = 2_000;
 
 comptime {
-    std.debug.assert(limits.worker.thread_cache_idle_release_ns < idle_worker_settle_ns);
+    std.debug.assert(limits.worker.idle_collection_delay_ns + limits.worker.thread_cache_idle_release_ns < idle_worker_settle_ns);
 }
 
 /// The context switches of every thread of process `pid` so far, voluntary
@@ -792,6 +796,97 @@ test "an idle worker's threads all sleep and none retires" {
         std.debug.print("an idle worker spent {d} us of CPU in {d} ms\n", .{ cpu_usec, window_ms });
         return error.IdleWorkerSpentCpu;
     }
+}
+
+/// The least the retaining request below must grow its worker's leaf by,
+/// well under the cells it keeps, so the bound holds however the engine
+/// packs them.
+const idle_collection_growth_min_bytes: u64 = 16 * 1024 * 1024;
+
+test "a worker gives back what its requests left behind once it goes quiet, through its seccomp filter, and serves again with its state intact" {
+    var spawned = try support.spawnZygote();
+    defer spawned.deinit();
+
+    // `/retain` keeps the cells it builds reachable from module state, so
+    // no collection can free them while it runs or after; `/drop` lets them
+    // go and then allocates nothing more.
+    var route = try TestRoute.init("idle-collect",
+        \\let retained = null;
+        \\let served = 0;
+        \\export default function handle(request) {
+        \\  served += 1;
+        \\  if (request.url.endsWith("/retain")) {
+        \\    const rounds = [];
+        \\    for (let round = 0; round < 64; round++) {
+        \\      const items = [];
+        \\      for (let i = 0; i < 4096; i++) items.push({ round, index: i, label: `item-${round}-${i}` });
+        \\      rounds.push(items);
+        \\    }
+        \\    retained = rounds;
+        \\    return new Response(`retained:${rounds.length * rounds[0].length}`);
+        \\  }
+        \\  if (request.url.endsWith("/drop")) {
+        \\    const count = retained.length * retained[0].length;
+        \\    retained = null;
+        \\    return new Response(`dropped:${count}`);
+        \\  }
+        \\  return new Response(`served:${served}`);
+        \\}
+    );
+    defer route.deinit();
+    var launched = try launchOrSkip(&spawned, 90_040, .{ .routes = route.launchRoutes() });
+    defer launched.deinit();
+    const handle = &launched.handle;
+
+    // Every reading follows a settle, in which the worker's idle collection
+    // after its last request has run and the scavenger has returned what it
+    // freed, so none races the collection.
+    std.Thread.sleep(idle_worker_settle_ns);
+    const ready_bytes = try support.readLeafUnsigned(handle.leaf, "memory.current");
+    try serveForkedGet(handle, 90_040, 1, "/retain", "retained:262144");
+    std.Thread.sleep(idle_worker_settle_ns);
+    const retained_bytes = try support.readLeafUnsigned(handle.leaf, "memory.current");
+    try serveForkedGet(handle, 90_041, 3, "/drop", "dropped:262144");
+    std.Thread.sleep(idle_worker_settle_ns);
+    const dropped_bytes = try support.readLeafUnsigned(handle.leaf, "memory.current");
+
+    const growth_bytes = retained_bytes -| ready_bytes;
+    const returned_bytes = retained_bytes -| dropped_bytes;
+    if (growth_bytes < idle_collection_growth_min_bytes or returned_bytes < growth_bytes / 2) {
+        std.debug.print("leaf memory.current: {d} B ready, {d} B retained, {d} B once dropped\n", .{
+            ready_bytes,
+            retained_bytes,
+            dropped_bytes,
+        });
+        return error.IdleWorkerKeptGarbage;
+    }
+    // The worker lived through both collections, and its module state with
+    // it.
+    try serveForkedGet(handle, 90_042, 5, "/count", "served:3");
+}
+
+/// Sends a GET of `path` to a forked worker on stream `stream_id` and
+/// checks that it answers 200 with `expected_body`.
+fn serveForkedGet(
+    handle: *host.WorkerHandle,
+    request_id: u64,
+    stream_id: u32,
+    path: []const u8,
+    expected_body: []const u8,
+) !void {
+    const request = rt.RequestParts{ .method = "GET", .path = path };
+    var dispatch = try rt.initDispatchWork(std.testing.allocator, .{
+        .request_id = request_id,
+        .deadline_monotonic_ns = try forkedDeadlineNs(),
+        .request = request,
+    });
+    defer dispatch.deinit();
+    try rt.sendIngressRoute(handle.control_fd, &dispatch, stream_id, request);
+    var response = try readForkedIngressResponse(handle, request_id, 8_000);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status);
+    try std.testing.expectEqual(ipc.RequestDoneStatus.ok, response.done.status);
+    try std.testing.expectEqualStrings(expected_body, response.body);
 }
 
 test "a worker's engine reads its footprint from its own cgroup leaf, within the leaf's memory.current" {

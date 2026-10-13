@@ -64,11 +64,23 @@ pub const request_task_capacity: usize = server.worker_concurrency_max;
 /// reach its deep sleep instead of polling for the worker's life.
 pub const thread_cache_idle_release_ns: u64 = 500 * ns_per_ms;
 
+/// How long a worker that finished a request holds no request and runs no
+/// owner's work before its loop collects the whole heap once and hands the
+/// freed memory back to the kernel (`worker/scheduler/idle.zig`). A request
+/// that arrives during the collection waits for it, so a shorter delay
+/// trades more collections, and more requests delayed by one, between
+/// closely spaced requests for less memory held by a quiet worker. It
+/// equals `thread_cache_idle_release_ns`, so one wake collects and then
+/// releases the VM thread's cache.
+pub const idle_collection_delay_ns: u64 = thread_cache_idle_release_ns;
+
 const ns_per_ms: u64 = 1_000_000;
 
 comptime {
     if (thread_cache_idle_release_ns == 0)
         @compileError("a thread must stay idle some time before it releases its cache");
+    if (idle_collection_delay_ns == 0)
+        @compileError("a worker must stay idle some time before it collects, or every gap between requests pays for one");
     if (fetches_per_request_max == 0 or fetches_per_request_max > fetches_per_worker_max)
         @compileError("a request's fetches must fit the worker's");
     if (fetch_bodies_per_worker_max < (request_task_capacity + 1) * fetches_per_request_max)

@@ -226,14 +226,20 @@ extern "C" ColloStatus collo_vm_collect_full_gc_and_trim(ColloVm* vm)
         return COLLO_STATUS_INVALID_ARGUMENT;
 
     JSC::JSLockHolder locker(*vm->vm);
+    // The stack is scanned conservatively, so words a deeper turn left below the caller's frame would keep the cells
+    // they point to alive; the WeakRef targets kept for the last turn would too.
     JSC::sanitizeStackForVM(*vm->vm);
     vm->vm->finalizeSynchronousJSExecution();
-    vm->vm->heap.collectNow(JSC::Sync, JSC::CollectionScope::Full);
+    JSC::GCRequest request(JSC::CollectionScope::Full);
+    request.isIdle = true;
+    // A synchronous collectNow also sweeps, so every block the collection emptied is back in the allocator before the
+    // trim below.
+    vm->vm->heap.collectNow(JSC::Sync, request);
+    // The scavenger thread would decommit the freed pages only once they are older than its epoch delay. Under libpas
+    // the release is bmalloc::api::scavenge, a synchronous scavenge that decommits every free page with madvise and
+    // stops the calling thread's allocators; it stops another thread's only through a thread suspender, which a worker
+    // has none of (Collo::resumeFastMallocScavengerForSandbox).
     WTF::releaseFastMallocFreeMemory();
-#if BUSE(LIBPAS)
-    pas_scavenger_run_synchronously_now();
-#endif
-    vm->vm->finalizeSynchronousJSExecution();
     return COLLO_STATUS_OK;
 }
 

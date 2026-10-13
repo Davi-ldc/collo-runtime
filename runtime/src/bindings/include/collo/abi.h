@@ -374,6 +374,11 @@ typedef struct ColloHeapStats {
     /* JSC's Heap::extraMemorySize(): memory outside the heap that cells
        report as theirs, ArrayBuffer contents included. */
     uint64_t extra_memory_bytes;
+    /* JSC's Heap::capacity(): the bytes of every block and large allocation
+       the heap holds, whatever their cells hold, plus extra_memory_bytes. It
+       grows as allocation adds blocks and falls only when a sweep frees the
+       blocks and large allocations a collection found dead. */
+    uint64_t capacity_bytes;
 } ColloHeapStats;
 
 COLLO_STATIC_ASSERT(sizeof(ColloMapping) == 16, "ColloMapping ABI size mismatch");
@@ -524,10 +529,11 @@ COLLO_STATIC_ASSERT(
     offsetof(ColloMemoryStatus, in_use_per_million) == 8, "ColloMemoryStatus.in_use_per_million offset mismatch");
 COLLO_STATIC_ASSERT(offsetof(ColloMemoryStatus, reserved0) == 12, "ColloMemoryStatus.reserved0 offset mismatch");
 
-COLLO_STATIC_ASSERT(sizeof(ColloHeapStats) == 16, "ColloHeapStats ABI size mismatch");
+COLLO_STATIC_ASSERT(sizeof(ColloHeapStats) == 24, "ColloHeapStats ABI size mismatch");
 COLLO_STATIC_ASSERT(offsetof(ColloHeapStats, size_bytes) == 0, "ColloHeapStats.size_bytes offset mismatch");
 COLLO_STATIC_ASSERT(
     offsetof(ColloHeapStats, extra_memory_bytes) == 8, "ColloHeapStats.extra_memory_bytes offset mismatch");
+COLLO_STATIC_ASSERT(offsetof(ColloHeapStats, capacity_bytes) == 16, "ColloHeapStats.capacity_bytes offset mismatch");
 
 #undef COLLO_STATIC_ASSERT
 
@@ -707,14 +713,26 @@ ColloStatus collo_vm_reseed_after_fork(ColloVm* vm, const ColloRandomSeeds* seed
    filter, and a retired thread cannot come back once clone is denied.
    Idempotent. */
 ColloStatus collo_vm_prespawn_compiler_threads(ColloVm* vm);
+/* Runs one synchronous full collection outside any turn, for a VM about to
+   stay quiet: the zygote after its warmup corpus, a worker that has gone idle
+   (worker/scheduler/idle.zig). The dead part of the stack and the WeakRef
+   targets kept for the last turn are dropped first. The collection is tagged
+   idle (the engine's GCRequest::isIdle, the only kind that lets optimized
+   code go once the mutator has stayed quiet long enough) and swept before
+   the call returns, and the allocator then hands every free page back to the
+   kernel. It runs on the calling thread with the collector and marker
+   threads collo_vm_prespawn_compiler_threads started, and creates none.
+   FinalizationRegistry callbacks it makes due run later, through
+   collo_vm_pump_deferred_work. Inside a turn it fails with
+   COLLO_STATUS_INVALID_ARGUMENT. */
 ColloStatus collo_vm_collect_full_gc_and_trim(ColloVm* vm);
 /* Runs a synchronous young-generation (Eden) collection and sweeps it, outside
    any turn. Cells that survived an earlier collection are traced again only
    when a write barrier remembered them, so a cell that gained an edge to a new
    cell without the barrier loses that cell here. */
 ColloStatus collo_vm_collect_eden_gc(ColloVm* vm);
-/* Reads the heap's size and the extra memory its cells report into *out,
-   which is cleared on entry. Inside or outside a turn. */
+/* Reads the heap's size, its capacity and the extra memory its cells report
+   into *out, which is cleared on entry. Inside or outside a turn. */
 ColloStatus collo_vm_heap_stats(ColloVm* vm, ColloHeapStats* out);
 /* Cross-thread cooperative termination trap. The caller must keep the ColloVm
    object alive. If VM destroy has begun, this returns invalid argument. */

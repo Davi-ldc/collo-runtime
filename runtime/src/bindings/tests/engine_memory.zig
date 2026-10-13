@@ -97,7 +97,7 @@ test "a helper-thread cache release with no idle interval is refused" {
     bindings.releaseThreadAllocatorCache();
 }
 
-test "heap statistics count an ArrayBuffer's bytes as the heap's extra memory" {
+test "heap statistics count an ArrayBuffer's bytes as the heap's extra memory, within its size and capacity" {
     var vm = try support.createVm();
     defer vm.deinit();
 
@@ -132,4 +132,6 @@ test "heap statistics count an ArrayBuffer's bytes as the heap's extra memory" {
 
     try std.testing.expect(after.extra_memory_bytes >= before.extra_memory_bytes + held_bytes);
     try std.testing.expect(after.size_bytes >= after.extra_memory_bytes);
+    // The marked cells sit in the blocks the capacity counts.
+    try std.testing.expect(after.capacity_bytes >= after.size_bytes);
 }

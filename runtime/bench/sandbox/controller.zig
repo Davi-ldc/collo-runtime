@@ -39,11 +39,14 @@ const idle_window_ms_default = 30_000;
 const idle_window_ms_min = 1_000;
 const idle_window_ms_max = 600_000;
 /// The pause between an `idle` target's load and the start of its window.
-/// A thread releases its allocator cache after
-/// `thread_cache_idle_release_ns` (`common/limits/worker.zig`) without work,
-/// and the libpas scavenger then needs its epoch delay and two empty passes
-/// before it sleeps, so the window starts once every thread can be asleep.
-const idle_settle_ms = 1_500;
+/// The worker collects its heap `idle_collection_delay_ns` after its last
+/// request, which keeps the collector's threads working while it runs; a
+/// thread releases its allocator cache after `thread_cache_idle_release_ns`
+/// (`common/limits/worker.zig`) without work; and the libpas scavenger then
+/// needs its epoch delay and two empty passes before it sleeps. The window
+/// starts once every thread can be asleep, with a second to spare for the
+/// collection on a loaded machine.
+const idle_settle_ms = 2_500;
 /// Bounds each daemon reply and the daemon's exit after a shutdown.
 const operation_timeout_ms = 30_000;
 /// Bounds each blocking read or write of the HTTP client. The server answers

@@ -3,10 +3,10 @@
 //! builds and drives it (`zygote/child_boot.zig`).
 //!
 //! `runtime/` holds the `Runtime` and its state per domain; `scheduler/` the
-//! event loop with its `ppoll` wait, ready queue, timers, immediates and
-//! request deadlines; `serve/` a request's run from its dispatch to its
-//! `request_done`; `modules/` the registration of the definition's artifact
-//! and the evaluation of its routes;
+//! event loop with its `ppoll` wait, ready queue, timers, immediates,
+//! request deadlines and idle work; `serve/` a request's run from its
+//! dispatch to its `request_done`; `modules/` the registration of the
+//! definition's artifact and the evaluation of its routes;
 //! `egress/` fetches through the egress gateway; `js/` the handler's
 //! `Request` and `Response`; `host/` the `collo_runtime_*`
 //! functions the engine bridge calls on the runtime that
@@ -82,6 +82,7 @@ pub const testing = if (builtin.is_test) struct {
     pub const egress_gateway_control = @import("egress/gateway_control.zig");
 
     pub const scheduler = struct {
+        pub const idle = @import("scheduler/idle.zig");
         pub const loop = @import("scheduler/loop.zig");
         pub const queue = @import("scheduler/queue.zig");
         pub const immediates = @import("scheduler/immediates.zig");

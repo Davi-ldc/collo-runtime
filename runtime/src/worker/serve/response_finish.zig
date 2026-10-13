@@ -377,6 +377,7 @@ fn removeFinishedRequest(runtime: *state.Runtime, request_id: u64) void {
     const removed = runtime.requests.active.fetchRemove(request_id) orelse return;
     cleanupRequestSubresources(runtime, removed.value);
     runtime.destroyRequestContext(removed.value);
+    runtime.requests.idle_collection_owed = true;
 }
 
 /// Releases everything `request_ctx` holds. Its live slot is not among them:

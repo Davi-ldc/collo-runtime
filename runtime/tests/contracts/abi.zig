@@ -76,8 +76,9 @@ test "an extracted response keeps its layout" {
 test "memory status and heap statistics keep their layouts" {
     try std.testing.expectEqual(@as(usize, 16), @sizeOf(bindings.MemoryStatus));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(bindings.MemoryStatus, "in_use_per_million"));
-    try std.testing.expectEqual(@as(usize, 16), @sizeOf(bindings.HeapStats));
+    try std.testing.expectEqual(@as(usize, 24), @sizeOf(bindings.HeapStats));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(bindings.HeapStats, "extra_memory_bytes"));
+    try std.testing.expectEqual(@as(usize, 16), @offsetOf(bindings.HeapStats, "capacity_bytes"));
 }
 
 // `COLLO_MODULE_PACK_MAX_BYTES` and `COLLO_MODULE_PACK_MAX_MODULES`, with

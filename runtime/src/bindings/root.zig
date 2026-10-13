@@ -559,6 +559,10 @@ pub const HeapStats = extern struct {
     /// Memory outside the heap that cells report, ArrayBuffer contents
     /// included.
     extra_memory_bytes: u64 = 0,
+    /// Every block and large allocation the heap holds, whatever their cells
+    /// hold, plus `extra_memory_bytes`; it falls only when a sweep frees what
+    /// a collection found dead.
+    capacity_bytes: u64 = 0,
 };
 
 extern fn collo_engine_page_size_ceiling() u64;
@@ -870,12 +874,14 @@ comptime {
         @compileError("MemoryStatus.in_use_per_million offset mismatch");
     if (@offsetOf(MemoryStatus, "reserved0") != 12)
         @compileError("MemoryStatus.reserved0 offset mismatch");
-    if (@sizeOf(HeapStats) != 16)
+    if (@sizeOf(HeapStats) != 24)
         @compileError("HeapStats ABI size mismatch");
     if (@offsetOf(HeapStats, "size_bytes") != 0)
         @compileError("HeapStats.size_bytes offset mismatch");
     if (@offsetOf(HeapStats, "extra_memory_bytes") != 8)
         @compileError("HeapStats.extra_memory_bytes offset mismatch");
+    if (@offsetOf(HeapStats, "capacity_bytes") != 16)
+        @compileError("HeapStats.capacity_bytes offset mismatch");
 }
 
 pub const OwnedString = struct {
@@ -1114,6 +1120,10 @@ pub const Vm = struct {
         try statusToError(collo_vm_prespawn_compiler_threads(self.ptr()));
     }
 
+    /// Collects the whole heap and hands the memory it frees back to the
+    /// kernel before returning; see `collo_vm_collect_full_gc_and_trim` in
+    /// abi.h. Outside a turn, on the VM thread; fails with
+    /// `error.InvalidArgument` inside one.
     pub fn collectFullGCAndTrim(self: *Vm) Error!void {
         try statusToError(collo_vm_collect_full_gc_and_trim(self.ptr()));
     }
@@ -1124,8 +1134,8 @@ pub const Vm = struct {
         try statusToError(collo_vm_collect_eden_gc(self.ptr()));
     }
 
-    /// The heap's size and the extra memory its cells report, inside or
-    /// outside a turn.
+    /// The heap's size, capacity and the extra memory its cells report,
+    /// inside or outside a turn.
     pub fn heapStats(self: *Vm) Error!HeapStats {
         var stats: HeapStats = .{};
         try statusToError(collo_vm_heap_stats(self.ptr(), &stats));

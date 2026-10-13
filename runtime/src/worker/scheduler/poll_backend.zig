@@ -1,8 +1,8 @@
 //! The worker loop's wait, on the VM thread: one `ppoll` over the
 //! descriptors whose events the loop handles now, with the earliest of the
 //! next timer, the next request deadline, the deferred-work recheck and the
-//! idle cache release as its timeout, or a zero timeout while gateway packets
-//! may wait past a drain's batch bound, turned into loop events. The set is
+//! idle work (`idle.zig`) as its timeout, or a zero timeout while gateway
+//! packets may wait past a drain's batch bound, turned into loop events. The set is
 //! built anew for every wait from what the runtime holds:
 //! - the control socket, for input always, and for room only while a
 //!   response send, the retirement notice or a `request_done` waits for it
@@ -84,10 +84,10 @@ pub const PollBackend = struct {
     /// a zero timeout, and the loop drains again at its next tick
     /// (`scheduler/loop.zig`).
     egress_completion_debt: bool = false,
-    /// When the VM thread will have been idle `thread_cache_idle_release_ns`
-    /// and releases its allocator cache; zero when the cache is released or
-    /// the loop is not about to block (`scheduler/loop.zig`).
-    idle_cache_release_deadline_ns: u64 = 0,
+    /// When the VM thread's idle work falls due, its allocator cache release
+    /// or its idle collection (`idle.zig:deadlineNs`); zero when neither is
+    /// pending or the loop is not about to block (`scheduler/loop.zig`).
+    idle_deadline_ns: u64 = 0,
 
     /// Blocks until a watched descriptor is ready or the earliest deadline
     /// passes, writes the events into `out` and returns their count, 0 when
@@ -114,14 +114,14 @@ pub const PollBackend = struct {
     }
 
     /// The earliest of the next timer, the next request deadline, the
-    /// deferred-work recheck and the idle cache release, the last two of
-    /// which must wake the loop even when no timer or deadline is armed.
+    /// deferred-work recheck and the idle work, the last two of which must
+    /// wake the loop even when no timer or deadline is armed.
     fn nextDeadlineNs(self: *const PollBackend, runtime: *state.Runtime) ?u64 {
         var deadline_ns: ?u64 = runtime.scheduler.timers.peekDueNs();
         const candidates = [_]?u64{
             runtime.nextRequestDeadlineNs(),
             nonZero(self.deferred_backstop_deadline_ns),
-            nonZero(self.idle_cache_release_deadline_ns),
+            nonZero(self.idle_deadline_ns),
         };
         for (candidates) |candidate| {
             const due_ns = candidate orelse continue;
