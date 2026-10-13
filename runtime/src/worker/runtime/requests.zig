@@ -112,12 +112,6 @@ pub const Requests = struct {
     /// and sends what it holds when the socket turns writable
     /// (`serve/response_finish.zig:flushPendingRequestDones`).
     done_outbox: RequestDoneOutbox,
-    /// A dispatched request finished since the loop's last idle collection,
-    /// so the heap may hold the garbage its work left. Set where a finished
-    /// request leaves the active map (`serve/response_finish.zig`) and
-    /// cleared by the idle collection (`scheduler/idle.zig`), which runs at
-    /// most once per stretch between requests.
-    idle_collection_owed: bool = false,
 
     pub fn init(
         allocator: std.mem.Allocator,

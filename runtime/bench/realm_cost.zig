@@ -103,7 +103,7 @@ pub fn main() !void {
 fn runZygote(allocator: std.mem.Allocator, mode: Mode, counts: []const usize) !void {
     try bindings.setHelperThreadsTimeoutOverrideNs(fork_helper_timeout_ns);
     defer bindings.clearHelperThreadsOverrides();
-    try bindings.prepareProcessForFork();
+    bindings.releaseAllocatorFreeMemory();
 
     var vm = try bindings.Vm.create(bindings.VmOptions.init());
     defer vm.deinit();

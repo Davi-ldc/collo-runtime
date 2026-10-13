@@ -161,14 +161,9 @@ extern "C" ColloStatus collo_vm_prepare_for_fork(ColloVm* vm)
     return suspendFastMallocScavengerForFork(vm);
 }
 
-extern "C" ColloStatus collo_prepare_process_for_fork(void)
-{
-    // Only trims allocator free pages. The zygote is started with fork and exec, so no worker inherits the calling
-    // process's heap, and suspending the process-global scavenger with no VM to resume it would leave it suspended
-    // for the rest of a process that keeps running.
-    WTF::releaseFastMallocFreeMemory();
-    return COLLO_STATUS_OK;
-}
+// Under libpas this is bmalloc::api::scavenge, a synchronous scavenge: it decommits every free page with madvise and
+// shrinks the calling thread's cache.
+extern "C" void collo_allocator_release_free_memory(void) { WTF::releaseFastMallocFreeMemory(); }
 
 extern "C" ColloStatus collo_vm_post_fork_child(ColloVm* vm)
 {
@@ -235,11 +230,8 @@ extern "C" ColloStatus collo_vm_collect_full_gc_and_trim(ColloVm* vm)
     // A synchronous collectNow also sweeps, so every block the collection emptied is back in the allocator before the
     // trim below.
     vm->vm->heap.collectNow(JSC::Sync, request);
-    // The scavenger thread would decommit the freed pages only once they are older than its epoch delay. Under libpas
-    // the release is bmalloc::api::scavenge, a synchronous scavenge that decommits every free page with madvise and
-    // stops the calling thread's allocators; it stops another thread's only through a thread suspender, which a worker
-    // has none of (Collo::resumeFastMallocScavengerForSandbox).
-    WTF::releaseFastMallocFreeMemory();
+    // The scavenger thread would decommit the freed pages only once they are older than its epoch delay.
+    collo_allocator_release_free_memory();
     return COLLO_STATUS_OK;
 }
 

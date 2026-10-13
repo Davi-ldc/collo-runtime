@@ -225,7 +225,7 @@ fn runVariant(
 ) !void {
     try bindings.setHelperThreadsTimeoutOverrideNs(fork_helper_timeout_ns);
     defer bindings.clearHelperThreadsOverrides();
-    try bindings.prepareProcessForFork();
+    bindings.releaseAllocatorFreeMemory();
 
     const self_pid: u32 = @intCast(std.c.getpid());
     const parent_before_create = try readSnapshot(allocator, self_pid);

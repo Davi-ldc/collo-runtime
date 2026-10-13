@@ -10,7 +10,8 @@
 //! runs under the worker owner. The loop waits in `ppoll`
 //! (`poll_backend.zig`), and after a wait that blocked it does the VM
 //! thread's idle work, the allocator cache release and the collection of a
-//! worker that went quiet (`idle.zig`).
+//! worker that went quiet (`idle.zig`), whose heap baseline it records
+//! before its first wait.
 //!
 //! Each tick starts with the retirement check (`runtime/retirement.zig`): a
 //! sentinel fire, a worker none of whose routes can serve, or one that
@@ -64,6 +65,7 @@ pub fn run(runtime: *state.Runtime) !void {
     if (runtime.scheduler.wakeup_fd) |wakeup_fd|
         try runtime.core.vm.setDeferredWorkWakeupFd(wakeup_fd);
     var deferred_pending_imminent = false;
+    idle.start(runtime);
 
     while (runtime.core.running) {
         // Two loads in the common case. A fire in the last tick's work item
@@ -153,7 +155,8 @@ pub fn run(runtime: *state.Runtime) !void {
             error.ControlPeerClosed => return,
             else => return err,
         };
-        idle.runDue(runtime, events[0..ready]);
+        // What was collected matters to tests, not to the loop.
+        _ = idle.runDue(runtime, events[0..ready]);
         backend.idle_deadline_ns = 0;
         if (ready == 0)
             continue;

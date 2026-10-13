@@ -598,7 +598,7 @@ extern fn collo_vm_set_console_sink(
 ) RawStatus;
 extern fn collo_vm_install_process(vm: *RawVm) RawStatus;
 extern fn collo_vm_enable_node_fs_for_worker(vm: *RawVm) RawStatus;
-extern fn collo_prepare_process_for_fork() RawStatus;
+extern fn collo_allocator_release_free_memory() void;
 extern fn collo_set_helper_threads_timeout_override_ns(timeout_ns: u64) RawStatus;
 extern fn collo_set_helper_threads_cache_release_ns(idle_ns: u64) RawStatus;
 extern fn collo_clear_helper_threads_overrides() void;
@@ -1879,8 +1879,12 @@ pub fn releaseThreadAllocatorCache() void {
     collo_allocator_release_thread_cache();
 }
 
-pub fn prepareProcessForFork() Error!void {
-    try statusToError(collo_prepare_process_for_fork());
+/// Hands every free page the process's allocator holds back to the kernel
+/// now and stops the calling thread's allocators; any thread, no `Vm`.
+/// Never called between `Vm.prepareForFork` and a fork, which must fork the
+/// memory as prepared.
+pub fn releaseAllocatorFreeMemory() void {
+    collo_allocator_release_free_memory();
 }
 
 pub fn setGcMaxHeapSizeOverrideBytes(bytes: u64) Error!void {

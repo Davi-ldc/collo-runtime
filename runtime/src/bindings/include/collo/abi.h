@@ -714,13 +714,14 @@ ColloStatus collo_vm_reseed_after_fork(ColloVm* vm, const ColloRandomSeeds* seed
    Idempotent. */
 ColloStatus collo_vm_prespawn_compiler_threads(ColloVm* vm);
 /* Runs one synchronous full collection outside any turn, for a VM about to
-   stay quiet: the zygote after its warmup corpus, a worker that has gone idle
-   (worker/scheduler/idle.zig). The dead part of the stack and the WeakRef
-   targets kept for the last turn are dropped first. The collection is tagged
-   idle (the engine's GCRequest::isIdle, the only kind that lets optimized
-   code go once the mutator has stayed quiet long enough) and swept before
-   the call returns, and the allocator then hands every free page back to the
-   kernel. It runs on the calling thread with the collector and marker
+   stay quiet: the zygote after its warmup corpus, a worker gone idle whose
+   old generation grew (worker/scheduler/idle.zig). The dead part of the
+   stack and the WeakRef targets kept for the last turn are dropped first.
+   The collection is tagged idle (the engine's GCRequest::isIdle, the only
+   kind that lets optimized code go once the mutator has stayed quiet long
+   enough) and swept before the call returns, and the allocator then hands
+   every free page back to the kernel (collo_allocator_release_free_memory).
+   It runs on the calling thread with the collector and marker
    threads collo_vm_prespawn_compiler_threads started, and creates none.
    FinalizationRegistry callbacks it makes due run later, through
    collo_vm_pump_deferred_work. Inside a turn it fails with
@@ -839,7 +840,13 @@ ColloStatus collo_vm_install_process(ColloVm* vm);
 ColloStatus collo_vm_enable_node_fs_for_worker(ColloVm* vm);
 /* The process-global engine settings below are not scoped to a ColloVm and
    take no API lock; each one says which thread may call it. */
-ColloStatus collo_prepare_process_for_fork(void);
+/* Hands every free page the process's allocator holds back to the kernel
+   now, rather than once the scavenger finds it older than its epoch delay,
+   and stops the calling thread's allocators; it stops another thread's only
+   through a thread suspender, which a worker has none of. Any thread,
+   VM-free. Never called between collo_vm_prepare_for_fork and a fork, where
+   the zygote's memory must stay as prepared. */
+void collo_allocator_release_free_memory(void);
 /* Replaces the idle timeout of every engine helper thread (JSC's compiler and
    collector threads, WTF's AutomaticThread). A short one lets the zygote's
    threads retire before it forks; one longer than the worker's life pins a

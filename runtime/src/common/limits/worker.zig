@@ -65,14 +65,25 @@ pub const request_task_capacity: usize = server.worker_concurrency_max;
 pub const thread_cache_idle_release_ns: u64 = 500 * ns_per_ms;
 
 /// How long a worker that finished a request holds no request and runs no
-/// owner's work before its loop collects the whole heap once and hands the
-/// freed memory back to the kernel (`worker/scheduler/idle.zig`). A request
-/// that arrives during the collection waits for it, so a shorter delay
-/// trades more collections, and more requests delayed by one, between
-/// closely spaced requests for less memory held by a quiet worker. It
-/// equals `thread_cache_idle_release_ns`, so one wake collects and then
-/// releases the VM thread's cache.
+/// owner's work before its loop collects once and hands the freed memory
+/// back to the kernel (`worker/scheduler/idle.zig`). A request that arrives
+/// during the collection waits for it, so a shorter delay trades more
+/// collections, and more requests delayed by one, between closely spaced
+/// requests for less memory held by a quiet worker. It equals
+/// `thread_cache_idle_release_ns`, so one wake collects and then releases
+/// the VM thread's cache.
 pub const idle_collection_delay_ns: u64 = thread_cache_idle_release_ns;
+
+/// How far the heap's capacity must stand above the worker's baseline, its
+/// lowest reading since the loop started, after the idle collection's young
+/// pass before the collection goes on to a full one (`worker/scheduler/idle.zig`).
+/// A worker's first full collection writes into engine state it inherited
+/// from the zygote, and every page it writes stays private to the worker
+/// from then on, while the young pass leaves those pages shared. Below this
+/// growth a full collection would make the worker hold more pages than the
+/// old generation's garbage it could free; the zygote-integration lane
+/// checks that a worker serving small requests keeps the pages shared.
+pub const idle_full_collection_growth_min_bytes: u64 = 2 * 1024 * 1024;
 
 const ns_per_ms: u64 = 1_000_000;
 
@@ -81,6 +92,8 @@ comptime {
         @compileError("a thread must stay idle some time before it releases its cache");
     if (idle_collection_delay_ns == 0)
         @compileError("a worker must stay idle some time before it collects, or every gap between requests pays for one");
+    if (idle_full_collection_growth_min_bytes == 0)
+        @compileError("a worker whose heap did not grow must not pay for a full collection");
     if (fetches_per_request_max == 0 or fetches_per_request_max > fetches_per_worker_max)
         @compileError("a request's fetches must fit the worker's");
     if (fetch_bodies_per_worker_max < (request_task_capacity + 1) * fetches_per_request_max)

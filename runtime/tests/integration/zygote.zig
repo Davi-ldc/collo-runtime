@@ -5,7 +5,8 @@
 //! of it, the WorkerInit handoff and its failures with the page left as the
 //! host wrote it, the sandboxed worker's boot order and its trace pipe closed
 //! before tenant code, its threads asleep when idle, the garbage it gives
-//! back once it goes quiet, the footprint its engine
+//! back once it goes quiet and the zygote pages it keeps shared when its
+//! requests leave little behind, the footprint its engine
 //! reads from its leaf and its mapped shared objects, a worker with no egress
 //! descriptor, workers whose `/tmp` the host never sees, a root read-only but
 //! for `/tmp` as `node:fs` sees it, the runtime's log lines and the tenant's
@@ -863,6 +864,64 @@ test "a worker gives back what its requests left behind once it goes quiet, thro
     // The worker lived through both collections, and its module state with
     // it.
     try serveForkedGet(handle, 90_042, 5, "/count", "served:3");
+}
+
+/// How much more private dirty memory a worker may hold after ten small
+/// requests and the idle collection that follows them than when it was
+/// ready: what the requests themselves leave, far below the zygote pages a
+/// full collection would make the worker's own.
+const small_requests_private_dirty_growth_max_bytes: u64 = 512 * 1024;
+
+test "a worker serving small requests keeps the pages it shares with the zygote once it goes quiet" {
+    var spawned = try support.spawnZygote();
+    defer spawned.deinit();
+
+    var route = try TestRoute.init("idle-small",
+        \\export default function handle() {
+        \\  return new Response("small");
+        \\}
+    );
+    defer route.deinit();
+    var launched = try launchOrSkip(&spawned, 90_043, .{ .routes = route.launchRoutes() });
+    defer launched.deinit();
+    const handle = &launched.handle;
+
+    // Both readings follow a settle, the second one covering the idle
+    // collection after the last request.
+    std.Thread.sleep(idle_worker_settle_ns);
+    const ready_bytes = try readPrivateDirtyBytes(handle.pid);
+    for (0..10) |index| {
+        try serveForkedGet(handle, 90_043 + index, @intCast(2 * index + 1), "/", "small");
+    }
+    std.Thread.sleep(idle_worker_settle_ns);
+    const quiet_bytes = try readPrivateDirtyBytes(handle.pid);
+
+    if (quiet_bytes -| ready_bytes > small_requests_private_dirty_growth_max_bytes) {
+        std.debug.print("private dirty: {d} B ready, {d} B once quiet\n", .{ ready_bytes, quiet_bytes });
+        return error.IdleWorkerUnsharedZygotePages;
+    }
+}
+
+/// The Private_Dirty of process `pid`, from `/proc/<pid>/smaps_rollup`, in
+/// bytes.
+fn readPrivateDirtyBytes(pid: u32) !u64 {
+    var path_buffer: [48]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, "/proc/{d}/smaps_rollup", .{pid});
+    const rollup = try support.readFileAlloc(path, std.testing.allocator);
+    defer std.testing.allocator.free(rollup);
+    var lines = std.mem.splitScalar(u8, rollup, '\n');
+    while (lines.next()) |line| {
+        const prefix = "Private_Dirty:";
+        if (!std.mem.startsWith(u8, line, prefix))
+            continue;
+        const value = std.mem.trim(u8, line[prefix.len..], &std.ascii.whitespace);
+        const unit = " kB";
+        if (!std.mem.endsWith(u8, value, unit))
+            return error.InvalidSmapsRollup;
+        const kib = try std.fmt.parseUnsigned(u64, std.mem.trimEnd(u8, value[0 .. value.len - unit.len], " "), 10);
+        return kib * 1024;
+    }
+    return error.InvalidSmapsRollup;
 }
 
 /// Sends a GET of `path` to a forked worker on stream `stream_id` and

@@ -1,7 +1,8 @@
 //! The scheduler domain of the worker runtime. `Scheduler` is its state: the
 //! ready queue and its backlog, the request-deadline heap, timers and
-//! immediates with their ready maps, the loop's wakeup eventfd, and the
-//! bookkeeping of the timer callback running now. `Methods` holds the
+//! immediates with their ready maps, the loop's wakeup eventfd, the
+//! bookkeeping of the timer callback running now, and the idle collection's
+//! state (`scheduler/idle.zig`). `Methods` holds the
 //! runtime's operations on that state, which `Runtime` declares as its own
 //! (`root.zig`): queueing ready work, timers and immediates, request
 //! deadlines, and waking and draining the loop. It belongs to the worker's
@@ -22,6 +23,7 @@ const ready_queue_mod = @import("../scheduler/queue.zig");
 const deadlines_mod = @import("../scheduler/deadlines.zig");
 const immediates_mod = @import("../scheduler/immediates.zig");
 const timers_mod = @import("../scheduler/timers.zig");
+const idle_mod = @import("../scheduler/idle.zig");
 const scheduler_resources = @import("../scheduler/resources.zig");
 const runtime_types = @import("types.zig");
 
@@ -46,6 +48,8 @@ pub const Scheduler = struct {
     immediate_collect_generation: ?u64,
     ingress_rescan_needed: bool,
     request_completion_rescan_needed: bool,
+    /// The idle collection's debt and heap baseline (`scheduler/idle.zig`).
+    idle: idle_mod.State,
 
     pub fn init(allocator: std.mem.Allocator, limits: runtime_types.RuntimeLimits) !Scheduler {
         const wakeup_fd = try std.posix.eventfd(0, std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK);
@@ -110,6 +114,7 @@ pub const Scheduler = struct {
             .immediate_collect_generation = null,
             .ingress_rescan_needed = false,
             .request_completion_rescan_needed = false,
+            .idle = .{},
         };
     }
 
