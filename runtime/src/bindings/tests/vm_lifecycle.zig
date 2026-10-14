@@ -1,5 +1,6 @@
-//! VM lifecycle through the wrappers: a value handle with no VM, or one whose VM was destroyed,
-//! fails instead of crashing; the fork sequence (`prepareForFork`, `postForkChild`,
+//! VM lifecycle through the wrappers: the engine's page ceiling matches the build option that
+//! chose the engine and fits the kernel the lane runs on; a value handle with no VM, or one
+//! whose VM was destroyed, fails instead of crashing; the fork sequence (`prepareForFork`, `postForkChild`,
 //! `reseedAfterFork`) leaves a VM that evaluates and invokes, with and without web APIs;
 //! `postForkChild` refuses a VM inside a turn; and a VM watches for deferred work from its
 //! creation, so a worker never sets that up after its filter. The sequence runs in this
@@ -9,6 +10,16 @@
 const std = @import("std");
 const support = @import("bindings_support");
 const bindings = support.bindings;
+
+test "the engine's page ceiling is the one its build option promised and fits this kernel" {
+    const ceiling = bindings.enginePageSizeCeiling();
+    // The option that chose the engine (`jscPageSizeCeilingBytes` in `runtime/build/options.zig`) and
+    // WTF's constant inside the engine are two derivations, and this is where they must agree.
+    try std.testing.expectEqual(support.engine_options.page_size_ceiling_bytes, ceiling);
+    try std.testing.expect(std.math.isPowerOfTwo(ceiling));
+    // Every VM this lane creates depends on it; `collo_vm_create` refuses a kernel where it fails.
+    try std.testing.expectEqual(@as(u64, 0), ceiling % std.heap.pageSize());
+}
 
 test "null Value handle returns InvalidJsValue instead of panicking" {
     var value = bindings.Value{};

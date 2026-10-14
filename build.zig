@@ -73,6 +73,7 @@ pub fn build(b: *std.Build) void {
         .cxx_sysroot = cxx_sysroot,
         .mcpu = toolchain.target_mcpu,
         .icu = icu,
+        .series_addendum = opts.jsc_series_addendum,
     };
     const jsc = jsc_mod.JscBuild{
         .cmake_build_type = jsc_cmake_build_type,
@@ -177,6 +178,14 @@ pub fn build(b: *std.Build) void {
         .link_libcpp = false,
     });
     jsc_set.importInto(bindings_support_module, &.{ .bindings, .ipc, .worker });
+    // What the engine this graph links promises, so a bindings test can check
+    // the engine against the option that chose it.
+    const engine_options = b.addOptions();
+    engine_options.addOption(u64, "page_size_ceiling_bytes", options_mod.jscPageSizeCeilingBytes(
+        opts.target.result.cpu.arch,
+        opts.arm64_pages,
+    ));
+    bindings_support_module.addImport("collo_engine_options", engine_options.createModule());
 
     const zygote_support_module = b.createModule(.{
         .root_source_file = b.path("runtime/tests/support/zygote/root.zig"),

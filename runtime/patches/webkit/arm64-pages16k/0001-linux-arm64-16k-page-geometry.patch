@@ -1,0 +1,230 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Davi <davilimacarv2536@gmail.com>
+Date: Tue, 13 Oct 2026 22:40:03 -0300
+Subject: [PATCH] linux arm64 16k page geometry
+
+JSC and libpas fix the sizes of their blocks, pages and granules at
+compile time, and each must be a multiple of the kernel's page: WTF
+crashes at the first pageSize() call on a kernel whose page does not
+divide CeilingOnPageSize, and libpas commits and decommits by granule.
+Linux ARM64 kernels run with 4 KiB, 16 KiB or 64 KiB pages. The series
+sizes Linux ARM64 for 64 KiB pages, so one engine runs on all three,
+and on the 4 KiB and 16 KiB kernels that spreads every process's heap
+over more pages: MarkedBlocks of 64 KiB instead of 16 KiB, libpas small
+pages and granules of 64 KiB, and four times the allocation bits in
+every thread-local cache. An embedder that forks many small processes
+from one parent pays that once per process.
+
+With this patch Linux ARM64 takes Darwin ARM64's geometry, which is
+also upstream WebKit's for Linux ARM64: CeilingOnPageSize 16 KiB, so
+MarkedBlock::blockSize 16 KiB; libpas small and small bitfit pages
+16 KiB, medium pages 128 KiB and granules 16 KiB; JIT heap small pages
+and granules 16 KiB, medium pages 128 KiB, medium granules 16 KiB and
+a medium minimum alignment of 256 bytes; expendable memory pages
+16 KiB. An engine built with it runs on kernels with 4 KiB and 16 KiB
+pages and on no others; the embedder checks the kernel's page size
+against CeilingOnPageSize before it creates a VM. Other CPUs and
+operating systems are unchanged, and PAS_MAX_OBJECTS_PER_PAGE follows
+the small page size as before.
+
+A page larger than its granule keeps one use count per granule, at most
+PAS_MAX_GRANULES of them and each below PAS_PAGE_GRANULE_DECOMMITTED.
+PAS_MAX_GRANULES is 256 on ARM64, which a 4 MiB marge page fills
+exactly with 16 KiB granules. Static assertions now check both bounds
+for the bmalloc and JIT page sizes, so a granule too small for its
+pages fails to compile instead of failing a PAS_ASSERT at the first
+decommit.
+---
+ Source/JavaScriptCore/heap/FreeListInlines.h  |  2 +-
+ Source/WTF/wtf/PageBlock.h                    | 10 ++---
+ .../libpas/src/libpas/jit_heap_config.h       | 25 +++++-------
+ .../libpas/src/libpas/pas_expendable_memory.h |  4 --
+ .../libpas/src/libpas/pas_internal_config.h   | 40 ++++++++-----------
+ 5 files changed, 32 insertions(+), 49 deletions(-)
+
+diff --git a/Source/JavaScriptCore/heap/FreeListInlines.h b/Source/JavaScriptCore/heap/FreeListInlines.h
+index d3c2cbae..90ea06a6 100644
+--- a/Source/JavaScriptCore/heap/FreeListInlines.h
++++ b/Source/JavaScriptCore/heap/FreeListInlines.h
+@@ -60,7 +60,7 @@ void FreeList::forEachInterval(const Invocable<void(char*, char*)> auto& func) c
+     char* intervalEnd = m_intervalEnd;
+     // An interval never spans more than one MarkedBlock payload. blockSize is
+     // 16 KB on most platforms, but 64 KB where CeilingOnPageSize is 64 KB
+-    // (e.g. Linux ARM64) — a hardcoded 16 KB bound fires spuriously there.
++    // (e.g. PowerPC) — a hardcoded 16 KB bound fires spuriously there.
+     ASSERT(intervalEnd - intervalStart < (ptrdiff_t)MarkedBlock::blockSize);
+ 
+     while (true) {
+diff --git a/Source/WTF/wtf/PageBlock.h b/Source/WTF/wtf/PageBlock.h
+index 46a31bf8..00611e22 100644
+--- a/Source/WTF/wtf/PageBlock.h
++++ b/Source/WTF/wtf/PageBlock.h
+@@ -47,14 +47,14 @@ namespace WTF {
+ // On Linux, Power systems normally use 64 KiB pages.
+ //
+ // aarch64 systems seem to be all over the place. Most Linux distros use 4 KiB, but RHEL uses
+-// 64 KiB. Since we cannot know the page size at compile time on Linux, use 64 KiB as the ceiling
+-// for Linux ARM64 to support all possible page size configurations (4 KiB, 16 KiB, 64 KiB).
+-// USE(64KB_PAGE_BLOCK) allows overriding this on other architectures too.
++// 64 KiB. Linux on Apple Silicon uses 16 KiB, so use that for Linux on aarch64: a build runs on
++// kernels with 4 KiB and 16 KiB pages, and every MarkedBlock is 16 KiB. libpas sizes its pages and
++// granules for the same ceiling (pas_internal_config.h). USE(64KB_PAGE_BLOCK) allows overriding this.
+ //
+ // Use 64 KiB for any unknown CPUs to be conservative.
+-#if OS(DARWIN) || PLATFORM(PLAYSTATION) || CPU(MIPS) || CPU(MIPS64) || CPU(LOONGARCH64)
++#if OS(DARWIN) || PLATFORM(PLAYSTATION) || CPU(MIPS) || CPU(MIPS64) || CPU(LOONGARCH64) || (OS(LINUX) && CPU(ARM64) && !USE(64KB_PAGE_BLOCK))
+ constexpr size_t CeilingOnPageSize = 16 * KB;
+-#elif USE(64KB_PAGE_BLOCK) || (OS(LINUX) && CPU(ARM64)) || CPU(PPC) || CPU(PPC64) || CPU(PPC64LE) || CPU(UNKNOWN)
++#elif USE(64KB_PAGE_BLOCK) || CPU(PPC) || CPU(PPC64) || CPU(PPC64LE) || CPU(UNKNOWN)
+ constexpr size_t CeilingOnPageSize = 64 * KB;
+ #elif OS(WINDOWS) || CPU(X86) || CPU(X86_64) || CPU(ARM) || CPU(ARM64) || CPU(RISCV64)
+ constexpr size_t CeilingOnPageSize = 4 * KB;
+diff --git a/Source/bmalloc/libpas/src/libpas/jit_heap_config.h b/Source/bmalloc/libpas/src/libpas/jit_heap_config.h
+index 3f3c3031..8fb03d9d 100644
+--- a/Source/bmalloc/libpas/src/libpas/jit_heap_config.h
++++ b/Source/bmalloc/libpas/src/libpas/jit_heap_config.h
+@@ -33,6 +33,7 @@
+ #include "jit_heap_config_root_data.h"
+ #include "pas_bitfit_max_free.h"
+ #include "pas_heap_config_utils.h"
++#include "pas_page_granule_use_count.h"
+ 
+ PAS_BEGIN_EXTERN_C;
+ 
+@@ -40,32 +41,24 @@ PAS_BEGIN_EXTERN_C;
+ #define JIT_SMALL_SEGREGATED_MIN_ALIGN (1u << JIT_SMALL_SEGREGATED_MIN_ALIGN_SHIFT)
+ #define JIT_SMALL_BITFIT_MIN_ALIGN_SHIFT 2u
+ #define JIT_SMALL_BITFIT_MIN_ALIGN (1u << JIT_SMALL_BITFIT_MIN_ALIGN_SHIFT)
+-#if PAS_ARM64 && PAS_OS(LINUX)
+-#define JIT_SMALL_PAGE_SIZE 65536u
+-#define JIT_SMALL_GRANULE_SIZE 65536u
+-#else
+ #define JIT_SMALL_PAGE_SIZE 16384u
+ #define JIT_SMALL_GRANULE_SIZE 16384u
+-#endif
+-#if PAS_ARM64 && PAS_OS(LINUX)
+-/* granule_size >> min_align_shift must be < 254 (use_count is uint8_t with 255 = DECOMMITTED).
+-   64K >> 8 = 256 overflows; 64K >> 9 = 128 is safe. Matches PAS_MIN_MEDIUM_ALIGN_SHIFT. */
+-#define JIT_MEDIUM_BITFIT_MIN_ALIGN_SHIFT 9u
+-#else
+ #define JIT_MEDIUM_BITFIT_MIN_ALIGN_SHIFT 8u
+-#endif
+ #define JIT_MEDIUM_BITFIT_MIN_ALIGN (1u << JIT_MEDIUM_BITFIT_MIN_ALIGN_SHIFT)
+-#if PAS_ARM64 && PAS_OS(LINUX)
+-#define JIT_MEDIUM_PAGE_SIZE 262144u
+-#define JIT_MEDIUM_GRANULE_SIZE 65536u
+-#else
+ #define JIT_MEDIUM_PAGE_SIZE 131072u
+ #if PAS_ARM64
+ #define JIT_MEDIUM_GRANULE_SIZE 16384u
+ #else
+ #define JIT_MEDIUM_GRANULE_SIZE 4096u
+ #endif
+-#endif
++
++/* A medium JIT page decommits by granule and keeps one use count per granule: at most
++   PAS_MAX_GRANULES of them, each below PAS_PAGE_GRANULE_DECOMMITTED even when every
++   minimum-aligned object in the granule holds it. */
++_Static_assert(JIT_MEDIUM_PAGE_SIZE / JIT_MEDIUM_GRANULE_SIZE <= PAS_MAX_GRANULES,
++               "a medium JIT page holds more granules than its use counts can track");
++_Static_assert((JIT_MEDIUM_GRANULE_SIZE >> JIT_MEDIUM_BITFIT_MIN_ALIGN_SHIFT) + 1 < PAS_PAGE_GRANULE_DECOMMITTED,
++               "a JIT granule holds more medium objects than its use count can count");
+ 
+ PAS_API void jit_heap_config_activate(void);
+ 
+diff --git a/Source/bmalloc/libpas/src/libpas/pas_expendable_memory.h b/Source/bmalloc/libpas/src/libpas/pas_expendable_memory.h
+index 5b7418a6..737fe957 100644
+--- a/Source/bmalloc/libpas/src/libpas/pas_expendable_memory.h
++++ b/Source/bmalloc/libpas/src/libpas/pas_expendable_memory.h
+@@ -51,11 +51,7 @@ struct pas_expendable_memory {
+     pas_expendable_memory_state states[1];
+ };
+ 
+-#if PAS_ARM64 && PAS_OS(LINUX)
+-#define PAS_EXPENDABLE_MEMORY_PAGE_SIZE 65536llu
+-#else
+ #define PAS_EXPENDABLE_MEMORY_PAGE_SIZE 16384llu
+-#endif
+ 
+ PAS_API extern pas_expendable_memory_state_version pas_expendable_memory_version_counter;
+ 
+diff --git a/Source/bmalloc/libpas/src/libpas/pas_internal_config.h b/Source/bmalloc/libpas/src/libpas/pas_internal_config.h
+index 25e00149..d09ae155 100644
+--- a/Source/bmalloc/libpas/src/libpas/pas_internal_config.h
++++ b/Source/bmalloc/libpas/src/libpas/pas_internal_config.h
+@@ -27,6 +27,7 @@
+ #define PAS_INTERNAL_CONFIG_H
+ 
+ #include "pas_config.h"
++#include "pas_page_granule_use_count.h"
+ 
+ #define PAS_USE_SMALL_SEGREGATED_OVERRIDE     true
+ #define PAS_USE_MEDIUM_SEGREGATED_OVERRIDE    true
+@@ -34,44 +35,25 @@
+ #define PAS_USE_MEDIUM_BITFIT_OVERRIDE        true
+ #define PAS_USE_MARGE_BITFIT_OVERRIDE         true
+ 
+-/* The OS may have a smaller page size. That's OK. */
+-/* On Linux ARM64, kernels may be configured with 64 KiB pages (e.g. RHEL, Oracle Linux).
+-   All page and granule sizes must be at least as large as the system page size, so use
+-   64 KiB minimums on Linux ARM64 to support all possible kernel page configurations. */
+-#if PAS_ARM64 && PAS_OS(LINUX)
+-#define PAS_SMALL_PAGE_DEFAULT_SHIFT     16
+-#else
++/* The OS may have a smaller page size. That's OK. Every page and granule must still be a multiple
++   of the OS page: 16 KiB fits every ARM64 and PlayStation kernel page up to WTF's CeilingOnPageSize
++   of 16 KiB, which Linux ARM64 shares with Darwin. */
+ #define PAS_SMALL_PAGE_DEFAULT_SHIFT     14
+-#endif
+ #define PAS_SMALL_PAGE_DEFAULT_SIZE      ((size_t)1 << PAS_SMALL_PAGE_DEFAULT_SHIFT)
+ 
+-#if PAS_ARM64 && PAS_OS(LINUX)
+-#define PAS_SMALL_BITFIT_PAGE_DEFAULT_SHIFT   16
+-#else
+ #define PAS_SMALL_BITFIT_PAGE_DEFAULT_SHIFT   14
+-#endif
+ #define PAS_SMALL_BITFIT_PAGE_DEFAULT_SIZE    ((size_t)1 << PAS_SMALL_BITFIT_PAGE_DEFAULT_SHIFT)
+ 
+-#if PAS_ARM64 && PAS_OS(LINUX)
+-#define PAS_MEDIUM_PAGE_DEFAULT_SHIFT    18
+-#else
+ #define PAS_MEDIUM_PAGE_DEFAULT_SHIFT    17
+-#endif
+ #define PAS_MEDIUM_PAGE_DEFAULT_SIZE     ((size_t)1 << PAS_MEDIUM_PAGE_DEFAULT_SHIFT)
+ 
+-#if PAS_ARM64 && PAS_OS(LINUX)
+-#define PAS_MEDIUM_BITFIT_PAGE_DEFAULT_SHIFT    19
+-#else
+ #define PAS_MEDIUM_BITFIT_PAGE_DEFAULT_SHIFT    19
+-#endif
+ #define PAS_MEDIUM_BITFIT_PAGE_DEFAULT_SIZE     ((size_t)1 << PAS_MEDIUM_BITFIT_PAGE_DEFAULT_SHIFT)
+ 
+ #define PAS_MARGE_PAGE_DEFAULT_SHIFT     22
+ #define PAS_MARGE_PAGE_DEFAULT_SIZE      ((size_t)1 << PAS_MARGE_PAGE_DEFAULT_SHIFT)
+ 
+-#if PAS_ARM64 && PAS_OS(LINUX)
+-#define PAS_GRANULE_DEFAULT_SHIFT        16
+-#elif PAS_ARM64 || PAS_PLATFORM(PLAYSTATION)
++#if PAS_ARM64 || PAS_PLATFORM(PLAYSTATION)
+ #define PAS_GRANULE_DEFAULT_SHIFT        14
+ #else
+ #define PAS_GRANULE_DEFAULT_SHIFT        12
+@@ -101,6 +83,18 @@
+ #define PAS_MIN_MARGE_ALIGN_SHIFT        12
+ #define PAS_MIN_MARGE_ALIGN              ((size_t)1 << PAS_MIN_MARGE_ALIGN_SHIFT)
+ 
++/* A medium or marge page commits and decommits by granule and keeps one use count per granule: at
++   most PAS_MAX_GRANULES of them, each below PAS_PAGE_GRANULE_DECOMMITTED even when every object of
++   the smallest medium alignment in the granule holds it. */
++_Static_assert(PAS_MEDIUM_PAGE_DEFAULT_SIZE / PAS_GRANULE_DEFAULT_SIZE <= PAS_MAX_GRANULES,
++               "a medium page holds more granules than its use counts can track");
++_Static_assert(PAS_MEDIUM_BITFIT_PAGE_DEFAULT_SIZE / PAS_GRANULE_DEFAULT_SIZE <= PAS_MAX_GRANULES,
++               "a medium bitfit page holds more granules than its use counts can track");
++_Static_assert(PAS_MARGE_PAGE_DEFAULT_SIZE / PAS_GRANULE_DEFAULT_SIZE <= PAS_MAX_GRANULES,
++               "a marge page holds more granules than its use counts can track");
++_Static_assert((PAS_GRANULE_DEFAULT_SIZE >> PAS_MIN_MEDIUM_ALIGN_SHIFT) + 1 < PAS_PAGE_GRANULE_DECOMMITTED,
++               "a granule holds more medium objects than its use count can count");
++
+ #define PAS_MEDIUM_SHARING_SHIFT         3
+ 
+ #define PAS_MIN_OBJECTS_PER_PAGE         11

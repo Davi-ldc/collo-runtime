@@ -10,11 +10,25 @@ const buildtool = @import("buildtool.zig");
 /// and the Debug engine exists for sanitized bindings smokes.
 pub const JscProfile = enum { release, debug };
 
+/// The engine's page geometry on aarch64 Linux, whose kernels run with 4, 16 or 64 KiB pages.
+/// JSC and libpas fix their block, page and granule sizes at compile time, each a multiple of the
+/// kernel's page. `16k` applies the series addendum `arm64_pages16k_addendum`, which sizes them
+/// for kernels with 4 or 16 KiB pages; `64k` builds the series alone, whose sizes also fit 64 KiB
+/// pages and cost every process more memory on the other kernels. An x86_64 engine has one
+/// geometry and ignores the option.
+pub const Arm64Pages = enum { @"16k", @"64k" };
+
+/// The directory under `runtime/patches/webkit/` that holds the 16 KiB geometry.
+pub const arm64_pages16k_addendum = "arm64-pages16k";
+
 pub const Options = struct {
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     sanitizer: shims.BindingsSanitizer,
     jsc_profile: JscProfile,
+    arm64_pages: Arm64Pages,
+    /// The series addendum of the engine for `target` (`jscSeriesAddendum`).
+    jsc_series_addendum: ?[]const u8,
     /// True admits the engine already in runtime/deps/jsc-build, and the ICU build it compiled
     /// against, by their provenance, and fails instead of building when either is stale.
     jsc_prebuilt: bool,
@@ -55,15 +69,23 @@ pub fn parse(b: *std.Build) Options {
         "jsc-prebuilt",
         "Admit the engine and its ICU by provenance; fail instead of building when stale",
     ) orelse false;
+    const arm64_pages = b.option(
+        Arm64Pages,
+        "arm64-pages",
+        "Engine page geometry on aarch64: 16k (default; kernels with 4 or 16 KiB pages) or 64k (also 64 KiB-page kernels, at a memory cost per worker); x86_64 ignores it",
+    ) orelse .@"16k";
 
     const triple = target.result.linuxTriple(b.allocator) catch @panic("OOM");
-    const engine = engineDirs(b, triple, jscProfileName(b, jsc_profile, null));
+    const series_addendum = jscSeriesAddendum(target.result.cpu.arch, arm64_pages);
+    const engine = engineDirs(b, triple, jscProfileName(b, jsc_profile, null, series_addendum));
 
     return .{
         .target = target,
         .optimize = optimize,
         .sanitizer = sanitizer,
         .jsc_profile = jsc_profile,
+        .arm64_pages = arm64_pages,
+        .jsc_series_addendum = series_addendum,
         .jsc_prebuilt = jsc_prebuilt,
         .jsc_build_dir = engine.jsc,
         .webkit_source_dir = engine.webkit_src,
@@ -90,6 +112,30 @@ pub const EngineDirs = struct {
     jsc: []const u8,
     webkit_src: []const u8,
 };
+
+/// The series addendum, under `runtime/patches/webkit/`, that the engine for `arch` applies after
+/// the series, or null. Only an aarch64 engine under `16k` takes one, so the x86_64 engine and the
+/// aarch64 `64k` engine build the series alone, in the directories and with the series hashes
+/// they had before the option existed.
+pub fn jscSeriesAddendum(arch: std.Target.Cpu.Arch, pages: Arm64Pages) ?[]const u8 {
+    if (arch != .aarch64)
+        return null;
+    return switch (pages) {
+        .@"16k" => arm64_pages16k_addendum,
+        .@"64k" => null,
+    };
+}
+
+/// The largest kernel page size the engine for `arch` and `pages` runs on, WTF's
+/// `CeilingOnPageSize`, which `bindings.enginePageSizeCeiling` reads back from the engine.
+pub fn jscPageSizeCeilingBytes(arch: std.Target.Cpu.Arch, pages: Arm64Pages) u64 {
+    if (arch != .aarch64)
+        return 4 * 1024;
+    return switch (pages) {
+        .@"16k" => 16 * 1024,
+        .@"64k" => 64 * 1024,
+    };
+}
 
 /// `runtime/deps/jsc-build/<triple>/<profile>/{src,build}`, absolute. The buildtool derives
 /// the same layout and refuses anything else, so a drift between the two derivations fails
@@ -119,11 +165,16 @@ pub fn jscCmakeBuildType(profile: JscProfile) []const u8 {
 }
 
 /// Engine profile directory name: release|debug, plus -<mcpu> when the release
-/// step pins a CPU model.
-pub fn jscProfileName(b: *std.Build, profile: JscProfile, mcpu: ?[]const u8) []const u8 {
+/// step pins a CPU model, plus -<addendum> when the engine applies a series
+/// addendum, so engines built from different patch lists never share a
+/// directory or a stamp.
+pub fn jscProfileName(b: *std.Build, profile: JscProfile, mcpu: ?[]const u8, addendum: ?[]const u8) []const u8 {
+    var name: []const u8 = @tagName(profile);
     if (mcpu) |cpu|
-        return b.fmt("{s}-{s}", .{ @tagName(profile), cpu });
-    return @tagName(profile);
+        name = b.fmt("{s}-{s}", .{ name, cpu });
+    if (addendum) |series_addendum|
+        name = b.fmt("{s}-{s}", .{ name, series_addendum });
+    return name;
 }
 
 pub fn discoverCompilerRtBuiltins(b: *std.Build, arch: std.Target.Cpu.Arch) ?[]const u8 {

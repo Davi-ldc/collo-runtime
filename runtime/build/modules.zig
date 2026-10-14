@@ -210,7 +210,7 @@ const specs = [_]Spec{
             .zygote,        .ipc,              .os,                .ktls,
             .worker_state,  .io_uring_tags,    .boringssl,         .hpack,
             .http,          .common_io,        .server_lifecycle,  .limits,
-            .host,          .server_analytics, .egress_gateway,
+            .host,          .server_analytics, .egress_gateway,    .bindings,
         },
     },
     .{

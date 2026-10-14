@@ -13,6 +13,9 @@ const ipc = @import("collo_ipc");
 const worker = @import("collo_worker");
 
 pub const bindings = @import("collo_bindings");
+/// What the build's options promise about the linked engine, such as its page
+/// ceiling (`jscPageSizeCeilingBytes` in `runtime/build/options.zig`).
+pub const engine_options = @import("collo_engine_options");
 /// Re-exported so suites the bindings smokes compile, which import only this
 /// module, can build packs.
 pub const module_pack = ipc.module_pack;

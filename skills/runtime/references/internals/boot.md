@@ -23,7 +23,7 @@ The spawn is a vfork-style clone (`CLONE_VM`, `CLONE_VFORK`, `CLONE_PIDFD`) on a
 
 | Step | What | Where | Why there |
 | --- | --- | --- | --- |
-| 1 | refuse an effective uid of 0 | `server/boot/root.zig:rootRefusal` | the zygote, every worker and the gateway run as the server's user, so a worker that escapes its sandbox holds what that user holds |
+| 1 | refuse an effective uid of 0, then a kernel whose page size does not divide the engine's page ceiling | `server/boot/root.zig:rootRefusal`, `pageSizeRefusal` | the zygote, every worker and the gateway run as the server's user, so a worker that escapes its sandbox holds what that user holds. JSC and libpas fixed their block, page and granule sizes for the ceiling at compile time (`bindings/root.zig:enginePageSizeCeiling`; 4 KiB on x86_64, 16 KiB on aarch64, or 64 KiB under `-Darm64-pages=64k`, [build.md](build.md#engine-profiles)), so on such a kernel the zygote could create no VM; the check reads the kernel's page size with `std.heap.pageSize`, depends on nothing else and fails before any child process exists, with one line naming both sizes and the fix |
 | 2 | block SIGHUP, SIGINT and SIGTERM, then start the signal monitor | `signals.zig:Signals.start` | every later thread inherits the mask, and a thread with one of them unblocked would take its default action and end the process without cleanup; nothing that needs cleanup exists yet |
 | 3 | raise the soft open-file limit to the hard one | `server/boot/root.zig:raiseOpenFileLimit` | the routes keep `artifact_descriptors_max` descriptors open from step 5 on |
 | 4 | load or synthesize the configuration, apply `--listen`, check the certificate files and the analytics directory it names | `server/boot/root.zig:loadConfiguration`, `checkConfiguredPaths` | a failure names the key that holds the path; `Server.init` opens them again |
@@ -81,7 +81,7 @@ The boot's own status lines go through `report.zig`: prefixed `collo: `, formatt
 | Exit status (`server/boot/root.zig:ExitStatus`) | When |
 | --- | --- |
 | 0, `ok` | the server stopped because a signal asked it to |
-| 1, `failure` | anything the other rows do not list, among them no kTLS cipher, no delegated cgroup subtree, a zygote that does not start, a listen address in use or held by no interface, a certificate the boot cannot generate or BoringSSL refuses once generated, a lane fault, the zygote's exit, memory exhausted during the boot, and a stop no signal asked for |
+| 1, `failure` | anything the other rows do not list, among them a kernel page size the engine does not run on, no kTLS cipher, no delegated cgroup subtree, a zygote that does not start, a listen address in use or held by no interface, a certificate the boot cannot generate or BoringSSL refuses once generated, a lane fault, the zygote's exit, memory exhausted during the boot, and a stop no signal asked for |
 | 2, `invalid` | a malformed command line, an effective uid of 0, or a configuration that cannot be served: the file, an entry module, a path it names, or a configured certificate or key BoringSSL refuses |
 | 128 plus the signal number | a second SIGINT or SIGTERM during the boot, the drain or the teardown |
 
@@ -93,7 +93,7 @@ The boot's own status lines go through `report.zig`: prefixed `collo: `, formatt
 
 | Step | What | Why there |
 | --- | --- | --- |
-| 1 | create the VM, which as the process's first fixes the engine's options for the whole process (`bindings/jsc/runtime/vm.cpp:collo_vm_create`) | those options bound the threads the engine can ever ask for, which a worker must start before its filter |
+| 1 | create the VM, which as the process's first fixes the engine's options for the whole process (`bindings/jsc/runtime/vm.cpp:collo_vm_create`) | those options bound the threads the engine can ever ask for, which a worker must start before its filter. `collo_vm_create` first refuses, with `COLLO_STATUS_UNSUPPORTED`, a kernel whose page size does not divide the engine's page ceiling, the check the server's boot already made, so no process that creates a VM, tests and benchmarks included, reaches WTF's abort on that kernel |
 | 2 | read the main thread's thread-id word with `PR_GET_TID_ADDRESS` and check that it holds the thread's id (`common/os.zig:process.callingThreadIdWord`, `fork_loop.zig:Prepared.thread_id_word`) | every clone hands it to the kernel, which writes the child's id there, so a child's glibc names its own thread; a kernel without `CONFIG_CHECKPOINT_RESTORE` has no `PR_GET_TID_ADDRESS`, and the zygote refuses to prepare with a line naming the option |
 | 3 | set the helper-thread idle timeout to `PREFORK_HELPER_THREAD_IDLE_TIMEOUT_NS` (`bindings/root.zig:setHelperThreadsTimeoutOverrideNs`) | before the corpus, so the helper threads it starts retire within that timeout |
 | 4 | run the warmup corpus, always (`warmup.zig:runCorpus`), then a full collection and allocator trim (`collo_vm_collect_full_gc_and_trim`) | JSC builds much of its state lazily, so the corpus moves builtin bytecode, structure caches and the RegExp, JSON, URL and Promise machinery into pages every worker shares, and the collection drops the corpus's own garbage |
@@ -258,6 +258,7 @@ A second SIGINT or SIGTERM skips whatever is left. The process ends with 128 plu
 | Invariant | Kept by |
 | --- | --- |
 | no process of the node runs with an effective uid of 0 outside a user namespace of its own | `server/boot/root.zig:rootRefusal`, the boot's first step, which checks the effective uid alone |
+| no process runs the engine on a kernel whose page size does not divide the engine's page ceiling | `server/boot/root.zig:pageSizeRefusal` in the boot's first step, and `collo_vm_create`, which refuses such a kernel before the engine initializes |
 | no server thread can take the default action of SIGHUP, SIGINT or SIGTERM, and every spawned child starts with an empty mask in a session of its own | `signals.zig:Signals.start` before any other thread; `common/os.zig:process.spawnInternal` |
 | no child process exists before the worker cgroup root | the boot order in `server/boot/root.zig:serve` |
 | no fork request reaches an unprepared zygote | `host_client.zig:spawnZygote` returns only after `ZygoteReady`, which follows `fork_loop.zig:prepareZygoteAtBoot`; `serveForkRequests` takes the `Prepared` value only the preparation returns |

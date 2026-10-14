@@ -13,7 +13,11 @@
 //! 1. Refuse to run as root (`rootRefusal`), before anything else. The
 //!    zygote, every worker and the gateway run as the server's user, so a
 //!    worker that gets out of its namespaces, chroot and seccomp filter holds
-//!    what that user holds; as root, that is the whole node. Then warn when
+//!    what that user holds; as root, that is the whole node. Then refuse a
+//!    kernel whose page size does not divide the engine's page ceiling
+//!    (`pageSizeRefusal`): JSC and libpas fixed their block, page and granule
+//!    sizes for that ceiling when they were compiled, so the zygote's VM, and
+//!    every worker it forks, would abort on such a kernel. Then warn when
 //!    the server's own `oom_score_adj` is at or above the lowest score the
 //!    runtime gives its children (`oomOrderHolds`): every score it writes is
 //!    at or above 0 and needs no privilege, so only the score the server was
@@ -64,13 +68,15 @@
 //! Exit status (`ExitStatus`): `ok` after a stop a signal requested,
 //! `invalid` for invalid usage, a run as root or a configuration that cannot
 //! be served (the configuration file, an entry module or a path it names),
-//! `failure` for anything else, resources the routes could not get included
+//! `failure` for anything else, a kernel page size the engine does not run on
+//! and resources the routes could not get included
 //! (`routesFailure`), and 128 plus the signal number when a second
 //! stop signal cuts the boot, the drain or the teardown short. Every failure
 //! ends with one `report.line` that names its cause; a library that logs its
 //! own reason, such as BoringSSL, adds that line before it.
 
 const std = @import("std");
+const bindings = @import("collo_bindings");
 const config = @import("collo_server_config");
 const routes_mod = @import("collo_server_routes");
 const zygote = @import("collo_zygote");
@@ -162,12 +168,28 @@ pub fn rootRefusal(effective_uid: std.posix.uid_t) ?ExitStatus {
     return .invalid;
 }
 
+/// Null when `kernel_page_bytes`, the kernel's page size, divides
+/// `engine_ceiling_bytes`, the largest page size the linked engine runs on
+/// (`bindings.enginePageSizeCeiling`). Otherwise reports on stderr both sizes
+/// and how to get a kernel and an engine that agree, and returns the status
+/// `serve` exits with.
+pub fn pageSizeRefusal(kernel_page_bytes: usize, engine_ceiling_bytes: u64) ?ExitStatus {
+    if (kernel_page_bytes != 0 and engine_ceiling_bytes % @as(u64, kernel_page_bytes) == 0)
+        return null;
+    report.line("this kernel uses {d}-byte pages, and this collo build runs only on kernels whose page size divides {d} bytes:" ++
+        " boot a kernel with smaller pages (on Ubuntu arm64, linux-generic rather than linux-generic-64k)," ++
+        " or run a collo built with -Darm64-pages=64k", .{ kernel_page_bytes, engine_ceiling_bytes });
+    return .failure;
+}
+
 /// Runs `collo serve` to its end on the main thread, which must not have
 /// started any other thread yet (`signals.zig`). `gpa` is the
 /// process-lifetime allocator. Every failure is reported on stderr and
 /// returned as an exit status.
 pub fn serve(gpa: std.mem.Allocator, invocation: command_line.Invocation) ExitStatus {
     if (rootRefusal(std.posix.geteuid())) |status|
+        return status;
+    if (pageSizeRefusal(std.heap.pageSize(), bindings.enginePageSizeCeiling())) |status|
         return status;
     warnOomOrder();
 

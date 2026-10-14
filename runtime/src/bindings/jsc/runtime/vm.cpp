@@ -1,4 +1,5 @@
-// ColloVm's life and its turns: VM creation with the engine options a worker needs, its realms, value handles, turns,
+// ColloVm's life and its turns: VM creation with the engine options a worker needs, refused on a kernel whose page
+// size the engine was not compiled for, its realms, value handles, turns,
 // the owners of running JavaScript with their microtask owner table, and the pump that runs JSC's deferred work in
 // place of a RunLoop. Runs on the VM thread, except where a comment names another thread. No clock is read here: the
 // embedder measures each owner at the turn boundaries and the owner transition hook.
@@ -24,6 +25,7 @@
 #include <JavaScriptCore/SimpleTypedArrayController.h>
 
 #include <wtf/FastMalloc.h>
+#include <wtf/PageBlock.h>
 #include <wtf/StdLibExtras.h>
 
 #include <unicode/udata.h>
@@ -76,6 +78,15 @@ UErrorCode restrictIcuDataToBinary()
     static std::once_flag once;
     std::call_once(once, [] { udata_setFileAccess(UDATA_NO_FILES, &status); });
     return status;
+}
+
+// JSC and libpas fixed their block, page and granule sizes for CeilingOnPageSize at compile time, and WTF::pageSize()
+// aborts the process on the first call when the kernel's page does not divide it. Reading the kernel's page here,
+// before any engine code runs, turns that abort into an error the caller can report.
+bool kernelPageSizeFitsEngine()
+{
+    long kernel_page_size = sysconf(_SC_PAGESIZE);
+    return kernel_page_size > 0 && !(CeilingOnPageSize % static_cast<size_t>(kernel_page_size));
 }
 
 // The client is attached only while a sink exists. JSC's console object returns on a null client before it coerces
@@ -567,6 +578,8 @@ void seedRealmWeakRandom(ColloRealm& realm)
 
 } // namespace Collo
 
+extern "C" uint64_t collo_engine_page_size_ceiling() { return CeilingOnPageSize; }
+
 extern "C" ColloStatus collo_vm_create(uint32_t flags, ColloVm** out_vm)
 {
     if (!out_vm)
@@ -574,6 +587,8 @@ extern "C" ColloStatus collo_vm_create(uint32_t flags, ColloVm** out_vm)
 
     *out_vm = nullptr;
     if (flags & ~allowedVmCreateFlags)
+        return COLLO_STATUS_UNSUPPORTED;
+    if (!kernelPageSizeFitsEngine())
         return COLLO_STATUS_UNSUPPORTED;
 
     if (U_FAILURE(restrictIcuDataToBinary()))

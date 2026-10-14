@@ -73,6 +73,23 @@ pub const webkit_authoring_relative = "runtime/deps/webkit-authoring";
 pub const engine_generated_relative = "runtime/deps/jsc-build";
 pub const webkit_patches_relative = "runtime/patches/webkit";
 
+/// The longest series addendum name the tool accepts.
+pub const series_addendum_name_bytes_max = 64;
+
+/// A series addendum is a directory directly under `webkit_patches_relative` whose patches some
+/// engines apply after the series. Its name is lowercase letters, digits and inner hyphens, so it
+/// names exactly one directory there and can neither climb out of it nor alias the series itself.
+pub fn validateSeriesAddendumName(name: []const u8) !void {
+    if (name.len == 0 or name.len > series_addendum_name_bytes_max)
+        return error.InvalidSeriesAddendum;
+    if (name[0] == '-' or name[name.len - 1] == '-')
+        return error.InvalidSeriesAddendum;
+    for (name) |byte| switch (byte) {
+        'a'...'z', '0'...'9', '-' => {},
+        else => return error.InvalidSeriesAddendum,
+    };
+}
+
 pub const JscBuildPaths = struct {
     repository: []const u8,
     worktree: []const u8,
@@ -309,7 +326,10 @@ const jsc_build = struct {
     const arg_mcpu = 8;
     const arg_tool_identity = 9;
     const arg_icu_prefix = 10;
-    const arg_count_required = 11;
+    /// The series addendum the engine applies after the series, or "" for none
+    /// (`validateSeriesAddendumName`).
+    const arg_series_addendum = 11;
+    const arg_count_required = 12;
 
     const stamp_schema = "collo-jsc-stamp-v4";
     const attestation_schema = "collo-jsc-attestation-v3";
@@ -354,7 +374,7 @@ const jsc_build = struct {
         if (argv.len != arg_count_required) {
             fail(argv, 1, "usage: {s} <jsc_build_dir> <webkit_worktree> <target_triple> " ++
                 "<target_arch> <cmake_build_type> <cxx_sysroot> <expected_commit> " ++
-                "<mcpu> <tool_identity> <icu_prefix>\n", .{argv[0]});
+                "<mcpu> <tool_identity> <icu_prefix> <series_addendum>\n", .{argv[0]});
         }
 
         const target_triple = argv[arg_target_triple];
@@ -392,8 +412,9 @@ const jsc_build = struct {
         try checkWebkitCheckout(gpa, argv, webkit_repo, expected_commit);
 
         // The series is the depth-1 `patches/webkit/*.patch` set, LC_ALL=C
-        // sorted. The pinned commit plus that series is the whole engine.
-        const series = try sortedPatchFiles(gpa, argv, patch_dir);
+        // sorted, followed by the addendum's patches when the engine names
+        // one. The pinned commit plus that list is the whole engine.
+        const series = try engineSeries(gpa, argv, patch_dir, argv[arg_series_addendum]);
         defer {
             for (series) |path| gpa.free(path);
             gpa.free(series);
@@ -630,6 +651,37 @@ const jsc_build = struct {
 
     fn lessThanBytes(_: void, lhs: []u8, rhs: []u8) bool {
         return std.mem.order(u8, lhs, rhs) == .lt;
+    }
+
+    /// engineSeries returns the patches an engine applies, in apply order: the
+    /// series in `patch_dir`, then, when `addendum` is not empty, the depth-1
+    /// `*.patch` files of `patch_dir/<addendum>`, sorted the same way. An
+    /// addendum that holds no patch is refused, because the engine would then
+    /// build into a directory named for a configuration it does not have. The
+    /// hash sees each patch by its path, so an engine with an addendum never
+    /// shares a series hash with the series alone. The caller owns the slice
+    /// and every path in it.
+    fn engineSeries(gpa: std.mem.Allocator, argv: [][:0]u8, patch_dir: []const u8, addendum: []const u8) ![][]u8 {
+        const series = try sortedPatchFiles(gpa, argv, patch_dir);
+        if (addendum.len == 0)
+            return series;
+        defer gpa.free(series);
+        errdefer for (series) |path| gpa.free(path);
+
+        validateSeriesAddendumName(addendum) catch
+            fail(argv, 1, "invalid series addendum name: {s}\n", .{addendum});
+        const addendum_dir = try std.fs.path.join(gpa, &.{ patch_dir, addendum });
+        defer gpa.free(addendum_dir);
+        const extra = try sortedPatchFiles(gpa, argv, addendum_dir);
+        defer gpa.free(extra);
+        errdefer for (extra) |path| gpa.free(path);
+        if (extra.len == 0)
+            fail(argv, 1, "series addendum {s} holds no patch\n", .{addendum_dir});
+
+        const all = try gpa.alloc([]u8, series.len + extra.len);
+        @memcpy(all[0..series.len], series);
+        @memcpy(all[series.len..], extra);
+        return all;
     }
 
     /// hashPatchSeries reproduces `(cd repo && sha256sum <patches>) | sha256sum`:

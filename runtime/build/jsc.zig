@@ -32,6 +32,9 @@ pub const EngineInputs = struct {
     /// The ICU the engine compiles against. Its step runs first, because the
     /// engine's configure reads the headers that build installs.
     icu: deps_mod.Icu,
+    /// The directory under `runtime/patches/webkit/` whose patches the
+    /// engine applies after the series, or null (`options.jscSeriesAddendum`).
+    series_addendum: ?[]const u8,
 };
 
 pub fn addBuildStep(b: *std.Build, tool: *const tool_mod.Tool, inputs: EngineInputs) *std.Build.Step.Run {
@@ -71,6 +74,7 @@ fn addEvidenceStep(
     // different evidence contract.
     run.addArg(tool.identity);
     run.addArg(inputs.icu.prefix);
+    run.addArg(inputs.series_addendum orelse "");
     run.step.dependOn(&inputs.icu.step.step);
     return run;
 }

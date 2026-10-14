@@ -117,7 +117,8 @@ fn addReleaseStep(
     const triple = target.result.linuxTriple(b.allocator) catch @panic("OOM");
     // One derivation, shared with options.zig. A second copy here is how a tree ends up with dev builds
     // and release builds disagreeing about where the engine lives.
-    const engine = options_mod.engineDirs(b, triple, options_mod.jscProfileName(b, .release, toolchain_ptr.target_mcpu));
+    const series_addendum = options_mod.jscSeriesAddendum(spec.arch, opts.arm64_pages);
+    const engine = options_mod.engineDirs(b, triple, options_mod.jscProfileName(b, .release, toolchain_ptr.target_mcpu, series_addendum));
     const jsc_cmake_build_type = options_mod.jscCmakeBuildType(.release);
     const jsc = jsc_mod.JscBuild{
         .cmake_build_type = jsc_cmake_build_type,
@@ -131,6 +132,7 @@ fn addReleaseStep(
             .cxx_sysroot = cxx_sysroot,
             .mcpu = toolchain_ptr.target_mcpu,
             .icu = icu,
+            .series_addendum = series_addendum,
         }),
     };
 

@@ -174,6 +174,30 @@ test "buildtool JSC native archive graph checks the selected build type" {
     }
 }
 
+test "buildtool series addendum names one directory under the series and nothing else" {
+    try buildtool.validateSeriesAddendumName("arm64-pages16k");
+    try buildtool.validateSeriesAddendumName("a");
+    try buildtool.validateSeriesAddendumName("a" ** buildtool.series_addendum_name_bytes_max);
+
+    const refused = [_][]const u8{
+        "",
+        "a" ** (buildtool.series_addendum_name_bytes_max + 1),
+        "-pages",
+        "pages-",
+        ".",
+        "..",
+        "../boringssl",
+        "arm64/pages16k",
+        "Arm64",
+        "arm64_pages",
+        "arm64 pages",
+        "pages\x00",
+    };
+    for (refused) |name| {
+        try std.testing.expectError(error.InvalidSeriesAddendum, buildtool.validateSeriesAddendumName(name));
+    }
+}
+
 test "buildtool JSC paths accept the deps layout without creating outputs" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

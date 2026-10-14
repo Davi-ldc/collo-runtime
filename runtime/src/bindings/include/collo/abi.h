@@ -658,10 +658,17 @@ void collo_owned_header_block_destroy(ColloOwnedHeaderBlock* owner);
 /* Releases the Web API state request_id owns in the VM: its console budget. */
 ColloStatus collo_webapi_cleanup_request(ColloVm* vm, uint64_t request_id);
 
+/* The largest kernel page size the engine runs on: the page size JSC and
+   libpas fixed their block, page and granule sizes for when they were
+   compiled. A kernel runs the engine only when its page size divides this
+   value. Reads a constant and touches no engine state, so any process may call
+   it, from any thread, before or without a VM. */
+uint64_t collo_engine_page_size_ceiling(void);
 /* Creates a fully initialized VM in *out_vm, which the caller owns until
    collo_vm_destroy, with its main realm and its deferred-work wakeup gate.
    `flags` holds COLLO_VM_CREATE_* bits; any other bit fails with
-   COLLO_STATUS_UNSUPPORTED. */
+   COLLO_STATUS_UNSUPPORTED, and so does a kernel whose page size does not
+   divide collo_engine_page_size_ceiling(), before the engine initializes. */
 ColloStatus collo_vm_create(uint32_t flags, ColloVm** out_vm);
 /* The realm created with the VM, or null when the VM is not ready. */
 ColloRealm* collo_vm_main_realm(ColloVm* vm);

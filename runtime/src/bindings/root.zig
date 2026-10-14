@@ -561,6 +561,7 @@ pub const HeapStats = extern struct {
     extra_memory_bytes: u64 = 0,
 };
 
+extern fn collo_engine_page_size_ceiling() u64;
 extern fn collo_vm_create(flags: u32, out_vm: *?*RawVm) RawStatus;
 extern fn collo_vm_destroy(vm: *RawVm) void;
 extern fn collo_vm_main_realm(vm: *RawVm) ?*RawRealm;
@@ -1050,6 +1051,15 @@ pub const ConsoleSink = *const fn (
     bytes: ?[*]const u8,
     len: usize,
 ) callconv(.c) void;
+
+/// The largest kernel page size the linked engine runs on, the page size JSC
+/// and libpas fixed their block, page and granule sizes for at compile time. A
+/// kernel runs the engine only when its page size divides this value; on any
+/// other, `Vm.create` fails with `error.Unsupported` before the engine starts.
+/// Touches no engine state, so any process may ask before it creates a VM.
+pub fn enginePageSizeCeiling() u64 {
+    return collo_engine_page_size_ceiling();
+}
 
 pub const Vm = struct {
     raw: ?*RawVm = null,
