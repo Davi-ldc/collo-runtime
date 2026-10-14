@@ -1,7 +1,8 @@
 //! The scale-out verdict (`server/supervisor/scale_out.zig`): which watched
-//! definitions get a worker more from their workers' CPU, their wait for a
-//! CPU and the node's idle CPU, with the idle cores shared out among the
-//! definitions of one sample; and the sampler that measures those figures,
+//! definitions get a worker more from their workers' wait for a CPU and the
+//! node's idle cores, shared out among the definitions of one sample, and
+//! that a low CPU share alone grants nothing; and the sampler that measures
+//! those figures,
 //! over a fixture tree of cgroup files and a `/proc/stat` of its own: the
 //! workers' CPUs narrowed by their cpuset, the room under an ancestor's
 //! quota, and figures only against the sample just before. The launcher's
@@ -21,7 +22,7 @@ fn expectGranted(candidates: []const Candidate, node_idle_permille: u32, start: 
     try std.testing.expectEqualSlices(bool, expected, granted[0..candidates.len]);
 }
 
-test "on a CPU-saturated node a definition of CPU-bound workers gets no worker while one of I/O-bound workers grows (#157)" {
+test "on a node without a whole idle core no definition grows, whatever CPU share its workers use (#157)" {
     const candidates = [_]Candidate{
         // One worker using most of a core, and waiting for one a third of
         // the time beside the lanes that share it.
@@ -29,11 +30,28 @@ test "on a CPU-saturated node a definition of CPU-bound workers gets no worker w
         // The same workers on a node with half a core idle: they do not wait
         // for a CPU, but no idle core is whole.
         .{ .definition = 1, .figures = .{ .workers = 1, .cpu_permille = 950, .stall_permille = 20 } },
-        // Workers parked on fetches, using a sliver of a core each.
+        // Workers using a sliver of a core each, as workers parked on
+        // fetches would; the server cannot verify that they are, so a sliver
+        // earns them nothing.
         .{ .definition = 2, .figures = .{ .workers = 3, .cpu_permille = 40, .stall_permille = 10 } },
     };
-    try expectGranted(&candidates, 0, 0, &.{ false, false, true });
-    try expectGranted(&candidates, 500, 0, &.{ false, false, true });
+    try expectGranted(&candidates, 0, 0, &.{ false, false, false });
+    try expectGranted(&candidates, 500, 0, &.{ false, false, false });
+    try expectGranted(&candidates, 1000, 1, &.{ false, true, false });
+}
+
+test "a hello definition whose worker takes under half of its one CPU beside the lane gets no company" {
+    // The worker uses 440 thousandths of the core because the lane that
+    // feeds it takes the rest, and neither waits for the CPU long. The rule
+    // that counted such a share as I/O grew this definition to 15 workers on
+    // one CPU; with no idle core left nothing grows.
+    const candidates = [_]Candidate{
+        .{ .definition = 0, .figures = .{ .workers = 1, .cpu_permille = 440, .stall_permille = 30 } },
+    };
+    try expectGranted(&candidates, 0, 0, &.{false});
+    try expectGranted(&candidates, 900, 0, &.{false});
+    // A whole idle core gives it a worker of its own.
+    try expectGranted(&candidates, 1000, 0, &.{true});
 }
 
 test "CPU-bound workers grow one worker per whole idle core, and definitions sharing the node never count one core twice" {

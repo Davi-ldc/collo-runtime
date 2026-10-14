@@ -45,6 +45,11 @@ pub const RequestTask = struct {
     canceled: bool = false,
     timed_out: bool = false,
     completion_queued: bool = false,
+    /// Set while the turn that attaches the task's settlers to the handler's
+    /// thenable runs (`serve/dispatch.zig:invokeHandlerOrFinish`). A
+    /// settlement in that turn's drain is parked without a work item, and
+    /// the request is answered as the turn returns, in the same window.
+    settling_in_turn: bool = false,
     response_value: ?js_value.JsValueOwned = null,
     pending_thenable: ?js_value.JsValueOwned = null,
 

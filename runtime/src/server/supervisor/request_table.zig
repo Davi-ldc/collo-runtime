@@ -34,7 +34,9 @@
 //!
 //! Locks: `mutex` is a leaf, held only inside these methods. The lanes record
 //! and end requests, the worker's reader checks what it forwards, and the
-//! metrics thread and the worker's teardown look up console lines.
+//! metrics thread and the worker's teardown look up console lines. The count
+//! of requests whose `request_done` the reader has not met changes under the
+//! mutex and is read without it, as a hint only (`awaitingDoneCount`).
 
 const std = @import("std");
 const server_limits = @import("collo_limits").server;
@@ -110,6 +112,11 @@ pub const RequestTable = struct {
     ended: [ended_requests_max]EndedRequest = undefined,
     ended_next: usize = 0,
     ended_len: usize = 0,
+    /// The entries whose `request_done` has not passed the worker's reader:
+    /// recorded, and neither ended, removed nor marked forwarded. Changed
+    /// only under `mutex`, together with the entries; read without it
+    /// (`awaitingDoneCount`).
+    awaiting_done: std.atomic.Value(u32) = .init(0),
     mutex: std.Thread.Mutex = .{},
 
     /// Records a request dispatched to this table's worker.
@@ -123,6 +130,7 @@ pub const RequestTable = struct {
         for (&self.entries) |*entry| {
             if (entry.isFree()) {
                 entry.* = .{ .dispatched = dispatched };
+                _ = self.awaiting_done.fetchAdd(1, .monotonic);
                 return;
             }
         }
@@ -137,7 +145,17 @@ pub const RequestTable = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         const entry = findLocked(self, request_id) orelse return;
-        entry.* = .{};
+        freeLocked(self, entry);
+    }
+
+    /// The requests whose `request_done` the worker's reader has not met
+    /// yet, read without the lock. The reader's drain stops after a packet
+    /// that leaves none (`server/ingress/runner/worker_control.zig`): a
+    /// worker with no request owes no descriptor, and a begin another lane
+    /// sends meanwhile, or a stale zero, costs only the drain's re-armed
+    /// poll, which completes at once for a packet waiting in the socket.
+    pub fn awaitingDoneCount(self: *const RequestTable) u32 {
+        return self.awaiting_done.load(.monotonic);
     }
 
     /// Frees the entry of a request the lane ended after its begin reached
@@ -156,7 +174,7 @@ pub const RequestTable = struct {
         self.ended_next = (self.ended_next + 1) % ended_requests_max;
         if (self.ended_len < ended_requests_max)
             self.ended_len += 1;
-        entry.* = .{};
+        freeLocked(self, entry);
     }
 
     /// Checks a descriptor the worker's reader is about to forward to the
@@ -189,7 +207,10 @@ pub const RequestTable = struct {
         const entry = findLocked(self, request_id) orelse return;
         if (!entry.dispatched.request_key.eql(request_key))
             return;
+        if (entry.done_forwarded)
+            return;
         entry.done_forwarded = true;
+        _ = self.awaiting_done.fetchSub(1, .monotonic);
     }
 
     /// The route of the request `request_id` names, from its entry or from
@@ -208,6 +229,15 @@ pub const RequestTable = struct {
                 return self.ended[index].route;
         }
         return null;
+    }
+
+    /// Caller holds `mutex`. Frees `entry`, which holds a request, keeping
+    /// `awaiting_done` in step.
+    fn freeLocked(self: *RequestTable, entry: *Entry) void {
+        std.debug.assert(!entry.isFree());
+        if (!entry.done_forwarded)
+            _ = self.awaiting_done.fetchSub(1, .monotonic);
+        entry.* = .{};
     }
 
     /// Caller holds `mutex`. Id 0 matches nothing, so a worker-written 0

@@ -2,8 +2,8 @@
 //! against real sandboxed workers: two connections on two lanes served at
 //! once by one worker, a steady load on one connection served by the one
 //! worker its first request launched, at concurrency 1 on one CPU too, the
-//! scale-out that gives workers waiting on timers company and keeps workers
-//! spinning on one CPU alone, a deadline that ends its request and
+//! scale-out that keeps a definition's one worker alone on one CPU whether
+//! its requests wait on timers or spin, a deadline that ends its request and
 //! keeps its worker, a worker's death answered on every lane that held one of
 //! its requests, request bodies that meet a worker running synchronous
 //! JavaScript or a worker that dies, workers that retire one after another
@@ -239,28 +239,33 @@ fn runSteadyLoad(harness: *Harness, comptime clients_count: usize, path: []const
     }
 }
 
-test "a definition whose workers wait on timers gets workers beside its first while its requests keep waiting (#157)" {
+test "a definition whose workers wait on timers keeps the one worker its first request launched on one CPU, since a worker more needs a whole idle core (#157)" {
     const configuration = try network_mod.configText(std.testing.allocator, &.{.{
         .name = "timers",
         .routes = &.{.{ .path = "/timers", .entry = "./api/token.js" }},
         .concurrency = 1,
     }});
     defer std.testing.allocator.free(configuration);
+    // Each request holds its worker's only slot through a timer and uses
+    // almost no CPU, so the waiters behind it wait for slots. The server
+    // cannot verify that a worker waits on I/O, so only a whole idle core
+    // grants a worker more, and one CPU that also runs the lane never has
+    // one.
+    const previous_affinity = try pinToFirstAllowedCpu();
+    // A mask the thread held a moment ago is always accepted again.
+    defer std.os.linux.sched_setaffinity(0, &previous_affinity) catch |err|
+        std.debug.panic("restoring the test thread's CPU mask failed: {s}", .{@errorName(err)});
     var harness: Harness = undefined;
     try harness.init(.{ .config_source = configuration });
     defer harness.deinit();
     errdefer harness_mod.dumpZygoteTrace(&harness.spawned);
     const definition = try harness.definitionIndex("timers");
 
-    // Each request holds its worker's only slot through a timer and uses
-    // almost no CPU, so the waiters behind it wait for slots, and the
-    // scale-out verdict grants a worker more at each sample while they do.
     try runSteadyLoad(&harness, scale_load_clients, "/timers?ms=40");
 
     var traces: [16]LaunchTrace = undefined;
     const launches = harness_mod.countLaunches(harness.takeLaunches(&traces), definition);
-    try std.testing.expect(launches.published >= 2);
-    try std.testing.expect(launches.published <= scale_load_clients);
+    try std.testing.expectEqual(@as(usize, 1), launches.published);
     try std.testing.expectEqual(@as(usize, 0), launches.failed);
 }
 

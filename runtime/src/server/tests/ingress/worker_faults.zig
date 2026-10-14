@@ -418,7 +418,7 @@ test "a send fault on a lane that only sends to its worker takes the worker out 
     try scene.second.data(1, body, true);
     const lane = harness.lane(1);
     try harness.discardPollCompletions(1);
-    try lane.handleConnectionReadable(scene.second.slot);
+    try harness.handleReadable(1, scene.second.slot);
     try lane.handleCommands();
     try harness.finishPass(1);
     try scene.second.expectStatus(1, 200);

@@ -28,6 +28,7 @@ const request_task = @import("collo_worker_request").task;
 const response_flow = @import("response.zig");
 const termination = @import("termination.zig");
 const module_routes = @import("../modules/routes.zig");
+const runtime_owner = @import("../runtime/owner.zig");
 
 /// Starts the request's run. A request already answered, as one the
 /// worker ended while its begin waited in the queue, is gone or finishing,
@@ -306,6 +307,10 @@ fn invokeHandlerOrFinish(
     const bench_handler = runtime.observability.bench_handler;
     var handler_started_ns: u64 = 0;
     const handler = &route.module.handler;
+    // A body read the call starts on a body it already holds waits for the
+    // call to return instead of queueing an item (`body_read.zig:schedule`).
+    // No drain ends its own request, so the context outlives the call.
+    request_ctx.handler_call_open = true;
     const invocation = turn.invokeWithTiming(
         runtime.core.vm,
         route.realm,
@@ -316,6 +321,7 @@ fn invokeHandlerOrFinish(
         &.{ request_value, route.module.env.inner.ptr() },
         if (bench_handler) &handler_started_ns else null,
     );
+    request_ctx.handler_call_open = false;
     if (bench_handler) {
         runtime.observability.metrics_view.publishBenchHandler(.{
             .request_id = request_ctx.exec.request_id,
@@ -339,15 +345,60 @@ fn invokeHandlerOrFinish(
     defer if (!result_moved)
         result.deinit();
 
+    // A handler that awaits a read of the body this request already holds,
+    // as `await request.json()` on a body that arrived with the begin, goes
+    // on here in the same window; its continuation runs in that settlement's
+    // drain.
+    if (body_read.requestBodyReadReady(request_ctx)) {
+        if (!try mayContinueInline(runtime, request_ctx.exec.request_id))
+            return;
+        try body_read.settleReadyNow(runtime, request_ctx);
+    }
+
     if (try handler_thenable.isThenableValue(runtime, request_ctx, &result)) {
         task.state = .waiting_thenable;
         task.pending_thenable = js_value.JsValueOwned.fromOwnedValue(result);
         result_moved = true;
-        try handler_thenable.settleRequestThenable(runtime, request_ctx, token, task.pending_thenable.?.ptr());
+        const request_id = request_ctx.exec.request_id;
+        task.settling_in_turn = true;
+        const settled = handler_thenable.settleRequestThenable(runtime, request_ctx, token, task.pending_thenable.?.ptr());
+        // The turn's drain may have ended the request, which frees its task
+        // and its context, so only the token and the id are used past it.
+        if (runtime.requests.tasks.get(token)) |settling_task|
+            settling_task.settling_in_turn = false;
+        try settled;
+        // A thenable that settled in that drain was parked without a work
+        // item (`request/completion.zig:schedule`) and is answered here, in
+        // the request's window.
+        if (runtime.requests.pending_completions.contains(request_id)) {
+            if (!try mayContinueInline(runtime, request_id))
+                return;
+            try executeCompletion(runtime, token);
+        }
         return;
     }
     task.state = .completed_sync;
     try response_bridge.writeValueResponse(runtime, request_ctx, &result);
+}
+
+/// The boundary a request's work passes when it goes on inside its own
+/// window instead of in a work item of its own, which would first meet
+/// `termination.admitAtBoundary`. A request whose CPU budget the turn before
+/// spent, whose deadline passed or whose JavaScript a fire stopped is
+/// answered here and runs no more JavaScript: running on would leave a spent
+/// budget or a passed deadline to the sentinel, whose fire retires the
+/// worker. A request with a CPU budget pays one clock reading, the fold that
+/// charges what its window spent so far. Returns whether the request may go
+/// on.
+fn mayContinueInline(runtime: *state.Runtime, request_id: u64) !bool {
+    const request_ctx = runtime.requests.active.get(request_id) orelse return false;
+    if (request_ctx.finish_started)
+        return false;
+    if (request_ctx.cpu_budget_ns != 0)
+        runtime_owner.foldOpenWindow(runtime, request_ctx);
+    const ending = termination.endingOf(runtime, request_ctx) orelse return true;
+    try termination.end(runtime, request_ctx, ending);
+    return false;
 }
 
 fn ensureRequestTask(runtime: *state.Runtime, request_ctx: *request_context.RequestContext) !request_task.TaskToken {

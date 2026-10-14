@@ -375,6 +375,8 @@ pub const Slot = struct {
     pub const h2ConsumeInboundWindow = flow_control.h2ConsumeInboundWindow;
     pub const h2DiscardInboundData = flow_control.h2DiscardInboundData;
     pub const h2BufferInboundWindowUpdate = flow_control.h2BufferInboundWindowUpdate;
+    pub const h2HasPendingWindowUpdate = flow_control.h2HasPendingWindowUpdate;
+    pub const h2WindowUpdateDue = flow_control.h2WindowUpdateDue;
     pub const h2RestoreTakenPendingBodyConnectionCredit = flow_control.h2RestoreTakenPendingBodyConnectionCredit;
 
     pub const h2WritesPending = write_queue.h2WritesPending;
@@ -384,6 +386,7 @@ pub const Slot = struct {
     pub const h2AppendResponseChunk = write_queue.h2AppendResponseChunk;
     pub const h2PendingResponseChunk = write_queue.h2PendingResponseChunk;
     pub const h2TakeRetiredResponseChunk = write_queue.h2TakeRetiredResponseChunk;
+    pub const h2TakeRetiredResponseChunks = write_queue.h2TakeRetiredResponseChunks;
     pub const h2QueuedWriteVectors = write_queue.h2QueuedWriteVectors;
     pub const h2ConsumeQueuedWrite = write_queue.h2ConsumeQueuedWrite;
     pub const h2HasPendingResponse = write_queue.h2HasPendingResponse;

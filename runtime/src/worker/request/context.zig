@@ -285,6 +285,12 @@ pub const RequestContext = struct {
     dispatch_queued: bool,
     body_ready_queued: bool,
     cancel_queued: bool,
+    /// Set while the handler's own call runs, its drain included
+    /// (`serve/dispatch.zig:invokeHandlerOrFinish`). A body read started then
+    /// on a body that is already complete queues no `request_body_ready`
+    /// item: the call's caller settles it as soon as the call returns
+    /// (`body_read.zig:settleReadyNow`).
+    handler_call_open: bool,
     /// When this request's `request`, `request_body_ready` and
     /// `request_cancelled` items first became ready, kept while a full ready
     /// queue makes their enqueue wait, so that wait counts as waiting
@@ -344,6 +350,7 @@ pub const RequestContext = struct {
             .dispatch_queued = false,
             .body_ready_queued = false,
             .cancel_queued = false,
+            .handler_call_open = false,
             .dispatch_ready_since_ns = 0,
             .body_ready_since_ns = 0,
             .cancel_ready_since_ns = 0,

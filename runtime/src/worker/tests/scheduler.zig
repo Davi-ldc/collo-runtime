@@ -11,8 +11,9 @@
 //! that a worker without a network grant refuses, closing every descriptor
 //! it brought, and does not block while a gateway drain may have left
 //! packets past its batch bound. The one loop run here meets a hangup before
-//! its first wait and stops cleanly. The loop running real turns, and
-//! resuming a parked response, is covered by
+//! its first wait and stops cleanly. The loop reading every queued control
+//! packet before it runs work is covered by `worker/tests/scheduler/loop.zig`,
+//! the loop running real turns, and resuming a parked response, by
 //! `worker/tests/runtime/` in the same worker-test lane, and inside a
 //! sandboxed worker by the zygote-integration lane.
 

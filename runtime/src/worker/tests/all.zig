@@ -7,6 +7,7 @@ comptime {
     _ = @import("egress/all.zig");
     _ = @import("scheduler.zig");
     _ = @import("scheduler/idle.zig");
+    _ = @import("scheduler/loop.zig");
     _ = @import("sentinel.zig");
     _ = @import("request/all.zig");
     _ = @import("runtime/all.zig");

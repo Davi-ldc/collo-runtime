@@ -104,6 +104,15 @@ pub fn h2TakeRetiredResponseChunk(self: *Slot) ?*ResponseChunk {
     return chunk;
 }
 
+/// Takes every chunk off the retired list at once, linked through
+/// `next_retired`, their bytes already freed. The caller returns their
+/// credit and destroys each.
+pub fn h2TakeRetiredResponseChunks(self: *Slot) ?*ResponseChunk {
+    const chunks = self.h2_retired_response_chunks;
+    self.h2_retired_response_chunks = null;
+    return chunks;
+}
+
 /// Appends a worker's body chunk to its stream. The chunk frees its bytes
 /// with `allocator`, so a payload `received` owns in `allocator` moves into
 /// it, and any other payload, borrowed ring bytes among them, is copied;

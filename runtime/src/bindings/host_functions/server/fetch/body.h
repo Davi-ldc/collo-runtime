@@ -236,6 +236,10 @@ public:
     bool beginStreamRead(JSC::JSGlobalObject*, JSC::ThrowScope&, WTF::ASCIILiteral already_used_message);
     bool cancelStream(JSC::JSGlobalObject*, JSC::ThrowScope&, WTF::ASCIILiteral already_used_message);
     ColloFetchBodyIdentity transferFetchStreamForHostResponse();
+    // Marks an unused body used once the host took its bytes through extractByteSegmentsForHostResponse in place
+    // of reading the stream `body` created over it, so the body reads as consumed, as it would after that stream's
+    // pull.
+    void markUsedForHost();
 
     // Each calls the matching BodyState method, clone for cloneBody, with this cell's stream; cloneBody also stores
     // the tee branch a stream body keeps.

@@ -443,6 +443,7 @@ pub fn LaneWorker(comptime Service: type) type {
         pub const handleH2ResetFrame = request_body.Methods(Self).handleH2ResetFrame;
         pub const flushPendingH2RequestBodies = request_body.Methods(Self).flushPendingH2RequestBodies;
         pub const responseChunkRetired = dispatch.Methods(Self).responseChunkRetired;
+        pub const grantResponseCredit = dispatch.Methods(Self).grantResponseCredit;
         pub const updateConnectionInterest = connection_flow.Methods(Self).updateConnectionInterest;
         pub const closeRuntimeConnection = connection_flow.Methods(Self).closeRuntimeConnection;
     };

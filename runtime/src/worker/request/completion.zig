@@ -3,6 +3,9 @@
 //! (`worker/host/completion.zig`), `schedule` checks it against the request
 //! task table and parks the value, and a `request_completion` work item
 //! later writes the response (`executeCompletion` in `serve/dispatch.zig`).
+//! A thenable that settles in the drain of the very turn that attached the
+//! settlers, as a handler whose awaits all resolve in microtasks does, is
+//! answered as that turn returns, in the same work item, and queues none.
 //! Runs on the worker's VM thread; the runtime holds the pending map, keyed
 //! by request id.
 //!
@@ -33,7 +36,9 @@ pub const Completion = struct {
 
 /// Parks the settled `value` of the thenable behind `token` and queues its
 /// work item, or leaves it for `collectReady` when the ready queue and its
-/// backlog are full. Takes `value` on every path. A token whose task is
+/// backlog are full; a task whose settlers' own turn is still running
+/// (`RequestTask.settling_in_turn`) gets no item, since that turn answers
+/// it. Takes `value` on every path. A token whose task is
 /// gone, belongs to another request or generation, no longer waits on a
 /// thenable, or was canceled or timed out is stale and dropped without an
 /// error. Fails only when the pending map cannot grow.
@@ -66,6 +71,10 @@ pub fn schedule(
         .ready_at_mono_ns = ready_at_mono_ns,
     });
     moved = true;
+    // The request's own turn is still running and answers the completion
+    // when it returns, so a work item would only cost another window.
+    if (task.settling_in_turn)
+        return;
     errdefer {
         if (runtime.requests.pending_completions.fetchRemove(request_id)) |removed| {
             var completion = removed.value;

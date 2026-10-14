@@ -1,8 +1,10 @@
 //! Response credit on the lane that owns a request
-//! (`dispatch.zig:responseChunkRetired`): an owned payload moves into its
-//! chunk only from the lane's allocator, a chunk keeps its bytes until the
-//! socket took the last of them, a reset or a later request in the slot
-//! gets no credit, a chunk past the window faults the worker, one
+//! (`dispatch.zig:responseChunkRetired`, `grantResponseCredit`): an owned
+//! payload moves into its chunk only from the lane's allocator, a chunk
+//! keeps its bytes until the socket took the last of them, a reset or a
+//! later request in the slot gets no credit, a grant goes out only once the
+//! worker holds half its window or less, and always before it runs out, a
+//! chunk past the window faults the worker, one
 //! WINDOW_UPDATE drains a stream, a full control socket keeps the newest
 //! total, and ring bytes go back at once. Also the order streams share a
 //! flush in, and a write queue too full for a head. Lane
@@ -71,6 +73,9 @@ const Writer = struct {
     h2_lane: struct { encode_scratch: []u8 } = .{ .encode_scratch = &.{} },
     retired: [8]lifecycle.RequestKey = undefined,
     retired_len: usize = 0,
+    /// `grantResponseCredit` calls, one per retired chunk after every
+    /// chunk of the write was counted.
+    grants: usize = 0,
     closed: bool = false,
 
     pub fn updateConnectionInterest(_: *Writer, _: *Slot) ingress.fault.LaneFault!void {}
@@ -83,6 +88,10 @@ const Writer = struct {
     pub fn responseChunkRetired(self: *Writer, owner: lifecycle.RequestKey) ingress.fault.LaneFault!void {
         self.retired[self.retired_len] = owner;
         self.retired_len += 1;
+    }
+
+    pub fn grantResponseCredit(self: *Writer, _: lifecycle.RequestKey) ingress.fault.LaneFault!void {
+        self.grants += 1;
     }
 };
 
@@ -187,6 +196,82 @@ test "a chunk written after its request ended gives no credit to the request tha
     try std.testing.expect(!reused.response_credit_unsent);
     try std.testing.expectEqual(ipc.response_credit.window, reused.response_credit.granted);
     try std.testing.expect(!try scene.stub.controlReadable());
+}
+
+test "a streamed response of fewer than half its window's chunks gets no grant" {
+    var scene: lane_harness.OneWorker = undefined;
+    try scene.init(.{});
+    defer scene.deinit();
+    const request = try scene.get(1);
+    try scene.stub.sendHead(request, 200, false);
+    try scene.stub.sendChunk(request, "only chunk", false);
+    try scene.harness.handleControl(0, scene.stub);
+    try scene.client.receive();
+    try std.testing.expectEqual(@as(usize, 10), (try scene.client.stream(1)).body_len);
+    // The chunk retired, and the worker still holds three of its four
+    // credits, more than half the window.
+    try std.testing.expect(!try scene.stub.controlReadable());
+    try scene.stub.sendChunk(request, "", true);
+    try scene.stub.sendDone(request, .{});
+    try scene.harness.handleControl(0, scene.stub);
+    try scene.client.receive();
+    try std.testing.expect((try scene.client.stream(1)).ended);
+    try std.testing.expect(!try scene.stub.controlReadable());
+    try scene.harness.expectServing(scene.stub);
+}
+
+test "a long streamed response gets each grant before its worker runs out of credit, at most one per half window" {
+    var scene: lane_harness.OneWorker = undefined;
+    try scene.init(.{});
+    defer scene.deinit();
+    const request = try scene.get(1);
+    try scene.stub.sendHead(request, 200, false);
+    try scene.harness.handleControl(0, scene.stub);
+    const chunks_total: usize = 40;
+    const chunk = "0123456789";
+    // The worker publishes while it holds credit, as a worker does.
+    var published: usize = 0;
+    var held: u64 = ipc.response_credit.window;
+    var grants: usize = 0;
+    var rounds: usize = 0;
+    while (published < chunks_total) : (rounds += 1) {
+        // A worker with no credit and no grant on its way would wait for
+        // good.
+        try std.testing.expect(published < held);
+        try std.testing.expect(rounds < chunks_total);
+        while (published < held and published < chunks_total) : (published += 1)
+            try scene.stub.sendChunk(request, chunk, false);
+        try scene.harness.handleControl(0, scene.stub);
+        try scene.client.receive();
+        if (try takeNewestGrant(scene.stub, &grants)) |total|
+            held = @max(held, total);
+    }
+    try std.testing.expect(grants * 2 <= chunks_total);
+    try scene.stub.sendChunk(request, "", true);
+    try scene.stub.sendDone(request, .{});
+    try scene.harness.handleControl(0, scene.stub);
+    try scene.client.receive();
+    const stream = try scene.client.stream(1);
+    try std.testing.expect(stream.ended);
+    try std.testing.expectEqual(chunks_total * chunk.len, stream.body_len);
+    try scene.harness.expectServing(scene.stub);
+}
+
+/// The highest cumulative total among the grants waiting on the worker's
+/// end of its control socket, which the reads take, counting each in
+/// `count`; null when none waits.
+fn takeNewestGrant(stub: *lane_harness.StubWorker, count: *usize) !?u64 {
+    var newest: ?u64 = null;
+    while (true) {
+        var packet = ipc.recvPacketWithFdsScratch(allocator, stub.control, stub.recv_scratch) catch |err| switch (err) {
+            error.WouldBlock => return newest,
+            else => return err,
+        };
+        defer packet.deinit();
+        const credit = try ipc.response_credit.decode(&packet);
+        count.* += 1;
+        newest = @max(newest orelse 0, credit.grant_chunks_total);
+    }
 }
 
 test "the owning lane faults a fifth unpaid chunk from its reader or another lane" {

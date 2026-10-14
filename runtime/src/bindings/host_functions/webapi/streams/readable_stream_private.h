@@ -402,6 +402,14 @@ public:
     // Appends the remaining bytes of a stream backed by a native source to the output in one step, keeping the output
     // within max_size bytes in total.
     ReadableStreamDrainResult drainNativeBytes(WTF::Vector<uint8_t>& out, size_t max_size);
+    // The native source while the stream is as it was created: readable, never read, locked or pulled, with nothing
+    // queued and no read pending, so the source still holds every byte. Null in any other state, and for a stream
+    // without a native source.
+    ReadableStreamNativeSource* untouchedNativeSource() const;
+    // Leaves the stream as a host reader that read it to its end would: locked by `reader`, a reader of the host's
+    // own that `reader`'s creation did not lock, disturbed and closed, with its native source released. Call it only
+    // while untouchedNativeSource() returns the source and once the host has taken every byte the source held.
+    void finishHostRead(JSC::JSGlobalObject*, JSColloReadableStreamDefaultReader* reader);
     void callNativePullIfNeeded(JSC::JSGlobalObject*);
     // The pending result of a native pull fulfilled with `result` or rejected with `reason`.
     void finishNativePull(JSC::JSGlobalObject*, JSC::JSValue result);

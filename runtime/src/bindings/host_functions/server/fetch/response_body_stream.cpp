@@ -1,7 +1,8 @@
-// How the worker reads a Response's ReadableStream body once the handler returned it. Extraction locks the stream and
-// hands Zig a ColloResponseBodyStream; Zig then starts one read at a time, each inside a turn of the request that owns
-// the response, borrows each chunk's bytes, and cancels or destroys the handle when the response ends. Runs on the VM
-// thread, and every ABI call takes the JSC lock.
+// How the worker reads a Response's ReadableStream body once the handler returned it. A stream nothing touched that
+// still holds a whole body of bytes gives them up at extraction as a buffered body (`handOffWholeBody`). Any other
+// stream is locked at extraction and handed to Zig as a ColloResponseBodyStream; Zig then starts one read at a time,
+// each inside a turn of the request that owns the response, borrows each chunk's bytes, and cancels or destroys the
+// handle when the response ends. Runs on the VM thread, and every ABI call takes the JSC lock.
 //
 // A ColloResponseBodyStream belongs to Zig from extraction until collo_response_body_stream_destroy. It roots the
 // locked stream and its two read reactions through ColloValue handles, which the VM's destruction empties, so the
@@ -16,6 +17,7 @@
 
 #include "host_functions/server/fetch/response_body_stream.h"
 
+#include "host_functions/server/fetch/body.h"
 #include "host_functions/server/fetch/extracted_response.h"
 #include "host_functions/webapi/dom/dom_exception.h"
 #include "host_functions/webapi/streams/readable_stream.h"
@@ -191,10 +193,65 @@ namespace {
         return dynamicDowncast<JSColloReadableStream>(Collo::toJSValue(body_stream.stream));
     }
 
+    enum class WholeBodyHandOff : uint8_t {
+        // The stream is untouched: it has no whole body to give, or the body is too large to take at once.
+        NotAvailable,
+        // `out` holds the body's bytes, and the stream and the body are consumed.
+        HandedOff,
+        // An exception is pending in the scope, and the stream and the body are untouched.
+        Threw,
+    };
+
+    // A stream nothing has touched that still holds a whole body of bytes, the stream `body` returns for a body built
+    // from a string, bytes or a Blob, as `new Response(response.body, response)` passes on, gives those bytes to the
+    // host at once, as a buffered body would: the worker then sends the response in one packet instead of reading the
+    // stream over several turns. The stream ends as the host's own reader would leave it after reading it to its end,
+    // and the body reads as used, so script sees the state a read would leave. A body above `max_body_bytes` is left
+    // to the stream, which the worker reads chunk by chunk under its credit.
+    WholeBodyHandOff handOffWholeBody(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope,
+        JSColloReadableStream& stream, size_t max_body_bytes, ColloExtractedResponseBody& out)
+    {
+        auto* source = stream.untouchedNativeSource();
+        if (!source)
+            return WholeBodyHandOff::NotAvailable;
+        auto* body_owner = source->wholeBodyOwner();
+        if (!body_owner || body_owner->bodyUsed())
+            return WholeBodyHandOff::NotAvailable;
+        const BodyState& body = body_owner->body();
+        switch (body.source()) {
+        case BodyState::Source::Empty:
+        case BodyState::Source::Text:
+        case BodyState::Source::Bytes:
+        case BodyState::Source::SharedBytes:
+            break;
+        case BodyState::Source::RequestLazy:
+        case BodyState::Source::FetchStream:
+        case BodyState::Source::ReadableStream:
+            return WholeBodyHandOff::NotAvailable;
+        }
+
+        size_t byte_length = 0;
+        if (!body.byteLength(global_object, scope, byte_length))
+            return WholeBodyHandOff::Threw;
+        if (byte_length > max_body_bytes)
+            return WholeBodyHandOff::NotAvailable;
+
+        // The reader is the only allocation the commit below needs, so it comes before the bytes are taken.
+        auto* reader = JSColloReadableStreamDefaultReader::create(global_object->vm(), global_object, &stream);
+        RETURN_IF_EXCEPTION(scope, WholeBodyHandOff::Threw);
+        if (!reader)
+            return WholeBodyHandOff::NotAvailable;
+        if (!body.extractByteSegmentsForHostResponse(global_object, scope, byte_length, 64, out))
+            return WholeBodyHandOff::Threw;
+        body_owner->markUsedForHost();
+        stream.finishHostRead(global_object, reader);
+        return WholeBodyHandOff::HandedOff;
+    }
+
 } // namespace
 
 ColloStatus extractResponseBodyStream(ColloVm* owner, JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope,
-    JSC::JSObject* body_stream, ColloExtractedResponseBody& out)
+    JSC::JSObject* body_stream, size_t max_body_bytes, ColloExtractedResponseBody& out)
 {
     auto* stream = dynamicDowncast<JSColloReadableStream>(body_stream);
     if (!stream)
@@ -211,6 +268,15 @@ ColloStatus extractResponseBodyStream(ColloVm* owner, JSC::JSGlobalObject* globa
         JSC::throwException(global_object, scope, stream->storedError());
         return COLLO_STATUS_JS_EXCEPTION;
     case StreamState::Readable:
+        break;
+    }
+
+    switch (handOffWholeBody(global_object, scope, *stream, max_body_bytes, out)) {
+    case WholeBodyHandOff::HandedOff:
+        return COLLO_STATUS_OK;
+    case WholeBodyHandOff::Threw:
+        return COLLO_STATUS_JS_EXCEPTION;
+    case WholeBodyHandOff::NotAvailable:
         break;
     }
 

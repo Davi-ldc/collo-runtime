@@ -1201,9 +1201,11 @@ test "expired deadline wins over queued async completion" {
 
     const route_specifier = try rt.routeSpecifier(std.testing.allocator, "/__test_route/async-deadline.js");
     defer std.testing.allocator.free(route_specifier);
+    // The handler settles in a timer's turn, so its completion is a work
+    // item of its own; one that settles in its own turn is answered there.
     const route_index = try rt.registerRoute(&runtime, route_specifier,
         \\export default async function handle() {
-        \\    await Promise.resolve();
+        \\    await new Promise((resolve) => setTimeout(resolve, 0));
         \\    return "late ok";
         \\}
     );
@@ -1216,6 +1218,8 @@ test "expired deadline wins over queued async completion" {
     defer dispatch.deinit();
     try rt.enqueueIngressRoute(&runtime, &dispatch, 1, .{});
 
+    try executeNextReady(&runtime);
+    try runtime.collectDueTimers();
     try executeNextReady(&runtime);
     const completion_item = runtime.scheduler.ready_queue.pop() orelse return error.MissingRequestCompletion;
     switch (completion_item) {

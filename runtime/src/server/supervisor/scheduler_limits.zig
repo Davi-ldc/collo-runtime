@@ -125,17 +125,11 @@ pub const scale_out = struct {
     /// workers may wait for a CPU and still grow: above it they queue for
     /// CPUs already, and a worker more would queue with them.
     pub const stall_permille_max: u32 = 100;
-    /// The mean CPU per worker, in thousandths of a core, from which a
-    /// definition's workers count as CPU-bound, so a worker more needs a
-    /// whole idle core; below it they mostly wait on I/O.
-    pub const cpu_bound_permille: u32 = 500;
 
     comptime {
         std.debug.assert(sample_interval_ns > 0);
         std.debug.assert(stall_permille_max > 0);
         std.debug.assert(stall_permille_max <= 1000);
-        std.debug.assert(cpu_bound_permille > 0);
-        std.debug.assert(cpu_bound_permille <= 1000);
     }
 };
 

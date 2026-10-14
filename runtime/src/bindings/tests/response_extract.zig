@@ -1,8 +1,9 @@
 //! Extraction of a handler's `new Response(...)` through `Realm.extractResponse`, the call the
 //! worker makes on every response (`fillExtractedResponse` in
 //! `host_functions/server/fetch/response.cpp`), and the bridge's half of streaming a ReadableStream
-//! body (`host_functions/server/fetch/response_body_stream.cpp`): extraction locks the stream and
-//! hands it over, a read runs the stream's pull in the caller's turn, a chunk's bytes are lent or
+//! body (`host_functions/server/fetch/response_body_stream.cpp`): extraction takes the whole body of
+//! an untouched stream over a Response's buffered body, or locks any other stream and hands it
+//! over, a read runs the stream's pull in the caller's turn, a chunk's bytes are lent or
 //! encoded, and a cancel reaches the stream's source with its reason. These are native paths no
 //! JavaScript-only `webapi` fixture reaches. Lane: `bindings-test`; the worker side of streaming,
 //! from the head to the finish, is covered in `worker-test`
@@ -103,6 +104,124 @@ test "a Response over a user ReadableStream extracts as a body stream the bridge
     // Locked, so no script can read or cancel it any more, and not yet disturbed: the worker has
     // not read it.
     try expectExportString(&vm, 5100, "state", "true false");
+}
+
+test "a Response that rewraps another's untouched body stream extracts that body's bytes as a buffered body" {
+    var vm = try support.createVm();
+    defer vm.deinit();
+
+    // Hono's shape: a middleware that sets a header after the handler ran rebuilds the response
+    // around the first one's body stream.
+    const source =
+        \\export let inner;
+        \\export let outer;
+        \\export default function handler() {
+        \\    inner = new Response(JSON.stringify({ ok: "é" }), { headers: { "content-type": "application/json" } });
+        \\    outer = new Response(inner.body, inner);
+        \\    outer.headers.set("x-tenant", "t1");
+        \\    return outer;
+        \\}
+        \\export function state() {
+        \\    return `${outer.body.locked} ${outer.bodyUsed} ${inner.bodyUsed}`;
+        \\}
+    ;
+    try support.registerModule(&vm, "/handler.js", source);
+    try support.evaluateOk(&vm, "/handler.js");
+
+    var extracted = try extractDefaultResponseOk(&vm, 5110);
+    defer extracted.deinit();
+    try std.testing.expect(extracted.body.kind != bindings.extracted_response_body_readable_stream);
+    try std.testing.expect(extracted.body.body_stream == null);
+    try std.testing.expectEqualStrings("{\"ok\":\"\xc3\xa9\"}", extracted.body.firstContiguousSlice());
+    try std.testing.expectEqual(@as(usize, 2), extracted.headersSlice().len);
+    // What a read of the stream to its end would leave: locked by the bridge, disturbed, and both
+    // bodies used.
+    try expectExportString(&vm, 5110, "state", "true true true");
+}
+
+/// Extracts what the module's export `name` returns, under `limits`, which
+/// must succeed; the caller owns the result.
+fn extractExportOk(
+    vm: *bindings.Vm,
+    request_id: u64,
+    name: []const u8,
+    limits: bindings.ResponseExtractLimits,
+) !bindings.ExtractedResponse {
+    var function = try support.getExportOk(vm, "/handler.js", name);
+    defer function.deinit();
+    var exec_ctx = support.makeExecCtx(request_id);
+    try vm.turnEnter(&exec_ctx);
+    defer vm.turnExit() catch {};
+    var response = try support.invokeOk(vm, &exec_ctx, &function, &.{});
+    defer response.deinit();
+    return switch (try vm.mainRealm().extractResponse(&response, limits)) {
+        .success => |extracted| extracted,
+        .exception => |exception| {
+            var owned = exception;
+            owned.deinit();
+            return error.UnexpectedExtractionException;
+        },
+    };
+}
+
+test "a rewrapped body above the body limit, or one script consumed through its Response, still extracts as a stream" {
+    var vm = try support.createVm();
+    defer vm.deinit();
+
+    const source =
+        \\export function large() {
+        \\    const inner = new Response("abcdefgh");
+        \\    return new Response(inner.body, inner);
+        \\}
+        \\export function consumed() {
+        \\    const inner = new Response("abc");
+        \\    const stream = inner.body;
+        \\    // Consuming through the Response neither locks nor disturbs the
+        \\    // stream it handed out, so only the used body tells the bytes are gone.
+        \\    inner.text();
+        \\    return new Response(stream, inner);
+        \\}
+    ;
+    try support.registerModule(&vm, "/handler.js", source);
+    try support.evaluateOk(&vm, "/handler.js");
+
+    var small_limits = extract_limits;
+    small_limits.max_body_bytes = 4;
+    var large = try extractExportOk(&vm, 5130, "large", small_limits);
+    defer large.deinit();
+    try std.testing.expectEqual(bindings.extracted_response_body_readable_stream, large.body.kind);
+    var large_stream = large.body.takeBodyStream() orelse return error.MissingBodyStream;
+    large_stream.deinit();
+
+    var consumed = try extractExportOk(&vm, 5131, "consumed", extract_limits);
+    defer consumed.deinit();
+    try std.testing.expectEqual(bindings.extracted_response_body_readable_stream, consumed.body.kind);
+    var consumed_stream = consumed.body.takeBodyStream() orelse return error.MissingBodyStream;
+    consumed_stream.deinit();
+}
+
+test "a tee branch of a Response's body stream still extracts as a stream" {
+    var vm = try support.createVm();
+    defer vm.deinit();
+
+    const source =
+        \\export let tee_branch;
+        \\export default function handler() {
+        \\    const inner = new Response("abcdef");
+        \\    const [first, second] = inner.body.tee();
+        \\    tee_branch = second;
+        \\    return new Response(first);
+        \\}
+    ;
+    try support.registerModule(&vm, "/handler.js", source);
+    try support.evaluateOk(&vm, "/handler.js");
+
+    var extracted = try extractDefaultResponseOk(&vm, 5120);
+    defer extracted.deinit();
+    // A tee branch reads from a source of its own, not from the Response's body.
+    try std.testing.expectEqual(bindings.extracted_response_body_readable_stream, extracted.body.kind);
+    var body_stream = extracted.body.takeBodyStream() orelse return error.MissingBodyStream;
+    body_stream.deinit();
 }
 
 test "a Response whose ReadableStream body is locked or already read fails extraction as already used" {

@@ -23,7 +23,9 @@
 //! request that finishes in its own turn or an evaluation closed by its own
 //! deadline, is not found when the window closes and gets nothing more, so
 //! `finishRequest` folds the window first (`foldOpenWindow`) and its
-//! `request_done` holds every nanosecond up to the finish. Every charge to a
+//! `request_done` holds every nanosecond up to the finish; closing such a
+//! window to no owner reads no clock, since nothing is left to charge or
+//! start. Every charge to a
 //! dispatched request also lands in its live slot on the page
 //! (`chargeContext`).
 //!
@@ -284,8 +286,16 @@ fn owedDeadlineNs(context: *const request_context.RequestContext) ?u64 {
 /// leaves ends here; the caller begins the next one's.
 fn switchWindow(runtime: anytype, next_id: u64, now_ns: u64) void {
     const owners = &runtime.owners;
-    const cpu_now_ns = readCpu(owners);
     const current_id = owners.current_id;
+    // A reading serves only to charge the closing window and to start the
+    // next one. Closing to no owner the window of an owner that ended inside
+    // it, the common end of a request's last item, needs neither: `charge`
+    // finds no owner to charge, and no window starts. The clock is a system
+    // call, so that border skips it.
+    const cpu_now_ns = if (next_id == 0 and current_id != 0 and !ownerLive(runtime, current_id))
+        owners.cpu_last_ns
+    else
+        readCpu(owners);
     if (current_id != 0) {
         charge(runtime, current_id, cpu_now_ns -| owners.window_cpu_start_ns);
         turnEnd(runtime, current_id, now_ns);
@@ -359,6 +369,14 @@ fn contextPublication(
 fn readCpu(owners: *Owners) u64 {
     owners.cpu_last_ns = @max(owners.cpu_last_ns, owners.cpu_clock.now());
     return owners.cpu_last_ns;
+}
+
+/// Whether `owner_id`, not 0, can still be charged: the worker owner always,
+/// a request or an evaluation while the active map holds it (`charge`).
+fn ownerLive(runtime: anytype, owner_id: u64) bool {
+    if (owner_id == worker_owner_id)
+        return true;
+    return runtime.requests.active.contains(owner_id);
 }
 
 fn charge(runtime: anytype, owner_id: u64, cpu_ns: u64) void {

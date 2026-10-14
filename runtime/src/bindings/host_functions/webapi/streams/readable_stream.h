@@ -30,6 +30,8 @@
 
 namespace Collo::HostFunctions {
 
+class JSColloBodyOwner;
+
 // What one pull of a native source produced. A synchronous source answers with a chunk or with its end at once, and
 // the stream fulfills a pending read without a promise of its own; an asynchronous source answers with a promise for a
 // {value, done} result. The cells it names are rooted by the stack that holds it.
@@ -97,6 +99,11 @@ public:
         out_supported = false;
         return false;
     }
+    // The Request or Response whose whole body the source would deliver on its next pull, for a host that can take
+    // that body's bytes without reading the stream (server/fetch/response_body_stream.cpp). Null when the source
+    // reads from anything else or has already delivered part of it, and then the host reads the stream chunk by
+    // chunk. The cell is traced through the source, so the caller keeps the stream alive while it uses it.
+    virtual JSColloBodyOwner* wholeBodyOwner() const { return nullptr; }
     // Lets go of what the source reads from. The stream never calls it under its cell lock, because a source may
     // call into Zig here.
     virtual void release() { }

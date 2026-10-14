@@ -18,8 +18,9 @@
 //! - Preparing a poll, a cancel or a close only fills a submission queue
 //!   entry (`LaneRing.prepare`). The lane hands everything a pass prepared to
 //!   the kernel in one `io_uring_enter` at the end of the pass, the same call
-//!   that waits when the pass found no work (`LaneRing.submit`,
-//!   `LaneRing.submitAndWait`), and every `io_uring_enter` the lane makes is
+//!   that waits unless the pass left work queued for the next one
+//!   (`LaneRing.submit`, `LaneRing.submitAndWait`, `ring_driver.runPass`),
+//!   and every `io_uring_enter` the lane makes is
 //!   counted (`LaneRing.enters`). Only a pass that fills the submission queue
 //!   submits early, and that call is counted too.
 //! - A socket closes through the ring, behind the cancels of its polls in

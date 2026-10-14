@@ -336,26 +336,49 @@ pub fn Methods(comptime Self: type) type {
             }
         }
 
-        /// Grants the request `owner` one more body chunk once the client
-        /// socket took the last byte of one of its chunks, and sends the
-        /// worker the new total. A request that ended, a later request in its
-        /// slot, and a response that ended or was reset get no credit.
+        /// Counts one more body chunk the request `owner` may hold once the
+        /// client socket took the last byte of one of its chunks, and sends
+        /// nothing: the writer calls `grantResponseCredit` once it counted
+        /// every chunk one write retired, so the chunks of a request that
+        /// leave together cost one grant. A request that ended, a later
+        /// request in its slot, and a response that ended or was reset get no
+        /// credit.
         pub fn responseChunkRetired(self: *Self, owner: lifecycle.RequestKey) LaneFault!void {
-            const index = Admission.findRequestSlot(self, owner) orelse return;
-            const slot = &self.requests.entries[index];
-            if (!slot.dispatched() or slot.h2_client_reset or slot.send_blocked == .failed)
-                return;
-            const runtime = Admission.requestConnection(self, slot) orelse return;
-            const stream = runtime.h2StreamEntry(slot.ingress_channel_id) orelse return;
-            if (stream.worker_response_ended)
-                return;
+            const slot = creditedSlot(self, owner) orelse return;
             _ = slot.response_credit.retire();
+        }
+
+        /// Sends the request `owner` its newest cumulative total when the
+        /// worker needs it (`RequestSlot.responseCreditDue`). A grant that
+        /// finds the control socket full waits for its writability poll,
+        /// which sends the newest total then, so a grant already waiting
+        /// sends nothing now.
+        pub fn grantResponseCredit(self: *Self, owner: lifecycle.RequestKey) LaneFault!void {
+            const slot = creditedSlot(self, owner) orelse return;
+            if (slot.response_credit_unsent or !slot.responseCreditDue())
+                return;
             slot.response_credit_unsent = true;
             switch (try sendResponseCredit(self, slot)) {
                 .sent => {},
                 .socket_full, .ring_full => try armSendPolls(self, slot),
                 .fault => |reason| try failSend(self, slot, reason),
             }
+        }
+
+        /// The slot of the request `owner` while its worker's response
+        /// still takes credit: the request is live and dispatched, its
+        /// stream neither reset nor ended by the worker, and its sends not
+        /// failed.
+        fn creditedSlot(self: *Self, owner: lifecycle.RequestKey) ?*RequestSlot {
+            const index = Admission.findRequestSlot(self, owner) orelse return null;
+            const slot = &self.requests.entries[index];
+            if (!slot.dispatched() or slot.h2_client_reset or slot.send_blocked == .failed)
+                return null;
+            const runtime = Admission.requestConnection(self, slot) orelse return null;
+            const stream = runtime.h2StreamEntry(slot.ingress_channel_id) orelse return null;
+            if (stream.worker_response_ended)
+                return null;
+            return slot;
         }
 
         /// Sends ResponseCredit straight to the control socket. It needs no
@@ -374,6 +397,7 @@ pub fn Methods(comptime Self: type) type {
             };
             ipc.response_credit.send(worker.handle.control_fd, message) catch |err|
                 return sendResult(self, worker, err);
+            slot.response_credit_sent = slot.response_credit.granted;
             slot.response_credit_unsent = false;
             return .sent;
         }

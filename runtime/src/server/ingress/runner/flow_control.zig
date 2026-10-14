@@ -16,6 +16,10 @@
 //!   holds, and the client gets that credit back only when the bytes reach
 //!   the worker or are released, so a worker that stops reading stalls the
 //!   client's sender rather than growing the buffer.
+//! - Credit owed waits until a window the client sees falls to half its
+//!   advertised size (`h2WindowUpdateDue`, which proves the bound) or until
+//!   the connection writes frames anyway, and a stream whose request ended
+//!   is owed none of its own.
 //! - No window grows past `h2.max_window_size`; an update that would is
 //!   `error.Http2FlowControlError`.
 
@@ -277,6 +281,15 @@ pub fn h2DiscardInboundData(self: *Slot, byte_len: usize) !void {
     try self.h2BufferInboundWindowUpdate(null, byte_len);
 }
 
+/// Owes the client `byte_len` bytes of receive credit for bytes the server
+/// no longer holds: the lane's own windows of the connection and of
+/// `stream_id`, when the table holds that stream open, grow at once, and the
+/// credit waits in the pending updates until a WINDOW_UPDATE carries it
+/// (`h2WindowUpdateDue` says when one must). A stream whose request's
+/// END_STREAM arrived owes no credit of its own: its client can send it no
+/// more DATA (RFC 9113 §5.1, half-closed remote), so only the connection's
+/// share is owed. Fails with `error.Http2FlowControlError` when a window or
+/// an update would pass `h2.max_window_size`, changing nothing.
 pub fn h2BufferInboundWindowUpdate(self: *Slot, stream_id: ?u32, byte_len: usize) !void {
     if (byte_len == 0)
         return;
@@ -302,11 +315,14 @@ pub fn h2BufferInboundWindowUpdate(self: *Slot, stream_id: ?u32, byte_len: usize
                     const stream_updated = entry.recv_window + @as(i64, increment);
                     if (stream_updated > h2.max_window_size)
                         return error.Http2FlowControlError;
-                    const pending_update = std.math.add(
-                        u32,
-                        entry.pending_recv_window_update,
-                        increment,
-                    ) catch return error.Http2FlowControlError;
+                    const pending_update = if (entry.request_body_complete)
+                        entry.pending_recv_window_update
+                    else
+                        std.math.add(
+                            u32,
+                            entry.pending_recv_window_update,
+                            increment,
+                        ) catch return error.Http2FlowControlError;
                     stream_entry = entry;
                     stream_recv_window = stream_updated;
                     pending_stream_update = pending_update;
@@ -322,6 +338,58 @@ pub fn h2BufferInboundWindowUpdate(self: *Slot, stream_id: ?u32, byte_len: usize
         entry.recv_window = stream_recv_window;
         entry.pending_recv_window_update = pending_stream_update;
     }
+}
+
+/// Whether the connection owes the client receive credit that a
+/// WINDOW_UPDATE has not carried yet.
+pub fn h2HasPendingWindowUpdate(self: *const Slot) bool {
+    if (self.h2_pending_connection_window_update != 0)
+        return true;
+    for (self.stream_ids, 0..) |stream_id, position| {
+        if (stream_id == 0)
+            continue;
+        if (stream_table.streamAt(self, position).pending_recv_window_update != 0)
+            return true;
+    }
+    return false;
+}
+
+/// Whether the credit the connection owes must go out in WINDOW_UPDATE
+/// frames of their own now, rather than behind the next frames the
+/// connection writes anyway (`http2/writing.zig`): the client's view of the
+/// connection's window, or of an open stream's that is owed credit, is at or
+/// below half the window the lane advertised.
+///
+/// The client's view of a window is the lane's own less the credit owed:
+/// A = W - H - U, where W is the advertised window, H the bytes the server
+/// still holds, whose credit it withholds, and U the credit owed and unsent.
+/// While A > W/2 the credit may wait, and once A <= W/2 it goes out: a drive
+/// checks as it starts and after each socket read, and credit owed outside a
+/// drive is checked where it is owed or by the turn its connection gets
+/// (`http2/connection.zig`, `writing.queueDueWindowUpdates`), so waiting
+/// for a write the connection
+/// makes anyway never keeps the client at W/2 or below past the read that
+/// brought it there, and once H alone reaches W/2 every credit goes out as
+/// it is owed. The client's sender stalls only when H reaches W, as it would
+/// with every credit sent at once, and credit is still owed only for bytes
+/// the server no longer holds; only the moment its frame leaves moves.
+pub fn h2WindowUpdateDue(self: *const Slot) bool {
+    const connection_half: i64 = limits.h2.INGRESS_CONNECTION_RECV_WINDOW_BYTES / 2;
+    const stream_half: i64 = limits.h2.INGRESS_STREAM_RECV_WINDOW_BYTES / 2;
+    const connection_owed = self.h2_pending_connection_window_update;
+    if (connection_owed != 0 and self.h2_connection_recv_window - connection_owed <= connection_half)
+        return true;
+    for (self.stream_ids, 0..) |stream_id, position| {
+        if (stream_id == 0)
+            continue;
+        const entry = stream_table.streamAt(self, position);
+        const owed = entry.pending_recv_window_update;
+        if (owed == 0 or entry.request_body_complete)
+            continue;
+        if (entry.recv_window - owed <= stream_half)
+            return true;
+    }
+    return false;
 }
 
 pub fn h2RestoreTakenPendingBodyConnectionCredit(self: *Slot, body: *PendingH2Body) !void {

@@ -93,7 +93,9 @@ pub const Requests = struct {
     active: std.AutoHashMapUnmanaged(u64, *request_context.RequestContext),
     tasks: request_task.RequestTaskTable,
     /// A request's settled handler result, held until its
-    /// `request_completion` work item runs (`request/completion.zig`).
+    /// `request_completion` work item runs, or, for a result that settled in
+    /// the turn that attached its settlers, until that turn returns
+    /// (`request/completion.zig`).
     pending_completions: std.AutoHashMapUnmanaged(u64, request_completion.Completion),
     /// Mapped read-write from `RuntimeOptions.ingress_payload_fd` as the
     /// worker's side (`SharedPayloadSide`).

@@ -22,9 +22,10 @@
 //!   reads that worker; any other completion is counted as stale.
 //! - A pass makes one `io_uring_enter` at most: handlers only prepare
 //!   submissions, and the pass ends by handing them to the kernel without
-//!   waiting when it found work, or with the wait when it found none
-//!   (`event_sources.LaneRing`). Only a pass that fills the submission queue
-//!   enters early.
+//!   waiting when it left work queued that no completion announces (a
+//!   connection's turn, a deferred worker fault), and with the wait
+//!   otherwise (`event_sources.LaneRing`). Only a pass that fills the
+//!   submission queue enters early.
 //! - A pass first renews the lane's egress lease when the manager's current
 //!   gateway is not the one the lease holds (`renewEgressLease`). It waits
 //!   for a completion only after that, and the wait ends the pass, so no
@@ -452,10 +453,12 @@ pub fn Methods(comptime Self: type) type {
         /// changed, prepares the accept's re-arm when it is due, runs the
         /// completions the ring holds and the rest of the pass
         /// (`runQueuedWork`), and ends in its one `io_uring_enter`: a submit
-        /// of what the pass prepared when it found work, so the next pass
-        /// starts at once, or the submit and the wait when it found none. The
-        /// completions the wait brings run in the next pass, after its
-        /// renewal.
+        /// alone while the pass left work queued for the next one, so that
+        /// pass starts at once, and otherwise the submit and the wait. Every
+        /// other input of the lane arrives as a completion, a poll armed on a
+        /// ready descriptor completes inside the submit, and the wait returns
+        /// at once while a completion is pending, so the wait loses nothing.
+        /// The completions it brings run in the next pass, after its renewal.
         fn runPass(self: *Self, ring: *LaneRing, retries: *RingRetries) LaneFault!void {
             self.lane.counters.loop_passes += 1;
             renewEgressLease(self);
@@ -464,12 +467,19 @@ pub fn Methods(comptime Self: type) type {
                 if (self.lane.accept_registration.state == .inactive)
                     try Accept.ensureAcceptArmed(self, ring);
             }
-            var did_work = try drainRingCqes(self, ring, retries);
-            did_work = (try runQueuedWork(self)) or did_work;
+            try drainRingCqes(self, ring, retries);
+            _ = try runQueuedWork(self);
             defer self.lane.counters.ring_enters = ring.enters;
-            if (did_work)
+            if (queuedWorkRemains(self))
                 return ring.submit();
             ring.submitAndWait() catch |err| try retries.note(err);
+        }
+
+        /// Whether the pass left work that no completion will announce: a
+        /// connection queued for a turn after the pass's turns ran, such as
+        /// one a deferred worker fault queued, or a deferred worker fault.
+        fn queuedWorkRemains(self: *const Self) bool {
+            return self.ready_connections.len != 0 or self.deferred_deaths.len != 0;
         }
 
         /// Gives the lane's egress lease the current gateway's generation and
@@ -494,20 +504,16 @@ pub fn Methods(comptime Self: type) type {
         }
 
         /// Takes the completions the ring holds without waiting and runs
-        /// each one's handler. Returns whether it took any. A transient
-        /// failure gives up this turn and is counted (`RingRetries`).
-        fn drainRingCqes(self: *Self, ring: *LaneRing, retries: *RingRetries) LaneFault!bool {
+        /// each one's handler. A transient failure gives up this turn and is
+        /// counted (`RingRetries`).
+        fn drainRingCqes(self: *Self, ring: *LaneRing, retries: *RingRetries) LaneFault!void {
             var cqes: [cqe_batch_max]linux.io_uring_cqe = undefined;
-            const ready = ring.copyCompletions(&cqes) catch |err| {
-                try retries.note(err);
-                return false;
-            };
+            const ready = ring.copyCompletions(&cqes) catch |err| return retries.note(err);
             if (ready == 0)
-                return false;
+                return;
             retries.failures = 0;
             for (cqes[0..ready]) |cqe|
                 try dispatchCqe(self, ring, cqe);
-            return true;
         }
 
         /// Runs the handler a completion names, after the poll bookkeeping:

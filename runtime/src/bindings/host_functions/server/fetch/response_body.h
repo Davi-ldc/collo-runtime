@@ -251,6 +251,16 @@ public:
         return false;
     }
 
+    // A fetch stream is pulled in many reads, so only a body this source delivers in one pull qualifies, and only
+    // before that pull.
+    JSColloBodyOwner* wholeBodyOwner() const override
+    {
+        auto* response = m_response.get();
+        if (!response || m_static_delivered || response->body().source() == BodyState::Source::FetchStream)
+            return nullptr;
+        return response;
+    }
+
     void release() override { m_response.clear(); }
 
     void visitAggregate(JSC::AbstractSlotVisitor& visitor) override { visitor.append(m_response); }

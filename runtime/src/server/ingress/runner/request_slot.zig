@@ -98,8 +98,30 @@ pub const RequestSlot = struct {
     /// The worker response's body chunks that its client has not taken yet,
     /// counted on this lane (`dispatch.zig:responseChunkRetired`).
     response_credit: ipc.response_credit.Window = .{},
-    /// `response_credit.granted` has not reached the worker: its send found
-    /// the control socket full, and the socket's writability poll retries it.
+    /// The last cumulative total that reached the worker, S below; the
+    /// window until the first grant goes out. A grant goes out only when
+    /// `responseCreditDue` says so.
+    ///
+    /// Let R = `response_credit.spent`, the chunks the lane accepted, and
+    /// spent_w the chunks the worker published. A grant is due when it
+    /// raises S and S - R <= window / 2, so a worker that streams gets its
+    /// next grant while it may still hold half the window, and a response of
+    /// fewer than half the window's chunks gets none. Safety: spent_w >= R,
+    /// since the lane accepts only chunks the worker published, so the
+    /// worker's credit S - spent_w is at most S - R; and every total sent is
+    /// window + retired <= window + R <= window + spent_w, which
+    /// `Window.grant` accepts. Liveness: the worker waits only at zero
+    /// credit, spent_w = S. Its S chunks reach the lane in order and each
+    /// retires after the lane accepted it, so the retirement of the last of
+    /// them finds R = S, a credit of 0 <= window / 2 and `granted` =
+    /// window + S > S, and the grant goes out then, no later than a grant
+    /// sent at every retirement would have reached a worker that waits. A
+    /// client that stops reading stops the retirements, which is the
+    /// backpressure the window exists for.
+    response_credit_sent: u64 = ipc.response_credit.window,
+    /// A grant was due and has not reached the worker: its send found the
+    /// control socket full, and the socket's writability poll retries it
+    /// with the newest total.
     response_credit_unsent: bool = false,
     /// Stamped at admission and emitted once, when the slot finishes.
     /// `request_id` 0 means nothing to emit.
@@ -115,6 +137,18 @@ pub const RequestSlot = struct {
 
     pub fn dispatched(self: *const RequestSlot) bool {
         return self.slab_link.live and self.worker != null;
+    }
+
+    /// Whether the worker needs a grant now (`response_credit_sent` proves
+    /// the rule): one would raise the total it holds, and its credit by the
+    /// lane's count is at most half the window.
+    pub fn responseCreditDue(self: *const RequestSlot) bool {
+        const credit = self.response_credit;
+        if (credit.granted <= self.response_credit_sent)
+            return false;
+        // The lane admits chunks up to `granted`, so a worker that sent past
+        // the total it holds has no credit left by this count.
+        return self.response_credit_sent -| credit.spent <= ipc.response_credit.window / 2;
     }
 
     /// The identity every descriptor of the request carries toward its

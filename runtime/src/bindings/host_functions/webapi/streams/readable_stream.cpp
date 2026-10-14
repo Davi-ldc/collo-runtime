@@ -685,6 +685,24 @@ ReadableStreamDrainResult JSColloReadableStream::drainNativeBytes(WTF::Vector<ui
     return exceeds_limit ? ReadableStreamDrainResult::TooLarge : ReadableStreamDrainResult::OutOfMemory;
 }
 
+ReadableStreamNativeSource* JSColloReadableStream::untouchedNativeSource() const
+{
+    if (!m_native_source || m_state != StreamState::Readable)
+        return nullptr;
+    if (m_disturbed || locked() || !queueEmpty() || hasReadRequests() || hasByobReadRequests() || m_native_pulling)
+        return nullptr;
+    return m_native_source.get();
+}
+
+void JSColloReadableStream::finishHostRead(
+    JSC::JSGlobalObject* global_object, JSColloReadableStreamDefaultReader* reader)
+{
+    ASSERT(untouchedNativeSource());
+    lock(global_object->vm(), reader);
+    m_disturbed = true;
+    finishClose(global_object);
+}
+
 // Pulls while reads wait and the source answers at once. A synchronous source fulfills each pending read in the same
 // call, one pull per read; an asynchronous source's promise ends the loop and the NativePull reaction resumes it.
 void JSColloReadableStream::callNativePullIfNeeded(JSC::JSGlobalObject* global_object)

@@ -298,6 +298,170 @@ test "a response's last descriptor and its request_done leave in one packet, so 
     }
 }
 
+/// A thread CPU clock that counts its readings, each a microsecond later.
+fn countCpuRead(ctx: ?*anyopaque) u64 {
+    const reads: *u64 = @ptrCast(@alignCast(ctx.?));
+    reads.* += 1;
+    return reads.* * std.time.ns_per_us;
+}
+
+test "an async handler that reads the body that came with its begin and rewraps its response is answered in one item and one packet" {
+    var vm = try support.createVm();
+    defer vm.deinit();
+
+    const control_pair = try socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
+    defer std.posix.close(control_pair[0]);
+    defer std.posix.close(control_pair[1]);
+
+    var now_mono_ns: u64 = 0;
+    var cpu_reads: u64 = 0;
+    var completion_fixture = try rt.CompletionFixture.init();
+    defer completion_fixture.deinit();
+    var runtime = try worker.Runtime.init(std.testing.allocator, &vm, control_pair[0], &completion_fixture.view, try rt.createCompletionEventfd(), worker.RuntimeOptions{
+        .clock = .{ .ctx = &now_mono_ns, .now_fn = fakeNow },
+        .cpu_clock = .{ .ctx = &cpu_reads, .now_fn = countCpuRead },
+    });
+    defer runtime.deinit();
+    try runtime.attachHostRuntime();
+
+    // Hono's shape: the handler awaits the body, answers JSON, and a
+    // middleware that sets a header afterwards rebuilds the response around
+    // the first one's body stream.
+    const source =
+        \\export default async function handle(request) {
+        \\    const order = await request.json();
+        \\    const inner = new Response(JSON.stringify({ total: order.qty * 2 }), {
+        \\        headers: { "content-type": "application/json" },
+        \\    });
+        \\    await null;
+        \\    const outer = new Response(inner.body, inner);
+        \\    outer.headers.set("x-tenant", "t1");
+        \\    return outer;
+        \\}
+    ;
+    const route_specifier = try rt.routeSpecifier(std.testing.allocator, "/one-item.js");
+    defer std.testing.allocator.free(route_specifier);
+    const route_index = try rt.registerRoute(&runtime, route_specifier, source);
+    const request: rt.RequestParts = .{
+        .method = "POST",
+        .path = "/one-item.js",
+        .headers = &[_]ipc.RequestHeader{
+            .{ .name = "host", .value = "demo.test" },
+            .{ .name = "content-length", .value = "10" },
+        },
+        .body = "{\"qty\":21}",
+    };
+    var dispatch = try rt.initDispatchWork(std.testing.allocator, .{
+        .request_id = 181,
+        .route_index = route_index,
+        .request = request,
+    });
+    defer dispatch.deinit();
+    try rt.enqueueIngressRoute(&runtime, &dispatch, 21, request);
+
+    // The request's own item runs the handler, settles its read of a body
+    // it already holds, takes its settled promise and sends the answer.
+    const reads_before = cpu_reads;
+    try rt.executeQueuedBegin(&runtime);
+    try std.testing.expect(!runtime.requests.active.contains(181));
+    try std.testing.expect(runtime.scheduler.ready_queue.isEmpty());
+    // The window's opening and the finish's fold; closing the window of a
+    // request that ended inside it charges nobody and reads nothing.
+    try std.testing.expectEqual(@as(u64, 2), cpu_reads - reads_before);
+
+    var scratch: [ipc.max_message_bytes]u8 = undefined;
+    var packet = try ipc.recvPacketWithFdsScratch(std.testing.allocator, control_pair[1], &scratch);
+    try std.testing.expect(ipc.ingress_channel.isDescriptorBatchPacket(packet.bytes));
+    var batch = try ipc.ingress_channel.decodeReceivedBatchPacket(std.testing.allocator, &packet);
+    defer batch.deinit();
+    try std.testing.expectEqual(@as(usize, 3), batch.items.len);
+    try std.testing.expectEqual(@intFromEnum(ipc.ingress_channel.Op.response_head), batch.items[0].descriptor.op);
+    try std.testing.expectEqual(@intFromEnum(ipc.ingress_channel.Op.response_chunk), batch.items[1].descriptor.op);
+    try std.testing.expect(batch.items[1].descriptor.hasFlag(ipc.ingress_channel.flags.end_stream));
+    try std.testing.expectEqualStrings("{\"total\":42}", batch.items[1].payload);
+    try std.testing.expectEqual(@intFromEnum(ipc.ingress_channel.Op.request_done), batch.items[2].descriptor.op);
+}
+
+test "a request whose handler turn spent its CPU budget is answered 503 where it would go on with the body it holds" {
+    var vm = try support.createVm();
+    defer vm.deinit();
+
+    const control_pair = try socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
+    defer std.posix.close(control_pair[0]);
+    defer std.posix.close(control_pair[1]);
+
+    var now_mono_ns: u64 = 0;
+    var cpu_reads: u64 = 0;
+    var completion_fixture = try rt.CompletionFixture.init();
+    defer completion_fixture.deinit();
+    // Each clock reading is a microsecond after the last, so the fold after
+    // the handler's turn finds the budget spent.
+    var runtime = try worker.Runtime.init(std.testing.allocator, &vm, control_pair[0], &completion_fixture.view, try rt.createCompletionEventfd(), worker.RuntimeOptions{
+        .clock = .{ .ctx = &now_mono_ns, .now_fn = fakeNow },
+        .cpu_clock = .{ .ctx = &cpu_reads, .now_fn = countCpuRead },
+        .request_cpu_budget_ns = std.time.ns_per_us,
+    });
+    defer runtime.deinit();
+    try runtime.attachHostRuntime();
+
+    // A GET reports whether a POST's continuation ever ran; it answers
+    // synchronously, so no inline boundary stands between it and its answer.
+    const source =
+        \\globalThis.continued = false;
+        \\async function post(request) {
+        \\    const order = await request.json();
+        \\    globalThis.continued = true;
+        \\    return Response.json(order);
+        \\}
+        \\export default function handle(request) {
+        \\    if (request.method === "GET") return new Response(String(globalThis.continued));
+        \\    return post(request);
+        \\}
+    ;
+    const route_specifier = try rt.routeSpecifier(std.testing.allocator, "/inline-budget.js");
+    defer std.testing.allocator.free(route_specifier);
+    const route_index = try rt.registerRoute(&runtime, route_specifier, source);
+    const request: rt.RequestParts = .{
+        .method = "POST",
+        .path = "/inline-budget.js",
+        .headers = &[_]ipc.RequestHeader{
+            .{ .name = "host", .value = "demo.test" },
+            .{ .name = "content-length", .value = "10" },
+        },
+        .body = "{\"qty\":21}",
+    };
+    var dispatch = try rt.initDispatchWork(std.testing.allocator, .{
+        .request_id = 191,
+        .route_index = route_index,
+        .request = request,
+    });
+    defer dispatch.deinit();
+    try rt.enqueueIngressRoute(&runtime, &dispatch, 23, request);
+
+    try rt.executeQueuedBegin(&runtime);
+    try rt.executeUntilRequestDone(&runtime, 191);
+    var response = try rt.readIngressResponse(&runtime, control_pair[1], 191);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 503), response.status);
+    try std.testing.expectEqual(ipc.RequestDoneStatus.cpu_exceeded, response.doneStatus());
+    try std.testing.expect(!std.mem.containsAtLeast(u8, response.body, 1, "qty"));
+
+    // The continuation after `await request.json()` never ran.
+    const probe: rt.RequestParts = .{ .method = "GET", .path = "/inline-budget.js" };
+    var probe_dispatch = try rt.initDispatchWork(std.testing.allocator, .{
+        .request_id = 192,
+        .route_index = route_index,
+        .request = probe,
+    });
+    defer probe_dispatch.deinit();
+    try rt.enqueueIngressRoute(&runtime, &probe_dispatch, 25, probe);
+    try rt.executeQueuedBegin(&runtime);
+    try rt.executeUntilRequestDone(&runtime, 192);
+    var probe_response = try rt.readIngressResponse(&runtime, control_pair[1], 192);
+    defer probe_response.deinit();
+    try std.testing.expectEqualStrings("false", probe_response.body);
+}
+
 test "H2 large route response uses shared payload ring" {
     var vm = try support.createVm();
     defer vm.deinit();

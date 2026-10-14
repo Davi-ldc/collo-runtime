@@ -1,7 +1,8 @@
 // The Response class's JavaScript surface and the ABI calls around it: creating a Response or a body read result from
 // host data, and extracting a handler's result into a ColloExtractedResponse for the host. The cell is JSColloResponse
 // in response_object.h. Extraction copies or shares a native body's bytes, moves a fetch body's identity to the host,
-// and locks a ReadableStream body for the host to read (response_body_stream.cpp). VM thread only; every ABI call
+// and takes a ReadableStream body's whole bytes when nothing touched the stream, or else locks it for the host to read
+// (response_body_stream.cpp). VM thread only; every ABI call
 // takes the JSC lock.
 //
 // A Response that an ABI call creates has immutable headers, as a fetch response has under the Fetch Standard. One
@@ -1060,8 +1061,9 @@ namespace {
             if (status != COLLO_STATUS_OK)
                 return status;
 
-            // Locking the stream comes last, because nothing undoes it.
-            status = extractResponseBodyStream(vm, global_object, scope, response->bodyStream(), out->body);
+            // Taking or locking the stream comes last, because nothing undoes either.
+            status = extractResponseBodyStream(
+                vm, global_object, scope, response->bodyStream(), limits.max_body_bytes, out->body);
             if (status == COLLO_STATUS_JS_EXCEPTION)
                 return statusOr(consumeExceptionStatus(vm, scope, out_exception), COLLO_STATUS_ERROR);
             return status;

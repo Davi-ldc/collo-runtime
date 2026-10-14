@@ -699,6 +699,8 @@ const TestWorker = struct {
 
     pub fn responseChunkRetired(_: *TestWorker, _: RequestKey) fault.LaneFault!void {}
 
+    pub fn grantResponseCredit(_: *TestWorker, _: RequestKey) fault.LaneFault!void {}
+
     pub fn closeRuntimeConnection(self: *TestWorker, runtime: *Slot, close: fault.ConnectionClose) void {
         if (self.close == null)
             self.close = close;
@@ -873,6 +875,8 @@ const BackpressuredTestWorker = struct {
     }
 
     pub fn responseChunkRetired(_: *BackpressuredTestWorker, _: RequestKey) fault.LaneFault!void {}
+
+    pub fn grantResponseCredit(_: *BackpressuredTestWorker, _: RequestKey) fault.LaneFault!void {}
 
     pub fn closeRuntimeConnection(self: *BackpressuredTestWorker, runtime: *Slot, close: fault.ConnectionClose) void {
         if (self.close == null)
@@ -1579,9 +1583,20 @@ test "http2 driver streams POST body and responds after end stream" {
     const received = try readAvailableFd(setup.pair[1], &out);
     try expectResponseHeader(allocator, received, 1, "200", "x-mode", "h2");
     try expectResponseBody(received, 1, "uploaded");
-    // The body's credit returns to the connection. The stream's own window
-    // matters no more once both its request and its response have ended.
-    _ = findWindowUpdateWithIncrement(received, 0, 11) orelse return error.MissingConnectionWindowUpdate;
+    // The stub answered from inside the body's handler, so the response went
+    // out before the body's credit was owed, and the stream is owed nothing
+    // once its request ended. The connection's credit is far from half its
+    // window, so it waits for the next write the connection makes.
+    try std.testing.expect(findWindowUpdateWithIncrement(received, 0, 11) == null);
+    try std.testing.expectEqual(@as(u32, 11), setup.runtime.h2_pending_connection_window_update);
+
+    // A PING's acknowledgement is that write, and the credit rides it.
+    try writeFrameFd(setup.pair[1], .ping, 0, 0, "credit!!");
+    try driveUntilIdle(TestWorker, &worker, &setup.runtime);
+    const after_ping = try readAvailableFd(setup.pair[1], &out);
+    _ = findFrame(after_ping, .ping, 0) orelse return error.MissingPingAck;
+    _ = findWindowUpdateWithIncrement(after_ping, 0, 11) orelse return error.MissingConnectionWindowUpdate;
+    try std.testing.expectEqual(@as(u32, 0), setup.runtime.h2_pending_connection_window_update);
 }
 
 test "http2 a request that expects 100-continue and announces a body gets an interim 100 before its final response" {
@@ -1712,8 +1727,11 @@ test "http2 driver accepts padded priority headers and padded data" {
     var out: [1024]u8 = undefined;
     const received = try readAvailableFd(setup.pair[1], &out);
     try expectResponseBody(received, 1, "padded-ok");
-    // The padding's credit returns with the payload's.
-    _ = findWindowUpdateWithIncrement(received, 0, 6) orelse return error.MissingConnectionWindowUpdate;
+    // The padding's credit is owed with the payload's, behind the response
+    // the stub wrote from inside the body's handler, until a write carries
+    // it.
+    try std.testing.expect(findWindowUpdateWithIncrement(received, 0, 6) == null);
+    try std.testing.expectEqual(@as(u32, 6), setup.runtime.h2_pending_connection_window_update);
 }
 
 test "http2 driver accepts request trailers as body terminator" {
@@ -2519,7 +2537,7 @@ test "http2 a header block the lane's budget cannot hold closes only its own con
     try std.testing.expectEqual(@as(usize, 0), shared_lane.header_blocks.used);
 }
 
-test "http2 driver streams POST body across multiple DATA frames and emits window updates" {
+test "http2 driver streams POST body across multiple DATA frames and owes only the connection's credit once the body ended" {
     const allocator = std.testing.allocator;
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
@@ -2527,7 +2545,12 @@ test "http2 driver streams POST body across multiple DATA frames and emits windo
     defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
+    // The SETTINGS exchange goes out in a drive of its own, so the body's
+    // credit below has no other frame to ride.
     try writeClientPrefaceAndSettings(setup.pair[1]);
+    _ = try drive(TestWorker, &worker, &setup.runtime);
+    var settings_out: [256]u8 = undefined;
+    _ = try readAvailableFd(setup.pair[1], &settings_out);
     try writeHeadersFrameFd(allocator, setup.pair[1], 1, &.{
         .{ .name = ":method", .value = "POST" },
         .{ .name = ":scheme", .value = "https" },
@@ -2547,10 +2570,54 @@ test "http2 driver streams POST body across multiple DATA frames and emits windo
     try std.testing.expect(worker.body_end_stream);
     try std.testing.expectEqual(@as(usize, 1), worker.body_batch_count);
 
+    // The body ended, so its stream can take no more DATA and is owed no
+    // credit, and the connection's waits for a write the connection makes
+    // anyway or for half its window, neither of which came.
     var out: [512]u8 = undefined;
     const received = try readAvailableFd(setup.pair[1], &out);
-    _ = findWindowUpdateWithIncrement(received, 0, 6) orelse return error.MissingConnectionWindowUpdate;
-    _ = findWindowUpdateWithIncrement(received, 1, 6) orelse return error.MissingStreamWindowUpdate;
+    try std.testing.expect(findWindowUpdateWithIncrement(received, 0, 6) == null);
+    try std.testing.expect(findFrame(received, .window_update, 1) == null);
+    try std.testing.expectEqual(@as(u32, 6), setup.runtime.h2_pending_connection_window_update);
+    try std.testing.expectEqual(@as(u32, 0), setup.runtime.h2StreamEntry(1).?.pending_recv_window_update);
+}
+
+test "http2 owed receive credit falls due once the client's view of a stream window reaches half of it" {
+    var runtime = testSlot();
+    defer runtime.deinitProtocolState(std.testing.allocator, &shared_lane.header_blocks);
+    try runtime.h2ReserveStream(1);
+    try runtime.h2SetRequestBodyExpectation(1, .ingress_channel, null, false);
+    const stream_half = limits.h2.INGRESS_STREAM_RECV_WINDOW_BYTES / 2;
+    // The client sees the stream window less what it is owed: one byte
+    // short of half the window, the credit may wait for a write.
+    try runtime.h2ConsumeInboundWindow(1, stream_half - 1);
+    try runtime.h2BufferInboundWindowUpdate(1, stream_half - 1);
+    try std.testing.expect(runtime.h2HasPendingWindowUpdate());
+    try std.testing.expect(!runtime.h2WindowUpdateDue());
+    try runtime.h2ConsumeInboundWindow(1, 1);
+    try runtime.h2BufferInboundWindowUpdate(1, 1);
+    try std.testing.expect(runtime.h2WindowUpdateDue());
+}
+
+test "http2 a stream whose request ended owes no credit of its own, and bytes the server holds bring the connection's due" {
+    var runtime = testSlot();
+    defer runtime.deinitProtocolState(std.testing.allocator, &shared_lane.header_blocks);
+    try runtime.h2ReserveStream(1);
+    try runtime.h2SetRequestBodyExpectation(1, .ingress_channel, null, false);
+    try runtime.h2RecordRequestBodyChunk(1, 4, true);
+    try runtime.h2ConsumeInboundWindow(1, 4);
+    try runtime.h2BufferInboundWindowUpdate(1, 4);
+    try std.testing.expectEqual(@as(u32, 0), runtime.h2StreamEntry(1).?.pending_recv_window_update);
+    try std.testing.expectEqual(@as(u32, 4), runtime.h2_pending_connection_window_update);
+    try std.testing.expect(!runtime.h2WindowUpdateDue());
+    // Two streams' whole windows held, half the connection's window, take
+    // the client's view of it below half once the 4 bytes owed count too.
+    for ([_]u32{ 3, 5 }) |stream_id| {
+        try runtime.h2ReserveStream(stream_id);
+        try runtime.h2SetRequestBodyExpectation(stream_id, .ingress_channel, null, false);
+        try runtime.h2ConsumeInboundWindow(stream_id, limits.h2.INGRESS_STREAM_RECV_WINDOW_BYTES);
+    }
+    comptime std.debug.assert(2 * limits.h2.INGRESS_STREAM_RECV_WINDOW_BYTES == limits.h2.INGRESS_CONNECTION_RECV_WINDOW_BYTES / 2);
+    try std.testing.expect(runtime.h2WindowUpdateDue());
 }
 
 test "http2 driver accepts end-stream delimited POST body without content length" {
@@ -2934,7 +3001,7 @@ test "http2 DATA on a stream the client reset gives the connection's credit back
     try std.testing.expectEqual(@intFromEnum(h2.ErrorCode.stream_closed), readU32(rst.payload[0..4]));
 }
 
-test "http2 DATA on a stream that drains its response is dropped with its connection credit returned and no reset" {
+test "http2 DATA on a stream that drains its response is dropped with its connection credit owed and no reset" {
     // Once its request has left, the stream only sends what is buffered of
     // the response, and a reset would cut that response short.
     const allocator = std.testing.allocator;
@@ -2970,7 +3037,10 @@ test "http2 DATA on a stream that drains its response is dropped with its connec
     try std.testing.expectEqual(@as(?stream_table.H2StreamState, .draining_response), setup.runtime.h2StreamState(1));
     const received = try readAvailableFd(setup.pair[1], &out);
     try std.testing.expect(findFrame(received, .rst_stream, 1) == null);
-    _ = findWindowUpdateWithIncrement(received, 0, 3) orelse return error.MissingConnectionWindowUpdate;
+    // Nothing else was written, and 3 bytes leave the client far above half
+    // its window, so the credit waits for the connection's next write.
+    try std.testing.expect(findWindowUpdateWithIncrement(received, 0, 3) == null);
+    try std.testing.expectEqual(@as(u32, 3), setup.runtime.h2_pending_connection_window_update);
 }
 
 test "http2 a padded DATA frame whose stream goes away between its pieces gives the connection its credit back once" {

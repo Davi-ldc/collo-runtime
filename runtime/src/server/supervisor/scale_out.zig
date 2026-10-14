@@ -1,6 +1,7 @@
 //! The scale-out verdict: whether a definition whose live workers hold every
-//! slot while requests wait gets one worker more, from the CPU the node has
-//! for it (`skills/runtime/references/internals/scheduler.md`, "Scale-out").
+//! slot while requests wait gets one worker more, from the whole idle cores
+//! the node has for it (`skills/runtime/references/internals/scheduler.md`,
+//! "Scale-out").
 //! The launcher thread alone runs it, once per
 //! `scheduler_limits.scale_out.sample_interval_ns` while it watches
 //! a definition (`launcher.zig:Launcher.stepScaleOut`, through
@@ -63,9 +64,6 @@ pub const Thresholds = struct {
     /// The mean share of the interval a definition's workers may wait for a
     /// CPU and still grow, in thousandths.
     stall_permille_max: u32 = scheduler_limits.scale_out.stall_permille_max,
-    /// The mean CPU per worker, in thousandths of a core, from which a
-    /// definition's workers count as CPU-bound.
-    cpu_bound_permille: u32 = scheduler_limits.scale_out.cpu_bound_permille,
 };
 
 /// What one sample measured of a definition's live workers: the means over
@@ -73,7 +71,8 @@ pub const Thresholds = struct {
 pub const DefinitionFigures = struct {
     /// The workers with a figure; with 0 the definition is not weighed.
     workers: u32 = 0,
-    /// CPU per worker, in thousandths of a core.
+    /// CPU per worker, in thousandths of a core. The verdict weighs it in no
+    /// rule; it comes with the reading that gives a worker its figure.
     cpu_permille: u32 = 0,
     /// The share of the interval a worker waited for a CPU, in thousandths.
     stall_permille: u32 = 0,
@@ -88,12 +87,13 @@ pub const Candidate = struct {
 /// Grants at most one launch to each candidate, writing `granted[i]` for
 /// `candidates[i]`. A candidate is weighed only with figures, and only while
 /// its workers wait for a CPU less than `thresholds.stall_permille_max` of
-/// the time. One whose workers use less than `thresholds.cpu_bound_permille`
-/// of a core each is I/O-bound and is granted; one whose workers are
-/// CPU-bound is granted only while a whole idle core is left of
-/// `node_idle_permille`, and takes it. Candidates are weighed from `start`
-/// on, wrapping, so a caller that moves `start` each sample lets each one
-/// come first in turn.
+/// the time; it is granted only while a whole idle core is left of
+/// `node_idle_permille`, and takes it. A worker's low CPU share earns
+/// nothing: one that shares its CPU with the lane feeding it uses under a
+/// core while the CPU has no idle time left, and the server cannot tell
+/// from anything it measures itself whether a worker waits on I/O.
+/// Candidates are weighed from `start` on, wrapping, so a caller that moves
+/// `start` each sample lets each one come first in turn.
 pub fn decide(
     candidates: []const Candidate,
     node_idle_permille: u32,
@@ -109,10 +109,6 @@ pub fn decide(
         const figures = candidates[index].figures;
         if (figures.workers == 0) continue;
         if (figures.stall_permille >= thresholds.stall_permille_max) continue;
-        if (figures.cpu_permille < thresholds.cpu_bound_permille) {
-            granted[index] = true;
-            continue;
-        }
         if (budget_permille < permille_per_core) continue;
         budget_permille -= permille_per_core;
         granted[index] = true;

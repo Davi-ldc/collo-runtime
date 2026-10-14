@@ -37,6 +37,11 @@
 //! - One drive reads the socket at most `reads_per_drive_max` times, so a
 //!   client that keeps its socket full waits for the lane's next pass like
 //!   every other connection.
+//! - A drive reads only while no read poll of the connection is in flight,
+//!   and after a read that left room in the read buffer it arms the poll
+//!   instead of reading again. A one-shot poll armed on a readable socket
+//!   completes at once, so neither rule leaves bytes unread; they only spare
+//!   the reads that would find nothing.
 
 const connection_slot = @import("../runner/connection_slot.zig");
 const event_sources = @import("../runner/event_sources.zig");
@@ -78,9 +83,10 @@ pub const DataFrameChunk = struct {
     window_credit_len: usize,
 };
 
-/// Advances one connection until its socket would block, a write stays
-/// queued, the connection closes or `reads_per_drive_max` reads are made,
-/// and returns whether anything happened. A stream error resets its stream;
+/// Advances one connection until its socket would block or a read leaves
+/// room in the read buffer, a write stays queued, the connection closes or
+/// `reads_per_drive_max` reads are made, and returns whether anything
+/// happened. A connection whose read poll is in flight is not read. A stream error resets its stream;
 /// any other error a client causes asks the lane to close the connection
 /// (`closeRuntimeConnection` on `Worker`). Fails only with a lane fault.
 pub fn drive(comptime Worker: type, worker: *Worker, runtime: *Slot) LaneFault!bool {
@@ -97,26 +103,51 @@ fn driveFrames(comptime Worker: type, worker: *Worker, runtime: *Slot) Http2Fail
     if (!runtime.isOpen() or runtime.h2WritesPending())
         return did_work;
     did_work = (try worker.flushPendingH2RequestBodies(runtime)) or did_work;
-    did_work = (try writing.flushPendingWindowUpdates(Worker, worker, runtime)) or did_work;
+    did_work = (try writing.queueDueWindowUpdates(Worker, worker, runtime)) or did_work;
     did_work = (try writing.flushPendingResponseData(Worker, worker, runtime, null)) or did_work;
 
+    // A read poll in flight reports the socket's next bytes, so a turn the
+    // connection got for its writes or a request's finish reads nothing.
+    if (runtime.registered_wait_events & event_sources.read_interest != 0)
+        return did_work;
     var reads: usize = 0;
     while (runtime.isOpen() and !runtime.h2WritesPending()) : (reads += 1) {
         if (reads == reads_per_drive_max) {
             // Bytes may remain on the socket. The read poll then completes
             // at once and brings the connection back on a later pass.
-            runtime.wait_events = event_sources.read_events;
-            try worker.updateConnectionInterest(runtime);
+            try awaitReadable(Worker, worker, runtime);
             return true;
         }
-        if (!try reading.readAndProcess(Worker, worker, runtime))
-            return did_work;
-        did_work = true;
+        const outcome = try reading.readAndProcess(Worker, worker, runtime);
+        switch (outcome) {
+            .idle => return did_work,
+            .ended, .full, .short => did_work = true,
+        }
         if (runtime.h2WritesPending())
             _ = try writing.flushPendingWrite(Worker, worker, runtime);
-        _ = try writing.flushPendingWindowUpdates(Worker, worker, runtime);
+        _ = try writing.queueDueWindowUpdates(Worker, worker, runtime);
+        switch (outcome) {
+            .idle, .ended, .full => {},
+            // A read that left room in the buffer emptied the socket, so the
+            // read poll stands in for the next read, which would most likely
+            // find nothing; bytes that came since complete it at once.
+            .short => {
+                try awaitReadable(Worker, worker, runtime);
+                return true;
+            },
+        }
     }
     return did_work;
+}
+
+/// Arms the connection's read poll, unless the connection closes or the
+/// socket holds writes back: such a connection is read again only once they
+/// drained.
+fn awaitReadable(comptime Worker: type, worker: *Worker, runtime: *Slot) LaneFault!void {
+    if (!runtime.isOpen() or runtime.h2WritesPending())
+        return;
+    runtime.wait_events = event_sources.read_events;
+    try worker.updateConnectionInterest(runtime);
 }
 
 pub const IoDirection = enum { read, write };

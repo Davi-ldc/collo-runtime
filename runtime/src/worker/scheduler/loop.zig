@@ -8,7 +8,16 @@
 //! item's JavaScript, and one a window took past its budget is answered
 //! after the item (`serve/termination.zig`). The deferred-work pump always
 //! runs under the worker owner. The loop waits in `ppoll`
-//! (`poll_backend.zig`), and after a wait that blocked it does the VM
+//! (`poll_backend.zig`) once nothing is queued, and polls without blocking
+//! before a queued item only when an item ran since its last poll, so the
+//! descriptors are read between any two items and never twice with no work
+//! between the reads. A readiness event of the control socket reads every
+//! packet the socket holds, up to `control_packets_per_wake_max`, before
+//! the loop runs work: a request's item then finds a body that came behind
+//! its begin whole, and a reset that came with its begin ends the request
+//! before any of its JavaScript runs. The read that finds the socket empty
+//! costs one `recvmsg` per readiness event.
+//! After a wait that blocked it does the VM
 //! thread's idle work, the allocator cache release and the collection of a
 //! worker that went quiet (`idle.zig`), whose heap baseline it records
 //! before its first wait.
@@ -31,6 +40,7 @@
 //! (`serve/response.zig:notifyTransport`), and sends the notice.
 
 const std = @import("std");
+const worker_limits = @import("collo_limits").worker;
 const bindings = @import("collo_bindings");
 const ipc = @import("collo_ipc");
 const state = @import("../runtime/root.zig");
@@ -65,6 +75,13 @@ pub fn run(runtime: *state.Runtime) !void {
     if (runtime.scheduler.wakeup_fd) |wakeup_fd|
         try runtime.core.vm.setDeferredWorkWakeupFd(wakeup_fd);
     var deferred_pending_imminent = false;
+    // Whether a work item ran since the loop last polled its descriptors.
+    // Only then can a packet or an eventfd be ready that no poll has seen,
+    // so only then does a tick with queued work poll before its item; a tick
+    // with nothing queued goes straight to the wait, which returns at once
+    // for anything ready. One request served in one item thus costs the one
+    // blocking poll that woke the loop for it.
+    var item_ran_since_poll = true;
     idle.start(runtime);
 
     while (runtime.core.running) {
@@ -108,33 +125,41 @@ pub fn run(runtime: *state.Runtime) !void {
         if (!runtime.core.running)
             break;
 
-        var drained_events: [poll_backend.events_max]poll_backend.Event = undefined;
-        const drained = backend.drain(runtime, &drained_events) catch |err| switch (err) {
-            error.ControlPeerClosed => return,
-            else => return err,
-        };
-        var drained_wakeup = false;
-        for (drained_events[0..drained]) |event| {
-            if (std.meta.activeTag(event) == .wakeup_ready)
-                drained_wakeup = true;
-            handleEvent(runtime, event, &backend.egress_completion_debt) catch |err| switch (err) {
+        // Control packets and gateway completions that arrived during the
+        // last item are read before the next one, so queued work never keeps
+        // a response grant, a reset or a begin waiting more than one item.
+        if (item_ran_since_poll and !runtime.scheduler.ready_queue.isEmpty()) {
+            var drained_events: [poll_backend.events_max]poll_backend.Event = undefined;
+            const drained = backend.drain(runtime, &drained_events) catch |err| switch (err) {
                 error.ControlPeerClosed => return,
                 else => return err,
             };
+            item_ran_since_poll = false;
+            var drained_wakeup = false;
+            for (drained_events[0..drained]) |event| {
+                if (std.meta.activeTag(event) == .wakeup_ready)
+                    drained_wakeup = true;
+                handleEvent(runtime, event, &backend.egress_completion_debt) catch |err| switch (err) {
+                    error.ControlPeerClosed => return,
+                    else => return err,
+                };
+            }
+            if (!runtime.core.running)
+                break;
+            // The deferred-work gate cannot lose a wake only if every drain of
+            // the wakeup eventfd is followed by a pump before the loop blocks
+            // (see `collo_vm_deferred_work_scheduled` in
+            // `bindings/jsc/runtime/vm.cpp`). This tick's pump already ran, so
+            // a wakeup drained here sends the loop back to the top; otherwise
+            // a settle scheduled between the pump and this drain would wait
+            // until some unrelated event.
+            if (drained_wakeup)
+                continue;
         }
-        if (!runtime.core.running)
-            break;
-        // The deferred-work gate cannot lose a wake only if every drain of the
-        // wakeup eventfd is followed by a pump before the loop blocks (see
-        // `collo_vm_deferred_work_scheduled` in `bindings/jsc/runtime/vm.cpp`).
-        // This tick's pump already ran, so a wakeup drained here sends the
-        // loop back to the top; otherwise a settle scheduled between the pump
-        // and this drain would wait until some unrelated event.
-        if (drained_wakeup)
-            continue;
 
         if (runtime.scheduler.ready_queue.pop()) |item| {
             try executeWorkItem(runtime, item);
+            item_ran_since_poll = true;
             continue;
         }
         if (!runtime.core.running)
@@ -155,6 +180,7 @@ pub fn run(runtime: *state.Runtime) !void {
             error.ControlPeerClosed => return,
             else => return err,
         };
+        item_ran_since_poll = false;
         // What was collected matters to tests, not to the loop.
         _ = idle.runDue(runtime, events[0..ready]);
         backend.idle_deadline_ns = 0;
@@ -171,16 +197,21 @@ pub fn run(runtime: *state.Runtime) !void {
     }
 }
 
+/// Control packets one readiness event of the control socket reads at most:
+/// a begin, a body packet, a response grant and a reset for every request
+/// the worker can hold at once. Packets past it keep the socket readable,
+/// so the poll before the next item reads them, and a server that keeps the
+/// socket full holds the loop in its reads for at most this many packets
+/// between two items.
+const control_packets_per_wake_max: usize = 4 * worker_limits.request_task_capacity;
+
 fn handleEvent(
     runtime: *state.Runtime,
     event: poll_backend.Event,
     egress_completion_debt: *bool,
 ) !void {
     switch (event) {
-        .control_ready => collectControlPacket(runtime) catch |err| switch (err) {
-            error.ControlPeerClosed => return error.ControlPeerClosed,
-            else => return err,
-        },
+        .control_ready => try collectControlPackets(runtime),
         .control_writable => try handleControlWritable(runtime),
         .wakeup_ready => {
             runtime.drainWakeup();
@@ -201,6 +232,21 @@ fn handleEvent(
     }
 }
 
+/// Reads the packets the control socket holds, up to
+/// `control_packets_per_wake_max`, and stops at the first read that finds
+/// the socket empty. Every packet the server queued before the loop runs
+/// work is then read before it: a reset is seen before the handler of the
+/// request it ends, and a body before the item that reads it. Fails as
+/// `collectControlPacket` does for anything but an empty socket.
+fn collectControlPackets(runtime: *state.Runtime) !void {
+    for (0..control_packets_per_wake_max) |_| {
+        collectControlPacket(runtime) catch |err| switch (err) {
+            error.WouldBlock => return,
+            else => return err,
+        };
+    }
+}
+
 /// Handles the control socket turning writable: sends the `request_done`
 /// packets that found it full, oldest first, queues the advance of every
 /// response that waited for room in it (`serve/response.zig:notifyTransport`),
@@ -215,21 +261,18 @@ pub fn handleControlWritable(runtime: *state.Runtime) !void {
 }
 
 /// One pass of the loop for a caller that drives the runtime on its own
-/// thread instead of `run`, as a bench does: takes one control packet when
-/// the socket holds one, which may be a response grant, sends the
-/// `request_done` packets that wait, resumes every response that waited for
-/// room in the control socket or the payload ring, collects what became
-/// ready and runs at most one work item. Such a caller polls neither the
-/// socket nor the ring, so each pass retries what waits for them, and a
-/// retry that finds no room waits again. The worker's end of the control
-/// socket must not block, as `zygote/child_boot.zig` leaves it, so a pass
-/// waits on no event. Fails as `collectControlPacket`, the `request_done`
-/// sends and the collectors do.
+/// thread instead of `run`, as a bench does: takes the control packets the
+/// socket holds, as a readiness event does (`collectControlPackets`), among
+/// them response grants, sends the `request_done` packets that wait,
+/// resumes every response that waited for room in the control socket or the
+/// payload ring, collects what became ready and runs at most one work item.
+/// Such a caller polls neither the socket nor the ring, so each pass retries
+/// what waits for them, and a retry that finds no room waits again. The
+/// worker's end of the control socket must not block, as
+/// `zygote/child_boot.zig` leaves it, so a pass waits on no event. Fails as
+/// `collectControlPacket`, the `request_done` sends and the collectors do.
 pub fn runPass(runtime: *state.Runtime) !void {
-    collectControlPacket(runtime) catch |err| switch (err) {
-        error.WouldBlock => {},
-        else => return err,
-    };
+    try collectControlPackets(runtime);
     try response_finish.flushPendingRequestDones(runtime);
     response_flow.notifyTransport(runtime, .socket);
     response_flow.notifyTransport(runtime, .ring);
@@ -272,9 +315,9 @@ fn requestPayloadReaders(
 
 /// Takes one packet from the control socket: the ingress descriptors it
 /// carries join the request queue, and an `egress_attach` attaches the worker
-/// to the session it brings. Call it once each time the read poll reports
-/// input: the worker's end of the socket does not block, so a call that
-/// finds no packet fails with `error.WouldBlock`. Fails with
+/// to the session it brings. The worker's end of the socket does not block,
+/// so a call that finds no packet fails with `error.WouldBlock`, which is how
+/// `collectControlPackets` learns the socket is empty. Fails with
 /// `error.ControlPeerClosed` once the server hangs up, and with the decode's
 /// or the attach's error for a packet the worker cannot take, which ends the
 /// loop.

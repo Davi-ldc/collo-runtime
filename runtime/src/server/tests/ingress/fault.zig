@@ -159,7 +159,7 @@ test "every error the classified callees return today is in their table or is a 
         assertCovered(ErrorsOfCall(@TypeOf(writing.flushPendingWrite(StubLane, stub_lane, stub_slot))), fault.Http2Error, "Http2Error");
         assertCovered(ErrorsOfCall(@TypeOf(writing.queueRstStream(StubLane, stub_lane, stub_slot, 1, .cancel))), fault.Http2Error, "Http2Error");
         assertCovered(ErrorsOfCall(@TypeOf(writing.queueGoawayNoNewStreams(StubLane, stub_lane, stub_slot))), fault.Http2Error, "Http2Error");
-        assertCovered(ErrorsOfCall(@TypeOf(writing.flushPendingWindowUpdates(StubLane, stub_lane, stub_slot))), fault.Http2Error, "Http2Error");
+        assertCovered(ErrorsOfCall(@TypeOf(writing.queueDueWindowUpdates(StubLane, stub_lane, stub_slot))), fault.Http2Error, "Http2Error");
         assertCovered(ErrorsOfCall(@TypeOf(writing.flushPendingResponseData(StubLane, stub_lane, stub_slot, null))), fault.Http2Error, "Http2Error");
         assertCovered(ErrorsOfCall(@TypeOf(writing.queueResponseHead(StubLane, stub_lane, stub_slot, 1, 200, &.{}, true))), fault.Http2Error, "Http2Error");
         assertCovered(ErrorsOfCall(@TypeOf(writing.queueResponseChunk(StubLane, stub_lane, stub_slot, 1, "", true))), fault.Http2Error, "Http2Error");
@@ -813,6 +813,8 @@ const StubLane = struct {
     pub fn closeRuntimeConnection(_: *StubLane, _: *Slot, _: anytype) void {}
 
     pub fn responseChunkRetired(_: *StubLane, _: anytype) error{}!void {}
+
+    pub fn grantResponseCredit(_: *StubLane, _: anytype) error{}!void {}
 
     pub fn startDynamicH2(_: *StubLane, _: *Slot, _: u32, _: *const request_head.ParsedHead) error{}!bool {
         return true;

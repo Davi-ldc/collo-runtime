@@ -2,7 +2,8 @@
 //! the lane's own handlers: `worker_faults.zig`, `lane_commands.zig`,
 //! `lane_connections.zig`, `lane_ring.zig`, `request_deadlines.zig`,
 //! `request_done.zig`, `response_credit.zig`, `early_answers.zig`,
-//! `egress_tokens.zig` and `listener_accept.zig`. Not a suite of its own.
+//! `egress_tokens.zig`, `listener_accept.zig` and `lane_io.zig`. Not a suite
+//! of its own.
 //!
 //! Each lane is a `runner.LaneWorker` over `TestService`, which stands in for
 //! the ingress service: it holds the fixture supervisor and the lanes, posts
@@ -23,7 +24,11 @@
 //! harness runs what the loop runs after the completions of a pass, the
 //! connections the handler queued for a turn and the worker faults it
 //! deferred (`ring_driver.runQueuedWork`), and ends the pass with the ring's
-//! one submit, as the loop does.
+//! one submit, as the loop does. A drive of a connection stands for its read
+//! poll completing and `collect` for its write poll completing, so each
+//! clears that poll's record of being in flight, as the loop's completion
+//! dispatch does; a turn a handler queues (`runConnectionTurn`) clears none,
+//! and a connection whose read poll is in flight is not read then.
 //!
 //! A client connection sits in a lane connection slot already in HTTP/2
 //! state, over a socketpair with no TLS. A stub worker is a real worker handle
@@ -697,10 +702,31 @@ pub const Harness = struct {
     }
 
     /// Runs the handler the lane runs when the connection in `slot` is
-    /// readable.
+    /// readable, as one pass.
     pub fn driveConnection(self: *Harness, lane_index: u16, slot: u32) !void {
         try self.discardPollCompletions(lane_index);
-        try self.lane(lane_index).handleConnectionReadable(slot);
+        try self.handleReadable(lane_index, slot);
+        try self.finishPass(lane_index);
+    }
+
+    /// Runs the handler of the connection's read poll as its completion
+    /// reaches the lane: the poll is no longer in flight
+    /// (`ring_driver.dispatchCqe`), so the drive reads the socket. The
+    /// harness discards the real completions, so it clears the record
+    /// itself.
+    pub fn handleReadable(self: *Harness, lane_index: u16, slot: u32) !void {
+        const lane_runner = self.lane(lane_index);
+        if (lane_runner.connections.get(slot)) |runtime|
+            runtime.registered_wait_events &= ~runner.event_sources.read_interest;
+        try lane_runner.handleConnectionReadable(slot);
+    }
+
+    /// Runs, as one pass, the turn a handler gives the connection in `slot`
+    /// when it queues it (`work_queues.enqueueConnection`), with no poll of
+    /// it completing.
+    pub fn runConnectionTurn(self: *Harness, lane_index: u16, slot: u32) !void {
+        try self.discardPollCompletions(lane_index);
+        runner.work_queues.Methods(Lane).enqueueConnection(self.lane(lane_index), slot);
         try self.finishPass(lane_index);
     }
 
@@ -1332,6 +1358,13 @@ pub const StubWorker = struct {
         return try std.posix.poll(&poll_fds, 0) != 0;
     }
 
+    /// Whether a packet the worker sent waits on the server's end of its
+    /// control socket, unread by its reader lane.
+    pub fn sentUnread(self: *StubWorker) !bool {
+        var poll_fds = [1]std.posix.pollfd{.{ .fd = self.record.handle.control_fd, .events = std.posix.POLL.IN, .revents = 0 }};
+        return try std.posix.poll(&poll_fds, 0) != 0;
+    }
+
     /// Reads every packet waiting on the control socket, each of which must
     /// carry body chunks of `request`, and appends their payloads to
     /// `out[body.len..]`, inline or from the server-to-worker ring. A release
@@ -1663,12 +1696,16 @@ pub const Client = struct {
         try self.harness.driveConnection(self.lane_index, self.slot);
     }
 
-    /// Lets the lane flush what it queued for the client, then reads and
-    /// parses every frame that arrived.
+    /// Lets the lane flush what it queued for the client, as the
+    /// connection's write poll completing does, then reads and parses every
+    /// frame that arrived.
     pub fn collect(self: *Client) !void {
         if (self.open()) {
+            const lane_runner = self.harness.lane(self.lane_index);
             try self.harness.discardPollCompletions(self.lane_index);
-            try self.harness.lane(self.lane_index).handleConnectionWritable(self.slot);
+            if (lane_runner.connections.get(self.slot)) |runtime|
+                runtime.registered_wait_events &= ~runner.event_sources.write_interest;
+            try lane_runner.handleConnectionWritable(self.slot);
             try self.harness.finishPass(self.lane_index);
         }
         try self.receive();

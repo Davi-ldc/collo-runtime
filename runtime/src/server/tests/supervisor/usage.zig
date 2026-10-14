@@ -1,8 +1,9 @@
 //! The server's side of what a dispatched request used: the worker's request
 //! table, which lets a descriptor or a `request_done` through only for a
 //! request in flight under its own key, lets nothing of a request through
-//! once its `request_done` went on, and names the route of a console line's
-//! request; and the usage floor a lane takes for a request it ended without
+//! once its `request_done` went on, counts the requests whose `request_done`
+//! is still to come, and names the route of a console line's request; and
+//! the usage floor a lane takes for a request it ended without
 //! the worker's `request_done`, which reads only the live slot at the
 //! request's pool slot while that slot holds the request, and the running
 //! window only when it names the request. The access line these measures
@@ -89,6 +90,30 @@ test "a descriptor goes on only for a request in flight under its own key, until
     table.end(40);
     table.markDoneForwarded(40, dispatched.request_key);
     try std.testing.expectEqual(request_table.ForwardCheck.absent, table.forwardCheck(40, dispatched.request_key));
+}
+
+test "a request table counts the requests whose request_done the reader has yet to meet, once each" {
+    var table = request_table.RequestTable{};
+    try table.record(fixture.dispatchedRequest(1));
+    try table.record(fixture.dispatchedRequest(2));
+    try table.record(fixture.dispatchedRequest(3));
+    try std.testing.expectEqual(@as(u32, 3), table.awaitingDoneCount());
+
+    // A forwarded `request_done` counts once, however often it is marked,
+    // and the end of its request after it changes nothing more.
+    const forwarded_key = fixture.dispatchedRequest(1).request_key;
+    table.markDoneForwarded(1, forwarded_key);
+    table.markDoneForwarded(1, forwarded_key);
+    try std.testing.expectEqual(@as(u32, 2), table.awaitingDoneCount());
+    table.end(1);
+    try std.testing.expectEqual(@as(u32, 2), table.awaitingDoneCount());
+
+    // A request the lane ends, or removes before its begin left, no longer
+    // counts; an id with no entry changes nothing.
+    table.end(2);
+    table.remove(3);
+    table.end(4);
+    try std.testing.expectEqual(@as(u32, 0), table.awaitingDoneCount());
 }
 
 test "a request id the worker writes as 0 names no entry, free or held" {

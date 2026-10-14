@@ -399,9 +399,11 @@ pub fn Methods(comptime Self: type) type {
         }
 
         /// Sends the body a dispatched stream buffered, as one chunk, and
-        /// returns its flow-control credit to the client once the worker has
-        /// the bytes. A send that would block leaves the bytes where they
-        /// are and says what the request waits for (`send_blocked`).
+        /// owes the client its flow-control credit once the worker has the
+        /// bytes, which a WINDOW_UPDATE carries when it is due or behind the
+        /// connection's next frames (`http2/writing.zig`). A send that would
+        /// block leaves the bytes where they are and says what the request
+        /// waits for (`send_blocked`).
         pub fn flushPendingBody(self: *Self, request_slot: u32) LaneFault!WorkerOutcome {
             const slot = &self.requests.entries[request_slot];
             const runtime = Admission.requestConnection(self, slot) orelse return .ok;
@@ -446,7 +448,7 @@ pub fn Methods(comptime Self: type) type {
                 return err;
             };
             pending.window_credit_len = 0;
-            return http2_writing.flushPendingWindowUpdates(Self, self, runtime);
+            return http2_writing.queueDueWindowUpdates(Self, self, runtime);
         }
 
         /// Sends one body chunk inline, or through the payload ring above

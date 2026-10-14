@@ -2,8 +2,10 @@
 //! `bytes`, `blob` and `formData`). A read parks its promise on the
 //! request's body pipe, and once the body is complete or has failed a
 //! `request_body_ready` work item settles it with a value built from the
-//! buffered bytes, which stay with the request. Runs on the worker's VM
-//! thread.
+//! buffered bytes, which stay with the request. A read the handler's own
+//! call starts on a body already complete settles instead as that call
+//! returns, in the request's `request` item (`settleReadyNow`). Runs on the
+//! worker's VM thread.
 //!
 //! A body is read at most once, and only by the request whose id and
 //! generation the call names. The read's deferred belongs to this file from
@@ -117,7 +119,9 @@ fn schedule(
     waiter_stored = true;
     errdefer request.body.rollbackWaiterForScheduleFailure();
 
-    if (requestBodyReadReady(request)) {
+    // A read the handler's own call starts on a body it already holds is
+    // settled as that call returns (`settleReadyNow`), with no item.
+    if (requestBodyReadReady(request) and !request.handler_call_open) {
         _ = ingress_runtime.queueBodyReady(runtime, request);
     }
     return task_id;
@@ -137,6 +141,27 @@ pub fn executeReady(runtime: anytype, request_id: u64) !void {
     }
     if (!request_ctx.body.isComplete())
         return error.RequestBodyNotComplete;
+    try resolveWaiter(runtime, request_ctx);
+}
+
+/// Settles now, in the caller's window of the request, a read that can
+/// settle. The request's `request` item calls it once the handler's call
+/// returns, so a handler that reads a body it already holds goes on in the
+/// same item instead of waiting a pass of the loop for one of its own; a
+/// read started during that call queued no item (`handler_call_open`), and
+/// one queued otherwise is withdrawn, its slot left to pop as a no-op. Does
+/// nothing when no read can settle. Fails as `executeReady` does.
+pub fn settleReadyNow(runtime: anytype, request_ctx: *request_context.RequestContext) !void {
+    if (!requestBodyReadReady(request_ctx))
+        return;
+    if (request_ctx.body_ready_queued)
+        runtime.withdrawReadyWork(.{ .request_body_ready = request_ctx.exec.request_id });
+    request_ctx.body_ready_queued = false;
+    request_ctx.body_ready_since_ns = 0;
+    if (request_ctx.body.pipe.state == .errored) {
+        try rejectPendingRead(runtime, request_ctx);
+        return;
+    }
     try resolveWaiter(runtime, request_ctx);
 }
 

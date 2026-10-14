@@ -11,7 +11,10 @@
 //! receive a packet only while the worker's forwarding window has room for
 //! its descriptors (`h2_worker_ipc.windowHasRoom`); a full window stops them
 //! until the release that makes room wakes the lane
-//! (`resumeWindowBlockedReaders`).
+//! (`resumeWindowBlockedReaders`). They also stop after a packet that leaves
+//! the worker owing no `request_done` (`RequestTable.awaitingDoneCount`),
+//! instead of a receive that would find the socket empty: the read poll the
+//! drain's caller arms again completes at once for anything sent since.
 //!
 //! A retiring notice takes the worker out of service with no death: the
 //! pool stops handing its slots out, the requests it holds finish on it, and
@@ -94,12 +97,13 @@ pub fn Methods(comptime Self: type) type {
         /// Reads the control socket of the worker that the registration at
         /// `registration_index` reads, until the socket is empty, a bounded
         /// batch was read, or, with `.yield_to_backlog`, a connection the
-        /// responses went to has bytes to write first or the worker's
-        /// forwarding window has no room for another packet. Returns
-        /// `.would_block` once the socket is empty; `.ok` when the drain
-        /// stopped early with packets possibly left, which a re-armed read
-        /// poll finds at once, or, with `window_blocked` set on the
-        /// registration, once the window reopens; `.fault` when the worker
+        /// responses went to has bytes to write first, the worker's
+        /// forwarding window has no room for another packet, or a packet
+        /// left the worker with no request whose `request_done` is still to
+        /// come. Returns `.would_block` once the socket is empty; `.ok` when
+        /// the drain stopped early with packets possibly left, which a
+        /// re-armed read poll finds at once, or, with `window_blocked` set on
+        /// the registration, once the window reopens; `.fault` when the worker
         /// broke the channel's protocol, and the caller runs the death path.
         /// Fails only with the lane's own faults, a registration that does
         /// not read its worker among them.
@@ -122,11 +126,26 @@ pub fn Methods(comptime Self: type) type {
                     .would_block, .fault => return handled.outcome,
                 }
                 switch (pace) {
-                    .yield_to_backlog => if (handled.yield) return .ok,
+                    .yield_to_backlog => {
+                        if (handled.yield)
+                            return .ok;
+                        if (owesNoDescriptor(registration))
+                            return .ok;
+                    },
                     .read_through => {},
                 }
             }
             return .ok;
+        }
+
+        /// Whether the worker of `registration` holds no request whose
+        /// `request_done` this reader has yet to meet, so its socket most
+        /// likely holds nothing more and a receive would only find it empty.
+        /// A packet sent meanwhile completes the read poll the drain's
+        /// caller arms again (`RequestTable.awaitingDoneCount`).
+        fn owesNoDescriptor(registration: *const completions.Registration) bool {
+            const worker = registration.worker orelse return false;
+            return worker.requests.awaitingDoneCount() == 0;
         }
 
         /// Decodes one packet and hands its descriptors on. Consumes `packet`

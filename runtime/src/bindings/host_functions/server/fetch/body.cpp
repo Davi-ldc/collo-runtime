@@ -689,6 +689,13 @@ ColloFetchBodyIdentity JSColloBodyOwner::transferFetchStreamForHostResponse()
     return identity;
 }
 
+void JSColloBodyOwner::markUsedForHost()
+{
+    if (m_body.m_source != BodyState::Source::Empty)
+        m_body.m_used = true;
+    storeOwnedBodyCost();
+}
+
 JSC::JSObject* JSColloBodyOwner::createBodyStream(
     JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, WTF::Ref<ReadableStreamNativeSource>&& source)
 {

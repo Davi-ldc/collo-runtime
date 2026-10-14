@@ -19,6 +19,11 @@
 //! - Body bytes go out only as far as the stream's and the connection's send
 //!   windows allow; the rest waits on its stream, and bytes queued after them
 //!   append behind them.
+//! - Receive credit the connection owes goes out in WINDOW_UPDATE frames of
+//!   their own only once it is due (`Slot.h2WindowUpdateDue`); until then it
+//!   rides at the tail of the next write of the queue (`flushPendingWrite`),
+//!   which every response head and control frame makes, while DATA written
+//!   straight from its buffer carries none.
 
 const std = @import("std");
 
@@ -406,10 +411,11 @@ fn decodeWorkerResponseResetCode(raw: u32) ?h2.ErrorCode {
 }
 
 /// Writes queued bytes until the queue drains or the socket would block, and
-/// returns whether anything happened. A socket that would block arms the
-/// connection's write poll, and one that failed asks the lane to close the
-/// connection. A closing connection writes only while its close flushes the
-/// queue.
+/// returns whether anything happened. The receive credit the connection
+/// owes rides at the tail of the write (`appendOwedCreditToWrite`). A socket
+/// that would block arms the connection's write poll, and one that failed
+/// asks the lane to close the connection. A closing connection writes only
+/// while its close flushes the queue.
 pub fn flushPendingWrite(comptime Worker: type, worker: *Worker, runtime: *Slot) LaneFault!bool {
     if (!runtime.isLive())
         return false;
@@ -417,6 +423,8 @@ pub fn flushPendingWrite(comptime Worker: type, worker: *Worker, runtime: *Slot)
         if (!closing.flush)
             return false;
     }
+    if (runtime.h2WritesPending())
+        try appendOwedCreditToWrite(Worker, worker, runtime);
     var did_work = false;
     while (runtime.h2WritesPending()) {
         const written = writeQueuedSegments(runtime) catch |err|
@@ -510,29 +518,39 @@ pub fn queuePingAck(comptime Worker: type, worker: *Worker, runtime: *Slot, payl
     return queueWriteCopy(Worker, worker, runtime, &scratch);
 }
 
-/// Sends the window updates buffered for consumed request bytes in one
-/// write: one frame for the connection and one for each stream with credit
-/// to return. Does nothing while other writes are queued. A connection that
-/// cannot take the frames is asked to close, and only lane faults return.
-pub fn flushPendingWindowUpdates(
+/// Queues WINDOW_UPDATE frames for the receive credit the connection owes
+/// once that credit is due (`Slot.h2WindowUpdateDue`), and writes what the
+/// socket takes. Credit that is not due waits for the next frames the
+/// connection writes anyway, which carry it at their tail
+/// (`flushPendingWrite`). Nothing is queued while the socket holds other
+/// writes back. A connection that cannot take the frames is asked to close,
+/// and only lane faults return.
+pub fn queueDueWindowUpdates(
     comptime Worker: type,
     worker: *Worker,
     runtime: *Slot,
 ) LaneFault!bool {
-    return queuePendingWindowUpdates(Worker, worker, runtime) catch |err| {
+    if (!runtime.isOpen() or runtime.h2WritesPending())
+        return false;
+    if (!runtime.h2WindowUpdateDue())
+        return false;
+    const queued = appendWindowUpdates(worker.service.allocator, runtime) catch |err| {
         try connection.closeForError(Worker, worker, runtime, err);
         return true;
     };
+    if (!queued)
+        return false;
+    return flushPendingWrite(Worker, worker, runtime);
 }
 
-fn queuePendingWindowUpdates(
-    comptime Worker: type,
-    worker: *Worker,
-    runtime: *Slot,
-) Http2Failure!bool {
-    if (!runtime.isOpen() or runtime.h2WritesPending())
-        return false;
-
+/// Appends a WINDOW_UPDATE for every credit the connection owes to the end
+/// of the write queue, the connection's first, then one per stream, and
+/// clears what they carry. A stream whose request's END_STREAM arrived drops
+/// its own credit instead of sending it (`flow_control.zig`). Returns
+/// whether a frame was queued. A queue without room for the frames fails
+/// with `error.Http2WriteBackpressure`, and a failed allocation with
+/// `error.OutOfMemory`; either keeps the credit owed.
+fn appendWindowUpdates(allocator: std.mem.Allocator, runtime: *Slot) !bool {
     const frame_len = h2.frame_header_len + 4;
     var scratch: [frame_len * (stream_table.max_h2_concurrent_streams + 1)]u8 = undefined;
     var cursor: usize = 0;
@@ -544,20 +562,36 @@ fn queuePendingWindowUpdates(
         if (stream_id == 0)
             continue;
         const entry = stream_table.streamAt(runtime, position);
-        if (entry.pending_recv_window_update == 0)
+        if (entry.pending_recv_window_update == 0 or entry.request_body_complete)
             continue;
         try h2.encodeWindowUpdateFrame(scratch[cursor..][0..frame_len], stream_id, entry.pending_recv_window_update);
         cursor += frame_len;
     }
-    if (cursor == 0)
-        return false;
-    const queued = try queueWriteCopy(Worker, worker, runtime, scratch[0..cursor]);
+    if (cursor != 0)
+        try runtime.h2AppendWriteCopy(allocator, scratch[0..cursor]);
     runtime.h2_pending_connection_window_update = 0;
     for (runtime.stream_ids, 0..) |stream_id, position| {
         if (stream_id != 0)
             stream_table.streamAt(runtime, position).pending_recv_window_update = 0;
     }
-    return queued;
+    return cursor != 0;
+}
+
+/// Appends the credit an open connection owes behind the frames about to be
+/// written, so it rides their write instead of a write of its own. The queue
+/// holds whole frames only, a header block's HEADERS and CONTINUATION frames
+/// as one segment, so the frames never land inside a header block; a closing
+/// connection appends nothing behind its GOAWAY. A queue without room, or an
+/// allocation that fails, leaves the credit owed for a later write or its
+/// due time; credit no frame can carry asks the lane to close the
+/// connection.
+fn appendOwedCreditToWrite(comptime Worker: type, worker: *Worker, runtime: *Slot) LaneFault!void {
+    if (!runtime.isOpen() or !runtime.h2HasPendingWindowUpdate())
+        return;
+    _ = appendWindowUpdates(worker.service.allocator, runtime) catch |err| switch (err) {
+        error.OutOfMemory, error.Http2WriteBackpressure => return,
+        else => |other| return connection.closeForError(Worker, worker, runtime, other),
+    };
 }
 
 /// Sends waiting response bytes that the send windows now admit, for
@@ -788,12 +822,23 @@ fn queueChunkFrameTail(
 
 /// Destroys each chunk whose last byte the client socket took
 /// (`write_queue.zig:ResponseChunk`) and returns its credit to the request
-/// that owned it.
+/// that owned it: every chunk counts first (`responseChunkRetired`), then
+/// each owner gets the grant it needs (`grantResponseCredit`), so the chunks
+/// of one request that left in one write cost the worker one grant.
 fn retireResponseChunks(comptime Worker: type, worker: *Worker, runtime: *Slot) LaneFault!void {
-    while (runtime.h2TakeRetiredResponseChunk()) |chunk| {
+    var retired = runtime.h2TakeRetiredResponseChunks();
+    errdefer while (retired) |chunk| {
+        retired = chunk.next_retired;
+        worker.service.allocator.destroy(chunk);
+    };
+    var counted = retired;
+    while (counted) |chunk| : (counted = chunk.next_retired)
+        try worker.responseChunkRetired(chunk.owner);
+    while (retired) |chunk| {
+        retired = chunk.next_retired;
         const owner = chunk.owner;
         worker.service.allocator.destroy(chunk);
-        try worker.responseChunkRetired(owner);
+        try worker.grantResponseCredit(owner);
     }
 }
 

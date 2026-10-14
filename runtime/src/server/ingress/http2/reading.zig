@@ -77,24 +77,38 @@ const FrameBudget = struct {
     }
 };
 
+/// What one socket read of a drive found (`readAndProcess`).
+pub const ReadOutcome = enum {
+    /// The socket held nothing, and the read poll now waits for it.
+    idle,
+    /// The read failed or met the client's close, and the connection closes.
+    ended,
+    /// The bytes filled the read buffer, so more may wait on the socket.
+    full,
+    /// The bytes did not fill the read buffer: the socket held no more when
+    /// it was read, so another read now would most likely find nothing.
+    short,
+};
+
 /// Reads the socket once into the lane's read buffer and handles every byte
 /// that arrived. The lane's clock is read once per read, and that reading is
 /// when every request head the read completes arrived
-/// (`ParsedHead.received_ns`). Returns false when the socket would block,
-/// which ends the drive's reads.
-pub fn readAndProcess(comptime Worker: type, worker: *Worker, runtime: *Slot) Http2Failure!bool {
+/// (`ParsedHead.received_ns`).
+pub fn readAndProcess(comptime Worker: type, worker: *Worker, runtime: *Slot) Http2Failure!ReadOutcome {
     const buffer = worker.h2_lane.read_buffer;
-    const read_len = readH2Bytes(runtime, buffer) catch |err|
-        return connection.actOnClientIo(Worker, worker, runtime, .read, err);
+    const read_len = readH2Bytes(runtime, buffer) catch |err| {
+        const closes = try connection.actOnClientIo(Worker, worker, runtime, .read, err);
+        return if (closes) .ended else .idle;
+    };
     if (read_len == 0) {
         // The client closed its side of the socket.
         _ = try connection.actOnClientIo(Worker, worker, runtime, .read, error.PeerClosed);
-        return true;
+        return .ended;
     }
     const received_ns = worker.monotonicNowNs();
     runtime.noteProgress(received_ns);
     try processInput(Worker, worker, runtime, buffer[0..read_len], received_ns);
-    return true;
+    return if (read_len < buffer.len) .short else .full;
 }
 
 fn readH2Bytes(runtime: *Slot, buffer: []u8) !usize {
