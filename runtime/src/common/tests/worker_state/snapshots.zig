@@ -1,80 +1,94 @@
-//! The host's snapshots of a worker's page (`common/worker_state/page/snapshots.zig`): a live
-//! slot's raw state compared and never cast, its identity matched on the copy the caller keeps,
-//! the lifecycle tags converted only when their enums name them, the startup-end flag read as
-//! ended only at 1, the owner section's pairs, the
-//! running owner's refused while its sequence is odd, and the usage record ring's
-//! cursor, which keeps the host's tail in host memory, refuses a head no append can produce and
-//! never reloads the head between a peek and its advance. The server's use of them, the death
-//! record and the fault a corrupt ring raises, is covered by the server-supervisor lane.
+//! The host's snapshots of a worker's page (`common/worker_state/page/snapshots.zig`), taken
+//! through its `HostReaderView`: a live slot read at its pool slot, its request id and generation
+//! matched on the copy the caller keeps, the lifecycle tags converted only when their enums name
+//! them, the startup-end flag read as ended only at 1, the owner section's pairs, and the running
+//! owner's refused while its sequence is odd. The server's use of them, the floor of a request the
+//! server ended, is covered by the server-supervisor lane.
 
 const std = @import("std");
 const page = @import("collo_worker_state").page;
-const metrics = @import("collo_worker_state").metrics;
 
-const identity: page.LifecycleIdentity = .{
-    .external_request_id = 41,
-    .request_lane_id = 2,
-    .request_slot = 7,
-    .request_generation = 3,
-    .worker_id = 11,
-    .worker_generation = 5,
+/// A page memfd mapped once by the worker and once by the host.
+const MappedPage = struct {
+    fd: std.posix.fd_t,
+    worker: page.WorkerWriterView,
+    host: page.HostReaderView,
+
+    fn init(self: *MappedPage, name: []const u8) !void {
+        self.fd = try page.createMemfd(name);
+        errdefer std.posix.close(self.fd);
+        self.worker = try page.mapWorkerWriter(self.fd);
+        errdefer self.worker.deinit();
+        self.host = try page.mapHostReader(self.fd);
+    }
+
+    fn deinit(self: *MappedPage) void {
+        self.host.deinit();
+        self.worker.deinit();
+        std.posix.close(self.fd);
+    }
 };
 
-fn claimedSlot(state: u32) page.LiveRequestSlot {
-    var slot = std.mem.zeroes(page.LiveRequestSlot);
-    slot.generation = 1;
-    slot.request_id = identity.external_request_id;
-    slot.request_lane_id = identity.request_lane_id;
-    slot.request_slot = identity.request_slot;
-    slot.request_generation = identity.request_generation;
-    slot.worker_id = identity.worker_id;
-    slot.worker_generation = identity.worker_generation;
-    slot.cpu_ns = 250;
-    slot.state = state;
-    return slot;
+/// Writes a live slot by hand, as a worker that breaks the writers' order
+/// or values could.
+fn writeSlot(view: *page.WorkerWriterView, index: usize, request_id: u64, request_generation: u64, cpu_ns: u64) void {
+    view.page.live_slots[index] = .{
+        .request_id = request_id,
+        .request_generation = request_generation,
+        .cpu_ns = cpu_ns,
+    };
 }
 
-test "a live slot whose state is 2 reads as inactive and matches no identity" {
-    // 2 is outside `LiveSlotState`, where a cast would be illegal behavior.
-    const slots = [_]page.LiveRequestSlot{ claimedSlot(2), claimedSlot(std.math.maxInt(u32)) };
-    for (&slots) |*slot| {
-        const snapshot = page.LiveSlotSnapshot.load(slot);
-        try std.testing.expect(!snapshot.isActive());
-        try std.testing.expect(!snapshot.matches(identity));
+test "a live slot no request was begun on names no request and matches none" {
+    var mapped: MappedPage = undefined;
+    try mapped.init("snapshot-live-slot-untouched");
+    defer mapped.deinit();
+
+    for (0..page.LIVE_SLOT_COUNT) |index| {
+        const snapshot = mapped.host.loadLiveSlot(index);
+        try std.testing.expectEqual(@as(u64, 0), snapshot.request_id);
+        try std.testing.expectEqual(@as(u64, 0), snapshot.request_generation);
+        try std.testing.expectEqual(@as(u64, 0), snapshot.cpu_ns);
+        // The host's request ids are never 0, so even a zero generation
+        // matches nothing here.
+        try std.testing.expect(!snapshot.matches(1, 0));
     }
-    try std.testing.expect(page.LiveSlotSnapshot.find(&slots, identity) == null);
-
-    const active = [_]page.LiveRequestSlot{ claimedSlot(@intFromEnum(page.LiveSlotState.empty)), claimedSlot(@intFromEnum(page.LiveSlotState.active)) };
-    const found = page.LiveSlotSnapshot.find(&active, identity) orelse return error.TestExpectedMatch;
-    try std.testing.expect(found.isActive());
 }
 
-test "a live slot snapshot is matched on every identity field and keeps what it copied" {
-    var slot = claimedSlot(@intFromEnum(page.LiveSlotState.active));
-    const snapshot = page.LiveSlotSnapshot.load(&slot);
-    try std.testing.expect(snapshot.matches(identity));
+test "a live slot matches on its request id and generation alone, as the worker wrote them" {
+    var mapped: MappedPage = undefined;
+    try mapped.init("snapshot-live-slot-identity-only");
+    defer mapped.deinit();
 
-    var other = identity;
-    other.request_generation += 1;
-    try std.testing.expect(!snapshot.matches(other));
-    other = identity;
-    other.worker_generation += 1;
-    try std.testing.expect(!snapshot.matches(other));
-    other = identity;
-    other.request_lane_id += 1;
-    try std.testing.expect(!snapshot.matches(other));
-    other = identity;
-    other.request_slot += 1;
-    try std.testing.expect(!snapshot.matches(other));
-    other = identity;
-    other.worker_id += 1;
-    try std.testing.expect(!snapshot.matches(other));
+    // A worker can write any identity by hand; the copy matches the request
+    // it names, whose record is that worker's own.
+    writeSlot(&mapped.worker, 5, 41, 3, 250);
+    const snapshot = mapped.host.loadLiveSlot(5);
+    try std.testing.expect(snapshot.matches(41, 3));
+    try std.testing.expectEqual(@as(u64, 250), snapshot.cpu_ns);
+    try std.testing.expect(!snapshot.matches(41, 2));
+    try std.testing.expect(!snapshot.matches(42, 3));
+}
+
+test "a live slot snapshot refuses a stale generation or another request id, and keeps what it copied" {
+    var mapped: MappedPage = undefined;
+    try mapped.init("snapshot-live-slot-identity");
+    defer mapped.deinit();
+
+    mapped.worker.beginLiveSlot(7, 41, 3);
+    mapped.worker.storeLiveSlotCpu(7, 41, 250);
+    const snapshot = mapped.host.loadLiveSlot(7);
+    try std.testing.expect(snapshot.matches(41, 3));
+    // Another generation or another request id matches nothing, and neither
+    // does another pool slot.
+    try std.testing.expect(!snapshot.matches(41, 2));
+    try std.testing.expect(!snapshot.matches(41, 4));
+    try std.testing.expect(!snapshot.matches(40, 3));
+    try std.testing.expect(!mapped.host.loadLiveSlot(6).matches(41, 3));
 
     // The worker rewrites the slot after the load; the copy is unchanged.
-    slot.request_id = 999;
-    slot.cpu_ns = 1 << 40;
-    slot.state = @intFromEnum(page.LiveSlotState.empty);
-    try std.testing.expect(snapshot.matches(identity));
+    writeSlot(&mapped.worker, 7, 999, 3, 1 << 40);
+    try std.testing.expect(snapshot.matches(41, 3));
     try std.testing.expectEqual(@as(u64, 250), snapshot.cpu_ns);
 }
 
@@ -96,23 +110,41 @@ test "a lifecycle tag outside its enum reads as null" {
     try std.testing.expect(unknown.knownTerminationReason() == null);
     try std.testing.expectEqual(@as(u32, 7), unknown.termination_reason);
 
+    // 4 names no reason.
+    header.termination_reason = 4;
+    try std.testing.expect(page.LifecycleSnapshot.load(&header).knownTerminationReason() == null);
+
     header.termination_reason = std.math.maxInt(u32);
     try std.testing.expect(page.LifecycleSnapshot.load(&header).knownTerminationReason() == null);
 }
 
 test "the startup-end flag reads as ended at 1 and at no other value" {
-    const fd = try page.createMemfd("startup-completion-snapshot");
-    defer std.posix.close(fd);
-    var view = try page.mapReadWrite(fd);
-    defer view.deinit();
-    view.initializeCrashDefault();
-    try std.testing.expect(!page.LifecycleSnapshot.load(view.header).startupEnded());
-    view.publishStartupEvaluationsEnded();
-    try std.testing.expect(page.LifecycleSnapshot.load(view.header).startupEnded());
+    var mapped: MappedPage = undefined;
+    try mapped.init("startup-completion-snapshot");
+    defer mapped.deinit();
+    try std.testing.expect(!mapped.host.loadLifecycle().startupEnded());
+    mapped.worker.publishStartupEvaluationsEnded();
+    try std.testing.expect(mapped.host.loadLifecycle().startupEnded());
     for ([_]u32{ 0, 2, std.math.maxInt(u32) }) |value| {
-        @atomicStore(u32, &view.header.startup_evaluations_ended, value, .release);
-        try std.testing.expect(!page.LifecycleSnapshot.load(view.header).startupEnded());
+        @atomicStore(u32, &mapped.worker.header.startup_evaluations_ended, value, .release);
+        try std.testing.expect(!mapped.host.loadLifecycle().startupEnded());
     }
+}
+
+test "the host's view reads the owner section the worker publishes" {
+    var mapped: MappedPage = undefined;
+    try mapped.init("owner-sections-through-host-view");
+    defer mapped.deinit();
+
+    try std.testing.expect(mapped.host.loadRunningOwner() == null);
+    mapped.worker.publishOwner(41, 9_000);
+    mapped.worker.publishRunningOwnerCpu(41, 700);
+    const owner = mapped.host.loadOwner();
+    try std.testing.expectEqual(@as(u64, 41), owner.owner_id);
+    try std.testing.expectEqual(@as(u64, 9_000), owner.deadline_mono_ns);
+    const running = mapped.host.loadRunningOwner() orelse return error.TestExpectedRunningOwner;
+    try std.testing.expectEqual(@as(u64, 41), running.owner_id);
+    try std.testing.expectEqual(@as(u64, 700), running.cpu_ns);
 }
 
 test "a running owner load refuses a pair the sentinel is still storing, and a pair that names no owner" {
@@ -149,100 +181,4 @@ test "the owner snapshot keeps the raw id and deadline the page holds" {
     header.owner_deadline_mono_ns = 0;
     try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), owned.owner_id);
     try std.testing.expectEqual(@as(u64, 12_345), owned.deadline_mono_ns);
-}
-
-fn record(request_id: u64) page.CompletedRecord {
-    return .{
-        .request_id = request_id,
-        .cpu_ns = request_id,
-        .status = @intFromEnum(page.CompletedStatus.done),
-    };
-}
-
-test "a head moved back between peek and advance leaves the host's tail where the peek put it, and the next peek refuses the ring" {
-    const fd = try page.createMemfd("snapshots-head-moved-back");
-    defer std.posix.close(fd);
-    var view = try page.mapReadWrite(fd);
-    defer view.deinit();
-    var work_state = metrics.WorkState.init(&view);
-    for (1..4) |request_id|
-        try work_state.appendCompletedRecord(record(request_id));
-
-    var cursor: page.RecordCursor = .{};
-    const peeked = cursor.peek(view.header) orelse return error.TestUnexpectedCorruption;
-    try std.testing.expectEqual(@as(u64, 3), peeked.count);
-    var out: [4]page.CompletedRecord = undefined;
-    try std.testing.expectEqual(@as(usize, 3), peeked.copy(view.completed_records, 0, &out));
-    try std.testing.expectEqual(@as(u64, 3), out[2].request_id);
-
-    // The worker moves its head back before the host consumes what it peeked.
-    @atomicStore(u64, &view.header.records_head, 1, .release);
-    cursor.advance(view.header, peeked, peeked.count);
-    try std.testing.expectEqual(@as(u64, 3), cursor.tail);
-    try std.testing.expectEqual(@as(u64, 3), @atomicLoad(u64, &view.header.records_tail, .acquire));
-
-    try std.testing.expect(cursor.peek(view.header) == null);
-    try std.testing.expect(cursor.drain(view.header, view.completed_records, &out) == null);
-    try std.testing.expectEqual(@as(u64, 3), cursor.tail);
-}
-
-test "a head more than the ring ahead of the host's tail is refused, and a full ring is not" {
-    var header = std.mem.zeroes(page.Header);
-    var cursor: page.RecordCursor = .{ .tail = 40 };
-
-    header.records_head = 40 + page.RECORD_RING_COUNT;
-    const full = cursor.peek(&header) orelse return error.TestUnexpectedCorruption;
-    try std.testing.expectEqual(@as(u64, page.RECORD_RING_COUNT), full.count);
-
-    header.records_head = 40 + page.RECORD_RING_COUNT + 1;
-    try std.testing.expect(cursor.peek(&header) == null);
-    header.records_head = std.math.maxInt(u64);
-    try std.testing.expect(cursor.peek(&header) == null);
-}
-
-test "the host's tail is never read back from the page" {
-    const fd = try page.createMemfd("snapshots-tail-read-back");
-    defer std.posix.close(fd);
-    var view = try page.mapReadWrite(fd);
-    defer view.deinit();
-    var work_state = metrics.WorkState.init(&view);
-    for (1..3) |request_id|
-        try work_state.appendCompletedRecord(record(request_id));
-
-    var cursor: page.RecordCursor = .{};
-    var out: [4]page.CompletedRecord = undefined;
-    try std.testing.expectEqual(@as(usize, 1), cursor.drain(view.header, view.completed_records, out[0..1]).?);
-    try std.testing.expectEqual(@as(u64, 1), out[0].request_id);
-
-    // A worker that rewrites `records_tail` changes only its own room check.
-    @atomicStore(u64, &view.header.records_tail, 0, .release);
-    try std.testing.expectEqual(@as(usize, 1), cursor.drain(view.header, view.completed_records, &out).?);
-    try std.testing.expectEqual(@as(u64, 2), out[0].request_id);
-    try std.testing.expectEqual(@as(u64, 2), @atomicLoad(u64, &view.header.records_tail, .acquire));
-}
-
-test "a peek copies past a skip and across the ring's wrap, and advances by the prefix taken" {
-    var header = std.mem.zeroes(page.Header);
-    const records = try std.testing.allocator.alloc(page.CompletedRecord, page.RECORD_RING_COUNT);
-    defer std.testing.allocator.free(records);
-    @memset(records, std.mem.zeroes(page.CompletedRecord));
-    const start: u64 = page.RECORD_RING_COUNT - 2;
-    for (0..4) |offset| {
-        const position = start + offset;
-        records[@intCast(position % page.RECORD_RING_COUNT)] = record(100 + offset);
-    }
-    header.records_head = start + 4;
-    var cursor: page.RecordCursor = .{ .tail = start };
-
-    const peeked = cursor.peek(&header) orelse return error.TestUnexpectedCorruption;
-    var out: [4]page.CompletedRecord = undefined;
-    try std.testing.expectEqual(@as(usize, 3), peeked.copy(records, 1, &out));
-    try std.testing.expectEqual(@as(u64, 101), out[0].request_id);
-    try std.testing.expectEqual(@as(u64, 103), out[2].request_id);
-    try std.testing.expectEqual(@as(usize, 0), peeked.copy(records, 4, &out));
-
-    cursor.advance(&header, peeked, 2);
-    try std.testing.expectEqual(start + 2, cursor.tail);
-    const rest = cursor.peek(&header) orelse return error.TestUnexpectedCorruption;
-    try std.testing.expectEqual(@as(u64, 2), rest.count);
 }

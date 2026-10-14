@@ -54,6 +54,7 @@ enum {
     COLLO_STATUS_JS_EXCEPTION = 3,
     COLLO_STATUS_UNSUPPORTED = 4,
     COLLO_STATUS_OUT_OF_MEMORY = 5,
+    /* The VM already holds a module pack (collo_module_register_pack). */
     COLLO_STATUS_ALREADY_EXISTS = 6,
     COLLO_STATUS_RESPONSE_BODY_TOO_LARGE = 7,
     COLLO_STATUS_RESPONSE_HEADER_COUNT_TOO_LARGE = 8,
@@ -61,20 +62,17 @@ enum {
     /* Module evaluation reached top-level await: the evaluation promise is
        parked and collo_runtime_module_eval_settled reports its settlement. */
     COLLO_STATUS_PENDING = 10,
-    /* The thing asked for does not exist: a file the fs fault's host does not
-       have, or no further entry of a listing. */
-    COLLO_STATUS_NOT_FOUND = 11,
 };
 
 enum {
+    /* The largest module pack: `max_pack_bytes` in common/ipc/module_pack.zig,
+       which C cannot read, so the two are kept equal by hand and
+       runtime/tests/contracts/abi.zig checks root.zig's mirror against it. */
     COLLO_MODULE_PACK_MAX_BYTES = 16 * 1024 * 1024,
-    /* The largest file an fs fault materializes. It equals
-       `max_fault_file_bytes` in common/limits/fs_fault.zig, as
-       COLLO_MODULE_PACK_MAX_BYTES equals `max_pack_bytes` in
-       common/ipc/module_pack.zig. C cannot read the Zig constants, so each
-       pair is kept equal by hand; runtime/tests/contracts/limits.zig pins how
-       the Zig constants relate. */
-    COLLO_FS_FAULT_MAX_FILE_BYTES = 256 * 1024 * 1024,
+    /* The most modules one pack holds: `max_module_count` in
+       common/ipc/module_pack.zig, kept equal and checked the same way. The
+       bridge refuses a pack that claims more. */
+    COLLO_MODULE_PACK_MAX_MODULES = 4096,
 };
 
 /* The owners a worker's VM can hold tokens for at once, and the request ids
@@ -109,7 +107,6 @@ typedef struct ColloVm ColloVm;
 typedef struct ColloRealm ColloRealm;
 typedef struct ColloValue ColloValue;
 typedef struct ColloPromiseDeferred ColloPromiseDeferred;
-typedef struct ColloCryptoJob ColloCryptoJob;
 typedef struct ColloOwnedByteSegments ColloOwnedByteSegments;
 typedef struct ColloOwnedHeaderBlock ColloOwnedHeaderBlock;
 typedef struct ColloResponseBodyStream ColloResponseBodyStream;
@@ -212,18 +209,6 @@ typedef struct ColloRequestIdentity {
     uint64_t request_id;
     uint64_t request_generation;
 } ColloRequestIdentity;
-
-typedef uint8_t ColloModuleLifetime;
-
-enum {
-    COLLO_MODULE_LIFETIME_EVICTABLE = 0,
-    COLLO_MODULE_LIFETIME_PERMANENT = 1,
-};
-
-typedef struct ColloModuleEvictStats {
-    size_t sources_removed;
-    size_t namespaces_removed;
-} ColloModuleEvictStats;
 
 /* The input of collo_request_new, which builds the Request a handler receives.
    Every pointer is borrowed for the call: the bridge copies each string and
@@ -391,47 +376,6 @@ typedef struct ColloHeapStats {
     uint64_t extra_memory_bytes;
 } ColloHeapStats;
 
-/* The namespace collo_runtime_fs_route sorts a path into
-   (worker/fs/index.zig describes each). */
-typedef uint8_t ColloFsRouteClass;
-
-enum {
-    /* Outside every namespace: ENOENT on a read, EROFS on a mutation. */
-    COLLO_FS_ROUTE_NONE = 0,
-    /* /tmp and below, the writable tmpfs, where node:fs issues real syscalls. */
-    COLLO_FS_ROUTE_TMP = 1,
-    /* A file of the read-only tree, answered from the worker's fs index. */
-    COLLO_FS_ROUTE_DEPLOY_FILE = 2,
-    /* A directory of the read-only tree, or a virtual ancestor of its root. */
-    COLLO_FS_ROUTE_DEPLOY_DIR = 3,
-};
-
-enum {
-    /* A normalized path buffer with its trailing NUL: PATH_MAX, which is
-       `max_normalized_bytes` in worker/fs/index.zig. */
-    COLLO_FS_PATH_BYTES_MAX = 4096,
-    /* The longest name a listing of the tree returns: `path_bytes_max` in
-       common/ipc/fs_index.zig, since a name is part of an index path. */
-    COLLO_FS_NAME_BYTES_MAX = 1024,
-};
-
-/* The cursor that starts a collo_runtime_fs_readdir_next listing. */
-#define COLLO_FS_READDIR_CURSOR_START UINT64_MAX
-
-/* The output of collo_runtime_fs_route. Cleared, it names no namespace. */
-typedef struct ColloFsRoute {
-    /* A DEPLOY_FILE's size from the index; 0 otherwise. */
-    uint64_t size;
-    /* The index's mtime_ms for DEPLOY_FILE and DEPLOY_DIR; 0 otherwise. */
-    uint64_t mtime_ms;
-    /* Bytes of the normalized path before its NUL. */
-    uint32_t normalized_len;
-    /* A ColloFsRouteClass. */
-    uint8_t route_class;
-    uint8_t reserved0;
-    uint16_t reserved1;
-} ColloFsRoute;
-
 COLLO_STATIC_ASSERT(sizeof(ColloMapping) == 16, "ColloMapping ABI size mismatch");
 COLLO_STATIC_ASSERT(offsetof(ColloMapping, ptr) == 0, "ColloMapping.ptr offset mismatch");
 COLLO_STATIC_ASSERT(offsetof(ColloMapping, len) == 8, "ColloMapping.len offset mismatch");
@@ -478,12 +422,6 @@ COLLO_STATIC_ASSERT(sizeof(ColloRequestIdentity) == 16, "ColloRequestIdentity AB
 COLLO_STATIC_ASSERT(offsetof(ColloRequestIdentity, request_id) == 0, "ColloRequestIdentity.request_id offset mismatch");
 COLLO_STATIC_ASSERT(
     offsetof(ColloRequestIdentity, request_generation) == 8, "ColloRequestIdentity.request_generation offset mismatch");
-
-COLLO_STATIC_ASSERT(sizeof(ColloModuleEvictStats) == 16, "ColloModuleEvictStats ABI size mismatch");
-COLLO_STATIC_ASSERT(
-    offsetof(ColloModuleEvictStats, sources_removed) == 0, "ColloModuleEvictStats.sources_removed offset mismatch");
-COLLO_STATIC_ASSERT(offsetof(ColloModuleEvictStats, namespaces_removed) == 8,
-    "ColloModuleEvictStats.namespaces_removed offset mismatch");
 
 COLLO_STATIC_ASSERT(sizeof(ColloRequestInit) == 112, "ColloRequestInit ABI size mismatch");
 COLLO_STATIC_ASSERT(offsetof(ColloRequestInit, method) == 0, "ColloRequestInit.method offset mismatch");
@@ -591,22 +529,14 @@ COLLO_STATIC_ASSERT(offsetof(ColloHeapStats, size_bytes) == 0, "ColloHeapStats.s
 COLLO_STATIC_ASSERT(
     offsetof(ColloHeapStats, extra_memory_bytes) == 8, "ColloHeapStats.extra_memory_bytes offset mismatch");
 
-COLLO_STATIC_ASSERT(sizeof(ColloFsRoute) == 24, "ColloFsRoute ABI size mismatch");
-COLLO_STATIC_ASSERT(offsetof(ColloFsRoute, size) == 0, "ColloFsRoute.size offset mismatch");
-COLLO_STATIC_ASSERT(offsetof(ColloFsRoute, mtime_ms) == 8, "ColloFsRoute.mtime_ms offset mismatch");
-COLLO_STATIC_ASSERT(offsetof(ColloFsRoute, normalized_len) == 16, "ColloFsRoute.normalized_len offset mismatch");
-COLLO_STATIC_ASSERT(offsetof(ColloFsRoute, route_class) == 20, "ColloFsRoute.route_class offset mismatch");
-COLLO_STATIC_ASSERT(offsetof(ColloFsRoute, reserved0) == 21, "ColloFsRoute.reserved0 offset mismatch");
-COLLO_STATIC_ASSERT(offsetof(ColloFsRoute, reserved1) == 22, "ColloFsRoute.reserved1 offset mismatch");
-
 #undef COLLO_STATIC_ASSERT
 
 /* Ends a mapping Zig handed to the bridge; the bridge calls it exactly once per
-   mapping it was given. JSC SourceProviders are thread-safe refcounted, so this
-   runs on whichever thread drops the last reference, not necessarily the VM
-   thread, and possibly while the JSC API lock or a bridge mutex is held; it
-   must not call into the bridge. A mapping with a null ptr maps nothing and is
-   ignored. */
+   mapping it was given. A module pack's mapping ends when the registration and
+   the last module source string over it are gone, so this runs on whichever
+   thread drops the last of them, not necessarily the VM thread, and possibly
+   while the JSC API lock or a bridge mutex is held; it must not call into the
+   bridge. A mapping with a null ptr maps nothing and is ignored. */
 void collo_runtime_mapping_release(ColloMapping mapping);
 /* If value is non-null, runtime consumes it on every call, including non-OK. */
 ColloStatus collo_runtime_complete_request_task(void* runtime, uint32_t slot, uint32_t generation, uint64_t request_id,
@@ -625,11 +555,14 @@ void collo_runtime_response_body_stream_settled(
    duration of the call; the runtime copies what it needs and only enqueues,
    so no JS runs. */
 void collo_runtime_module_eval_settled(void* runtime, uint32_t realm_index, ColloString specifier, uint8_t resolved);
-/* Runtime owns job on OK. On non-OK, caller still owns job, and the status
-   names the cause: COLLO_STATUS_INVALID_ARGUMENT for a call outside an active
-   request turn or an invalid job, COLLO_STATUS_ERROR when the in-flight bound
-   is full, COLLO_STATUS_UNSUPPORTED when the crypto pool is not running. */
-ColloStatus collo_runtime_crypto_job_enqueue(void* runtime, uint64_t request_id, ColloCryptoJob* job);
+/* How long native work the bridge cannot interrupt may still keep the VM
+   thread, in nanoseconds: the least of every live owner's time to its wall
+   deadline and, when the owner whose window is open has a CPU budget, the CPU
+   it has left (worker/runtime/owner.zig:nativeTimeLeftNs). UINT64_MAX when
+   nothing limits the thread, 0 once a limit is spent. WebCrypto asks it
+   before and while it works (bindings/host_functions/webapi/crypto/budget.h).
+   VM thread only; runs no JavaScript. */
+uint64_t collo_runtime_native_time_left_ns(void* runtime);
 /* If deferred is non-null, Zig owns once passed, including non-OK. On OK,
    *out_fetch_id names the fetch for collo_runtime_fetch_cancel, or is 0 when
    Zig refused the fetch and rejected its promise during the call. That promise
@@ -674,66 +607,13 @@ ColloStatus collo_runtime_set_timer(void* runtime, uint64_t request_id, ColloVal
     ColloValue** args, size_t args_len, uint32_t delay_ms, uint8_t repeats, uint64_t* out_timer_id);
 ColloStatus collo_runtime_clear_timeout(void* runtime, uint64_t request_id, uint64_t timer_id);
 /* Runtime consumes callback, this_arg, and each args[i] handle on every call,
-   including non-OK. The args array storage itself is borrowed. */
+   including non-OK. this_arg is the callback's receiver: the globalThis of
+   the realm whose setImmediate scheduled it, as for timers. The args array
+   storage itself is borrowed. */
 ColloStatus collo_runtime_set_immediate(void* runtime, uint64_t request_id, ColloValue* callback, ColloValue* this_arg,
     ColloValue** args, size_t args_len, uint64_t* out_immediate_id);
 ColloStatus collo_runtime_clear_immediate(void* runtime, uint64_t request_id, uint64_t immediate_id);
 
-/* The worker's file tree, which only node:fs (host_functions/node/fs.cpp)
-   calls, on the VM thread. worker/fs/index.zig owns the namespaces and the
-   process-wide index the first three read; worker/fs/fault.zig owns the
-   faults. Paths are UTF-8 borrowed for the call, and every out-parameter is
-   cleared on entry. */
-
-/* Normalizes `path` against the worker's cwd and sorts it into a namespace.
-   On OK, out_path holds the normalized path followed by a NUL, which the
-   binding hands to its syscalls as is, and *out_route is filled. A path that
-   belongs to no namespace is OK with COLLO_FS_ROUTE_NONE. A path whose
-   normalized form needs more than COLLO_FS_PATH_BYTES_MAX - 1 bytes, or a
-   null path with a length, fails with COLLO_STATUS_INVALID_ARGUMENT. A null
-   out-parameter, an out_path_cap below COLLO_FS_PATH_BYTES_MAX or a worker
-   with no index installed fails with COLLO_STATUS_ERROR. */
-ColloStatus collo_runtime_fs_route(ColloString path, uint8_t* out_path, size_t out_path_cap, ColloFsRoute* out_route);
-/* One child of `dir`, the normalized path of a directory collo_runtime_fs_route
-   sorted into COLLO_FS_ROUTE_DEPLOY_DIR, per call. The caller starts *cursor
-   at COLLO_FS_READDIR_CURSOR_START and passes back what each call leaves
-   there. On OK, out_name holds the child's name without a NUL, *out_name_len
-   its length and *out_is_dir whether it is a directory. Past the last child
-   the call fails with COLLO_STATUS_NOT_FOUND. A null argument, a dir that is
-   not such a directory, a cursor this listing never produced, a name longer
-   than out_name_cap or a worker with no index fails with COLLO_STATUS_ERROR.
-   Stateless: the cursor is the listing's whole state. */
-ColloStatus collo_runtime_fs_readdir_next(ColloString dir, uint64_t* cursor, uint8_t* out_name, size_t out_name_cap,
-    uint32_t* out_name_len, uint8_t* out_is_dir);
-/* Where the tmpfs copy of the tree file `path`, a normalized path under the
-   tree's root, lives: on OK, out_path holds it followed by a NUL and *out_len
-   its length without the NUL. In a worker it is `path` itself; the in-process
-   test install copies files elsewhere, which is why a read after a fault asks.
-   Fails with COLLO_STATUS_ERROR for a null argument, a path outside the tree
-   or equal to its root, a buffer too short or a worker with no index. */
-ColloStatus collo_runtime_fs_materialized_path(
-    ColloString path, uint8_t* out_path, size_t out_path_cap, size_t* out_len);
-/* Parks a promise-returning read of the tree file `path`, a normalized path,
-   that has no copy yet, owned by request_id, and on OK names the fault in
-   *out_fault_id. deferred is consumed on every call, including non-OK: Zig
-   settles it on the event loop once the copy exists, resolving with
-   undefined, or releases it unsettled on failure. COLLO_STATUS_INVALID_ARGUMENT
-   for a null runtime, deferred or out_fault_id, request id 0 or an empty path;
-   COLLO_STATUS_ERROR when the fault cannot be scheduled. */
-ColloStatus collo_runtime_fs_fault_read_file(
-    void* runtime, uint64_t request_id, ColloString path, ColloPromiseDeferred* deferred, uint64_t* out_fault_id);
-/* Blocks the VM thread until the tree file `path` is copied into the tmpfs,
-   for a synchronous read; worker/fs/fault_sync.zig bounds the wait. OK once
-   the copy exists; COLLO_STATUS_NOT_FOUND when the host has no such file;
-   COLLO_STATUS_INVALID_ARGUMENT for a null runtime, request id 0 or an empty
-   path; COLLO_STATUS_ERROR for any other failure. */
-ColloStatus collo_runtime_fs_fault_sync(void* runtime, uint64_t request_id, ColloString path);
-/* Records that node:fs read the existing copy of the tree file `path`
-   directly, which keeps the copy from the idle sweep. A null runtime or path
-   records nothing. */
-void collo_runtime_fs_fault_hit_local(void* runtime, ColloString path);
-
-ColloStatus collo_webapi_immediate_mark_destroyed(ColloVm* vm, const ColloValue* value);
 /* Builds a handler's Request in `realm` from init (see ColloRequestInit). A
    VM that is not ready, a zero request id, an empty authority, or a nonzero
    length or count with a null pointer fails with
@@ -775,8 +655,7 @@ ColloStatus collo_response_body_stream_cancel(
 void collo_response_body_stream_destroy(ColloResponseBodyStream* stream);
 void collo_owned_byte_segments_destroy(ColloOwnedByteSegments* owner);
 void collo_owned_header_block_destroy(ColloOwnedHeaderBlock* owner);
-/* Releases the Web API state request_id owns in the VM and in every realm:
-   its blob: URLs, its request-scoped GC roots and its console budget. */
+/* Releases the Web API state request_id owns in the VM: its console budget. */
 ColloStatus collo_webapi_cleanup_request(ColloVm* vm, uint64_t request_id);
 
 /* Creates a fully initialized VM in *out_vm, which the caller owns until
@@ -925,9 +804,13 @@ ColloStatus collo_vm_set_console_sink(ColloVm* vm, ColloConsoleSink sink, void* 
    the ones created later. A route's bindings reach only its handler's `env`
    argument, never `process.env`. Idempotent. */
 ColloStatus collo_vm_install_process(ColloVm* vm);
-/* Workers only: installs and exposes node:fs, on every realm, once the
-   worker is inside its chroot and seccomp confinement. No other VM calls it.
-   Idempotent. */
+/* Workers only: opens node:fs for the whole process, then installs and
+   exposes it on every realm, including the ones created later. Until the
+   first call every node:fs operation in the process fails with EPERM,
+   whether or not the binding is installed, and nothing closes it again. The
+   worker's sandbox is all that confines what node:fs reaches, so call it only
+   once the process is inside its chroot and seccomp filter, as the worker's
+   child boot does after its filter; the zygote never calls it. Idempotent. */
 ColloStatus collo_vm_enable_node_fs_for_worker(ColloVm* vm);
 /* The process-global engine settings below are not scoped to a ColloVm and
    take no API lock; each one says which thread may call it. */
@@ -975,23 +858,29 @@ void collo_clear_memory_status_override(void);
    A null `out` fails with COLLO_STATUS_INVALID_ARGUMENT. Any thread. */
 ColloStatus collo_memory_status(ColloMemoryStatus* out);
 
-/* Modules live in memory only and are registered a pack at a time. A module
-   that no registered pack holds fails to load with an Error that names it. */
-/* Registers the modules of a pack from a mapping of its sealed memfd. The
-   SourceProviders read the mapping in place, so every worker of a definition
-   shares the pack's page cache instead of keeping a private copy.
-   pack is consumed on every call, including non-OK: the bridge validates the
-   bytes in place, then releases the mapping before returning unless a
-   registered module keeps it, in which case the release comes when the last
-   SourceProvider pointing into it dies. The caller must not read pack.ptr
-   after the call. Every module is an ES module; `lifetime` is a
-   ColloModuleLifetime, and any other value fails with
-   COLLO_STATUS_INVALID_ARGUMENT. */
-ColloStatus collo_module_register_pack(ColloVm* vm, ColloMapping pack, ColloModuleLifetime lifetime);
-/* Removes Collo-owned module providers and cached namespaces only. JSC may keep
-   already-fetched/evaluated module records alive until the VM is recycled. */
-ColloStatus collo_module_evict_specifier(ColloVm* vm, ColloString specifier, ColloModuleEvictStats* out_stats);
-ColloStatus collo_module_evict_lifetime(ColloVm* vm, ColloModuleLifetime lifetime, ColloModuleEvictStats* out_stats);
+/* Modules live in memory only, in the one module pack a VM holds at a time
+   (common/ipc/module_pack.zig owns the format). A module that the pack does
+   not hold fails to load with an Error that names it. */
+/* Registers the pack in `pack`, a mapping of its sealed memfd, as the VM's
+   module source. pack is consumed on every call, including non-OK. The
+   bridge checks the header and reads each record through bounds-checked
+   offsets when a module is first fetched, creating its source provider then;
+   a source is wrapped in place as an external string, so every worker of a
+   definition shares the pack's page cache and keeps no private copy. A VM
+   that already holds a pack fails with COLLO_STATUS_ALREADY_EXISTS, a header
+   the format refuses with COLLO_STATUS_INVALID_ARGUMENT, and an allocation
+   with COLLO_STATUS_OUT_OF_MEMORY; on every failure the mapping is released
+   before the call returns. On OK the mapping stays valid at least until
+   collo_module_unregister_pack or collo_vm_destroy, so the caller may keep
+   reading the bytes until then, and the bridge releases it once the
+   registration and the last source string over it are gone. */
+ColloStatus collo_module_register_pack(ColloVm* vm, ColloMapping pack);
+/* Drops the VM's pack, its source providers and every realm's cached module
+   namespaces; a module evaluated from it stays in JSC's module registry. A
+   string a module's source shares, such as a Function.prototype.toString
+   result, keeps the mapping alive until it dies. A null or not ready VM, or
+   one that holds no pack, fails with COLLO_STATUS_INVALID_ARGUMENT. */
+ColloStatus collo_module_unregister_pack(ColloVm* vm);
 /* Imports and evaluates the module `specifier` in `realm`'s registry, once
    per realm: the same specifier in another realm is another module instance
    with its own top-level state. A top-level await that needs the worker's
@@ -1004,19 +893,6 @@ ColloStatus collo_module_evaluate(ColloRealm* realm, ColloString specifier, Coll
    COLLO_STATUS_UNSUPPORTED. */
 ColloStatus collo_module_get_export(ColloRealm* realm, ColloString specifier, ColloString export_name,
     ColloValue** out_value, ColloValue** out_exception);
-
-/* Serializes the bytecode of one ES module, for a module pack's bytecode
-   segment, through a process-wide tooling VM that holds no ColloVm, on any
-   thread. `specifier` is the exact pack specifier the worker's loader
-   registers the module under; jsc/runtime/tooling_bytecode.cpp lists what
-   else must match the loader. On OK, *out_bytes and *out_len hold the blob,
-   which the caller releases with collo_tool_bytecode_release. An empty source
-   or specifier fails with COLLO_STATUS_INVALID_ARGUMENT, a parse or
-   serialization failure with COLLO_STATUS_ERROR and a failed copy with
-   COLLO_STATUS_OUT_OF_MEMORY. */
-ColloStatus collo_tool_generate_module_bytecode(
-    ColloBuffer source_utf8, ColloString specifier_utf8, uint8_t** out_bytes, size_t* out_len);
-void collo_tool_bytecode_release(uint8_t* bytes);
 
 /* Enters a turn owned by exec_ctx. The outermost enter installs it as the
    owner, registers its token and holds the microtask drain; a nested enter
@@ -1083,7 +959,28 @@ ColloStatus collo_vm_pump_deferred_work(
 
 ColloStatus collo_value_retain(ColloValue* value, ColloValue** out_value);
 void collo_value_release(ColloValue* value);
-ColloStatus collo_value_is_callable(ColloVm* vm, const ColloValue* value, uint8_t* out_is_callable);
+
+/* The type of a value as `typeof` names it, except that null has a kind of
+   its own. A callable object, a callable proxy included, is a function and
+   every other object is an object. */
+typedef uint8_t ColloValueKind;
+
+enum {
+    COLLO_VALUE_KIND_UNDEFINED = 0,
+    COLLO_VALUE_KIND_NULL = 1,
+    COLLO_VALUE_KIND_BOOLEAN = 2,
+    COLLO_VALUE_KIND_NUMBER = 3,
+    COLLO_VALUE_KIND_BIGINT = 4,
+    COLLO_VALUE_KIND_STRING = 5,
+    COLLO_VALUE_KIND_SYMBOL = 6,
+    COLLO_VALUE_KIND_OBJECT = 7,
+    COLLO_VALUE_KIND_FUNCTION = 8,
+};
+
+/* Writes the ColloValueKind of `value` to *out_kind, which is cleared on
+   entry. Runs no JavaScript, so no getter or proxy trap observes it; inside
+   or outside a turn. */
+ColloStatus collo_value_kind(ColloVm* vm, const ColloValue* value, ColloValueKind* out_kind);
 /* Whether `value` is an object with a callable `then`. The read runs in the
    object's realm, or in `realm` for an object with none, and a getter it runs
    can throw. A primitive is not thenable. */
@@ -1112,15 +1009,6 @@ void collo_promise_deferred_release(ColloPromiseDeferred* deferred);
    result. */
 ColloStatus collo_request_task_settle_thenable(
     ColloRealm* realm, const ColloRequestCompletionToken* token, const ColloValue* value, ColloValue** out_exception);
-/* Runs the job's native work. A crypto pool thread calls it, off the VM
-   thread, so the job carries only native data; collo_crypto_job_settle later
-   settles its promise on the VM thread. */
-void collo_crypto_job_run(ColloCryptoJob* job);
-/* Consumes job on every call, including non-OK. The result is built in the
-   realm of the job's promise. */
-ColloStatus collo_crypto_job_settle(ColloVm* vm, ColloCryptoJob* job, ColloValue** out_exception);
-/* Must run on the VM thread because jobs may own JSC Strong handles. */
-void collo_crypto_job_destroy(ColloCryptoJob* job);
 ColloStatus collo_json_parse_utf8(
     ColloRealm* realm, ColloString source, ColloValue** out_value, ColloValue** out_exception);
 

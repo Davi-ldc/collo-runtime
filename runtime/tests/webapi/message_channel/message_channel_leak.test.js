@@ -14,8 +14,7 @@ describeLeaks("MessageChannel MessagePort and MessageEvent retention", () => {
         let channel = new MessageChannel();
         channel.port1.onmessage = () => {};
         channel.port2.addEventListener("message", () => {});
-        channel.port1.ref();
-        channel.port1.unref();
+        channel.port2.start();
         channelRefs.push(new WeakRef(channel));
         portRefs.push(new WeakRef(channel.port1));
         portRefs.push(new WeakRef(channel.port2));

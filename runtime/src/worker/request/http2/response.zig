@@ -6,9 +6,12 @@ const std = @import("std");
 const ipc = @import("collo_ipc");
 
 /// Encodes the head and the whole body as two batch entries into
-/// `out_entries`, with the head payload in `scratch`. Returns null when the
-/// body is empty or larger than `small_body_batch_limit`, or when the batch
-/// would not fit `scratch` or one message; the caller then sends the
+/// `out_entries`, with the head payload in `scratch` at its place in a batch
+/// of those two entries, or of three when `with_request_done`, for the
+/// request's `request_done` that follows them
+/// (`ipc.ingress_channel.encodeBatchEndingInRequestDone`). Returns null when
+/// the body is empty or larger than `small_body_batch_limit`, or when the
+/// batch would not fit `scratch` or one message; the caller then sends the
 /// response on the streaming path. The returned entries borrow `scratch`,
 /// `body` and `out_entries`. Fails with `error.MessageTooLarge` only for a
 /// head that no packet can encode.
@@ -20,12 +23,15 @@ pub fn tryEncodeInlineHeadBodyBatch(
     headers: []const ipc.ingress_channel.ResponseHeader,
     body: []const u8,
     small_body_batch_limit: usize,
+    with_request_done: bool,
     out_entries: *[2]ipc.ingress_channel.BatchEntry,
 ) !?[]const ipc.ingress_channel.BatchEntry {
     if (body.len == 0 or body.len > small_body_batch_limit)
         return null;
 
-    const batch_payload_offset = ipc.ingress_channel.batchPayloadOffset(2) catch return null;
+    const entry_count: usize = if (with_request_done) 3 else 2;
+    const trailing_payload_len: usize = if (with_request_done) @sizeOf(ipc.ingress_channel.RequestDonePayload) else 0;
+    const batch_payload_offset = ipc.ingress_channel.batchPayloadOffset(entry_count) catch return null;
     if (scratch.len <= batch_payload_offset)
         return null;
 
@@ -38,7 +44,7 @@ pub fn tryEncodeInlineHeadBodyBatch(
         else => return err,
     };
     const batch_len = std.math.add(usize, batch_payload_offset, head_payload.len) catch return error.MessageTooLarge;
-    const total_len = std.math.add(usize, batch_len, body.len) catch return error.MessageTooLarge;
+    const total_len = std.math.add(usize, batch_len, body.len + trailing_payload_len) catch return error.MessageTooLarge;
     if (total_len > scratch.len or total_len > ipc.max_message_bytes)
         return null;
 

@@ -1,18 +1,18 @@
 //! The types a worker runtime is built from: the options the worker boot
-//! hands `Runtime.init`, the per-worker limits WorkerInit carries, the
-//! injectable clocks, and a route's evaluated module. Plain data; the runtime
-//! built from them runs on the worker's VM thread.
+//! hands `Runtime.init`, the limits it sizes its tables from, the injectable
+//! clocks, and a route's evaluated module. Plain data; the runtime built
+//! from them runs on the worker's VM thread.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const ipc = @import("collo_ipc");
+const worker_limits = @import("collo_limits").worker;
 const process = @import("collo_os").process;
 const js_value = @import("collo_worker_js").value;
 
-/// A route whose module evaluated: its default export and the `env` object
-/// every request of the route receives with it.
+/// A route whose module evaluated: its handler and the `env` object every
+/// request of the route receives with it.
 pub const RouteModule = struct {
-    handler: js_value.JsFunctionOwned,
+    handler: RouteHandler,
     env: js_value.JsObjectOwned,
 
     pub fn deinit(self: *RouteModule) void {
@@ -22,83 +22,33 @@ pub const RouteModule = struct {
     }
 };
 
-/// `ipc.WorkerRuntimeBootOptions`, which WorkerInit carries, is where the
-/// limit defaults are set; this file only widens them to usize. The crypto
-/// pool's stack is no limit: it is a property of the binary, which
-/// `runtime/crypto.zig` takes from `common/limits/worker.zig`.
-const wire_defaults = ipc.WorkerRuntimeBootOptions{};
+/// The function a route calls for each request and the `this` it calls it
+/// with, both read from the default export once, when the route's module
+/// settles (`worker/modules/routes.zig`), and rooted for the worker's life,
+/// so a later change to the default export never changes them.
+pub const RouteHandler = struct {
+    function: js_value.JsFunctionOwned,
+    /// The default export when the handler is its `fetch`; null when the
+    /// default export is itself the handler, which is then called with
+    /// `this` undefined.
+    receiver: ?js_value.JsObjectOwned,
 
-pub const RuntimeLimits = struct {
-    pub const max_crypto_thread_count: usize =
-        ipc.WorkerRuntimeBootOptions.max_crypto_thread_count;
-    pub const default_crypto_thread_count: usize =
-        ipc.WorkerRuntimeBootOptions.default_crypto_thread_count;
-    pub const default_crypto_max_in_flight_per_request: usize =
-        ipc.WorkerRuntimeBootOptions.default_crypto_max_in_flight_per_request;
-
-    /// Fetches one request may start, finished ones included; never above the
-    /// fetch budget of the request's egress token
-    /// (`runtime/tests/contracts/limits.zig`).
-    max_fetches_per_request: usize = wire_defaults.max_fetches_per_request,
-    /// Fetches the worker may have in flight at once.
-    max_fetches_per_worker: usize = wire_defaults.max_fetches_per_worker,
-    max_timers_per_worker: usize = wire_defaults.max_timers_per_worker,
-    ready_queue_capacity: usize = wire_defaults.ready_queue_capacity,
-    request_task_capacity: usize = wire_defaults.request_task_capacity,
-    /// `default_crypto_thread_count` pool threads let concurrent requests make
-    /// WebCrypto progress while keeping CPU ownership predictable for the JS
-    /// event loop.
-    crypto_thread_count: usize = default_crypto_thread_count,
-    crypto_max_in_flight_per_request: usize = default_crypto_max_in_flight_per_request,
-    /// 0 derives the worker's cap as `request_task_capacity` times
-    /// `crypto_max_in_flight_per_request` (`resolveAutoRuntimeLimits`), the
-    /// product the wire default already holds. The policy is then set by the
-    /// thread count and the per-request cap alone.
-    crypto_max_in_flight_per_worker: usize = 0,
+    pub fn deinit(self: *RouteHandler) void {
+        self.function.deinit();
+        if (self.receiver) |*receiver|
+            receiver.deinit();
+        self.* = undefined;
+    }
 };
 
-/// Replaces each zero crypto limit with its default and a zero
-/// `crypto_max_in_flight_per_worker` with the derived cap, and caps
-/// `crypto_thread_count` at `max_crypto_thread_count`
-/// (`resolveCryptoThreadCount`); the other limits pass through.
-pub fn resolveAutoRuntimeLimits(base: RuntimeLimits) RuntimeLimits {
-    var limits = base;
-    limits.crypto_thread_count = resolveCryptoThreadCount(limits.crypto_thread_count);
-    if (limits.crypto_max_in_flight_per_request == 0) {
-        limits.crypto_max_in_flight_per_request =
-            RuntimeLimits.default_crypto_max_in_flight_per_request;
-    }
-    if (limits.crypto_max_in_flight_per_worker == 0) {
-        std.debug.assert(limits.request_task_capacity > 0);
-        std.debug.assert(limits.crypto_max_in_flight_per_request > 0);
-        const wire = ipc.WorkerRuntimeBootOptions{
-            .request_task_capacity = limits.request_task_capacity,
-            .crypto_max_in_flight_per_request = limits.crypto_max_in_flight_per_request,
-        };
-        limits.crypto_max_in_flight_per_worker = std.math.cast(
-            usize,
-            wire.deriveCryptoMaxInFlightPerWorker(),
-        ) orelse std.math.maxInt(usize);
-    }
-    return limits;
-}
-
-/// 0 selects `default_crypto_thread_count`; any other value is capped at
-/// `max_crypto_thread_count`.
-pub fn resolveCryptoThreadCount(value: usize) usize {
-    if (value != 0)
-        return @min(value, RuntimeLimits.max_crypto_thread_count);
-    return RuntimeLimits.default_crypto_thread_count;
-}
-
-pub const WorkerSchedulerMetrics = struct {
-    worker_loop_ticks: u64 = 0,
-    worker_ring_arm_calls: u64 = 0,
-    worker_ring_sqe_submits: u64 = 0,
-    worker_ring_submit_syscalls: u64 = 0,
-    worker_ring_cqes: u64 = 0,
-    timeout_rearms: u64 = 0,
-    timeout_cancels: u64 = 0,
+/// The capacities the runtime sizes its tables from. Every worker gets the
+/// constants of `common/limits/worker.zig`, which are the defaults here; a
+/// test sets smaller ones to reach a full table. The fetch caps are no
+/// field: the egress files read them from `common/limits/worker.zig`.
+pub const RuntimeLimits = struct {
+    max_timers_per_worker: usize = worker_limits.timers_per_worker_max,
+    ready_queue_capacity: usize = worker_limits.ready_queue_capacity,
+    request_task_capacity: usize = worker_limits.request_task_capacity,
 };
 
 /// A clock in nanoseconds the runtime reads. `monotonic` reads
@@ -139,7 +89,6 @@ pub const RuntimeOptions = struct {
     cpu_clock: Clock = Clock.threadCpu(),
     limits: RuntimeLimits = .{},
     memory_events_fd: ?std.posix.fd_t = null,
-    trace_fd: ?std.posix.fd_t = null,
     /// Borrowed memfd; `Runtime.init` maps it and does not close it.
     ingress_payload_fd: ?std.posix.fd_t = null,
     /// Owned eventfd; `Runtime.init` closes it on failure or runtime teardown.
@@ -148,10 +97,6 @@ pub const RuntimeOptions = struct {
     /// check out; null or empty for a worker whose definition grants no
     /// network access (`egress/state.zig:State.grant`).
     egress_shared_fds: ?*ipc.egress_shared.RawFds = null,
-    /// The route table of the worker's definition (`common/ipc/route_table.zig`),
-    /// borrowed for the runtime's whole life, since every route's bindings
-    /// point into it; the default holds no route.
-    route_table: []const u8 = &ipc.route_table.empty_blob,
     /// Each route but the first runs in a realm of its own
     /// (`WorkerInit.flag_isolate_realm`); false runs every route in the VM's
     /// main realm.
@@ -167,8 +112,6 @@ pub const RuntimeOptions = struct {
     /// The wall-clock limit of each stretch of JavaScript the worker owner
     /// runs, `WorkerInit.unowned_time_limit_ns`; never 0.
     unowned_time_limit_ns: u64 = ipc.WorkerInit.default_unowned_time_limit_ns,
-    trace_requests: bool = false,
-    trace_all_requests: bool = false,
     /// Gives the first handler call the benchmark marker
     /// `__colloBenchHandlerEntered` (`invokeWithTiming` in `js/jsc/turn.zig`),
     /// which a fixture calls as its first statement, and publishes the
@@ -176,7 +119,6 @@ pub const RuntimeOptions = struct {
     /// (`publishBenchHandler`), 0 when the marker never ran. Later calls get
     /// no marker.
     bench_handler: bool = false,
-    log_full_js_exceptions: bool = builtin.mode == .Debug,
 };
 
 /// Builds `RuntimeOptions` from what `Runtime.init` received: the struct

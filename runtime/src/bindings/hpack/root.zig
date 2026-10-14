@@ -1,121 +1,54 @@
-//! HPACK ABI wrapper around the patched ls-hpack encoder/decoder.
+//! HPACK encoder and decoder over the patched ls-hpack shim (`shim.c`).
+//!
+//! A `Decoder` or `Encoder` holds its ls-hpack handle and its table capacity
+//! state, nothing else. Every decode, skip and encode takes the caller's
+//! scratch: the server keeps one per ingress lane and the egress client one
+//! per engine shard, since one thread codes one block at a time for every
+//! connection it serves. A decode or a skip leaves nothing in the scratch
+//! that the caller needs, while the block `Encoder.encodeHeaders` returns
+//! lives in the scratch until the caller's next use of it.
+//!
+//! An encoder's output for a list of fields never exceeds the sum of
+//! `encodedFieldBytesMax` over them plus `table_size_updates_bytes_max`,
+//! whatever its dynamic table holds. A caller that must refuse a list
+//! before any connection's encoder sees it checks that bound.
 
 const std = @import("std");
 
-pub const RawDecoder = opaque {};
-pub const RawEncoder = opaque {};
+const RawDecoder = opaque {};
+const RawEncoder = opaque {};
 
 /// Hard memory cap for HPACK dynamic tables. Peers may advertise a larger
 /// SETTINGS_HEADER_TABLE_SIZE, but using less table capacity is always valid.
 pub const max_dynamic_table_capacity: u32 = 4096;
 
-pub const RawDecodedHeader = extern struct {
+/// The longest name or value one decoded field may have, and so the length
+/// of every decode scratch (`Decoder.decodeBlock`, `Decoder.skipBlock`).
+pub const max_single_header_decode_bytes: usize = 64 * 1024 - 1;
+
+/// One field, as HTTP/1 and HTTP/2 code across the runtime spell it.
+pub const Header = @import("collo_http").Header;
+
+/// The most bytes an encoder writes for `header`: a literal whose name is a
+/// literal too, neither string Huffman-coded. The shim keeps a Huffman
+/// string only when it is no longer than the raw one, and an indexed form is
+/// never longer than the literal it replaces. Saturates rather than
+/// overflowing.
+pub fn encodedFieldBytesMax(header: Header) usize {
+    return 1 +| encodedStringBytesMax(header.name.len) +| encodedStringBytesMax(header.value.len);
+}
+
+/// The most bytes the dynamic table size updates an encoder owes its peer
+/// add before a block's first field (RFC 7541 §4.2): the lowest capacity
+/// since the last block, then the current one, each at most
+/// `max_dynamic_table_capacity`.
+pub const table_size_updates_bytes_max: usize = 2 * hpackIntegerEncodedLen(5, max_dynamic_table_capacity);
+
+const RawDecodedHeader = extern struct {
     name_offset: u32,
     name_len: u32,
     value_offset: u32,
     value_len: u32,
-};
-
-const RawPreparedHeader = extern struct {
-    storage_offset: u32,
-    name_hash: u32,
-    name_value_hash: u32,
-    name_len: u16,
-    value_len: u16,
-    static_index: u8,
-    flags: u8,
-    reserved: u16,
-};
-
-comptime {
-    std.debug.assert(@sizeOf(RawPreparedHeader) == 20);
-    std.debug.assert(@offsetOf(RawPreparedHeader, "storage_offset") == 0);
-    std.debug.assert(@offsetOf(RawPreparedHeader, "name_hash") == 4);
-    std.debug.assert(@offsetOf(RawPreparedHeader, "name_value_hash") == 8);
-    std.debug.assert(@offsetOf(RawPreparedHeader, "name_len") == 12);
-    std.debug.assert(@offsetOf(RawPreparedHeader, "value_len") == 14);
-    std.debug.assert(@offsetOf(RawPreparedHeader, "static_index") == 16);
-    std.debug.assert(@offsetOf(RawPreparedHeader, "flags") == 17);
-    std.debug.assert(@offsetOf(RawPreparedHeader, "reserved") == 18);
-}
-
-pub const Header = struct {
-    name: []const u8,
-    value: []const u8,
-};
-
-pub const PreparedHeaders = struct {
-    storage: []u8 = &.{},
-    headers: []RawPreparedHeader = &.{},
-    encoded_bytes_max: usize = 0,
-
-    pub fn init(
-        allocator: std.mem.Allocator,
-        source: []const Header,
-    ) !PreparedHeaders {
-        if (source.len == 0)
-            return .{};
-
-        var storage_len: usize = 0;
-        var encoded_bytes_max: usize = 0;
-        for (source) |header| {
-            if (header.name.len > max_single_header_decode_bytes)
-                return error.HpackHeaderListTooLarge;
-            if (header.value.len > max_single_header_decode_bytes)
-                return error.HpackHeaderListTooLarge;
-            const header_storage_len = std.math.add(
-                usize,
-                header.name.len,
-                header.value.len,
-            ) catch return error.HpackHeaderListTooLarge;
-            storage_len = std.math.add(
-                usize,
-                storage_len,
-                header_storage_len,
-            ) catch return error.HpackHeaderListTooLarge;
-            if (storage_len > std.math.maxInt(u32))
-                return error.HpackHeaderListTooLarge;
-            encoded_bytes_max = std.math.add(
-                usize,
-                encoded_bytes_max,
-                try encodedHeaderUpperBound(header),
-            ) catch return error.HpackHeaderListTooLarge;
-        }
-
-        const prepared_headers = try allocator.alloc(RawPreparedHeader, source.len);
-        errdefer allocator.free(prepared_headers);
-        const storage = try allocator.alloc(u8, storage_len);
-        errdefer allocator.free(storage);
-
-        var storage_offset: usize = 0;
-        for (source, prepared_headers) |header, *prepared| {
-            try statusToError(collo_hpack_prepare_header(
-                prepared,
-                storage.ptr,
-                storage.len,
-                @intCast(storage_offset),
-                @ptrCast(header.name.ptr),
-                header.name.len,
-                @ptrCast(header.value.ptr),
-                header.value.len,
-            ));
-            storage_offset += header.name.len + header.value.len;
-        }
-        std.debug.assert(storage_offset == storage.len);
-        return .{
-            .storage = storage,
-            .headers = prepared_headers,
-            .encoded_bytes_max = encoded_bytes_max,
-        };
-    }
-
-    pub fn deinit(self: *PreparedHeaders, allocator: std.mem.Allocator) void {
-        if (self.headers.len != 0)
-            allocator.free(self.headers);
-        if (self.storage.len != 0)
-            allocator.free(self.storage);
-        self.* = .{};
-    }
 };
 
 const DecodedHeaderOffset = struct {
@@ -125,6 +58,8 @@ const DecodedHeaderOffset = struct {
     value_len: usize,
 };
 
+/// A decoded block: `headers` slice into `storage`, both allocated with the
+/// allocator `Decoder.decodeBlock` took, and freed together by `deinit`.
 pub const DecodedBlock = struct {
     storage: []u8 = &.{},
     headers: []Header = &.{},
@@ -136,30 +71,8 @@ pub const DecodedBlock = struct {
     }
 };
 
-pub const EncodedBlock = struct {
-    storage: []u8 = &.{},
-    len: usize = 0,
-
-    pub fn bytes(self: EncodedBlock) []const u8 {
-        return self.storage[0..self.len];
-    }
-
-    pub fn deinit(self: *EncodedBlock, allocator: std.mem.Allocator) void {
-        allocator.free(self.storage);
-        self.* = .{};
-    }
-};
-
 pub const Decoder = struct {
     handle: ?*RawDecoder = null,
-    /// Decode scratch reused across decodeBlock calls so each HEADERS frame
-    /// does not pay a 64KiB allocate/free round trip. First-allocator-wins:
-    /// the buffer is allocated lazily with the allocator of the first
-    /// decodeBlock call and freed in deinit. Callers pass one stable
-    /// per-connection runtime allocator, so later calls assert the same
-    /// allocator vtable instead of reallocating.
-    scratch: []u8 = &.{},
-    scratch_allocator: ?std.mem.Allocator = null,
 
     pub fn init() !Decoder {
         var self = Decoder{};
@@ -172,15 +85,9 @@ pub const Decoder = struct {
             collo_hpack_decoder_free(handle);
             self.handle = null;
         }
-        if (self.scratch_allocator) |scratch_allocator| {
-            scratch_allocator.free(self.scratch);
-            self.scratch = &.{};
-            self.scratch_allocator = null;
-        }
-        std.debug.assert(self.scratch.len == 0);
     }
 
-    pub fn ensureInitialized(self: *Decoder) !void {
+    fn ensureInitialized(self: *Decoder) !void {
         if (self.handle != null)
             return;
         var raw: ?*RawDecoder = null;
@@ -194,25 +101,17 @@ pub const Decoder = struct {
         collo_hpack_decoder_set_max_capacity(self.handle.?, clampDynamicTableCapacity(capacity));
     }
 
+    /// Decodes `block` into one allocation of `allocator` for the field bytes
+    /// and one for the field list; the caller owns both through the result.
+    /// `scratch` holds the field being decoded and must be
+    /// `max_single_header_decode_bytes` long.
+    ///
+    /// A list over `max_header_count` fields or `max_header_bytes` bytes is
+    /// decoded to its end, so the dynamic table stays in step, and then
+    /// fails with `HpackHeaderListTooLarge`. Every other error
+    /// (`HpackBadData`, `HpackOutputTooSmall`, the shim's) leaves the table
+    /// out of step, so the caller fails the connection on it.
     pub fn decodeBlock(
-        self: *Decoder,
-        allocator: std.mem.Allocator,
-        block: []const u8,
-        max_header_count: usize,
-        max_header_bytes: usize,
-    ) !DecodedBlock {
-        try self.ensureInitialized();
-        if (block.len == 0)
-            return .{};
-        return self.decodeBlockScratch(allocator, try self.ensureScratch(allocator), block, max_header_count, max_header_bytes);
-    }
-
-    /// `decodeBlock` with the caller's room for the field being decoded,
-    /// `max_single_header_decode_bytes` long, instead of the decoder's own:
-    /// for a caller that decodes many connections' blocks one at a time and
-    /// keeps one scratch for all of them. The decoder never allocates its own
-    /// scratch on this path.
-    pub fn decodeBlockScratch(
         self: *Decoder,
         allocator: std.mem.Allocator,
         scratch: []u8,
@@ -320,18 +219,10 @@ pub const Decoder = struct {
     /// Decodes `block` only to keep the dynamic table in step with the
     /// peer's encoder and keeps no field, for a block whose stream takes no
     /// more headers. No count or size cap applies, so a block `decodeBlock`
-    /// would refuse with `HpackHeaderListTooLarge` passes. Every error it
-    /// returns (`HpackBadData`, `HpackOutputTooSmall`, the shim's) leaves the
-    /// table out of step, so the caller fails the connection on it.
-    pub fn skipBlock(self: *Decoder, allocator: std.mem.Allocator, block: []const u8) !void {
-        try self.ensureInitialized();
-        if (block.len == 0)
-            return;
-        try self.skipBlockScratch(try self.ensureScratch(allocator), block);
-    }
-
-    /// `skipBlock` with the caller's scratch, as `decodeBlockScratch` takes it.
-    pub fn skipBlockScratch(self: *Decoder, scratch: []u8, block: []const u8) !void {
+    /// would refuse with `HpackHeaderListTooLarge` passes. `scratch` is as
+    /// `decodeBlock` takes it. Every error it returns leaves the table out of
+    /// step, so the caller fails the connection on it.
+    pub fn skipBlock(self: *Decoder, scratch: []u8, block: []const u8) !void {
         std.debug.assert(scratch.len >= max_single_header_decode_bytes);
         try self.ensureInitialized();
         if (block.len == 0)
@@ -366,22 +257,6 @@ pub const Decoder = struct {
             }
         }
     }
-
-    fn ensureScratch(self: *Decoder, allocator: std.mem.Allocator) ![]u8 {
-        if (self.scratch_allocator) |scratch_allocator| {
-            // First-allocator-wins: callers hold one stable allocator per
-            // connection, so a different vtable here is a programmer error.
-            std.debug.assert(scratch_allocator.ptr == allocator.ptr);
-            std.debug.assert(scratch_allocator.vtable == allocator.vtable);
-            std.debug.assert(self.scratch.len == max_single_header_decode_bytes);
-            return self.scratch;
-        }
-        std.debug.assert(self.scratch.len == 0);
-        const scratch = try allocator.alloc(u8, max_single_header_decode_bytes);
-        self.scratch = scratch;
-        self.scratch_allocator = allocator;
-        return scratch;
-    }
 };
 
 pub const Encoder = struct {
@@ -394,8 +269,6 @@ pub const Encoder = struct {
     /// cleared together with pending_capacity_update.
     pending_capacity_min: ?u32 = null,
     poisoned: ?anyerror = null,
-    scratch: []u8 = &.{},
-    scratch_allocator: ?std.mem.Allocator = null,
 
     pub fn init() !Encoder {
         var self = Encoder{};
@@ -412,15 +285,9 @@ pub const Encoder = struct {
         self.pending_capacity_update = null;
         self.pending_capacity_min = null;
         self.poisoned = null;
-        if (self.scratch_allocator) |scratch_allocator| {
-            scratch_allocator.free(self.scratch);
-            self.scratch = &.{};
-            self.scratch_allocator = null;
-        }
-        std.debug.assert(self.scratch.len == 0);
     }
 
-    pub fn ensureInitialized(self: *Encoder) !void {
+    fn ensureInitialized(self: *Encoder) !void {
         if (self.poisoned != null)
             return error.HpackEncoderPoisoned;
         if (self.handle != null)
@@ -448,38 +315,18 @@ pub const Encoder = struct {
         collo_hpack_encoder_set_max_capacity(self.handle.?, clamped);
     }
 
+    /// Encodes `headers` into the caller's `scratch` and returns the block,
+    /// which borrows `scratch` until the caller's next use of it. The block
+    /// is at most `max_block_bytes` long. Fails with
+    /// `error.HpackOutputTooSmall` when the worst case for `headers`, capped
+    /// at `max_block_bytes`, does not fit `scratch`, and with
+    /// `error.HpackEncoderPoisoned` from the first failed encode on, because
+    /// a field the shim refused may have changed the dynamic table. A list
+    /// whose worst case is over `max_block_bytes` is still tried, since
+    /// compression may make it fit, and poisons the encoder when it does
+    /// not; a caller that must not lose the connection over one list refuses
+    /// it first by the bound in the file header.
     pub fn encodeHeaders(
-        self: *Encoder,
-        allocator: std.mem.Allocator,
-        headers: []const Header,
-        max_block_bytes: usize,
-    ) !EncodedBlock {
-        const storage_len = try self.encodedStorageLen(headers, max_block_bytes);
-        const storage = try allocator.alloc(u8, storage_len);
-        errdefer allocator.free(storage);
-
-        const len = try self.encodeHeadersInto(storage, headers);
-        return .{ .storage = storage, .len = len };
-    }
-
-    pub fn encodeHeadersScratch(
-        self: *Encoder,
-        allocator: std.mem.Allocator,
-        headers: []const Header,
-        max_block_bytes: usize,
-    ) ![]const u8 {
-        const storage_len = try self.encodedStorageLen(headers, max_block_bytes);
-        const storage = try self.ensureScratchCapacity(allocator, storage_len);
-        const len = try self.encodeHeadersInto(storage, headers);
-        return storage[0..len];
-    }
-
-    /// `encodeHeadersScratch` into the caller's `scratch` instead of the
-    /// encoder's own: for a caller that encodes many connections' heads one
-    /// at a time and keeps one scratch for all of them. The block borrows
-    /// `scratch`. Fails with `error.HpackOutputTooSmall` when the block may
-    /// not fit it.
-    pub fn encodeHeadersWithScratch(
         self: *Encoder,
         scratch: []u8,
         headers: []const Header,
@@ -490,32 +337,6 @@ pub const Encoder = struct {
             return error.HpackOutputTooSmall;
         const len = try self.encodeHeadersInto(scratch[0..storage_len], headers);
         return scratch[0..len];
-    }
-
-    pub fn encodePreparedHeaders(
-        self: *Encoder,
-        allocator: std.mem.Allocator,
-        prepared: *const PreparedHeaders,
-        max_block_bytes: usize,
-    ) !EncodedBlock {
-        const storage_len = try self.preparedStorageLen(prepared, max_block_bytes);
-        const storage = try allocator.alloc(u8, storage_len);
-        errdefer allocator.free(storage);
-
-        const len = try self.encodePreparedHeadersInto(storage, prepared);
-        return .{ .storage = storage, .len = len };
-    }
-
-    pub fn encodePreparedHeadersScratch(
-        self: *Encoder,
-        allocator: std.mem.Allocator,
-        prepared: *const PreparedHeaders,
-        max_block_bytes: usize,
-    ) ![]const u8 {
-        const storage_len = try self.preparedStorageLen(prepared, max_block_bytes);
-        const storage = try self.ensureScratchCapacity(allocator, storage_len);
-        const len = try self.encodePreparedHeadersInto(storage, prepared);
-        return storage[0..len];
     }
 
     fn encodedStorageLen(
@@ -572,94 +393,6 @@ pub const Encoder = struct {
         return offset;
     }
 
-    fn preparedStorageLen(
-        self: *const Encoder,
-        prepared: *const PreparedHeaders,
-        max_block_bytes: usize,
-    ) !usize {
-        if (self.poisoned != null)
-            return error.HpackEncoderPoisoned;
-
-        var storage_len = prepared.encoded_bytes_max;
-        if (self.pending_capacity_update) |capacity| {
-            storage_len = std.math.add(
-                usize,
-                storage_len,
-                hpackIntegerEncodedLen(5, capacity),
-            ) catch return error.HpackHeaderListTooLarge;
-            const minimum = self.pending_capacity_min orelse capacity;
-            std.debug.assert(minimum <= capacity);
-            if (minimum != capacity) {
-                storage_len = std.math.add(
-                    usize,
-                    storage_len,
-                    hpackIntegerEncodedLen(5, minimum),
-                ) catch return error.HpackHeaderListTooLarge;
-            }
-        }
-        storage_len = @min(storage_len, max_block_bytes);
-        if (storage_len == 0 and
-            (prepared.headers.len != 0 or self.pending_capacity_update != null))
-        {
-            return error.HpackOutputTooSmall;
-        }
-        return storage_len;
-    }
-
-    fn encodePreparedHeadersInto(
-        self: *Encoder,
-        storage: []u8,
-        prepared: *const PreparedHeaders,
-    ) !usize {
-        try self.ensureInitialized();
-
-        var offset: usize = 0;
-        if (self.pending_capacity_update) |capacity| {
-            const minimum = self.pending_capacity_min orelse capacity;
-            std.debug.assert(minimum <= capacity);
-            if (minimum != capacity)
-                offset = try encodeDynamicTableSizeUpdate(storage, minimum);
-            offset += try encodeDynamicTableSizeUpdate(storage[offset..], capacity);
-        }
-        statusToError(collo_hpack_encode_prepared_block(
-            self.handle.?,
-            storage.ptr,
-            storage.len,
-            &offset,
-            prepared.storage.ptr,
-            prepared.storage.len,
-            prepared.headers.ptr,
-            prepared.headers.len,
-        )) catch |err| {
-            self.poison(err);
-            return error.HpackEncoderPoisoned;
-        };
-        self.pending_capacity_update = null;
-        self.pending_capacity_min = null;
-        return offset;
-    }
-
-    fn ensureScratchCapacity(self: *Encoder, allocator: std.mem.Allocator, len: usize) ![]u8 {
-        if (self.scratch_allocator) |scratch_allocator| {
-            // First-allocator-wins, matching Decoder: connection-owned encoders
-            // must be used with one stable runtime allocator.
-            std.debug.assert(scratch_allocator.ptr == allocator.ptr);
-            std.debug.assert(scratch_allocator.vtable == allocator.vtable);
-            if (self.scratch.len >= len)
-                return self.scratch;
-
-            const scratch = try scratch_allocator.realloc(self.scratch, len);
-            self.scratch = scratch;
-            return scratch;
-        }
-
-        std.debug.assert(self.scratch.len == 0);
-        const scratch = try allocator.alloc(u8, len);
-        self.scratch = scratch;
-        self.scratch_allocator = allocator;
-        return scratch;
-    }
-
     fn poison(self: *Encoder, err: anyerror) void {
         self.poisoned = err;
         if (self.handle) |handle| {
@@ -670,9 +403,6 @@ pub const Encoder = struct {
 };
 
 const default_dynamic_table_capacity: u32 = max_dynamic_table_capacity;
-/// The longest name or value one decoded field may have: the size of the
-/// decoder's scratch, its own or a caller's (`Decoder.decodeBlockScratch`).
-pub const max_single_header_decode_bytes: usize = 64 * 1024 - 1;
 
 fn encodedHeadersStorageLen(
     headers: []const Header,
@@ -688,34 +418,24 @@ fn encodedHeadersStorageLen(
         if (minimum != capacity)
             len += hpackIntegerEncodedLen(5, minimum);
     }
+    std.debug.assert(len <= table_size_updates_bytes_max);
 
     for (headers) |header| {
         if (header.name.len > max_single_header_decode_bytes)
             return error.HpackHeaderListTooLarge;
         if (header.value.len > max_single_header_decode_bytes)
             return error.HpackHeaderListTooLarge;
-        const header_len = try encodedHeaderUpperBound(header);
-        len = std.math.add(usize, len, header_len) catch return error.HpackHeaderListTooLarge;
+        len +|= encodedFieldBytesMax(header);
     }
     return @min(len, max_block_bytes);
 }
 
-fn encodedHeaderUpperBound(header: Header) !usize {
-    const name_len = encodedStringUpperBound(header.name.len);
-    const value_len = encodedStringUpperBound(header.value.len);
-    const name_and_value_len = std.math.add(usize, name_len, value_len) catch
-        return error.HpackHeaderListTooLarge;
-    return std.math.add(usize, 1, name_and_value_len) catch
-        return error.HpackHeaderListTooLarge;
+fn encodedStringBytesMax(len: usize) usize {
+    return hpackIntegerEncodedLen(7, len) +| len;
 }
 
-fn encodedStringUpperBound(len: usize) usize {
-    std.debug.assert(len <= max_single_header_decode_bytes);
-    return hpackIntegerEncodedLen(7, @intCast(len)) + len;
-}
-
-fn hpackIntegerEncodedLen(prefix_bits: u5, value: u32) usize {
-    const prefix_max = (@as(u32, 1) << prefix_bits) - 1;
+fn hpackIntegerEncodedLen(prefix_bits: u5, value: usize) usize {
+    const prefix_max = (@as(usize, 1) << prefix_bits) - 1;
     if (value < prefix_max)
         return 1;
 
@@ -728,7 +448,7 @@ fn hpackIntegerEncodedLen(prefix_bits: u5, value: u32) usize {
     return len + 1;
 }
 
-pub fn clampDynamicTableCapacity(capacity: u32) u32 {
+fn clampDynamicTableCapacity(capacity: u32) u32 {
     return @min(capacity, max_dynamic_table_capacity);
 }
 
@@ -772,26 +492,6 @@ extern fn collo_hpack_encode_header(
     name_len: usize,
     value: [*]const u8,
     value_len: usize,
-) c_int;
-extern fn collo_hpack_prepare_header(
-    prepared: *RawPreparedHeader,
-    storage: [*]u8,
-    storage_len: usize,
-    storage_offset: u32,
-    name: [*]const u8,
-    name_len: usize,
-    value: [*]const u8,
-    value_len: usize,
-) c_int;
-extern fn collo_hpack_encode_prepared_block(
-    handle: *RawEncoder,
-    dst: [*]u8,
-    dst_len: usize,
-    offset: *usize,
-    storage: [*]const u8,
-    storage_len: usize,
-    headers: [*]const RawPreparedHeader,
-    header_count: usize,
 ) c_int;
 
 fn decodedSlice(buffer: []const u8, offset: u32, len: u32) ![]const u8 {

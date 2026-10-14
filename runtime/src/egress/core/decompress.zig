@@ -3,9 +3,10 @@
 //! pinned trees (`collo_zlib`, `collo_brotli`). Every coding is therefore
 //! always available: the transport advertises one constant Accept-Encoding,
 //! and no process loads anything to decode, inside its sandbox or before it.
-//! The gateway's HTTP/1 pump decodes on the engine owner thread and the worker
-//! decodes forwarded HTTP/2 bodies on its event loop. A `StreamDecoder` has no
-//! synchronization and serves one response.
+//! The gateway's HTTP/1 pump (`stream_pump.zig`) decodes on the engine owner
+//! thread and the worker decodes forwarded HTTP/2 bodies on its event loop.
+//! A `StreamDecoder` has no synchronization and serves one response; every
+//! step takes an output bound.
 
 const std = @import("std");
 const brotli = @import("collo_brotli");
@@ -186,24 +187,6 @@ pub const StreamDecoder = struct {
                 };
             },
         }
-    }
-
-    /// Flushes the codec trailer and returns the rest of the output, owned by
-    /// `allocator`. Fails with `error.FetchResponseTooLarge` when output
-    /// remains past `max_body_bytes` and `error.FetchResponseTruncated` when
-    /// the stream did not end.
-    pub fn finishToOwnedSlice(
-        self: *StreamDecoder,
-        allocator: std.mem.Allocator,
-        max_body_bytes: usize,
-    ) ![]u8 {
-        var decoded = try self.finishToOwnedSliceLimited(allocator, max_body_bytes, max_body_bytes);
-        errdefer decoded.deinit(allocator);
-        if (decoded.needs_output)
-            return error.FetchResponseTooLarge;
-        if (!decoded.finished and self.state != .identity)
-            return error.FetchResponseTruncated;
-        return decoded.takeBytes();
     }
 
     /// Flushes the codec trailer within `max_output_bytes`. A result with

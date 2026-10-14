@@ -5,8 +5,9 @@
 //!
 //! `applyProcessBaseline` runs first, while the process is single-threaded, because
 //! `unshare(CLONE_NEWUSER)` refuses a multithreaded caller. It enters a user and a mount namespace
-//! and lowers the resource limits, the open files and the address space to what the sizing plan
-//! derived (`sizing.zig`). It then opens the machine's trust store and resolver files and
+//! and lowers the resource limits, the open files to what the sizing plan derived (`sizing.zig`).
+//! The address space stays unlimited: the gateway's budgeted allocators bound its memory
+//! (`containment.zig`). It then opens the machine's trust store and resolver files and
 //! mounts a tmpfs over `staging_path`, which hides what the machine keeps below that path in this
 //! namespace only; binds the opened files into the tmpfs read-only, makes the tmpfs read-only too
 //! and chroots into it; and finally drops every capability, sets no-new-privileges and installs a
@@ -78,7 +79,7 @@ comptime {
 }
 
 /// Applies every step that must come before the gateway's first thread, in the order the header
-/// gives, with the open-file and address-space limits of `plan`. The calling process must be
+/// gives, with the open-file limit of `plan`. The calling process must be
 /// single-threaded and must hold no descriptor of a directory, which would let `fchdir` walk back
 /// out of the chroot. Fails with `error.EgressGatewayTrustStoreMissing` when the machine has no
 /// CA bundle at any of `trust_store_sources`.
@@ -158,7 +159,6 @@ const resource_limits = struct {
         try lower(.CORE, 0);
         try lower(.NOFILE, plan.open_files);
         try lower(.NPROC, process_limits.EGRESS_GATEWAY_TASKS_MAX);
-        try lower(.AS, plan.address_space_bytes);
     }
 
     /// Sets the soft and hard limit of `resource` to `ceiling`, or to the inherited hard limit

@@ -22,8 +22,10 @@
 //! charged to nobody. An owner whose context ends inside its own window, a
 //! request that finishes in its own turn or an evaluation closed by its own
 //! deadline, is not found when the window closes and gets nothing more, so
-//! `finishRequest` folds the window first (`foldOpenWindow`) and its records
-//! hold every nanosecond up to the finish.
+//! `finishRequest` folds the window first (`foldOpenWindow`) and its
+//! `request_done` holds every nanosecond up to the finish. Every charge to a
+//! dispatched request also lands in its live slot on the page
+//! (`chargeContext`).
 //!
 //! Limits. A dispatched request has its wall deadline and, when its
 //! definition sets `cpuMs`, a CPU budget; an evaluation has the deadline it
@@ -38,7 +40,9 @@
 //! (`termination.admitAtBoundary`); only an owner that passes a limit while it
 //! runs is stopped. A charge that takes a request to its CPU budget marks it
 //! `cpu_spent`, and the loop answers it after the work item
-//! (`termination.endSpentBudgets`).
+//! (`termination.endSpentBudgets`). Native work the bridge cannot interrupt
+//! never reaches a safepoint, so it asks first how long it may keep the
+//! thread under these limits (`nativeTimeLeftNs`).
 //!
 //! A border also moves a dispatched request's timeline
 //! (`RequestContext.noteTurnBegin`, `noteTurnEnd`); an evaluation and the
@@ -173,9 +177,9 @@ pub fn leave(runtime: anytype, previous_id: u64) void {
 }
 
 /// Charges `request` the CPU of its open window so far and restarts the
-/// window, for `finishRequest`, which writes the request's CPU into its
-/// records from inside that window. Does nothing when another owner's
-/// window is open.
+/// window, for `finishRequest`, which reports the request's CPU in its
+/// `request_done` from inside that window. Does nothing when another
+/// owner's window is open.
 pub fn foldOpenWindow(runtime: anytype, request: *request_context.RequestContext) void {
     const owners = &runtime.owners;
     if (owners.current_id != request.exec.request_id)
@@ -186,11 +190,22 @@ pub fn foldOpenWindow(runtime: anytype, request: *request_context.RequestContext
 }
 
 /// Adds `cpu_ns` to the CPU of `context`, a request or an evaluation, from
-/// a window of its own or from the crypto pool's run of its job
-/// (`js/crypto/runtime.zig`). A request whose CPU reaches its budget is
-/// marked `cpu_spent` once, for `termination.endSpentBudgets` to answer.
+/// a window of its own. A dispatched request's new total goes to its
+/// live slot at once, so the CPU a death leaves the server holds every
+/// charge up to it, and no pass of the loop has to publish it. The page
+/// drops the store when a later begin on the same pool slot replaced the
+/// request (`WorkerWriterView.storeLiveSlotCpu`). A request whose
+/// CPU reaches its budget is marked `cpu_spent` once, for
+/// `termination.endSpentBudgets` to answer.
 pub fn chargeContext(runtime: anytype, context: *request_context.RequestContext, cpu_ns: u64) void {
     context.cpu_ns +|= cpu_ns;
+    if (!request_context.isReservedId(context.exec.request_id)) {
+        runtime.observability.metrics_view.storeLiveSlotCpu(
+            context.dispatch_work.worker_slot,
+            context.exec.request_id,
+            context.cpu_ns,
+        );
+    }
     if (context.cpu_budget_ns == 0 or context.cpu_spent)
         return;
     if (context.cpu_ns < context.cpu_budget_ns)
@@ -208,6 +223,59 @@ pub fn refreshPublication(runtime: anytype, context: *const request_context.Requ
     if (owners.current_id == 0 or owners.current_id != context.exec.request_id)
         return;
     publish(runtime, contextPublication(runtime, context, owners.window_cpu_start_ns));
+}
+
+/// How long native work the bridge cannot interrupt may still keep the VM
+/// thread (`collo_runtime_native_time_left_ns` in `host/crypto.zig`, which
+/// WebCrypto asks before and while it works): the least of every live
+/// owner's wall time to its deadline and, when the owner whose window is
+/// open has a CPU budget, the CPU it has left. Every live owner counts, not
+/// only the one running: while native work holds the thread the loop answers
+/// no deadline, so a request whose deadline passed meanwhile would get its
+/// 504 late, and past the server's grace its worker would be faulted. The
+/// live owners are the contexts of the active map with a deadline they owe
+/// (`owedDeadlineNs`) and the worker owner while its window is open.
+/// `maxInt(u64)` when nothing limits the thread; 0 once a limit is spent.
+pub fn nativeTimeLeftNs(runtime: anytype) u64 {
+    const owners = &runtime.owners;
+    const now_ns = runtime.nowMonoNs();
+    var left_ns: u64 = std.math.maxInt(u64);
+    var contexts = runtime.requests.active.valueIterator();
+    while (contexts.next()) |context| {
+        const deadline_ns = owedDeadlineNs(context.*) orelse continue;
+        left_ns = @min(left_ns, deadline_ns -| now_ns);
+    }
+    const owner_id = owners.current_id;
+    if (owner_id == worker_owner_id) {
+        // The worker owner's deadline is on CLOCK_MONOTONIC, which the
+        // sentinel compares it with (`switchWindow`).
+        left_ns = @min(left_ns, owners.worker_deadline_ns -| process.monotonicNowNsOrZero());
+    } else if (owner_id != 0) {
+        if (runtime.requests.active.get(owner_id)) |context| {
+            if (context.cpu_budget_ns != 0) {
+                const spent_ns = context.cpu_ns +| (readCpu(owners) -| owners.window_cpu_start_ns);
+                left_ns = @min(left_ns, context.cpu_budget_ns -| spent_ns);
+            }
+        }
+    }
+    return left_ns;
+}
+
+/// The wall deadline `context` owes an answer by, on the runtime's clock:
+/// its armed deadline, or, for a dispatched request whose `request` item has
+/// not run yet, the deadline its dispatch carries, since the server's
+/// deadline for a decoded request already runs. Null for a context with
+/// neither, such as a request whose answer has begun or an evaluation that
+/// armed none.
+fn owedDeadlineNs(context: *const request_context.RequestContext) ?u64 {
+    const deadline_ns = context.exec.deadline_monotonic_ns;
+    if (deadline_ns == 0)
+        return null;
+    if (context.deadline_armed)
+        return deadline_ns;
+    if (!context.dispatch_started)
+        return deadline_ns;
+    return null;
 }
 
 /// Closes the open window into its owner and makes `next_id` the owner the

@@ -1,9 +1,11 @@
-//! The boot trace drain (`server/boot/trace_drain.zig`): it keeps a pipe empty
-//! while writers outrun the pipe's capacity, stops on request while the pipe
-//! stays open, ends by itself once every writer is gone, and hands on whole
-//! the lines its reads split, dropping a piece longer than any line a writer
-//! emits. Lane `server-core-test`; the drain on a real zygote runs under
-//! `zig build smoke`.
+//! The boot trace drain (`server/boot/trace_drain.zig`): which build modes
+//! and variables make the server log the trace, and so spawn its zygote with
+//! a pipe; a drain given no pipe starts no thread; with a pipe the drain
+//! keeps it empty while writers outrun the pipe's capacity, stops on request
+//! while the pipe stays open, ends by itself once every writer is gone, and
+//! hands on whole the lines its reads split, dropping a piece longer than any
+//! line a writer emits. Lane `server-core-test`; the drain on a real zygote
+//! runs under `zig build smoke` in a Debug build, which logs the trace.
 
 const std = @import("std");
 const fd_mod = @import("collo_os").fd;
@@ -38,12 +40,51 @@ const Pipe = struct {
     }
 };
 
+test "a server logs the boot trace in a Debug build or when either variable is 1, and otherwise asks for no pipe" {
+    const Case = struct {
+        mode: std.builtin.OptimizeMode,
+        boot_trace: ?[]const u8 = null,
+        debug: ?[]const u8 = null,
+        logged: bool,
+    };
+    const cases = [_]Case{
+        .{ .mode = .Debug, .logged = true },
+        .{ .mode = .Debug, .boot_trace = "0", .logged = true },
+        .{ .mode = .ReleaseFast, .logged = false },
+        .{ .mode = .ReleaseSafe, .logged = false },
+        .{ .mode = .ReleaseSmall, .logged = false },
+        .{ .mode = .ReleaseFast, .boot_trace = "1", .logged = true },
+        .{ .mode = .ReleaseFast, .debug = "1", .logged = true },
+        .{ .mode = .ReleaseFast, .boot_trace = " 1\n", .logged = true },
+        .{ .mode = .ReleaseFast, .boot_trace = "0", .debug = "true", .logged = false },
+        .{ .mode = .ReleaseFast, .boot_trace = "", .debug = "", .logged = false },
+    };
+    for (cases) |case| {
+        const logged = trace_drain.traceLogged(.{
+            .mode = case.mode,
+            .boot_trace = case.boot_trace,
+            .debug = case.debug,
+        });
+        try std.testing.expectEqual(case.logged, logged);
+    }
+}
+
+test "a drain given no pipe starts no thread, and its teardown stops nothing" {
+    // The server hands the drain the zygote's read end, which a zygote
+    // spawned without tracing does not have (`SpawnedZygote.trace_read_fd`).
+    var drain: trace_drain.TraceDrain = undefined;
+    try drain.init(null);
+    try std.testing.expect(drain.thread == null);
+    drain.deinit();
+}
+
 test "the drain keeps the pipe empty while writes outrun its capacity" {
     var pipe = try Pipe.init();
     defer pipe.deinit();
     var drain: trace_drain.TraceDrain = undefined;
-    try drain.init(pipe.read_end.fd(), false);
+    try drain.init(pipe.read_end.fd());
     defer drain.deinit();
+    try std.testing.expect(drain.thread != null);
 
     const line = "boot-event zygote_ready\n";
     var written: usize = 0;
@@ -55,7 +96,7 @@ test "the drain stops on request while the pipe stays open" {
     var pipe = try Pipe.init();
     defer pipe.deinit();
     var drain: trace_drain.TraceDrain = undefined;
-    try drain.init(pipe.read_end.fd(), false);
+    try drain.init(pipe.read_end.fd());
     try fd_mod.writeAllRaw(pipe.write_end.fd(), "boot-event before_stop\n");
     drain.deinit();
 }
@@ -64,7 +105,7 @@ test "the drain ends by itself once every writer is gone and still joins" {
     var pipe = try Pipe.init();
     defer pipe.deinit();
     var drain: trace_drain.TraceDrain = undefined;
-    try drain.init(pipe.read_end.fd(), false);
+    try drain.init(pipe.read_end.fd());
     try fd_mod.writeAllRaw(pipe.write_end.fd(), "boot-event last\n");
     pipe.write_end.deinit();
     drain.deinit();

@@ -1,7 +1,12 @@
-//! The page's lifecycle header and the tags it stores. The host writes the
-//! header whole at launch; afterwards each field has one writer thread in the
-//! worker, named on the field. The sentinel thread stores `state` and
-//! `termination_reason` only right before it ends the process. A host reader
+//! The page's lifecycle header and the tags it stores. `createMemfd` writes
+//! the header whole (`mapping.zig`); afterwards each field has one writer
+//! thread in the worker, named on the field. The sentinel thread stores
+//! `state` and `termination_reason` only right before it ends the process.
+//! The boot's own failure path writes no field and reports in
+//! `WorkerInitFailed`, but the sentinel starts before the routes evaluate,
+//! so it can still stamp `dead` with `memory` or `sentinel` during the boot,
+//! which `host/launch.zig:Machine.endedCause` reads, and the VM thread
+//! publishes the owner section during the boot's evaluations. A host reader
 //! loads the tags once through `LifecycleSnapshot` and the owner section
 //! through `OwnerSnapshot` and `RunningOwnerSnapshot` (`snapshots.zig`),
 //! which keep each value raw and convert a tag only when its enum names it.
@@ -14,12 +19,13 @@ pub const State = enum(u32) {
     dead = 3,
 };
 
+/// Value 4 names no reason, and a host reader takes it as unknown
+/// (`LifecycleSnapshot.knownTerminationReason`).
 pub const TerminationReason = enum(u32) {
     none = 0,
     cpu = 1,
     memory = 2,
     crash = 3,
-    init_failed = 4,
     deadline = 5,
     /// The sentinel thread could no longer watch the worker, its poll, its
     /// command descriptor, the memory events or the VM thread's CPU clock
@@ -28,13 +34,9 @@ pub const TerminationReason = enum(u32) {
     sentinel = 6,
 };
 
-/// The lifecycle header. The host writes it whole at launch
-/// (`WorkerWriterView.initializeCrashDefault`).
-///
-/// `records_head` is the worker's cursor of the usage record ring, and
-/// `records_tail` the copy of the host's cursor that the host stores for the
-/// worker's room check and never reads back (`RecordCursor` in
-/// `snapshots.zig`).
+/// The lifecycle header. `createMemfd` writes it whole, state `forked` and
+/// reason `crash`, so a worker that dies before it stores a state of its own
+/// reads as crashed.
 ///
 /// The owner section says whom the worker's VM thread works for. The VM
 /// thread stores `owner_id` and `owner_deadline_mono_ns` at every owner
@@ -56,10 +58,6 @@ pub const Header = extern struct {
     /// Sentinel thread. Odd while it stores the running owner's pair.
     running_owner_sequence: u32,
     /// VM thread.
-    records_head: u64,
-    /// Host.
-    records_tail: u64,
-    /// VM thread.
     owner_id: u64,
     /// VM thread. CLOCK_MONOTONIC; 0 for none.
     owner_deadline_mono_ns: u64,
@@ -75,24 +73,17 @@ pub const Header = extern struct {
 };
 
 comptime {
-    if (@sizeOf(Header) != 72)
+    if (@sizeOf(Header) != 56)
         @compileError("worker_state.page.Header size mismatch");
-    if (@offsetOf(Header, "records_head") != 16)
-        @compileError("worker_state.page.Header records_head offset mismatch");
-    if (@offsetOf(Header, "owner_id") != 32)
+    if (@offsetOf(Header, "owner_id") != 16)
         @compileError("worker_state.page.Header owner_id offset mismatch");
-    if (@offsetOf(Header, "running_owner_id") != 48)
+    if (@offsetOf(Header, "running_owner_id") != 32)
         @compileError("worker_state.page.Header running_owner_id offset mismatch");
-    if (@offsetOf(Header, "startup_evaluations_ended") != 64 or
-        @offsetOf(Header, "_reserved0") != 68)
+    if (@offsetOf(Header, "startup_evaluations_ended") != 48 or
+        @offsetOf(Header, "_reserved0") != 52)
         @compileError("worker_state.page.Header startup end offset mismatch");
 
     const zero_header = std.mem.zeroes(Header);
-    if (zero_header.records_head != 0 or
-        zero_header.records_tail != 0)
-    {
-        @compileError("worker_state.page zero-filled record cursors must describe an empty ring");
-    }
     if (zero_header.owner_id != 0 or
         zero_header.owner_deadline_mono_ns != 0 or
         zero_header.running_owner_sequence != 0 or

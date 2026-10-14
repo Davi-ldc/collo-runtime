@@ -7,11 +7,13 @@
 // Each cell reports its type string as GC extra memory, and its storage too when it wins
 // BlobStorage::tryClaimExtraMemoryReport. A File's name goes unreported (see the FIXME in JSColloFile::finishCreation).
 // A constructor copies string and BufferSource parts into new BlobBytes and shares the BlobBytes of Blob parts, unless
-// BlobSegmentCompactionMinRetainedRatio calls for a copy.
+// BlobSegmentCompactionMinRetainedRatio calls for a copy. A storage keeps only its segments and the cost fixed at its
+// creation.
 
 #include "host_functions/webapi/files/blob.h"
-#include "host_functions/webapi/dom/dom_exception.h"
+
 #include "host_functions/webapi/buffer_source.h"
+#include "host_functions/webapi/dom/dom_exception.h"
 #include "host_functions/webapi/encoding/utf8.h"
 #include "host_functions/webapi/files/file.h"
 #include "host_functions/webapi/files/formdata.h"
@@ -41,8 +43,8 @@
 #include <wtf/WallTime.h>
 #include <wtf/text/Latin1Character.h>
 #include <wtf/text/MakeString.h>
-#include <wtf/text/StringImpl.h>
 #include <wtf/text/StringBuilder.h>
+#include <wtf/text/StringImpl.h>
 #include <wtf/text/WTFString.h>
 
 #include <algorithm>
@@ -94,7 +96,7 @@ WTF::RefPtr<BlobBytes> BlobBytes::create(WTF::Vector<uint8_t>&& bytes)
 
 std::span<const uint8_t> BlobBytes::span() const LIFETIME_BOUND { return m_bytes.span(); }
 
-size_t BlobBytes::objectURLMemoryCost() const
+size_t BlobBytes::memoryCost() const
 {
     if (m_bytes.capacity() > std::numeric_limits<size_t>::max() - sizeof(BlobBytes))
         return std::numeric_limits<size_t>::max();
@@ -130,48 +132,43 @@ BlobSegment& BlobSegment::operator=(const BlobSegment& other)
     return *this;
 }
 
-static bool appendUniqueBlobObjectURLByteStores(
-    std::span<const BlobSegment> segments, WTF::Vector<BlobObjectURLBackingStore>& out)
+// The sum of memoryCost() over the distinct BlobBytes that `segments` view, each counted once however many segments
+// share it. Several segments are deduplicated through a sorted list of their BlobBytes that lives only for the call.
+// Returns nullopt when that list cannot be allocated.
+static std::optional<size_t> distinctBlobBytesCost(std::span<const BlobSegment> segments)
 {
-    for (auto& segment : segments) {
-        auto* storage = segment.storage.ptr();
-        if (!out.tryAppend(BlobObjectURLBackingStore { storage, storage->objectURLMemoryCost() }))
-            return false;
-    }
+    if (segments.size() == 1)
+        return segments.front().storage->memoryCost();
 
-    std::sort(
-        out.begin(), out.end(), [](auto& left, auto& right) { return std::less<const void*> {}(left.key, right.key); });
+    WTF::Vector<const BlobBytes*> distinct;
+    if (!distinct.tryReserveInitialCapacity(segments.size()))
+        return std::nullopt;
+    for (auto& segment : segments)
+        distinct.append(segment.storage.ptr());
+    std::sort(distinct.begin(), distinct.end(), std::less<const BlobBytes*>());
 
-    size_t write_index = 0;
-    for (size_t read_index = 0; read_index < out.size(); ++read_index) {
-        if (write_index && out[write_index - 1].key == out[read_index].key)
-            continue;
-        if (write_index != read_index)
-            out[write_index] = out[read_index];
-        write_index++;
+    size_t cost = 0;
+    const BlobBytes* previous = nullptr;
+    for (auto* bytes : distinct) {
+        if (bytes != previous)
+            cost = saturatingAdd(cost, bytes->memoryCost());
+        previous = bytes;
     }
-    out.shrink(write_index);
-    return true;
+    return cost;
 }
 
 WTF::RefPtr<BlobStorage> BlobStorage::create(WTF::Vector<BlobSegment>&& segments, size_t size)
 {
-    WTF::Vector<BlobObjectURLBackingStore> object_url_byte_stores;
-    if (!appendUniqueBlobObjectURLByteStores(segments.span(), object_url_byte_stores))
+    auto bytes_cost = distinctBlobBytesCost(segments.span());
+    if (!bytes_cost)
         return nullptr;
-
-    size_t object_url_metadata_cost = saturatingAdd(sizeof(BlobStorage),
-        saturatingAdd(saturatingMultiply(segments.capacity(), sizeof(BlobSegment)),
-            saturatingMultiply(object_url_byte_stores.capacity(), sizeof(BlobObjectURLBackingStore))));
-    size_t memory_cost = object_url_metadata_cost;
-    for (auto& byte_store : object_url_byte_stores)
-        memory_cost = saturatingAdd(memory_cost, byte_store.bytes);
+    size_t memory_cost = saturatingAdd(
+        sizeof(BlobStorage), saturatingAdd(saturatingMultiply(segments.capacity(), sizeof(BlobSegment)), *bytes_cost));
 
     BlobStorage* storage = nullptr;
     if (!WTF::tryFastMalloc(sizeof(BlobStorage)).getValue(storage))
         return nullptr;
-    storage = new (NotNull, storage) BlobStorage(
-        WTF::move(segments), WTF::move(object_url_byte_stores), size, object_url_metadata_cost, memory_cost);
+    storage = new (NotNull, storage) BlobStorage(WTF::move(segments), size, memory_cost);
     return adoptRef(*storage);
 }
 
@@ -248,17 +245,6 @@ bool BlobStorage::appendSegmentsTo(WTF::Vector<BlobSegment>& out, size_t offset,
     return false;
 }
 
-bool BlobStorage::appendObjectURLBackingStores(WTF::Vector<BlobObjectURLBackingStore>& out) const
-{
-    if (!out.tryAppend(BlobObjectURLBackingStore { this, m_object_url_metadata_cost }))
-        return false;
-    for (auto& byte_store : m_object_url_byte_stores) {
-        if (!out.tryAppend(byte_store))
-            return false;
-    }
-    return true;
-}
-
 void BlobStorage::copyTo(std::span<uint8_t> destination, size_t offset, size_t size) const
 {
     ASSERT(destination.size() >= size);
@@ -290,13 +276,9 @@ void BlobStorage::copyTo(std::span<uint8_t> destination, size_t offset, size_t s
     ASSERT_NOT_REACHED();
 }
 
-BlobStorage::BlobStorage(WTF::Vector<BlobSegment>&& segments,
-    WTF::Vector<BlobObjectURLBackingStore>&& object_url_byte_stores, size_t size, size_t object_url_metadata_cost,
-    size_t memory_cost)
+BlobStorage::BlobStorage(WTF::Vector<BlobSegment>&& segments, size_t size, size_t memory_cost)
     : m_segments(WTF::move(segments))
-    , m_object_url_byte_stores(WTF::move(object_url_byte_stores))
     , m_size(size)
-    , m_object_url_metadata_cost(object_url_metadata_cost)
     , m_memory_cost(memory_cost)
 {
 }
@@ -401,11 +383,6 @@ bool JSColloBlob::appendStorageSegments(WTF::Vector<BlobSegment>& out) const
     return m_storage->appendSegmentsTo(out, m_offset, m_size);
 }
 
-bool JSColloBlob::appendObjectURLBackingStores(WTF::Vector<BlobObjectURLBackingStore>& out) const
-{
-    return m_storage->appendObjectURLBackingStores(out);
-}
-
 JSColloBlob* JSColloBlob::slice(JSC::VM& vm, JSC::Structure* structure, size_t start, size_t length, String type)
 {
     WTF::Vector<BlobSegment> segments;
@@ -471,15 +448,13 @@ JSC::Structure* JSColloFile::createStructure(JSC::VM& vm, JSC::JSGlobalObject* g
     return JSC::Structure::create(vm, global_object, prototype, JSC::TypeInfo(JSC::ObjectType, StructureFlags), info());
 }
 
-JSColloFile* JSColloFile::create(JSC::VM& vm, JSC::Structure* structure, WTF::Vector<uint8_t>&& bytes, String type,
-    String name, double last_modified)
+JSColloFile* JSColloFile::create(JSC::VM& vm, JSC::Structure* structure, WTF::Ref<BlobStorage>&& storage, size_t offset,
+    size_t size, String type, String name, double last_modified)
 {
-    size_t size = bytes.size();
-    auto storage = BlobStorage::create(WTF::move(bytes));
-    if (!storage)
-        return nullptr;
+    ASSERT(offset <= storage->size());
+    ASSERT(size <= storage->size() - offset);
     auto* object = new (NotNull, JSC::allocateCell<JSColloFile>(vm))
-        JSColloFile(vm, structure, storage.releaseNonNull(), 0, size, WTF::move(type), WTF::move(name), last_modified);
+        JSColloFile(vm, structure, WTF::move(storage), offset, size, WTF::move(type), WTF::move(name), last_modified);
     object->finishCreation(vm);
     return object;
 }
@@ -490,10 +465,7 @@ JSColloFile* JSColloFile::create(JSC::VM& vm, JSC::Structure* structure, WTF::Ve
     auto storage = BlobStorage::create(WTF::move(segments), size);
     if (!storage)
         return nullptr;
-    auto* object = new (NotNull, JSC::allocateCell<JSColloFile>(vm))
-        JSColloFile(vm, structure, storage.releaseNonNull(), 0, size, WTF::move(type), WTF::move(name), last_modified);
-    object->finishCreation(vm);
-    return object;
+    return create(vm, structure, storage.releaseNonNull(), 0, size, WTF::move(type), WTF::move(name), last_modified);
 }
 
 JSColloFile* JSColloFile::createFromBlob(
@@ -1032,24 +1004,23 @@ namespace {
             return adoptRef(*source);
         }
 
-        EncodedJSValue pull(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope) override
+        ReadableStreamPull pull(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope) override
         {
             if (!m_storage || m_position >= m_size) {
                 m_storage = nullptr;
-                return resolvedPromise(
-                    global_object, createReadableStreamReadResult(global_object, JSC::jsUndefined(), true));
+                return ReadableStreamPull::done();
             }
 
             size_t remaining = m_size - m_position;
-            size_t chunk_size = std::min(remaining, default_chunk_size);
+            size_t chunk_size = std::min(remaining, WebApiReadableStreamChunkBytes);
             auto* value = createUint8ArrayCopy(global_object, scope, *m_storage, m_offset + m_position, chunk_size);
-            RETURN_IF_EXCEPTION(scope, {});
+            RETURN_IF_EXCEPTION(scope, ReadableStreamPull::threw());
             if (!value)
-                return {};
+                return ReadableStreamPull::threw();
             m_position += chunk_size;
             if (m_position >= m_size)
                 m_storage = nullptr;
-            return resolvedPromise(global_object, createReadableStreamReadResult(global_object, value, false));
+            return ReadableStreamPull::withChunk(value);
         }
 
         EncodedJSValue cancel(JSC::JSGlobalObject* global_object, JSC::ThrowScope&, JSValue) override
@@ -1134,7 +1105,6 @@ namespace {
         {
         }
 
-        static constexpr size_t default_chunk_size = 64 * 1024;
         WTF::RefPtr<BlobStorage> m_storage;
         size_t m_offset { 0 };
         size_t m_size { 0 };
@@ -1343,13 +1313,17 @@ namespace {
         auto* blob = requireBlob(global_object, scope, call_frame->thisValue());
         RETURN_IF_EXCEPTION(scope, {});
 
+        // The decode refuses such a blob too; refusing it here spares the copy.
         if (blob->size() > WTF::String::MaxLength)
             return rejectedPromise(global_object, JSC::createOutOfMemoryError(global_object));
         WTF::Vector<uint8_t> bytes;
         if (!copyBlobToVector(global_object, scope, *blob, bytes))
             return {};
         RETURN_IF_EXCEPTION(scope, {});
-        return resolvedPromise(global_object, JSC::jsString(vm, decodeUtf8Bytes(bytes.span())));
+        String text;
+        if (!decodeUtf8Bytes(global_object, scope, bytes.span(), text))
+            return {};
+        return resolvedPromise(global_object, JSC::jsString(vm, text));
     }
 
     JSC_DEFINE_HOST_FUNCTION(blobStream, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))

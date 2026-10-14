@@ -1,9 +1,12 @@
 //! Tests of single streams on the codec's `Connection`: response validation,
-//! HPACK encoder poisoning, flow control in both directions, trailers,
-//! interim 1xx responses, resets that must or must not fail a stream, and the
-//! billed-byte meters. Everything runs in memory: tests feed hand-built
-//! server frames, or header lists straight to the response parser, and
-//! inspect the events and the frames the client wrote.
+//! the head event that owns the stream's one header decode, also when an
+//! allocation fails, request heads refused by their worst-case block before
+//! the encoder sees them, flow control in both directions with the checks on
+//! a consumer's acks, trailers, interim 1xx responses, DATA before a head,
+//! and resets that must or must not fail a stream. Everything runs in
+//! memory: tests feed hand-built server frames, or header lists straight to
+//! the response parser, and inspect the events and the frames the client
+//! wrote.
 
 const std = @import("std");
 const egress_http2 = @import("collo_egress_client").http2;
@@ -37,24 +40,29 @@ test "egress http2 response parser validates status and content length" {
     }, false);
     try std.testing.expectEqual(@as(u16, 200), head.status_code);
     try std.testing.expectEqual(@as(?usize, 5), head.content_length);
+    try std.testing.expectEqual(@as(usize, 2), head.regular_headers.len);
+    try std.testing.expectEqualStrings("content-length", head.regular_headers[0].name);
 
-    var acc = egress_http2.ResponseAccumulator.init(std.testing.allocator, 16);
-    defer acc.deinit();
-    try acc.receiveHead(head);
-    try acc.receiveData("hel", false);
-    try std.testing.expectError(error.Http2ContentLengthMismatch, acc.receiveData("!", true));
+    var short = egress_http2.ResponseState.init(16);
+    try std.testing.expectEqual(egress_http2.ResponseState.HeadKind.final, try short.receiveHead(head));
+    try short.receiveData(3, false);
+    try std.testing.expectError(error.Http2ContentLengthMismatch, short.receiveData(1, true));
 
-    var ok = egress_http2.ResponseAccumulator.init(std.testing.allocator, 16);
-    defer ok.deinit();
+    var ok = egress_http2.ResponseState.init(16);
     head = try egress_http2.parseResponseHead(&.{
         .{ .name = ":status", .value = "200" },
         .{ .name = "content-length", .value = "5" },
     }, false);
-    try ok.receiveHead(head);
-    try ok.receiveData("hello", true);
-    const body = try ok.takeBody();
-    defer std.testing.allocator.free(body);
-    try std.testing.expectEqualStrings("hello", body);
+    _ = try ok.receiveHead(head);
+    try ok.receiveData(5, true);
+    try std.testing.expect(ok.complete);
+    try std.testing.expectEqual(@as(usize, 5), ok.received_body_bytes);
+
+    // An interim head leaves the state waiting for the final one.
+    var waiting = egress_http2.ResponseState.init(16);
+    const interim = try egress_http2.parseResponseHead(&.{.{ .name = ":status", .value = "103" }}, false);
+    try std.testing.expectEqual(egress_http2.ResponseState.HeadKind.interim, try waiting.receiveHead(interim));
+    try std.testing.expectError(error.Http2MalformedResponse, waiting.receiveData(1, false));
 }
 
 test "egress http2 response parser rejects malformed header blocks" {
@@ -86,33 +94,85 @@ test "egress http2 response parser refuses te in a head and in trailers, even as
     }));
 }
 
-test "egress http2 hpack encoder poison closes connection for reuse" {
+test "an oversized request head fails alone and never reaches the connection's encoder" {
     var sent_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer sent_wire.deinit();
-    var connection = try egress_http2.Connection.init(std.testing.allocator);
+    var connection = try egress_http2.Connection.init(std.testing.allocator, &test_support.scratch);
     defer connection.deinit();
 
+    // '~' has a 13-bit Huffman code, so the value would go out raw, and the
+    // block could not fit the request block cap. The fields before it are
+    // ones an encoder that ran would have added to its dynamic table.
     const large = try std.testing.allocator.alloc(u8, 64 * 1024 - 1);
     defer std.testing.allocator.free(large);
     @memset(large, '~');
-
-    try std.testing.expectError(error.HpackEncoderPoisoned, connection.openRequest(&sent_wire.writer, .{
+    const oversized: egress_http2.RequestHead = .{
         .method = "GET",
         .scheme = "https",
         .authority = "demo.example.test",
-        .path = "/poison",
+        .path = "/oversized",
         .headers = &.{
+            .{ .name = "x-before", .value = "indexed" },
             .{ .name = "x-large", .value = large },
         },
-    }, 16));
-    try std.testing.expect(connection.closing);
+    };
+    try std.testing.expectError(error.Http2RequestHeadersTooLarge, egress_http2.validateRequestHead(oversized));
+    try std.testing.expectError(error.Http2RequestHeadersTooLarge, connection.openRequest(&sent_wire.writer, oversized, 16));
+    try std.testing.expect(!connection.closing);
+    try std.testing.expect(connection.canOpenStream());
 
-    try std.testing.expectError(error.Http2ConnectionClosed, connection.openRequest(&sent_wire.writer, .{
+    // The next block is the first the peer sees. A fresh decoder takes it
+    // only if the encoder's table holds nothing from the refused head, which
+    // its fields would otherwise refer to.
+    const stream_id = try connection.openRequest(&sent_wire.writer, .{
         .method = "GET",
         .scheme = "https",
         .authority = "demo.example.test",
-        .path = "/after",
-    }, 16));
+        .path = "/oversized",
+        .headers = &.{.{ .name = "x-before", .value = "indexed" }},
+    }, 16);
+    var decoder = try hpack.Decoder.init();
+    defer decoder.deinit();
+    var decoded = try decoder.decodeBlock(
+        std.testing.allocator,
+        test_support.scratch.decode,
+        try test_support.clientHeaderBlock(sent_wire.written(), stream_id),
+        16,
+        4096,
+    );
+    defer decoded.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 5), decoded.headers.len);
+    try std.testing.expectEqualStrings(":authority", decoded.headers[2].name);
+    try std.testing.expectEqualStrings("demo.example.test", decoded.headers[2].value);
+    try std.testing.expectEqualStrings("x-before", decoded.headers[4].name);
+    try std.testing.expectEqualStrings("indexed", decoded.headers[4].value);
+}
+
+test "a request head's worst-case block, not its compressed size, decides whether it fits" {
+    // Every field counts as a raw literal: one prefix byte, then each
+    // string's length byte or bytes and its bytes.
+    const value = try std.testing.allocator.alloc(u8, 32 * 1024);
+    defer std.testing.allocator.free(value);
+    @memset(value, 'a');
+    try egress_http2.validateRequestHead(.{
+        .method = "GET",
+        .scheme = "https",
+        .authority = "demo.example.test",
+        .path = "/",
+        .headers = &.{.{ .name = "x-half", .value = value }},
+    });
+    // Two such values compress far below the cap, since 'a' takes five bits,
+    // but their raw form does not fit it.
+    try std.testing.expectError(error.Http2RequestHeadersTooLarge, egress_http2.validateRequestHead(.{
+        .method = "GET",
+        .scheme = "https",
+        .authority = "demo.example.test",
+        .path = "/",
+        .headers = &.{
+            .{ .name = "x-first", .value = value },
+            .{ .name = "x-second", .value = value },
+        },
+    }));
 }
 
 test "egress http2 client drives settings response and body flow control" {
@@ -126,7 +186,7 @@ test "egress http2 client drives settings response and body flow control" {
     var reader = std.Io.Reader.fixed(server_wire.written());
     var sent_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer sent_wire.deinit();
-    var connection = try egress_http2.Connection.init(std.testing.allocator);
+    var connection = try egress_http2.Connection.init(std.testing.allocator, &test_support.scratch);
     defer connection.deinit();
     const stream_id = try connection.openRequest(&sent_wire.writer, .{
         .method = "GET",
@@ -144,10 +204,6 @@ test "egress http2 client drives settings response and body flow control" {
     try std.testing.expectEqualStrings("5", result.headers[0].value);
     try std.testing.expectEqualStrings(h2.client_connection_preface, sent_wire.written()[0..h2.client_connection_preface.len]);
     try std.testing.expectEqual(@as(usize, 1), countClientFrames(sent_wire.written(), .window_update));
-    try std.testing.expectEqual(
-        @as(u64, @intCast(sent_wire.written().len + server_wire.written().len)),
-        result.wire_bytes,
-    );
 }
 
 test "egress http2 client accepts padded data and priority headers" {
@@ -163,7 +219,7 @@ test "egress http2 client accepts padded data and priority headers" {
     var reader = std.Io.Reader.fixed(server_wire.written());
     var sent_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer sent_wire.deinit();
-    var connection = try egress_http2.Connection.init(std.testing.allocator);
+    var connection = try egress_http2.Connection.init(std.testing.allocator, &test_support.scratch);
     defer connection.deinit();
     const stream_id = try connection.openRequest(&sent_wire.writer, .{
         .method = "GET",
@@ -195,7 +251,7 @@ test "egress http2 client batches receive window updates" {
         .connection_receive_window = 4 * 1024 * 1024,
         .max_pending_body_credit_per_stream = 1024 * 1024,
         .max_pending_body_credit_per_connection = 4 * 1024 * 1024,
-    });
+    }, &test_support.scratch);
     defer connection.deinit();
     const stream_id = try connection.openRequest(&sent_wire.writer, .{
         .method = "GET",
@@ -218,7 +274,7 @@ test "egress http2 client requires initial peer settings" {
     var sent_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer sent_wire.deinit();
 
-    var connection = try egress_http2.Connection.init(std.testing.allocator);
+    var connection = try egress_http2.Connection.init(std.testing.allocator, &test_support.scratch);
     defer connection.deinit();
     const stream_id = try connection.openRequest(&sent_wire.writer, .{
         .method = "GET",
@@ -243,7 +299,7 @@ test "egress http2 client resumes a large upload after window update" {
     var sent_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer sent_wire.deinit();
 
-    var connection = try egress_http2.Connection.init(std.testing.allocator);
+    var connection = try egress_http2.Connection.init(std.testing.allocator, &test_support.scratch);
     defer connection.deinit();
     const stream_id = try connection.openRequest(&sent_wire.writer, .{
         .method = "POST",
@@ -264,7 +320,7 @@ test "egress http2 upload emits DATA frames without staging a joined body" {
     @memset(body, 'u');
     var sent_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer sent_wire.deinit();
-    var connection = try egress_http2.Connection.init(std.testing.allocator);
+    var connection = try egress_http2.Connection.init(std.testing.allocator, &test_support.scratch);
     defer connection.deinit();
 
     _ = try connection.openRequest(
@@ -301,7 +357,7 @@ test "egress http2 client accepts validated trailing headers" {
     var reader = std.Io.Reader.fixed(server_wire.written());
     var sent_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer sent_wire.deinit();
-    var connection = try egress_http2.Connection.init(std.testing.allocator);
+    var connection = try egress_http2.Connection.init(std.testing.allocator, &test_support.scratch);
     defer connection.deinit();
     const stream_id = try connection.openRequest(&sent_wire.writer, .{
         .method = "GET",
@@ -328,7 +384,7 @@ test "egress http2 connection reuses one preface across sequential streams" {
     var reader = std.Io.Reader.fixed(server_wire.written());
     var sent_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer sent_wire.deinit();
-    var connection = try egress_http2.Connection.init(std.testing.allocator);
+    var connection = try egress_http2.Connection.init(std.testing.allocator, &test_support.scratch);
     defer connection.deinit();
 
     const first_stream = try connection.openRequest(&sent_wire.writer, .{
@@ -375,7 +431,7 @@ test "egress http2 event reader reports headers before body completion" {
     var reader = std.Io.Reader.fixed(server_wire.written());
     var sent_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer sent_wire.deinit();
-    var connection = try egress_http2.Connection.init(std.testing.allocator);
+    var connection = try egress_http2.Connection.init(std.testing.allocator, &test_support.scratch);
     defer connection.deinit();
 
     const stream_id = try connection.openRequest(&sent_wire.writer, .{
@@ -391,15 +447,15 @@ test "egress http2 event reader reports headers before body completion" {
         .path = "/other",
     }, 16);
 
-    var head = try connection.readNextEvent(&reader, &sent_wire.writer);
+    var head = try test_support.readEvent(&connection, &reader, &sent_wire.writer);
     defer head.deinit();
     switch (head) {
         .head => |event| {
             try std.testing.expectEqual(stream_id, event.stream_id);
-            try std.testing.expectEqual(@as(u16, 200), event.result.status_code);
-            try std.testing.expect(!event.result.end_stream);
-            try std.testing.expectEqualStrings("x-test", event.result.headers[1].name);
-            try std.testing.expectEqualStrings("early", event.result.headers[1].value);
+            try std.testing.expectEqual(@as(u16, 200), event.status_code);
+            try std.testing.expect(!event.end_stream);
+            try std.testing.expectEqualStrings("x-test", event.headers[1].name);
+            try std.testing.expectEqualStrings("early", event.headers[1].value);
         },
         .progress => return error.UnexpectedHttp2Progress,
         .end => return error.UnexpectedHttp2End,
@@ -407,7 +463,7 @@ test "egress http2 event reader reports headers before body completion" {
         .body_chunk => return error.UnexpectedHttp2BodyChunk,
     }
 
-    var chunk = try connection.readNextEvent(&reader, &sent_wire.writer);
+    var chunk = try test_support.readEvent(&connection, &reader, &sent_wire.writer);
     defer chunk.deinit();
     switch (chunk) {
         .body_chunk => |event| {
@@ -422,13 +478,13 @@ test "egress http2 event reader reports headers before body completion" {
         .progress => return error.UnexpectedHttp2Progress,
         .failure => return error.UnexpectedHttp2Failure,
     }
-    var second_head = try connection.readNextEvent(&reader, &sent_wire.writer);
+    var second_head = try test_support.readEvent(&connection, &reader, &sent_wire.writer);
     defer second_head.deinit();
     switch (second_head) {
         .head => |event| {
             try std.testing.expectEqual(second_stream_id, event.stream_id);
-            try std.testing.expect(event.result.end_stream);
-            try std.testing.expectEqualStrings("other", event.result.headers[1].value);
+            try std.testing.expect(event.end_stream);
+            try std.testing.expectEqualStrings("other", event.headers[1].value);
         },
         .progress => return error.UnexpectedHttp2Progress,
         .end => return error.UnexpectedHttp2End,
@@ -465,7 +521,7 @@ test "egress http2 interim 1xx surfaces progress before the final head" {
     var reader = std.Io.Reader.fixed(server_wire.written());
     var sent_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer sent_wire.deinit();
-    var connection = try egress_http2.Connection.init(std.testing.allocator);
+    var connection = try egress_http2.Connection.init(std.testing.allocator, &test_support.scratch);
     defer connection.deinit();
 
     const stream_id = try connection.openRequest(&sent_wire.writer, .{
@@ -477,21 +533,21 @@ test "egress http2 interim 1xx surfaces progress before the final head" {
 
     // The 103 block never becomes the head, but it must surface as progress
     // because the engine restarts its stall clock on it.
-    var progress = try connection.readNextEvent(&reader, &sent_wire.writer);
+    var progress = try test_support.readEvent(&connection, &reader, &sent_wire.writer);
     defer progress.deinit();
     switch (progress) {
         .progress => |event| try std.testing.expectEqual(stream_id, event.stream_id),
         else => return error.ExpectedHttp2Progress,
     }
 
-    var head = try connection.readNextEvent(&reader, &sent_wire.writer);
+    var head = try test_support.readEvent(&connection, &reader, &sent_wire.writer);
     defer head.deinit();
     switch (head) {
         .head => |event| {
             try std.testing.expectEqual(stream_id, event.stream_id);
-            try std.testing.expectEqual(@as(u16, 200), event.result.status_code);
+            try std.testing.expectEqual(@as(u16, 200), event.status_code);
             // The interim headers must not leak into the final response.
-            for (event.result.headers) |header|
+            for (event.headers) |header|
                 try std.testing.expect(!std.mem.eql(u8, header.name, "link"));
         },
         else => return error.ExpectedHttp2Head,
@@ -509,7 +565,7 @@ test "egress http2 interim 1xx with END_STREAM fails the stream" {
     var reader = std.Io.Reader.fixed(server_wire.written());
     var sent_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer sent_wire.deinit();
-    var connection = try egress_http2.Connection.init(std.testing.allocator);
+    var connection = try egress_http2.Connection.init(std.testing.allocator, &test_support.scratch);
     defer connection.deinit();
 
     const stream_id = try connection.openRequest(&sent_wire.writer, .{
@@ -519,7 +575,7 @@ test "egress http2 interim 1xx with END_STREAM fails the stream" {
         .path = "/early-hints-end",
     }, 16);
 
-    var failure = try connection.readNextEvent(&reader, &sent_wire.writer);
+    var failure = try test_support.readEvent(&connection, &reader, &sent_wire.writer);
     defer failure.deinit();
     switch (failure) {
         .failure => |event| {
@@ -546,7 +602,7 @@ test "egress http2 cancel restores connection credit for delivered body chunk" {
     var connection = try egress_http2.Connection.initWithLimits(std.testing.allocator, .{
         .connection_receive_window = h2.default_initial_window_size,
         .receive_window_update_threshold = 1,
-    });
+    }, &test_support.scratch);
     defer connection.deinit();
 
     const stream_id = try connection.openRequest(&sent_wire.writer, .{
@@ -556,14 +612,14 @@ test "egress http2 cancel restores connection credit for delivered body chunk" {
         .path = "/cancel-after-chunk",
     }, 16);
 
-    var head = try connection.readNextEvent(&reader, &sent_wire.writer);
+    var head = try test_support.readEvent(&connection, &reader, &sent_wire.writer);
     defer head.deinit();
     switch (head) {
         .head => {},
         else => return error.ExpectedHttp2Head,
     }
 
-    var chunk = try connection.readNextEvent(&reader, &sent_wire.writer);
+    var chunk = try test_support.readEvent(&connection, &reader, &sent_wire.writer);
     defer chunk.deinit();
     switch (chunk) {
         .body_chunk => |event| {
@@ -593,7 +649,7 @@ test "egress http2 trailers defer end behind body credit acks" {
     var reader = std.Io.Reader.fixed(server_wire.written());
     var sent_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer sent_wire.deinit();
-    var connection = try egress_http2.Connection.init(std.testing.allocator);
+    var connection = try egress_http2.Connection.init(std.testing.allocator, &test_support.scratch);
     defer connection.deinit();
     const stream_id = try connection.openRequest(&sent_wire.writer, .{
         .method = "GET",
@@ -602,14 +658,14 @@ test "egress http2 trailers defer end behind body credit acks" {
         .path = "/trailing",
     }, 16);
 
-    var head = try connection.readNextEvent(&reader, &sent_wire.writer);
+    var head = try test_support.readEvent(&connection, &reader, &sent_wire.writer);
     defer head.deinit();
     switch (head) {
-        .head => |event| try std.testing.expect(!event.result.end_stream),
+        .head => |event| try std.testing.expect(!event.end_stream),
         else => return error.ExpectedHttp2Head,
     }
 
-    var chunk = try connection.readNextEvent(&reader, &sent_wire.writer);
+    var chunk = try test_support.readEvent(&connection, &reader, &sent_wire.writer);
     defer chunk.deinit();
     switch (chunk) {
         .body_chunk => |event| {
@@ -657,7 +713,7 @@ test "egress http2 reset after end stream keeps a credit-deferred stream alive" 
     var reader = std.Io.Reader.fixed(server_wire.written());
     var sent_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer sent_wire.deinit();
-    var connection = try egress_http2.Connection.init(std.testing.allocator);
+    var connection = try egress_http2.Connection.init(std.testing.allocator, &test_support.scratch);
     defer connection.deinit();
     const stream_id = try connection.openRequest(&sent_wire.writer, .{
         .method = "GET",
@@ -666,13 +722,13 @@ test "egress http2 reset after end stream keeps a credit-deferred stream alive" 
         .path = "/reset-after-end",
     }, 16);
 
-    var head = try connection.readNextEvent(&reader, &sent_wire.writer);
+    var head = try test_support.readEvent(&connection, &reader, &sent_wire.writer);
     defer head.deinit();
     switch (head) {
         .head => {},
         else => return error.ExpectedHttp2Head,
     }
-    var chunk = try connection.readNextEvent(&reader, &sent_wire.writer);
+    var chunk = try test_support.readEvent(&connection, &reader, &sent_wire.writer);
     defer chunk.deinit();
     switch (chunk) {
         .body_chunk => |event| try std.testing.expect(event.end_stream),
@@ -715,7 +771,7 @@ test "egress http2 peer reset restores pending connection credit" {
     var connection = try egress_http2.Connection.initWithLimits(std.testing.allocator, .{
         .connection_receive_window = h2.default_initial_window_size,
         .receive_window_update_threshold = 1,
-    });
+    }, &test_support.scratch);
     defer connection.deinit();
     const stream_id = try connection.openRequest(&sent_wire.writer, .{
         .method = "GET",
@@ -724,13 +780,13 @@ test "egress http2 peer reset restores pending connection credit" {
         .path = "/reset-mid-body",
     }, 16);
 
-    var head = try connection.readNextEvent(&reader, &sent_wire.writer);
+    var head = try test_support.readEvent(&connection, &reader, &sent_wire.writer);
     defer head.deinit();
     switch (head) {
         .head => {},
         else => return error.ExpectedHttp2Head,
     }
-    var chunk = try connection.readNextEvent(&reader, &sent_wire.writer);
+    var chunk = try test_support.readEvent(&connection, &reader, &sent_wire.writer);
     defer chunk.deinit();
     switch (chunk) {
         .body_chunk => |event| try std.testing.expectEqual(@as(usize, 5), event.flow_credit),
@@ -759,6 +815,125 @@ test "egress http2 peer reset restores pending connection credit" {
     try std.testing.expectEqual(@as(usize, 0), connection.pending_body_credit_total);
 }
 
+/// Opens a GET on `connection`, then feeds it the server's SETTINGS and a
+/// final head without END_STREAM for that stream. Returns the stream id.
+fn openStreamWithHead(connection: *egress_http2.Connection, writer: *std.Io.Writer) !u32 {
+    const stream_id = try connection.openRequest(writer, .{
+        .method = "GET",
+        .scheme = "https",
+        .authority = "demo.example.test",
+        .path = "/credit",
+    }, 64);
+
+    var settings_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer settings_wire.deinit();
+    try appendSettingsFrame(&settings_wire.writer);
+    var settings_frame = try frameFromWire(settings_wire.written());
+    defer settings_frame.deinit();
+    try std.testing.expect((try connection.processEventFrame(writer, &settings_frame)) == null);
+
+    var headers_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer headers_wire.deinit();
+    try appendHeaderFramesForStream(&headers_wire.writer, stream_id, &.{.{ .name = ":status", .value = "200" }}, false);
+    var headers_frame = try frameFromWire(headers_wire.written());
+    defer headers_frame.deinit();
+    var head = (try connection.processEventFrame(writer, &headers_frame)) orelse return error.ExpectedHttp2Head;
+    defer head.deinit();
+    if (head != .head)
+        return error.ExpectedHttp2Head;
+    return stream_id;
+}
+
+/// Feeds `connection` one DATA frame for `stream_id` and returns the body
+/// chunk it yields, which the caller deinits.
+fn receiveBodyChunk(
+    connection: *egress_http2.Connection,
+    writer: *std.Io.Writer,
+    stream_id: u32,
+    bytes: []const u8,
+    end_stream: bool,
+) !egress_http2.Event {
+    var data_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer data_wire.deinit();
+    try appendDataFrameForStream(&data_wire.writer, stream_id, bytes, end_stream);
+    var frame = try frameFromWire(data_wire.written());
+    defer frame.deinit();
+    var event = (try connection.processEventFrame(writer, &frame)) orelse return error.ExpectedHttp2BodyChunk;
+    if (event != .body_chunk) {
+        event.deinit();
+        return error.ExpectedHttp2BodyChunk;
+    }
+    return event;
+}
+
+test "an ack above the credit a stream holds fails before any window reopens" {
+    var sent_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer sent_wire.deinit();
+    // With a one-byte threshold every acked byte goes out as WINDOW_UPDATE
+    // at once, on both windows, so a window the ack reopened would show.
+    var connection = try egress_http2.Connection.initWithLimits(std.testing.allocator, .{
+        .connection_receive_window = h2.default_initial_window_size,
+        .receive_window_update_threshold = 1,
+    }, &test_support.scratch);
+    defer connection.deinit();
+    const stream_id = try openStreamWithHead(&connection, &sent_wire.writer);
+    var chunk = try receiveBodyChunk(&connection, &sent_wire.writer, stream_id, "hello", false);
+    defer chunk.deinit();
+    try std.testing.expectEqual(@as(usize, 5), chunk.body_chunk.flow_credit);
+
+    const sent_before = sent_wire.written().len;
+    try std.testing.expectError(
+        error.Http2AckExceedsPendingCredit,
+        connection.ackReceivedData(&sent_wire.writer, stream_id, 6, true),
+    );
+    try std.testing.expectEqual(sent_before, sent_wire.written().len);
+    try std.testing.expectEqual(@as(usize, 5), connection.pending_body_credit_total);
+
+    // The stream still holds its credit, and acking exactly that reopens
+    // each window by exactly that much.
+    try std.testing.expect((try connection.ackReceivedData(&sent_wire.writer, stream_id, 5, true)) == null);
+    try std.testing.expectEqual(@as(u32, 5), try sumClientWindowUpdateIncrements(sent_wire.written(), 0));
+    try std.testing.expectEqual(@as(u32, 5), try sumClientWindowUpdateIncrements(sent_wire.written(), stream_id));
+    try std.testing.expectEqual(@as(usize, 0), connection.pending_body_credit_total);
+}
+
+test "one ack returns several chunks' credit, and the last chunk's own ack ends the stream" {
+    var sent_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer sent_wire.deinit();
+    var connection = try egress_http2.Connection.initWithLimits(std.testing.allocator, .{
+        .connection_receive_window = h2.default_initial_window_size,
+        .receive_window_update_threshold = 1,
+    }, &test_support.scratch);
+    defer connection.deinit();
+    const stream_id = try openStreamWithHead(&connection, &sent_wire.writer);
+
+    // A consumer may sum the credits that reopen the stream window into one
+    // ack, and ack the chunk that ended the stream, whose stream window
+    // needs no update, on its own.
+    var first = try receiveBodyChunk(&connection, &sent_wire.writer, stream_id, "ab", false);
+    defer first.deinit();
+    var second = try receiveBodyChunk(&connection, &sent_wire.writer, stream_id, "cde", false);
+    defer second.deinit();
+    var last = try receiveBodyChunk(&connection, &sent_wire.writer, stream_id, "f", true);
+    defer last.deinit();
+    try std.testing.expect(first.body_chunk.update_stream_window);
+    try std.testing.expect(second.body_chunk.update_stream_window);
+    try std.testing.expect(!last.body_chunk.update_stream_window);
+
+    const summed = first.body_chunk.flow_credit + second.body_chunk.flow_credit;
+    try std.testing.expect((try connection.ackReceivedData(&sent_wire.writer, stream_id, summed, true)) == null);
+    var done = (try connection.ackReceivedData(&sent_wire.writer, stream_id, last.body_chunk.flow_credit, false)) orelse
+        return error.ExpectedHttp2End;
+    defer done.deinit();
+    switch (done) {
+        .end => |event| try std.testing.expectEqual(stream_id, event.stream_id),
+        else => return error.ExpectedHttp2End,
+    }
+    try std.testing.expectEqual(@as(usize, 0), connection.pending_body_credit_total);
+    try std.testing.expectEqual(@as(u32, 6), try sumClientWindowUpdateIncrements(sent_wire.written(), 0));
+    try std.testing.expectEqual(@as(u32, 5), try sumClientWindowUpdateIncrements(sent_wire.written(), stream_id));
+}
+
 test "egress http2 rejects DATA beyond stream receive window" {
     var sent_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer sent_wire.deinit();
@@ -767,7 +942,7 @@ test "egress http2 rejects DATA beyond stream receive window" {
         .connection_receive_window = h2.default_initial_window_size,
         .max_pending_body_credit_per_stream = 64,
         .max_pending_body_credit_per_connection = 1024,
-    });
+    }, &test_support.scratch);
     defer connection.deinit();
     const stream_id = try connection.openRequest(&sent_wire.writer, .{
         .method = "GET",
@@ -817,7 +992,7 @@ test "egress http2 rejects DATA beyond connection receive window" {
         .connection_receive_window = h2.default_initial_window_size,
         .max_pending_body_credit_per_stream = 128 * 1024,
         .max_pending_body_credit_per_connection = 128 * 1024,
-    });
+    }, &test_support.scratch);
     defer connection.deinit();
     const stream_id = try connection.openRequest(&sent_wire.writer, .{
         .method = "GET",
@@ -871,53 +1046,126 @@ test "egress http2 rejects DATA beyond connection receive window" {
     );
 }
 
-// The billed meters count the HTTP payload as sent: HPACK header blocks and
-// DATA payload in both directions. Frame headers, padding, the preface,
-// SETTINGS, WINDOW_UPDATE and interim 1xx blocks are transport cost and must
-// never appear in them.
-
-test "egress http2 billed meters count header blocks and body payload only" {
-    var server_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer server_wire.deinit();
-    try appendSettingsFrame(&server_wire.writer);
-    try appendResponseFrames(&server_wire.writer, "200", &.{
-        .{ .name = "content-length", .value = "5" },
-    }, "hello");
-
-    var reader = std.Io.Reader.fixed(server_wire.written());
+test "a head event owns the stream's one header decode and outlives a later header block" {
     var sent_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer sent_wire.deinit();
-    var connection = try egress_http2.Connection.init(std.testing.allocator);
+    var connection = try egress_http2.Connection.init(std.testing.allocator, &test_support.scratch);
     defer connection.deinit();
-    const opened = try connection.openRequestAllocMetered(&sent_wire.writer, .{
+    const stream_id = try connection.openRequest(&sent_wire.writer, .{
         .method = "GET",
         .scheme = "https",
         .authority = "demo.example.test",
-        .path = "/billed",
-    }, 16, std.testing.allocator);
-    // The request side bills, at open, exactly the HEADERS payload on the
-    // wire, which is the HPACK block; the preface, SETTINGS and window
-    // updates are excluded.
-    try std.testing.expectEqual(
-        @as(u64, @intCast(try sumClientFramePayloadBytes(sent_wire.written(), .headers))),
-        opened.billed_sent,
-    );
+        .path = "/owned-head",
+    }, 64);
+    const later_stream_id = try connection.openRequest(&sent_wire.writer, .{
+        .method = "GET",
+        .scheme = "https",
+        .authority = "demo.example.test",
+        .path = "/later-head",
+    }, 64);
 
-    var result = try readCollectedResponse(std.testing.allocator, &connection, &reader, &sent_wire.writer, opened.stream_id);
-    defer result.deinit();
-    const head_block_len = try test_support.encodedHeaderBlockLen(&.{
+    var settings_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer settings_wire.deinit();
+    try appendSettingsFrame(&settings_wire.writer);
+    var settings_frame = try frameFromWire(settings_wire.written());
+    defer settings_frame.deinit();
+    try std.testing.expect((try connection.processEventFrame(&sent_wire.writer, &settings_frame)) == null);
+
+    var headers_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer headers_wire.deinit();
+    try appendHeaderFramesForStream(&headers_wire.writer, stream_id, &.{
         .{ .name = ":status", .value = "200" },
-        .{ .name = "content-length", .value = "5" },
-    });
-    try std.testing.expectEqual(@as(u64, @intCast(head_block_len)), result.billed_head_bytes);
-    try std.testing.expectEqual(opened.billed_sent, result.billed_sent);
-    try std.testing.expectEqual(@as(u64, @intCast(head_block_len + 5)), result.billed_received);
-    // Billed stays strictly below the plaintext wire counter; the difference
-    // is the framing and control overhead, which is cost.
-    try std.testing.expect(result.billed_sent + result.billed_received < result.wire_bytes);
+        .{ .name = "content-type", .value = "text/plain" },
+        .{ .name = "x-trace", .value = "abc" },
+    }, false);
+    var headers_frame = try frameFromWire(headers_wire.written());
+    defer headers_frame.deinit();
+    var head = (try connection.processEventFrame(&sent_wire.writer, &headers_frame)) orelse
+        return error.ExpectedHttp2Head;
+    defer head.deinit();
+
+    // The later block runs through the same decode scratch and the same
+    // pending-block buffer, with fields of the same lengths in the same
+    // order, so a head that pointed into either would now read the later
+    // values.
+    var later_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer later_wire.deinit();
+    try appendHeaderFramesForStream(&later_wire.writer, later_stream_id, &.{
+        .{ .name = ":status", .value = "404" },
+        .{ .name = "content-type", .value = "image/webp" },
+        .{ .name = "x-trace", .value = "xyz" },
+    }, false);
+    var later_frame = try frameFromWire(later_wire.written());
+    defer later_frame.deinit();
+    var later = (try connection.processEventFrame(&sent_wire.writer, &later_frame)) orelse
+        return error.ExpectedHttp2Head;
+    defer later.deinit();
+    switch (later) {
+        .head => |event| {
+            try std.testing.expectEqual(later_stream_id, event.stream_id);
+            try std.testing.expectEqualStrings("image/webp", event.headers[0].value);
+            try std.testing.expectEqualStrings("xyz", event.headers[1].value);
+        },
+        else => return error.ExpectedHttp2Head,
+    }
+
+    switch (head) {
+        .head => |event| {
+            try std.testing.expectEqual(@as(u16, 200), event.status_code);
+            // The regular fields only: `:status` stays in the block.
+            try std.testing.expectEqual(@as(usize, 2), event.headers.len);
+            try std.testing.expectEqual(event.block.headers.len, event.headers.len + 1);
+            try std.testing.expectEqualStrings(":status", event.block.headers[0].name);
+            try std.testing.expectEqualStrings("content-type", event.headers[0].name);
+            try std.testing.expectEqualStrings("text/plain", event.headers[0].value);
+            try std.testing.expectEqualStrings("x-trace", event.headers[1].name);
+            try std.testing.expectEqualStrings("abc", event.headers[1].value);
+        },
+        else => return error.ExpectedHttp2Head,
+    }
 }
 
-test "egress http2 billed meters count a bodyless 204 as head block only" {
+/// Reads one head through a connection that takes every allocation from
+/// `allocator`: the request, the server's SETTINGS acknowledgement, the
+/// pending header block and the head's decode.
+fn decodeOneHead(allocator: std.mem.Allocator, server_frames: []const u8) !void {
+    var sent_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer sent_wire.deinit();
+    var connection = try egress_http2.Connection.init(allocator, &test_support.scratch);
+    defer connection.deinit();
+    _ = try connection.openRequest(&sent_wire.writer, .{
+        .method = "GET",
+        .scheme = "https",
+        .authority = "demo.example.test",
+        .path = "/allocation-failure",
+    }, 16);
+    var reader = std.Io.Reader.fixed(server_frames);
+    var event = try test_support.readEvent(&connection, &reader, &sent_wire.writer);
+    defer event.deinit();
+    switch (event) {
+        .head => |head| {
+            try std.testing.expectEqual(@as(u16, 200), head.status_code);
+            try std.testing.expectEqual(@as(usize, 2), head.headers.len);
+            try std.testing.expectEqualStrings("x-trace", head.headers[1].name);
+            try std.testing.expectEqualStrings("abc", head.headers[1].value);
+        },
+        else => return error.ExpectedHttp2Head,
+    }
+}
+
+test "a head decode that runs out of memory at any allocation keeps nothing it took" {
+    var server_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer server_wire.deinit();
+    try appendSettingsFrame(&server_wire.writer);
+    try appendHeaderFramesForStream(&server_wire.writer, 1, &.{
+        .{ .name = ":status", .value = "200" },
+        .{ .name = "content-type", .value = "text/plain" },
+        .{ .name = "x-trace", .value = "abc" },
+    }, false);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, decodeOneHead, .{server_wire.written()});
+}
+
+test "a head that ends its stream surfaces the stream's end on a zero-credit ack" {
     var server_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer server_wire.deinit();
     try appendSettingsFrame(&server_wire.writer);
@@ -926,158 +1174,183 @@ test "egress http2 billed meters count a bodyless 204 as head block only" {
     var reader = std.Io.Reader.fixed(server_wire.written());
     var sent_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer sent_wire.deinit();
-    var connection = try egress_http2.Connection.init(std.testing.allocator);
+    var connection = try egress_http2.Connection.init(std.testing.allocator, &test_support.scratch);
     defer connection.deinit();
-    const opened = try connection.openRequestAllocMetered(&sent_wire.writer, .{
+    const stream_id = try connection.openRequest(&sent_wire.writer, .{
         .method = "GET",
         .scheme = "https",
         .authority = "demo.example.test",
         .path = "/nothing",
-    }, 16, std.testing.allocator);
-    var result = try readCollectedResponse(std.testing.allocator, &connection, &reader, &sent_wire.writer, opened.stream_id);
-    defer result.deinit();
+    }, 16);
 
-    try std.testing.expectEqual(@as(u16, 204), result.status_code);
-    const head_block_len = try test_support.encodedHeaderBlockLen(&.{
-        .{ .name = ":status", .value = "204" },
-    });
-    try std.testing.expectEqual(@as(u64, @intCast(head_block_len)), result.billed_received);
-    try std.testing.expectEqual(opened.billed_sent, result.billed_sent);
+    var head = try test_support.readEvent(&connection, &reader, &sent_wire.writer);
+    defer head.deinit();
+    switch (head) {
+        .head => |event| {
+            try std.testing.expectEqual(@as(u16, 204), event.status_code);
+            try std.testing.expect(event.end_stream);
+        },
+        else => return error.ExpectedHttp2Head,
+    }
+    // No credit is outstanding, so the stream waits only for an ack to report
+    // its end; the engine acks zero credit for exactly this.
+    try std.testing.expect(connection.hasActiveStreams());
+    var done = (try connection.ackReceivedData(&sent_wire.writer, stream_id, 0, false)) orelse
+        return error.ExpectedHttp2End;
+    defer done.deinit();
+    switch (done) {
+        .end => |event| try std.testing.expectEqual(stream_id, event.stream_id),
+        else => return error.ExpectedHttp2End,
+    }
+    try std.testing.expect(!connection.hasActiveStreams());
 }
 
-test "egress http2 billed meters exclude interim 1xx header blocks" {
-    var server_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer server_wire.deinit();
-    try appendSettingsFrame(&server_wire.writer);
-    try appendHeaderFrames(&server_wire.writer, &.{
-        .{ .name = ":status", .value = "103" },
-        .{ .name = "link", .value = "</style.css>; rel=preload" },
-    }, false);
-    try appendResponseFrames(&server_wire.writer, "200", &.{
-        .{ .name = "content-length", .value = "5" },
-    }, "hello");
-
-    var reader = std.Io.Reader.fixed(server_wire.written());
+test "DATA before a stream's final head fails only that stream and reopens the connection window" {
     var sent_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer sent_wire.deinit();
-    var connection = try egress_http2.Connection.init(std.testing.allocator);
+    var connection = try egress_http2.Connection.initWithLimits(std.testing.allocator, .{
+        .connection_receive_window = h2.default_initial_window_size,
+        .receive_window_update_threshold = 1,
+    }, &test_support.scratch);
     defer connection.deinit();
-    const opened = try connection.openRequestAllocMetered(&sent_wire.writer, .{
+    const early_stream = try connection.openRequest(&sent_wire.writer, .{
         .method = "GET",
         .scheme = "https",
         .authority = "demo.example.test",
-        .path = "/hints",
-    }, 16, std.testing.allocator);
-    var result = try readCollectedResponse(std.testing.allocator, &connection, &reader, &sent_wire.writer, opened.stream_id);
-    defer result.deinit();
-
-    try std.testing.expectEqual(@as(u16, 200), result.status_code);
-    // Billed received counts only the final head block and the payload; the
-    // 103 block surfaced as progress and is never billed.
-    const head_block_len = try test_support.encodedHeaderBlockLen(&.{
-        .{ .name = ":status", .value = "200" },
-        .{ .name = "content-length", .value = "5" },
-    });
-    try std.testing.expectEqual(@as(u64, @intCast(head_block_len)), result.billed_head_bytes);
-    try std.testing.expectEqual(@as(u64, @intCast(head_block_len + 5)), result.billed_received);
-}
-
-test "egress http2 billed meters count trailer blocks" {
-    var server_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer server_wire.deinit();
-    try appendSettingsFrame(&server_wire.writer);
-    try appendHeaderFrames(&server_wire.writer, &.{
-        .{ .name = ":status", .value = "200" },
-        .{ .name = "content-length", .value = "5" },
-    }, false);
-    const data_wire = try h2.encodeDataFrames(std.testing.allocator, h2.default_max_frame_size, 1, "hello", false);
-    defer std.testing.allocator.free(data_wire);
-    try server_wire.writer.writeAll(data_wire);
-    try appendHeaderFrames(&server_wire.writer, &.{
-        .{ .name = "x-checksum", .value = "ok" },
-    }, true);
-
-    var reader = std.Io.Reader.fixed(server_wire.written());
-    var sent_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer sent_wire.deinit();
-    var connection = try egress_http2.Connection.init(std.testing.allocator);
-    defer connection.deinit();
-    const opened = try connection.openRequestAllocMetered(&sent_wire.writer, .{
+        .path = "/early-data",
+    }, 64);
+    const healthy_stream = try connection.openRequest(&sent_wire.writer, .{
         .method = "GET",
         .scheme = "https",
         .authority = "demo.example.test",
-        .path = "/trailers",
-    }, 16, std.testing.allocator);
-    var result = try readCollectedResponse(std.testing.allocator, &connection, &reader, &sent_wire.writer, opened.stream_id);
-    defer result.deinit();
+        .path = "/healthy",
+    }, 64);
 
-    const head_block_len = try test_support.encodedHeaderBlockLen(&.{
-        .{ .name = ":status", .value = "200" },
-        .{ .name = "content-length", .value = "5" },
-    });
-    const trailer_block_len = try test_support.encodedHeaderBlockLen(&.{
-        .{ .name = "x-checksum", .value = "ok" },
-    });
+    var settings_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer settings_wire.deinit();
+    try appendSettingsFrame(&settings_wire.writer);
+    var settings_frame = try frameFromWire(settings_wire.written());
+    defer settings_frame.deinit();
+    try std.testing.expect((try connection.processEventFrame(&sent_wire.writer, &settings_frame)) == null);
+    const window_updates_before = try sumClientWindowUpdateIncrements(sent_wire.written(), 0);
+
+    var data_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer data_wire.deinit();
+    try appendDataFrameForStream(&data_wire.writer, early_stream, "early", false);
+    var data_frame = try frameFromWire(data_wire.written());
+    defer data_frame.deinit();
+    var failure = (try connection.processEventFrame(&sent_wire.writer, &data_frame)) orelse
+        return error.ExpectedHttp2Failure;
+    defer failure.deinit();
+    switch (failure) {
+        .failure => |event| {
+            try std.testing.expectEqual(early_stream, event.stream_id);
+            try std.testing.expectEqual(error.Http2MalformedResponse, event.err);
+        },
+        else => return error.ExpectedHttp2Failure,
+    }
     try std.testing.expectEqual(
-        @as(u64, @intCast(head_block_len + 5 + trailer_block_len)),
-        result.billed_received,
+        window_updates_before + 5,
+        try sumClientWindowUpdateIncrements(sent_wire.written(), 0),
     );
+    try std.testing.expectEqual(@as(usize, 0), connection.pending_body_credit_total);
+
+    // The other stream on the connection still gets its response.
+    var headers_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer headers_wire.deinit();
+    try appendHeaderFramesForStream(&headers_wire.writer, healthy_stream, &.{
+        .{ .name = ":status", .value = "200" },
+    }, false);
+    var headers_frame = try frameFromWire(headers_wire.written());
+    defer headers_frame.deinit();
+    var head = (try connection.processEventFrame(&sent_wire.writer, &headers_frame)) orelse
+        return error.ExpectedHttp2Head;
+    defer head.deinit();
+    switch (head) {
+        .head => |event| try std.testing.expectEqual(healthy_stream, event.stream_id),
+        else => return error.ExpectedHttp2Head,
+    }
 }
 
-test "egress http2 billed meters strip padding and priority sections" {
-    var server_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer server_wire.deinit();
-    try appendSettingsFrame(&server_wire.writer);
-    try appendPaddedPriorityHeaderFrame(&server_wire.writer, 1, &.{
-        .{ .name = ":status", .value = "200" },
-        .{ .name = "content-length", .value = "5" },
-    }, false, 2);
-    try appendPaddedDataFrame(&server_wire.writer, 1, "hello", true, 3);
+test "two connections sharing one HPACK scratch each keep their own dynamic table" {
+    // Each server encoder indexes its field, so its second block refers to
+    // its connection's dynamic table. The heads arrive interleaved through
+    // the one scratch, as on an engine shard.
+    var first_server = try hpack.Encoder.init();
+    defer first_server.deinit();
+    var second_server = try hpack.Encoder.init();
+    defer second_server.deinit();
 
-    var reader = std.Io.Reader.fixed(server_wire.written());
-    var sent_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer sent_wire.deinit();
-    var connection = try egress_http2.Connection.init(std.testing.allocator);
-    defer connection.deinit();
-    const opened = try connection.openRequestAllocMetered(&sent_wire.writer, .{
-        .method = "GET",
-        .scheme = "https",
-        .authority = "demo.example.test",
-        .path = "/padded",
-    }, 16, std.testing.allocator);
-    var result = try readCollectedResponse(std.testing.allocator, &connection, &reader, &sent_wire.writer, opened.stream_id);
-    defer result.deinit();
+    var first_sent: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer first_sent.deinit();
+    var second_sent: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer second_sent.deinit();
+    var first = try egress_http2.Connection.init(std.testing.allocator, &test_support.scratch);
+    defer first.deinit();
+    var second = try egress_http2.Connection.init(std.testing.allocator, &test_support.scratch);
+    defer second.deinit();
+    try startServedConnection(&first, &first_sent.writer);
+    try startServedConnection(&second, &second_sent.writer);
 
-    // Payload counts; the pad-length octet, padding, and the 5-byte priority
-    // section do not.
-    const head_block_len = try test_support.encodedHeaderBlockLen(&.{
-        .{ .name = ":status", .value = "200" },
-        .{ .name = "content-length", .value = "5" },
-    });
-    try std.testing.expectEqual(@as(u64, @intCast(head_block_len + 5)), result.billed_received);
+    for ([_]u32{ 1, 3 }) |stream_id| {
+        const first_open = try first.openRequest(&first_sent.writer, .{
+            .method = "GET",
+            .scheme = "https",
+            .authority = "first.example.test",
+            .path = "/",
+        }, 16);
+        const second_open = try second.openRequest(&second_sent.writer, .{
+            .method = "GET",
+            .scheme = "https",
+            .authority = "second.example.test",
+            .path = "/",
+        }, 16);
+        try std.testing.expectEqual(stream_id, first_open);
+        try std.testing.expectEqual(stream_id, second_open);
+
+        try expectServedHead(&first, &first_sent.writer, &first_server, stream_id, "first-connection-value");
+        try expectServedHead(&second, &second_sent.writer, &second_server, stream_id, "second-connection-value");
+    }
 }
 
-test "egress http2 billed meters count upload DATA payload" {
-    const body = try std.testing.allocator.alloc(u8, 40 * 1024);
-    defer std.testing.allocator.free(body);
-    @memset(body, 'u');
-    var sent_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer sent_wire.deinit();
-    var connection = try egress_http2.Connection.init(std.testing.allocator);
-    defer connection.deinit();
+fn startServedConnection(connection: *egress_http2.Connection, writer: *std.Io.Writer) !void {
+    var settings_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer settings_wire.deinit();
+    try appendSettingsFrame(&settings_wire.writer);
+    var settings_frame = try frameFromWire(settings_wire.written());
+    defer settings_frame.deinit();
+    try std.testing.expect((try connection.processEventFrame(writer, &settings_frame)) == null);
+}
 
-    const opened = try connection.openRequestAllocMetered(&sent_wire.writer, .{
-        .method = "POST",
-        .scheme = "https",
-        .authority = "demo.example.test",
-        .path = "/upload",
-        .body = body,
-    }, 16, std.testing.allocator);
-
-    // The whole body fits the default send windows, so open reports the
-    // header block plus the upload payload, without DATA frame headers.
-    const headers_payload = try sumClientFramePayloadBytes(sent_wire.written(), .headers);
-    const data_payload = try sumClientFramePayloadBytes(sent_wire.written(), .data);
-    try std.testing.expectEqual(body.len, data_payload);
-    try std.testing.expectEqual(@as(u64, @intCast(headers_payload + data_payload)), opened.billed_sent);
+/// Feeds `connection` a head for `stream_id` that `server` encodes with a
+/// `x-shared` field of `value`, which the server indexes, and expects the
+/// decoded head to carry it, ending the stream through the zero-credit ack.
+fn expectServedHead(
+    connection: *egress_http2.Connection,
+    writer: *std.Io.Writer,
+    server: *hpack.Encoder,
+    stream_id: u32,
+    value: []const u8,
+) !void {
+    var storage: [512]u8 = undefined;
+    const block = try server.encodeHeaders(&storage, &.{
+        .{ .name = ":status", .value = "200" },
+        .{ .name = "x-shared", .value = value },
+    }, storage.len);
+    const wire = try h2.encodeHeadersFrames(std.testing.allocator, h2.default_max_frame_size, stream_id, block, true);
+    defer std.testing.allocator.free(wire);
+    var frame = try frameFromWire(wire);
+    defer frame.deinit();
+    var head = (try connection.processEventFrame(writer, &frame)) orelse return error.ExpectedHttp2Head;
+    defer head.deinit();
+    switch (head) {
+        .head => |event| {
+            try std.testing.expectEqual(stream_id, event.stream_id);
+            try std.testing.expectEqualStrings("x-shared", event.headers[0].name);
+            try std.testing.expectEqualStrings(value, event.headers[0].value);
+        },
+        else => return error.ExpectedHttp2Head,
+    }
+    var done = (try connection.ackReceivedData(writer, stream_id, 0, false)) orelse return error.ExpectedHttp2End;
+    done.deinit();
 }

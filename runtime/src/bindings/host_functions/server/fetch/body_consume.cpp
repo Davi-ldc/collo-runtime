@@ -5,9 +5,10 @@
 // A body too long to decode and an allocation failure throw into the scope instead.
 
 #include "host_functions/server/fetch/body.h"
-#include "host_functions/server/fetch/body_utils.h"
+
 #include "host_functions/runtime/fetch_body.h"
 #include "host_functions/runtime/request_body.h"
+#include "host_functions/server/fetch/body_utils.h"
 #include "host_functions/webapi/files/blob.h"
 #include "host_functions/webapi/streams/readable_stream_consume.h"
 #include "host_functions/webapi/streams/stream_common_private.h"
@@ -158,11 +159,12 @@ JSC::EncodedJSValue BodyState::consumeText(JSC::JSGlobalObject* global_object, J
         // text() decodes the body's UTF-8 bytes, and that decode drops a leading BOM, so a text body drops a leading
         // U+FEFF too.
         return resolvedPromise(global_object, JSC::jsString(global_object->vm(), stripLeadingUtf8Bom(m_text)));
-    case Source::Bytes:
-        if (!ensureDecodedStringSize(global_object, scope, sharedBytesSpan(m_bytes).size()))
+    case Source::Bytes: {
+        WTF::String text;
+        if (!decodeUtf8Bytes(global_object, scope, sharedBytesSpan(m_bytes), text))
             return {};
-        return resolvedPromise(
-            global_object, JSC::jsString(global_object->vm(), decodeUtf8Bytes(sharedBytesSpan(m_bytes))));
+        return resolvedPromise(global_object, JSC::jsString(global_object->vm(), text));
+    }
     case Source::SharedBytes: {
         if (!ensureDecodedStringSize(global_object, scope, m_shared_size))
             return {};
@@ -170,7 +172,10 @@ JSC::EncodedJSValue BodyState::consumeText(JSC::JSGlobalObject* global_object, J
         if (!appendSharedBytes(global_object, scope, bytes))
             return {};
         RETURN_IF_EXCEPTION(scope, {});
-        return resolvedPromise(global_object, JSC::jsString(global_object->vm(), decodeUtf8Bytes(bytes.span())));
+        WTF::String text;
+        if (!decodeUtf8Bytes(global_object, scope, bytes.span(), text))
+            return {};
+        return resolvedPromise(global_object, JSC::jsString(global_object->vm(), text));
     }
     case Source::RequestLazy:
         return requestTextForIdentity(global_object, scope, m_identity);
@@ -201,10 +206,12 @@ JSC::EncodedJSValue BodyState::consumeJson(JSC::JSGlobalObject* global_object, J
         break;
     case Source::Text:
         return parseBodyJsonTextToPromise(global_object, m_text);
-    case Source::Bytes:
-        if (!ensureDecodedStringSize(global_object, scope, sharedBytesSpan(m_bytes).size()))
+    case Source::Bytes: {
+        WTF::String text;
+        if (!decodeUtf8Bytes(global_object, scope, sharedBytesSpan(m_bytes), text))
             return {};
-        return parseBodyJsonTextToPromise(global_object, decodeUtf8Bytes(sharedBytesSpan(m_bytes)));
+        return parseBodyJsonTextToPromise(global_object, text);
+    }
     case Source::SharedBytes: {
         if (!ensureDecodedStringSize(global_object, scope, m_shared_size))
             return {};
@@ -212,7 +219,10 @@ JSC::EncodedJSValue BodyState::consumeJson(JSC::JSGlobalObject* global_object, J
         if (!appendSharedBytes(global_object, scope, bytes))
             return {};
         RETURN_IF_EXCEPTION(scope, {});
-        return parseBodyJsonTextToPromise(global_object, decodeUtf8Bytes(bytes.span()));
+        WTF::String text;
+        if (!decodeUtf8Bytes(global_object, scope, bytes.span(), text))
+            return {};
+        return parseBodyJsonTextToPromise(global_object, text);
     }
     case Source::RequestLazy:
         return requestJsonForIdentity(global_object, scope, m_identity);

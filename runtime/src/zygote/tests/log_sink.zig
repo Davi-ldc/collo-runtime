@@ -2,11 +2,13 @@
 //! this process: a line logged after `install` lands in the page's console
 //! ring as the runtime's, at its level and under request id 0, a scoped line
 //! names its scope, a line over the ring's cap is cut and flagged, nothing is
-//! published once the sink is uninstalled, and the runtime's lines and the
-//! VM thread's console lines interleave whole when they race. The tests call
-//! the sink directly, since the test runner owns this binary's `logFn`; a
-//! real worker's lines through `std.log` are covered by the
-//! `zygote-integration` lane.
+//! published once the sink is uninstalled, the runtime's lines and the VM
+//! thread's console lines interleave whole when they race, and a line of the
+//! scope that never waits is dropped, never waited for, while another line
+//! holds the sink or another producer holds the ring. The tests call the sink
+//! directly, since the test runner owns this binary's `logFn`; a real
+//! worker's lines through `std.log` are covered by the `zygote-integration`
+//! lane.
 
 const std = @import("std");
 const zygote = @import("collo_zygote");
@@ -15,27 +17,31 @@ const worker_shared_page = @import("collo_worker_state").page;
 const log_sink = zygote.log_sink;
 const LogLineFlags = worker_shared_page.LogLineFlags;
 
-/// A state page in a memfd of this process, mapped once, as a worker child
-/// maps its own.
+/// A state page in a memfd of this process, mapped twice: as a worker child
+/// maps its own, for the sink to publish through, and as the host maps it,
+/// for the test to drain.
 const TestPage = struct {
     fd: std.posix.fd_t,
     view: worker_shared_page.WorkerWriterView,
+    reader: worker_shared_page.HostReaderView,
 
     fn init(self: *TestPage) !void {
         self.fd = try worker_shared_page.createMemfd("collo-test-log-sink");
         errdefer std.posix.close(self.fd);
-        self.view = try worker_shared_page.mapReadWrite(self.fd);
-        self.view.initializeCrashDefault();
+        self.view = try worker_shared_page.mapWorkerWriter(self.fd);
+        errdefer self.view.deinit();
+        self.reader = try worker_shared_page.mapHostReader(self.fd);
     }
 
     fn deinit(self: *TestPage) void {
+        self.reader.deinit();
         self.view.deinit();
         std.posix.close(self.fd);
     }
 
     /// Every line the ring holds, drained into `scratch`.
     fn drain(self: *TestPage, scratch: []u8, out: []worker_shared_page.DrainedLogLine) !usize {
-        return self.view.drainLogLinesChecked(scratch, out);
+        return self.reader.drainLogLinesChecked(scratch, out);
     }
 };
 
@@ -48,7 +54,7 @@ test "a line logged after install lands in the console ring as the runtime's, un
     // A failed expectation must not leave the sink on a page that unmaps.
     errdefer log_sink.uninstall();
     try std.testing.expect(log_sink.tryPublish(.warn, .default, "worker event loop failed: {s}", .{"BrokenPipe"}));
-    try std.testing.expect(log_sink.tryPublish(.err, .sentinel, "memory events read failed: {d}", .{5}));
+    try std.testing.expect(log_sink.tryPublish(.err, .crypto, "digest job failed: {d}", .{5}));
     log_sink.uninstall();
 
     var scratch: [2 * worker_shared_page.LOG_LINE_BYTES_MAX]u8 = undefined;
@@ -64,7 +70,7 @@ test "a line logged after install lands in the console ring as the runtime's, un
 
     // A scoped line names its scope, as the default handler does.
     try std.testing.expectEqual(@intFromEnum(worker_shared_page.LogLevel.err), lines[1].header.level);
-    try std.testing.expectEqualStrings("(sentinel) memory events read failed: 5", lines[1].payload);
+    try std.testing.expectEqualStrings("(crypto) digest job failed: 5", lines[1].payload);
 }
 
 test "a line over the console ring's cap is cut and flagged truncated" {
@@ -107,7 +113,7 @@ test "the runtime's lines and the VM thread's console lines interleave whole whe
 
     log_sink.install(&page.view);
     defer log_sink.uninstall();
-    // A second thread logs as the sentinel or the crypto pool would while
+    // A second thread logs as the sentinel would while
     // this one publishes console lines as the VM thread does.
     const runtime_thread = try std.Thread.spawn(.{}, publishRuntimeLines, .{});
     for (0..racing_lines_per_producer) |index|
@@ -134,10 +140,60 @@ test "the runtime's lines and the VM thread's console lines interleave whole whe
             }
         }
     }
-    const dropped = page.view.loadLogDropCounters().lines;
+    const dropped = page.reader.loadLogDropCounters().lines;
     try std.testing.expectEqual(@as(u64, 0), dropped);
     try std.testing.expectEqual(racing_lines_per_producer, runtime_count);
     try std.testing.expectEqual(racing_lines_per_producer, console_count);
+}
+
+test "a line of the never-wait scope is dropped uncounted, without waiting, while another line holds the sink" {
+    var page: TestPage = undefined;
+    try page.init();
+    defer page.deinit();
+
+    log_sink.install(&page.view);
+    defer log_sink.uninstall();
+    {
+        // The test thread stands for a line in flight; a line that waited
+        // for the lock would wait for its own thread forever.
+        log_sink.mutex.lock();
+        defer log_sink.mutex.unlock();
+        try std.testing.expect(log_sink.tryPublish(.warn, log_sink.never_wait_scope, "worker memory pressure: {s}", .{"high"}));
+    }
+
+    var scratch: [worker_shared_page.LOG_LINE_BYTES_MAX]u8 = undefined;
+    var lines: [2]worker_shared_page.DrainedLogLine = undefined;
+    try std.testing.expectEqual(@as(usize, 0), try page.drain(&scratch, &lines));
+    // A busy sink may be uninstalling, so the line never touched the page.
+    try std.testing.expectEqual(@as(u64, 0), page.reader.loadLogDropCounters().lines);
+}
+
+test "a line of the never-wait scope is dropped and counted, without waiting, while another producer holds the console ring" {
+    var page: TestPage = undefined;
+    try page.init();
+    defer page.deinit();
+
+    log_sink.install(&page.view);
+    defer log_sink.uninstall();
+    {
+        // The test thread stands for the VM thread mid-line, as a thread the
+        // kernel throttles inside the ring's lock would hold it.
+        worker_shared_page.log_producer_mutex.lock();
+        defer worker_shared_page.log_producer_mutex.unlock();
+        try std.testing.expect(log_sink.tryPublish(.warn, log_sink.never_wait_scope, "worker memory pressure: {s}", .{"high"}));
+    }
+
+    var scratch: [worker_shared_page.LOG_LINE_BYTES_MAX]u8 = undefined;
+    var lines: [2]worker_shared_page.DrainedLogLine = undefined;
+    try std.testing.expectEqual(@as(usize, 0), try page.drain(&scratch, &lines));
+    try std.testing.expectEqual(@as(u64, 1), page.reader.loadLogDropCounters().lines);
+
+    // With both locks free the scope's line goes out as any runtime line
+    // does, named by its scope.
+    try std.testing.expect(log_sink.tryPublish(.warn, log_sink.never_wait_scope, "worker memory pressure: {s}", .{"high"}));
+    try std.testing.expectEqual(@as(usize, 1), try page.drain(&scratch, &lines));
+    try std.testing.expectEqual(LogLineFlags.runtime, lines[0].header.flags);
+    try std.testing.expectEqualStrings("(sentinel) worker memory pressure: high", lines[0].payload);
 }
 
 /// Lines each producer of the race writes: together with their frame

@@ -1,19 +1,26 @@
 //! `Routes` and the definition artifacts (`server/routes/root.zig`,
 //! `server/routes/artifacts.zig`, `server/routes/module_graph.zig`) built from
-//! modules in a temporary directory: a two-module entry packed into a sealed
-//! memfd with its dependency, the route table with the route's bindings, the
-//! shared placeholder fs index, lookups by path and by key, a definition with
-//! several routes sharing one pack and one table, the synthesized
-//! configuration, a module root above the entry's directory, the runtime's
-//! own fs modules, an empty module, the targets of string-literal `import()`
-//! packed with their own imports while computed ones and those that cannot
-//! be packed stay out, the ways a graph fails with the file and line each
+//! modules in a temporary directory: a two-module entry and its import
+//! packed into one sealed memfd with the route and its bindings, keys under
+//! the task root, lookups by path and by key, a definition with several
+//! routes sharing one artifact and naming their entries by module index, the
+//! synthesized configuration, the definition's root (the deepest directory
+//! of its entries) confining what is read, whether an import leaves it
+//! lexically, through a symlink or into another definition's files, a FIFO
+//! that would block the boot, keys taken from the directory an import climbs
+//! to, a '..' above the filesystem root, the runtime's own fs modules,
+//! sources stored as Latin-1 or UTF-16 by their text, an empty module, the
+//! targets of string-literal `import()` packed
+//! with their own imports while computed ones and those that cannot be
+//! packed stay out, the ways a graph fails with the file and line each
 //! failure names, as invalid routes, a descriptor quota failing the build as
 //! unavailable resources instead, allocation failure at every step, and the
 //! configuration local-e2e serves. The network policies are covered in
-//! `network.zig`.
+//! `network.zig`, and the artifact's format in
+//! `common/tests/ipc/module_pack.zig`.
 //!
-//! What a worker does with the artifacts is covered by `worker-test`,
+//! What a worker does with the artifacts is covered by `worker-test`
+//! (`worker/tests/runtime/modules.zig` boots an artifact this builder made),
 //! `zygote-integration` and `local-e2e`.
 
 const std = @import("std");
@@ -23,6 +30,7 @@ const ipc = @import("collo_ipc");
 const fd_mod = @import("collo_os").fd;
 
 const module_pack = ipc.module_pack;
+const route_bindings = ipc.route_bindings;
 
 const index_source =
     \\import { greet } from "./lib/greet.js";
@@ -83,27 +91,19 @@ fn readAll(allocator: std.mem.Allocator, fd: std.posix.fd_t, length: u64) ![]u8 
     return bytes;
 }
 
-/// The route table of `artifact`, read back from its sealed memfd; the
-/// caller frees it.
-fn readRouteTable(allocator: std.mem.Allocator, artifact: *const routes.DefinitionArtifact) ![]u8 {
-    try fd_mod.requireSeals(artifact.route_table.fd, fd_mod.memfd_readonly_seals);
-    return readAll(allocator, artifact.route_table.fd, artifact.route_table.blob_len);
-}
-
-/// The entry specifier of route `index` in `artifact`'s route table; the
-/// caller frees it.
-fn entrySpecifier(allocator: std.mem.Allocator, artifact: *const routes.DefinitionArtifact, index: usize) ![]u8 {
-    const table = try readRouteTable(allocator, artifact);
-    defer allocator.free(table);
-    var decoded: ipc.route_table.Routes = undefined;
-    const table_routes = try ipc.route_table.decode(table, &decoded);
-    return allocator.dupe(u8, table_routes[index].entry_specifier);
+/// The bytes of `artifact`, read back from its sealed memfd; the caller frees
+/// them and parses them with `module_pack.parse`, whose view borrows them.
+fn readPack(allocator: std.mem.Allocator, artifact: *const routes.DefinitionArtifact) ![]u8 {
+    try fd_mod.requireSeals(artifact.module_pack.fd(), fd_mod.memfd_readonly_seals);
+    return readAll(allocator, artifact.module_pack.fd(), artifact.module_pack_bytes);
 }
 
 fn expectEntrySpecifier(artifact: *const routes.DefinitionArtifact, index: usize, expected: []const u8) !void {
-    const actual = try entrySpecifier(std.testing.allocator, artifact, index);
-    defer std.testing.allocator.free(actual);
-    try std.testing.expectEqualStrings(expected, actual);
+    const bytes = try readPack(std.testing.allocator, artifact);
+    defer std.testing.allocator.free(bytes);
+    const pack = try module_pack.parse(bytes);
+    try module_pack.validateDefinition(pack);
+    try std.testing.expectEqualStrings(expected, pack.routeAt(index).entry_specifier);
 }
 
 /// The build of `source` fails as invalid routes, naming `expected`.
@@ -118,7 +118,7 @@ fn expectBuildFailure(fixture: *const Fixture, source: []const u8, expected: []c
     }
 }
 
-test "a two-module entry is packed with its dependency next to its route table and fs index" {
+test "a two-module entry is packed with its import and its route in one sealed artifact" {
     const allocator = std.testing.allocator;
     var fixture: Fixture = undefined;
     try fixture.init();
@@ -139,41 +139,31 @@ test "a two-module entry is packed with its dependency next to its route table a
 
     const key: config.RouteKey = .{ .definition = 0, .route = 0 };
     const artifact = built.artifact(key.definition);
-    // The module root is `app/`, the deepest directory holding both files.
-    const entry = "/__collo_route/api/index.js";
+    // The module root is `app/`, the deepest directory holding both files,
+    // and every key sits under the task root.
+    const entry = "/var/task/index.js";
     try expectEntrySpecifier(artifact, key.route, entry);
     try std.testing.expectEqual(@as(u32, 2), artifact.module_count);
     try std.testing.expectEqual(artifact.module_pack_bytes, built.pack_bytes_total);
 
-    try fd_mod.requireSeals(artifact.module_pack.fd(), fd_mod.memfd_readonly_seals);
-    const pack_bytes = try readAll(allocator, artifact.module_pack.fd(), artifact.module_pack_bytes);
+    const pack_bytes = try readPack(allocator, artifact);
     defer allocator.free(pack_bytes);
     const pack = try module_pack.parse(pack_bytes);
-    try std.testing.expectEqualStrings(entry, pack.entrySpecifier());
-    try module_pack.validateSameDeployScopedPack(pack, entry);
+    try module_pack.validateDefinition(pack);
+    try std.testing.expectEqual(@as(usize, 1), pack.routes.len);
+    try std.testing.expectEqual(@as(u32, 0), pack.routeAt(0).entry_module);
+    try std.testing.expectEqualStrings(entry, pack.moduleAt(0).specifier);
+    try std.testing.expectEqual(module_pack.Encoding.latin1, pack.moduleAt(0).encoding);
     try std.testing.expectEqualStrings(index_source, pack.moduleAt(0).source);
-    try std.testing.expectEqual(@as(usize, 1), pack.moduleAt(0).dependency_count);
-    try std.testing.expectEqualStrings("/__collo_route/api/lib/greet.js", pack.dependencyAt(0, 0).specifier);
-    const greet = pack.findModule("/__collo_route/api/lib/greet.js") orelse return error.TestMissingModule;
+    const greet = pack.findModule("/var/task/lib/greet.js") orelse return error.TestMissingModule;
     try std.testing.expectEqualStrings(greet_source, greet.source);
 
-    // The table both processes read, byte for byte: one route, its entry,
-    // then its bindings in configuration order.
-    const table = try readRouteTable(allocator, artifact);
-    defer allocator.free(table);
+    // The route's bindings both processes read, byte for byte, in
+    // configuration order.
     const expected_bindings = "\x02\x00\x00\x00" ++
         "\x08\x00\x00\x00GREETING" ++ "\x05\x00\x00\x00hello" ++
         "\x05\x00\x00\x00EMPTY" ++ "\x00\x00\x00\x00";
-    const expected_table = "\x01\x00\x00\x00" ++
-        "\x1b\x00\x00\x00" ++ entry ++
-        "\x26\x00\x00\x00" ++ expected_bindings;
-    try std.testing.expectEqualSlices(u8, expected_table, table);
-
-    try fd_mod.requireSeals(artifact.fs_index.fd(), fd_mod.memfd_readonly_seals);
-    try std.testing.expectEqual(built.fs_index.fd(), artifact.fs_index.fd());
-    const index_bytes = try readAll(allocator, artifact.fs_index.fd(), 8);
-    defer allocator.free(index_bytes);
-    try std.testing.expectEqualStrings("COLLOFS1", index_bytes);
+    try std.testing.expectEqualSlices(u8, expected_bindings, pack.routeAt(0).bindings);
 
     var captures: routes.Captures = undefined;
     const matched = (try built.match("/any/path", &captures)) orelse return error.TestNoMatch;
@@ -183,7 +173,7 @@ test "a two-module entry is packed with its dependency next to its route table a
     try std.testing.expectEqual(@as(u16, 1), built.definitionCount());
 }
 
-test "a definition's routes share one pack holding each module once and a table in route order" {
+test "a definition's routes share one artifact holding each module once and naming entries by module index" {
     const allocator = std.testing.allocator;
     var fixture: Fixture = undefined;
     try fixture.init();
@@ -213,33 +203,32 @@ test "a definition's routes share one pack holding each module once and a table 
     // Route 0's entry leads the pack, and every module some route reaches is
     // in it exactly once.
     try std.testing.expectEqual(@as(u32, 4), artifact.module_count);
-    const pack_bytes = try readAll(allocator, artifact.module_pack.fd(), artifact.module_pack_bytes);
+    const pack_bytes = try readPack(allocator, artifact);
     defer allocator.free(pack_bytes);
     const pack = try module_pack.parse(pack_bytes);
-    try std.testing.expectEqualStrings("/__collo_route/api/a.js", pack.entrySpecifier());
+    try std.testing.expectEqualStrings("/var/task/a.js", pack.moduleAt(0).specifier);
     try std.testing.expectEqual(@as(usize, 4), pack.records.len);
     for ([_][]const u8{ "a.js", "b.js", "lib/shared.js", "lib/only_b.js" }) |path| {
-        const key = try std.fmt.allocPrint(allocator, "/__collo_route/api/{s}", .{path});
+        const key = try std.fmt.allocPrint(allocator, "/var/task/{s}", .{path});
         defer allocator.free(key);
         try std.testing.expect(pack.findModule(key) != null);
     }
 
-    // Each route names its entry in the table, routes that share an entry
-    // share its key, and each keeps its own bindings.
-    const table = try readRouteTable(allocator, artifact);
-    defer allocator.free(table);
-    var decoded: ipc.route_table.Routes = undefined;
-    const table_routes = try ipc.route_table.decode(table, &decoded);
-    try std.testing.expectEqual(@as(usize, 3), table_routes.len);
-    const expected = [_]struct { entry: []const u8, name: ?[]const u8 }{
-        .{ .entry = "/__collo_route/api/a.js", .name = "a" },
-        .{ .entry = "/__collo_route/api/b.js", .name = "b" },
-        .{ .entry = "/__collo_route/api/a.js", .name = null },
+    // Each route names its entry by module index, routes that share an entry
+    // name the same module, and each keeps its own bindings.
+    try std.testing.expectEqual(@as(usize, 3), pack.routes.len);
+    const b_index = pack.findIndex("/var/task/b.js") orelse return error.TestMissingModule;
+    const expected = [_]struct { entry_module: usize, entry: []const u8, name: ?[]const u8 }{
+        .{ .entry_module = 0, .entry = "/var/task/a.js", .name = "a" },
+        .{ .entry_module = b_index, .entry = "/var/task/b.js", .name = "b" },
+        .{ .entry_module = 0, .entry = "/var/task/a.js", .name = null },
     };
-    for (table_routes, expected) |table_route, want| {
-        try std.testing.expectEqualStrings(want.entry, table_route.entry_specifier);
-        var entries: ipc.route_bindings.Entries = undefined;
-        const bindings = try ipc.route_bindings.decode(table_route.bindings, &entries);
+    for (expected, 0..) |want, route_index| {
+        const route = pack.routeAt(route_index);
+        try std.testing.expectEqual(want.entry_module, route.entry_module);
+        try std.testing.expectEqualStrings(want.entry, route.entry_specifier);
+        var entries: route_bindings.Entries = undefined;
+        const bindings = try route_bindings.decode(route.bindings, &entries);
         if (want.name) |name| {
             try std.testing.expectEqual(@as(usize, 1), bindings.len);
             try std.testing.expectEqualStrings("NAME", bindings[0].name);
@@ -249,7 +238,7 @@ test "a definition's routes share one pack holding each module once and a table 
         }
     }
 
-    // A path's route key indexes that table.
+    // A path's route key indexes the artifact's routes.
     var captures: routes.Captures = undefined;
     const matched = (try built.match("/b", &captures)) orelse return error.TestNoMatch;
     try std.testing.expectEqual(config.RouteKey{ .definition = 0, .route = 1 }, matched.key);
@@ -272,32 +261,291 @@ test "the synthesized configuration of an entry builds the same pack" {
     defer built.deinit();
 
     const artifact = built.artifact(0);
-    try expectEntrySpecifier(artifact, 0, "/__collo_route/index/index.js");
+    try expectEntrySpecifier(artifact, 0, "/var/task/index.js");
     try std.testing.expectEqual(@as(u32, 2), artifact.module_count);
     var captures: routes.Captures = undefined;
     try std.testing.expect((try built.match("/", &captures)) != null);
 }
 
-test "an import above the entry's directory moves the module root up" {
+test "a static import that leaves the definition's root fails the boot with file and line, and a dynamic one is left out unread" {
     const allocator = std.testing.allocator;
     var fixture: Fixture = undefined;
     try fixture.init();
     defer fixture.deinit();
     try fixture.write("app/src/main.js", "import { util } from \"../../shared/util.js\";\nexport default { fetch: util };\n");
+    try fixture.write("app/src/lazy.js", "export const later = () => import(\"../../shared/util.js\");\nexport default { fetch() {} };\n");
     try fixture.write("shared/util.js", "export function util() {}\n");
 
+    // The root is app/src, the entry's directory, and the import does not
+    // widen it.
+    const directory = fixture.directory();
+    const expected = try std.fmt.allocPrint(
+        allocator,
+        "worker 'api' route '/*': {s}/app/src/main.js:1: import '../../shared/util.js': {s}/shared/util.js lies outside the definition's root {s}/app/src",
+        .{ directory, directory, directory },
+    );
+    defer allocator.free(expected);
+    try expectBuildFailure(&fixture, catchAll("{\"entry\": \"app/src/main.js\"}"), expected);
+
+    // The same target behind `import()` boots and stays out of the pack, to
+    // reject at run time.
     var diagnostic: config.Diagnostic = .{};
-    const parsed = try fixture.parse(allocator, catchAll("{\"entry\": \"app/src/main.js\"}"), &diagnostic);
+    const parsed = try fixture.parse(allocator, catchAll("{\"entry\": \"app/src/lazy.js\"}"), &diagnostic);
     var built: routes.Routes = undefined;
-    try built.init(allocator, parsed, &diagnostic);
+    built.init(allocator, parsed, &diagnostic) catch |err| {
+        std.debug.print("{s}\n", .{diagnostic.message()});
+        return err;
+    };
+    defer built.deinit();
+    try std.testing.expectEqual(@as(u32, 1), built.artifact(0).module_count);
+    try expectEntrySpecifier(built.artifact(0), 0, "/var/task/lazy.js");
+}
+
+test "one definition's code cannot pull another definition's files into its artifact" {
+    const allocator = std.testing.allocator;
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    try fixture.write("tenants/a/index.js",
+        \\export const steal = () => import("../b/index.js");
+        \\export default { fetch() { return new Response("a"); } };
+    );
+    try fixture.write("tenants/a/static.js",
+        \\import { secret } from "../b/index.js";
+        \\export default { fetch() { return new Response(secret); } };
+    );
+    try fixture.write("tenants/b/index.js",
+        \\export const secret = "b-secret";
+        \\export default { fetch() { return new Response(secret); } };
+    );
+
+    var diagnostic: config.Diagnostic = .{};
+    const parsed = try fixture.parse(allocator,
+        \\{"workers": {
+        \\  "a": {"routes": {"/a": {"entry": "./tenants/a/index.js"}}},
+        \\  "b": {"routes": {"/b": {"entry": "./tenants/b/index.js"}}}
+        \\}}
+    , &diagnostic);
+    var built: routes.Routes = undefined;
+    built.init(allocator, parsed, &diagnostic) catch |err| {
+        std.debug.print("{s}\n", .{diagnostic.message()});
+        return err;
+    };
+    defer built.deinit();
+
+    // a's root is tenants/a, so b's entry is never read for a's artifact,
+    // which holds a's entry alone.
+    const a_artifact = built.artifact(0);
+    try std.testing.expectEqual(@as(u32, 1), a_artifact.module_count);
+    try expectEntrySpecifier(a_artifact, 0, "/var/task/index.js");
+    const pack_bytes = try readPack(allocator, a_artifact);
+    defer allocator.free(pack_bytes);
+    const pack = try module_pack.parse(pack_bytes);
+    for (0..pack.records.len) |index|
+        try std.testing.expect(std.mem.indexOf(u8, pack.moduleAt(index).source, "b-secret") == null);
+
+    // A static import of the same file fails a's boot instead.
+    const directory = fixture.directory();
+    const expected = try std.fmt.allocPrint(allocator, "{s}/tenants/a/static.js:1: import '../b/index.js': {s}/tenants/b/index.js lies outside the definition's root {s}/tenants/a", .{ directory, directory, directory });
+    defer allocator.free(expected);
+    try expectBuildFailure(&fixture,
+        \\{"workers": {"a": {"routes": {"/a": {"entry": "./tenants/a/static.js"}}}}}
+    , expected);
+}
+
+test "a symlink inside the root that leads outside it fails the boot, and one that stays inside keeps its own path" {
+    const allocator = std.testing.allocator;
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    try fixture.write("outside.js", "export const secret = 'outside';\n");
+    try fixture.write("shared/util.js", "export const secret = 'shared';\n");
+    try fixture.write("app/real.js", "export const value = 'real';\n");
+    try fixture.tmp.dir.symLink("../outside.js", "app/escape.js", .{});
+    try fixture.tmp.dir.symLink("../shared", "app/linked", .{});
+    try fixture.tmp.dir.symLink("real.js", "app/alias.js", .{});
+    const directory = fixture.directory();
+    const absolute_target = try fixture.path(allocator, "app/real.js");
+    defer allocator.free(absolute_target);
+    try fixture.tmp.dir.symLink(absolute_target, "app/absolute.js", .{});
+    try fixture.write("app/imports-escape.js", "import \"./escape.js\";\n");
+    try fixture.write("app/imports-linked.js", "\nimport \"./linked/util.js\";\n");
+    try fixture.write("app/imports-absolute.js", "import \"./absolute.js\";\n");
+    try fixture.write("app/lazy-escape.js", "export const later = () => import(\"./escape.js\");\n");
+    try fixture.write("app/imports-alias.js", "import { value } from \"./alias.js\";\nexport default () => new Response(value);\n");
+
+    const cases = [_]struct { entry: []const u8, site: []const u8, module: []const u8 }{
+        // A relative symlink to a file above the root.
+        .{ .entry = "imports-escape.js", .site = "imports-escape.js:1: import './escape.js'", .module = "app/escape.js" },
+        // A symlinked directory whose target lies outside the root.
+        .{ .entry = "imports-linked.js", .site = "imports-linked.js:2: import './linked/util.js'", .module = "app/linked/util.js" },
+        // An absolute symlink, refused even though it names a file inside
+        // the root.
+        .{ .entry = "imports-absolute.js", .site = "imports-absolute.js:1: import './absolute.js'", .module = "app/absolute.js" },
+        // Behind `import()` the file exists and cannot be packed.
+        .{ .entry = "lazy-escape.js", .site = "lazy-escape.js:1: import('./escape.js')", .module = "app/escape.js" },
+    };
+    for (cases) |case| {
+        const source = try std.fmt.allocPrint(allocator, "{{\"workers\": {{\"api\": {{\"routes\": {{\"/*\": {{\"entry\": \"./app/{s}\"}}}}}}}}}}", .{case.entry});
+        defer allocator.free(source);
+        const expected = try std.fmt.allocPrint(allocator, "{s}/app/{s}: cannot read module {s}/{s}: it resolves outside the definition's root {s}/app", .{ directory, case.site, directory, case.module, directory });
+        defer allocator.free(expected);
+        try expectBuildFailure(&fixture, source, expected);
+    }
+
+    // An entry that is itself such a symlink fails with its route.
+    const entry_failure = try std.fmt.allocPrint(allocator, "worker 'api' route '/*': cannot read module {s}/app/escape.js: it resolves outside the definition's root {s}/app", .{ directory, directory });
+    defer allocator.free(entry_failure);
+    try expectBuildFailure(&fixture, catchAll("{\"entry\": \"./app/escape.js\"}"), entry_failure);
+
+    // A relative symlink that stays inside is read, under its own path.
+    var diagnostic: config.Diagnostic = .{};
+    const parsed = try fixture.parse(allocator, catchAll("{\"entry\": \"./app/imports-alias.js\"}"), &diagnostic);
+    var built: routes.Routes = undefined;
+    built.init(allocator, parsed, &diagnostic) catch |err| {
+        std.debug.print("{s}\n", .{diagnostic.message()});
+        return err;
+    };
+    defer built.deinit();
+    const pack_bytes = try readPack(allocator, built.artifact(0));
+    defer allocator.free(pack_bytes);
+    const pack = try module_pack.parse(pack_bytes);
+    const alias = pack.findModule("/var/task/alias.js") orelse return error.TestMissingModule;
+    try std.testing.expectEqualStrings("export const value = 'real';\n", alias.source);
+}
+
+test "a FIFO named by an import fails the boot instead of blocking it" {
+    const allocator = std.testing.allocator;
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const rc = std.os.linux.mknodat(fixture.tmp.dir.fd, "pipe.js", std.os.linux.S.IFIFO | 0o600, 0);
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.E.init(rc));
+    try fixture.write("imports-pipe.js", "import \"./pipe.js\";\n");
+    try fixture.write("lazy-pipe.js", "export const later = () => import(\"./pipe.js\");\n");
+
+    // No writer ever opens the FIFO, so an open that waited for one would
+    // never return.
+    const directory = fixture.directory();
+    const static_failure = try std.fmt.allocPrint(allocator, "{s}/imports-pipe.js:1: import './pipe.js': cannot read module {s}/pipe.js: NotRegularFile", .{ directory, directory });
+    defer allocator.free(static_failure);
+    try expectBuildFailure(&fixture, catchAll("{\"entry\": \"imports-pipe.js\"}"), static_failure);
+    const dynamic_failure = try std.fmt.allocPrint(allocator, "{s}/lazy-pipe.js:1: import('./pipe.js'): cannot read module {s}/pipe.js: NotRegularFile", .{ directory, directory });
+    defer allocator.free(dynamic_failure);
+    try expectBuildFailure(&fixture, catchAll("{\"entry\": \"lazy-pipe.js\"}"), dynamic_failure);
+}
+
+test "an import that climbs above the root and descends into it again is keyed from the directory it climbs to" {
+    const allocator = std.testing.allocator;
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    // Every module lives in app/src, the root, but `../src/util.js` passes
+    // through app/ on its way, as the engine's walk from the entry's key
+    // does.
+    try fixture.write("app/src/index.js",
+        \\import { util } from "../src/util.js";
+        \\export const later = () => import("../src/lib/lazy.js");
+        \\export default { fetch() { return new Response(util); } };
+    );
+    try fixture.write("app/src/util.js", "export const util = 'u';\n");
+    try fixture.write("app/src/lib/lazy.js", "export const value = 'l';\n");
+
+    var diagnostic: config.Diagnostic = .{};
+    const parsed = try fixture.parse(allocator, catchAll("{\"entry\": \"app/src/index.js\"}"), &diagnostic);
+    var built: routes.Routes = undefined;
+    built.init(allocator, parsed, &diagnostic) catch |err| {
+        std.debug.print("{s}\n", .{diagnostic.message()});
+        return err;
+    };
     defer built.deinit();
 
     const artifact = built.artifact(0);
-    try expectEntrySpecifier(artifact, 0, "/__collo_route/api/app/src/main.js");
-    const pack_bytes = try readAll(allocator, artifact.module_pack.fd(), artifact.module_pack_bytes);
+    try expectEntrySpecifier(artifact, 0, "/var/task/src/index.js");
+    try std.testing.expectEqual(@as(u32, 3), artifact.module_count);
+    const pack_bytes = try readPack(allocator, artifact);
     defer allocator.free(pack_bytes);
     const pack = try module_pack.parse(pack_bytes);
-    try std.testing.expect(pack.findModule("/__collo_route/api/shared/util.js") != null);
+    // Resolving `../src/util.js` against `/var/task/src/index.js` lands on
+    // the packed key.
+    try std.testing.expect(pack.findModule("/var/task/src/util.js") != null);
+    try std.testing.expect(pack.findModule("/var/task/src/lib/lazy.js") != null);
+}
+
+test "an import whose '..' would rise above the filesystem root fails the boot" {
+    const allocator = std.testing.allocator;
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const directory = fixture.directory();
+    // One `..` more than the entry's directory has segments, then back down
+    // to a file inside the root: the filesystem stops at `/` and finds it,
+    // while the engine's walk from `/var/task/app.js` fails at `/`.
+    var specifier: std.ArrayList(u8) = .empty;
+    defer specifier.deinit(allocator);
+    for (0..std.mem.count(u8, directory, "/") + 1) |_|
+        try specifier.appendSlice(allocator, "../");
+    try specifier.appendSlice(allocator, directory[1..]);
+    try specifier.appendSlice(allocator, "/lib.js");
+    const source = try std.fmt.allocPrint(allocator, "import \"{s}\";\n", .{specifier.items});
+    defer allocator.free(source);
+    try fixture.write("app.js", source);
+    try fixture.write("lib.js", "export {};\n");
+
+    const expected = try std.fmt.allocPrint(allocator, "{s}/app.js:1: import '{s}': the path rises above the filesystem root", .{ directory, specifier.items });
+    defer allocator.free(expected);
+    try expectBuildFailure(&fixture, catchAll("{\"entry\": \"app.js\"}"), expected);
+}
+
+test "a definition's root is the deepest directory holding its routes' entries, for a configuration and for a lone entry" {
+    const allocator = std.testing.allocator;
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    try fixture.write("api/index.js", "import { util } from \"../shared/util.js\";\nexport default () => new Response(util);\n");
+    try fixture.write("web/index.js", "import { util } from \"../shared/util.js\";\nexport default () => new Response(util);\n");
+    try fixture.write("shared/util.js", "export const util = 'u';\n");
+
+    // Two routes in api/ and web/ give the definition the directory above
+    // both, which holds shared/.
+    {
+        var diagnostic: config.Diagnostic = .{};
+        const parsed = try fixture.parse(allocator,
+            \\{"workers": {"site": {"routes": {
+            \\  "/api": {"entry": "./api/index.js"},
+            \\  "/web": {"entry": "./web/index.js"}
+            \\}}}}
+        , &diagnostic);
+        var built: routes.Routes = undefined;
+        built.init(allocator, parsed, &diagnostic) catch |err| {
+            std.debug.print("{s}\n", .{diagnostic.message()});
+            return err;
+        };
+        defer built.deinit();
+        const pack_bytes = try readPack(allocator, built.artifact(0));
+        defer allocator.free(pack_bytes);
+        const pack = try module_pack.parse(pack_bytes);
+        for ([_][]const u8{ "/var/task/api/index.js", "/var/task/web/index.js", "/var/task/shared/util.js" }) |key|
+            try std.testing.expect(pack.findModule(key) != null);
+    }
+
+    // The api route alone has api/ for its root, which shared/ is not in.
+    const directory = fixture.directory();
+    const expected = try std.fmt.allocPrint(allocator, "{s}/api/index.js:1: import '../shared/util.js': {s}/shared/util.js lies outside the definition's root {s}/api", .{ directory, directory, directory });
+    defer allocator.free(expected);
+    try expectBuildFailure(&fixture,
+        \\{"workers": {"site": {"routes": {"/api": {"entry": "./api/index.js"}}}}}
+    , expected);
+
+    // `collo serve api/index.js` synthesizes a configuration whose root is
+    // the entry's directory, with the same result.
+    const entry_path = try fixture.path(allocator, "api/index.js");
+    defer allocator.free(entry_path);
+    var diagnostic: config.Diagnostic = .{};
+    const synthesized = try config.synthesize(allocator, entry_path, &diagnostic);
+    var built: routes.Routes = undefined;
+    try std.testing.expectError(error.RoutesInvalid, built.init(allocator, synthesized, &diagnostic));
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic.message(), "lies outside the definition's root") != null);
 }
 
 test "the runtime's own fs modules are not read from disk" {
@@ -321,7 +569,48 @@ test "the runtime's own fs modules are not read from disk" {
     try std.testing.expectEqual(@as(u32, 1), built.artifact(0).module_count);
 }
 
-test "an empty module is packed as a one-newline source that evaluates the same" {
+test "module text with a character above U+00FF is stored as UTF-16 and Latin-1 text as Latin-1" {
+    const allocator = std.testing.allocator;
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const latin_source = "export const word = 'caf\xc3\xa9';\n";
+    const wide_source = "export const word = '\xcf\x80 \xf0\x9f\x98\x80';\n";
+    try fixture.write("app.js", "import \"./latin.js\";\nimport \"./wide.js\";\nexport default { fetch() {} };\n");
+    try fixture.write("latin.js", latin_source);
+    try fixture.write("wide.js", wide_source);
+
+    var diagnostic: config.Diagnostic = .{};
+    const parsed = try fixture.parse(allocator, catchAll("{\"entry\": \"app.js\"}"), &diagnostic);
+    var built: routes.Routes = undefined;
+    built.init(allocator, parsed, &diagnostic) catch |err| {
+        std.debug.print("{s}\n", .{diagnostic.message()});
+        return err;
+    };
+    defer built.deinit();
+
+    const pack_bytes = try readPack(allocator, built.artifact(0));
+    defer allocator.free(pack_bytes);
+    const pack = try module_pack.parse(pack_bytes);
+
+    // U+00E9 fits a byte, so the whole module stays one byte per character.
+    const latin = pack.findModule("/var/task/latin.js") orelse return error.TestMissingModule;
+    try std.testing.expectEqual(module_pack.Encoding.latin1, latin.encoding);
+    try std.testing.expectEqualSlices(u8, "export const word = 'caf\xe9';\n", latin.source);
+
+    // U+03C0 does not, so the module is stored as UTF-16LE, U+1F600 as a
+    // surrogate pair.
+    const wide = pack.findModule("/var/task/wide.js") orelse return error.TestMissingModule;
+    try std.testing.expectEqual(module_pack.Encoding.utf16le, wide.encoding);
+    const expected_units = std.unicode.utf8ToUtf16LeStringLiteral(wide_source);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(expected_units), wide.source);
+
+    // The entry, plain ASCII, keeps its bytes as they are on disk.
+    const entry = pack.moduleAt(0);
+    try std.testing.expectEqual(module_pack.Encoding.latin1, entry.encoding);
+}
+
+test "an empty module is packed as an empty Latin-1 source" {
     const allocator = std.testing.allocator;
     var fixture: Fixture = undefined;
     try fixture.init();
@@ -338,12 +627,12 @@ test "an empty module is packed as a one-newline source that evaluates the same"
     };
     defer built.deinit();
 
-    const artifact = built.artifact(0);
-    const pack_bytes = try readAll(allocator, artifact.module_pack.fd(), artifact.module_pack_bytes);
+    const pack_bytes = try readPack(allocator, built.artifact(0));
     defer allocator.free(pack_bytes);
     const pack = try module_pack.parse(pack_bytes);
-    const polyfill = pack.findModule("/__collo_route/api/polyfill.js") orelse return error.TestMissingModule;
-    try std.testing.expectEqualStrings("\n", polyfill.source);
+    const polyfill = pack.findModule("/var/task/polyfill.js") orelse return error.TestMissingModule;
+    try std.testing.expectEqual(module_pack.Encoding.latin1, polyfill.encoding);
+    try std.testing.expectEqual(@as(usize, 0), polyfill.source.len);
 }
 
 test "a string-literal import() is packed with its own imports and a computed one is not" {
@@ -383,23 +672,20 @@ test "a string-literal import() is packed with its own imports and a computed on
     defer built.deinit();
 
     const artifact = built.artifact(0);
-    try expectEntrySpecifier(artifact, 0, "/__collo_route/api/index.js");
+    try expectEntrySpecifier(artifact, 0, "/var/task/index.js");
     try std.testing.expectEqual(@as(u32, 4), artifact.module_count);
-    const pack_bytes = try readAll(allocator, artifact.module_pack.fd(), artifact.module_pack_bytes);
+    const pack_bytes = try readPack(allocator, artifact);
     defer allocator.free(pack_bytes);
     const pack = try module_pack.parse(pack_bytes);
 
-    // The entry evaluates without the module it imports dynamically, so the
-    // pack records no dependency for it; the lazy module's own static import
-    // is one.
-    try std.testing.expectEqual(@as(usize, 0), pack.moduleAt(0).dependency_count);
-    const lazy_index = pack.findIndex("/__collo_route/api/lib/lazy.js") orelse return error.TestMissingModule;
-    try std.testing.expectEqual(@as(usize, 1), pack.moduleAt(lazy_index).dependency_count);
-    try std.testing.expectEqualStrings("/__collo_route/api/lib/shared.js", pack.dependencyAt(lazy_index, 0).specifier);
-    try std.testing.expect(pack.findModule("/__collo_route/api/lib/deeper.js") != null);
+    // The lazy module, its own static import and the target of its own
+    // `import()` are packed.
+    try std.testing.expect(pack.findModule("/var/task/lib/lazy.js") != null);
+    try std.testing.expect(pack.findModule("/var/task/lib/shared.js") != null);
+    try std.testing.expect(pack.findModule("/var/task/lib/deeper.js") != null);
 
-    try std.testing.expect(pack.findModule("/__collo_route/api/lib/computed.js") == null);
-    try std.testing.expect(pack.findModule("/__collo_route/api/lib/joined.js") == null);
+    try std.testing.expect(pack.findModule("/var/task/lib/computed.js") == null);
+    try std.testing.expect(pack.findModule("/var/task/lib/joined.js") == null);
 }
 
 test "a string-literal import() of a target that cannot be packed boots and leaves it to fail at run time" {
@@ -435,10 +721,10 @@ test "a string-literal import() of a target that cannot be packed boots and leav
 
     const artifact = built.artifact(0);
     try std.testing.expectEqual(@as(u32, 1), artifact.module_count);
-    const pack_bytes = try readAll(allocator, artifact.module_pack.fd(), artifact.module_pack_bytes);
+    const pack_bytes = try readPack(allocator, artifact);
     defer allocator.free(pack_bytes);
     const pack = try module_pack.parse(pack_bytes);
-    try std.testing.expect(pack.findModule("/__collo_route/api/a.js") == null);
+    try std.testing.expect(pack.findModule("/var/task/a.js") == null);
 }
 
 test "a string-literal import() of a target that exists but cannot be packed fails the boot, with file and line" {
@@ -482,12 +768,12 @@ test "the configuration local-e2e serves builds, with the target of its string-l
     var captures: routes.Captures = undefined;
     const matched = (try built.match("/lazy", &captures)) orelse return error.TestNoMatch;
     const artifact = built.artifact(matched.key.definition);
-    try expectEntrySpecifier(artifact, matched.key.route, "/__collo_route/lazy/lazy.js");
-    const pack_bytes = try readAll(allocator, artifact.module_pack.fd(), artifact.module_pack_bytes);
+    try expectEntrySpecifier(artifact, matched.key.route, "/var/task/lazy.js");
+    const pack_bytes = try readPack(allocator, artifact);
     defer allocator.free(pack_bytes);
     const pack = try module_pack.parse(pack_bytes);
-    try std.testing.expect(pack.findModule("/__collo_route/lazy/lib/lazy_value.js") != null);
-    try std.testing.expect(pack.findModule("/__collo_route/lazy/lib/absent.js") == null);
+    try std.testing.expect(pack.findModule("/var/task/lib/lazy_value.js") != null);
+    try std.testing.expect(pack.findModule("/var/task/lib/absent.js") == null);
 }
 
 test "a graph that cannot be packed fails with the route and the file" {

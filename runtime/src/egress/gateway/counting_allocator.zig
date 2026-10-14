@@ -2,10 +2,10 @@
 //! count of live bytes. With a budget it also refuses any growth past it, so a runaway consumer
 //! fails its own allocations with `error.OutOfMemory` instead of leaving the kernel to pick an
 //! out-of-memory victim. Each shard's engine allocates through one, budgeted at
-//! `supervisor_limits.shard_memory`: the fetch whose publication allocated is demoted, and any
-//! other failure restarts the shard (`engine.zig`, `runtime/shard_flow.zig`). The gateway's
-//! pooled upload buffers come from another, budgeted at `supervisor_limits.upload_memory`, where
-//! a refusal fails one fetch start (`runtime/upload_flow.zig`).
+//! `containment.shard_memory`: the fetch whose publication allocated fails alone, and any other
+//! failure restarts the shard (`runtime/shard_flow.zig`). The gateway's pooled upload buffers come
+//! from another, budgeted at `containment.upload_memory`, where a refusal fails one fetch start
+//! (`runtime/upload_flow.zig`).
 //!
 //! The shard's engine threads and the gateway's loop thread allocate through it concurrently, so
 //! the count and the budget are atomics and no lock is taken. The cost is one or two atomic
@@ -23,10 +23,10 @@ pub const CountingAllocator = struct {
     /// passes that same length back to resize, remap and free, so every addition meets its exact
     /// subtraction. Monotonic ordering suffices: the count orders no other memory access.
     live_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    /// The shard's budget in bytes, or 0 for none. Production sets it once when the shard is
-    /// built, and it survives engine restarts because a restart reuses this cell
-    /// (`shard.Shard.restart`). It is atomic so tests can change it while engine threads
-    /// allocate.
+    /// The budget in bytes, or 0 for none. The gateway sets it once when it builds the cell
+    /// (`shard.Shard.init`, `runtime/root.zig:Gateway.init`), and a shard's survives engine
+    /// restarts because a restart reuses the cell. It is atomic so tests can change it while
+    /// engine threads allocate.
     budget_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     pub fn allocator(self: *CountingAllocator) std.mem.Allocator {
@@ -41,8 +41,8 @@ pub const CountingAllocator = struct {
         return self.budget_bytes.load(.monotonic);
     }
 
-    /// Replaces the budget; 0 removes it. Only tests call this, possibly while engine threads
-    /// allocate: a reservation already in flight is judged against whichever budget it loaded.
+    /// Replaces the budget; 0 removes it. It may run while engine threads allocate: a
+    /// reservation already in flight is judged against whichever budget it loaded.
     pub fn setBudget(self: *CountingAllocator, budget: u64) void {
         self.budget_bytes.store(budget, .monotonic);
     }

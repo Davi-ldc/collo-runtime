@@ -27,14 +27,10 @@ pub fn main() !void {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
     const name = std.fs.path.basename(args[0]);
-    if (std.mem.eql(u8, name, "collo-zygote")) {
-        try zygote.fork_loop.runFromInheritedFds();
-        return;
-    }
-    if (std.mem.eql(u8, name, "collo-egress-gateway")) {
-        try gateway.runFromInheritedControlFd(allocator);
-        return;
-    }
+    if (std.mem.eql(u8, name, "collo-zygote"))
+        zygote.fork_loop.runFromInheritedFds();
+    if (std.mem.eql(u8, name, "collo-egress-gateway"))
+        gateway.runFromInheritedControlFd(allocator);
     if (args.len != 2) {
         std.debug.print("usage: sandbox-bench <cold|memory|all|idle|regions|daemon>\n", .{});
         return error.InvalidArguments;

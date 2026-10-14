@@ -10,9 +10,15 @@
 //!   launching, live, retiring or dead. A live entry points at its worker's
 //!   record and has `Options.concurrency` slots, and a slot belongs to one
 //!   request of one lane from the `acquire` or handoff that takes it to the
-//!   `release` that gives it back. Records belong to the supervisor: an entry
-//!   only points at one, from `publish` to `remove`, and the entry's reader
-//!   epoch keeps counting across the workers it holds.
+//!   `release` that gives it back. A lane releases the slot of a request the
+//!   worker heard of only once the worker's `request_done` for it arrived
+//!   or the worker died (`server/ingress/runner/request_finish.zig`), so
+//!   `concurrency` bounds the requests in flight in the worker process, and
+//!   a worker's live slot at a pool slot's index belongs to the request that
+//!   holds that slot (`DispatchWork.worker_slot`). Records belong to the
+//!   supervisor: an entry only points at one, from `publish` to `remove`,
+//!   and the entry's reader epoch keeps counting across the workers it
+//!   holds.
 //! - The free list is every live worker with a free slot, ordered by last use
 //!   with the most recent first, so load packs onto warm workers and idle ones
 //!   stay idle until the reaper retires them. A published worker that serves
@@ -23,10 +29,16 @@
 //!   to the head waiter at once, so free slots and waiters never coexist.
 //! - A launch holds a table entry from `launchStarted` to `publish` or
 //!   `launchEnded`, so live, retiring, dead and launching workers together
-//!   never outnumber the table.
+//!   never outnumber the table. A pool with no live worker and no launch
+//!   wants its first worker at once; beside live workers a worker more
+//!   starts only on the launcher's scale-out verdict, which weighs the CPU
+//!   the node has for it (`scale_out.zig`). The waiters of one backlog ask
+//!   the launcher to watch the pool once, until its watch ends
+//!   (`Growth.watch`, `keepScaleOutWatch`).
 //!
-//! One lane at a time reads a worker's output channels, its control socket,
-//! its completion eventfd and ring and its pidfd, and forwards to the lane
+//! One lane at a time reads a worker's output channels, its control socket
+//! with its worker-to-server payload ring, its completion eventfd and its
+//! pidfd, and forwards to the lane
 //! that owns each request whatever is not its own. The first lane to take a
 //! slot of a worker without a reader becomes its reader under a new epoch,
 //! and the role stays while the worker alternates between idle and busy on
@@ -37,20 +49,26 @@
 //! at once and a ring payload is never decoded by one lane while another still
 //! holds the ones before it. A grant is an obligation the lane discharges
 //! even when it can no longer use the slot, and a handoff whose lane never
-//! sees it goes back with its grant through `returnHandoff`.
+//! sees it goes back with its grant through `returnHandoff`. A lane takes a
+//! slot of a worker without a reader only by becoming its reader, so the
+//! epoch moves whenever a lane takes a slot of a worker no lane reads: the
+//! reaper, which watches those workers without telling the lanes, learns
+//! from an unchanged epoch that no lane took one since its listing
+//! (`retireOnUnreadNotice`).
 //!
-//! A worker leaves through `markDead`, `retireForEgress`, `retireIdle` or
-//! `retireOnNotice`, which its entry records (`Departure`), and no slot of it
-//! is handed out afterwards. A worker that announced it is retiring
-//! (`worker_retiring`) keeps the slots its lanes hold and its reader, which
-//! goes on forwarding its output, until those requests finish: every begin
-//! it ever receives was sent while a slot was held, so its teardown, which
-//! comes only after the last slot is released, never races a begin. It is
-//! finished once no lane holds a slot of it or reads it. Exactly one call
-//! observes that and says so: `.retire` from `release`, `returnHandoff`,
-//! `transferReader`, `retireIdle` or `retireOnNotice`, or `retire` in a
-//! `Death`. Its caller queues the retirement to the reaper, which calls
-//! `remove` after the teardown. A retiring worker whose last slot is released
+//! A worker leaves through `markDead`, `retireForEgress`, `retireIdle`,
+//! `retireOnNotice` or `retireOnUnreadNotice`, which its entry records
+//! (`Departure`), and no slot of it is handed out afterwards. A worker that
+//! announced it is retiring (`worker_retiring`) keeps the slots its lanes
+//! hold and its reader, which goes on forwarding its output, until those
+//! requests finish: every begin it ever receives was sent while a slot was
+//! held, so its teardown, which comes only after the last slot is released,
+//! never races a begin. It is finished once no lane holds a slot of it or
+//! reads it. Exactly one call observes that and says so: `.retire` from
+//! `release`, `returnHandoff`, `transferReader`, `retireIdle`,
+//! `retireOnNotice` or `retireOnUnreadNotice`, or `retire` in a `Death`. Its
+//! caller queues the retirement to the reaper, which calls `remove` after
+//! the teardown. A retiring worker whose last slot is released
 //! while a lane still reads it answers `.release_reader` instead, so the
 //! releasing lane asks the reader to give its role up.
 //!
@@ -148,15 +166,46 @@ pub const ReaderGrant = union(enum) {
 /// A table entry a launch holds until `publish` or `launchEnded`.
 pub const LaunchTicket = struct {
     entry: u8,
+    /// The launch adds a worker beside live ones, on the launcher's
+    /// scale-out verdict; false for a pool's first worker.
+    scale_out: bool = false,
+};
+
+/// What a pool's waiters ask of the launcher (`Pool.growthWanted`).
+pub const Growth = enum {
+    /// Nothing: no request waits beyond what the launches in flight will
+    /// serve, the table is full, `launches_max` launches are in flight, the
+    /// memory gate is closed, or the pool's first launch is still in flight,
+    /// since a scale-out weighs the CPU its live workers use.
+    none,
+    /// The pool's first worker: no worker is live and no launch is in
+    /// flight. The launcher claims it at once.
+    launch,
+    /// A worker more beside the live ones, which only the launcher's
+    /// scale-out verdict starts. The caller asks the launcher to watch the
+    /// pool; `growthWanted` answers it once until that watch ends
+    /// (`keepScaleOutWatch`), so one backlog submits once.
+    watch,
+};
+
+/// What `Pool.launchStarted` did.
+pub const LaunchStart = union(enum) {
+    started: LaunchTicket,
+    /// The pool wants a scale-out the caller did not allow; it now counts as
+    /// watched, and the caller watches it.
+    watch,
+    /// Nothing to launch (`Growth.none`).
+    none,
 };
 
 pub const EntryState = enum {
     empty,
     launching,
     live,
-    /// Leaving in good order: `retireIdle` took it out of service idle, or
-    /// `retireOnNotice` with whatever requests it holds, which finish on it.
-    /// Its reader stays while a slot is held.
+    /// Leaving in good order: `retireIdle` took it out of service idle,
+    /// `retireOnUnreadNotice` idle and unread, or `retireOnNotice` with
+    /// whatever requests it holds, which finish on it. Its reader stays while
+    /// a slot is held.
     retiring,
     /// `markDead` or `retireForEgress` took it out of service.
     dead,
@@ -172,8 +221,13 @@ pub const Departure = enum {
     /// `retireForEgress`: its gateway was lost and no other one could give
     /// it a session.
     egress,
-    /// `retireOnNotice`: the worker announced `worker_retiring`, because its
-    /// routes failed or its VM was terminated, and asked for no more work.
+    /// `retireForEgress`: its gateway removed its session for what the
+    /// worker sent or left unread (`control.SessionRemovedCause` in
+    /// `egress/gateway/control.zig`).
+    egress_removed,
+    /// `retireOnNotice` or `retireOnUnreadNotice`: the worker announced
+    /// `worker_retiring` (`ipc.WorkerRetiringReason` says why) and asked for
+    /// no more work.
     recycled,
 };
 
@@ -235,6 +289,17 @@ pub const RetireOnNotice = union(enum) {
     release_reader: ReaderTenure,
 };
 
+/// How `retireOnUnreadNotice` answered the reaper.
+pub const RetireOnUnreadNotice = enum {
+    /// The worker is no longer as the reaper listed it: a lane took a slot
+    /// of it or reads it, either of which moved its reader epoch, it left
+    /// service, or its record holds another worker by now. Nothing changed.
+    stale,
+    /// The worker left service as `recycled` and no lane holds or reads it:
+    /// the caller retires it now.
+    retire,
+};
+
 /// Monotonic counts since `init`.
 pub const Counters = struct {
     acquired: u64 = 0,
@@ -249,6 +314,8 @@ pub const Counters = struct {
     reader_releases_requested: u64 = 0,
     readers_released: u64 = 0,
     launches_started: u64 = 0,
+    /// Those of `launches_started` that added a worker beside live ones.
+    scale_outs_started: u64 = 0,
     launches_ended: u64 = 0,
     published: u64 = 0,
     deaths: u64 = 0,
@@ -256,7 +323,8 @@ pub const Counters = struct {
     egress_retirements: u64 = 0,
     /// Idle retirements `retireIdle` started.
     idle_retirements: u64 = 0,
-    /// Workers `retireOnNotice` took out of service.
+    /// Workers `retireOnNotice` or `retireOnUnreadNotice` took out of
+    /// service.
     notice_retirements: u64 = 0,
     /// `.retire` results, one per worker that left service and finished.
     retirements: u64 = 0,
@@ -296,6 +364,9 @@ pub fn Pool(comptime Record: type) type {
         waiter_head: u32,
         waiter_count: u32,
         launching: u32,
+        /// The launcher watches the pool for a scale-out, so a waiter that
+        /// finds one wanted asks for nothing more (`Growth.watch`).
+        scale_out_watched: bool,
         /// Stamps `Entry.last_use`, which orders the free list.
         use_clock: u64,
         counters: Counters,
@@ -370,10 +441,15 @@ pub fn Pool(comptime Record: type) type {
             }
         };
 
+        /// A live worker that holds no request, as `idleWorkers` lists it.
         pub const IdleWorker = struct {
             worker: *Record,
             idle_since_ns: u64,
-            reader: ?ReaderTenure,
+            /// The lane that reads the worker, or null when none does.
+            reader: ?LaneId,
+            /// The entry's reader epoch, whether a lane reads the worker or
+            /// not, which `retireOnUnreadNotice` compares.
+            reader_epoch: ReaderEpoch,
         };
 
         /// A retiring worker that holds no request and still has a reader.
@@ -434,6 +510,7 @@ pub fn Pool(comptime Record: type) type {
                 .waiter_head = 0,
                 .waiter_count = 0,
                 .launching = 0,
+                .scale_out_watched = false,
                 .use_clock = 0,
                 .counters = .{},
             };
@@ -530,8 +607,9 @@ pub fn Pool(comptime Record: type) type {
 
         /// Gives back `slot` of `worker`, handed to a waiter of `lane` with
         /// the reader grant `reader`, when that lane will never use it: it
-        /// refused the `dispatch_ready`, or tears down with the command
-        /// unread. Under the same lock hold, a tenure the grant made for
+        /// refused the `dispatch_ready`, tears down with the command unread,
+        /// or found the worker out of service when the command arrived.
+        /// Under the same lock hold, a tenure the grant made for
         /// `lane`, which the lane never took up, ends first, so the slot's
         /// next holder becomes the reader, and a release the grant asked of
         /// the reader for `lane` is forgotten, since it was never sent. The
@@ -641,13 +719,20 @@ pub fn Pool(comptime Record: type) type {
 
         /// Takes a live worker out of service for good as `markDead` does,
         /// for a worker whose gateway was lost and that no other gateway
-        /// could give a session, and returns what `markDead` returns. The
-        /// worker leaves with its requests, like a dead one, and the reaper
-        /// counts it apart from deaths.
-        pub fn retireForEgress(self: *Self, worker: *Record, worker_key: lifecycle.WorkerKey) ?Death {
+        /// could give a session (`departure` `.egress`), or whose session its
+        /// gateway removed (`.egress_removed`), and returns what `markDead`
+        /// returns. The worker leaves with its requests, like a dead one, and
+        /// the reaper counts it apart from deaths.
+        pub fn retireForEgress(
+            self: *Self,
+            worker: *Record,
+            worker_key: lifecycle.WorkerKey,
+            departure: Departure,
+        ) ?Death {
+            std.debug.assert(departure == .egress or departure == .egress_removed);
             self.mutex.lock();
             defer self.mutex.unlock();
-            const death = self.leaveService(worker, worker_key, .egress) orelse return null;
+            const death = self.leaveService(worker, worker_key, departure) orelse return null;
             self.counters.egress_retirements += 1;
             return death;
         }
@@ -657,9 +742,9 @@ pub fn Pool(comptime Record: type) type {
         /// no slot of it is handed out again, no lane is told of a death,
         /// and the requests it holds finish on it, its reader forwarding
         /// their output. The worker's reader lane calls it when it reads the
-        /// notice, and the reaper when the control socket of an idle worker
-        /// no lane reads turns readable, since such a worker writes nothing
-        /// else there. `RetireOnNotice` says who finishes the worker.
+        /// notice; the notice of a worker no lane reads reaches the pool
+        /// through `retireOnUnreadNotice`. `RetireOnNotice` says who
+        /// finishes the worker.
         pub fn retireOnNotice(self: *Self, worker: *Record, worker_key: lifecycle.WorkerKey) RetireOnNotice {
             self.mutex.lock();
             defer self.mutex.unlock();
@@ -679,6 +764,50 @@ pub fn Pool(comptime Record: type) type {
                 self.counters.reader_releases_requested += 1;
                 return .{ .release_reader = .{ .lane = lane, .epoch = entry.reader_epoch } };
             }
+            self.counters.retirements += 1;
+            return .retire;
+        }
+
+        /// Takes out of service, as `recycled`, a worker the reaper listed
+        /// idle with no reader (`idleWorkers`) once its control socket turns
+        /// readable, which the reaper polls but never reads. `worker_key` and
+        /// `epoch_seen` are the key and the reader epoch it was listed with.
+        /// A lane takes a slot of a worker with no reader only by becoming
+        /// its reader, which moves the epoch, so a worker still live, holding
+        /// no slot, with no reader and at `epoch_seen` has had no slot taken
+        /// since the listing. A lane gives a slot of a live worker back only
+        /// once it read the worker's `request_done` for its request, the last
+        /// thing the worker sends for it, or at the server's stop, so the
+        /// socket holds nothing of a request: the bytes are the worker's
+        /// `worker_retiring` notice, or bytes it has no business writing, and
+        /// either retires it. Otherwise the readability is most likely the
+        /// worker's answer to a lane that became its reader since, which that
+        /// lane reads, a notice behind it included, and nothing changes
+        /// (`RetireOnUnreadNotice`).
+        pub fn retireOnUnreadNotice(
+            self: *Self,
+            worker: *Record,
+            worker_key: lifecycle.WorkerKey,
+            epoch_seen: ReaderEpoch,
+        ) RetireOnUnreadNotice {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            const entry = self.occupiedEntry(worker) orelse return .stale;
+            // A record's key is written only while its entry is launching,
+            // when the table does not point at it, so it is stable here.
+            if (!worker.key().eql(worker_key)) return .stale;
+            if (entry.state != .live) return .stale;
+            if (entry.reader_epoch != epoch_seen) return .stale;
+            // An unchanged epoch leaves both at what the listing saw, but the
+            // epoch wraps after `maxInt(ReaderEpoch)` tenures, so they are
+            // checked rather than assumed.
+            if (entry.reader != null) return .stale;
+            if (entry.held.count() != 0) return .stale;
+            entry.state = .retiring;
+            entry.departure = .recycled;
+            entry.release_requested = false;
+            self.counters.notice_retirements += 1;
             self.counters.retirements += 1;
             return .retire;
         }
@@ -719,7 +848,7 @@ pub fn Pool(comptime Record: type) type {
         /// `markDead` and `retireForEgress` under the mutex; the caller counts
         /// the departure.
         fn leaveService(self: *Self, worker: *Record, worker_key: lifecycle.WorkerKey, departure: Departure) ?Death {
-            std.debug.assert(departure == .died or departure == .egress);
+            std.debug.assert(departure == .died or departure == .egress or departure == .egress_removed);
             const entry = self.occupiedEntry(worker) orelse return null;
             // A record's key is written only while its entry is launching,
             // when the table does not point at it, so it is stable here.
@@ -831,34 +960,72 @@ pub fn Pool(comptime Record: type) type {
             self.counters.removed += 1;
         }
 
-        /// Whether a launch should start: more requests wait than the
-        /// launches in flight will serve, the table has an entry no worker or
-        /// launch holds, fewer than `launches_max` launches are in flight, and
-        /// `memory_gate_allows`, the reaper's verdict on the node's memory,
-        /// holds. Advisory, since another thread may claim first; the launcher
+        /// What the pool's waiters ask of the launcher (`Growth`), with
+        /// `memory_gate_allows` the reaper's verdict on the node's memory.
+        /// The first answer `watch` marks the pool watched, and later calls
+        /// answer `none` for it until `keepScaleOutWatch` ends the watch.
+        /// Advisory, since another thread may claim first; the launcher
         /// claims through `launchStarted`, which decides again.
-        pub fn growthWanted(self: *Self, memory_gate_allows: bool) bool {
+        pub fn growthWanted(self: *Self, memory_gate_allows: bool) Growth {
             self.mutex.lock();
             defer self.mutex.unlock();
-            return self.growthWantedLocked(memory_gate_allows);
+            const growth = self.growthWantedLocked(memory_gate_allows);
+            switch (growth) {
+                .none, .launch => return growth,
+                .watch => {
+                    if (self.scale_out_watched) return .none;
+                    self.scale_out_watched = true;
+                    return .watch;
+                },
+            }
         }
 
-        /// Claims an empty entry for one launch when `growthWanted` holds, and
-        /// returns its ticket; null otherwise. The launcher thread calls it
-        /// and gives the ticket back through `publish` or `launchEnded`.
-        pub fn launchStarted(self: *Self, memory_gate_allows: bool) ?LaunchTicket {
+        /// Claims an empty entry for one launch: the pool's first worker
+        /// whenever `growthWanted` would answer `launch`, a worker more
+        /// beside live ones only with `allow_scale_out`, the launcher's
+        /// scale-out verdict. A scale-out it was not allowed answers
+        /// `watch`. The pool counts as watched exactly when it wants a
+        /// scale-out at the claim. The launcher thread calls it and gives a
+        /// ticket back through `publish` or `launchEnded`.
+        pub fn launchStarted(self: *Self, memory_gate_allows: bool, allow_scale_out: bool) LaunchStart {
             self.mutex.lock();
             defer self.mutex.unlock();
 
-            if (!self.growthWantedLocked(memory_gate_allows)) return null;
+            const growth = self.growthWantedLocked(memory_gate_allows);
+            // The launcher watches the pool from a `watch` on, and a claim
+            // that finds no scale-out wanted leaves nothing to watch, so a
+            // waiter that a submit could not serve asks again.
+            self.scale_out_watched = growth == .watch;
+            const scale_out = switch (growth) {
+                .none => return .none,
+                .launch => false,
+                .watch => blk: {
+                    if (!allow_scale_out) return .watch;
+                    break :blk true;
+                },
+            };
             for (self.entries, 0..) |*entry, index| {
                 if (entry.state != .empty) continue;
                 entry.state = .launching;
                 self.launching += 1;
                 self.counters.launches_started += 1;
-                return .{ .entry = @intCast(index) };
+                if (scale_out) self.counters.scale_outs_started += 1;
+                return .{ .started = .{ .entry = @intCast(index), .scale_out = scale_out } };
             }
-            return null;
+            // `growthWantedLocked` found an empty entry under this hold.
+            unreachable;
+        }
+
+        /// Whether the pool still wants a scale-out, which the launcher asks
+        /// at each sample of its watch. When it no longer does, its watch
+        /// ends here, and the next `growthWanted` that finds one wanted
+        /// answers `watch` again.
+        pub fn keepScaleOutWatch(self: *Self, memory_gate_allows: bool) bool {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            const wanted = self.growthWantedLocked(memory_gate_allows) == .watch;
+            self.scale_out_watched = wanted;
+            return wanted;
         }
 
         /// Gives back the entry of a launch that ended without a worker. A
@@ -913,9 +1080,9 @@ pub fn Pool(comptime Record: type) type {
 
         /// Fills `out` with the live workers that hold no request, longest
         /// idle first, keeping the longest idle when there are more than
-        /// `out.len`, and returns the filled part: the reaper's candidates. A
-        /// listed worker may take a request before `retireIdle`, which
-        /// decides again.
+        /// `out.len`, and returns the filled part: the reaper's candidates and
+        /// the workers it watches. A listed worker may take a request before
+        /// `retireIdle` or `retireOnUnreadNotice`, which decide again.
         pub fn idleWorkers(self: *Self, out: []IdleWorker) []IdleWorker {
             self.mutex.lock();
             defer self.mutex.unlock();
@@ -927,7 +1094,8 @@ pub fn Pool(comptime Record: type) type {
                 const candidate: IdleWorker = .{
                     .worker = entry.record.?,
                     .idle_since_ns = entry.idle_since_ns,
-                    .reader = if (entry.reader) |lane| .{ .lane = lane, .epoch = entry.reader_epoch } else null,
+                    .reader = entry.reader,
+                    .reader_epoch = entry.reader_epoch,
                 };
                 if (len < out.len) {
                     out[len] = candidate;
@@ -1139,16 +1307,27 @@ pub fn Pool(comptime Record: type) type {
             return true;
         }
 
-        fn growthWantedLocked(self: *Self, memory_gate_allows: bool) bool {
-            if (!memory_gate_allows) return false;
-            if (self.launching >= self.launches_max) return false;
+        fn growthWantedLocked(self: *Self, memory_gate_allows: bool) Growth {
+            if (!memory_gate_allows) return .none;
+            if (self.launching >= self.launches_max) return .none;
             var occupied: usize = 0;
+            var live: usize = 0;
             for (self.entries) |*entry| {
-                if (entry.state != .empty) occupied += 1;
+                switch (entry.state) {
+                    .empty => {},
+                    .live => {
+                        occupied += 1;
+                        live += 1;
+                    },
+                    .launching, .retiring, .dead => occupied += 1,
+                }
             }
-            if (occupied >= self.entries.len) return false;
+            if (occupied >= self.entries.len) return .none;
             const covered = @as(u64, self.launching) * self.concurrency;
-            return self.waiter_count > covered;
+            if (self.waiter_count <= covered) return .none;
+            if (live != 0) return .watch;
+            if (self.launching == 0) return .launch;
+            return .none;
         }
 
         fn popLiveWaiter(self: *Self, now_ns: u64) ?Waiter {

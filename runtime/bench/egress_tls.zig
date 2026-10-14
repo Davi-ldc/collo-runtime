@@ -1,438 +1,619 @@
-//! Measures the egress TLS data paths in this process, against local
-//! BoringSSL test origins that run on their own threads. Full and
-//! session-resumed handshakes are timed on the fd path, where BoringSSL reads
-//! and writes the socket itself. Every other scenario runs over the BIO path
-//! driven by io_uring: a handshake alone that negotiates HTTP/2, and HTTP/2
-//! uploads, downloads, small frames and a 100-stream multiplex through the h2
-//! pool and its data driver. Each BIO sample starts a fresh origin, pool and
-//! drivers. A transfer sample primes its connection with one untimed request
-//! and fails unless every stream reused that connection and the body bytes
-//! received total the stream count times the response size. Like every
-//! egress bench it builds ReleaseFast without JSC.
+//! Measures TLS egress through one egress engine, the engine a gateway shard
+//! runs, against local HTTP/2 origins of the test TLS shim
+//! (`collo_bench_h2_origin_start`), each serving exactly one connection on a
+//! thread of its own. Every sample starts a fresh engine and origin. Like
+//! every egress bench it builds ReleaseFast without JSC.
+//!
+//! `tls_handshake_full` times a fresh engine's first fetch from submit to its
+//! response head: the DNS cache's first lookup, the TCP connect, a full TLS
+//! handshake on the engine's owner thread, the HTTP/2 session setup and one
+//! stream. Each sample dials under a security cell of its own, so its
+//! session key (`tls.buildSessionKey`) never matches a ticket an earlier
+//! sample left in the process-wide client session cache.
+//!
+//! The transfer scenarios measure HTTP/2 over one established connection:
+//! one untimed fetch pays for the dial, then the sample times `streams`
+//! fetches submitted at once, as uploads, downloads, small responses or a
+//! 100-stream multiplex. A transfer sample fails unless the origin answered
+//! every stream on its one connection and the body bytes received total the
+//! stream count times the response size.
+//!
+//! The bench consumes each fetch the way the gateway's loop does: it arms
+//! the task's response queue before it sleeps, pulls one chunk per pull,
+//! returns every chunk's credit to the engine, which opens HTTP/2
+//! flow-control windows only as credits come back, and sleeps on an eventfd
+//! that the engine's wake callback writes.
+//!
+//! No scenario times a resumed handshake. A resumed dial needs an origin that
+//! redeems a ticket an earlier connection to the same name and port received
+//! and then answers HTTP, and no shim origin does both: a bench origin builds
+//! its own server context and serves one connection on a port the kernel
+//! picks, and the resumption origin answers no request.
+//!
+//! COLLO_BENCH_EGRESS_ITERATIONS sets the measured samples per scenario and
+//! COLLO_BENCH_EGRESS_WARMUP the unmeasured samples before them.
 
 const std = @import("std");
+const bench_common = @import("common.zig");
 const bench_metadata = @import("metadata.zig");
 const local_origin = @import("local_origin.zig");
-const pool_mod = @import("collo_egress_pool");
+const proc_memory = @import("proc_memory.zig");
+const egress = @import("collo_egress_client");
+const tls_shim = @import("collo_test_tls_shim");
 
-const data_io = pool_mod.data_io;
-const readiness = pool_mod.readiness;
-const transport = pool_mod.transport;
+const Engine = egress.engine.Engine;
+const ResponseQueue = egress.core.ResponseQueue;
+const Task = egress.task.Task;
+const TestH2Origin = tls_shim.TestH2Origin;
 
+const bench_name = "egress_tls";
 const default_iterations: usize = 20;
 const default_warmup_iterations: usize = 3;
 
-const tls_shim = @import("collo_test_tls_shim");
-const TestH2Origin = tls_shim.TestH2Origin;
-const collo_bench_h2_origin_start = tls_shim.collo_bench_h2_origin_start;
-const collo_test_h2_origin_stop = tls_shim.collo_test_h2_origin_stop;
-const collo_test_h2_origin_last_error = tls_shim.collo_test_h2_origin_last_error;
-
-const TestTlsResumptionOrigin = tls_shim.TestTlsResumptionOrigin;
-const collo_test_tls_resumption_origin_start = tls_shim.collo_test_tls_resumption_origin_start;
-const collo_test_tls_resumption_origin_stop = tls_shim.collo_test_tls_resumption_origin_stop;
-
-const Path = enum {
-    bio_iouring,
-    fd_blocking,
-
-    fn name(self: Path) []const u8 {
-        return @tagName(self);
-    }
-};
-
-const ResumptionMode = enum {
-    full,
-    resumed,
-};
+/// How long a sample may go without progress before it fails.
+const stall_timeout_ns: u64 = 30 * std.time.ns_per_s;
+/// Chunks one `Consumer.advance` pulls before the other fetches get a turn.
+const pulls_per_advance_max: usize = 64;
+/// The most timed streams a scenario runs, plus the untimed one.
+const fetches_max: usize = 101;
+/// The largest HTTP/2 flow-control window.
+const h2_window_bytes_max: usize = (1 << 31) - 1;
 
 const Scenario = struct {
     name: []const u8,
+    /// One untimed fetch opens the connection before the timed ones.
+    primed: bool,
+    streams: u32,
     request_body_bytes: usize = 0,
+    /// What the origin sends for every stream but its first, which it
+    /// answers with an empty body.
     response_body_bytes: usize = 0,
-    streams: u32 = 1,
-    handshake_only: bool = false,
-};
-
-const Sample = struct {
-    elapsed_ns: u64,
-    ttfb_ns: u64,
-    rss_kib: u64,
-    peak_rss_kib: u64,
-};
-
-const CompletionStats = struct {
-    first_head_ns: ?u64 = null,
 };
 
 const scenarios = [_]Scenario{
-    .{ .name = "handshake", .handshake_only = true },
-    .{ .name = "upload_16k", .request_body_bytes = 16 * 1024 },
-    .{ .name = "upload_256k", .request_body_bytes = 256 * 1024 },
-    .{ .name = "download_16k", .response_body_bytes = 16 * 1024 },
-    .{ .name = "download_256k", .response_body_bytes = 256 * 1024 },
-    .{ .name = "small_frame_h2", .response_body_bytes = 1, .streams = 32 },
-    .{ .name = "multiplex_100_small_h2", .response_body_bytes = 2, .streams = 100 },
+    .{ .name = "tls_handshake_full", .primed = false, .streams = 1 },
+    .{ .name = "upload_16k", .primed = true, .streams = 1, .request_body_bytes = 16 * 1024 },
+    .{ .name = "upload_256k", .primed = true, .streams = 1, .request_body_bytes = 256 * 1024 },
+    .{ .name = "download_16k", .primed = true, .streams = 1, .response_body_bytes = 16 * 1024 },
+    .{ .name = "download_256k", .primed = true, .streams = 1, .response_body_bytes = 256 * 1024 },
+    .{ .name = "small_frame_h2", .primed = true, .streams = 32, .response_body_bytes = 1 },
+    .{ .name = "multiplex_100_small_h2", .primed = true, .streams = 100, .response_body_bytes = 2 },
+};
+
+comptime {
+    for (scenarios) |scenario| {
+        std.debug.assert(scenario.streams != 0);
+        std.debug.assert(@intFromBool(scenario.primed) + scenario.streams <= fetches_max);
+    }
+}
+
+const Sample = struct {
+    /// From the first timed submit to the end of the last body.
+    elapsed_ns: u64,
+    /// From the first timed submit to the first published head.
+    ttfb_ns: u64,
+    /// The process with the sample's engine still running.
+    memory: proc_memory.Metrics,
 };
 
 pub fn main() !void {
-    var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = debug_allocator.deinit();
-    const allocator = debug_allocator.allocator();
-
-    try bench_metadata.print(allocator, "egress_tls");
+    // The engine's owner thread allocates while the bench thread does, and
+    // smp_allocator keeps a freelist per thread, so no allocator lock adds
+    // contention the gateway does not have.
+    const allocator = std.heap.smp_allocator;
+    try bench_metadata.print(allocator, bench_name);
     const iterations = try envUsize(allocator, "COLLO_BENCH_EGRESS_ITERATIONS", default_iterations);
     const warmup_iterations = try envUsize(allocator, "COLLO_BENCH_EGRESS_WARMUP", default_warmup_iterations);
-
-    try runResumptionScenario(allocator, .full, iterations, warmup_iterations);
-    try runResumptionScenario(allocator, .resumed, iterations, warmup_iterations);
-
-    const path: Path = .bio_iouring;
+    if (iterations == 0) {
+        std.debug.print("{s}: iterations must be nonzero\n", .{bench_name});
+        return error.InvalidBenchConfig;
+    }
+    const local = try LocalAddress.init();
+    var sample_number: u64 = 0;
     for (scenarios) |scenario| {
-        const elapsed_samples = try allocator.alloc(u64, iterations);
-        defer allocator.free(elapsed_samples);
-        const ttfb_samples = try allocator.alloc(u64, iterations);
-        defer allocator.free(ttfb_samples);
-
         var warmup: usize = 0;
-        while (warmup < warmup_iterations) : (warmup += 1)
-            _ = try runSample(allocator, scenario);
-
-        for (elapsed_samples, ttfb_samples, 0..) |*elapsed, *ttfb, iteration| {
-            const sample = try runSample(allocator, scenario);
-            elapsed.* = sample.elapsed_ns;
-            ttfb.* = sample.ttfb_ns;
-            printJsonSample(path, scenario, iteration + 1, sample);
+        while (warmup < warmup_iterations) : (warmup += 1) {
+            sample_number += 1;
+            _ = try runSample(allocator, scenario, &local, securityCell(sample_number));
         }
-        std.mem.sort(u64, elapsed_samples, {}, std.sort.asc(u64));
-        std.mem.sort(u64, ttfb_samples, {}, std.sort.asc(u64));
-        printSummary(path, scenario, elapsed_samples, ttfb_samples);
+        const samples = try allocator.alloc(Sample, iterations);
+        defer allocator.free(samples);
+        for (samples, 1..) |*sample, iteration| {
+            sample_number += 1;
+            sample.* = try runSample(allocator, scenario, &local, securityCell(sample_number));
+            printJsonSample(scenario, iteration, sample.*);
+        }
+        try printSummary(allocator, scenario, samples);
     }
 }
 
-/// TLS handshake latency on the fd path, full or session-resumed. One origin,
-/// and so one server SSL_CTX whose tickets stay valid, serves every connect.
-/// The first connect and the warmup connects are not measured. Under
-/// `resumed` the first one fills the session cache and every later connect
-/// must resume; under `full` none may.
-fn runResumptionScenario(
+/// A security cell no other sample of this process uses.
+fn securityCell(sample_number: u64) [16]u8 {
+    var cell: [16]u8 = @splat(0);
+    std.mem.writeInt(u64, cell[0..8], sample_number, .little);
+    return cell;
+}
+
+fn runSample(
     allocator: std.mem.Allocator,
-    mode: ResumptionMode,
-    iterations: usize,
-    warmup_iterations: usize,
-) !void {
-    const tls = transport.tls;
-    const scenario = Scenario{
-        .name = switch (mode) {
-            .full => "tls_handshake_full",
-            .resumed => "tls_handshake_resumed",
-        },
-        .handshake_only = true,
-    };
-    const total_connects = 1 + warmup_iterations + iterations;
+    scenario: Scenario,
+    local: *const LocalAddress,
+    security_cell: [16]u8,
+) !Sample {
+    const primed_streams: u32 = @intFromBool(scenario.primed);
+    const origin = try Origin.start(primed_streams + scenario.streams, scenario.response_body_bytes);
+    defer origin.stop();
 
-    var origin: ?*TestTlsResumptionOrigin = null;
-    var port: u16 = 0;
-    if (collo_test_tls_resumption_origin_start(@intCast(total_connects), &origin, &port) != 0)
-        return error.EgressBenchOriginStartFailed;
-    defer collo_test_tls_resumption_origin_stop(origin.?);
-
-    const routable = try local_origin.routableLocalIpv4();
-    var host_buffer: [15]u8 = undefined;
-    const host = local_origin.formatIpv4(routable, &host_buffer);
-    const address = std.net.Address.initIp4(routable, port);
-    const cell: [16]u8 = [_]u8{7} ** 16;
-    // A ticket is only reusable under the offer that produced it, so the key
-    // and the handshake must read the same offer.
-    const alpn_offer: tls.AlpnOffer = .http_1_1;
-    var key_buffer: [tls.max_session_key_bytes]u8 = undefined;
-    const session_key: ?[]const u8 = switch (mode) {
-        // No cache interaction: the cost of a cold handshake alone.
-        .full => null,
-        // One cell id as both the security and the policy cell, plus the ALPN
-        // offer every connect uses, keeps the key stable across the scenario,
-        // which is what lets the measured handshakes resume.
-        .resumed => tls.buildSessionKey(&key_buffer, cell, cell, alpn_offer, host, port),
-    };
-
-    const elapsed_samples = try allocator.alloc(u64, iterations);
-    defer allocator.free(elapsed_samples);
-
-    var connect_index: usize = 0;
-    var sample_index: usize = 0;
-    while (connect_index < total_connects) : (connect_index += 1) {
-        const measured = connect_index >= 1 + warmup_iterations;
-        const stream = try std.net.tcpConnectToAddress(address);
-        const start_ns = try monotonicNowNs();
-        const connection = try tls.Connection.create(allocator, stream, host, true, alpn_offer, session_key);
-        const handshake_ns = (try monotonicNowNs()) - start_ns;
-        defer connection.deinit();
-        // The origin writes one byte post-handshake; reading it pulls the
-        // NewSessionTickets in so the next connect can resume.
-        var ready: [1]u8 = undefined;
-        switch (try connection.readStep(&ready)) {
-            .ready => {},
-            else => return error.EgressBenchOriginReadFailed,
-        }
-        const reused = connection.sessionReused();
-        // The very first connect is always full; with a key every later one
-        // must resume, without one none may.
-        if (connect_index != 0 and reused != (mode == .resumed))
-            return error.EgressBenchUnexpectedResumptionState;
-
-        if (measured) {
-            elapsed_samples[sample_index] = handshake_ns;
-            sample_index += 1;
-            printJsonSample(.fd_blocking, scenario, sample_index, sampleWithMemory(handshake_ns, handshake_ns));
-        }
-    }
-
-    std.mem.sort(u64, elapsed_samples, {}, std.sort.asc(u64));
-    printSummary(.fd_blocking, scenario, elapsed_samples, elapsed_samples);
-}
-
-fn runSample(allocator: std.mem.Allocator, scenario: Scenario) !Sample {
-    var origin: ?*TestH2Origin = null;
-    var port: u16 = 0;
-    if (collo_bench_h2_origin_start(
-        if (scenario.handshake_only) 1 else scenario.streams + 1,
-        scenario.response_body_bytes,
-        &origin,
-        &port,
-    ) != 0)
-        return error.EgressBenchOriginStartFailed;
-    defer collo_test_h2_origin_stop(origin.?);
-
-    const body = try allocator.alloc(u8, scenario.request_body_bytes);
-    defer allocator.free(body);
-    @memset(body, 'p');
-
-    const routable = try local_origin.routableLocalIpv4();
-    var host_buffer: [15]u8 = undefined;
-    const host = local_origin.formatIpv4(routable, &host_buffer);
-    const url = try std.fmt.allocPrint(allocator, "https://{s}:{d}/bench", .{ host, port });
-    defer allocator.free(url);
+    var url_buffer: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buffer, "https://{s}:{d}/bench", .{ local.host(), origin.port });
+    // The engine stops before this returns, so the grant outlives every hop
+    // that reads it.
     var grant: local_origin.LocalGrant = undefined;
-    try grant.init(routable, &.{port});
-    const config = transport.Config{
-        .network = grant.policy(),
-        .insecure_tls = true,
-        .socket_timeout_ms = 15_000,
-        .max_response_body_bytes = @max(scenario.response_body_bytes, 1),
-        .http2_max_active_streams = @max(scenario.streams, 1),
-        .http2_max_outgoing_buffer_bytes = @max(scenario.request_body_bytes + 64 * 1024, 1024 * 1024),
-        .tls_ciphertext_buffer_bytes = @max(scenario.request_body_bytes + 64 * 1024, 1024 * 1024),
-    };
+    try grant.init(local.bytes, &.{origin.port});
+    const config = sampleConfig(scenario, grant.policy(), security_cell);
+    const request_body = try allocator.alloc(u8, scenario.request_body_bytes);
+    defer allocator.free(request_body);
+    @memset(request_body, 'p');
 
-    var plan = try transport.prepareRequest(allocator, url, "POST", &.{}, config);
-    defer plan.deinit();
-    var readiness_driver = readiness.Driver.init(allocator);
-    defer readiness_driver.deinit();
-    var dns_cache = transport.DnsCache.init(allocator, .{});
-    defer dns_cache.deinit();
-    // Pool entries own BIO connections that the data driver's deinit drain
-    // still touches; LIFO defers must run the driver's deinit before the
-    // pool frees them.
-    var client_pool = pool_mod.Pool.init(allocator, .{ .max_entries = 1 });
-    defer client_pool.deinit();
-    var data_driver = try data_io.Driver.init(allocator);
-    defer data_driver.deinit();
-
-    if (scenario.handshake_only) {
-        const start_ns = try monotonicNowNs();
-        var wire = try connectBioH2(allocator, &plan, config, &dns_cache, &readiness_driver, &data_driver);
-        defer wire.deinit();
-        const end_ns = try monotonicNowNs();
-        return sampleWithMemory(end_ns - start_ns, end_ns - start_ns);
-    }
-
-    var wire = try connectBioH2(allocator, &plan, config, &dns_cache, &readiness_driver, &data_driver);
-    var wire_owned = true;
-    defer if (wire_owned)
-        wire.deinit();
-
-    const prime_request = pool_mod.BatchRequest{
-        .allocator = allocator,
-        .url = url,
-        .method = "POST",
-        .body = "",
-        .headers = &.{},
-        .config = config,
-    };
-    const entry = switch (try client_pool.adoptConnection(prime_request, wire)) {
-        .pending => |stream| stream.entry,
-        else => return error.EgressBenchExpectedPendingStream,
-    };
-    wire_owned = false;
-    _ = try completeStreams(entry, &client_pool, &data_driver, 1, 0, null);
-
-    const request = pool_mod.BatchRequest{
-        .allocator = allocator,
-        .url = url,
-        .method = "POST",
-        .body = body,
-        .headers = &.{},
-        .config = config,
-    };
-    const start_ns = try monotonicNowNs();
-    switch (try client_pool.startRequest(request)) {
-        .pending => |stream| if (stream.entry != entry) return error.EgressBenchDidNotReuseConnection,
-        else => return error.EgressBenchExpectedPendingStream,
-    }
-    var stream_index: u32 = 1;
-    while (stream_index < scenario.streams) : (stream_index += 1) {
-        switch (try client_pool.startRequest(request)) {
-            .pending => |stream| if (stream.entry != entry) return error.EgressBenchDidNotReuseConnection,
-            else => return error.EgressBenchExpectedPendingStream,
+    var fetches: [fetches_max]?Fetch = @splat(null);
+    var consumer: Consumer = undefined;
+    try consumer.init(allocator, @intFromBool(scenario.primed) + scenario.streams);
+    defer consumer.deinit();
+    defer {
+        consumer.stop();
+        for (&fetches) |*slot| {
+            if (slot.*) |*fetch|
+                consumer.discard(fetch);
         }
     }
-    const completed = try completeStreams(
-        entry,
-        &client_pool,
-        &data_driver,
-        scenario.streams,
-        scenario.response_body_bytes,
-        start_ns,
-    );
-    const elapsed_ns = (try monotonicNowNs()) - start_ns;
-    return sampleWithMemory(elapsed_ns, completed.first_head_ns orelse elapsed_ns);
-}
 
-fn connectBioH2(
-    allocator: std.mem.Allocator,
-    plan: *const transport.RequestPlan,
-    config: transport.Config,
-    dns_cache: *transport.DnsCache,
-    readiness_driver: *readiness.Driver,
-    data_driver: *data_io.Driver,
-) !transport.HttpConnection {
-    return switch (try pool_mod.Entry.connectBio(allocator, plan, config, dns_cache, readiness_driver, data_driver)) {
-        .h2 => |connected| connected,
-        .h1 => |connected| {
-            var rejected = connected;
-            rejected.deinit();
-            return error.EgressBenchExpectedH2Negotiation;
-        },
-    };
-}
-
-fn completeStreams(
-    entry: *pool_mod.Entry,
-    client_pool: *pool_mod.Pool,
-    data_driver: *data_io.Driver,
-    stream_count: u32,
-    expected_response_body_bytes: usize,
-    start_ns: ?u64,
-) !CompletionStats {
-    var completed: u32 = 0;
-    var received_body_bytes: usize = 0;
-    var stats = CompletionStats{};
-    while (completed < stream_count) {
-        while (completed < stream_count) {
-            var event = client_pool.readEntryEvent(entry) catch |err| switch (err) {
-                error.Http2WouldBlock => break,
-                else => return err,
-            };
-            defer event.deinit();
-            switch (event) {
-                .head => {
-                    if (stats.first_head_ns == null) {
-                        if (start_ns) |start|
-                            stats.first_head_ns = (try monotonicNowNs()) - start;
-                    }
-                },
-                .body_chunk => |body| {
-                    received_body_bytes += body.bytes.len;
-                    var maybe_end = try client_pool.ackReceivedData(entry, body.stream_id, body.flow_credit, body.update_stream_window);
-                    if (maybe_end) |*end_event| {
-                        defer end_event.deinit();
-                        switch (end_event.*) {
-                            .end => completed += 1,
-                            .failure => |failure| return failure.err,
-                            else => {},
-                        }
-                    }
-                },
-                .end => completed += 1,
-                // An interim (1xx) block would land between the request and the
-                // head this scenario times. The bench origin serves one final
-                // response and nothing else, so a progress event means the
-                // origin changed and these samples no longer compare with the
-                // ones before it.
-                .progress => return error.EgressBenchUnexpectedInterimResponse,
-                .failure => |failure| return failure.err,
-            }
-        }
-        if (completed == stream_count)
-            break;
-        try waitForEntry(entry, data_driver);
+    var timer = try std.time.Timer.start();
+    if (scenario.primed) {
+        const priming = fetches[0..1];
+        priming[0] = try consumer.createFetch(.{ .url = url, .method = "GET", .config = config });
+        try consumer.submit(&priming[0].?, &timer);
+        _ = try runToEnd(&consumer, priming, &timer, origin);
     }
-    const expected_total_body_bytes = @as(usize, stream_count) * expected_response_body_bytes;
-    if (received_body_bytes != expected_total_body_bytes)
-        return error.EgressBenchUnexpectedResponseBody;
-    return stats;
-}
 
-fn waitForEntry(
-    entry: *pool_mod.Entry,
-    data_driver: *data_io.Driver,
-) !void {
-    var context: u8 = 0;
-    switch (try data_driver.wait(&.{.{
-        .context = &context,
-        .connection = entry.bioTls() orelse return error.EgressBenchExpectedBioTls,
-        .deadline_mono_ns = try data_io.deadlineAfterMs(15_000),
-        .want_read = true,
-        .want_write = entry.wantsOutgoingWrite(),
-    }}, null)) {
-        .ready => |ready| if (ready.writable and entry.hasOutgoing()) try entry.flushOutgoing(),
-        .failed => |failure| return failure.err,
-        .expired => return error.EgressBenchTimeout,
-        .wake, .tick => {},
+    // Tasks copy their request bodies here, before the timed window.
+    const timed = fetches[primed_streams..][0..scenario.streams];
+    const method: []const u8 = if (scenario.request_body_bytes == 0) "GET" else "POST";
+    const request: Request = .{ .url = url, .method = method, .body = request_body, .config = config };
+    for (timed) |*slot|
+        slot.* = try consumer.createFetch(request);
+    timer.reset();
+    for (timed) |*slot|
+        try consumer.submit(&slot.*.?, &timer);
+    const outcome = try runToEnd(&consumer, timed, &timer, origin);
+
+    const answered = origin.streamCount();
+    if (answered != primed_streams + scenario.streams) {
+        std.debug.print(
+            "{s}: {s}: the origin answered {d} of {d} streams on its one connection\n",
+            .{ bench_name, scenario.name, answered, primed_streams + scenario.streams },
+        );
+        return error.EgressTlsBenchConnectionNotReused;
     }
-}
-
-fn monotonicNowNs() !u64 {
-    const ts = try std.posix.clock_gettime(std.posix.CLOCK.MONOTONIC);
-    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
-}
-
-fn sampleWithMemory(elapsed_ns: u64, ttfb_ns: u64) Sample {
-    const memory = readProcessMemory();
+    // The origin's first stream carries no body: the untimed fetch's, or the
+    // first timed one's when no fetch primed the connection.
+    const full_responses: usize = if (scenario.primed) scenario.streams else scenario.streams - 1;
+    const expected_body_bytes = full_responses * scenario.response_body_bytes;
+    if (outcome.body_bytes != expected_body_bytes) {
+        std.debug.print(
+            "{s}: {s}: received {d} body bytes, expected {d}\n",
+            .{ bench_name, scenario.name, outcome.body_bytes, expected_body_bytes },
+        );
+        return error.EgressTlsBenchUnexpectedBodyBytes;
+    }
     return .{
-        .elapsed_ns = elapsed_ns,
-        .ttfb_ns = ttfb_ns,
-        .rss_kib = memory.rss_kib,
-        .peak_rss_kib = memory.peak_rss_kib,
+        .elapsed_ns = outcome.last_end_ns,
+        .ttfb_ns = outcome.first_head_ns,
+        .memory = try proc_memory.readProcess(allocator, @intCast(std.os.linux.getpid())),
     };
 }
 
-const ProcessMemory = struct {
-    rss_kib: u64 = 0,
-    peak_rss_kib: u64 = 0,
+const BatchOutcome = struct {
+    /// Readings of the sample's timer.
+    first_head_ns: u64 = std.math.maxInt(u64),
+    last_end_ns: u64 = 0,
+    body_bytes: usize = 0,
 };
 
-fn readProcessMemory() ProcessMemory {
-    var file = std.fs.openFileAbsolute("/proc/self/status", .{}) catch return .{};
-    defer file.close();
-    var buffer: [64 * 1024]u8 = undefined;
-    const len = file.readAll(&buffer) catch return .{};
+/// Advances every submitted fetch in `slots` until each body ended,
+/// discarding each fetch as it ends. On failure it prints the origin's error,
+/// a diagnostic only: the origin's thread may still be writing it.
+fn runToEnd(consumer: *Consumer, slots: []?Fetch, timer: *std.time.Timer, origin: Origin) !BatchOutcome {
+    var outcome: BatchOutcome = .{};
+    var remaining = slots.len;
+    var deadline_ns = try bench_common.deadlineFromNowNs(stall_timeout_ns);
+    errdefer {
+        const origin_error = origin.lastError();
+        if (origin_error.len != 0)
+            std.debug.print("{s}: origin error: {s}\n", .{ bench_name, origin_error });
+    }
+    while (remaining != 0) {
+        var progressed = false;
+        for (slots) |*slot| {
+            const fetch = if (slot.*) |*held| held else continue;
+            switch (try consumer.advance(fetch, timer)) {
+                .idle => continue,
+                .progressed => {},
+                .finished => {
+                    outcome.first_head_ns = @min(outcome.first_head_ns, fetch.head_ns.?);
+                    outcome.last_end_ns = @max(outcome.last_end_ns, fetch.end_ns);
+                    outcome.body_bytes += fetch.body_bytes;
+                    consumer.discard(fetch);
+                    slot.* = null;
+                    remaining -= 1;
+                },
+            }
+            progressed = true;
+        }
+        if (progressed) {
+            deadline_ns = try bench_common.deadlineFromNowNs(stall_timeout_ns);
+        } else {
+            consumer.wait(deadline_ns) catch |err| {
+                std.debug.print(
+                    "{s}: stalled with {d} of {d} fetches open\n",
+                    .{ bench_name, remaining, slots.len },
+                );
+                return err;
+            };
+        }
+    }
+    return outcome;
+}
+
+/// One config for every fetch of a sample, so they all share the origin key
+/// of the one connection the origin accepts. The stream limit admits every
+/// timed stream at once, since a pool entry at its limit makes the engine
+/// dial a second connection; the priming stream never counts against it,
+/// because a stream leaves the connection's active set before its queue
+/// completes (`completeStreamAt` in the HTTP/2 codec). The bench origin
+/// sends each response whole without waiting for window updates, so each
+/// stream's receive window covers a whole response and the connection's
+/// covers every stream at once, within the HTTP/2 maximum. The body limits
+/// cover the windows, since `Config.http2Limits` clamps the windows to them.
+fn sampleConfig(
+    scenario: Scenario,
+    policy: egress.network.Policy,
+    security_cell: [16]u8,
+) egress.Config {
+    const response_window = @max(scenario.response_body_bytes, 64 * 1024);
+    const stream_window: usize = @min(response_window, h2_window_bytes_max);
+    const connection_window: usize = @min(stream_window * scenario.streams, h2_window_bytes_max);
+    // Room for a whole request body in the HTTP/2 send queue and on the wire.
+    const outgoing_bytes: usize = @max(scenario.request_body_bytes + 64 * 1024, 1024 * 1024);
     return .{
-        .rss_kib = procStatusKb(buffer[0..len], "VmRSS:") catch 0,
-        .peak_rss_kib = procStatusKb(buffer[0..len], "VmHWM:") catch 0,
+        .network = policy,
+        .insecure_tls = true,
+        .socket_timeout_ms = 15_000,
+        .max_response_body_bytes = stream_window,
+        .max_encoded_response_bytes = stream_window,
+        .max_pending_decoded_body_bytes = stream_window,
+        .http2_max_active_streams = scenario.streams,
+        .http2_stream_receive_window = @intCast(stream_window),
+        .http2_conn_receive_window = @intCast(connection_window),
+        .http2_max_pending_body_credit_per_stream = stream_window,
+        .http2_max_pending_body_credit_per_connection = connection_window,
+        .http2_max_outgoing_buffer_bytes = outgoing_bytes,
+        .wire_buffer_bytes = outgoing_bytes,
+        .pool_security_cell_id = security_cell,
     };
 }
 
-fn procStatusKb(status: []const u8, key: []const u8) !u64 {
-    var lines = std.mem.splitScalar(u8, status, '\n');
-    while (lines.next()) |line| {
-        if (!std.mem.startsWith(u8, line, key))
-            continue;
-        const rest = std.mem.trim(u8, line[key.len..], &std.ascii.whitespace);
-        const end = std.mem.indexOfAny(u8, rest, &std.ascii.whitespace) orelse rest.len;
-        return std.fmt.parseUnsigned(u64, rest[0..end], 10);
+/// A bench origin of the test TLS shim. It serves `expected_stream_count`
+/// streams on the one connection it accepts, answers its first stream with
+/// an empty body and every later one with `response_body_bytes`.
+const Origin = struct {
+    handle: *TestH2Origin,
+    port: u16,
+
+    fn start(expected_stream_count: u32, response_body_bytes: usize) !Origin {
+        var handle: ?*TestH2Origin = null;
+        var port: u16 = 0;
+        const status = tls_shim.collo_bench_h2_origin_start(
+            expected_stream_count,
+            response_body_bytes,
+            &handle,
+            &port,
+        );
+        if (status != 0) {
+            const reason = std.mem.span(tls_shim.collo_test_tls_last_error());
+            std.debug.print("{s}: origin start failed: {s}\n", .{ bench_name, reason });
+            return error.BenchOriginStartFailed;
+        }
+        return .{ .handle = handle orelse return error.BenchOriginStartFailed, .port = port };
     }
-    return error.ProcStatusKeyMissing;
+
+    fn stop(self: Origin) void {
+        tls_shim.collo_test_h2_origin_stop(self.handle);
+    }
+
+    /// Responses answered so far, all on the origin's one connection. Each
+    /// is counted before its last frame is written, so once a body ended its
+    /// response is counted.
+    fn streamCount(self: Origin) u32 {
+        return tls_shim.collo_test_h2_origin_stream_count(self.handle);
+    }
+
+    fn lastError(self: Origin) []const u8 {
+        return std.mem.span(tls_shim.collo_test_h2_origin_last_error(self.handle));
+    }
+};
+
+/// The address the bench dials its origins at, which listen on every
+/// address: the default route's source address, since every grant refuses
+/// loopback (`local_origin.zig`).
+const LocalAddress = struct {
+    bytes: [4]u8,
+    host_buffer: [15]u8,
+    host_len: usize,
+
+    fn init() !LocalAddress {
+        var self: LocalAddress = .{
+            .bytes = try local_origin.routableLocalIpv4(),
+            .host_buffer = undefined,
+            .host_len = 0,
+        };
+        self.host_len = local_origin.formatIpv4(self.bytes, &self.host_buffer).len;
+        return self;
+    }
+
+    fn host(self: *const LocalAddress) []const u8 {
+        return self.host_buffer[0..self.host_len];
+    }
+};
+
+/// What a fetch asks for.
+const Request = struct {
+    url: []const u8,
+    method: []const u8,
+    body: []const u8 = "",
+    config: egress.Config,
+    /// The decoded body the fetch must deliver byte for byte; null counts
+    /// its bytes only.
+    expected_body: ?[]const u8 = null,
+};
+
+/// One fetch as its consumer tracks it. It holds a reference to its task,
+/// and through the task to the task's response queue, until
+/// `Consumer.discard`.
+const Fetch = struct {
+    task: *Task,
+    config: egress.Config,
+    expected_body: ?[]const u8,
+    /// Readings of the sample's timer.
+    submit_ns: u64 = 0,
+    head_ns: ?u64 = null,
+    end_ns: u64 = 0,
+    body_bytes: usize = 0,
+};
+
+const Progress = enum {
+    /// Nothing new; the fetch's queue is armed, so the engine wakes the
+    /// consumer on its next chunk or end.
+    idle,
+    /// The head or a chunk arrived; the body has not ended.
+    progressed,
+    /// The body ended and was checked.
+    finished,
+};
+
+/// One engine and the bench thread's consumer of its fetches. The engine's
+/// wake callback writes `wake_fd`, an eventfd the consumer sleeps on between
+/// passes over its fetches. Initialize it in place: the engine keeps a
+/// pointer to it as its wake context.
+const Consumer = struct {
+    allocator: std.mem.Allocator,
+    engine: Engine,
+    wake_fd: std.posix.fd_t,
+    next_task_id: u64,
+
+    /// Starts an engine that runs up to `fetches_in_flight` fetches at once,
+    /// the most a sample has in flight.
+    fn init(self: *Consumer, allocator: std.mem.Allocator, fetches_in_flight: usize) !void {
+        const wake_fd = try std.posix.eventfd(0, std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK);
+        errdefer std.posix.close(wake_fd);
+        self.* = .{
+            .allocator = allocator,
+            .engine = try Engine.init(allocator, fetches_in_flight),
+            .wake_fd = wake_fd,
+            .next_task_id = 0,
+        };
+        errdefer self.engine.deinit();
+        try self.engine.start(self, wakeFromEngine);
+    }
+
+    /// Frees the engine, after `stop` and after every fetch was discarded.
+    fn deinit(self: *Consumer) void {
+        self.engine.deinit();
+        std.posix.close(self.wake_fd);
+        self.* = undefined;
+    }
+
+    /// Ends the engine's run, which settles every fetch the engine still
+    /// holds, so no chunk reaches a response queue afterwards.
+    fn stop(self: *Consumer) void {
+        self.engine.stop();
+    }
+
+    /// A fetch of `request` whose task holds a response queue of its own.
+    /// The fetch holds the task's only reference until it is submitted.
+    fn createFetch(self: *Consumer, request: Request) !Fetch {
+        const allocator = self.allocator;
+        self.next_task_id += 1;
+        const id = self.next_task_id;
+        const identity: egress.core.FetchBodyIdentity = .{
+            .request_id = id,
+            .request_generation = 1,
+            .fetch_id = id,
+            .body_id = id,
+        };
+        const queue = try allocator.create(ResponseQueue);
+        queue.* = ResponseQueue.init(identity, null);
+        const task = allocator.create(Task) catch |err| {
+            queue.release(allocator);
+            return err;
+        };
+        // On success the task takes over the queue's only reference.
+        task.* = Task.init(
+            allocator,
+            id,
+            request.url,
+            request.method,
+            request.body,
+            &.{},
+            0,
+            queue,
+        ) catch |err| {
+            allocator.destroy(task);
+            queue.release(allocator);
+            return err;
+        };
+        return .{ .task = task, .config = request.config, .expected_body = request.expected_body };
+    }
+
+    /// Submits `fetch`'s task, stamping it with `timer`'s reading. On error
+    /// the fetch stays unsubmitted and still holds its task.
+    fn submit(self: *Consumer, fetch: *Fetch, timer: *std.time.Timer) !void {
+        fetch.submit_ns = timer.read();
+        try self.engine.submit(.{ .task = fetch.task, .config = fetch.config });
+    }
+
+    /// Takes what `fetch`'s task and response queue hold now: the head once
+    /// the task settled, then body chunks, each checked against
+    /// `fetch.expected_body` before its credit goes back to the engine. Fails
+    /// when the fetch or its body failed, its status is not 200, or its body
+    /// differs from the one expected.
+    fn advance(self: *Consumer, fetch: *Fetch, timer: *std.time.Timer) !Progress {
+        var progress: Progress = .idle;
+        if (fetch.head_ns == null) {
+            switch (settledHead(fetch.task)) {
+                .pending => return .idle,
+                .failed => |message| {
+                    std.debug.print(
+                        "{s}: fetch of {s} failed: {s}\n",
+                        .{ bench_name, fetch.task.url, message },
+                    );
+                    return error.BenchFetchFailed;
+                },
+                .status => |status| {
+                    if (status != 200) {
+                        std.debug.print(
+                            "{s}: fetch of {s} answered {d}\n",
+                            .{ bench_name, fetch.task.url, status },
+                        );
+                        return error.BenchUnexpectedStatus;
+                    }
+                    fetch.head_ns = timer.read();
+                    progress = .progressed;
+                },
+            }
+        }
+        const queue = fetch.task.response_body;
+        var pulls: usize = 0;
+        while (pulls < pulls_per_advance_max) : (pulls += 1) {
+            if (!queue.armPull())
+                return progress;
+            const pulled = queue.pull(self.allocator);
+            self.engine.releaseFetchBodyCredit(pulled.credit);
+            if (pulled.bytes) |bytes| {
+                defer self.allocator.free(bytes);
+                try takeBody(fetch, bytes);
+            }
+            if (pulled.failed) {
+                const message = queue.failureMessage() orelse "no message";
+                std.debug.print("{s}: body of {s} failed: {s}\n", .{ bench_name, fetch.task.url, message });
+                return error.BenchBodyFailed;
+            }
+            if (pulled.done) {
+                fetch.end_ns = timer.read();
+                try finishBody(fetch);
+                return .finished;
+            }
+            progress = .progressed;
+        }
+        return .progressed;
+    }
+
+    /// Returns the credits of the chunks still queued for `fetch` and drops
+    /// its task reference. Valid for a fetch never submitted, one whose body
+    /// ended, and any fetch once the engine stopped, so no chunk can reach
+    /// the queue afterwards. A stopped engine drops the credits, since it
+    /// holds no stream they could open.
+    fn discard(self: *Consumer, fetch: *Fetch) void {
+        fetch.task.response_body.releaseQueued(self.allocator, &self.engine, Engine.releaseFetchBodyCredit);
+        fetch.task.release();
+        fetch.* = undefined;
+    }
+
+    /// Sleeps until the engine wakes the consumer. Fails with
+    /// `error.BenchResponseTimeout` once CLOCK_MONOTONIC passes
+    /// `deadline_ns`.
+    fn wait(self: *Consumer, deadline_ns: u64) !void {
+        const max_poll_ms = stall_timeout_ns / std.time.ns_per_ms;
+        try bench_common.waitReadableBeforeDeadline(self.wake_fd, deadline_ns, max_poll_ms);
+        var wakes: u64 = 0;
+        _ = std.posix.read(self.wake_fd, std.mem.asBytes(&wakes)) catch |err| switch (err) {
+            // Nothing to drain; the next pass finds no progress and waits
+            // again.
+            error.WouldBlock => {},
+            else => return err,
+        };
+    }
+};
+
+/// The engine's wake callback, on its owner thread. Every wake means the
+/// same to the consumer, which scans all its fetches after each.
+fn wakeFromEngine(context: ?*anyopaque, event: egress.engine.WakeEvent) void {
+    _ = event;
+    const consumer: *Consumer = @ptrCast(@alignCast(context.?));
+    const one: u64 = 1;
+    _ = std.posix.write(consumer.wake_fd, std.mem.asBytes(&one)) catch |err| switch (err) {
+        // A saturated eventfd already holds a wake.
+        error.WouldBlock => {},
+        // The consumer's stall deadline then fails the sample.
+        else => std.debug.print("{s}: engine wake failed: {s}\n", .{ bench_name, @errorName(err) }),
+    };
+}
+
+const Head = union(enum) {
+    pending,
+    status: u16,
+    /// In the task's result arena, or static.
+    failed: []const u8,
+};
+
+fn settledHead(task: *Task) Head {
+    task.mutex.lock();
+    defer task.mutex.unlock();
+    if (!task.done)
+        return .pending;
+    const result = task.result orelse return .{ .failed = "task settled without a result" };
+    return switch (result) {
+        .success => |success| .{ .status = success.status },
+        .failure => |failure| .{ .failed = failure.message },
+    };
+}
+
+/// Counts `bytes` into `fetch`'s body after checking them against the
+/// expected body at that offset.
+fn takeBody(fetch: *Fetch, bytes: []const u8) !void {
+    if (fetch.expected_body) |expected| {
+        const end = fetch.body_bytes + bytes.len;
+        if (end > expected.len)
+            return error.BenchUnexpectedBody;
+        if (!std.mem.eql(u8, expected[fetch.body_bytes..end], bytes))
+            return error.BenchUnexpectedBody;
+    }
+    fetch.body_bytes += bytes.len;
+}
+
+fn finishBody(fetch: *const Fetch) !void {
+    const expected = fetch.expected_body orelse return;
+    if (fetch.body_bytes != expected.len)
+        return error.BenchUnexpectedBody;
 }
 
 fn envUsize(allocator: std.mem.Allocator, name: []const u8, default: usize) !usize {
@@ -444,48 +625,54 @@ fn envUsize(allocator: std.mem.Allocator, name: []const u8, default: usize) !usi
     return std.fmt.parseUnsigned(usize, std.mem.trim(u8, raw, " \t\r\n"), 10);
 }
 
-fn printJsonSample(path: Path, scenario: Scenario, iteration: usize, sample: Sample) void {
-    const operations = if (scenario.handshake_only) @as(u32, 1) else scenario.streams;
+fn printJsonSample(scenario: Scenario, iteration: usize, sample: Sample) void {
     std.debug.print(
-        "{{\"bench\":\"egress_tls\",\"path\":\"{s}\",\"scenario\":\"{s}\",\"iteration\":{d},\"streams\":{d},\"request_body_bytes\":{d},\"response_body_bytes\":{d},\"elapsed_ns\":{d},\"ttfb_ns\":{d},\"rss_kib\":{d},\"peak_rss_kib\":{d},\"ns_per_operation\":{d:.3}}}\n",
+        "{{\"bench\":\"{s}\",\"scenario\":\"{s}\",\"iteration\":{d},\"streams\":{d},\"request_body_bytes\":{d},\"response_body_bytes\":{d},\"elapsed_ns\":{d},\"ttfb_ns\":{d},\"ns_per_stream\":{d:.3},\"rss_kib\":{d},\"pss_kib\":{d},\"private_dirty_kib\":{d}}}\n",
         .{
-            path.name(),
+            bench_name,
             scenario.name,
             iteration,
-            operations,
+            scenario.streams,
             scenario.request_body_bytes,
             scenario.response_body_bytes,
             sample.elapsed_ns,
             sample.ttfb_ns,
-            sample.rss_kib,
-            sample.peak_rss_kib,
-            @as(f64, @floatFromInt(sample.elapsed_ns)) / @as(f64, @floatFromInt(operations)),
+            nsPerStream(scenario, sample.elapsed_ns),
+            sample.memory.rss_kib,
+            sample.memory.pss_kib,
+            sample.memory.private_dirty_kib,
         },
     );
 }
 
-fn printSummary(path: Path, scenario: Scenario, sorted_elapsed_samples: []const u64, sorted_ttfb_samples: []const u64) void {
-    const operations = if (scenario.handshake_only) @as(u32, 1) else scenario.streams;
-    const p50_ns = percentile(sorted_elapsed_samples, 50);
-    const p95_ns = percentile(sorted_elapsed_samples, 95);
-    const ttfb_p50_ns = percentile(sorted_ttfb_samples, 50);
-    const ttfb_p95_ns = percentile(sorted_ttfb_samples, 95);
+/// Percentiles over the samples of the time per stream and of the first
+/// head.
+fn printSummary(allocator: std.mem.Allocator, scenario: Scenario, samples: []const Sample) !void {
+    const elapsed_ns = try allocator.alloc(u64, samples.len);
+    defer allocator.free(elapsed_ns);
+    const ttfb_ns = try allocator.alloc(u64, samples.len);
+    defer allocator.free(ttfb_ns);
+    for (samples, elapsed_ns, ttfb_ns) |sample, *elapsed, *ttfb| {
+        elapsed.* = sample.elapsed_ns;
+        ttfb.* = sample.ttfb_ns;
+    }
+    std.mem.sort(u64, elapsed_ns, {}, std.sort.asc(u64));
+    std.mem.sort(u64, ttfb_ns, {}, std.sort.asc(u64));
     std.debug.print(
-        "egress_tls_summary path={s} scenario={s} samples={d} streams={d} p50_ns_per_operation={d:.3} p95_ns_per_operation={d:.3} ttfb_p50_ns={d} ttfb_p95_ns={d}\n",
+        "{s}_summary scenario={s} samples={d} streams={d} p50_ns_per_stream={d:.3} p95_ns_per_stream={d:.3} ttfb_p50_ns={d} ttfb_p95_ns={d}\n",
         .{
-            path.name(),
+            bench_name,
             scenario.name,
-            sorted_elapsed_samples.len,
-            operations,
-            @as(f64, @floatFromInt(p50_ns)) / @as(f64, @floatFromInt(operations)),
-            @as(f64, @floatFromInt(p95_ns)) / @as(f64, @floatFromInt(operations)),
-            ttfb_p50_ns,
-            ttfb_p95_ns,
+            samples.len,
+            scenario.streams,
+            nsPerStream(scenario, bench_common.percentileNearestRank(u64, elapsed_ns, 50)),
+            nsPerStream(scenario, bench_common.percentileNearestRank(u64, elapsed_ns, 95)),
+            bench_common.percentileNearestRank(u64, ttfb_ns, 50),
+            bench_common.percentileNearestRank(u64, ttfb_ns, 95),
         },
     );
 }
 
-fn percentile(sorted_samples: []const u64, percentile_value: usize) u64 {
-    const rank = @max(@as(usize, 1), (sorted_samples.len * percentile_value + 99) / 100);
-    return sorted_samples[@min(rank, sorted_samples.len) - 1];
+fn nsPerStream(scenario: Scenario, elapsed_ns: u64) f64 {
+    return @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, @floatFromInt(scenario.streams));
 }

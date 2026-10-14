@@ -1,9 +1,10 @@
 //! The low-level helpers in `collo_os`, run against the live kernel: the
-//! cmsghdr layout, fd ownership, close-on-exec socket pairs, socket options,
-//! start ticks from `/proc/<pid>/stat`, spawning with mapped fds into a new
-//! session with the child's pidfd, closing every fd outside an allowlist,
-//! thread CPU clocks read from another thread, and the two fork primitives
-//! the zygote depends on, `makeAddressSpaceForkInheritable` and
+//! cmsghdr layout, fd ownership, the seal check of a file that cannot carry
+//! seals, openat2 confined beneath a directory, close-on-exec socket pairs,
+//! socket options, start ticks from `/proc/<pid>/stat`, spawning with mapped
+//! fds into a new session with the child's pidfd, closing every fd outside an
+//! allowlist, thread CPU clocks read from another thread, and the two fork
+//! primitives the zygote depends on, `makeAddressSpaceForkInheritable` and
 //! `cloneForkWithPidFd` with the thread identity it gives the child and the
 //! errors a failed clone reports. The fork tests fork the test binary itself;
 //! the zygote's own fork loop is covered by the `zygote-integration` lane.
@@ -33,6 +34,38 @@ test "FdRef borrows without taking ownership" {
     defer std.posix.close(fds[1]);
     const borrowed = os.fd.FdRef.fromRaw(fds[0]);
     try std.testing.expectEqual(fds[0], borrowed.fd());
+}
+
+test "a descriptor that cannot carry seals reads as missing them" {
+    const fds = try std.posix.pipe2(.{ .CLOEXEC = true });
+    defer std.posix.close(fds[0]);
+    defer std.posix.close(fds[1]);
+    try std.testing.expectError(error.MissingFdSeals, os.fd.requireSeals(fds[0], os.fd.memfd_size_seals));
+}
+
+test "openat2 beneath a directory opens what lies inside and refuses a path or a link that leaves it" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makeDir("inner");
+    try tmp.dir.writeFile(.{ .sub_path = "inner/file", .data = "inside" });
+    try tmp.dir.writeFile(.{ .sub_path = "outside", .data = "outside" });
+    try tmp.dir.symLink("file", "inner/near", .{});
+    try tmp.dir.symLink("../outside", "inner/far", .{});
+    var inner = try tmp.dir.openDir("inner", .{});
+    defer inner.close();
+    const flags: std.posix.O = .{ .ACCMODE = .RDONLY, .CLOEXEC = true };
+
+    var file = try os.fd.openat2(inner.fd, "file", flags, os.fd.resolve_beneath);
+    file.deinit();
+    var near = try os.fd.openat2(inner.fd, "near", flags, os.fd.resolve_beneath);
+    near.deinit();
+    try std.testing.expectError(error.PathEscapesDirectory, os.fd.openat2(inner.fd, "../outside", flags, os.fd.resolve_beneath));
+    try std.testing.expectError(error.PathEscapesDirectory, os.fd.openat2(inner.fd, "far", flags, os.fd.resolve_beneath));
+    try std.testing.expectError(
+        error.SymLinkLoop,
+        os.fd.openat2(inner.fd, "near", flags, os.fd.resolve_beneath | os.fd.resolve_no_symlinks),
+    );
+    try std.testing.expectError(error.FileNotFound, os.fd.openat2(inner.fd, "missing", flags, os.fd.resolve_beneath));
 }
 
 test "fork inherits a MADV_DONTFORK mapping once the address space is made inheritable" {

@@ -10,7 +10,11 @@
 //!   FIFO and owns a copy of its head (`head`), because the HTTP/2 decoder's
 //!   buffers are gone by the time a worker slot reaches it. A dispatched
 //!   request holds one slot of `worker` (`worker_slot`) until its finish gives
-//!   the slot back to the pool, and that slot keeps the record valid.
+//!   the slot back to the pool, and that slot keeps the record valid. Once
+//!   its begin reached the worker, that finish comes only at its
+//!   `request_done`, its worker's death or the lane's teardown, even after
+//!   the lane answered the client (`request_finish.zig`), so the worker never
+//!   holds two requests on one pool slot.
 //! - `route`, `request_id`, the request key and the access facts' identity
 //!   are the lane's own, assigned at admission; nothing a worker sends
 //!   changes them.
@@ -26,8 +30,11 @@
 //!   the worker's doing (`send_blocked == .failed`), nothing more goes out,
 //!   and the worker's death path ends the request.
 //! - `begin_sent` is set once the request's `request_begin` is in the
-//!   worker's socket. Until then the worker cannot have run the request, so
-//!   its finish writes no usage floor for it.
+//!   worker's socket. Until then the worker cannot have run the request: its
+//!   access record carries no CPU from the worker's page, and a
+//!   `request_done` naming it is a worker fault.
+//! - The worker's `request_done` finishes the request when it arrives
+//!   (`request_done.zig`), so the slot holds nothing of it.
 
 const std = @import("std");
 
@@ -36,7 +43,6 @@ const lifecycle = @import("collo_server_lifecycle");
 const server_config = @import("collo_server_config");
 const supervision = @import("collo_server_supervisor");
 const access_log = @import("collo_server_analytics").access;
-const worker_shared_page = @import("collo_worker_state").page;
 const server_responses = @import("../server_responses.zig");
 const slab = @import("../slab.zig");
 const timer_wheel = @import("../timer_wheel.zig");
@@ -71,13 +77,6 @@ pub const RequestSlot = struct {
     worker_slot: pool.Slot = 0,
     /// `worker.key()` at dispatch; zero while the request waits.
     worker_key: lifecycle.WorkerKey = .{ .worker_id = 0, .worker_generation = 0 },
-    /// The gateway generation and the worker session the request's egress
-    /// token was minted for, both 0 when its dispatch carried
-    /// `egress_token.none` or it was never dispatched. Its finish owes that
-    /// gateway a `request_ended` entry (`Lease.noteEnded` in
-    /// `server/gateway/lease.zig`).
-    egress_gateway_generation: u64 = 0,
-    egress_gateway_session_id: u64 = 0,
     /// The client reset the stream, or the lane answered it alone and
     /// detached it: the worker's descriptors for it are dropped and the lane
     /// writes nothing more on it.
@@ -85,17 +84,13 @@ pub const RequestSlot = struct {
     /// The answer the lane gave the client itself on a dispatched request's
     /// stream, refusing its body (`request_body.zig`). The client got this
     /// and never the worker's response, so the request's access record
-    /// reports it, from the server, whatever the worker's completion says
-    /// (`request_finish.zig`).
+    /// reports it, from the server, whatever the worker's `request_done`
+    /// says (`request_finish.zig`).
     local_answer: ?server_responses.Id = null,
     /// What the request's next send toward the worker waits for, or `.none`.
     send_blocked: SendBlock = .none,
     /// The request's `request_begin` reached the worker's socket.
     begin_sent: bool = false,
-    /// The grace backstop once moved out by another grace for this request,
-    /// because its worker kept the control socket filling past the
-    /// backstop's read (`deadline_driver.expireDispatchedRequest`).
-    backstop_deferred: bool = false,
     /// The request's begin, when its send would have blocked.
     parked_begin: ?ParkedBegin = null,
     /// The error code of a request reset whose send would have blocked.
@@ -106,11 +101,6 @@ pub const RequestSlot = struct {
     /// `response_credit.granted` has not reached the worker: its send found
     /// the control socket full, and the socket's writability poll retries it.
     response_credit_unsent: bool = false,
-    /// A worker completion that arrived after the request's response head
-    /// went out and before its end did. It finishes the request when the
-    /// response ends, when the stream goes away, or at the deadline, whose
-    /// wheel entry stays armed (`worker_completions.zig`).
-    pending_worker_completion: ?worker_shared_page.WorkerCompletionRecord = null,
     /// Stamped at admission and emitted once, when the slot finishes.
     /// `request_id` 0 means nothing to emit.
     access: access_log.AccessFacts = .{},

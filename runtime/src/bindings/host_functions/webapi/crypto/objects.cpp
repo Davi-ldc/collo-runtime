@@ -1,36 +1,30 @@
 // Cell implementations for `Crypto`, `SubtleCrypto` and `CryptoKey`, the CryptoKey getters, and the interface
-// constructors that refuse every call. Runs on the VM thread. Destroying a cell zeroes the secret bytes it holds: a
-// key's material through `SecretBytes`, the entropy cache by hand. It also frees the asymmetric key the cell owns.
+// constructors that refuse every call. Runs on the VM thread. Destroying a CryptoKey zeroes its secret bytes through
+// `SecretBytes` and frees the asymmetric key it owns.
 
 #include "jsc/runtime/state.h"
 
 #include "host_functions/webapi/crypto/objects.h"
-#include "host_functions/webapi/crypto/keys.h"
+
+#include "host_functions/webapi/crypto/algorithms.h"
 #include "host_functions/webapi/crypto/normalize.h"
 
-#include <JavaScriptCore/JSCInlines.h>
-#include <wtf/text/WTFString.h>
-#include <JavaScriptCore/JSTypedArrays.h>
-#include <JavaScriptCore/JSObject.h>
-#include <JavaScriptCore/JSFunction.h>
 #include <JavaScriptCore/IdentifierInlines.h>
-#include <openssl/rand.h>
+#include <JavaScriptCore/JSCInlines.h>
+#include <JavaScriptCore/JSFunction.h>
+#include <JavaScriptCore/JSObject.h>
+#include <JavaScriptCore/JSTypedArrays.h>
 #include <wtf/StdLibExtras.h>
+#include <wtf/text/MakeString.h>
+#include <wtf/text/WTFString.h>
 
-#include <algorithm>
 #include <cstring>
 
 namespace Collo::HostFunctions::WebCrypto {
-using namespace JSC;
+
 using WTF::String;
-namespace {
-
-    bool fillCryptoRandom(std::span<uint8_t> bytes)
-    {
-        return bytes.empty() || RAND_bytes(bytes.data(), bytes.size()) == 1;
-    }
-
-}
+// CREATE_METHOD_TABLE names JSC's JSCastingHelpers without qualification.
+namespace JSCastingHelpers = JSC::JSCastingHelpers;
 
 JSC::Structure* JSColloCrypto::createStructure(JSC::VM& vm, JSC::JSGlobalObject* global_object, JSC::JSValue prototype)
 {
@@ -46,59 +40,9 @@ JSColloCrypto* JSColloCrypto::create(JSC::VM& vm, JSC::Structure* structure)
 
 void JSColloCrypto::destroy(JSC::JSCell* cell) { static_cast<JSColloCrypto*>(cell)->~JSColloCrypto(); }
 
-bool JSColloCrypto::fillRandom(uint64_t process_id, std::span<uint8_t> bytes)
-{
-    if (bytes.empty())
-        return true;
-
-    // A different process id means nothing filled the cache yet, or this process was forked from the one that did.
-    if (m_entropy_process_id != process_id) {
-        WTF::secureZeroSpan(std::span<uint8_t> {
-            m_entropy_cache.data(),
-            m_entropy_cache.size(),
-        });
-        m_entropy_offset = m_entropy_cache.size();
-        m_entropy_process_id = process_id;
-    }
-
-    if (bytes.size() > max_cache_served_bytes) {
-        return fillCryptoRandom(bytes);
-    }
-
-    while (!bytes.empty()) {
-        if (m_entropy_offset == m_entropy_cache.size()) {
-            // The cache fills on first use, never at creation, because the object is created in the zygote and every
-            // worker would inherit bytes drawn there.
-            if (!fillCryptoRandom(m_entropy_cache))
-                return false;
-            m_entropy_offset = 0;
-        }
-
-        auto available = m_entropy_cache.size() - m_entropy_offset;
-        auto count = std::min(available, bytes.size());
-        std::memcpy(bytes.data(), m_entropy_cache.data() + m_entropy_offset, count);
-        // Served bytes are zeroed in the cache, so a later disclosure of the cache cannot reveal what callers got.
-        WTF::secureZeroSpan(std::span<uint8_t> {
-            m_entropy_cache.data() + m_entropy_offset,
-            count,
-        });
-        m_entropy_offset += count;
-        bytes = bytes.subspan(count);
-    }
-    return true;
-}
-
 JSColloCrypto::JSColloCrypto(JSC::VM& vm, JSC::Structure* structure)
     : Base(vm, structure)
 {
-}
-
-JSColloCrypto::~JSColloCrypto()
-{
-    WTF::secureZeroSpan(std::span<uint8_t> {
-        m_entropy_cache.data(),
-        m_entropy_cache.size(),
-    });
 }
 
 void JSColloCrypto::finishCreation(JSC::VM& vm)
@@ -142,7 +86,7 @@ JSC::Structure* JSColloCryptoKey::createStructure(
     return JSC::Structure::create(vm, global_object, prototype, JSC::TypeInfo(JSC::ObjectType, StructureFlags), info());
 }
 
-JSColloCryptoKey* JSColloCryptoKey::create(JSC::VM& vm, JSC::Structure* structure, CryptoKeyAlgorithm algorithm,
+JSColloCryptoKey* JSColloCryptoKey::createSecret(JSC::VM& vm, JSC::Structure* structure, CryptoKeyAlgorithm algorithm,
     WebCryptoHash hash, SecretBytes&& material, bool extractable, uint8_t usages, size_t hmac_length_bits)
 {
     auto* object = new (NotNull, JSC::allocateCell<JSColloCryptoKey>(vm))
@@ -151,30 +95,10 @@ JSColloCryptoKey* JSColloCryptoKey::create(JSC::VM& vm, JSC::Structure* structur
     return object;
 }
 
-JSColloCryptoKey* JSColloCryptoKey::createRsa(JSC::VM& vm, JSC::Structure* structure, CryptoKeyAlgorithm algorithm,
-    WebCryptoHash hash, CryptoKeyType type, EVP_PKEY* pkey, size_t modulus_bits, WTF::Vector<uint8_t>&& public_exponent,
-    bool extractable, uint8_t usages)
+JSColloCryptoKey* JSColloCryptoKey::createAsymmetric(JSC::VM& vm, JSC::Structure* structure, AsymmetricKeyParts&& parts)
 {
-    auto* object = new (NotNull, JSC::allocateCell<JSColloCryptoKey>(vm)) JSColloCryptoKey(
-        vm, structure, algorithm, hash, type, pkey, modulus_bits, WTF::move(public_exponent), extractable, usages);
-    object->finishCreation(vm);
-    return object;
-}
-
-JSColloCryptoKey* JSColloCryptoKey::createEc(JSC::VM& vm, JSC::Structure* structure, CryptoKeyAlgorithm algorithm,
-    CryptoKeyNamedCurve named_curve, CryptoKeyType type, EVP_PKEY* pkey, bool extractable, uint8_t usages)
-{
-    auto* object = new (NotNull, JSC::allocateCell<JSColloCryptoKey>(vm))
-        JSColloCryptoKey(vm, structure, algorithm, WebCryptoHash::SHA256, type, named_curve, pkey, extractable, usages);
-    object->finishCreation(vm);
-    return object;
-}
-
-JSColloCryptoKey* JSColloCryptoKey::createOkp(JSC::VM& vm, JSC::Structure* structure, CryptoKeyAlgorithm algorithm,
-    CryptoKeyNamedCurve named_curve, CryptoKeyType type, EVP_PKEY* pkey, bool extractable, uint8_t usages)
-{
-    auto* object = new (NotNull, JSC::allocateCell<JSColloCryptoKey>(vm))
-        JSColloCryptoKey(vm, structure, algorithm, WebCryptoHash::SHA256, type, named_curve, pkey, extractable, usages);
+    auto* object
+        = new (NotNull, JSC::allocateCell<JSColloCryptoKey>(vm)) JSColloCryptoKey(vm, structure, WTF::move(parts));
     object->finishCreation(vm);
     return object;
 }
@@ -187,46 +111,25 @@ JSColloCryptoKey::JSColloCryptoKey(JSC::VM& vm, JSC::Structure* structure, Crypt
     , m_algorithm(algorithm)
     , m_type(CryptoKeyType::Secret)
     , m_hash(hash)
+    , m_extractable(extractable)
+    , m_usages(usages)
     , m_material(WTF::move(material))
     , m_hmac_length_bits(hmac_length_bits)
-    , m_extractable(extractable)
-    , m_usages(usages)
 {
 }
 
-JSColloCryptoKey::JSColloCryptoKey(JSC::VM& vm, JSC::Structure* structure, CryptoKeyAlgorithm algorithm,
-    WebCryptoHash hash, CryptoKeyType type, EVP_PKEY* rsa_key, size_t modulus_bits,
-    WTF::Vector<uint8_t>&& public_exponent, bool extractable, uint8_t usages)
+JSColloCryptoKey::JSColloCryptoKey(JSC::VM& vm, JSC::Structure* structure, AsymmetricKeyParts&& parts)
     : Base(vm, structure)
-    , m_algorithm(algorithm)
-    , m_type(type)
-    , m_hash(hash)
-    , m_rsa_key(rsa_key)
-    , m_rsa_modulus_bits(modulus_bits)
-    , m_rsa_public_exponent(WTF::move(public_exponent))
-    , m_extractable(extractable)
-    , m_usages(usages)
+    , m_algorithm(parts.algorithm)
+    , m_type(parts.type)
+    , m_named_curve(parts.named_curve)
+    , m_hash(parts.hash)
+    , m_extractable(parts.extractable)
+    , m_usages(parts.usages)
+    , m_pkey(WTF::move(parts.pkey))
+    , m_rsa_modulus_bits(parts.rsa_modulus_bits)
+    , m_rsa_public_exponent(WTF::move(parts.rsa_public_exponent))
 {
-}
-
-JSColloCryptoKey::JSColloCryptoKey(JSC::VM& vm, JSC::Structure* structure, CryptoKeyAlgorithm algorithm,
-    WebCryptoHash hash, CryptoKeyType type, CryptoKeyNamedCurve named_curve, EVP_PKEY* pkey, bool extractable,
-    uint8_t usages)
-    : Base(vm, structure)
-    , m_algorithm(algorithm)
-    , m_type(type)
-    , m_named_curve(named_curve)
-    , m_hash(hash)
-    , m_rsa_key(pkey)
-    , m_extractable(extractable)
-    , m_usages(usages)
-{
-}
-
-JSColloCryptoKey::~JSColloCryptoKey()
-{
-    if (m_rsa_key)
-        EVP_PKEY_free(m_rsa_key);
 }
 
 void JSColloCryptoKey::finishCreation(JSC::VM& vm)
@@ -244,98 +147,84 @@ const JSC::ClassInfo JSColloSubtleCrypto::s_info
 const JSC::ClassInfo JSColloCryptoKey::s_info
     = { "CryptoKey"_s, &Base::s_info, nullptr, nullptr, CREATE_METHOD_TABLE(JSColloCryptoKey) };
 
-static JSC::JSValue createUint8ArrayCopy(
-    JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, std::span<const uint8_t> bytes)
-{
-    auto* structure = global_object->typedArrayStructureWithTypedArrayType<JSC::TypeUint8>();
-    auto* array = JSC::JSUint8Array::createUninitialized(global_object, structure, bytes.size());
-    if (scope.exception())
-        return {};
-    if (!bytes.empty())
-        std::memcpy(array->vector(), bytes.data(), bytes.size());
-    return array;
-}
+namespace {
 
-static JSC::JSValue createCryptoKeyAlgorithm(
-    JSC::JSGlobalObject* global_object, JSC::VM& vm, JSC::ThrowScope& scope, JSColloCryptoKey* key)
-{
-    if (key->algorithm() == CryptoKeyAlgorithm::Pbkdf2 || key->algorithm() == CryptoKeyAlgorithm::Hkdf) {
-        auto* algorithm = JSC::constructEmptyObject(global_object, global_object->objectPrototype(), 1);
-        algorithm->putDirect(vm, JSC::Identifier::fromString(vm, "name"_s),
-            JSC::jsString(vm, key->algorithm() == CryptoKeyAlgorithm::Pbkdf2 ? String("PBKDF2"_s) : String("HKDF"_s)));
-        return algorithm;
+    JSC::JSValue createUint8ArrayCopy(
+        JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, std::span<const uint8_t> bytes)
+    {
+        auto* structure = global_object->typedArrayStructureWithTypedArrayType<JSC::TypeUint8>();
+        auto* array = JSC::JSUint8Array::createUninitialized(global_object, structure, bytes.size());
+        RETURN_IF_EXCEPTION(scope, {});
+        if (!bytes.empty())
+            std::memcpy(array->vector(), bytes.data(), bytes.size());
+        return array;
     }
 
-    if (isAesAlgorithm(key->algorithm())) {
-        auto* algorithm = JSC::constructEmptyObject(global_object, global_object->objectPrototype(), 2);
-        algorithm->putDirect(vm, JSC::Identifier::fromString(vm, "name"_s),
-            JSC::jsString(vm, String(aesAlgorithmName(key->algorithm()))));
-        algorithm->putDirect(
-            vm, JSC::Identifier::fromString(vm, "length"_s), JSC::jsNumber(key->material().size() * 8));
-        return algorithm;
+    JSC::JSObject* createNamedObject(
+        JSC::JSGlobalObject* global_object, JSC::VM& vm, WTF::ASCIILiteral name, unsigned inline_capacity)
+    {
+        auto* object = JSC::constructEmptyObject(global_object, global_object->objectPrototype(), inline_capacity);
+        object->putDirect(vm, JSC::Identifier::fromString(vm, "name"_s), JSC::jsString(vm, String(name)));
+        return object;
     }
 
-    if (isRsaAlgorithm(key->algorithm())) {
-        auto public_exponent = createUint8ArrayCopy(global_object, scope, key->rsaPublicExponent());
-        if (scope.exception())
-            return {};
-
-        const bool has_hash = key->algorithm() != CryptoKeyAlgorithm::RsaEsPkcs1V15;
-        auto* algorithm = JSC::constructEmptyObject(global_object, global_object->objectPrototype(), has_hash ? 4 : 3);
-        algorithm->putDirect(vm, JSC::Identifier::fromString(vm, "name"_s),
-            JSC::jsString(vm, String(rsaAlgorithmName(key->algorithm()))));
-        algorithm->putDirect(
-            vm, JSC::Identifier::fromString(vm, "modulusLength"_s), JSC::jsNumber(key->rsaModulusBits()));
-        algorithm->putDirect(vm, JSC::Identifier::fromString(vm, "publicExponent"_s), public_exponent);
-        if (has_hash) {
-            auto* hash = JSC::constructEmptyObject(global_object, global_object->objectPrototype(), 1);
-            hash->putDirect(
-                vm, JSC::Identifier::fromString(vm, "name"_s), JSC::jsString(vm, String(hashSpec(key->hash()).name)));
-            algorithm->putDirect(vm, JSC::Identifier::fromString(vm, "hash"_s), hash);
+    // The KeyAlgorithm dictionary of `key`, with the members its family adds.
+    JSC::JSValue createCryptoKeyAlgorithm(
+        JSC::JSGlobalObject* global_object, JSC::VM& vm, JSC::ThrowScope& scope, JSColloCryptoKey* key)
+    {
+        const auto& spec = algorithmSpec(key->algorithm());
+        switch (spec.family) {
+        case AlgorithmFamily::Kdf:
+        case AlgorithmFamily::Okp:
+            return createNamedObject(global_object, vm, spec.name, 1);
+        case AlgorithmFamily::Aes: {
+            auto* algorithm = createNamedObject(global_object, vm, spec.name, 2);
+            algorithm->putDirect(
+                vm, JSC::Identifier::fromString(vm, "length"_s), JSC::jsNumber(key->material().size() * 8));
+            return algorithm;
         }
-        return algorithm;
+        case AlgorithmFamily::Hmac: {
+            auto* algorithm = createNamedObject(global_object, vm, spec.name, 3);
+            algorithm->putDirect(vm, JSC::Identifier::fromString(vm, "hash"_s),
+                createNamedObject(global_object, vm, hashSpec(key->hash()).name, 1));
+            algorithm->putDirect(vm, JSC::Identifier::fromString(vm, "length"_s), JSC::jsNumber(key->hmacLengthBits()));
+            return algorithm;
+        }
+        case AlgorithmFamily::Rsa: {
+            auto public_exponent = createUint8ArrayCopy(global_object, scope, key->rsaPublicExponent());
+            RETURN_IF_EXCEPTION(scope, {});
+            // RSAES-PKCS1-v1_5 keys take no hash.
+            const bool has_hash = key->algorithm() != CryptoKeyAlgorithm::RsaEsPkcs1V15;
+            auto* algorithm = createNamedObject(global_object, vm, spec.name, has_hash ? 4 : 3);
+            algorithm->putDirect(
+                vm, JSC::Identifier::fromString(vm, "modulusLength"_s), JSC::jsNumber(key->rsaModulusBits()));
+            algorithm->putDirect(vm, JSC::Identifier::fromString(vm, "publicExponent"_s), public_exponent);
+            if (has_hash) {
+                algorithm->putDirect(vm, JSC::Identifier::fromString(vm, "hash"_s),
+                    createNamedObject(global_object, vm, hashSpec(key->hash()).name, 1));
+            }
+            return algorithm;
+        }
+        case AlgorithmFamily::Ec: {
+            auto* algorithm = createNamedObject(global_object, vm, spec.name, 2);
+            algorithm->putDirect(vm, JSC::Identifier::fromString(vm, "namedCurve"_s),
+                JSC::jsString(vm, String(curveSpec(key->namedCurve()).name)));
+            return algorithm;
+        }
+        }
+        RELEASE_ASSERT_NOT_REACHED();
     }
 
-    if (isEcAlgorithm(key->algorithm())) {
-        auto* algorithm = JSC::constructEmptyObject(global_object, global_object->objectPrototype(), 2);
-        algorithm->putDirect(vm, JSC::Identifier::fromString(vm, "name"_s),
-            JSC::jsString(vm, String(ecAlgorithmName(key->algorithm()))));
-        algorithm->putDirect(vm, JSC::Identifier::fromString(vm, "namedCurve"_s),
-            JSC::jsString(vm, String(namedCurveName(key->namedCurve()))));
-        return algorithm;
+    JSColloCryptoKey* requireKeyReceiver(
+        JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSC::CallFrame* call_frame)
+    {
+        auto* key = dynamicDowncast<JSColloCryptoKey>(call_frame->thisValue());
+        if (!key)
+            JSC::throwTypeError(global_object, scope, "CryptoKey accessor called on incompatible receiver"_s);
+        return key;
     }
 
-    if (isOkpAlgorithm(key->algorithm())) {
-        auto* algorithm = JSC::constructEmptyObject(global_object, global_object->objectPrototype(), 1);
-        algorithm->putDirect(vm, JSC::Identifier::fromString(vm, "name"_s),
-            JSC::jsString(vm, String(okpAlgorithmName(key->algorithm()))));
-        return algorithm;
-    }
-
-    const auto& spec = hashSpec(key->hash());
-    auto* hash = JSC::constructEmptyObject(global_object, global_object->objectPrototype(), 1);
-    hash->putDirect(vm, JSC::Identifier::fromString(vm, "name"_s), JSC::jsString(vm, String(spec.name)));
-
-    auto* algorithm = JSC::constructEmptyObject(global_object, global_object->objectPrototype(), 3);
-    algorithm->putDirect(vm, JSC::Identifier::fromString(vm, "name"_s), JSC::jsString(vm, String("HMAC"_s)));
-    algorithm->putDirect(vm, JSC::Identifier::fromString(vm, "hash"_s), hash);
-    algorithm->putDirect(vm, JSC::Identifier::fromString(vm, "length"_s), JSC::jsNumber(key->hmacLengthBits()));
-    return algorithm;
-}
-
-JSC_DEFINE_HOST_FUNCTION(cryptoConstructorCall, (JSC::JSGlobalObject * global_object, JSC::CallFrame*))
-{
-    auto& vm = global_object->vm();
-    auto scope = DECLARE_THROW_SCOPE(vm);
-    return JSC::throwVMTypeError(global_object, scope, "Crypto is not constructable"_s);
-}
-
-JSC_DEFINE_HOST_FUNCTION(cryptoConstructorConstruct, (JSC::JSGlobalObject * global_object, JSC::CallFrame*))
-{
-    auto& vm = global_object->vm();
-    auto scope = DECLARE_THROW_SCOPE(vm);
-    return JSC::throwVMTypeError(global_object, scope, "Crypto is not constructable"_s);
-}
+} // namespace
 
 // FIXME: Each read builds a new object, so `key.algorithm !== key.algorithm`. The Web Cryptography API (CryptoKey
 // interface members) returns one cached object per key for `algorithm`, and likewise for `usages`, which
@@ -344,19 +233,17 @@ JSC_DEFINE_HOST_FUNCTION(cryptoKeyGetAlgorithm, (JSC::JSGlobalObject * global_ob
 {
     auto& vm = global_object->vm();
     auto scope = DECLARE_THROW_SCOPE(vm);
-    auto* key = dynamicDowncast<JSColloCryptoKey>(call_frame->thisValue());
-    if (!key)
-        return JSC::throwVMTypeError(global_object, scope, "CryptoKey accessor called on incompatible receiver"_s);
-    return JSC::JSValue::encode(createCryptoKeyAlgorithm(global_object, vm, scope, key));
+    auto* key = requireKeyReceiver(global_object, scope, call_frame);
+    RETURN_IF_EXCEPTION(scope, {});
+    RELEASE_AND_RETURN(scope, JSC::JSValue::encode(createCryptoKeyAlgorithm(global_object, vm, scope, key)));
 }
 
 JSC_DEFINE_HOST_FUNCTION(cryptoKeyGetExtractable, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
 {
     auto& vm = global_object->vm();
     auto scope = DECLARE_THROW_SCOPE(vm);
-    auto* key = dynamicDowncast<JSColloCryptoKey>(call_frame->thisValue());
-    if (!key)
-        return JSC::throwVMTypeError(global_object, scope, "CryptoKey accessor called on incompatible receiver"_s);
+    auto* key = requireKeyReceiver(global_object, scope, call_frame);
+    RETURN_IF_EXCEPTION(scope, {});
     return JSC::JSValue::encode(JSC::jsBoolean(key->extractable()));
 }
 
@@ -364,9 +251,8 @@ JSC_DEFINE_HOST_FUNCTION(cryptoKeyGetType, (JSC::JSGlobalObject * global_object,
 {
     auto& vm = global_object->vm();
     auto scope = DECLARE_THROW_SCOPE(vm);
-    auto* key = dynamicDowncast<JSColloCryptoKey>(call_frame->thisValue());
-    if (!key)
-        return JSC::throwVMTypeError(global_object, scope, "CryptoKey accessor called on incompatible receiver"_s);
+    auto* key = requireKeyReceiver(global_object, scope, call_frame);
+    RETURN_IF_EXCEPTION(scope, {});
     switch (key->type()) {
     case CryptoKeyType::Secret:
         return JSC::JSValue::encode(JSC::jsString(vm, String("secret"_s)));
@@ -382,63 +268,27 @@ JSC_DEFINE_HOST_FUNCTION(cryptoKeyGetUsages, (JSC::JSGlobalObject * global_objec
 {
     auto& vm = global_object->vm();
     auto scope = DECLARE_THROW_SCOPE(vm);
-    auto* key = dynamicDowncast<JSColloCryptoKey>(call_frame->thisValue());
-    if (!key)
-        return JSC::throwVMTypeError(global_object, scope, "CryptoKey accessor called on incompatible receiver"_s);
-    auto* usages = createUsagesArray(global_object, vm, key->usages());
-    if (!usages)
-        return JSC::JSValue::encode(JSC::JSValue());
+    auto* key = requireKeyReceiver(global_object, scope, call_frame);
+    RETURN_IF_EXCEPTION(scope, {});
+    auto* usages = createUsagesArray(global_object, scope, key->usages());
+    RETURN_IF_EXCEPTION(scope, {});
     return JSC::JSValue::encode(usages);
 }
 
-JSC::JSFunction* createCryptoConstructor(JSC::JSGlobalObject* global_object, JSC::VM& vm)
-{
-    auto* constructor = JSC::JSFunction::create(vm, global_object, 0, "Crypto"_s, cryptoConstructorCall,
-        JSC::ImplementationVisibility::Public, JSC::NoIntrinsic, cryptoConstructorConstruct, nullptr);
-    RELEASE_ASSERT(constructor);
-    return constructor;
-}
-
-JSC_DEFINE_HOST_FUNCTION(subtleCryptoConstructorCall, (JSC::JSGlobalObject * global_object, JSC::CallFrame*))
+// One host function serves every refusing interface constructor; the message names the callee.
+JSC_DEFINE_HOST_FUNCTION(refuseInterfaceConstruction, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
 {
     auto& vm = global_object->vm();
     auto scope = DECLARE_THROW_SCOPE(vm);
-    return JSC::throwVMTypeError(global_object, scope, "SubtleCrypto is not constructable"_s);
+    auto* callee = dynamicDowncast<JSC::JSFunction>(call_frame->jsCallee());
+    String name = callee ? callee->name(vm) : String("Interface"_s);
+    return JSC::throwVMTypeError(global_object, scope, WTF::makeString(name, " is not constructable"_s));
 }
 
-JSC_DEFINE_HOST_FUNCTION(subtleCryptoConstructorConstruct, (JSC::JSGlobalObject * global_object, JSC::CallFrame*))
+JSC::JSFunction* createInterfaceConstructor(JSC::JSGlobalObject* global_object, JSC::VM& vm, WTF::ASCIILiteral name)
 {
-    auto& vm = global_object->vm();
-    auto scope = DECLARE_THROW_SCOPE(vm);
-    return JSC::throwVMTypeError(global_object, scope, "SubtleCrypto is not constructable"_s);
-}
-
-JSC_DEFINE_HOST_FUNCTION(cryptoKeyConstructorCall, (JSC::JSGlobalObject * global_object, JSC::CallFrame*))
-{
-    auto& vm = global_object->vm();
-    auto scope = DECLARE_THROW_SCOPE(vm);
-    return JSC::throwVMTypeError(global_object, scope, "CryptoKey is not constructable"_s);
-}
-
-JSC_DEFINE_HOST_FUNCTION(cryptoKeyConstructorConstruct, (JSC::JSGlobalObject * global_object, JSC::CallFrame*))
-{
-    auto& vm = global_object->vm();
-    auto scope = DECLARE_THROW_SCOPE(vm);
-    return JSC::throwVMTypeError(global_object, scope, "CryptoKey is not constructable"_s);
-}
-
-JSC::JSFunction* createSubtleCryptoConstructor(JSC::JSGlobalObject* global_object, JSC::VM& vm)
-{
-    auto* constructor = JSC::JSFunction::create(vm, global_object, 0, "SubtleCrypto"_s, subtleCryptoConstructorCall,
-        JSC::ImplementationVisibility::Public, JSC::NoIntrinsic, subtleCryptoConstructorConstruct, nullptr);
-    RELEASE_ASSERT(constructor);
-    return constructor;
-}
-
-JSC::JSFunction* createCryptoKeyConstructor(JSC::JSGlobalObject* global_object, JSC::VM& vm)
-{
-    auto* constructor = JSC::JSFunction::create(vm, global_object, 0, "CryptoKey"_s, cryptoKeyConstructorCall,
-        JSC::ImplementationVisibility::Public, JSC::NoIntrinsic, cryptoKeyConstructorConstruct, nullptr);
+    auto* constructor = JSC::JSFunction::create(vm, global_object, 0, String(name), refuseInterfaceConstruction,
+        JSC::ImplementationVisibility::Public, JSC::NoIntrinsic, refuseInterfaceConstruction, nullptr);
     RELEASE_ASSERT(constructor);
     return constructor;
 }

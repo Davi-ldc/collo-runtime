@@ -57,10 +57,11 @@ pub const EventKind = enum(u8) {
     connection_poll_cancel,
     /// The completion of the close of a connection's socket.
     connection_close,
-    worker_completion,
+    /// A worker's completion eventfd, which it writes when it frees room in
+    /// its server-to-worker payload ring.
+    worker_ring_credit,
     worker_control,
     worker_control_writable,
-    worker_fs_fault,
     worker_pidfd,
     /// The completion of a cancel the lane submitted for one of a worker
     /// registration's polls.
@@ -279,22 +280,21 @@ pub const EventSet = struct {
     }
 };
 
-/// Reads every count an eventfd holds. Ends at `WouldBlock`; a read that
-/// returns fewer than eight bytes fails with `error.EventfdShortRead`, and
+/// Reads and clears the count of a nonblocking eventfd made without
+/// `EFD_SEMAPHORE`, whose one read returns the whole count; 0 when no wake
+/// is pending. A read of fewer than eight bytes, which only a descriptor
+/// that is no eventfd returns, fails with `error.EventfdShortRead`, and
 /// every other error is the read's (`fault.classifyWorkerError` sorts them
 /// as `.wake`).
 pub fn drainEventFd(fd: std.posix.fd_t) fault.WakeError!u64 {
-    var total: u64 = 0;
-    while (true) {
-        var value: u64 = 0;
-        const read_len = std.posix.read(fd, std.mem.asBytes(&value)) catch |err| switch (err) {
-            error.WouldBlock => return total,
-            else => |other| return other,
-        };
-        if (read_len != @sizeOf(u64))
-            return error.EventfdShortRead;
-        total +|= value;
-    }
+    var value: u64 = 0;
+    const read_len = std.posix.read(fd, std.mem.asBytes(&value)) catch |err| switch (err) {
+        error.WouldBlock => return 0,
+        else => |other| return other,
+    };
+    if (read_len != @sizeOf(u64))
+        return error.EventfdShortRead;
+    return value;
 }
 
 fn nsToTimespec(ns: u64) linux.timespec {

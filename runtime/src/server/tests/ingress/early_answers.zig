@@ -34,7 +34,9 @@ fn expectServerRecord(record: access.AccessRecord, status: u16) !void {
     try std.testing.expectEqual(access.AnsweredBy.server, record.answered_by);
     try std.testing.expect(record.facts.request_id != 0);
     try std.testing.expectEqual(@as(u64, 0), record.facts.worker_id);
-    try std.testing.expectEqual(lane_harness.page.CompletedStatus.done, record.facts.error_code);
+    try std.testing.expectEqual(access.ErrorCode.done, record.facts.error_code);
+    // No worker took it, so it carries no usage.
+    try std.testing.expect(record.usage == null);
     try std.testing.expect(record.facts.first_byte_mono_ns != 0);
     try std.testing.expect(record.ttfbMs() >= 1);
 }
@@ -68,7 +70,7 @@ test "a head with more fields than a head may hold gets 431 and one access recor
     // The next request on the connection reaches the worker.
     const next = try scene.get(3);
     try scene.stub.answer(next, 200, "after");
-    try harness.serveWorker(0, scene.stub);
+    try harness.handleControl(0, scene.stub);
     try scene.expectStatus(3, 200);
     const served = harness.takeAccessRecord(0) orelse return error.AccessRecordMissing;
     // Every record of the connection has its own request id.
@@ -188,7 +190,7 @@ test "the health answer and a refused stream write no access record, and a refus
     try std.testing.expect(harness.takeAccessRecord(0) == null);
 
     try stub.answer(held, 200, "held");
-    try harness.serveWorker(0, stub);
+    try harness.handleControl(0, stub);
     try client.expectStatus(3, 200);
     try harness.expectLanesRunning();
 }
@@ -206,12 +208,12 @@ test "a dispatched request whose body passes its declared length records the lan
 
     // The lane cancelled the request toward the worker, which ends it as the
     // client's departure.
-    try scene.stub.publishCompletion(request, .{ .http_status = 499, .done = .client_closed });
-    try harness.serveWorker(0, scene.stub);
+    try scene.stub.sendDone(request, .{ .http_status = 499, .done = .client_closed });
+    try harness.handleControl(0, scene.stub);
     const record = harness.takeAccessRecord(0) orelse return error.AccessRecordMissing;
     try std.testing.expectEqual(@as(u16, 400), record.status);
     try std.testing.expectEqual(access.AnsweredBy.server, record.answered_by);
-    try std.testing.expectEqual(lane_harness.page.CompletedStatus.bad_request, record.facts.error_code);
+    try std.testing.expectEqual(access.ErrorCode.bad_request, record.facts.error_code);
     // The request still ran on its worker, which the record names.
     try std.testing.expectEqual(scene.stub.key.worker_id, record.facts.worker_id);
     try harness.expectLanesRunning();

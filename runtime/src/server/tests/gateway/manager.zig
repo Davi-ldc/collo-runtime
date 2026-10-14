@@ -9,7 +9,7 @@
 //! and reports the loss once through `Deps.gatewayLost`. The next attach spawns a new gateway under
 //! a new key, which a renewed lease then carries. A session whose worker gives it up is removed by
 //! the gateway, which stays current, and its report reaches `Deps.sessionLost` with the gateway's
-//! generation. The lease is covered in `lease.zig`, the control
+//! generation and the cause `liveness_closed`. The lease is covered in `lease.zig`, the control
 //! client's failure tiers in `control_client.zig`, and the launcher's reattach of live workers in
 //! `server/tests/supervisor/launcher.zig`. Lane: server-gateway.
 
@@ -24,6 +24,8 @@ const egress_token = ipc.egress_token;
 const linux = std.os.linux;
 const Manager = gateway.Manager;
 const Lease = gateway.lease.Lease;
+const RemovedSession = gateway.control_client.protocol.RemovedSession;
+const SessionRemovedCause = gateway.control_client.protocol.SessionRemovedCause;
 
 /// Waits for another thread's event in slices of `wait_slice_ns`, at most `wait_slices_max` of
 /// them, so a manager that never reports fails the test instead of hanging it.
@@ -94,24 +96,15 @@ test "a gateway whose control channel fails is retired and the next attach spawn
     try std.testing.expect(manager.keyFor(2, &second_key));
     try std.testing.expect(!std.mem.eql(u8, &first_key.bytes, &second_key.bytes));
 
-    // A renewed lease carries the new gateway's generation and key and a descriptor of its live
-    // control socket, on which the boot token's end of the new session goes out.
-    const lease = try std.testing.allocator.create(Lease);
-    defer std.testing.allocator.destroy(lease);
-    lease.* = .{};
+    // A renewed lease carries the new gateway's generation and key, and the boot token's end of
+    // the new session goes out to the new gateway.
+    var lease: Lease = .{};
     defer lease.deinit();
-    manager.renewLease(lease);
+    manager.renewLease(&lease);
     try std.testing.expectEqual(@as(u64, 2), lease.generation);
     try std.testing.expectEqualSlices(u8, &second_key.bytes, &lease.key.bytes);
-    try std.testing.expect(lease.control.isValid());
-    lease.noteEnded(2, .{
-        .session_id = attachment.session_id,
-        .request_id = 0,
-        .request_generation = 0,
-    });
-    lease.flush();
-    try std.testing.expectEqual(@as(u64, 0), lease.ended_batches_dropped_full);
-    try std.testing.expectEqual(@as(u64, 0), lease.ended_batches_dropped_closed);
+    try std.testing.expect(manager.endBoot(2, attachment.session_id));
+    try std.testing.expectEqual(@as(u64, 2), manager.currentGeneration());
     try std.testing.expectEqual(@as(usize, 1), losses.calls());
 }
 
@@ -143,8 +136,10 @@ test "a session the worker gives up reaches Deps.sessionLost under its gateway's
     attachment.deinit();
 
     const lost = losses.waitFirstSession() orelse return error.TestSessionLossNotReported;
-    try std.testing.expectEqual(@as(u64, 1), lost[0]);
-    try std.testing.expectEqual(session_id, lost[1]);
+    try std.testing.expectEqual(@as(u64, 1), lost.generation);
+    try std.testing.expectEqual(session_id, lost.removed.session_id);
+    // A closed liveness pipe reads the same for an exit and a detach, so the report says only that.
+    try std.testing.expectEqual(SessionRemovedCause.liveness_closed, lost.removed.cause);
     try std.testing.expectEqual(@as(u64, 1), manager.currentGeneration());
     try std.testing.expectEqual(@as(usize, 1), losses.sessionCalls());
     try std.testing.expectEqual(@as(usize, 0), losses.calls());
@@ -181,13 +176,11 @@ test "a gateway that cannot be spawned leaves no gateway current and reports no 
     try std.testing.expectError(error.FileNotFound, manager.attachWorker("app", &wake_set));
     try std.testing.expect(wake_set.isValid());
 
-    const lease = try std.testing.allocator.create(Lease);
-    defer std.testing.allocator.destroy(lease);
-    lease.* = .{};
+    var lease: Lease = .{};
     defer lease.deinit();
-    manager.renewLease(lease);
+    manager.renewLease(&lease);
     try std.testing.expectEqual(@as(u64, 0), lease.generation);
-    try std.testing.expect(!lease.control.isValid());
+    try std.testing.expect(lease.key.isZero());
     try std.testing.expectEqual(@as(usize, 0), losses.calls());
 }
 
@@ -216,15 +209,15 @@ test "the supervisor's hooks reach a live gateway, whose attach leaves only the 
     try gateway.manager.prewarmCallback(&manager);
     try std.testing.expectEqual(@as(u64, 1), manager.currentGeneration());
 
-    // A lease renewed while its gateway stays current keeps its descriptor.
-    const lease = try std.testing.allocator.create(Lease);
-    defer std.testing.allocator.destroy(lease);
-    lease.* = .{};
+    // A lease renewed while its gateway stays current keeps that gateway and its key.
+    var lease: Lease = .{};
     defer lease.deinit();
-    manager.renewLease(lease);
-    const held_fd = lease.control.fd();
-    manager.renewLease(lease);
-    try std.testing.expectEqual(held_fd, lease.control.fd());
+    manager.renewLease(&lease);
+    try std.testing.expectEqual(@as(u64, 1), lease.generation);
+    try std.testing.expectEqualSlices(u8, &key.bytes, &lease.key.bytes);
+    manager.renewLease(&lease);
+    try std.testing.expectEqual(@as(u64, 1), lease.generation);
+    try std.testing.expectEqualSlices(u8, &key.bytes, &lease.key.bytes);
 
     var wake_set = try ipc.egress_shared.WakeSet.create();
     defer wake_set.deinit();
@@ -248,26 +241,31 @@ const LossRecorder = struct {
     condition: std.Thread.Condition = .{},
     count: usize = 0,
     first: ?u64 = null,
-    /// The first session reported lost, as its gateway's generation and its id.
-    first_session: ?[2]u64 = null,
+    /// The first session reported lost, with its gateway's generation.
+    first_session: ?LostSession = null,
     session_count: usize = 0,
+
+    const LostSession = struct {
+        generation: u64,
+        removed: RemovedSession,
+    };
 
     fn deps(self: *LossRecorder) gateway.manager.Deps {
         return .{ .ctx = self, .gatewayLost = gatewayLost, .sessionLost = sessionLost };
     }
 
-    fn sessionLost(ctx: *anyopaque, generation: u64, session_id: u64) void {
+    fn sessionLost(ctx: *anyopaque, generation: u64, removed: RemovedSession) void {
         const self: *LossRecorder = @ptrCast(@alignCast(ctx));
         self.mutex.lock();
         defer self.mutex.unlock();
         if (self.first_session == null)
-            self.first_session = .{ generation, session_id };
+            self.first_session = .{ .generation = generation, .removed = removed };
         self.session_count += 1;
         self.condition.broadcast();
     }
 
     /// Waits for the first session loss and returns it, or null when none came.
-    fn waitFirstSession(self: *LossRecorder) ?[2]u64 {
+    fn waitFirstSession(self: *LossRecorder) ?LostSession {
         self.mutex.lock();
         defer self.mutex.unlock();
         for (0..wait_slices_max) |_| {

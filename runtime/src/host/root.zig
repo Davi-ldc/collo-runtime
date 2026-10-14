@@ -9,55 +9,25 @@
 //! takes, how the egress gateway works or how usage is recorded: a host
 //! resolves those before it calls in.
 //!
-//! - `cgroup_root.zig`, `cgroup.zig`: the delegated cgroup subtree and each
-//!   worker's leaf.
-//! - `tmp_mount.zig`: the one directory every worker of the host mounts its
-//!   tmpfs over.
-//! - `host_identity.zig`: the names a host claims in a shared parent and the
-//!   proof that a host behind such a name is gone, which the boot sweeps of
-//!   the two above share.
+//! - `cgroup_root.zig`: the delegated cgroup subtree and each worker's leaf,
+//!   named by the subtree and the fork job id (`WorkerLeaf`).
+//! - `host_identity.zig`: the names a host claims in a parent other hosts
+//!   share, and the proof that a host behind such a name is gone, which the
+//!   boot sweep of the cgroup subtree uses.
 //! - `launch.zig`: the WorkerInit handoff, from a forked child to a ready
 //!   worker.
 //! - `handle.zig`: a ready worker's descriptors and mappings.
 //! - `dispatch.zig`: one request sent to a worker and its response read
 //!   back, for harnesses and benchmarks.
 
-const std = @import("std");
-const zygote = @import("collo_zygote");
-const process = @import("collo_os").process;
-const process_limits = @import("collo_limits").process;
-
 pub const cgroup_root = @import("cgroup_root.zig");
-pub const cgroup = @import("cgroup.zig");
-pub const tmp_mount = @import("tmp_mount.zig");
 pub const host_identity = @import("host_identity.zig");
 pub const launch = @import("launch.zig");
 pub const handle = @import("handle.zig");
 pub const dispatch = @import("dispatch.zig");
 
 pub const WorkerCgroupRoot = cgroup_root.WorkerCgroupRoot;
-pub const TmpMountPoint = tmp_mount.TmpMountPoint;
+pub const WorkerLeaf = cgroup_root.WorkerLeaf;
 pub const WorkerHandle = handle.WorkerHandle;
 pub const LaunchOptions = launch.LaunchOptions;
 pub const runToReady = launch.runToReady;
-
-/// Kills a forked worker that never reached a handle (no WorkerInit sent,
-/// or an init that failed) and removes the cgroup leaf it was born into.
-pub fn terminateForkedWorkerBestEffort(forked: *zygote.host_client.ForkedWorker) void {
-    // The pidfd from the fork reply is the kernel-attested handle; the
-    // numeric pid is subject to reuse once the auto-reaped child exits. A
-    // ForkedWorker without one (test fixtures) has no process to kill.
-    if (forked.pidfd) |pidfd| {
-        process.pidFdSendSignal(pidfd, std.posix.SIG.KILL) catch |err| switch (err) {
-            error.ProcessNotFound => {},
-            else => std.log.warn("failed to terminate forked worker pid={d}: {s}", .{ forked.pid, @errorName(err) }),
-        };
-        // A still-listed member blocks the rmdir below; the reap retries
-        // after cgroup.kill, so a failed wait only slows the cleanup.
-        _ = process.waitForPidFdExit(pidfd, process_limits.PROCESS_EXIT_WAIT_MS) catch |err|
-            std.log.debug("wait for worker exit before cgroup reap failed: {s}", .{@errorName(err)});
-    }
-    if (forked.cgroup_dir_fd) |dir_fd|
-        cgroup_root.reapWorkerCgroupByFd(dir_fd);
-    forked.deinit();
-}

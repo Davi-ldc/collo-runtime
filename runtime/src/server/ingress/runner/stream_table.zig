@@ -278,11 +278,6 @@ pub fn h2MarkWorkerResponseBodyQueued(self: *Slot, stream_id: u32, end_stream: b
         entry.worker_response_ended = true;
 }
 
-pub fn h2WorkerResponseEnded(self: *const Slot, stream_id: u32) bool {
-    const entry = h2StreamEntryConst(self, stream_id) orelse return false;
-    return entry.worker_response_ended;
-}
-
 /// Whether the worker's response head for `stream_id` is queued toward
 /// the client, by the lane's own record (`worker_response_head_sent`),
 /// which is the one source for that fact: a request that fails after it

@@ -1,23 +1,18 @@
-//! Logs the JavaScript exceptions the worker catches at its turn boundaries,
-//! and the lines the worker writes about a tenant's code, such as a returned
-//! Response it refused, for two readers. The tenant gets the full text, an
-//! exception's message and stack, through the sink its VM registered; the
-//! worker runtime publishes it to the log ring of the worker's shared page.
-//! The operator's `std.log` line
-//! carries only the text's length and a digest prefix, so tenant data in an
-//! exception message stays out of the operator's log, unless the worker was
-//! started with full exception logging. Runs in the worker on the VM thread.
+//! Sends the JavaScript exceptions the worker catches at its turn
+//! boundaries, and the lines the worker writes about a tenant's code, such
+//! as a returned Response it refused, to the tenant's log: the full text, an
+//! exception's message and stack, goes to the sink its VM registered, and
+//! the worker runtime publishes it to the log ring of the worker's shared
+//! page. A tenant's exception is the tenant's event, so it never becomes an
+//! operator line; only a failure to format one does. Runs in the worker on
+//! the VM thread.
 //!
-//! The sink registry and the logging switch are process-wide. A worker
-//! process has one VM, while a test process may hold several, so each
-//! registration is keyed by its VM and only that VM's exceptions reach it.
+//! The sink registry is process-wide. A worker process has one VM, while a
+//! test process may hold several, so each registration is keyed by its VM
+//! and only that VM's exceptions reach it.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const bindings = @import("collo_bindings");
-
-const digest_hex_len: usize = 16;
-var log_full_exceptions = std.atomic.Value(bool).init(builtin.mode == .Debug);
 
 /// Receives the full formatted exception of one request, borrowed for the
 /// call.
@@ -47,7 +42,7 @@ var slot_registrations = [_]std.atomic.Value(?*const Registration){
 
 /// Claims a free slot for `reg`, which must stay alive until
 /// `clearRegistrationIf`. With every slot taken it warns and leaves the sink
-/// inactive, so that VM's exceptions reach only `std.log`.
+/// inactive, so that VM's exceptions reach no log.
 pub fn setRegistration(reg: *const Registration) void {
     for (&slot_identities, &slot_registrations) |*slot_identity, *slot_registration| {
         if (slot_identity.cmpxchgStrong(null, reg.vm_identity, .acq_rel, .acquire) == null) {
@@ -82,20 +77,10 @@ fn emitToSink(vm: *bindings.Vm, request_id: u64, message: []const u8) void {
     }
 }
 
-pub const Config = struct {
-    log_full_exceptions: bool = builtin.mode == .Debug,
-};
-
-/// Sets whether `std.log` gets full exception text. The switch is
-/// process-wide, so the last call wins for every VM in the process.
-pub fn configure(config: Config) void {
-    log_full_exceptions.store(config.log_full_exceptions, .release);
-}
-
-/// Formats `exception`, which stays the caller's, sends the text to the sink
-/// registered for `vm` and logs it under `context` for `request_id`. When
-/// formatting fails, that failure is logged instead and neither reader gets
-/// the exception. Must run on `vm`'s thread.
+/// Formats `exception`, which stays the caller's, and sends the text to the
+/// sink registered for `vm` under `request_id`. When formatting fails, the
+/// operator's log gets that failure under `context`, with no tenant text,
+/// and the tenant's log gets nothing. Must run on `vm`'s thread.
 pub fn logException(
     vm: *bindings.Vm,
     request_id: u64,
@@ -111,48 +96,16 @@ pub fn logException(
     };
     defer formatted.deinit();
     emitToSink(vm, request_id, formatted.slice());
-    logFormatted(request_id, context, formatted.slice());
 }
 
 /// Sends `message`, a line the worker wrote about the tenant's code under
 /// `request_id`, such as the check a returned Response failed, to the sink
-/// registered for `vm` and logs it under `context`, as an exception's text
-/// is. Must run on `vm`'s thread.
+/// registered for `vm`, as an exception's text is. Must run on `vm`'s
+/// thread.
 pub fn logMessage(
     vm: *bindings.Vm,
     request_id: u64,
-    context: []const u8,
     message: []const u8,
 ) void {
     emitToSink(vm, request_id, message);
-    logFormatted(request_id, context, message);
-}
-
-/// Logs already formatted exception text to `std.log`: in full when
-/// configured, otherwise as its length and the first `digest_hex_len` hex
-/// digits of its SHA-256, so repeats of one exception can still be matched.
-pub fn logFormatted(request_id: u64, context: []const u8, formatted: []const u8) void {
-    if (shouldLogFullException()) {
-        std.log.warn("{s} request_id={d}: {s}", .{ context, request_id, formatted });
-        return;
-    }
-
-    const digest = shortDigestHex(formatted);
-    std.log.warn(
-        "{s} request_id={d} message_len={d} digest={s}",
-        .{ context, request_id, formatted.len, digest[0..] },
-    );
-}
-
-fn shouldLogFullException() bool {
-    return log_full_exceptions.load(.acquire);
-}
-
-fn shortDigestHex(bytes: []const u8) [digest_hex_len]u8 {
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
-    const hex = std.fmt.bytesToHex(digest, .lower);
-    var out: [digest_hex_len]u8 = undefined;
-    @memcpy(&out, hex[0..digest_hex_len]);
-    return out;
 }

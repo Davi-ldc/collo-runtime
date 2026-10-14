@@ -488,12 +488,10 @@ describe("WPT compact: Readable byte streams", () => {
       expect(() => controller.byobRequest.respondWithNewView(view)).toThrow(TypeError);
     });
 
-    const subviewResult = await runValidation((controller) => {
-      const view = controller.byobRequest.view.subarray(1, 2);
-      controller.byobRequest.respondWithNewView(view);
+    await runValidation((controller) => {
+      const view = new Uint8Array(controller.byobRequest.view.buffer, 1, 1);
+      expect(() => controller.byobRequest.respondWithNewView(view)).toThrow(RangeError);
     });
-    expect(subviewResult.done).toBe(false);
-    expect(Array.from(subviewResult.value)).toEqual([5]);
 
     await runValidation((controller) => {
       const view = new Uint8Array(new ArrayBuffer(10), 0, 3);

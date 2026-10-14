@@ -2,7 +2,12 @@
 //! validates a request head before it reaches a live session. Pseudo-headers
 //! always come first, and content-length is synthesized for any request with
 //! a body or body semantics. Connection-specific headers, `host`, a `te` other
-//! than trailers, uppercase names and a caller's content-length are rejected.
+//! than trailers, uppercase names, a caller's content-length and a head whose
+//! header block could outgrow `EGRESS_H2_REQUEST_HEADER_BLOCK_BYTES` are
+//! rejected.
+//!
+//! Encoding a head that passed validation can fail only for memory or for an
+//! encoder its connection already lost, never for the head itself.
 
 const std = @import("std");
 const h2 = @import("collo_http").http2;
@@ -29,10 +34,6 @@ pub const RequestHead = struct {
 pub const EncodedRequest = struct {
     allocator: std.mem.Allocator,
     wire: []u8,
-    /// Length of the HPACK header block as sent, without frame headers or
-    /// padding. The request side bills this compressed block, never the
-    /// framing around it.
-    header_block_len: usize = 0,
 
     pub fn deinit(self: *EncodedRequest) void {
         self.allocator.free(self.wire);
@@ -40,9 +41,13 @@ pub const EncodedRequest = struct {
     }
 };
 
+/// Encodes the head through `encoder` into `encode_scratch`, which must hold
+/// `EGRESS_H2_REQUEST_HEADER_BLOCK_BYTES`, then frames the block and any
+/// inline body into one allocation of `allocator` that the result owns.
 pub fn encodeRequest(
     allocator: std.mem.Allocator,
     encoder: *hpack.Encoder,
+    encode_scratch: []u8,
     stream_id: u32,
     max_frame_size: u32,
     head: RequestHead,
@@ -51,22 +56,13 @@ pub fn encodeRequest(
         return error.InvalidHttp2StreamId;
     try validateRequestHead(head);
 
-    // WAFs, request signers and strict origins expect an explicit
-    // content-length on requests with body semantics, as curl, Bun and
-    // browsers send. validateRegularHeader rejects a caller's content-length,
-    // so the synthesized one is the only one.
-    var content_length_buf: [20]u8 = undefined;
-    const body_len: ?u64 = head.declared_content_length orelse
-        (if (head.body.len != 0 or methodHasRequestBody(head.method)) @as(?u64, head.body.len) else null);
-    const content_length = if (body_len) |len|
-        std.fmt.bufPrint(&content_length_buf, "{d}", .{len}) catch unreachable
-    else
-        null;
+    var content_length_buffer: [content_length_digits_max]u8 = undefined;
+    const content_length = contentLengthValue(head, &content_length_buffer);
     const hpack_headers = try buildHeaderList(allocator, head, content_length);
     defer allocator.free(hpack_headers);
 
-    const block = try encoder.encodeHeadersScratch(
-        allocator,
+    const block = try encoder.encodeHeaders(
+        encode_scratch,
         hpack_headers,
         limits.headers.EGRESS_H2_REQUEST_HEADER_BLOCK_BYTES,
     );
@@ -84,13 +80,21 @@ pub fn encodeRequest(
             head.body,
             has_body,
         ),
-        .header_block_len = block.len,
     };
 }
 
 /// The pool calls this before it picks a connection. A request rejected here
 /// fails alone, while an error from opening its stream would fail the pool
-/// entry and every stream already sharing that connection.
+/// entry and every stream already sharing that connection, so it refuses
+/// everything about the head that `encodeRequest` could refuse.
+///
+/// Fails with `error.Http2RequestHeadersTooLarge` when the head's header
+/// block could take more than `EGRESS_H2_REQUEST_HEADER_BLOCK_BYTES` before
+/// compression. The encoder writes into a scratch of that size, and an
+/// encode that runs out of room midway leaves the connection's dynamic table
+/// changed for a block the peer never sees, which ends the connection for
+/// every stream on it. The bound ignores what compression could save, so
+/// whether a head fits never depends on the connection's table.
 pub fn validateRequestHead(head: RequestHead) !void {
     try validatePseudoValue(head.method);
     try validatePseudoValue(head.scheme);
@@ -98,6 +102,41 @@ pub fn validateRequestHead(head: RequestHead) !void {
     try http.request_target.validateOriginForm(head.path);
     for (head.headers) |header|
         try validateRegularHeader(header);
+    var content_length_buffer: [content_length_digits_max]u8 = undefined;
+    const content_length = contentLengthValue(head, &content_length_buffer);
+    if (headerBlockBytesMax(head, content_length) > limits.headers.EGRESS_H2_REQUEST_HEADER_BLOCK_BYTES)
+        return error.Http2RequestHeadersTooLarge;
+}
+
+/// The digits of the largest content-length, `maxInt(u64)`.
+const content_length_digits_max: usize = 20;
+
+/// The content-length the request declares, written into `buffer`, or null
+/// for none. WAFs, request signers and strict origins expect an explicit
+/// content-length on requests with body semantics, as curl, Bun and browsers
+/// send. `validateRegularHeader` rejects a caller's content-length, so this
+/// one is the only one.
+fn contentLengthValue(head: RequestHead, buffer: *[content_length_digits_max]u8) ?[]const u8 {
+    const body_len: ?u64 = head.declared_content_length orelse
+        (if (head.body.len != 0 or methodHasRequestBody(head.method)) @as(?u64, head.body.len) else null);
+    const len = body_len orelse return null;
+    return std.fmt.bufPrint(buffer, "{d}", .{len}) catch unreachable;
+}
+
+/// The most bytes the header block `encodeRequest` builds for `head` can
+/// take, whatever the connection's dynamic table holds and whatever table
+/// size updates its encoder owes the peer (`hpack.encodedFieldBytesMax`).
+fn headerBlockBytesMax(head: RequestHead, content_length: ?[]const u8) usize {
+    var total: usize = hpack.table_size_updates_bytes_max;
+    total +|= hpack.encodedFieldBytesMax(.{ .name = ":method", .value = head.method });
+    total +|= hpack.encodedFieldBytesMax(.{ .name = ":scheme", .value = head.scheme });
+    total +|= hpack.encodedFieldBytesMax(.{ .name = ":authority", .value = head.authority });
+    total +|= hpack.encodedFieldBytesMax(.{ .name = ":path", .value = head.path });
+    if (content_length) |value|
+        total +|= hpack.encodedFieldBytesMax(.{ .name = "content-length", .value = value });
+    for (head.headers) |header|
+        total +|= hpack.encodedFieldBytesMax(header);
+    return total;
 }
 
 fn methodHasRequestBody(method: []const u8) bool {

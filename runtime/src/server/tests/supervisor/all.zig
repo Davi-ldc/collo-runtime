@@ -1,8 +1,10 @@
 //! Root of the server's worker-supervision tests. `pool.zig` holds one
 //! definition's pool on its own, `worker_pool.zig` the pools as the
 //! supervisor builds and keeps them, `supervisor.zig` the supervisor's own
-//! decisions, `usage.zig` the usage path into `usage.jsonl`, `components.zig`
-//! the small parts, `worker_factory.zig` the egress side of a launch,
+//! decisions, `usage.zig` the request table and the usage floor,
+//! `worker_table.zig` a death's classification and the figures read off a
+//! worker's leaf, `components.zig` the small parts, `worker_factory.zig` the
+//! egress side of a launch,
 //! `launcher.zig` the launcher against a stand-in zygote, and `reaper/` the
 //! reaper's memory readings, retirements and memory-pressure passes.
 //!
@@ -20,8 +22,10 @@ comptime {
     _ = @import("components.zig");
     _ = @import("supervisor.zig");
     _ = @import("usage.zig");
+    _ = @import("worker_table.zig");
     _ = @import("worker_factory.zig");
     _ = @import("launcher.zig");
+    _ = @import("scale_out.zig");
     _ = @import("reaper/memory.zig");
     _ = @import("reaper/reaping.zig");
     _ = @import("reaper/retirement.zig");

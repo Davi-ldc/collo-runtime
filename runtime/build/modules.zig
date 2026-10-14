@@ -42,16 +42,7 @@ pub const ModuleId = enum {
     worker_state,
     worker_js,
     worker_request,
-    egress_accounting,
     egress_core,
-    egress_io,
-    egress_readiness,
-    egress_dns_cache,
-    egress_http2,
-    egress_tls,
-    egress_transport,
-    egress_data_io,
-    egress_pool,
     egress_client,
     egress_gateway,
     worker,
@@ -76,19 +67,13 @@ const Spec = struct {
     imports: []const ModuleId = &.{},
 };
 
-const egress_io_imports = [_]ModuleId{
-    .egress_accounting, .common_io, .egress_io, .io_uring_tags,
-    .os,                .http,      .hpack,     .boringssl,
-    .egress_core,
-};
-
 const specs = [_]Spec{
     .{ .id = .bindings, .root = "runtime/src/bindings/root.zig", .imports = &.{.limits} },
     .{ .id = .zlib, .root = "runtime/src/bindings/zlib/root.zig" },
     .{ .id = .brotli, .root = "runtime/src/bindings/brotli/root.zig" },
     .{ .id = .zstd, .root = "runtime/src/bindings/zstd/root.zig" },
     .{ .id = .boringssl, .root = "runtime/src/bindings/boringssl/root.zig" },
-    .{ .id = .hpack, .root = "runtime/src/bindings/hpack/root.zig" },
+    .{ .id = .hpack, .root = "runtime/src/bindings/hpack/root.zig", .imports = &.{.http} },
     .{ .id = .dns_name, .root = "runtime/src/common/dns_name.zig", .libc = false },
     .{ .id = .network, .root = "runtime/src/common/network/root.zig", .libc = false, .imports = &.{.limits} },
     .{ .id = .limits, .root = "runtime/src/common/limits/root.zig", .libc = false },
@@ -115,80 +100,26 @@ const specs = [_]Spec{
         .id = .worker_request,
         .root = "runtime/src/worker/request_api.zig",
         .imports = &.{
-            .bindings,  .worker_state, .ipc,    .http,
-            .common_io, .egress_core,  .limits, .worker_js,
+            .bindings,  .worker_state, .ipc,       .http,
+            .common_io, .limits,       .worker_js,
         },
     },
-    .{ .id = .egress_accounting, .root = "runtime/src/egress/core/accounting.zig", .libc = false },
     .{
         .id = .egress_core,
         .root = "runtime/src/egress/core/root.zig",
         .libcpp = true,
-        .imports = &.{ .bindings, .common_io, .http, .limits, .zlib, .brotli },
-    },
-    .{ .id = .egress_io, .root = "runtime/src/egress/client/io.zig", .libc = false },
-    .{
-        .id = .egress_readiness,
-        .root = "runtime/src/egress/client/io/readiness.zig",
-        .libc = false,
-        .imports = &.{ .egress_io, .common_io, .io_uring_tags },
+        .imports = &.{ .common_io, .zlib, .brotli },
     },
     .{
-        .id = .egress_dns_cache,
-        .root = "runtime/src/egress/client/dns_cache.zig",
-        .imports = &.{.egress_readiness},
-    },
-    .{
-        .id = .egress_http2,
-        .root = "runtime/src/egress/client/transport/h2/codec/root.zig",
-        .libc = false,
-        .imports = &.{ .egress_accounting, .http, .hpack, .limits },
-    },
-    .{ .id = .egress_tls, .root = "runtime/src/egress/client/tls.zig", .libcpp = true, .imports = &.{.boringssl} },
-    .{
-        .id = .egress_transport,
-        .root = "runtime/src/egress/client/transport/root.zig",
-        .libcpp = true,
-        .imports = &([_]ModuleId{
-            .egress_tls,
-            .egress_http2,
-            .egress_readiness,
-            .egress_dns_cache,
-            .limits,
-            .network,
-        } ++ egress_io_imports),
-    },
-    .{
-        .id = .egress_data_io,
-        .root = "runtime/src/egress/client/io/bio_data.zig",
-        .libcpp = true,
-        .imports = &([_]ModuleId{.egress_transport} ++ egress_io_imports),
-    },
-    .{
-        .id = .egress_pool,
-        .root = "runtime/src/egress/client/transport/h2/pool.zig",
-        .libcpp = true,
-        .imports = &([_]ModuleId{
-            .egress_transport,
-            .egress_http2,
-            .egress_data_io,
-            .egress_readiness,
-        } ++ egress_io_imports),
-    },
-    .{
+        // The egress client, one module: engine, dials, wire, both protocols,
+        // DNS cache and TLS. It imports no worker or bindings module.
         .id = .egress_client,
         .root = "runtime/src/egress/client/root.zig",
         .libcpp = true,
-        .imports = &([_]ModuleId{
-            .bindings,
-            .egress_transport,
-            .egress_tls,
-            .egress_http2,
-            .egress_readiness,
-            .egress_dns_cache,
-            .egress_data_io,
-            .egress_pool,
-        } ++ egress_io_imports),
+        .imports = &.{
+            .boringssl,     .common_io, .egress_core, .hpack, .http,
+            .io_uring_tags, .limits,    .network,     .os,
+        },
     },
     .{
         // The egress gateway process, and the control wire and launch
@@ -197,7 +128,7 @@ const specs = [_]Spec{
         .root = "runtime/src/egress/gateway/root.zig",
         .libcpp = true,
         .imports = &.{
-            .ipc,           .os,            .bindings, .common_io,
+            .ipc,           .os,            .http,   .common_io,
             .io_uring_tags, .egress_client, .limits,
         },
     },

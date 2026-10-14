@@ -16,17 +16,19 @@ const worker_retiring = ipc.worker_retiring;
 /// far fewer.
 const filler_packets_max: usize = 1 << 16;
 
-test "worker_retiring is message kind 27, its body the kind and a reason, and the reasons are 1 and 2" {
+test "worker_retiring is message kind 27, its body the kind and a reason, and the reasons are 1 to 3" {
     try std.testing.expectEqual(@as(u32, 27), @intFromEnum(ipc.MessageKind.worker_retiring));
     try std.testing.expectEqual(ipc.MessageKind.worker_retiring, try ipc.decodeMessageKind(27));
     try std.testing.expectEqual(@as(usize, 8), @sizeOf(ipc.WorkerRetiring));
     try std.testing.expectEqual(@as(u32, 1), @intFromEnum(ipc.WorkerRetiringReason.routes_failed));
     try std.testing.expectEqual(@as(u32, 2), @intFromEnum(ipc.WorkerRetiringReason.vm_terminated));
+    try std.testing.expectEqual(@as(u32, 3), @intFromEnum(ipc.WorkerRetiringReason.egress_detached));
     const message = ipc.WorkerRetiring.init(.vm_terminated);
     try std.testing.expectEqual(@as(u32, 27), message.kind);
     try std.testing.expectEqual(@as(u32, 2), message.reason);
+    try std.testing.expectEqual(ipc.WorkerRetiringReason.egress_detached, try ipc.decodeWorkerRetiringReason(3));
     try std.testing.expectError(error.InvalidWorkerRetiringReason, ipc.decodeWorkerRetiringReason(0));
-    try std.testing.expectError(error.InvalidWorkerRetiringReason, ipc.decodeWorkerRetiringReason(3));
+    try std.testing.expectError(error.InvalidWorkerRetiringReason, ipc.decodeWorkerRetiringReason(4));
 }
 
 test "a worker_retiring notice crosses the control socket with its reason" {
@@ -75,7 +77,7 @@ test "decode refuses another length, another kind, a descriptor and an unnamed r
     var unknown_kind = notice;
     unknown_kind.kind = 999;
     var unnamed_reason = notice;
-    unnamed_reason.reason = 3;
+    unnamed_reason.reason = 4;
     var zero_reason = notice;
     zero_reason.reason = 0;
 

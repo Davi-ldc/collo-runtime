@@ -11,7 +11,8 @@
 //!
 //! Each process sends one direction and receives the other: the host sends
 //! request begins, request body chunks and request resets and receives
-//! response heads, chunks, ends and resets, and the worker does the reverse.
+//! response heads, chunks, ends, resets and each request's `request_done`,
+//! its last descriptor, and the worker does the reverse.
 //! The parts under `ingress_channel/` follow those roles: `framing.zig` holds
 //! the packet format both directions share, `payload_ring.zig` the payload
 //! memfd and its rings, `send.zig` the sending side, `receive.zig` the
@@ -36,8 +37,12 @@ pub const batch_magic = framing.batch_magic;
 pub const max_batch_descriptors = framing.max_batch_descriptors;
 pub const Descriptor = framing.Descriptor;
 pub const RequestIdentity = framing.RequestIdentity;
+pub const RequestDone = framing.RequestDone;
+pub const RequestDonePayload = framing.RequestDonePayload;
 pub const Packet = framing.Packet;
 pub const batchPayloadOffset = framing.batchPayloadOffset;
+pub const encodeRequestDone = framing.encodeRequestDone;
+pub const decodeRequestDone = framing.decodeRequestDone;
 
 pub const shared_payload_threshold = payload_ring.shared_payload_threshold;
 pub const shared_payload_ring_capacity = payload_ring.shared_payload_ring_capacity;
@@ -59,6 +64,7 @@ pub const mapSharedPayloadReadWrite = payload_ring.mapSharedPayloadReadWrite;
 
 pub const BatchEntry = send.BatchEntry;
 pub const sendDescriptor = send.sendDescriptor;
+pub const sendRequestDone = send.sendRequestDone;
 pub const sendDescriptorPayload = send.sendDescriptorPayload;
 pub const sendDescriptorBatchPayloads = send.sendDescriptorBatchPayloads;
 pub const sendDescriptorBatchRingPayloads = send.sendDescriptorBatchRingPayloads;
@@ -69,6 +75,8 @@ pub const sendDescriptorPayloadRequireRing = send.sendDescriptorPayloadRequireRi
 pub const encodeDescriptorInto = send.encodeDescriptorInto;
 pub const encodeDescriptorPayloadInto = send.encodeDescriptorPayloadInto;
 pub const encodeDescriptorBatchPayloadsInto = send.encodeDescriptorBatchPayloadsInto;
+pub const RequestDoneBatch = send.RequestDoneBatch;
+pub const encodeBatchEndingInRequestDone = send.encodeBatchEndingInRequestDone;
 
 pub const SharedPayloadReaders = receive.SharedPayloadReaders;
 pub const SharedPayloadSpan = receive.SharedPayloadSpan;

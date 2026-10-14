@@ -11,14 +11,13 @@ bench("message-channel.create-close", iterations => {
   return checksum;
 }, { iterations: 50000, warmup: 1000 });
 
-bench("message-port.ref-unref-hasref", iterations => {
+bench("message-port.onmessage-replace", iterations => {
   const channel = new MessageChannel();
+  const handlers = [() => {}, () => {}];
   let checksum = 0;
   for (let i = 0; i < iterations; i++) {
-    channel.port1.ref();
-    checksum += channel.port1.hasRef();
-    channel.port1.unref();
-    checksum += channel.port1.hasRef();
+    channel.port1.onmessage = handlers[i & 1];
+    checksum += channel.port1.onmessage === handlers[i & 1];
   }
   channel.port1.close();
   channel.port2.close();

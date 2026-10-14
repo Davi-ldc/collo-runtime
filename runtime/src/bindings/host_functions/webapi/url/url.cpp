@@ -1,22 +1,18 @@
 // The URL class on the VM thread: a cell that owns one parsed WTF::URL, its accessors and setters, `canParse` and
-// `parse`, and Blob object URLs. Among the setters, only `href` throws for its value, a TypeError when it does not
-// parse; every other setter leaves the URL unchanged when the URL Standard's setter steps reject the value. The cell
-// reaches its URLSearchParams through a WriteBarrier: the params are created on the first `searchParams` access,
-// reparsed when a setter replaces the query, and write their own changes back through
-// `syncURLSearchParamsToAssociatedURL`. Object URLs live in the calling realm's `ColloBlobObjectURLRegistry`
-// (state.h), which bounds their count and bytes, so revokeObjectURL reaches only URLs its own realm created.
+// `parse`. Among the setters, only `href` throws for its value, a TypeError when it does not parse; every other setter
+// leaves the URL unchanged when the URL Standard's setter steps reject the value. The cell reaches its URLSearchParams
+// through a WriteBarrier: the params are created on the first `searchParams` access, reparsed when a setter replaces
+// the query, and write their own changes back through `syncURLSearchParamsToAssociatedURL`. The setter rules that
+// WTF::URL lacks come from the WebCore port under `pattern/webcore_port/`, which URLPattern shares.
 
 #include "host_functions/webapi/url/url.h"
 
-#include "host_functions/webapi/dom/dom_exception.h"
-#include "host_functions/webapi/files/blob.h"
-#include "host_functions/runtime/bridge.h"
+#include "host_functions/webapi/url/pattern/webcore_port/URLDecomposition.h"
 #include "host_functions/webapi/url/search_params.h"
 
 #include <JavaScriptCore/Error.h>
-#include <JavaScriptCore/GetterSetter.h>
-#include <JavaScriptCore/InternalFunction.h>
 #include <JavaScriptCore/IdentifierInlines.h>
+#include <JavaScriptCore/InternalFunction.h>
 #include <JavaScriptCore/JSCInlines.h>
 #include <JavaScriptCore/JSDestructibleObject.h>
 #include <JavaScriptCore/JSFunction.h>
@@ -24,15 +20,14 @@
 #include <JavaScriptCore/JSString.h>
 #include <JavaScriptCore/ObjectConstructor.h>
 #include <JavaScriptCore/SlotVisitorMacros.h>
+#include <wtf/SaturatingArithmetic.h>
 #include <wtf/URL.h>
 #include <wtf/URLParser.h>
-#include <wtf/UUID.h>
 #include <wtf/text/MakeString.h>
-#include <wtf/text/StringImpl.h>
 #include <wtf/text/StringBuilder.h>
+#include <wtf/text/StringImpl.h>
 #include <wtf/text/WTFString.h>
 
-#include <limits>
 #include <optional>
 
 namespace Collo::HostFunctions {
@@ -44,13 +39,6 @@ namespace {
     using namespace JSC;
 
     class JSColloURL;
-
-    static size_t saturatingAdd(size_t left, size_t right)
-    {
-        if (right > std::numeric_limits<size_t>::max() - left)
-            return std::numeric_limits<size_t>::max();
-        return left + right;
-    }
 
     static size_t stringMemoryCost(const String& value)
     {
@@ -163,40 +151,6 @@ namespace {
         return builder.toString();
     }
 
-    // The URL Standard's port state with a state override: tabs and newlines are skipped, the digits before the first
-    // other code point are the port, and the scheme's default port becomes null. The outer nullopt means the value
-    // is rejected and the port stays as it was: the first code point other than a tab or newline is not a digit, or
-    // the number exceeds 65535. An inner nullopt means the port becomes null: the value is empty or holds only tabs
-    // and newlines, or its number is the scheme's default port.
-    // FIXME: the URL Standard strips tabs and newlines before the port state runs, so it rejects a value of only tabs
-    // and newlines and leaves the port unchanged.
-    static std::optional<std::optional<uint16_t>> parsePort(WTF::StringView value, WTF::StringView protocol)
-    {
-        if (value.isEmpty())
-            return std::optional<uint16_t> { std::nullopt };
-
-        uint32_t port = 0;
-        bool found_digit = false;
-        for (unsigned i = 0; i < value.length(); i++) {
-            auto ch = value[i];
-            if (ch == 0x0009 || ch == 0x000A || ch == 0x000D)
-                continue;
-            if (ch >= '0' && ch <= '9') {
-                port = port * 10 + static_cast<uint32_t>(ch - '0');
-                found_digit = true;
-                if (port > std::numeric_limits<uint16_t>::max())
-                    return std::nullopt;
-                continue;
-            }
-            if (!found_digit)
-                return std::nullopt;
-            break;
-        }
-        if (!found_digit || WTF::isDefaultPortForProtocol(static_cast<uint16_t>(port), protocol))
-            return std::optional<uint16_t> { std::nullopt };
-        return { { static_cast<uint16_t>(port) } };
-    }
-
     class JSColloURL final : public JSC::JSDestructibleObject {
         using Base = JSC::JSDestructibleObject;
 
@@ -262,7 +216,7 @@ namespace {
     size_t JSColloURL::estimatedSize(JSC::JSCell* cell, JSC::VM& vm)
     {
         auto* this_object = static_cast<JSColloURL*>(cell);
-        return saturatingAdd(Base::estimatedSize(cell, vm), stringMemoryCost(this_object->m_url.string()));
+        return WTF::saturatingSum<size_t>(Base::estimatedSize(cell, vm), stringMemoryCost(this_object->m_url.string()));
     }
 
     void JSColloURL::setURL(JSC::VM&, WTF::URL&& url, bool reset_params)
@@ -347,7 +301,11 @@ namespace {
         if (url.host().isEmpty() || url.protocolIsFile())
             return true;
 
-        auto port = parsePort(value, url.protocol());
+        // The port state with a state override: an outer nullopt rejects the value and keeps the port, an inner one
+        // makes the port null.
+        // FIXME: the URL Standard strips tabs and newlines before the port state runs, so it rejects a value of only
+        // tabs and newlines and keeps the port, where parsePort makes the port null.
+        auto port = WebCore::URLDecomposition::parsePort(value, url.protocol());
         if (!port)
             return true;
         url.setPort(*port);
@@ -382,18 +340,13 @@ namespace {
         return true;
     }
 
-    static EncodedJSValue getURLStringProperty(JSC::JSGlobalObject* global_object, JSColloURL* url_object, String value)
-    {
-        return JSValue::encode(JSC::jsString(global_object->vm(), value));
-    }
-
     JSC_DEFINE_HOST_FUNCTION(urlGetHref, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
     {
         auto& vm = global_object->vm();
         auto scope = DECLARE_THROW_SCOPE(vm);
         auto* url_object = requireURL(global_object, scope, call_frame->thisValue());
         RETURN_IF_EXCEPTION(scope, {});
-        return getURLStringProperty(global_object, url_object, url_object->url().string());
+        return JSValue::encode(JSC::jsString(vm, url_object->url().string()));
     }
 
     JSC_DEFINE_HOST_FUNCTION(urlSetHref, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
@@ -421,7 +374,7 @@ namespace {
         auto scope = DECLARE_THROW_SCOPE(vm);                                                                          \
         auto* url_object = requireURL(global_object, scope, call_frame->thisValue());                                  \
         RETURN_IF_EXCEPTION(scope, {});                                                                                \
-        return getURLStringProperty(global_object, url_object, (expression));                                          \
+        return JSValue::encode(JSC::jsString(vm, (expression)));                                                       \
     }
 
     URL_STRING_GETTER(urlGetOrigin, originFor(url_object->url()))
@@ -586,67 +539,6 @@ namespace {
         return JSValue::encode(object);
     }
 
-    JSC_DEFINE_HOST_FUNCTION(urlCreateObjectURL, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
-    {
-        auto& vm = global_object->vm();
-        auto scope = DECLARE_THROW_SCOPE(vm);
-
-        auto* blob = dynamicDowncast<JSColloBlob>(call_frame->argument(0));
-        if (!blob)
-            return JSC::throwVMTypeError(global_object, scope, "createObjectURL expects a Blob object"_s);
-
-        auto* collo_global = uncheckedDowncast<Collo::GlobalObject>(global_object);
-        auto& registry = collo_global->realm().blob_object_urls;
-        // The entry carries the creating request's id, so request cleanup (`collo_webapi_cleanup_request`) revokes
-        // only that request's URLs and a co-scheduled request keeps its own. Outside a request turn the id is 0, and
-        // the entry lives until revokeObjectURL or VM teardown.
-        auto* owner_exec_ctx = Collo::HostFunctions::Runtime::activeExecContext(collo_global->owner());
-        const uint64_t owner_request_id = owner_exec_ctx ? owner_exec_ctx->request_id : 0;
-        WTF::Vector<BlobObjectURLBackingStore> backing_stores;
-        if (!blob->appendObjectURLBackingStores(backing_stores))
-            return JSValue::encode(JSC::throwOutOfMemoryError(global_object, scope));
-        if (!registry.canInsert(backing_stores)) {
-            auto* exception = createDOMException(
-                global_object, DOMExceptionCode::QuotaExceededError, "Blob object URL registry quota exceeded"_s);
-            return JSValue::encode(JSC::throwException(global_object, scope, exception));
-        }
-
-        String url;
-        for (unsigned attempts = 0; attempts < 4; attempts++) {
-            url = WTF::makeString("blob:"_s, WTF::createVersion4UUIDString());
-            if (!registry.contains(url)) {
-                auto result_url = url;
-                if (!registry.insert(vm, WTF::move(url), blob, WTF::move(backing_stores), owner_request_id)) {
-                    auto* exception = createDOMException(global_object, DOMExceptionCode::QuotaExceededError,
-                        "Blob object URL registry quota exceeded"_s);
-                    return JSValue::encode(JSC::throwException(global_object, scope, exception));
-                }
-                return JSValue::encode(JSC::jsString(vm, result_url));
-            }
-        }
-
-        auto* exception = createDOMException(
-            global_object, DOMExceptionCode::OperationError, "Could not allocate a unique blob URL"_s);
-        return JSValue::encode(JSC::throwException(global_object, scope, exception));
-    }
-
-    JSC_DEFINE_HOST_FUNCTION(urlRevokeObjectURL, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
-    {
-        auto& vm = global_object->vm();
-        auto scope = DECLARE_THROW_SCOPE(vm);
-
-        if (call_frame->argumentCount() < 1)
-            return JSC::throwVMTypeError(
-                global_object, scope, "Not enough arguments to 'revokeObjectURL'. Expected 1, got 0."_s);
-
-        auto url = argumentToWebApiString(global_object, scope, call_frame, 0);
-        RETURN_IF_EXCEPTION(scope, {});
-
-        auto* collo_global = uncheckedDowncast<Collo::GlobalObject>(global_object);
-        collo_global->realm().blob_object_urls.remove(url);
-        return JSValue::encode(JSC::jsUndefined());
-    }
-
 } // namespace
 
 void syncURLSearchParamsToAssociatedURL(JSC::JSObject* associated_url, const WTF::URLParser::URLEncodedForm& pairs)
@@ -699,10 +591,6 @@ void installWebApiURL(Collo::GlobalObject* global_object, JSC::VM& vm)
     putWebApiFunction(global_object, url_constructor, vm, "canParse"_s, 1, urlCanParse,
         static_cast<unsigned>(JSC::PropertyAttribute::DontEnum));
     putWebApiFunction(global_object, url_constructor, vm, "parse"_s, 1, urlParse,
-        static_cast<unsigned>(JSC::PropertyAttribute::DontEnum));
-    putWebApiFunction(global_object, url_constructor, vm, "createObjectURL"_s, 1, urlCreateObjectURL,
-        static_cast<unsigned>(JSC::PropertyAttribute::DontEnum));
-    putWebApiFunction(global_object, url_constructor, vm, "revokeObjectURL"_s, 1, urlRevokeObjectURL,
         static_cast<unsigned>(JSC::PropertyAttribute::DontEnum));
     url_prototype->putDirect(
         vm, vm.propertyNames->constructor, url_constructor, static_cast<unsigned>(JSC::PropertyAttribute::DontEnum));

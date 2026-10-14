@@ -224,22 +224,29 @@ describe("ReadableStream strategy integration", () => {
 });
 
 describe("WritableStream strategy integration", () => {
-  test("writer desiredSize uses CountQueuingStrategy", async () => {
-    let releaseWrite;
-    const stream = new WritableStream(
-      {
-        write() {
-          return new Promise(resolve => {
-            releaseWrite = resolve;
-          });
-        },
+  // The sink starts a microtask after construction, so the first write reaches it only then; `written` resolves with the
+  // function that finishes that write.
+  function pendingSink() {
+    let reached;
+    return {
+      written: new Promise(resolve => {
+        reached = resolve;
+      }),
+      write() {
+        return new Promise(finish => reached(finish));
       },
-      new CountQueuingStrategy({ highWaterMark: 2 }),
-    );
+    };
+  }
+
+  test("writer desiredSize uses CountQueuingStrategy", async () => {
+    const sink = pendingSink();
+    const stream = new WritableStream(sink, new CountQueuingStrategy({ highWaterMark: 2 }));
 
     const writer = stream.getWriter();
     assert.equal(writer.desiredSize, 2);
     const first = writer.write("a");
+    assert.equal(writer.desiredSize, 1);
+    const releaseWrite = await sink.written;
     assert.equal(writer.desiredSize, 1);
     releaseWrite();
     await first;
@@ -247,21 +254,14 @@ describe("WritableStream strategy integration", () => {
   });
 
   test("writer desiredSize uses ByteLengthQueuingStrategy", async () => {
-    let releaseWrite;
-    const stream = new WritableStream(
-      {
-        write() {
-          return new Promise(resolve => {
-            releaseWrite = resolve;
-          });
-        },
-      },
-      new ByteLengthQueuingStrategy({ highWaterMark: 8 }),
-    );
+    const sink = pendingSink();
+    const stream = new WritableStream(sink, new ByteLengthQueuingStrategy({ highWaterMark: 8 }));
 
     const writer = stream.getWriter();
     assert.equal(writer.desiredSize, 8);
     const first = writer.write(new Uint8Array([1, 2, 3]));
+    assert.equal(writer.desiredSize, 5);
+    const releaseWrite = await sink.written;
     assert.equal(writer.desiredSize, 5);
     releaseWrite();
     await first;
@@ -354,7 +354,7 @@ describe("WritableStream strategy integration", () => {
     await writer.closed;
   });
 
-  test("write rejects instead of enqueueing while abort is erroring", async () => {
+  test("write rejects instead of enqueueing while the sink's abort runs", async () => {
     let writer;
     const reason = new Error("abort from size");
     let reentrantWrite;
@@ -423,8 +423,11 @@ describe("WritableStream strategy integration", () => {
 });
 
 describe("TransformStream strategy integration", () => {
-  test("null transformer is treated as an empty transformer", () => {
-    const stream = new TransformStream(null);
+  test("null transformer is rejected while an undefined one is empty", () => {
+    // The transformer's Web IDL type is `optional object`, so null is not an object; the strategies below are
+    // dictionaries, which accept null.
+    assert.throws(() => new TransformStream(null), TypeError);
+    const stream = new TransformStream(undefined);
     assert(stream.readable instanceof ReadableStream);
     assert(stream.writable instanceof WritableStream);
   });

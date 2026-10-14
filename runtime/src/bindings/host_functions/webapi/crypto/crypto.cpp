@@ -1,9 +1,10 @@
 // Installs the Web Cryptography API on a global object: the `crypto` instance with its `subtle` member, and the
 // `Crypto`, `SubtleCrypto` and `CryptoKey` interfaces, whose constructors throw on every call. It runs at most once
 // per realm, on the VM thread, when the VM installs Web APIs; a worker's VM and main realm are created in the zygote,
-// so every worker inherits the main realm's objects from the zygote's heap. The CryptoKey structure is cached on the
-// global object (`cacheCryptoApi`), where the key factories in `keys.cpp` read it, so this installer must run before
-// any key is created.
+// so every worker inherits the main realm's objects from the zygote's heap. The objects hold no native state, which a
+// worker would otherwise dirty in those shared pages on first use. The CryptoKey structure is cached on the global
+// object (`cacheCryptoApi`), where the key factories in `keys.cpp` read it, so this installer must run before any key
+// is created.
 
 #include "host_functions/webapi/crypto/crypto.h"
 
@@ -38,7 +39,7 @@ void installWebApiCrypto(Collo::GlobalObject* global_object, JSC::VM& vm)
     putWebApiFunction(global_object, subtle_prototype, vm, "digest"_s, 2, subtleDigest, enumerableFunction);
     putWebApiFunction(global_object, subtle_prototype, vm, "generateKey"_s, 3, subtleGenerateKey, enumerableFunction);
     putWebApiFunction(global_object, subtle_prototype, vm, "deriveKey"_s, 5, subtleDeriveKey, enumerableFunction);
-    putWebApiFunction(global_object, subtle_prototype, vm, "deriveBits"_s, 3, subtleDeriveBits, enumerableFunction);
+    putWebApiFunction(global_object, subtle_prototype, vm, "deriveBits"_s, 2, subtleDeriveBits, enumerableFunction);
     putWebApiFunction(global_object, subtle_prototype, vm, "importKey"_s, 5, subtleImportKey, enumerableFunction);
     putWebApiFunction(global_object, subtle_prototype, vm, "exportKey"_s, 2, subtleExportKey, enumerableFunction);
     putWebApiFunction(global_object, subtle_prototype, vm, "wrapKey"_s, 4, subtleWrapKey, enumerableFunction);
@@ -46,7 +47,7 @@ void installWebApiCrypto(Collo::GlobalObject* global_object, JSC::VM& vm)
     subtle_prototype->putDirect(vm, vm.propertyNames->toStringTagSymbol, JSC::jsString(vm, String("SubtleCrypto"_s)),
         JSC::PropertyAttribute::ReadOnly | JSC::PropertyAttribute::DontEnum);
 
-    auto* subtle_constructor = createSubtleCryptoConstructor(global_object, vm);
+    auto* subtle_constructor = createInterfaceConstructor(global_object, vm, "SubtleCrypto"_s);
     subtle_constructor->putDirect(vm, vm.propertyNames->prototype, subtle_prototype,
         JSC::PropertyAttribute::ReadOnly | JSC::PropertyAttribute::DontEnum | JSC::PropertyAttribute::DontDelete);
     subtle_prototype->putDirect(
@@ -65,7 +66,7 @@ void installWebApiCrypto(Collo::GlobalObject* global_object, JSC::VM& vm)
     key_prototype->putDirect(vm, vm.propertyNames->toStringTagSymbol, JSC::jsString(vm, String("CryptoKey"_s)),
         JSC::PropertyAttribute::ReadOnly | JSC::PropertyAttribute::DontEnum);
 
-    auto* key_constructor = createCryptoKeyConstructor(global_object, vm);
+    auto* key_constructor = createInterfaceConstructor(global_object, vm, "CryptoKey"_s);
     key_constructor->putDirect(vm, vm.propertyNames->prototype, key_prototype,
         JSC::PropertyAttribute::ReadOnly | JSC::PropertyAttribute::DontEnum | JSC::PropertyAttribute::DontDelete);
     key_prototype->putDirect(
@@ -81,7 +82,7 @@ void installWebApiCrypto(Collo::GlobalObject* global_object, JSC::VM& vm)
     prototype->putDirect(vm, vm.propertyNames->toStringTagSymbol, JSC::jsString(vm, String("Crypto"_s)),
         JSC::PropertyAttribute::ReadOnly | JSC::PropertyAttribute::DontEnum);
 
-    auto* constructor = createCryptoConstructor(global_object, vm);
+    auto* constructor = createInterfaceConstructor(global_object, vm, "Crypto"_s);
     constructor->putDirect(vm, vm.propertyNames->prototype, prototype,
         JSC::PropertyAttribute::ReadOnly | JSC::PropertyAttribute::DontEnum | JSC::PropertyAttribute::DontDelete);
     prototype->putDirect(

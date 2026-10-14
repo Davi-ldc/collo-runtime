@@ -13,35 +13,42 @@ const lifecycle = @import("collo_server_lifecycle");
 const commands = @import("commands.zig");
 const timer_wheel = @import("timer_wheel.zig");
 const uring = @import("uring.zig");
-const supervision = @import("collo_server_supervisor");
 
 /// Sizes of a lane's state besides its tables. A serving lane uses the
 /// defaults.
 pub const Config = struct {
     lane_id: u16 = 0,
-    /// The worker definitions the lane serves and every definition's
-    /// `concurrency` added up (`Routes.slotsPerWorkerTotal`), which size its
-    /// command queue's reserve (`obligationReserve`). Neither has a default:
-    /// a reserve smaller than the configuration needs refuses worker output
-    /// the forwarding window promised a place to.
-    definition_count: usize,
-    slots_per_worker_total: usize,
+    /// The worker definitions the server serves, which size the lane's
+    /// command queue's reserve (`obligationReserve`). No default: a reserve
+    /// smaller than the configuration needs refuses the obligations and the
+    /// worker output it promised a place to.
+    served: ServedDefinitions,
     /// Deadline wheel entries: one per request the lane can hold.
     max_requests: usize = limits.ingress.requests_per_lane_max,
     deadline_wheel_slots: usize = timer_wheel.minimum_slots,
     command_queue_capacity: usize = limits.ingress.commands_per_lane_max,
 };
 
-/// The command places a lane reserves for `definition_count` worker
-/// definitions whose `concurrency` adds up to `slots_per_worker_total`: for
-/// each entry of each pool's worker table, one death, one reader grant, one
-/// forwarded completion per slot of its own definition's `concurrency`, and
-/// the forwarding window of the entry's output (`commands.zig` says why that
-/// bounds them).
-pub fn obligationReserve(definition_count: usize, slots_per_worker_total: usize) usize {
-    std.debug.assert(slots_per_worker_total <= definition_count * supervision.pool.slots_per_worker_max);
-    const per_definition = 2 + limits.ingress.forwarded_commands_per_worker_max;
-    return (definition_count * per_definition + slots_per_worker_total) * limits.pool.pool_workers_max;
+/// The worker definitions a configuration holds, as a lane's command
+/// reserve counts them (`runner/root.zig:servedDefinitions` reads them off
+/// the routes).
+pub const ServedDefinitions = struct {
+    count: usize,
+    /// Every definition's `concurrency` added up: the pool slots one worker
+    /// of each definition has.
+    slots_per_worker_total: usize,
+};
+
+/// The command places a lane reserves for the definitions `served` names:
+/// for each entry of each pool's worker table, one death, one reader grant,
+/// one forwarded `request_done` per slot of its own definition's
+/// `concurrency`, and the forwarding window of the entry's other output
+/// (`commands.zig` says why that bounds them).
+pub fn obligationReserve(served: ServedDefinitions) usize {
+    // The configuration caps every definition's `concurrency` there.
+    std.debug.assert(served.slots_per_worker_total <= served.count * limits.server.worker_concurrency_max);
+    const per_entry = 2 + limits.ingress.forwarded_commands_per_worker_max;
+    return (served.count * per_entry + served.slots_per_worker_total) * limits.pool.pool_workers_max;
 }
 
 /// Monotonic counters of one lane. `Service.countersSnapshot` sums them over
@@ -94,8 +101,7 @@ pub const CounterSnapshot = struct {
     /// the hard-timeout grace.
     deadline_grace_faults: u64 = 0,
     deadline_wheel_inserts: u64 = 0,
-    worker_completion_records_drained: u64 = 0,
-    worker_completion_drain_fatal_errors: u64 = 0,
+    /// Dispatched requests the lane finished, whatever ended them.
     completed_requests: u64 = 0,
     stale_connection_cqe: u64 = 0,
     connection_poll_cancel_attempts: u64 = 0,
@@ -109,15 +115,19 @@ pub const CounterSnapshot = struct {
     /// readiness: the registration had moved on, or a cancel removed the
     /// poll.
     stale_worker_poll_cqes: u64 = 0,
-    stale_worker_completion: u64 = 0,
+    /// `request_done` descriptors naming a request that had ended.
+    stale_request_done: u64 = 0,
     stale_timeout: u64 = 0,
-    /// Dispatched requests past their deadline and grace that a completion
-    /// ended after all, taken just before the backstop or parked behind the
-    /// response, so their worker took no fault.
-    completion_before_timeout: u64 = 0,
-    worker_completion_registrations: u64 = 0,
+    /// Dispatched requests past their deadline and grace whose
+    /// `request_done` the backstop's read of the worker found, so their
+    /// worker took no fault.
+    request_done_at_backstop: u64 = 0,
+    /// Registrations of a worker this lane took (`completions.Registration`).
+    worker_registrations: u64 = 0,
     silent_queue_overflows: u64 = 0,
-    worker_completion_eventfd_wakes: u64 = 0,
+    /// Wakes of a worker's completion eventfd, which the worker writes when
+    /// it frees room in its server-to-worker payload ring.
+    worker_ring_credit_wakes: u64 = 0,
     command_eventfd_wakes: u64 = 0,
     timerfd_expirations: u64 = 0,
     deadline_wheel_expired: u64 = 0,
@@ -154,15 +164,7 @@ pub const CounterSnapshot = struct {
     /// `payload_consumed` answers a reader's full queue refused; the ring
     /// bytes they would free stay held.
     payload_answer_drops: u64 = 0,
-    /// Fault answers dropped because the worker's fault socket had no room;
-    /// the worker's read then ends at its request's deadline.
-    fs_fault_answer_drops: u64 = 0,
     ingress_response_body_bytes: u64 = 0,
-    /// `request_ended` batches lost because the gateway's control socket was
-    /// full, and because the gateway was gone (`server/gateway/lease.zig`).
-    /// Each costs its requests' fetches until their tokens' deadlines.
-    egress_ended_batches_dropped_full: u64 = 0,
-    egress_ended_batches_dropped_closed: u64 = 0,
 
     pub fn add(self: *CounterSnapshot, other: CounterSnapshot) void {
         inline for (std.meta.fields(CounterSnapshot)) |field|
@@ -198,7 +200,7 @@ pub const IngressLane = struct {
         errdefer wheel.deinit();
         var queue = try commands.Queue.init(
             config.command_queue_capacity,
-            obligationReserve(config.definition_count, config.slots_per_worker_total),
+            obligationReserve(config.served),
         );
         errdefer queue.deinit();
         return .{
@@ -247,11 +249,6 @@ pub const IngressLane = struct {
 
     pub fn recordDispatchHandoff(self: *IngressLane) void {
         self.counters.dispatch_handoffs += 1;
-    }
-
-    pub fn recordCompletionDrained(self: *IngressLane, count: usize) void {
-        self.counters.worker_completion_records_drained += @intCast(count);
-        self.counters.completed_requests += @intCast(count);
     }
 
     pub fn countersSnapshot(self: *const IngressLane) CounterSnapshot {

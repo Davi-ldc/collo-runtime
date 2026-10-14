@@ -1,4 +1,4 @@
-//! The server configuration: global settings and named worker definitions,
+//! The server configuration: top-level settings and named worker definitions,
 //! each with its resolved settings and its routes, read once at boot from a
 //! `collo.json` file or synthesized for a single entry module. Nothing here
 //! touches a module on disk or a worker; the route table and the per-route

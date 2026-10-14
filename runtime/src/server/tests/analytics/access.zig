@@ -1,11 +1,14 @@
 //! Access records (`server/analytics/access.zig`): stamping facts with each
 //! capture cut at its cap on a UTF-8 boundary, the derived durations, the
-//! `access.jsonl` line built from hostile client bytes, the encoded bound
-//! against a worst-case record, the ingress lane's handoff ring, and draining
-//! a ring into a sink in a temporary directory with and without an access
-//! file. The status an ingress lane records for each way a dispatched request
-//! ends, and the metrics tick that drains every ingress lane's ring, are
-//! covered in `server/tests/ingress/analytics_drain.zig`.
+//! `access.jsonl` line built from hostile client bytes, the usage a
+//! dispatched request's line carries beside the server's identity and wall
+//! time and the line of a request no worker was dispatched without it, the
+//! encoded bound against a worst-case record, the ingress lane's handoff
+//! ring, and draining a ring into a sink in a temporary directory with and
+//! without an access file. The status, error code and usage an ingress lane
+//! records for each way a dispatched request ends, and the metrics tick that
+//! drains every ingress lane's ring, are covered in `server/tests/ingress/`,
+//! and the usage floor in `server/tests/supervisor/usage.zig`.
 
 const std = @import("std");
 const analytics = @import("collo_server_analytics");
@@ -87,7 +90,7 @@ test "duration clamps at zero and a queued response head reports at least one mi
     try std.testing.expectEqual(@as(u64, 30), slow.ttfbMs());
 }
 
-test "an access record encodes every field as one valid JSON line" {
+test "the line of a request no worker was dispatched encodes every field as one valid JSON line, and no usage field" {
     var facts = access.stamp(.{
         .request_id = 77,
         .worker = "demo.example.test",
@@ -137,17 +140,98 @@ test "an access record encodes every field as one valid JSON line" {
     try std.testing.expectEqualStrings("deadline_grace_expired", object.get("worker_fault").?.string);
     try std.testing.expectEqualStrings("2001:db8::1", object.get("client_ip").?.string);
     try std.testing.expectEqualStrings("Bot/1.\xef\xbf\xbd0", object.get("user_agent").?.string);
-    // What the request used is the usage record's alone: the access line
-    // carries no resource measure.
-    for ([_][]const u8{ "cpu_time_ns", "io_time_ns", "waiting_ns", "cpu_ns", "io_ns", "exec_ns" }) |key|
+    // No worker measured anything for the request, so the line has no usage
+    // field at all.
+    for ([_][]const u8{ "origin", "wall_ns", "exec_ns", "waiting_ns", "io_ns", "cpu_ns", "client_served_bytes", "fetch_sent_bytes", "fetch_received_bytes" }) |key|
         try std.testing.expect(object.get(key) == null);
     try std.testing.expectEqual(@as(usize, 19), object.count());
+}
+
+test "a dispatched request's line carries the worker's measures beside the server's identity and wall time" {
+    var facts = makeFacts(78);
+    facts.worker_id = 5;
+    facts.worker_generation = 2;
+    // Dispatched at 8 s and ended by the lane at 8.5 s on the server's clock.
+    facts.dispatched_mono_ns = 8_000_000_000;
+    var record = access.recordFromFacts(facts, 200, .worker, 8_500_000_000);
+    record.usage = .{
+        .origin = .worker,
+        .exec_ns = 11,
+        .waiting_ns = 13,
+        .io_ns = 17,
+        .cpu_ns = 19,
+        .client_served_bytes = 100,
+        .fetch_sent_bytes = 20,
+        .fetch_received_bytes = 3,
+    };
+
+    var buffer: [access.json_record_bytes_max]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try access.writeRecordJson(&writer, &record, clock);
+    const json = writer.buffered();
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    const object = parsed.value.object;
+
+    // The identity and the times are the server's: the facts the lane
+    // stamped, and its dispatch to its end, 0.5 s before the clock reading.
+    try std.testing.expectEqual(@as(i64, 78), object.get("request_id").?.integer);
+    try std.testing.expectEqualStrings("demo.example.test", object.get("worker").?.string);
+    try std.testing.expectEqualStrings("/api/:kind", object.get("route").?.string);
+    try std.testing.expectEqual(@as(i64, 5), object.get("worker_id").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), object.get("worker_generation").?.integer);
+    try std.testing.expectEqual(@as(i64, 1_700_000_000_000 - 500), object.get("ts").?.integer);
+    try std.testing.expectEqual(@as(i64, 500_000_000), object.get("wall_ns").?.integer);
+    // The measures are the worker's, each under its own key.
+    try std.testing.expectEqualStrings("worker", object.get("origin").?.string);
+    try std.testing.expectEqual(@as(i64, 11), object.get("exec_ns").?.integer);
+    try std.testing.expectEqual(@as(i64, 13), object.get("waiting_ns").?.integer);
+    try std.testing.expectEqual(@as(i64, 17), object.get("io_ns").?.integer);
+    try std.testing.expectEqual(@as(i64, 19), object.get("cpu_ns").?.integer);
+    try std.testing.expectEqual(@as(i64, 100), object.get("client_served_bytes").?.integer);
+    try std.testing.expectEqual(@as(i64, 20), object.get("fetch_sent_bytes").?.integer);
+    try std.testing.expectEqual(@as(i64, 3), object.get("fetch_received_bytes").?.integer);
+    try std.testing.expect(object.get("fetch_wire_bytes") == null);
+    try std.testing.expectEqual(@as(usize, 28), object.count());
+
+    // The times keep one order on every line: the server's span, then the
+    // worker's partition of its own span, then the CPU.
+    const keys = [_][]const u8{ "\"wall_ns\"", "\"exec_ns\"", "\"waiting_ns\"", "\"io_ns\"", "\"cpu_ns\"" };
+    var previous: usize = 0;
+    for (keys) |key| {
+        const at = std.mem.indexOf(u8, json, key) orelse return error.TestExpectedKey;
+        try std.testing.expect(at > previous);
+        previous = at;
+    }
+}
+
+test "a floor's line says the server measured it, and a request the lane never dispatched has no wall time" {
+    var facts = makeFacts(79);
+    facts.dispatched_mono_ns = 1_200_000_000;
+    var record = access.recordFromFacts(facts, 502, .worker, 1_250_000_000);
+    record.usage = .{ .origin = .server, .cpu_ns = 40 };
+    try std.testing.expectEqual(@as(u64, 50_000_000), record.wallNs());
+
+    var buffer: [access.json_record_bytes_max]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try access.writeRecordJson(&writer, &record, clock);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, writer.buffered(), .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("server", parsed.value.object.get("origin").?.string);
+    try std.testing.expectEqual(@as(i64, 40), parsed.value.object.get("cpu_ns").?.integer);
+    try std.testing.expectEqual(@as(i64, 0), parsed.value.object.get("exec_ns").?.integer);
+
+    // The wall time runs from the dispatch, never from the head's arrival,
+    // and a clock reading before the dispatch clamps it at zero.
+    facts.dispatched_mono_ns = 0;
+    try std.testing.expectEqual(@as(u64, 0), access.recordFromFacts(facts, 503, .server, 1_250_000_000).wallNs());
+    facts.dispatched_mono_ns = 1_300_000_000;
+    try std.testing.expectEqual(@as(u64, 0), access.recordFromFacts(facts, 502, .worker, 1_250_000_000).wallNs());
 }
 
 test "a worst-case access record fits its encoded bound" {
     // The metrics thread encodes into a buffer of exactly this bound and
     // treats running out of room as impossible.
-    const CompletedStatus = @import("collo_worker_state").page.CompletedStatus;
     const limits = @import("collo_limits").runtime_logs;
     const widest = std.math.maxInt(u64);
     // Every capture past its cap, made of a byte that escapes to six.
@@ -167,10 +251,23 @@ test "a worst-case access record fits its encoded bound" {
     facts.first_byte_mono_ns = widest;
     facts.cold_start_ns = widest;
     facts.cold_start_blocked_ns = widest;
-    facts.error_code = comptime std.meta.stringToEnum(CompletedStatus, analytics.record.longestTagName(CompletedStatus)).?;
+    // A dispatch at 1 ns and an end at the widest stamp give the widest wall
+    // time.
+    facts.dispatched_mono_ns = 1;
+    facts.error_code = comptime std.meta.stringToEnum(access.ErrorCode, analytics.record.longestTagName(access.ErrorCode)).?;
     facts.worker_fault = control[0..limits.WORKER_FAULT_BYTES_MAX];
     const longest_answerer = comptime std.meta.stringToEnum(access.AnsweredBy, analytics.record.longestTagName(access.AnsweredBy)).?;
-    const record = access.recordFromFacts(facts, std.math.maxInt(u16), longest_answerer, widest);
+    var record = access.recordFromFacts(facts, std.math.maxInt(u16), longest_answerer, widest);
+    record.usage = .{
+        .origin = comptime std.meta.stringToEnum(access.Origin, analytics.record.longestTagName(access.Origin)).?,
+        .exec_ns = widest,
+        .waiting_ns = widest,
+        .io_ns = widest,
+        .cpu_ns = widest,
+        .client_served_bytes = widest,
+        .fetch_sent_bytes = widest,
+        .fetch_received_bytes = widest,
+    };
 
     var buffer: [access.json_record_bytes_max]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buffer);

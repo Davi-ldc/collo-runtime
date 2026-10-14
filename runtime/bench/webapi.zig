@@ -173,9 +173,8 @@ fn runColloBench(allocator: std.mem.Allocator, spec: BenchSpec, run_count: u32) 
 
     const metrics_fd = try worker_shared_page.createMemfd("collo-bench-webapi-metrics");
     defer std.posix.close(metrics_fd);
-    var metrics_view = try worker_shared_page.mapReadWrite(metrics_fd);
+    var metrics_view = try worker_shared_page.mapWorkerWriter(metrics_fd);
     defer metrics_view.deinit();
-    metrics_view.initializeCrashDefault();
     const completion_eventfd = try std.posix.eventfd(0, std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK);
 
     var now_mono_ns: u64 = 0;
@@ -351,16 +350,16 @@ fn runRouteAndReadBody(
     defer std.posix.close(route_fd);
     const route_specifier = try scopedRouteSpecifier(allocator, specifier);
     defer allocator.free(route_specifier);
-    const pack = try ipc.module_pack.buildSingleAlloc(allocator, route_specifier, source);
+    const pack = try ipc.module_pack.buildSingleRouteAlloc(allocator, route_specifier, source);
     defer allocator.free(pack);
     try fd_mod.writeAllRaw(route_fd, pack);
     try std.posix.lseek_SET(route_fd, 0);
     try fd_mod.addSeals(route_fd, fd_mod.memfd_readonly_seals);
 
-    // A worker's boot registers its definition's pack and evaluates every
-    // route of the table WorkerInit carried before any request names one;
-    // this runtime's table is the one route.
-    const route_index = try runtime.modules.state.addRoute(allocator, route_specifier, &ipc.route_bindings.empty_blob);
+    // A worker's boot registers its definition's artifact and evaluates
+    // every route it carries before any request names one; this artifact's
+    // one route is route 0.
+    const route_index: u16 = 0;
     try runtime.evaluateBootRoutes(route_fd, 0, null);
     runtime.sealStartupEvaluations();
 
@@ -371,7 +370,7 @@ fn runRouteAndReadBody(
         .worker_generation = 1,
         .request_lane_id = 0,
         .request_slot = 0,
-        .accounting_flags = 0,
+        .worker_slot = 0,
         .authority = "demo.test",
         .deadline_monotonic_ns = 30 * std.time.ns_per_s,
         .method = "GET",
@@ -396,11 +395,15 @@ fn runRouteAndReadBody(
 /// (`fakeNow`), so this is the only bound.
 const response_wall_ms: u32 = 10 * 60 * 1000;
 
+/// The artifact key of a bench file: its specifier under the worker's task
+/// root (`ipc.module_pack.task_root`), where a worker's boot requires every
+/// key to be.
 fn scopedRouteSpecifier(allocator: std.mem.Allocator, specifier: []const u8) ![]u8 {
-    if (ipc.module_pack.deployHashFromSpecifier(specifier) != null)
+    const task_prefix = ipc.module_pack.task_root ++ "/";
+    if (std.mem.startsWith(u8, specifier, task_prefix))
         return allocator.dupe(u8, specifier);
     const suffix = if (std.mem.startsWith(u8, specifier, "/")) specifier[1..] else specifier;
-    return std.fmt.allocPrint(allocator, "/__collo_route/bench/{s}", .{suffix});
+    return std.fmt.allocPrint(allocator, task_prefix ++ "{s}", .{suffix});
 }
 
 fn requestIdForSpecifier(specifier: []const u8) u64 {

@@ -38,9 +38,8 @@ test "a pass that admits a request and arms its worker's polls hands every entry
     _ = try scene.stub.readRequestBegin();
 
     // The worker's first request armed its registration's polls: its
-    // completion eventfd, its control socket, its fs-fault socket and its
-    // pidfd.
-    try std.testing.expect(ring.ring.sq.sqe_tail -% prepared_before >= 4);
+    // completion eventfd, its control socket and its pidfd.
+    try std.testing.expect(ring.ring.sq.sqe_tail -% prepared_before >= 3);
     try std.testing.expectEqual(enters_before + 1, ring.enters);
     try std.testing.expect(!ring.hasPending());
 }

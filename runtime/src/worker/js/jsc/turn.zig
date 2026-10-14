@@ -295,22 +295,6 @@ pub fn cancelResponseBodyStream(
     try finishNativeTurn(vm, exec_ctx, "response body stream cancel", cancel_result);
 }
 
-/// Settles the promise of the finished crypto `job` in a turn and consumes
-/// `job` on every path, a failed enter included. An exception from the
-/// settlement or the drain is logged and returned as `error.JsException`.
-pub fn settleCryptoJob(
-    vm: *bindings.Vm,
-    exec_ctx: *bindings.ExecCtx,
-    job: *bindings.RawCryptoJob,
-) !void {
-    vm.turnEnter(exec_ctx) catch |err| {
-        bindings.destroyCryptoJob(job);
-        return err;
-    };
-    const settle_result = vm.cryptoJobSettle(job);
-    try finishNativeTurn(vm, exec_ctx, "crypto job settlement", settle_result);
-}
-
 fn settlePromise(
     vm: *bindings.Vm,
     exec_ctx: *bindings.ExecCtx,

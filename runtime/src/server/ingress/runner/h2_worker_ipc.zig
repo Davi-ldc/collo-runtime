@@ -1,12 +1,13 @@
-//! A worker's response descriptors on an ingress lane thread of the server.
-//! The worker's reader (`server/supervisor/pool.zig`) decodes them from the
-//! worker's control socket (`worker_control.zig`). A descriptor for a request
-//! of the reader's own lane goes onto that request's client stream here; one
-//! for another lane's request travels to that lane as `forwarded_descriptor`
-//! (`lane_commands.zig`), which applies it here as if it had read it itself.
-//! The completions parked behind an unfinished response, the answer of a
-//! stream whose request ends without its response, and the worker's
-//! forwarding window are here too.
+//! A worker's descriptors on an ingress lane thread of the server. The
+//! worker's reader (`server/supervisor/pool.zig`) decodes them from the
+//! worker's control socket (`worker_control.zig`). A response descriptor for
+//! a request of the reader's own lane goes onto that request's client stream
+//! here, and a `request_done` finishes the request (`request_done.zig`);
+//! a response descriptor for another lane's request travels to that lane as
+//! `forwarded_descriptor` (`lane_commands.zig`), which applies it here as if
+//! it had read it itself, and a `request_done` as `forwarded_request_done`.
+//! The answer of a stream whose request ends without its response and the
+//! worker's forwarding window are here too.
 //!
 //! - A descriptor is worker output, so it acts only on a request it names
 //!   exactly: the request key of a live request dispatched to the sending
@@ -18,45 +19,48 @@
 //!   faults returned to the caller as `fault.WorkerOutcome`; the caller runs
 //!   the death path, and nothing here marks a worker dead. Before it
 //!   forwards one, the reader checks it against the worker's request table
-//!   (`RequestTable.forwardCheck`): a request the table no longer holds drops
-//!   the descriptor, and one the table holds under another key is a fault.
-//! - The forwarding window bounds the commands one worker's output holds in
-//!   all lanes' queues to `limits.ingress.forwarded_commands_per_worker_max`
-//!   (`Record.forwarded_in_queues`). Each forwarded descriptor takes a unit
-//!   before its post; the owner releases it once it applied or dropped the
-//!   descriptor, or hands it on to the `payload_consumed` that answers a ring
-//!   payload, which the reader releases. Every unit is released once, by
-//!   whoever ends the command, a refused post and a lane's teardown included.
-//!   The reader receives the worker's next packet only while a packet's worth
-//!   of units fits (`windowHasRoom`); otherwise it stops reading the control
-//!   socket (`Registration.window_blocked`), and the release that makes room
-//!   raises its `window_reopened` wake. A drain that must read through, the
-//!   last read of a dead worker or the grace backstop, ignores the window,
-//!   and a descriptor that finds it full drops as a refused post does.
+//!   (`RequestTable.forwardCheck`): a request the table no longer holds, or
+//!   whose `request_done` the reader already forwarded, drops the
+//!   descriptor, and one the table holds under another key is a fault. The
+//!   table marks a request's `request_done` forwarded once its post went in
+//!   (`RequestTable.markDoneForwarded`), so the reader forwards at most one
+//!   per request and nothing of the request after it.
+//! - The forwarding window bounds the response descriptors and answers one
+//!   worker's output holds in all lanes' queues to
+//!   `limits.ingress.forwarded_commands_per_worker_max`
+//!   (`Record.forwarded_in_queues`). Each forwarded response descriptor takes
+//!   a unit before its post; the owner releases it once it applied or
+//!   dropped the descriptor, or hands it on to the `payload_consumed` that
+//!   answers a ring payload, which the reader releases. Every unit is
+//!   released once, by whoever ends the command, a refused post and a lane's
+//!   teardown included. A forwarded `request_done` takes no unit: the
+//!   owner's reserve holds one per request in flight (`commands.zig`), so a
+//!   full window never costs a worker that answered its request. The reader
+//!   receives the worker's next packet only while a packet's worth of units
+//!   fits (`windowHasRoom`); otherwise it stops reading the control socket
+//!   (`Registration.window_blocked`), and the release that makes room raises
+//!   its `window_reopened` wake. A drain that must read through, the last
+//!   read of a dead worker or the grace backstop, ignores the window, and a
+//!   response descriptor that finds it full drops as a refused post does.
 //! - A ring payload stays in the worker's ring until its consumer is done
 //!   with it. The reader accounts for every ring payload it decodes
 //!   (`Registration.ring_payloads`), holds the ones it forwards until their
 //!   owner answers `payload_consumed`, and frees ring bytes only over the
 //!   answered prefix, in ring order. An owner answers every ring payload it
 //!   was forwarded, used or not, before it drives the connection or finishes
-//!   the request. Only a completion parked ahead of the payload could finish
-//!   the request sooner, and the reader forwards a request's descriptors
-//!   before its completion, so the answers reach the reader before the
-//!   request's slot goes back to the pool, and a reader whose worker is idle
-//!   holds nothing unless an answer was lost.
+//!   the request. The reader forwards a request's `request_done` after every
+//!   descriptor of the request, and one lane's commands run in the order
+//!   they were posted, so the answers reach the reader before the request's
+//!   slot goes back to the pool, and a reader whose worker is idle holds
+//!   nothing unless an answer was lost.
 //! - Once a forwarded descriptor of a request is lost, the reader drops the
 //!   rest of that response (`Registration.forward_loss`) but still forwards
-//!   the request's completion (`worker_completions.zig`), so no client gets a
-//!   response with a gap. A request whose response head was lost ends with
-//!   502 when the completion arrives (`request_finish.zig`). After a later
-//!   descriptor was lost, the completion parks behind a response that never
-//!   ends, and the grace backstop finishes the request and resets its stream
-//!   (`deadline_driver.zig`).
-//! - A completion parks on its request only behind a response head the lane
-//!   queued, until the response ends. The request's deadline stays armed
-//!   meanwhile, so a response that never ends still ends the request. A
-//!   parked completion was counted when it arrived, so taking it counts
-//!   nothing again.
+//!   the request's `request_done`, so no client gets a response with a gap.
+//!   The `request_done` ends the request: with 502 when its response head
+//!   was the descriptor lost, and otherwise with its stream reset, since the
+//!   response's end will never come (`request_finish.zig`). A `request_done`
+//!   whose post is refused, which only an owner lane that stopped or a queue
+//!   full past its reserve can do, leaves its request to the grace backstop.
 //! - Whether a worker's response head went out is the lane's own HTTP/2
 //!   record (`responseHeadQueued`), never a flag the worker wrote.
 
@@ -76,9 +80,9 @@ const admission = @import("admission.zig");
 const connection_flow = @import("connection_flow.zig");
 const connection_slot = @import("connection_slot.zig");
 const dispatch = @import("dispatch.zig");
-const request_finish = @import("request_finish.zig");
 const request_slot = @import("request_slot.zig");
 const work_queues = @import("work_queues.zig");
+const request_done = @import("request_done.zig");
 const runner = @import("root.zig");
 
 const LaneFault = fault.LaneFault;
@@ -149,21 +153,13 @@ pub const Handled = struct {
     yield: bool = false,
 };
 
-/// Whether a worker completion waits on its request until the stream's
-/// response ends (`h2CompletionDeferDecision`).
-pub const H2CompletionDeferDecision = enum {
-    no,
-    already_pending,
-    should_store,
-};
-
 pub fn Methods(comptime Self: type) type {
     return struct {
         const Admission = admission.Methods(Self);
+        const Done = request_done.Methods(Self);
         const Connection = connection_flow.Methods(Self);
         const Dispatch = dispatch.Methods(Self);
         const Queues = work_queues.Methods(Self);
-        const RequestFinish = request_finish.Methods(Self);
 
         /// The request a descriptor acts on and the connection its stream
         /// lives on.
@@ -268,7 +264,6 @@ pub fn Methods(comptime Self: type) type {
                 .would_block, .fault => return outcome,
             }
             try driveBacklog(self, target.runtime);
-            try finishParkedCompletionIfResponseOver(self, target.active);
             _ = yieldForBacklog(self, target.runtime);
             return .ok;
         }
@@ -327,61 +322,6 @@ pub fn Methods(comptime Self: type) type {
             try self.service.raiseLaneWake(waiter - 1, runner.wake.window_reopened);
         }
 
-        /// Whether a worker completion for `active` waits on the slot until
-        /// the stream's response ends: `.should_store` while the lane has
-        /// queued the worker's response head on an open stream and the
-        /// response has not ended, `.already_pending` when a completion is
-        /// parked already, `.no` otherwise. A completion with no head queued
-        /// ends its request at once.
-        pub fn h2CompletionDeferDecision(
-            self: *Self,
-            active: *RequestSlot,
-        ) H2CompletionDeferDecision {
-            if (active.ingress_channel_id == 0)
-                return .no;
-            if (active.pending_worker_completion != null)
-                return .already_pending;
-            const runtime = Admission.requestConnection(self, active) orelse return .no;
-            // A stream that is gone never ends its response. `.draining_response`
-            // counts as gone: while a slot is live it is reached only by the
-            // local-response detach, which sets `h2_client_reset`, so the
-            // worker's later descriptors drop and nothing ends the response.
-            switch (runtime.h2StreamState(active.ingress_channel_id) orelse .vacant) {
-                .vacant, .draining_response => return .no,
-                .preparing, .active => {},
-            }
-            if (!runtime.responseHeadQueued(active.ingress_channel_id))
-                return .no;
-            if (runtime.h2WorkerResponseEnded(active.ingress_channel_id))
-                return .no;
-            return .should_store;
-        }
-
-        /// Parks `completion` on the slot until the stream's response ends
-        /// or the stream dies. The caller had `.should_store` from
-        /// `h2CompletionDeferDecision`. The request's deadline stays armed,
-        /// so a response that never ends still ends the request then.
-        pub fn storeDeferredWorkerCompletionForH2Descriptors(
-            self: *Self,
-            active: *RequestSlot,
-            completion: completions.WorkerCompletionRecord,
-        ) void {
-            std.debug.assert(h2CompletionDeferDecision(self, active) == .should_store);
-            active.pending_worker_completion = completion;
-        }
-
-        /// Finishes the request with the completion parked on `active` once
-        /// its stream has died, by a reset or a local response, since nothing
-        /// will end the response then. Returns whether one was parked.
-        pub fn finalizeDeferredWorkerCompletionForDeadStream(
-            self: *Self,
-            active: *RequestSlot,
-        ) LaneFault!bool {
-            const completion = takeParkedCompletion(active) orelse return false;
-            try RequestFinish.finishRequest(self, active.request_key.slot, .{ .worker_completion = completion });
-            return true;
-        }
-
         /// Answers the client stream of a request that ends before its
         /// worker finished the response, at its deadline or its worker's
         /// death or fault, with the server response `response_id`, while no
@@ -422,6 +362,13 @@ pub fn Methods(comptime Self: type) type {
                     return faulted(.descriptor_names_no_request);
                 return .{ .outcome = try forwardDescriptor(self, registration, received) };
             }
+            if (request_done.isRequestDone(descriptor)) {
+                const done = switch (request_done.decodeDone(received.payload)) {
+                    .done => |done| done,
+                    .fault => |reason| return faulted(reason),
+                };
+                return .{ .outcome = try Done.completeRequest(self, registration.worker_key, descriptor, done) };
+            }
             const resolution = try resolveAfterBacklog(self, registration.worker_key, descriptor);
             const target = switch (resolution) {
                 .local => |target| target,
@@ -438,7 +385,6 @@ pub fn Methods(comptime Self: type) type {
                 .would_block, .fault => return .{ .outcome = outcome },
             }
             try driveBacklog(self, target.runtime);
-            try finishParkedCompletionIfResponseOver(self, target.active);
             return .{ .yield = yieldForBacklog(self, target.runtime) };
         }
 
@@ -463,25 +409,29 @@ pub fn Methods(comptime Self: type) type {
             }
         }
 
-        /// Sends a descriptor of another lane's request to that lane, under a
-        /// unit of the worker's window. An inline payload moves into the
-        /// command; a ring payload stays in the ring, held until the owner
-        /// answers. A descriptor whose request the worker's table no longer
-        /// holds drops, and one the table holds under another key is a
-        /// fault. A lost post, refused or past a full window, loses the rest
-        /// of that request's response too (`forward_loss`).
+        /// Sends a descriptor of another lane's response to that lane, under
+        /// a unit of the worker's window, or its `request_done`
+        /// (`forwardRequestDone`). An inline payload moves into the command;
+        /// a ring payload stays in the ring, held until the owner answers. A
+        /// descriptor whose request the worker's table no longer holds, or
+        /// whose `request_done` already went, drops, and one the table holds
+        /// under another key is a fault. A lost post, refused or past a full
+        /// window, loses the rest of that request's response too
+        /// (`forward_loss`).
         fn forwardDescriptor(
             self: *Self,
             registration: *completions.Registration,
             received: *Received,
         ) LaneFault!WorkerOutcome {
-            const worker = registration.worker orelse return error.InvalidCompletionRegistration;
+            const worker = registration.worker orelse return error.InvalidWorkerRegistration;
             const descriptor = received.descriptor;
             const request_key: lifecycle.RequestKey = .{
                 .lane_id = descriptor.request_lane_id,
                 .slot = descriptor.request_slot,
                 .generation = descriptor.request_generation,
             };
+            if (request_done.isRequestDone(descriptor))
+                return forwardRequestDone(self, registration, worker, request_key, received);
             if (registration.forward_loss.contains(request_key)) {
                 if (endsResponse(descriptor))
                     registration.forward_loss.remove(request_key);
@@ -541,8 +491,67 @@ pub fn Methods(comptime Self: type) type {
             return .ok;
         }
 
-        /// Counts a forwarded descriptor that was lost and, unless it ended
-        /// its response, drops the rest of that response (`forward_loss`).
+        /// Sends the `request_done` of another lane's request to that lane,
+        /// decoded and outside the forwarding window
+        /// (`lane_commands.ForwardedRequestDone` says why it needs no unit).
+        /// It is the request's last descriptor, so the reader forgets a loss
+        /// it noted for the response, and the owner ends the request with
+        /// the response it lost a part of. One whose request the worker's
+        /// table no longer holds, or whose `request_done` already went,
+        /// drops, and one the table holds under another key is a fault. The
+        /// table marks the request's `request_done` forwarded only once the
+        /// post took it, so a refused post leaves no claim behind. A refusal
+        /// leaves the request to its grace backstop, which faults the worker
+        /// although it answered, so it is logged.
+        fn forwardRequestDone(
+            self: *Self,
+            registration: *completions.Registration,
+            worker: *WorkerRecord,
+            request_key: lifecycle.RequestKey,
+            received: *const Received,
+        ) LaneFault!WorkerOutcome {
+            const descriptor = received.descriptor;
+            registration.forward_loss.remove(request_key);
+            const done = switch (request_done.decodeDone(received.payload)) {
+                .done => |done| done,
+                .fault => |reason| return .{ .fault = reason },
+            };
+            switch (worker.requests.forwardCheck(descriptor.request_id, request_key)) {
+                .live => {},
+                .absent => {
+                    self.lane.counters.forwarded_descriptor_drops += 1;
+                    return .ok;
+                },
+                .mismatch => return .{ .fault = .descriptor_names_no_request },
+            }
+            const posted = try self.postToLane(descriptor.request_lane_id, .{ .forwarded_request_done = .{
+                .request_key = request_key,
+                .worker_key = registration.worker_key,
+                .worker = worker,
+                .descriptor = descriptor,
+                .done = done,
+            } });
+            if (posted) {
+                worker.requests.markDoneForwarded(descriptor.request_id, request_key);
+                self.lane.counters.worker_descriptors_forwarded += 1;
+                return .ok;
+            }
+            self.lane.counters.forwarded_descriptor_drops += 1;
+            std.log.warn(
+                "ingress lane {d} could not forward the request_done of worker_id={d} for lane {d}'s request in slot {d}; that request waits for its grace backstop",
+                .{
+                    self.listener_index,
+                    registration.worker_key.worker_id,
+                    request_key.lane_id,
+                    request_key.slot,
+                },
+            );
+            return .ok;
+        }
+
+        /// Counts a forwarded response descriptor that was lost and, unless
+        /// it ended its response, drops the rest of that response
+        /// (`forward_loss`), whose request's `request_done` then ends it.
         fn noteForwardLoss(
             self: *Self,
             registration: *completions.Registration,
@@ -610,15 +619,15 @@ pub fn Methods(comptime Self: type) type {
             }
             if (endsResponse(received.descriptor))
                 target.active.response_credit_unsent = false;
-            const body_bytes = http2_writing.queueWorkerResponseDescriptor(
+            const queued = http2_writing.queueWorkerResponseDescriptor(
                 Self,
                 self,
                 target.runtime,
                 received,
             ) catch |err| return actOnQueueError(self, target, received.descriptor, err);
-            self.lane.counters.ingress_response_body_bytes += @intCast(body_bytes);
-            if (received.descriptor.op == @intFromEnum(Op.response_head))
-                stampFirstByte(target.active);
+            self.lane.counters.ingress_response_body_bytes += @intCast(queued.body_bytes);
+            if (queued.head_status) |status|
+                noteHeadQueued(target.active, status);
             return .ok;
         }
 
@@ -647,10 +656,8 @@ pub fn Methods(comptime Self: type) type {
         }
 
         /// Resets a client stream that cannot take its worker's response and
-        /// stops the request in the worker, which stays alive. A completion
-        /// parked on the request means the worker is done; the caller's
-        /// `finishParkedCompletionIfResponseOver` finishes the request with
-        /// it, since the response will never end.
+        /// stops the request in the worker, which stays alive; the worker's
+        /// `request_done` then ends the request.
         fn failStream(
             self: *Self,
             target: Target,
@@ -662,40 +669,13 @@ pub fn Methods(comptime Self: type) type {
             const active = target.active;
             if (active.isLive() and active.request_key.eql(request_key)) {
                 active.h2_client_reset = true;
-                if (active.pending_worker_completion == null) {
-                    try Dispatch.cancelRequestToWorker(
-                        self,
-                        active.request_key.slot,
-                        @intFromEnum(http_common.http2.ErrorCode.cancel),
-                    );
-                }
+                try Dispatch.cancelRequestToWorker(
+                    self,
+                    active.request_key.slot,
+                    @intFromEnum(http_common.http2.ErrorCode.cancel),
+                );
             }
             try resetClientStream(self, runtime, descriptor.stream_id, code);
-        }
-
-        /// Finishes the request with its parked completion once the stream's
-        /// response has ended, or at once when the stream died meanwhile;
-        /// while the response goes on, the completion stays parked.
-        fn finishParkedCompletionIfResponseOver(self: *Self, active: *RequestSlot) LaneFault!void {
-            if (!active.isLive() or active.pending_worker_completion == null)
-                return;
-            // A closing connection resets its streams, and the reset of a
-            // stream finishes the completion parked on its request
-            // (`request_body.zig`).
-            const runtime = Admission.requestConnection(self, active) orelse return;
-            switch (runtime.h2StreamState(active.ingress_channel_id) orelse .vacant) {
-                // A worker's `response_reset` or a local-response detach
-                // leaves the stream unable to end its response.
-                .vacant, .draining_response => {
-                    _ = try finalizeDeferredWorkerCompletionForDeadStream(self, active);
-                    return;
-                },
-                .preparing, .active => {},
-            }
-            if (!runtime.h2WorkerResponseEnded(active.ingress_channel_id))
-                return;
-            const completion = takeParkedCompletion(active) orelse return;
-            try RequestFinish.finishRequest(self, active.request_key.slot, .{ .worker_completion = completion });
         }
 
         /// Ends the window unit of a forwarded descriptor this lane is done
@@ -813,20 +793,19 @@ fn heldRingPayload(active: *RequestSlot, ring: lane_commands.RingRef) ?[]u8 {
     };
 }
 
-fn takeParkedCompletion(active: *RequestSlot) ?completions.WorkerCompletionRecord {
-    const completion = active.pending_worker_completion orelse return null;
-    active.pending_worker_completion = null;
-    return completion;
-}
-
-/// Stamps the request's time to first byte when the worker's response head
-/// is queued; an earlier stamp stays.
-fn stampFirstByte(active: *RequestSlot) void {
+/// Records on the request's access facts that the worker's response head
+/// with `status` went toward the client: the status the client receives,
+/// which its access record carries whatever the worker reports later
+/// (`request_finish.zig`), and the time to first byte, an earlier stamp
+/// kept.
+fn noteHeadQueued(active: *RequestSlot, status: u16) void {
+    active.access.response_status = status;
     if (active.access.first_byte_mono_ns == 0)
         active.access.first_byte_mono_ns = process.monotonicNowNsOrZero();
 }
 
-/// Whether no descriptor of the response follows `descriptor`.
+/// Whether no descriptor of the response follows `descriptor`: the
+/// response's end or reset, or a descriptor that carries END_STREAM.
 fn endsResponse(descriptor: Descriptor) bool {
     if (descriptor.op == @intFromEnum(Op.response_end) or descriptor.op == @intFromEnum(Op.response_reset))
         return true;

@@ -86,16 +86,19 @@ pub const ring_submission_entries: u16 = 256;
 /// completions on its overflow list.
 pub const ring_completion_entries: u32 = 4096;
 
-/// Ordinary places of a lane's command queue. Worker output never takes one;
-/// a death, a reader grant and a forwarded completion take one only once the
-/// reserve (`server/ingress/lane.zig`, `obligationReserve`) is full.
+/// Ordinary places of a lane's command queue. Forwarded response output never
+/// takes one; a death, a reader grant and a forwarded `request_done` take one
+/// only once the reserve (`server/ingress/lane.zig`, `obligationReserve`) is
+/// full.
 pub const commands_per_lane_max: u32 = 1024;
 
-/// Commands of one worker's output that may wait in other lanes' queues at
-/// once: the descriptors its reader forwards and the answers to their ring
-/// payloads. The reader receives a packet of the worker only while a full
-/// batch of descriptors still fits, so a worker that writes faster than the
-/// lanes it answers can apply it waits in its own socket, and each lane
-/// reserves this many places per worker table entry, so worker output never
-/// takes an ordinary place of a queue.
+/// Commands of one worker's response output that may wait in other lanes'
+/// queues at once: the response descriptors its reader forwards and the
+/// answers to their ring payloads; a forwarded `request_done` takes a
+/// reserved place of its own instead (`server/ingress/lane.zig`,
+/// `obligationReserve`). The reader receives a packet of the worker only
+/// while a full batch of descriptors still fits, so a worker that writes
+/// faster than the lanes it answers can apply it waits in its own socket, and
+/// each lane reserves this many places per worker table entry, so worker
+/// output never takes an ordinary place of a queue.
 pub const forwarded_commands_per_worker_max: u32 = 64;

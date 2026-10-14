@@ -11,13 +11,13 @@
 //!   workers. Nothing else changes.
 //! - A worker fault is anything a worker's bytes or memory cause: a packet
 //!   that fails to decode, a descriptor that names no active request, a
-//!   corrupt or overrun ring, a datagram carrying descriptors it may not
-//!   carry, a hang-up, an exit. The lane marks the worker dead with a
+//!   corrupt payload ring, a datagram carrying descriptors it may not carry,
+//!   a hang-up, an exit. The lane marks the worker dead with a
 //!   `WorkerFaultReason`, answers each of its in-flight requests with 502, or
 //!   RST_STREAM when the lane's own record says the response head went out,
-//!   writes the reason into the access record and the usage floor, and
-//!   queues the retirement. A send to a worker that would block is
-//!   backpressure under the request's deadline, never a fault.
+//!   writes the reason into each of their access records, and queues the
+//!   retirement. A send to a worker that would block is backpressure under
+//!   the request's deadline, never a fault.
 //! - A lane fault is a broken invariant in the lane's own state: its ring,
 //!   its slabs, its queues, its descriptors. It stops the lane, and a stopped
 //!   lane stops the server, because a lane owns one share of every connection
@@ -103,8 +103,8 @@ pub const LaneFault = error{
     DispatchScratchTooSmall,
     // Records the lane keeps that disagree with each other: a request, stream
     // or connection whose companion record is gone or in the wrong state.
-    InvalidCompletionRegistration,
-    WorkerCompletionRegistrationNotFound,
+    InvalidWorkerRegistration,
+    WorkerRegistrationNotFound,
     StaleRequestGeneration,
     RequestSlotVacant,
     RequestSlotOutOfRange,
@@ -115,8 +115,9 @@ pub const LaneFault = error{
     // record for that lane (`Pool.release` in `server/supervisor/pool.zig`).
     SlotNotHeld,
     // A worker's request table with no free entry: its entries are bounded
-    // by the worker's slots, so one was never settled
-    // (`RequestTable.record` in `server/supervisor/request_table.zig`).
+    // by the worker's slots, so a request's finish never ended or removed
+    // its entry (`request_finish.zig:finishDispatched`, `RequestTable.record`
+    // in `server/supervisor/request_table.zig`).
     RequestTableFull,
     // A message to a worker that the lane sized or built wrong
     // (`classifyWorkerError` names the send errors behind it).
@@ -627,8 +628,7 @@ fn close(reason: ConnectionCloseReason, goaway: ?h2.ErrorCode) ConnectionOutcome
 }
 
 /// Why the lane declared a worker dead. The reason goes into the access
-/// record of each request the fault ends and into the usage floor written
-/// for it.
+/// record of each request the fault ends.
 pub const WorkerFaultReason = enum {
     /// A control packet shorter than its message kind.
     packet_short,
@@ -647,14 +647,13 @@ pub const WorkerFaultReason = enum {
     /// closes.
     zero_length_datagram_with_descriptors,
     /// An ingress-channel packet, single or batch, that fails to decode
-    /// (`common/ipc/ingress_channel.zig`).
+    /// (`common/ipc/ingress_channel.zig`), a `request_done` among them.
     ingress_channel_undecodable,
-    /// An fs-fault request that fails to decode (`common/ipc/fs_fault.zig`).
-    fs_fault_request_undecodable,
-    /// A descriptor naming a request the worker was never sent: stream 0, or
-    /// a request identity the stream it names does not hold. A descriptor
-    /// for a request the lane has already finished is a race and drops
-    /// without a fault.
+    /// A descriptor naming a request the worker was never sent: stream 0, a
+    /// lane the server does not have, a request identity the stream it names
+    /// does not hold, or a request id the worker's request table holds under
+    /// another key. A descriptor for a request the lane has already finished
+    /// is a race and drops without a fault.
     descriptor_names_no_request,
     /// A response head too short for its header, over the lane's head caps,
     /// or with a status or header the client may not receive.
@@ -662,17 +661,6 @@ pub const WorkerFaultReason = enum {
     /// A response descriptor that its stream's response state does not
     /// admit, or whose payload does not fit its operation.
     response_descriptor_invalid,
-    /// The completion ring's header says fatal, which the worker sets when it
-    /// overruns the ring.
-    completion_ring_fatal,
-    /// The completion ring claims more records than it has slots.
-    completion_ring_corrupt,
-    /// A completion record out of sequence.
-    completion_sequence_mismatch,
-    /// A completion record that fails validation, names a lane the server
-    /// does not have, or names a request the worker's request table holds
-    /// under another key.
-    completion_record_invalid,
     /// A shared payload ring whose cursors contradict each other, or a
     /// descriptor claiming ring bytes the ring does not hold.
     payload_ring_invalid,
@@ -682,7 +670,7 @@ pub const WorkerFaultReason = enum {
     /// The worker's socket or one of its eventfds failed with an errno no
     /// other reason names, and the lane can no longer talk to the worker.
     channel_failed,
-    /// The worker's control or fault socket hung up.
+    /// The worker's control socket hung up.
     peer_closed,
     /// The worker's process exited, as its pidfd reported.
     exited,
@@ -694,10 +682,6 @@ pub const WorkerFaultReason = enum {
     /// the worker's page (`analytics_drain.zig`): the worker's sentinel
     /// could not stop it.
     owner_overran,
-    /// The worker's usage record ring has its head where no append puts it:
-    /// behind the server's own cursor or more than a ring past it
-    /// (`RecordCursor.peek` in `common/worker_state/page/snapshots.zig`).
-    usage_record_protocol,
     /// The worker's console log ring contradicted itself
     /// (`server/analytics/logs.zig`).
     log_ring_corrupt,
@@ -705,12 +689,16 @@ pub const WorkerFaultReason = enum {
     /// it a session, so the launcher retired it (`Launcher.gatewayLost` in
     /// `server/supervisor/launcher.zig`).
     egress_session_failed,
+    /// The worker's egress gateway removed its session for what the worker
+    /// sent or left unread, so the launcher retired it
+    /// (`Launcher.egressSessionLost`).
+    egress_session_removed,
     /// A `worker_retiring` packet of another size than the notice, or naming
     /// a reason `ipc.WorkerRetiringReason` does not (`ipc.worker_retiring`).
     retiring_notice_invalid,
 
-    /// The reason as `access.jsonl` and `usage.jsonl` spell it. Consumers
-    /// read these strings, so a label never changes once it ships.
+    /// The reason as `access.jsonl` spells it. Consumers read these strings,
+    /// so a label never changes once it ships.
     pub fn label(reason: WorkerFaultReason) []const u8 {
         return switch (reason) {
             .packet_short => "packet_short",
@@ -720,14 +708,9 @@ pub const WorkerFaultReason = enum {
             .too_many_descriptors => "too_many_descriptors",
             .zero_length_datagram_with_descriptors => "zero_length_datagram_with_descriptors",
             .ingress_channel_undecodable => "ingress_channel_undecodable",
-            .fs_fault_request_undecodable => "fs_fault_request_undecodable",
             .descriptor_names_no_request => "descriptor_names_no_request",
             .response_head_invalid => "response_head_invalid",
             .response_descriptor_invalid => "response_descriptor_invalid",
-            .completion_ring_fatal => "completion_ring_fatal",
-            .completion_ring_corrupt => "completion_ring_corrupt",
-            .completion_sequence_mismatch => "completion_sequence_mismatch",
-            .completion_record_invalid => "completion_record_invalid",
             .payload_ring_invalid => "payload_ring_invalid",
             .allocation_failed => "allocation_failed",
             .channel_failed => "channel_failed",
@@ -735,9 +718,9 @@ pub const WorkerFaultReason = enum {
             .exited => "exited",
             .deadline_grace_expired => "deadline_grace_expired",
             .owner_overran => "owner_overran",
-            .usage_record_protocol => "usage_record_protocol",
             .log_ring_corrupt => "log_ring_corrupt",
             .egress_session_failed => "egress_session_failed",
+            .egress_session_removed => "egress_session_removed",
             .retiring_notice_invalid => "retiring_notice_invalid",
         };
     }
@@ -764,14 +747,12 @@ pub const WorkerError = union(enum) {
     receive: (LaneFault || PacketReceiveError),
     ingress_decode: (LaneFault || IngressDecodeError),
     retiring_decode: (LaneFault || RetiringDecodeError),
-    fs_fault_decode: (LaneFault || FsFaultDecodeError),
     wake: (LaneFault || WakeError),
-    completion: (LaneFault || CompletionError),
     send: (LaneFault || WorkerSendError),
 };
 
-/// `ipc.packet.recvPacketWithFdsScratch` on a worker's control or fault
-/// socket. `EmptyPacketWithFds` is a zero-length datagram that carried
+/// `ipc.packet.recvPacketWithFdsScratch` on a worker's control socket.
+/// `EmptyPacketWithFds` is a zero-length datagram that carried
 /// descriptors, which the receive closes; a zero-length datagram without any
 /// reads as `PeerClosed`, as an end of stream does.
 pub const PacketReceiveError = error{
@@ -811,38 +792,17 @@ pub const RetiringDecodeError = error{
     InvalidWorkerRetiringReason,
 };
 
-/// `ipc.fs_fault.decodeRequest`.
-pub const FsFaultDecodeError = error{
-    InvalidMessageKind,
-    ShortRead,
-    InvalidPacket,
-    InvalidFsFaultRequest,
-    OutOfMemory,
-};
-
-/// A read of the eventfd a worker writes to wake its reader lane, its
-/// completion eventfd (`page.drainCompletionEventfd`, whose short read is
-/// `ShortRead`), which also carries the credit of its server-to-worker
-/// payload ring (`common/ipc/ingress_channel/payload_ring.zig`).
+/// A read of the eventfd a worker writes when it frees room in its
+/// server-to-worker payload ring, its completion eventfd
+/// (`runner/event_sources.zig:drainEventFd`;
+/// `common/ipc/ingress_channel/payload_ring.zig`).
 pub const WakeError = std.posix.ReadError || error{
-    ShortRead,
     EventfdShortRead,
-};
-
-/// The drain of a worker's completion ring
-/// (`WorkerWriterView.drainWorkerCompletions`).
-pub const CompletionError = error{
-    WorkerCompletionRingFatal,
-    WorkerCompletionRingCorrupt,
-    WorkerCompletionSequenceMismatch,
-    InvalidWorkerCompletionRecord,
-    InvalidWorkerCompletionStatus,
 };
 
 /// Every send toward a worker: request descriptors, bodies and resets
 /// through the send functions of `common/ipc/ingress_channel/send.zig`, the
-/// payload ring (`SharedPayloadView.write`), `ipc.packet.sendWithFds`, and
-/// fault answers (`ipc.fs_fault.sendResponse`).
+/// payload ring (`SharedPayloadView.write`) and `ipc.packet.sendWithFds`.
 pub const WorkerSendError = error{
     WouldBlock,
     IngressSharedPayloadRingFull,
@@ -860,8 +820,6 @@ pub const WorkerSendError = error{
     TooManyFds,
     IngressSharedPayloadUnavailable,
     IngressSharedPayloadTooLarge,
-    MissingFsFaultFd,
-    UnexpectedFsFaultFd,
 };
 
 /// Sorts an error a worker's callee returned into the worker's outcome, or
@@ -871,9 +829,7 @@ pub fn classifyWorkerError(err: WorkerError) LaneFault!WorkerOutcome {
         .receive => |receive_error| classifyReceive(receive_error),
         .ingress_decode => |decode_error| classifyIngressDecode(decode_error),
         .retiring_decode => |decode_error| classifyRetiringDecode(decode_error),
-        .fs_fault_decode => |decode_error| classifyFsFaultDecode(decode_error),
         .wake => |wake_error| classifyWake(wake_error),
-        .completion => |completion_error| classifyCompletion(completion_error),
         .send => |send_error| classifySend(send_error),
     };
 }
@@ -929,18 +885,6 @@ fn classifyRetiringDecode(err: (LaneFault || RetiringDecodeError)) LaneFault!Wor
     };
 }
 
-fn classifyFsFaultDecode(err: (LaneFault || FsFaultDecodeError)) LaneFault!WorkerOutcome {
-    return switch (err) {
-        error.InvalidMessageKind => fault(.unknown_kind),
-        error.ShortRead,
-        error.InvalidPacket,
-        error.InvalidFsFaultRequest,
-        => fault(.fs_fault_request_undecodable),
-        error.OutOfMemory => fault(.allocation_failed),
-        inline else => |lane_fault| @errorCast(lane_fault),
-    };
-}
-
 fn classifyWake(err: (LaneFault || WakeError)) LaneFault!WorkerOutcome {
     return switch (err) {
         // No wake is pending.
@@ -949,7 +893,6 @@ fn classifyWake(err: (LaneFault || WakeError)) LaneFault!WorkerOutcome {
         // A read of an eventfd fails like this only when the descriptor is no
         // eventfd. The worker shares it, so the failure retires the worker
         // and leaves the lane alone.
-        error.ShortRead,
         error.EventfdShortRead,
         error.InputOutput,
         error.AccessDenied,
@@ -965,18 +908,6 @@ fn classifyWake(err: (LaneFault || WakeError)) LaneFault!WorkerOutcome {
         error.SocketNotConnected,
         error.Canceled,
         => fault(.channel_failed),
-        inline else => |lane_fault| @errorCast(lane_fault),
-    };
-}
-
-fn classifyCompletion(err: (LaneFault || CompletionError)) LaneFault!WorkerOutcome {
-    return switch (err) {
-        error.WorkerCompletionRingFatal => fault(.completion_ring_fatal),
-        error.WorkerCompletionRingCorrupt => fault(.completion_ring_corrupt),
-        error.WorkerCompletionSequenceMismatch => fault(.completion_sequence_mismatch),
-        error.InvalidWorkerCompletionRecord,
-        error.InvalidWorkerCompletionStatus,
-        => fault(.completion_record_invalid),
         inline else => |lane_fault| @errorCast(lane_fault),
     };
 }
@@ -1001,17 +932,14 @@ fn classifySend(err: (LaneFault || WorkerSendError)) LaneFault!WorkerOutcome {
         => |lane_fault| lane_fault,
         // The lane built a message its own send refuses: a payload over the
         // packet, the socket or the ring, a ring the descriptor may not use,
-        // more descriptors than a packet holds, or a fault answer whose
-        // descriptor does not match its status. The lane's limits rule each
-        // one out, so the caller logs the name and stops the lane.
+        // or more descriptors than a packet holds. The lane's limits rule
+        // each one out, so the caller logs the name and stops the lane.
         error.MessageTooBig,
         error.MessageTooLarge,
         error.InvalidPacket,
         error.TooManyFds,
         error.IngressSharedPayloadUnavailable,
         error.IngressSharedPayloadTooLarge,
-        error.MissingFsFaultFd,
-        error.UnexpectedFsFaultFd,
         => error.WorkerSendMisuse,
         inline else => |lane_fault| @errorCast(lane_fault),
     };
@@ -1207,8 +1135,7 @@ pub const loop_handlers = [_]LoopHandler{
     .{ .name = "handleCommands", .Argument = void },
     .{ .name = "handleWorkerControlReadable", .Argument = u32 },
     .{ .name = "handleWorkerControlWritable", .Argument = u32 },
-    .{ .name = "handleWorkerCompletions", .Argument = u32 },
-    .{ .name = "handleWorkerFsFault", .Argument = u32 },
+    .{ .name = "handleWorkerRingCredit", .Argument = u32 },
     .{ .name = "handleWorkerPidfd", .Argument = u32 },
     .{ .name = "handleDeadlineTimer", .Argument = void },
     .{ .name = "handleStop", .Argument = void },
@@ -1216,7 +1143,7 @@ pub const loop_handlers = [_]LoopHandler{
 // A worker fault below means: mark the worker dead with the reason, answer
 // each of its requests in flight on the lane with 502, or RST_STREAM when the
 // lane's own record says the response head went out, write the reason into
-// each access record and usage floor, and queue the worker's retirement.
+// each access record, and queue the worker's retirement.
 //
 // handleConnectionReadable(lane, slot: u32) LaneFault!void
 //   Drives the handshake or HTTP/2 of the connection in `slot` after its
@@ -1245,24 +1172,19 @@ pub const loop_handlers = [_]LoopHandler{
 //   nothing else.
 // handleWorkerControlReadable(lane, registration: u32) LaneFault!void
 //   Drains a bounded batch from the worker's control socket, queues each
-//   response of this lane's requests onto its stream and forwards the rest
-//   to their lanes. `WorkerOutcome.would_block` ends the drain and re-arms
-//   the read poll; `.fault` is a worker fault. A
-//   `ResponseQueueOutcome.connection` resets that stream or closes that
-//   connection and leaves the worker alone.
+//   response of this lane's requests onto its stream, finishes each request
+//   of this lane a `request_done` names, and forwards the rest to their
+//   lanes. `WorkerOutcome.would_block` ends the drain and re-arms the read
+//   poll; `.fault` is a worker fault. A `ResponseQueueOutcome.connection`
+//   resets that stream or closes that connection and leaves the worker
+//   alone.
 // handleWorkerControlWritable(lane, registration: u32) LaneFault!void
 //   Sends, in order, the bytes parked on the worker's full control socket.
 //   `.would_block` parks the rest again; `.fault` is a worker fault.
-// handleWorkerCompletions(lane, registration: u32) LaneFault!void
-//   Wakes the lanes whose request bodies wait on the worker's full payload
-//   ring, then drains the worker's control socket, then its completion
-//   eventfd and ring, finishes each request of this lane a completion names,
-//   or parks the completion behind its response, and forwards the rest to
-//   their lanes. `.fault` is a worker fault.
-// handleWorkerFsFault(lane, registration: u32) LaneFault!void
-//   Answers each fault request on the worker's fault socket. `.fault` is a
-//   worker fault; an answer that would block is dropped, and the worker's
-//   read then ends at its request's deadline.
+// handleWorkerRingCredit(lane, registration: u32) LaneFault!void
+//   Drains the worker's completion eventfd and wakes the lanes whose request
+//   bodies wait on the worker's full payload ring. `.fault` is a worker
+//   fault.
 // handleWorkerPidfd(lane, registration: u32) LaneFault!void
 //   The pidfd of a worker this lane reads reported its exit: a worker fault
 //   with `.exited`.
@@ -1274,11 +1196,10 @@ pub const loop_handlers = [_]LoopHandler{
 //   written, or as `.stall_timeout` at once past its stall deadline. A
 //   request still waiting for a worker slot at its deadline leaves its
 //   pool's waiters with 503. A dispatched request past its deadline plus
-//   `hard_timeout_grace_ns` first lets its worker's output in; a completion
-//   parked behind its response then ends it, with RST_STREAM for the
-//   response, and otherwise its worker takes a fault with
-//   `.deadline_grace_expired`, which answers it 504, or RST_STREAM when its
-//   head went out, and its other requests 502.
+//   `hard_timeout_grace_ns` first lets its worker's output in; a
+//   `request_done` there ends it, and otherwise its worker takes a fault
+//   with `.deadline_grace_expired`, which answers it 504, or RST_STREAM when
+//   its head went out, and its other requests 502.
 // handleStop(lane) LaneFault!void
 //   Runs once the server is stopping: queues GOAWAY with no new streams on
 //   every HTTP/2 connection, best effort, serves until no request of the lane
@@ -1323,7 +1244,7 @@ fn assertErrorSubset(comptime Subset: type, comptime Superset: type) void {
 comptime {
     // A ring error left after its retries is returned as it is.
     assertErrorSubset(RingError, LaneFault);
-    // A worker fault's label travels in the access and usage records, which
-    // are sized for labels up to this bound.
+    // A worker fault's label travels in the access record, which is sized
+    // for labels up to this bound.
     std.debug.assert(WorkerFaultReason.label_bytes_max <= runtime_logs.WORKER_FAULT_BYTES_MAX);
 }

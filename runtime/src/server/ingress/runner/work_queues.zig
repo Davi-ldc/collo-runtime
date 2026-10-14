@@ -30,7 +30,7 @@ pub fn Methods(comptime Self: type) type {
         /// `registration_index` for the loop's next pass.
         pub fn enqueueDeath(self: *Self, registration_index: u32) LaneFault!void {
             if (self.registrations.get(registration_index) == null)
-                return error.InvalidCompletionRegistration;
+                return error.InvalidWorkerRegistration;
             _ = self.deferred_deaths.push(&self.registrations, registration_index);
         }
 

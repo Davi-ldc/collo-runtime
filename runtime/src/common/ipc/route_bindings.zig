@@ -1,6 +1,7 @@
 //! The bindings of one route: its text bindings as name/value pairs in
-//! configuration order, the section a route holds in its definition's route
-//! table (`route_table.zig`). The worker builds the route's `env` from it
+//! configuration order, the section a route holds in the routes section of
+//! its definition's artifact (`route_table.zig`). The worker builds the
+//! route's `env` from it
 //! (`worker/modules/route_env.zig`). Both processes compile this file, so the
 //! layout and the rules below are the whole contract. Bindings hold secrets
 //! and never reach `process.env`, which a worker installs empty.

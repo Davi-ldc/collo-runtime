@@ -1,17 +1,18 @@
-//! The limits the egress gateway enforces on every fetch, the identity of its fetches in pool
-//! and session keys, and the worker pressure the body drain consults.
+//! The limits the egress gateway enforces on every fetch, the check of a fetch start against them,
+//! and the identity of a fetch's pooled connections.
 //!
-//! Nothing configures the limits: every gateway runs `production`, and the server stamps the
-//! fetch budgets of `production` into the tokens it mints. A `Policy` with other values exists
-//! only in tests that drive an engine directly. The defaults cite the shared budgets in
-//! `common/limits` and `common/ipc/fetch_limits.zig`, and `runtime/tests/contracts/limits.zig`
-//! asserts that they keep doing so.
+//! Nothing configures the limits: every gateway runs `production`. A `Policy` with other values
+//! exists only in tests, which inject lower caps the way they inject clocks. The defaults cite the
+//! shared budgets in `common/limits` and `common/ipc/fetch_limits.zig`, the comptime block below
+//! holds `production` inside what the fetch IPC can carry, and `runtime/tests/contracts/limits.zig`
+//! asserts that the defaults keep citing the budgets.
 //!
-//! The network policies are the server's policy image (`collo_network`'s `table.zig`), which
-//! each gateway's hello hands over (`control.zig`) and the gateway decodes once; a token names
-//! its route's policy by id, and the table never changes for the life of a gateway.
-//! `networkPolicyIsolationId` names one policy of one image under one set of limits in pool
-//! keys.
+//! The network policies are the server's policy image (`collo_network`'s `table.zig`), which each
+//! gateway's hello hands over (`control.zig`) and the gateway decodes once; a token names its
+//! route's policy by id, and the table never changes for the life of a gateway. A fetch's pooled
+//! connections, TLS sessions and shard are keyed by its security cell and that id
+//! (`PoolIsolation`), so one definition's connections never serve another, and one policy's never
+//! serve another policy's fetches.
 
 const std = @import("std");
 const ipc = @import("collo_ipc");
@@ -42,132 +43,85 @@ pub const Policy = struct {
     enable_http2: bool = true,
     max_redirects: usize = 20,
     max_redirect_drain_bytes: usize = 64 * 1024,
-    max_active_fetches_per_worker_session: usize = 64,
+    /// Fetches one worker session runs at once, from admission to the terminal packet the worker
+    /// reads (`runtime/fetch_flow.zig`). The worker refuses a fetch past
+    /// `limits.worker.fetches_per_worker_max` itself, counting the same lifetime, so an honest
+    /// worker never meets this cap.
+    max_active_fetches_per_worker_session: usize = limits.worker.fetches_per_worker_max,
+    /// Fetches the sessions of one security cell run at once.
     max_active_fetches_per_security_cell: usize = 1024,
-    /// The budget the server stamps into each request token.
-    max_fetches_per_request: usize = 16,
-    /// The budget the server stamps into each boot token, for the fetches a worker session makes
-    /// while its routes' modules evaluate. No byte budget exists apart from it: this count times
-    /// the response caps bounds the bytes.
-    max_fetches_per_boot: usize = 16,
     max_body_chunk_bytes: usize = limits.http_body.EGRESS_BODY_CHUNK_BYTES,
 };
 
 comptime {
-    // A token carries its budget as a u32 (`common/ipc/egress_token.zig`).
-    std.debug.assert(production.max_fetches_per_request <= std.math.maxInt(u32));
-    std.debug.assert(production.max_fetches_per_boot <= std.math.maxInt(u32));
+    // What the fetch IPC can carry bounds every limit a worker's packets meet, and a cap of zero
+    // would refuse every fetch.
+    std.debug.assert(production.max_response_body_bytes != 0);
+    std.debug.assert(production.max_encoded_response_bytes != 0);
+    std.debug.assert(production.max_request_body_bytes <= ipc.fetch_limits.request_body_pooled_bytes_max);
+    std.debug.assert(production.max_request_headers <= ipc.max_request_header_count);
+    std.debug.assert(production.max_request_header_bytes <= ipc.fetch_limits.request_headers_bytes_max);
+    std.debug.assert(production.max_response_headers <= ipc.max_request_header_count);
+    std.debug.assert(production.max_response_header_bytes <= maxResponseHeaderBytesForIpc());
+    std.debug.assert(production.max_active_fetches_per_worker_session != 0);
+    std.debug.assert(production.max_active_fetches_per_security_cell != 0);
+    std.debug.assert(production.max_body_chunk_bytes != 0);
+    std.debug.assert(production.max_body_chunk_bytes <= ipc.egress_shared.body_pool_capacity);
+    // An honest worker counts its fetches over the lifetime the gateway counts them and refuses
+    // one past its own cap, so it never meets the gateway's.
+    std.debug.assert(limits.worker.fetches_per_worker_max <= production.max_active_fetches_per_worker_session);
+    // A security cell is one worker definition, whose pool holds at most `pool_workers_max`
+    // workers, so honest workers never meet the cell's cap either.
+    std.debug.assert(@as(usize, limits.pool.pool_workers_max) * limits.worker.fetches_per_worker_max <=
+        production.max_active_fetches_per_security_cell);
+    // A session's and a cell's record counts are `u32` (`fetch_table.List.len`, `Table.cells`).
+    std.debug.assert(production.max_active_fetches_per_worker_session <= std.math.maxInt(u32));
+    std.debug.assert(production.max_active_fetches_per_security_cell <= std.math.maxInt(u32));
 }
 
-/// The identity of policy `id` of the image whose digest is `table_digest` in the keys of pooled
-/// connections, TLS sessions and shard placement: fetches under two policies, under one policy
-/// of two images, or under one policy with other limits never share a pooled connection.
-/// `limits_id` is `policyIsolationId` of the gateway's limits. Pools never outlive their gateway,
-/// which decodes one image, so the digest only guards against ids reused across tables. The
-/// gateway computes one per policy when it takes its hello.
-pub fn networkPolicyIsolationId(
-    limits_id: PoolIsolationId,
-    table_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8,
-    id: network.PolicyId,
-) PoolIsolationId {
-    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hasher.update("collo-egress-network-policy-v2");
-    hasher.update(&limits_id);
-    hasher.update(&table_digest);
-    hasher.update(std.mem.asBytes(&id));
-    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    hasher.final(&digest);
-    var isolation_id: PoolIsolationId = undefined;
-    @memcpy(isolation_id[0..], digest[0..isolation_id.len]);
-    return isolation_id;
-}
-
-/// What the gateway's probe reports about one worker session, which the body drain obeys
-/// (`body_pump.drainBody`).
-pub const WorkerPressure = struct {
-    /// While set, no body pull is armed and no chunk is drained for this worker.
-    pause_pulls: bool = false,
-    /// Largest body chunk to publish to this worker, or 0 for no limit below the policy's
-    /// `max_body_chunk_bytes`.
-    max_body_chunk_bytes: usize = 0,
-    /// Free bytes in the worker's body pool. A chunk the body drain takes leaves the engine's
-    /// body queue for good, so the drain checks this before it takes one. The default reads as
-    /// unconstrained: the gateway's probe always sets the field, and an engine without a probe,
-    /// which only tests build, must not stall on a pool it cannot see.
-    pool_free_bytes: usize = std.math.maxInt(usize),
-    /// Free bytes in the worker's completion ring. A fragmented pool can split one body chunk
-    /// into one ring descriptor per pool block, so the drain checks the ring against that worst
-    /// case before it takes a chunk; a publish that found the ring full after the drain would
-    /// lose the drained bytes. Defaults like `pool_free_bytes`.
-    completion_ring_free_bytes: usize = std.math.maxInt(usize),
-};
-
+/// A fetch's pool key: its security cell and the pool id of the network policy its token named.
 pub const PoolIsolation = struct {
     security_cell_id: SecurityCellId = transport.zero_pool_isolation_id,
     policy_id: PoolIsolationId = transport.zero_pool_isolation_id,
 };
 
-pub fn validate(policy: Policy) !void {
-    if (policy.max_response_body_bytes == 0 or
-        policy.max_encoded_response_bytes == 0 or
-        policy.max_request_body_bytes > ipc.fetch_limits.request_body_pooled_bytes_max or
-        policy.max_request_headers > ipc.max_request_header_count or
-        policy.max_request_header_bytes > ipc.fetch_limits.request_headers_bytes_max or
-        policy.max_response_headers > ipc.max_request_header_count or
-        policy.max_response_header_bytes > maxResponseHeaderBytesForIpc() or
-        policy.max_active_fetches_per_worker_session == 0 or
-        policy.max_active_fetches_per_security_cell == 0 or
-        policy.max_fetches_per_request == 0 or
-        policy.max_fetches_per_boot == 0 or
-        policy.max_body_chunk_bytes == 0 or
-        policy.max_body_chunk_bytes > ipc.egress_shared.body_pool_capacity)
-    {
-        return error.InvalidEgressGatewayResponseBodyLimit;
-    }
-}
-
-/// The identity of the limits in `policy`, which `networkPolicyIsolationId` folds into the key of
-/// every table entry: fetches under limits that differ in any field never share a pooled
-/// connection.
-pub fn policyIsolationId(policy: Policy) PoolIsolationId {
-    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hasher.update("collo-egress-policy-v1");
-    hasher.update(std.mem.asBytes(&policy.max_response_body_bytes));
-    hasher.update(std.mem.asBytes(&policy.max_encoded_response_bytes));
-    hasher.update(std.mem.asBytes(&policy.max_request_body_bytes));
-    hasher.update(std.mem.asBytes(&policy.max_request_headers));
-    hasher.update(std.mem.asBytes(&policy.max_request_header_bytes));
-    hasher.update(std.mem.asBytes(&policy.max_response_headers));
-    hasher.update(std.mem.asBytes(&policy.max_response_header_bytes));
-    hasher.update(std.mem.asBytes(&policy.socket_timeout_ms));
-    hasher.update(std.mem.asBytes(&policy.enable_http2));
-    hasher.update(std.mem.asBytes(&policy.max_redirects));
-    hasher.update(std.mem.asBytes(&policy.max_redirect_drain_bytes));
-    hasher.update(std.mem.asBytes(&policy.max_active_fetches_per_worker_session));
-    hasher.update(std.mem.asBytes(&policy.max_active_fetches_per_security_cell));
-    hasher.update(std.mem.asBytes(&policy.max_fetches_per_request));
-    hasher.update(std.mem.asBytes(&policy.max_fetches_per_boot));
-    hasher.update(std.mem.asBytes(&policy.max_body_chunk_bytes));
-    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    hasher.final(&digest);
-    var id: PoolIsolationId = undefined;
-    @memcpy(id[0..], digest[0..id.len]);
-    return id;
+/// The pool id of network policy `id`: the id's little-endian bytes, zero-padded to the
+/// transport's key width. Pools never outlive their gateway, which decodes one image whose ids
+/// never change, so the id alone tells two policies' pools apart.
+pub fn poolPolicyId(id: network.PolicyId) PoolIsolationId {
+    var pool_id = transport.zero_pool_isolation_id;
+    std.mem.writeInt(network.PolicyId, pool_id[0..@sizeOf(network.PolicyId)], id, .little);
+    return pool_id;
 }
 
 pub fn maxResponseHeaderBytesForIpc() usize {
     return ipc.max_message_bytes - @sizeOf(ipc.EgressFetchHeadHeader);
 }
 
-/// The response body cap of one fetch: the cap the worker requested, or `gateway_limit` when it
-/// requested none (0). A request above `gateway_limit` fails with
-/// `error.EgressGatewayResponseBodyLimitExceeded` instead of being lowered.
-pub fn resolveMaxResponseBodyBytes(requested: u64, gateway_limit: usize) !usize {
-    if (gateway_limit == 0)
-        return error.InvalidEgressGatewayResponseBodyLimit;
-    if (requested == 0)
-        return gateway_limit;
-    if (requested > @as(u64, @intCast(gateway_limit)))
-        return error.EgressGatewayResponseBodyLimitExceeded;
-    return @intCast(requested);
+/// Checks a decoded fetch start's shape against `policy` before anything is allocated for it, an
+/// inline body and a pooled one alike: nonzero fetch and body ids, the header count and bytes, and
+/// the request body's length (the inline bytes, or the announced length of a pooled body). Returns
+/// the response cap the fetch runs under, the policy's, since a start names none. Every error is
+/// the worker's own packet's.
+pub fn checkStart(fetch: ipc.EgressFetchStartView, policy: Policy) !usize {
+    if (fetch.fetch_id == 0 or fetch.body_id == 0)
+        return error.InvalidEgressGatewayFetchIdentity;
+    if (fetch.headers.len > @min(ipc.max_request_header_count, policy.max_request_headers))
+        return error.TooManyFetchHeaders;
+    if (requestHeaderBytes(fetch.headers) > policy.max_request_header_bytes)
+        return error.EgressGatewayRequestHeadersTooLarge;
+    const pooled = (fetch.flags & ipc.egress_fetch_start_flag_body_pooled) != 0;
+    const body_len: u64 = if (pooled) fetch.pooled_body_len else fetch.body.len;
+    if (pooled and body_len == 0)
+        return error.EgressGatewayRequestBodyLimitExceeded;
+    if (body_len > policy.max_request_body_bytes)
+        return error.EgressGatewayRequestBodyLimitExceeded;
+    return policy.max_response_body_bytes;
+}
+
+fn requestHeaderBytes(headers: []const ipc.RequestHeader) usize {
+    var total: usize = 0;
+    for (headers) |header|
+        total +|= header.name.len + header.value.len;
+    return total;
 }

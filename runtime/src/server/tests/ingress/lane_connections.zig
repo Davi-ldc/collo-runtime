@@ -136,14 +136,14 @@ test "a stream past the lane's stream table is refused with REFUSED_STREAM, and 
 
     // An answered stream leaves the table, and the next one fits.
     try stub.answer(first, 200, "one");
-    try harness.serveWorker(0, stub);
+    try harness.handleControl(0, stub);
     try client.expectStatus(1, 200);
     try client.get(7);
     try client.drive();
     const third = try stub.readRequestBegin();
     try stub.answer(second, 200, "two");
     try stub.answer(third, 200, "three");
-    try harness.serveWorker(0, stub);
+    try harness.handleControl(0, stub);
     try client.expectStatus(3, 200);
     try client.expectStatus(7, 200);
     try harness.expectLanesRunning();
@@ -164,13 +164,13 @@ test "a stream past the lane's request table is refused with REFUSED_STREAM, and
     try std.testing.expectEqual(@as(?u32, @intFromEnum(h2.ErrorCode.refused_stream)), (try client.stream(3)).reset_code);
 
     try stub.answer(first, 200, "one");
-    try harness.serveWorker(0, stub);
+    try harness.handleControl(0, stub);
     try client.expectStatus(1, 200);
     try client.get(5);
     try client.drive();
     const second = try stub.readRequestBegin();
     try stub.answer(second, 200, "two");
-    try harness.serveWorker(0, stub);
+    try harness.handleControl(0, stub);
     try client.expectStatus(5, 200);
     try harness.expectLanesRunning();
 }
@@ -203,7 +203,7 @@ test "a connection that starts no request by its pre-request deadline gets GOAWA
     try harness.expireDeadlines(0, started_deadline);
     try std.testing.expect(started.open());
     try stub.answer(request, 200, "ok");
-    try harness.serveWorker(0, stub);
+    try harness.handleControl(0, stub);
     try started.expectStatus(1, 200);
     try std.testing.expectEqual(@as(u64, 1), lane.lane.counters.pre_request_timeouts);
 }
@@ -220,7 +220,7 @@ test "a connection with no stream for its idle timeout gets GOAWAY NO_ERROR nami
     try client.drive();
     const first = try stub.readRequestBegin();
     try stub.answer(first, 200, "one");
-    try harness.serveWorker(0, stub);
+    try harness.handleControl(0, stub);
     try client.expectStatus(1, 200);
     const idle_since = lane.connections.get(client.slot).?.idle_since_ns orelse return error.ConnectionNotIdle;
 
@@ -238,7 +238,7 @@ test "a connection with no stream for its idle timeout gets GOAWAY NO_ERROR nami
     try harness.expireDeadlines(0, idle_since + short_timeout_ns);
     try std.testing.expect(client.open());
     try stub.answer(second, 200, "two");
-    try harness.serveWorker(0, stub);
+    try harness.handleControl(0, stub);
     try client.expectStatus(3, 200);
 
     const idle_again = lane.connections.get(client.slot).?.idle_since_ns orelse return error.ConnectionNotIdle;
@@ -263,7 +263,7 @@ test "a connection that stops inside a frame for its stall timeout closes withou
     try client.drive();
     const first = try stub.readRequestBegin();
     try stub.answer(first, 200, "one");
-    try harness.serveWorker(0, stub);
+    try harness.handleControl(0, stub);
     try client.expectStatus(1, 200);
 
     const ping = pingFrame(.{});
@@ -305,7 +305,7 @@ test "a client that stops reading a response keeps its connection past the stall
     const chunk: [1024]u8 = @splat('b');
     try stub.sendHead(request, 200, false);
     try stub.sendChunk(request, &chunk, false);
-    try harness.serveWorker(0, stub);
+    try harness.handleControl(0, stub);
     const runtime = lane.connections.get(client.slot).?;
     try std.testing.expect(runtime.stalled());
 
@@ -318,8 +318,8 @@ test "a client that stops reading a response keeps its connection past the stall
 
     // Once the client grants credit, the response ends as usual.
     try stub.sendChunk(request, "!", true);
-    try stub.publishCompletion(request, .{});
-    try harness.serveWorker(0, stub);
+    try stub.sendDone(request, .{});
+    try harness.handleControl(0, stub);
     var increment: [4]u8 = undefined;
     std.mem.writeInt(u32, &increment, 4096, .big);
     try client.writeFrame(.window_update, 0, 1, &increment);
@@ -398,7 +398,7 @@ test "a first stream the lane refuses with REFUSED_STREAM ends the pre-request d
     try std.testing.expectEqual(@as(u64, 0), lane.lane.counters.pre_request_timeouts);
 
     try stub.answer(request, 200, "held");
-    try harness.serveWorker(0, stub);
+    try harness.handleControl(0, stub);
     try holder.expectStatus(1, 200);
     try harness.expectLanesRunning();
 }
@@ -441,7 +441,7 @@ test "a waiting request answered outside any drive leaves its connection under i
     try std.testing.expectEqual(@as(u64, 1), lane.lane.counters.idle_timeouts);
 
     try stub.answer(request, 200, "held");
-    try harness.serveWorker(0, stub);
+    try harness.handleControl(0, stub);
     try holder.expectStatus(1, 200);
     try harness.expectLanesRunning();
 }
@@ -472,7 +472,7 @@ test "a header block left open stalls its connection even while another stream's
     // The close reset the request toward its worker, whose answer then
     // finds no stream and ends it.
     try stub.answer(request, 200, "late");
-    try harness.serveWorker(0, stub);
+    try harness.handleControl(0, stub);
     try std.testing.expect(harness.requestKeyOf(client, 1) == null);
     try harness.expectLanesRunning();
     try harness.expectServing(stub);

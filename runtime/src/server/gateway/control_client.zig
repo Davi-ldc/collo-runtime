@@ -47,7 +47,7 @@ pub const Client = struct {
     thread: ?std.Thread = null,
     ctx: *anyopaque = undefined,
     failed: *const fn (ctx: *anyopaque, err: anyerror) void = undefined,
-    session_removed: *const fn (ctx: *anyopaque, session_id: u64) void = undefined,
+    session_removed: *const fn (ctx: *anyopaque, removed: control.RemovedSession) void = undefined,
     /// Held for each attach's whole round trip, before `mutex`.
     attach_mutex: std.Thread.Mutex = .{},
     /// Guards the fields below it and the waiter `waiter` points to.
@@ -67,10 +67,10 @@ pub const Client = struct {
         /// thread or inside a failing `attachWorker`, so it must neither deinit the client nor
         /// attach through it.
         failed: *const fn (ctx: *anyopaque, err: anyerror) void,
-        /// Told each session the gateway removed on its own (`control.SessionRemoved`), on the
-        /// reader thread, which receives nothing more until it returns. It must neither deinit
-        /// the client nor attach through it.
-        session_removed: *const fn (ctx: *anyopaque, session_id: u64) void,
+        /// Told each session the gateway removed on its own and why (`control.SessionRemoved`),
+        /// on the reader thread, which receives nothing more until it returns. It must neither
+        /// deinit the client nor attach through it.
+        session_removed: *const fn (ctx: *anyopaque, removed: control.RemovedSession) void,
     };
 
     /// Starts the reader on `control_fd`, which stays the caller's: the client never closes it,
@@ -278,7 +278,7 @@ pub const Client = struct {
                 defer packet.deinit();
                 switch (try control.decodeGatewayToServerPacket(&packet)) {
                     .attach_ack => |ack| try self.completeAttachAck(ack),
-                    .session_removed => |removed| self.session_removed(self.ctx, removed.session_id),
+                    .session_removed => |removed| self.session_removed(self.ctx, removed),
                 }
             }
         }

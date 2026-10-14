@@ -1,33 +1,38 @@
 //! The reaper: the node's one thread that retires workers. Every worker that
 //! leaves its pool, whatever ended it, is torn down here, off every request
-//! path: SIGKILL, the exit wait, the final drains of its usage and console
-//! rings, its line in `workers.jsonl`, and its descriptors, wake set,
-//! mappings and cgroup leaf released (`worker_registry.teardown`), then
+//! path: SIGKILL, the exit wait, the last drain of its console ring, its
+//! line in `workers.jsonl`, and its descriptors, wake set, mappings and
+//! cgroup leaf released (`worker_registry.teardown`), then
 //! `Pool.remove`, which frees its table entry for a later launch. Its egress
 //! session needs nothing: the exit hangs up the liveness pipe its gateway
-//! watches, and the gateway drops the session. A failed launch's child and
-//! cgroup leaf are torn down here too (`AbandonedChild.reap` in
-//! `host/launch.zig`).
+//! watches, and the gateway drops the session. A failed launch's child is
+//! torn down here too, in the same order (`reapLeftovers`): the kill, the
+//! exit wait, the one drain of its console ring, then its page and cgroup
+//! leaf released (`AbandonedChild` in `host/launch.zig`).
 //!
 //! Work reaches the reaper three ways. Other threads queue what their pool
 //! calls finished (`queueRetirement`): a lane whose `Pool.release`,
 //! `Pool.transferReader`, `Pool.retireOnNotice` or `Pool.markDead` said
-//! `.retire`, or the launcher's `Deps.retireForEgress`, whose
-//! `Pool.retireForEgress` did. The launcher's failed launches queue their
+//! `.retire`, or the launcher's `Deps.retireForEgress` and
+//! `Deps.retireEgressSession`, whose `Pool.retireForEgress` did. The launcher's failed launches queue their
 //! leftovers (`queueLeftovers`). The reaper's own passes retire idle workers
 //! on its timer, on memory pressure and on demand reclaim (`reaping.zig`),
 //! and ask again each reader that still holds a retiring worker with no
 //! request (`retryReleases`). It watches the live idle workers no lane
 //! reads, rescanning them before every wait, so a lane that gives up reading
 //! a worker only wakes it (`wakeForPidfdScan`); a lane watches the workers
-//! it reads. For each it polls the pidfd, and the control socket: such a
-//! worker holds no request, so the only thing it writes there is its
-//! `worker_retiring` notice, which takes it out of service
-//! (`Pool.retireOnNotice`) without the reaper ever reading the socket, since
-//! a lane may become its reader at any moment and read the notice itself.
-//! When the reaper sees a death first, its pidfd or a hung-up control
-//! socket, it marks the worker dead in its pool and posts `worker_died` to
-//! every lane that holds a slot of it or reads it.
+//! it reads. For each it polls the pidfd and the control socket, which it
+//! never reads, since a lane may become the worker's reader at any moment
+//! and read the socket itself. A lane takes a slot through the pool without
+//! waking the reaper, so between the scan and the poll a lane may become a
+//! listed worker's reader and the worker's answer to it turn the socket
+//! readable. The scan therefore keeps each worker's reader epoch, and a
+//! readable socket takes the worker out of service only while that epoch is
+//! unchanged (`Pool.retireOnUnreadNotice`): then no lane took a slot since,
+//! and what the worker wrote is its `worker_retiring` notice or bytes it has
+//! no business writing. When the reaper sees a death first, its pidfd or a
+//! hung-up control socket, it marks the worker dead in its pool and posts
+//! `worker_died` to every lane that holds a slot of it or reads it.
 //!
 //! After a removal its definition's pool may grow again, and the reaper
 //! submits a launch when the pool wants one. Waiters nothing can serve are
@@ -59,6 +64,8 @@ const fd_mod = @import("collo_os").fd;
 const process = @import("collo_os").process;
 const lifecycle = @import("collo_server_lifecycle");
 const config = @import("collo_server_config");
+const analytics = @import("collo_server_analytics");
+const worker_shared_page = @import("collo_worker_state").page;
 
 const pool = @import("../pool.zig");
 const launcher = @import("../launcher.zig");
@@ -66,7 +73,6 @@ const scheduler_limits = @import("../scheduler_limits.zig");
 const worker_table = @import("../worker_table.zig");
 const supervisor_mod = @import("../supervisor.zig");
 const worker_registry = @import("../worker_registry.zig");
-const usage_drain = @import("../usage_drain.zig");
 
 pub const memory = @import("memory.zig");
 pub const reaping = @import("reaping.zig");
@@ -91,8 +97,8 @@ const poll_entries_per_watched: usize = 2;
 const poll_retry_ns: u64 = 10 * std.time.ns_per_ms;
 
 /// Why a worker is retired. The reaper counts each apart, and a worker's
-/// line in `workers.jsonl` says it, a death split into crash and memory
-/// (`usage_drain.classifyWorkerDeath`).
+/// line in `workers.jsonl` says it, a death split by who ended it
+/// (`Record.classifyDeath` and `Death` in `server/supervisor/worker_table.zig`).
 pub const RetireReason = enum {
     /// `Pool.markDead` took it out of service: a fault, its exit or its
     /// deadline's grace.
@@ -104,9 +110,13 @@ pub const RetireReason = enum {
     /// and no other one could give it a session (`Launcher.gatewayLost` in
     /// `launcher.zig`).
     egress_reattach,
-    /// `Pool.retireOnNotice` took it out of service: it announced
-    /// `worker_retiring`, its routes having failed or its VM having been
-    /// terminated, and finished the requests it held.
+    /// `Pool.retireForEgress` took it out of service: its gateway removed its
+    /// session for what it sent or left unread
+    /// (`Launcher.egressSessionLost`).
+    egress_session_removed,
+    /// `Pool.retireOnNotice` or `Pool.retireOnUnreadNotice` took it out of
+    /// service: it announced `worker_retiring` and finished the requests it
+    /// held.
     recycled,
 
     /// The reason for a worker its pool reports finished with `departure`,
@@ -116,6 +126,7 @@ pub const RetireReason = enum {
             .idle => .idle,
             .died => .died,
             .egress => .egress_reattach,
+            .egress_removed => .egress_session_removed,
             .recycled => .recycled,
         };
     }
@@ -145,8 +156,8 @@ pub const Deps = struct {
 };
 
 pub const Options = struct {
-    /// Borrowed; outlives the reaper. Its pools, records, memory gate and
-    /// usage drains are what the reaper works on.
+    /// Borrowed; outlives the reaper. Its pools, records and memory gate are
+    /// what the reaper works on.
     supervisor: *Supervisor,
     deps: Deps,
 };
@@ -155,6 +166,7 @@ pub const Counters = struct {
     retired_died: u64 = 0,
     retired_idle: u64 = 0,
     retired_egress_reattach: u64 = 0,
+    retired_egress_session_removed: u64 = 0,
     retired_recycled: u64 = 0,
     /// Failed launches whose child and leaf were torn down.
     leftovers_reaped: u64 = 0,
@@ -162,8 +174,12 @@ pub const Counters = struct {
     /// reads.
     deaths_seen: u64 = 0,
     /// Control sockets of idle workers no lane reads that turned readable,
-    /// each a `worker_retiring` notice the reaper took to the pool.
+    /// each taken to the pool as the worker's `worker_retiring` notice.
     notices_seen: u64 = 0,
+    /// Those the pool refused because the worker was no longer as the scan
+    /// saw it, mostly because a lane took a slot of it since and the
+    /// readability was the worker's answer to that lane.
+    notices_stale: u64 = 0,
     /// Idle retirements by cause. A memory-pressure reap counts under the
     /// pressure it found, demand reclaim included.
     idle_ttl_retirements: u64 = 0,
@@ -189,10 +205,11 @@ const Retirement = union(enum) {
 };
 
 /// A live idle worker no lane reads, whose pidfd and control socket the
-/// reaper polls.
+/// reaper polls, with the key and the reader epoch the scan saw.
 const Watched = struct {
     record: *WorkerRecord,
     key: lifecycle.WorkerKey,
+    reader_epoch: pool.ReaderEpoch,
     pidfd: std.posix.fd_t,
     control_fd: std.posix.fd_t,
 };
@@ -367,15 +384,35 @@ pub const Reaper = struct {
     }
 
     /// The watch on the calling thread, while no reaper thread runs: the
-    /// rescan of the idle workers no lane reads, one poll of their pidfds and
-    /// control sockets that does not wait, the exits and notices it found,
-    /// then the retire queue. Returns how many workers it watched. The memory
-    /// reading and the passes stay with the thread's timer and
+    /// rescan of the idle workers no lane reads (`scanWatchedWorkers`), then
+    /// one poll of their pidfds and control sockets that does not wait, the
+    /// exits and notices it found and the retire queue
+    /// (`pollScannedWorkers`). Returns how many workers it watched. The
+    /// memory reading and the passes stay with the thread's timer and
     /// `retireIdleWorkers`, so the watch runs without reading the node's
     /// memory, which could retire the workers it watches.
     pub fn pollWatchedWorkers(self: *Reaper) usize {
+        _ = self.scanWatchedWorkers();
+        return self.pollScannedWorkers();
+    }
+
+    /// The first half of a watch on the calling thread, while no reaper
+    /// thread runs: the rescan of the idle workers no lane reads. Returns how
+    /// many it listed.
+    pub fn scanWatchedWorkers(self: *Reaper) usize {
         std.debug.assert(self.thread == null);
         self.scanReaderless();
+        return self.watched_len;
+    }
+
+    /// The second half: the poll of the workers the last scan listed, as
+    /// `pollWatchedWorkers` runs it. Between the halves a lane may take a
+    /// slot of a listed worker, as it may while the thread waits in its
+    /// poll. Only the reaper tears a worker down, so with no other reaper
+    /// call between the halves every listed descriptor is still open.
+    /// Returns how many workers it polled.
+    pub fn pollScannedWorkers(self: *Reaper) usize {
+        std.debug.assert(self.thread == null);
         const count_polled = self.buildPollSet();
         // The watched entries follow the fixed sources, so polling only them
         // leaves their revents where `handleWatched` reads them.
@@ -489,10 +526,66 @@ pub const Reaper = struct {
         switch (retirement.*) {
             .worker => |queued| self.retire(queued.record, queued.reason),
             .leftovers => |*leftovers| {
-                leftovers.child.reap();
+                self.reapLeftovers(leftovers);
                 self.deps.leftoversReaped(self.deps.ctx);
                 self.count("leftovers_reaped", 1);
             },
+        }
+    }
+
+    /// Tears down what a failed launch left as a worker's teardown does
+    /// (`worker_registry.teardown`): the kill and the exit wait, so the
+    /// child's console ring holds every line it will ever hold, then the one
+    /// drain of that ring, then the page, the leaf and the pidfd released.
+    fn reapLeftovers(self: *Reaper, leftovers: *launcher.Leftovers) void {
+        const child = &leftovers.child;
+        _ = child.kill();
+        if (child.page) |*page|
+            self.drainLaunchConsole(leftovers.definition, child.pid, page);
+        child.release();
+    }
+
+    /// Drains the console ring of a failed launch's child into the analytics
+    /// sink through the checked reads every worker's ring goes through
+    /// (`analytics.logs.drainRing`). The child may have run tenant code, so
+    /// every line is hostile, and it gets the identity the server gives it:
+    /// its definition's name, and worker id and generation 0, since the
+    /// server numbers a worker only at its publish and no worker is ever
+    /// numbered 0 (`lifecycle.nextGeneration`). It was dispatched no
+    /// request, so a line's request id prints as 0. Its runtime lines, the
+    /// `worker boot failed` line among them, reach stderr alone. The reaper
+    /// holds the only mapping of the page, so this is the ring's only
+    /// consumer, and `dying_ring_line_budget` bounds a child whose exit went
+    /// unseen and still writes.
+    fn drainLaunchConsole(
+        self: *Reaper,
+        definition: config.DefinitionIndex,
+        pid: u32,
+        page: *worker_shared_page.HostReaderView,
+    ) void {
+        const name = self.supervisor.routes.definition(definition).name;
+        const identity: analytics.Identity = .{
+            .worker = name,
+            .route = "",
+            .worker_id = 0,
+            .worker_generation = 0,
+        };
+        var requests: NoRequests = .{};
+        var drop_reported: u64 = 0;
+        if (analytics.logs.drainRing(
+            page,
+            &requests,
+            identity,
+            &drop_reported,
+            self.supervisor.analytics,
+            analytics.Clock.capture(),
+            analytics.logs.dying_ring_line_budget,
+        )) |_| {} else |err| {
+            std.log.warn("console ring of a failed launch of {s} pid={d} failed; its remaining lines are lost: {s}", .{
+                name,
+                pid,
+                @errorName(err),
+            });
         }
     }
 
@@ -516,15 +609,13 @@ pub const Reaper = struct {
             return;
         }
         // Read while the cgroup that says whether the kernel killed it for
-        // memory still exists.
+        // memory still exists, and before the teardown's own kill.
         const ending: worker_registry.Ending = switch (reason) {
             .idle => .idle,
-            .egress_reattach => .egress_reattach,
+            .egress_reattach => egressRetirementEnding(worker, .egress_reattach),
+            .egress_session_removed => egressRetirementEnding(worker, .egress_session_removed),
             .recycled => .recycled,
-            .died => switch (usage_drain.classifyWorkerDeath(self.supervisor.usageDrain(), worker)) {
-                .memory => .memory,
-                else => .crash,
-            },
+            .died => worker.classifyDeath().ending(),
         };
         const worker_id = worker.id;
         worker_registry.teardown(self.supervisor, worker, ending);
@@ -539,12 +630,33 @@ pub const Reaper = struct {
             .died => self.count("retired_died", 1),
             .idle => self.count("retired_idle", 1),
             .egress_reattach => self.count("retired_egress_reattach", 1),
+            .egress_session_removed => self.count("retired_egress_session_removed", 1),
             .recycled => self.count("retired_recycled", 1),
         }
-        if (definition_pool.growthWanted(self.supervisor.memoryGate())) {
-            self.deps.submit(self.deps.ctx, definition, .capacity);
-            self.count("launches_submitted", 1);
+        switch (definition_pool.growthWanted(self.supervisor.memoryGate())) {
+            .launch, .watch => {
+                self.deps.submit(self.deps.ctx, definition, .capacity);
+                self.count("launches_submitted", 1);
+            },
+            .none => {},
         }
+    }
+
+    /// The ending of a worker the launcher retired for its egress session,
+    /// whose retirement can reach the reaper ahead of the worker's own death,
+    /// since the gateway reports a session gone on another path than the
+    /// worker's pidfd: a memory death its page or cgroup records, a crash
+    /// when its process already exited, and `retirement` for a worker still
+    /// running, which the teardown kills.
+    fn egressRetirementEnding(worker: *WorkerRecord, retirement: worker_registry.Ending) worker_registry.Ending {
+        const death = worker.classifyDeath();
+        switch (death) {
+            .memory_high, .memory_max => return death.ending(),
+            .crash => {},
+        }
+        if (worker.hasExited())
+            return .crash;
+        return retirement;
     }
 
     /// Asks the reader `tenure` names to give its role over `key`'s worker
@@ -578,18 +690,20 @@ pub const Reaper = struct {
         return reaping.idleTtlPass(self, now_ns);
     }
 
-    /// A watched worker's control socket turned readable: the worker holds
-    /// no request, so this is its `worker_retiring` notice, or bytes it has
-    /// no business writing, which retire it just the same. The pool decides
-    /// with the key the scan saw (`Pool.retireOnNotice`); a lane that took a
-    /// slot meanwhile is the worker's reader and reads the notice itself.
+    /// A watched worker's control socket turned readable. The pool decides
+    /// with the key and the reader epoch the scan saw
+    /// (`Pool.retireOnUnreadNotice`): a worker no lane took since is retired
+    /// on what it wrote, its notice or bytes it has no business writing,
+    /// and a worker a lane took since is that lane's to read, the
+    /// readability most likely its answer to the lane. A stale answer costs
+    /// nothing more: the next turn's scan watches the worker again if it is
+    /// idle and unread by then, under its new epoch.
     fn noticeReadable(self: *Reaper, watched: Watched) void {
         self.count("notices_seen", 1);
         const definition_pool = self.supervisor.poolFor(watched.record.definition_index);
-        switch (definition_pool.retireOnNotice(watched.record, watched.key)) {
-            .stale, .draining => {},
+        switch (definition_pool.retireOnUnreadNotice(watched.record, watched.key, watched.reader_epoch)) {
+            .stale => self.count("notices_stale", 1),
             .retire => self.retire(watched.record, .recycled),
-            .release_reader => |tenure| self.postRelease(watched.key, tenure),
         }
     }
 
@@ -735,10 +849,9 @@ pub const Reaper = struct {
             self.retire(watched.record, .died);
     }
 
-    /// Lists the live workers no lane reads, which are idle, since the first
-    /// lane to take a slot of a worker becomes its reader. Their descriptors
-    /// stay open until their retirement, which only this thread carries out
-    /// after the scan.
+    /// Lists the live idle workers no lane reads, with the reader epoch of
+    /// each. Their descriptors stay open until their retirement, which only
+    /// this thread carries out after the scan.
     fn scanReaderless(self: *Reaper) void {
         self.watched_len = 0;
         for (self.supervisor.pools, 0..) |*definition_pool, definition| {
@@ -749,6 +862,7 @@ pub const Reaper = struct {
                 self.watched[self.watched_len] = .{
                     .record = idle.worker,
                     .key = idle.worker.key(),
+                    .reader_epoch = idle.reader_epoch,
                     .pidfd = idle.worker.handle.pidfd,
                     .control_fd = idle.worker.handle.control_fd,
                 };
@@ -773,6 +887,15 @@ pub const Reaper = struct {
             self.pollfds[entry + 1] = .{ .fd = watched.control_fd, .events = std.posix.POLL.IN, .revents = 0 };
         }
         return poll_fixed_sources + poll_entries_per_watched * self.watched_len;
+    }
+};
+
+/// The request table of a failed launch's child as `analytics.logs.drainRing`
+/// asks it: the child was dispatched no request, so every request id a line
+/// names is refused.
+const NoRequests = struct {
+    pub fn routeOf(_: *NoRequests, _: u64) ?[]const u8 {
+        return null;
     }
 };
 

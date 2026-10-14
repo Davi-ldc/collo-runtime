@@ -43,6 +43,19 @@ async function collectBytes(stream) {
   return concatUint8(chunks);
 }
 
+function utf8(text) {
+  return new TextEncoder().encode(text);
+}
+
+function chunkStream(chunks) {
+  return new ReadableStream({
+    start(controller) {
+      for (const chunk of chunks) controller.enqueue(chunk);
+      controller.close();
+    },
+  });
+}
+
 async function waitForMicrotaskCondition(label, predicate) {
   for (let index = 0; index < 16; index++) {
     await Promise.resolve();
@@ -191,10 +204,13 @@ describe("ReadableStream core", () => {
       },
     }).tee();
 
-    await left.cancel("left reason");
+    // A branch's cancel settles with the original's cancel, so the first one is not awaited alone.
+    const leftCancel = left.cancel("left reason");
+    for (let index = 0; index < 8; index++) await Promise.resolve();
     assert.equal(cancel_reason, undefined);
 
     await right.cancel("right reason");
+    await leftCancel;
     assert.deepEqual(cancel_reason, ["left reason", "right reason"]);
   });
 
@@ -227,6 +243,83 @@ describe("ReadableStream core", () => {
     const rightReader = right.getReader();
     assert.deepEqual(await rightReader.read(), { value: "1", done: false });
     assert.deepEqual(await rightReader.read(), { value: "2", done: false });
+  });
+
+  test("a 17th tee in one tee tree throws a QuotaExceededError like a 17th Response.clone and leaves the stream readable", async () => {
+    // WebApiBodyCloneFanoutMax (limits.h): the clones and tees one tree may make.
+    const fanoutMax = 16;
+    function throwsQuotaExceeded(fn) {
+      const error = assert.throws(fn, DOMException);
+      assert.equal(error.name, "QuotaExceededError");
+      return error;
+    }
+
+    const response = new Response(new ReadableStream());
+    for (let index = 0; index < fanoutMax; index++) response.clone();
+    const cloneError = throwsQuotaExceeded(() => response.clone());
+
+    for (const createRoot of [() => chunkStream([new Uint8Array([7])]), () => new Blob([new Uint8Array([7])]).stream()]) {
+      // Each tee splits the oldest stream of the tree that nobody has teed yet, so the tees spread over the branches.
+      const untouched = [createRoot()];
+      for (let index = 0; index < fanoutMax; index++) untouched.push(...untouched.shift().tee());
+      const stream = untouched.shift();
+      const teeError = throwsQuotaExceeded(() => stream.tee());
+      assert.equal(teeError.code, cloneError.code);
+
+      assert.equal(stream.locked, false);
+      const reader = stream.getReader();
+      const first = await reader.read();
+      assert.deepEqual(Array.from(first.value), [7]);
+      assert.deepEqual(await reader.read(), { value: undefined, done: true });
+    }
+  });
+
+  test("close resolves the reader's closed promise before it settles pending reads", async () => {
+    let controller;
+    const stream = new ReadableStream({
+      start(value) {
+        controller = value;
+      },
+    });
+    const reader = stream.getReader();
+    const order = [];
+    const read = reader.read().then(() => order.push("read"));
+    const closed = reader.closed.then(() => order.push("closed"));
+    controller.close();
+    await Promise.all([read, closed]);
+    assert.deepEqual(order, ["closed", "read"]);
+  });
+
+  test("cancel closes the stream before the source's cancel runs", async () => {
+    let controller;
+    let desiredSize;
+    let enqueueError;
+    const stream = new ReadableStream({
+      start(value) {
+        controller = value;
+      },
+      cancel() {
+        desiredSize = controller.desiredSize;
+        try {
+          controller.enqueue("late");
+        } catch (error) {
+          enqueueError = error;
+        }
+      },
+    });
+    const reader = stream.getReader();
+    const read = reader.read();
+    await reader.cancel("stop");
+    assert.equal(desiredSize, 0);
+    assert(enqueueError instanceof TypeError);
+    assert.deepEqual(await read, { value: undefined, done: true });
+  });
+
+  test("cancel ends a pending BYOB read as done instead of rejecting it", async () => {
+    const reader = new ReadableStream({ type: "bytes" }).getReader({ mode: "byob" });
+    const read = reader.read(new Uint8Array(4));
+    await reader.cancel("stop");
+    assert.deepEqual(await read, { value: undefined, done: true });
   });
 
   test("async iterator consumes chunks", async () => {
@@ -686,6 +779,117 @@ describe("ReadableStream core", () => {
     assert.deepEqual(Array.from(result.value), [3]);
   });
 
+  test("BYOB respondWithNewView refuses a view that does not start at the filled bytes, before it transfers anything", async () => {
+    let refusal = null;
+    const stream = new ReadableStream({
+      type: "bytes",
+      pull(controller) {
+        const view = controller.byobRequest.view;
+        try {
+          controller.byobRequest.respondWithNewView(new Uint8Array(view.buffer, view.byteOffset + 1, 2));
+        } catch (error) {
+          refusal = error;
+        }
+        // The refusal transferred nothing, so the request's own view still writes into the read.
+        view.set([4, 5]);
+        controller.byobRequest.respondWithNewView(view.subarray(0, 2));
+      },
+    });
+
+    const result = await stream.getReader({ mode: "byob" }).read(new Uint8Array(4));
+    assert(refusal instanceof RangeError);
+    assert.equal(result.done, false);
+    assert.deepEqual(Array.from(result.value), [4, 5]);
+  });
+
+  test("BYOB respondWithNewView with a partial element delivers the whole elements and queues the rest", async () => {
+    let pulls = 0;
+    const stream = new ReadableStream({
+      type: "bytes",
+      pull(controller) {
+        pulls += 1;
+        if (pulls > 1) return;
+        const view = controller.byobRequest.view;
+        view.set([1, 2, 3]);
+        controller.byobRequest.respondWithNewView(new Uint8Array(view.buffer, view.byteOffset, 3));
+      },
+    });
+
+    const reader = stream.getReader({ mode: "byob" });
+    const first = await reader.read(new Uint16Array(2));
+    assert.equal(first.done, false);
+    assert(first.value instanceof Uint16Array);
+    assert.deepEqual(Array.from(new Uint8Array(first.value.buffer, first.value.byteOffset, first.value.byteLength)), [1, 2]);
+    const second = await reader.read(new Uint8Array(4));
+    assert.equal(second.done, false);
+    assert.deepEqual(Array.from(second.value), [3]);
+  });
+
+  test("a BYOB read's trailing partial element is queued before the read settles, so a read its settlement starts finds it", async () => {
+    // A Blob's source answers a pull at once, so the read below settles inside read(), where resolving it looks up
+    // `then` on its result; the getter issues the next read from there.
+    const stream = new Blob([new Uint8Array([1, 2, 3])]).stream();
+    const reader = stream.getReader({ mode: "byob" });
+    let nested = null;
+    Object.defineProperty(Object.prototype, "then", {
+      configurable: true,
+      get() {
+        if (nested === null && this !== null && typeof this === "object" && this.value instanceof Uint16Array) {
+          delete Object.prototype.then;
+          nested = reader.read(new Uint8Array(4));
+        }
+        return undefined;
+      },
+    });
+    let outer;
+    try {
+      outer = reader.read(new Uint16Array(2));
+    } finally {
+      delete Object.prototype.then;
+    }
+
+    const outerResult = await outer;
+    assert.equal(outerResult.done, false);
+    const outerBytes = new Uint8Array(outerResult.value.buffer, outerResult.value.byteOffset, outerResult.value.byteLength);
+    assert.deepEqual(Array.from(outerBytes), [1, 2]);
+    assert(nested !== null, "settling the read looked up no then");
+    const nestedResult = await nested;
+    assert.equal(nestedResult.done, false);
+    assert.deepEqual(Array.from(nestedResult.value), [3]);
+    assert.equal((await reader.read(new Uint8Array(1))).done, true);
+  });
+
+  test("a byte source that responds one byte per synchronous pull fills a large min read without nesting a call per pull", async () => {
+    // Enough pulls that one native frame per pull would exhaust the stack.
+    const size = 65536;
+    let pulls = 0;
+    const stream = new ReadableStream({
+      type: "bytes",
+      pull(controller) {
+        pulls += 1;
+        controller.byobRequest.view[0] = pulls & 0xff;
+        controller.byobRequest.respond(1);
+      },
+    });
+
+    const { value, done } = await stream.getReader({ mode: "byob" }).read(new Uint8Array(size), { min: size });
+    assert.equal(done, false);
+    assert.equal(value.byteLength, size);
+    assert.equal(pulls, size);
+    assert.equal(value[0], 1);
+    assert.equal(value[size - 1], size & 0xff);
+  });
+
+  test("byte stream sizes convert as [EnforceRange] unsigned long long, which ends at 2^53 - 1", async () => {
+    for (const size of [2 ** 53, 2 ** 64, Number.MAX_VALUE])
+      assert.throws(() => new ReadableStream({ type: "bytes", autoAllocateChunkSize: size }), TypeError);
+    new ReadableStream({ type: "bytes", autoAllocateChunkSize: 2 ** 53 - 1 });
+
+    const reader = new ReadableStream({ type: "bytes" }).getReader({ mode: "byob" });
+    await assertRejects(reader.read(new Uint8Array(1), { min: 2 ** 53 }), TypeError);
+    await assertRejects(reader.read(new Uint8Array(1), { min: 2 }), RangeError);
+  });
+
   test("tee preserves byte stream branches and BYOB reads", async () => {
     const [left, right] = new ReadableStream({
       type: "bytes",
@@ -766,7 +970,35 @@ describe("ReadableStream Body integration", () => {
     assert.throws(() => response.clone(), TypeError);
   });
 
-  test("Response readable stream body consumer releases reader after chunk type error", async () => {
+  test("Body consumption settles with the converted body itself, in the microtask of the read that ends the stream", async () => {
+    let controller;
+    const stream = new ReadableStream({
+      start(value) {
+        controller = value;
+      },
+    });
+    const consumption = new Response(stream).arrayBuffer();
+    // The consumption's read waits on the empty stream.
+    for (let index = 0; index < 8; index++) await Promise.resolve();
+
+    const order = [];
+    consumption.then(() => order.push("body"));
+    const markers = Promise.resolve()
+      .then(() => order.push(1))
+      .then(() => order.push(2))
+      .then(() => order.push(3))
+      .then(() => order.push(4));
+    // The chunk fulfills the waiting read; its reaction takes the chunk, finds the stream closed and settles the
+    // consumption, whose own reaction then runs one turn later. A promise in between would add two turns.
+    controller.enqueue(utf8("abc"));
+    controller.close();
+    const body = await consumption;
+    await markers;
+    assert.deepEqual(Array.from(new Uint8Array(body)), [97, 98, 99]);
+    assert(order.indexOf("body") < order.indexOf(3), `the body settled late: ${JSON.stringify(order)}`);
+  });
+
+  test("Response readable stream body consumer keeps the stream locked after chunk type error", async () => {
     const stream = new ReadableStream({
       start(controller) {
         controller.enqueue({});
@@ -776,7 +1008,7 @@ describe("ReadableStream Body integration", () => {
     const response = new Response(stream);
 
     await assertRejects(response.text(), TypeError);
-    assert.equal(stream.locked, false);
+    assert.equal(stream.locked, true);
   });
 
   test("Response readable stream body rejects resizable ArrayBufferView chunks", async () => {
@@ -794,47 +1026,178 @@ describe("ReadableStream Body integration", () => {
     });
 
     await assertRejects(new Response(stream).bytes(), TypeError);
-    assert.equal(stream.locked, false);
+    assert.equal(stream.locked, true);
   });
 
-  test("ReadableStream body methods reject when public reader hooks throw", async () => {
-    const getReaderError = new TypeError("patched getReader");
+  test("Body methods take only ArrayBuffer and ArrayBufferView chunks and reject a string chunk with a TypeError", async () => {
+    const buffer = text => Uint8Array.from(text, character => character.charCodeAt(0)).buffer;
+    const chunks = [
+      buffer("a"),
+      new Uint8Array(buffer("b")),
+      new Uint8ClampedArray(buffer("c")),
+      new Int8Array(buffer("d")),
+      new Int16Array(buffer("ef")),
+      new Uint16Array(buffer("gh")),
+      new Int32Array(buffer("ijkl")),
+      new Uint32Array(buffer("mnop")),
+      new Float32Array(buffer("qrst")),
+      new Float64Array(buffer("uvwxyz01")),
+      new BigInt64Array(buffer("23456789")),
+      new BigUint64Array(buffer("ABCDEFGH")),
+      new DataView(buffer("IJ")),
+      new Uint8Array(buffer("xKLx"), 1, 2),
+    ];
+    const expected = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKL";
+    const request = body => new Request("https://example.test/", { method: "POST", body, duplex: "half" });
+
+    assert.equal(await new Response(chunkStream(chunks)).text(), expected);
+    assert.equal(new TextDecoder().decode(await new Response(chunkStream(chunks)).arrayBuffer()), expected);
+    assert.equal(await request(chunkStream(chunks)).text(), expected);
+    assert.equal(await chunkStream(chunks).text(), expected);
+    const json = [buffer("{\"ok\":"), new Uint16Array(buffer("tr")), new DataView(buffer("ue}"))];
+    assert.deepEqual(await new Response(chunkStream(json)).json(), { ok: true });
+
+    const consumers = [
+      stream => new Response(stream).text(),
+      stream => new Response(stream).arrayBuffer(),
+      stream => new Response(stream).json(),
+      stream => request(stream).text(),
+      stream => stream.text(),
+    ];
+    for (const consume of consumers) {
+      await assertRejects(consume(chunkStream(["\"text\""])), TypeError);
+      await assertRejects(consume(chunkStream([buffer("\""), "text\""])), TypeError);
+    }
+  });
+
+  test("Body methods read a stream without calling its getReader or the reader's read", async () => {
+    let calls = 0;
+    const own = chunkStream([utf8("ok")]);
+    own.getReader = () => {
+      calls += 1;
+      throw new TypeError("own getReader");
+    };
+    assert.equal(await new Response(own).text(), "ok");
+
     const originalGetReader = ReadableStream.prototype.getReader;
+    const originalRead = ReadableStreamDefaultReader.prototype.read;
     try {
       ReadableStream.prototype.getReader = function () {
-        throw getReaderError;
+        calls += 1;
+        throw new TypeError("patched getReader");
       };
-      const stream = new ReadableStream({
-        pull() {},
+      ReadableStreamDefaultReader.prototype.read = function () {
+        calls += 1;
+        throw new TypeError("patched read");
+      };
+      assert.equal(await new Response(chunkStream([utf8("ok")])).text(), "ok");
+      const request = new Request("https://example.test/", {
+        method: "POST",
+        body: chunkStream([utf8("ok")]),
+        duplex: "half",
       });
-      const promise = stream.text();
-      assert(promise instanceof Promise);
-      assert.equal(await promise.catch(error => error), getReaderError);
+      assert.equal(await request.text(), "ok");
+      assert.equal(await chunkStream([utf8("ok")]).text(), "ok");
     } finally {
       ReadableStream.prototype.getReader = originalGetReader;
+      ReadableStreamDefaultReader.prototype.read = originalRead;
     }
+    assert.equal(calls, 0);
+  });
 
-    const probe = new ReadableStream({
-      pull() {},
+  test("a Response built from a stream returns that stream as its body and reads the chunks its pull enqueues", async () => {
+    const stream = new ReadableStream({
+      pull(controller) {
+        controller.enqueue(utf8("hello"));
+        controller.enqueue(utf8("world"));
+        controller.close();
+      },
     });
-    const probeReader = probe.getReader();
-    const readerPrototype = Object.getPrototypeOf(probeReader);
-    probeReader.releaseLock();
+    const response = new Response(stream);
+    assert.equal(response.body, stream);
+    assert.equal(await response.text(), "helloworld");
+  });
 
-    const readError = new TypeError("patched read");
-    const originalRead = readerPrototype.read;
-    try {
-      readerPrototype.read = function () {
-        throw readError;
-      };
-      const stream = new ReadableStream({
-        pull() {},
+  test("ReadableStream text, json and blob join the chunks of default and byte streams, and json rejects invalid JSON with a SyntaxError", async () => {
+    assert.equal(await chunkStream([utf8("ab"), utf8("cd")]).text(), "abcd");
+    const byteChunks = [utf8("ab"), utf8("cd")];
+    const byteStream = new ReadableStream({
+      type: "bytes",
+      pull(controller) {
+        if (byteChunks.length) controller.enqueue(byteChunks.shift());
+        else controller.close();
+      },
+    });
+    assert.equal(await byteStream.text(), "abcd");
+    assert.deepEqual(await chunkStream([utf8("{\"ok\":"), utf8("true}")]).json(), { ok: true });
+    const blob = await chunkStream([utf8("hello "), utf8("world")]).blob();
+    assert(blob instanceof Blob);
+    assert.equal(blob.type, "");
+    assert.equal(await blob.text(), "hello world");
+    await assertRejects(chunkStream([utf8("{")]).json(), SyntaxError);
+  });
+
+  test("Response formData parses a multipart body from the byte chunks of start, pull and asynchronous pull sources", async () => {
+    const boundary = "WebKitFormBoundary7MA4YWxkTrZu0gW";
+    const parts = [
+      `--${boundary}\r\n`,
+      "Content-Disposition: form-data; name=\"field\"\r\n",
+      "\r\n",
+      "value",
+      "\r\n",
+      `--${boundary}\r\n`,
+      "Content-Disposition: form-data; name=\"file\"; filename=\"test.txt\"\r\n",
+      "Content-Type: text/plain\r\n",
+      "\r\n",
+      "hello world",
+      "\r\n",
+      `--${boundary}--\r\n`,
+      "\r\n",
+    ];
+    const sources = [
+      {
+        start(controller) {
+          for (const part of parts) controller.enqueue(utf8(part));
+          controller.close();
+        },
+      },
+      {
+        pull(controller) {
+          for (const part of parts) controller.enqueue(utf8(part));
+          controller.close();
+        },
+      },
+      {
+        async pull(controller) {
+          for (const part of parts) {
+            await Promise.resolve();
+            controller.enqueue(utf8(part));
+          }
+          controller.close();
+        },
+      },
+    ];
+    for (const source of sources) {
+      const response = new Response(new ReadableStream(source), {
+        headers: { "content-type": `multipart/form-data; boundary=${boundary}` },
       });
-      const promise = stream.text();
-      assert(promise instanceof Promise);
-      assert.equal(await promise.catch(error => error), readError);
-    } finally {
-      readerPrototype.read = originalRead;
+      const form = await response.formData();
+      assert.deepEqual([...form.keys()], ["field", "file"]);
+      assert.equal(form.get("field"), "value");
+      const file = form.get("file");
+      assert(file instanceof File);
+      assert.equal(file.name, "test.txt");
+      assert.equal(file.type, "text/plain");
+      assert.equal(await file.text(), "hello world");
+    }
+  });
+
+  test("Body methods reject a stream body beyond the materialized body limit with a QuotaExceededError", async () => {
+    // One byte past WebApiMaterializedBodyBytesMax (limits.h).
+    const oversized = new Uint8Array(4 * 1024 * 1024 + 1);
+    for (const stream of [chunkStream([oversized]), new Blob([oversized]).stream()]) {
+      const error = await assertRejects(new Response(stream).arrayBuffer(), DOMException);
+      assert.equal(error.name, "QuotaExceededError");
     }
   });
 });
@@ -861,6 +1224,27 @@ describe("WritableStream core", () => {
     assert.equal(writable.locked, true);
     writer.releaseLock();
     assert.equal(writable.locked, false);
+  });
+
+  test("the sink starts through a promise, so a first write waits even when start returns synchronously", async () => {
+    for (const hasStart of [true, false]) {
+      const events = [];
+      const sink = {
+        write(chunk) {
+          events.push(`write:${chunk}`);
+        },
+      };
+      if (hasStart) {
+        sink.start = () => {
+          events.push("start");
+        };
+      }
+      const writer = new WritableStream(sink).getWriter();
+      const written = writer.write("a");
+      assert.deepEqual(events, hasStart ? ["start"] : []);
+      await written;
+      assert.deepEqual(events, hasStart ? ["start", "write:a"] : ["write:a"]);
+    }
   });
 
   test("serializes asynchronous writes before close", async () => {
@@ -1334,6 +1718,681 @@ describe("ReadableStream.prototype.pipeTo", () => {
     assert.equal(aborted, "stop");
   });
 
+  describe("ReadableStream pull results, tee, from and Body consumption", () => {
+    const outcome = promise => promise.then(() => "fulfilled", reason => reason);
+
+    async function flushMicrotasks() {
+      for (let index = 0; index < 8; index++) await Promise.resolve();
+    }
+
+    test("pull adopts a thenable it returns and pulls again only once that thenable settles", async () => {
+      let pulls = 0;
+      let settlePull;
+      const stream = new ReadableStream(
+        {
+          pull(controller) {
+            pulls += 1;
+            controller.enqueue(pulls);
+            return {
+              then(resolve) {
+                settlePull = resolve;
+              },
+            };
+          },
+        },
+        { highWaterMark: 0 },
+      );
+      const reader = stream.getReader();
+      assert.deepEqual(await reader.read(), { value: 1, done: false });
+      const second = reader.read();
+      await flushMicrotasks();
+      assert.equal(pulls, 1);
+      settlePull();
+      assert.deepEqual(await second, { value: 2, done: false });
+      assert.equal(pulls, 2);
+    });
+
+    test("a tee reads the original once at a time, even when that read runs script that reads a branch", async () => {
+      let pulls = 0;
+      const [left, right] = new ReadableStream({
+        start(controller) {
+          controller.enqueue("a");
+          controller.enqueue("b");
+        },
+        pull(controller) {
+          pulls += 1;
+          controller.enqueue(`p${pulls}`);
+        },
+      }).tee();
+      const leftReader = left.getReader();
+      const rightReader = right.getReader();
+      // Both branches take "a" and, holding one chunk each, want no more.
+      await flushMicrotasks();
+
+      let reenter = null;
+      Object.defineProperty(Object.prototype, "then", {
+        configurable: true,
+        get() {
+          const action = reenter;
+          reenter = null;
+          if (action) action();
+          return undefined;
+        },
+      });
+      let leftFirst;
+      let rightFirst;
+      try {
+        // Reading "a" from the left branch makes the tee read "b" from the original. Settling that read looks up
+        // `then` on its result, and the getter reads "a" from the right branch, which asks the tee for a chunk again.
+        reenter = () => {
+          rightFirst = rightReader.read();
+        };
+        leftFirst = leftReader.read();
+      } finally {
+        delete Object.prototype.then;
+      }
+      assert.deepEqual(await leftFirst, { value: "a", done: false });
+      assert.deepEqual(await rightFirst, { value: "a", done: false });
+      assert.deepEqual(await leftReader.read(), { value: "b", done: false });
+      assert.deepEqual(await leftReader.read(), { value: "p1", done: false });
+      assert.deepEqual(await rightReader.read(), { value: "b", done: false });
+    });
+
+    test("a tee keeps its read in flight until the chunk reached both branches, so a branch read from a then getter loses nothing", async () => {
+      let controller;
+      const [left, right] = new ReadableStream({
+        start(value) {
+          controller = value;
+        },
+      }).tee();
+      const leftReader = left.getReader();
+      const rightReader = right.getReader();
+      const leftFirst = leftReader.read();
+      await flushMicrotasks();
+
+      // The first result holding "a" is the tee's read of the original, settled inside enqueue(). The second is the
+      // left branch's, settled while the tee hands "a" to the branches; the getter reads the right branch from there,
+      // which asks the tee for a chunk while "a" is still on its way to the right branch.
+      let sightings = 0;
+      let nested = null;
+      Object.defineProperty(Object.prototype, "then", {
+        configurable: true,
+        get() {
+          if (this !== null && typeof this === "object" && this.value === "a" && ++sightings === 2) {
+            delete Object.prototype.then;
+            nested = rightReader.read();
+          }
+          return undefined;
+        },
+      });
+      try {
+        controller.enqueue("a");
+        controller.enqueue("b");
+        controller.close();
+        await flushMicrotasks();
+      } finally {
+        delete Object.prototype.then;
+      }
+
+      assert(nested !== null, "settling the left read looked up no then");
+      assert.deepEqual(await leftFirst, { value: "a", done: false });
+      assert.deepEqual(await nested, { value: "a", done: false });
+      assert.deepEqual(await leftReader.read(), { value: "b", done: false });
+      assert.deepEqual(await leftReader.read(), { value: undefined, done: true });
+      assert.deepEqual(await rightReader.read(), { value: "b", done: false });
+      assert.deepEqual(await rightReader.read(), { value: undefined, done: true });
+    });
+
+    test("a tee of a native stream with bytes already queued reads them first, so both branches get every byte", async () => {
+      const total = 100000;
+      const data = new Uint8Array(total);
+      for (let index = 0; index < total; index++) data[index] = index & 0xff;
+      const stream = new Blob([data]).stream();
+      // The Blob's source hands over its first chunk whole; the read takes 10 bytes and the rest stays queued.
+      const reader = stream.getReader({ mode: "byob" });
+      const first = await reader.read(new Uint8Array(10));
+      assert.deepEqual(Array.from(first.value), Array.from(data.subarray(0, 10)));
+      reader.releaseLock();
+
+      const [left, right] = stream.tee();
+      const [leftBytes, rightBytes] = await Promise.all([collectBytes(left), collectBytes(right)]);
+      for (const bytes of [leftBytes, rightBytes]) {
+        assert.equal(bytes.byteLength, total - 10);
+        assert.deepEqual(Array.from(bytes.subarray(0, 4)), Array.from(data.subarray(10, 14)));
+        assert.deepEqual(Array.from(bytes.subarray(bytes.byteLength - 4)), Array.from(data.subarray(total - 4)));
+      }
+    });
+
+    test("tee branches' cancels share one promise that follows the original's cancel, or resolves when the original ends first", async () => {
+      const cancelError = new Error("cancel failed");
+      const [left, right] = new ReadableStream({
+        cancel() {
+          throw cancelError;
+        },
+      }).tee();
+      const leftCancel = left.cancel("left");
+      const rightCancel = right.cancel("right");
+      assert.equal(await outcome(leftCancel), cancelError);
+      assert.equal(await outcome(rightCancel), cancelError);
+
+      let closeController;
+      const [first, second] = new ReadableStream({
+        start(controller) {
+          closeController = controller;
+        },
+      }).tee();
+      let firstSettled = false;
+      const firstCancel = first.cancel("first").then(() => {
+        firstSettled = true;
+      });
+      await flushMicrotasks();
+      assert.equal(firstSettled, false);
+      closeController.close();
+      await firstCancel;
+      assert.deepEqual(await second.getReader().read(), { value: undefined, done: true });
+
+      let errorController;
+      const [third] = new ReadableStream({
+        start(controller) {
+          errorController = controller;
+        },
+      }).tee();
+      const thirdCancel = third.cancel("third");
+      errorController.error(new Error("source failed"));
+      assert.equal(await thirdCancel, undefined);
+    });
+
+    test("a tee errors both branches as soon as the original errors, with no read in flight", async () => {
+      const sourceError = new Error("source failed");
+      let sourceController;
+      const [left, right] = new ReadableStream({
+        start(controller) {
+          sourceController = controller;
+          controller.enqueue("x");
+        },
+      }).tee();
+      // Both branches take "x"; the tee then has no read in flight.
+      await flushMicrotasks();
+      sourceController.error(sourceError);
+      await flushMicrotasks();
+      for (const branch of [left, right])
+        assert.equal(await outcome(branch.getReader().read()), sourceError);
+    });
+
+    test("a tee closes both branches when the original closes while the tee is idle, or was closed before the tee", async () => {
+      async function expectDone(reader, label) {
+        let result;
+        reader.read().then(value => {
+          result = value;
+        });
+        await waitForMicrotaskCondition(label, () => result !== undefined);
+        assert.deepEqual(result, { value: undefined, done: true });
+      }
+
+      let sourceController;
+      const [left, right] = new ReadableStream({
+        start(controller) {
+          sourceController = controller;
+          controller.enqueue("x");
+        },
+      }).tee();
+      await flushMicrotasks();
+      sourceController.close();
+      for (const branch of [left, right]) {
+        const reader = branch.getReader();
+        assert.deepEqual(await reader.read(), { value: "x", done: false });
+        await expectDone(reader, "a branch of an original that closed while the tee was idle closes");
+      }
+
+      const closed = new ReadableStream({
+        start(controller) {
+          controller.close();
+        },
+      });
+      for (const branch of closed.tee())
+        await expectDone(branch.getReader(), "a branch of a closed stream closes");
+    });
+
+    test("ReadableStream.from keeps a sync iterator's rejected value as the error when closing the iterator throws", async () => {
+      const throwingReturn = {
+        [Symbol.iterator]() {
+          return this;
+        },
+        next() {
+          return { done: false, value: Promise.reject("value") };
+        },
+        return() {
+          throw "return";
+        },
+      };
+      assert.equal(await outcome(ReadableStream.from(throwingReturn).getReader().read()), "value");
+
+      const throwingGetter = {
+        [Symbol.iterator]() {
+          return this;
+        },
+        next() {
+          return { done: false, value: Promise.reject("value") };
+        },
+        get return() {
+          throw "getter";
+        },
+      };
+      assert.equal(await outcome(ReadableStream.from(throwingGetter).getReader().read()), "value");
+    });
+
+    test("ReadableStream.from reads and awaits the value of a sync iterator's done result before closing", async () => {
+      let valueReads = 0;
+      const plain = {
+        [Symbol.iterator]() {
+          return this;
+        },
+        next() {
+          return {
+            done: true,
+            get value() {
+              valueReads += 1;
+              return "ignored";
+            },
+          };
+        },
+      };
+      assert.deepEqual(await ReadableStream.from(plain).getReader().read(), { value: undefined, done: true });
+      assert.equal(valueReads, 1);
+
+      let returnCalls = 0;
+      const rejecting = {
+        [Symbol.iterator]() {
+          return this;
+        },
+        next() {
+          return { done: true, value: Promise.reject("late") };
+        },
+        return() {
+          returnCalls += 1;
+          return {};
+        },
+      };
+      assert.equal(await outcome(ReadableStream.from(rejecting).getReader().read()), "late");
+      // The iterator said it was done, so its rejected value does not close it.
+      assert.equal(returnCalls, 0);
+    });
+
+    test("Body consumption leaves the stream locked after it succeeds or fails, drained in one step or read chunk by chunk", async () => {
+      const drained = new Blob([utf8("abc")]).stream();
+      assert.equal(await new Response(drained).text(), "abc");
+      assert.equal(drained.locked, true);
+      assert.throws(() => drained.getReader(), TypeError);
+
+      const read = chunkStream([utf8("abc")]);
+      assert.equal(await new Response(read).text(), "abc");
+      assert.equal(read.locked, true);
+
+      const failed = chunkStream(["not bytes"]);
+      await assertRejects(new Response(failed).text(), TypeError);
+      assert.equal(failed.locked, true);
+    });
+  });
+
+  test("pipes sharing an AbortSignal each abort once, including those after pipes that settle during the abort", async () => {
+    const controller = new AbortController();
+    const reason = new Error("stop");
+    // Every other pipe, starting with the first, prevents both actions, so it settles while the signal is still running
+    // its abort steps for the pipes after it.
+    const pipes = [];
+    for (let index = 0; index < 6; index++) {
+      const pipe = { prevent: index % 2 === 0, cancels: [], aborts: [] };
+      pipe.source = new ReadableStream({
+        cancel(value) {
+          pipe.cancels.push(value);
+        },
+      });
+      pipe.destination = new WritableStream({
+        abort(value) {
+          pipe.aborts.push(value);
+        },
+      });
+      const options = pipe.prevent
+        ? { signal: controller.signal, preventAbort: true, preventCancel: true }
+        : { signal: controller.signal };
+      pipe.result = pipe.source.pipeTo(pipe.destination, options).then(
+        () => "resolved",
+        error => error,
+      );
+      pipes.push(pipe);
+    }
+
+    controller.abort(reason);
+    for (const pipe of pipes) {
+      assert.equal(await pipe.result, reason);
+      assert.deepEqual(pipe.cancels, pipe.prevent ? [] : [reason]);
+      assert.deepEqual(pipe.aborts, pipe.prevent ? [] : [reason]);
+      assert.equal(pipe.source.locked, false);
+      assert.equal(pipe.destination.locked, false);
+    }
+  });
+
+  describe("shutdown conditions and actions", () => {
+    // The pipe's outcome, "resolved" or its rejection reason. Fails once the pipe is still pending after more
+    // microtasks than any pipe here needs, so a pipe that never settles fails at once.
+    async function outcome(promise) {
+      const pending = {};
+      let result = pending;
+      promise.then(
+        () => {
+          result = "resolved";
+        },
+        error => {
+          result = error;
+        },
+      );
+      for (let tick = 0; tick < 64 && result === pending; tick++) await Promise.resolve();
+      if (result === pending) throw new Error("the pipe did not settle");
+      return result;
+    }
+
+    test("an already closed or errored source ends a pipe into a destination whose highWaterMark is 0", async () => {
+      let closed = false;
+      const closing = new ReadableStream({
+        start(controller) {
+          controller.close();
+        },
+      }).pipeTo(
+        new WritableStream(
+          {
+            close() {
+              closed = true;
+            },
+          },
+          { highWaterMark: 0 },
+        ),
+      );
+      assert.equal(await outcome(closing), "resolved");
+      assert.equal(closed, true);
+
+      const broken = new Error("broken");
+      let aborted;
+      const aborting = new ReadableStream({
+        start(controller) {
+          controller.error(broken);
+        },
+      }).pipeTo(
+        new WritableStream(
+          {
+            abort(reason) {
+              aborted = reason;
+            },
+          },
+          { highWaterMark: 0 },
+        ),
+      );
+      assert.equal(await outcome(aborting), broken);
+      assert.equal(aborted, broken);
+    });
+
+    test("a destination its controller errors while the source idles rejects the pipe and cancels the source", async () => {
+      const broken = new Error("broken");
+      let destinationController;
+      let canceled;
+      const source = new ReadableStream({
+        cancel(reason) {
+          canceled = reason;
+        },
+      });
+      const destination = new WritableStream({
+        start(controller) {
+          destinationController = controller;
+        },
+      });
+      const piping = source.pipeTo(destination);
+      await Promise.resolve();
+      destinationController.error(broken);
+      assert.equal(await outcome(piping), broken);
+      assert.equal(canceled, broken);
+    });
+
+    test("a destination errored before the source closes rejects the pipe with the destination's error", async () => {
+      const broken = new Error("broken");
+      let sourceController;
+      let destinationController;
+      const source = new ReadableStream({
+        start(controller) {
+          sourceController = controller;
+        },
+      });
+      const destination = new WritableStream({
+        start(controller) {
+          destinationController = controller;
+        },
+      });
+      const piping = source.pipeTo(destination);
+      await Promise.resolve();
+      destinationController.error(broken);
+      sourceController.close();
+      assert.equal(await outcome(piping), broken);
+    });
+
+    test("a closed source piped into a destination that is closed or closing resolves", async () => {
+      const closedDestination = new WritableStream();
+      const closedWriter = closedDestination.getWriter();
+      await closedWriter.close();
+      closedWriter.releaseLock();
+
+      const closingDestination = new WritableStream({
+        close() {
+          return new Promise(() => {});
+        },
+      });
+      const closingWriter = closingDestination.getWriter();
+      void closingWriter.close();
+      closingWriter.releaseLock();
+
+      for (const destination of [closedDestination, closingDestination]) {
+        const source = new ReadableStream({
+          start(controller) {
+            controller.close();
+          },
+        });
+        assert.equal(await outcome(source.pipeTo(destination)), "resolved");
+        assert.equal(destination.locked, false);
+      }
+    });
+
+    test("a write queued before the pipe took the lock does not stall the pipe once it finishes", async () => {
+      const written = [];
+      let releaseFirst;
+      const destination = new WritableStream({
+        write(chunk) {
+          written.push(chunk);
+          if (chunk === "x") {
+            return new Promise(resolve => {
+              releaseFirst = resolve;
+            });
+          }
+        },
+      });
+      const writer = destination.getWriter();
+      const first = writer.write("x");
+      writer.releaseLock();
+      const source = new ReadableStream({
+        start(controller) {
+          controller.enqueue("y");
+          controller.close();
+        },
+      });
+      const piping = source.pipeTo(destination);
+      await waitForMicrotaskCondition("the queued write to reach the sink", () => typeof releaseFirst === "function");
+      releaseFirst();
+      await first;
+      assert.equal(await outcome(piping), "resolved");
+      assert.deepEqual(written, ["x", "y"]);
+    });
+
+    test("a source that closes while backpressure holds the pipe closes the destination, even if the signal aborts later", async () => {
+      const controller = new AbortController();
+      let sourceController;
+      let releaseWrite;
+      let closed = false;
+      let aborted = false;
+      const source = new ReadableStream({
+        start(streamController) {
+          sourceController = streamController;
+          streamController.enqueue("a");
+        },
+      });
+      const destination = new WritableStream({
+        write() {
+          return new Promise(resolve => {
+            releaseWrite = resolve;
+          });
+        },
+        close() {
+          closed = true;
+        },
+        abort() {
+          aborted = true;
+        },
+      });
+      const piping = source.pipeTo(destination, { signal: controller.signal });
+      await waitForMicrotaskCondition("the first write to reach the sink", () => typeof releaseWrite === "function");
+      sourceController.close();
+      // The pipe sees the close when the source reader's closed promise resolves, a microtask later.
+      await Promise.resolve();
+      await Promise.resolve();
+      controller.abort("stop");
+      releaseWrite();
+      assert.equal(await outcome(piping), "resolved");
+      assert.equal(closed, true);
+      assert.equal(aborted, false);
+    });
+
+    test("a chunk the source delivers while a shutdown waits for writes is written before the destination is aborted", async () => {
+      const controller = new AbortController();
+      const written = [];
+      let sourceController;
+      let releaseWrite;
+      let aborted;
+      let canceled;
+      let pulls = 0;
+      // A source of highWaterMark 0 pulls only for a pending read, so its second pull shows the pipe's second read.
+      const source = new ReadableStream(
+        {
+          pull(streamController) {
+            pulls += 1;
+            if (pulls === 1) {
+              streamController.enqueue("x");
+              return undefined;
+            }
+            sourceController = streamController;
+            return new Promise(() => {});
+          },
+          cancel(reason) {
+            canceled = reason;
+          },
+        },
+        { highWaterMark: 0 },
+      );
+      // Room for two chunks, so the pipe reads again while the sink still writes the first.
+      const destination = new WritableStream(
+        {
+          write(chunk) {
+            written.push(chunk);
+            if (chunk === "x") {
+              return new Promise(resolve => {
+                releaseWrite = resolve;
+              });
+            }
+          },
+          abort(reason) {
+            aborted = reason;
+          },
+        },
+        { highWaterMark: 2 },
+      );
+      const piping = source.pipeTo(destination, { signal: controller.signal });
+      await waitForMicrotaskCondition("a second read during the first write", () => pulls === 2 && releaseWrite !== undefined);
+      controller.abort("stop");
+      releaseWrite();
+      // The chunk arrives after the first write has finished but before the pipe has seen it finish.
+      await Promise.resolve();
+      sourceController.enqueue("y");
+      assert.equal(await outcome(piping), "stop");
+      assert.deepEqual(written, ["x", "y"]);
+      assert.equal(aborted, "stop");
+      assert.equal(canceled, "stop");
+    });
+
+    test("the first shutdown action to reject gives the pipe its reason without waiting for the other", async () => {
+      async function abortPipe(cancel) {
+        const controller = new AbortController();
+        const source = new ReadableStream({ cancel });
+        const destination = new WritableStream({
+          abort() {
+            return Promise.reject("a");
+          },
+        });
+        const piping = source.pipeTo(destination, { signal: controller.signal });
+        // Lets the destination start, so the abort reaches its sink at once.
+        for (let tick = 0; tick < 4; tick++) await Promise.resolve();
+        controller.abort("stop");
+        return outcome(piping);
+      }
+      assert.equal(await abortPipe(() => Promise.reject("c")), "a");
+      assert.equal(await abortPipe(() => new Promise(() => {})), "a");
+    });
+
+    test("a signal abort leaves an errored source alone, so the pipe rejects with the signal's reason", async () => {
+      const broken = new Error("broken");
+      const controller = new AbortController();
+      controller.abort("stop");
+      let aborted;
+      const source = new ReadableStream({
+        start(streamController) {
+          streamController.error(broken);
+        },
+      });
+      const destination = new WritableStream({
+        abort(reason) {
+          aborted = reason;
+        },
+      });
+      assert.equal(await outcome(source.pipeTo(destination, { signal: controller.signal })), "stop");
+      assert.equal(aborted, "stop");
+    });
+
+    test("pipeTo marks the source disturbed even when it never reads from it", async () => {
+      // A Response's bodyUsed reports whether its stream is disturbed; a constructor that refuses a disturbed stream
+      // reports it too.
+      function disturbed(stream) {
+        try {
+          return new Response(stream).bodyUsed;
+        } catch (error) {
+          return error instanceof TypeError;
+        }
+      }
+      assert.equal(disturbed(new ReadableStream()), false);
+
+      const aborted = new AbortController();
+      aborted.abort("stop");
+      const preAborted = new ReadableStream();
+      const preAbortedOptions = { signal: aborted.signal, preventCancel: true };
+      assert.equal(await outcome(preAborted.pipeTo(new WritableStream(), preAbortedOptions)), "stop");
+      assert.equal(preAborted.locked, false);
+      assert.equal(disturbed(preAborted), true);
+
+      const controller = new AbortController();
+      const held = new ReadableStream();
+      const piping = held.pipeTo(new WritableStream({}, { highWaterMark: 0 }), {
+        signal: controller.signal,
+        preventCancel: true,
+      });
+      await Promise.resolve();
+      controller.abort("stop");
+      assert.equal(await outcome(piping), "stop");
+      assert.equal(disturbed(held), true);
+    });
+  });
+
   test("signal option getter value is kept alive until pipeTo installs it", async () => {
     let controller = new AbortController();
     const options = {};
@@ -1634,6 +2693,185 @@ describe("TransformStream core", () => {
     assert.deepEqual(await reader.read(), { value: "first", done: false });
     assert.deepEqual(await reader.read(), { value: "second", done: false });
     await first;
+  });
+});
+
+describe("TransformStream with a native transformer", () => {
+  // The promise's outcome after more microtask turns than any step here takes: { pending: true }, { value } or
+  // { error }.
+  async function outcomeSoon(promise) {
+    let outcome = { pending: true };
+    promise.then(
+      value => {
+        outcome = { value };
+      },
+      error => {
+        outcome = { error };
+      },
+    );
+    for (let index = 0; index < 32; index++) await Promise.resolve();
+    return outcome;
+  }
+
+  async function flush() {
+    for (let index = 0; index < 8; index++) await Promise.resolve();
+  }
+
+  test("a write waits for a pull before its chunk reaches the transformer", async () => {
+    const encoder = new TextEncoderStream();
+    const writer = encoder.writable.getWriter();
+    let conversions = 0;
+    const write = writer.write({
+      toString() {
+        conversions += 1;
+        return "";
+      },
+    });
+    assert.deepEqual(await outcomeSoon(write), { pending: true });
+    assert.equal(conversions, 0);
+    const reader = encoder.readable.getReader();
+    const read = reader.read();
+    // The chunk converts to no output, so the write settles with the read still waiting.
+    assert.deepEqual(await outcomeSoon(write), { value: undefined });
+    assert.equal(conversions, 1);
+    await writer.close();
+    assert.deepEqual(await read, { value: undefined, done: true });
+
+    // A fatal decoder meets the invalid byte only once a read lets the write through.
+    const decoder = new TextDecoderStream("utf-8", { fatal: true });
+    const decoderWriter = decoder.writable.getWriter();
+    const decoderWrite = decoderWriter.write(new Uint8Array([0xff]));
+    assert.deepEqual(await outcomeSoon(decoderWrite), { pending: true });
+    const decoderRead = decoder.readable.getReader().read();
+    assert((await outcomeSoon(decoderWrite)).error instanceof TypeError);
+    await assertRejects(decoderRead, TypeError);
+  });
+
+  test("a pull lifts backpressure until output is enqueued, so a write after its reader let go still converts at once", async () => {
+    const encoder = new TextEncoderStream();
+    const writer = encoder.writable.getWriter();
+    const firstReader = encoder.readable.getReader();
+    const released = firstReader.read().catch(() => "released");
+    await flush();
+    firstReader.releaseLock();
+    assert.equal(await released, "released");
+
+    let conversions = 0;
+    const write = writer.write({
+      toString() {
+        conversions += 1;
+        return "y";
+      },
+    });
+    // The chunk converts now; its output waits for a read.
+    assert.deepEqual(await outcomeSoon(write), { pending: true });
+    assert.equal(conversions, 1);
+    const reader = encoder.readable.getReader();
+    assert.deepEqual(Array.from((await reader.read()).value), [0x79]);
+    assert.deepEqual(await outcomeSoon(write), { value: undefined });
+  });
+
+  test("a read made from a write's conversion waits for that write's output", async () => {
+    const encoder = new TextEncoderStream();
+    const reader = encoder.readable.getReader();
+    const writer = encoder.writable.getWriter();
+    // Both sides have started, so the write below reaches the transformer inside write().
+    await writer.ready;
+    await flush();
+    const first = reader.read();
+    let nested = null;
+    const write = writer.write({
+      toString() {
+        nested = reader.read();
+        return "x";
+      },
+    });
+    assert.deepEqual(await outcomeSoon(write), { value: undefined });
+    assert.deepEqual(Array.from((await first).value), [0x78]);
+    await writer.close();
+    assert(nested !== null, "the conversion never ran");
+    assert.deepEqual(await nested, { value: undefined, done: true });
+  });
+
+  test("close resolves once the last output is enqueued, before any read takes it", async () => {
+    const encoder = new TextEncoderStream();
+    const encoderReader = encoder.readable.getReader();
+    const encoderWriter = encoder.writable.getWriter();
+    const firstEncoded = encoderReader.read();
+    await encoderWriter.write("a\uD83D");
+    assert.deepEqual(Array.from((await firstEncoded).value), [0x61]);
+    // The lead surrogate the write carried becomes U+FFFD at close.
+    assert.deepEqual(await outcomeSoon(encoderWriter.close()), { value: undefined });
+    assert.deepEqual(Array.from((await encoderReader.read()).value), [0xef, 0xbf, 0xbd]);
+    assert.deepEqual(await encoderReader.read(), { value: undefined, done: true });
+
+    const decoder = new TextDecoderStream();
+    const decoderReader = decoder.readable.getReader();
+    const decoderWriter = decoder.writable.getWriter();
+    const firstDecoded = decoderReader.read();
+    await decoderWriter.write(new Uint8Array([0x41, 0xe2]));
+    assert.deepEqual(await firstDecoded, { value: "A", done: false });
+    assert.deepEqual(await outcomeSoon(decoderWriter.close()), { value: undefined });
+    assert.deepEqual(await decoderReader.read(), { value: "�", done: false });
+    assert.deepEqual(await decoderReader.read(), { value: undefined, done: true });
+
+    const compressor = new CompressionStream("gzip");
+    const compressorReader = compressor.readable.getReader();
+    const compressorWriter = compressor.writable.getWriter();
+    const firstCompressed = compressorReader.read();
+    await compressorWriter.write(utf8("hello"));
+    assert.deepEqual(await outcomeSoon(compressorWriter.close()), { value: undefined });
+    const chunks = [];
+    for (let result = await firstCompressed; !result.done; result = await compressorReader.read())
+      chunks.push(result.value);
+    const decompressed = new Blob(chunks).stream().pipeThrough(new DecompressionStream("gzip"));
+    assert.equal(await new Response(decompressed).text(), "hello");
+  });
+
+  test("a write whose conversion cancels the readable side rejects with the cancel's reason", async () => {
+    const encoder = new TextEncoderStream();
+    const reader = encoder.readable.getReader();
+    const writer = encoder.writable.getWriter();
+    const reason = new Error("canceled during the conversion");
+    const read = reader.read();
+    let cancel = null;
+    const write = writer.write({
+      toString() {
+        cancel = reader.cancel(reason);
+        return "x";
+      },
+    });
+    const outcome = await outcomeSoon(write);
+    assert.equal(outcome.error, reason);
+    assert.deepEqual(await read, { value: undefined, done: true });
+    assert(cancel !== null, "the conversion never ran");
+    assert.equal(await cancel, undefined);
+  });
+
+  test("each class's readable and writable accessors accept only its own instances", () => {
+    const classes = { TransformStream, CompressionStream, DecompressionStream, TextEncoderStream, TextDecoderStream };
+    const instances = {
+      TransformStream: new TransformStream(),
+      CompressionStream: new CompressionStream("gzip"),
+      DecompressionStream: new DecompressionStream("gzip"),
+      TextEncoderStream: new TextEncoderStream(),
+      TextDecoderStream: new TextDecoderStream(),
+    };
+    for (const [className, Class] of Object.entries(classes)) {
+      for (const [instanceName, instance] of Object.entries(instances)) {
+        for (const [side, Side] of [["readable", ReadableStream], ["writable", WritableStream]]) {
+          if (className === instanceName) {
+            assert(Reflect.get(Class.prototype, side, instance) instanceof Side, `${className}.prototype.${side}`);
+          } else {
+            assert.throws(
+              () => Reflect.get(Class.prototype, side, instance),
+              TypeError,
+              `${className}.prototype.${side} accepted a ${instanceName}`,
+            );
+          }
+        }
+      }
+    }
   });
 });
 
@@ -2000,10 +3238,17 @@ describe("CompressionStream and DecompressionStream", () => {
     assert.equal(await writeResultPromise, "stop");
   });
 
+  // A write reaches the codec, which checks its chunk, only once a read waits.
+  function readingCompressionWriter() {
+    const stream = new CompressionStream("gzip");
+    stream.readable.getReader().read().catch(() => {});
+    return stream.writable.getWriter();
+  }
+
   test("compression write rejects non-BufferSource chunks including strings", async () => {
     // Per the Compression spec, chunks must be BufferSource.
     for (const chunk of [{}, "hello", 42, null, undefined]) {
-      const writer = new CompressionStream("gzip").writable.getWriter();
+      const writer = readingCompressionWriter();
       assert(await writer.write(chunk).then(
         () => false,
         error => error instanceof TypeError,
@@ -2014,19 +3259,19 @@ describe("CompressionStream and DecompressionStream", () => {
   test("compression write rejects unavailable BufferSource chunks", async () => {
     const detached = new ArrayBuffer(8);
     structuredClone(detached, { transfer: [detached] });
-    const writer = new CompressionStream("gzip").writable.getWriter();
+    const writer = readingCompressionWriter();
     await assertRejects(writer.write(detached), TypeError);
 
     if (typeof ArrayBuffer.prototype.resize === "function") {
       const resizable = new ArrayBuffer(8, { maxByteLength: 8 });
-      const resizableWriter = new CompressionStream("gzip").writable.getWriter();
+      const resizableWriter = readingCompressionWriter();
       await assertRejects(resizableWriter.write(resizable), TypeError);
 
       const buffer = new ArrayBuffer(8, { maxByteLength: 8 });
       const view = new Uint8Array(buffer, 4, 4);
       buffer.resize(2);
 
-      const viewWriter = new CompressionStream("gzip").writable.getWriter();
+      const viewWriter = readingCompressionWriter();
       await assertRejects(viewWriter.write(view), TypeError);
     }
   });
@@ -2160,22 +3405,18 @@ describe("Body stream integration", () => {
     assert.deepEqual(third, { value: undefined, done: true });
   });
 
-  test("native source keeps a pending chunk when releaseLock races pull fulfillment", async () => {
+  test("a Blob stream fulfills a read from its synchronous source before a releaseLock right after it", async () => {
+    // A deliberate departure from the File API, whose Blob stream reads its bytes in parallel and so always answers a
+    // pull later: Collo's Blob source answers at once, from bytes already in memory.
     const stream = new Blob(["abc"]).stream();
     const reader = stream.getReader();
-    const pending = reader.read().then(
-      () => "resolved",
-      error => String(error && (error.message || error)),
-    );
-
+    const pending = reader.read();
     reader.releaseLock();
-    assert((await pending).includes("reader was released"));
 
-    const nextReader = stream.getReader();
-    const first = await nextReader.read();
+    const first = await pending;
     assert.equal(first.done, false);
     assert.equal(new TextDecoder().decode(first.value), "abc");
-    assert.deepEqual(await nextReader.read(), { value: undefined, done: true });
+    assert.deepEqual(await stream.getReader().read(), { value: undefined, done: true });
   });
 
   test("Blob.stream tee reads both branches", async () => {
@@ -2297,5 +3538,324 @@ describe("Body stream integration", () => {
       error => String(error && (error.message || error)),
     );
     assert(rejection.includes("body stream already used"));
+  });
+});
+
+describe("Sink and transformer callbacks, abort and chunk checks", () => {
+  // The promise's outcome after a bounded number of microtask turns, so a promise that never settles fails the
+  // assertion instead of stalling the test.
+  async function outcomeAfterMicrotasks(promise) {
+    let outcome = { pending: true };
+    promise.then(
+      value => {
+        outcome = { value };
+      },
+      error => {
+        outcome = { error };
+      },
+    );
+    for (let index = 0; index < 32; index++) await Promise.resolve();
+    return outcome;
+  }
+
+  test("32768 writes that each finish synchronously complete without nesting a native call per write", async () => {
+    // A few native frames per write exhaust an 8 MiB stack in about ten thousand writes, so this many would overflow it
+    // if writes nested, while staying small enough for the forced-collection profile.
+    const count = 32768;
+    const transform = new TransformStream(undefined, undefined, { highWaterMark: Infinity });
+    const writer = transform.writable.getWriter();
+    for (let index = 0; index < count; index++) writer.write(index);
+    await writer.close();
+    const reader = transform.readable.getReader();
+    for (let index = 0; index < count; index++) {
+      const { value } = await reader.read();
+      if (value !== index) assert.equal(value, index);
+    }
+    assert.equal((await reader.read()).done, true);
+
+    let written = 0;
+    const sink = new WritableStream(
+      {
+        write() {
+          written++;
+        },
+      },
+      { highWaterMark: Infinity },
+    );
+    const sinkWriter = sink.getWriter();
+    for (let index = 0; index < count; index++) sinkWriter.write(index);
+    await sinkWriter.close();
+    assert.equal(written, count);
+  });
+
+  test("a sink's write and close adopt the thenables they return", async () => {
+    const events = [];
+    const resolvers = [];
+    const thenable = name => ({
+      then(resolve) {
+        events.push(name);
+        resolvers.push(resolve);
+      },
+    });
+    const stream = new WritableStream({
+      write(chunk) {
+        return thenable(`write ${chunk}`);
+      },
+      close() {
+        return thenable("close");
+      },
+    });
+    const writer = stream.getWriter();
+    const write = writer.write("a").then(() => events.push("write settled"));
+    const close = writer.close().then(() => events.push("close settled"));
+    await waitForMicrotaskCondition("the write's then", () => events.length > 0);
+    assert.deepEqual(events, ["write a"]);
+    resolvers.shift()();
+    await write;
+    await waitForMicrotaskCondition("the close's then", () => events.includes("close"));
+    assert.deepEqual(events, ["write a", "write settled", "close"]);
+    resolvers.shift()();
+    await close;
+    assert.deepEqual(events, ["write a", "write settled", "close", "close settled"]);
+  });
+
+  test("a sink's abort adopts the thenable it returns", async () => {
+    const events = [];
+    let resolveAbort = null;
+    const stream = new WritableStream({
+      abort() {
+        return {
+          then(resolve) {
+            events.push("then");
+            resolveAbort = resolve;
+          },
+        };
+      },
+    });
+    await Promise.resolve();
+    const abort = stream.abort("stop").then(() => events.push("abort settled"));
+    await waitForMicrotaskCondition("the abort's then", () => events.length > 0);
+    assert.deepEqual(events, ["then"]);
+    resolveAbort();
+    await abort;
+    assert.deepEqual(events, ["then", "abort settled"]);
+  });
+
+  test("a transformer's transform and flush adopt the thenables they return", async () => {
+    const events = [];
+    const resolvers = [];
+    const thenable = name => ({
+      then(resolve) {
+        events.push(name);
+        resolvers.push(resolve);
+      },
+    });
+    const stream = new TransformStream(
+      {
+        transform(chunk) {
+          return thenable(`transform ${chunk}`);
+        },
+        flush() {
+          return thenable("flush");
+        },
+      },
+      undefined,
+      { highWaterMark: 1 },
+    );
+    const writer = stream.writable.getWriter();
+    const write = writer.write("a").then(() => events.push("write settled"));
+    const close = writer.close().then(() => events.push("close settled"));
+    await waitForMicrotaskCondition("the transform's then", () => events.length > 0);
+    assert.deepEqual(events, ["transform a"]);
+    resolvers.shift()();
+    await write;
+    await waitForMicrotaskCondition("the flush's then", () => events.includes("flush"));
+    assert.deepEqual(events, ["transform a", "write settled", "flush"]);
+    resolvers.shift()();
+    await close;
+    assert.deepEqual(events, ["transform a", "write settled", "flush", "close settled"]);
+  });
+
+  test("a read result whose value a then getter made an accessor hands the pipe no engine-internal value", async () => {
+    const chunk = { marker: true };
+    const received = [];
+    const source = new ReadableStream({
+      start(controller) {
+        controller.enqueue(chunk);
+        controller.close();
+      },
+    });
+    const destination = new WritableStream({
+      write(value) {
+        received.push(value);
+      },
+    });
+    Object.defineProperty(Object.prototype, "then", {
+      configurable: true,
+      get() {
+        if (this !== null && typeof this === "object" && Object.hasOwn(this, "done") && Object.hasOwn(this, "value")) {
+          if (Object.getOwnPropertyDescriptor(this, "value").value === chunk)
+            Object.defineProperty(this, "value", { configurable: true, enumerable: true, get: () => chunk });
+        }
+        return undefined;
+      },
+    });
+    try {
+      await source.pipeTo(destination);
+    } finally {
+      delete Object.prototype.then;
+    }
+    assert.equal(received.length, 1);
+    // The standard hands the pipe the chunk itself. A pipe that reads it from the result object may see the accessor
+    // as no value, but never the engine's accessor cell.
+    assert(received[0] === chunk || received[0] === undefined, "the sink received an engine-internal value");
+  });
+
+  test("a write parked under backpressure never reaches transform once the writable side errored", async () => {
+    const transformed = [];
+    const sizeError = new Error("size");
+    let sizes = 0;
+    const stream = new TransformStream(
+      {
+        transform(chunk, controller) {
+          transformed.push(chunk);
+          controller.enqueue(chunk);
+        },
+      },
+      {
+        size() {
+          sizes++;
+          if (sizes === 2) throw sizeError;
+          return 1;
+        },
+      },
+    );
+    const writer = stream.writable.getWriter();
+    const first = writer.write("a").then(() => "resolved", error => error);
+    // Start settles and the first write parks: the readable side's high-water mark of 0 sets backpressure.
+    for (let index = 0; index < 4; index++) await Promise.resolve();
+    const second = writer.write("b").then(() => "resolved", error => error);
+    assert.equal(await second, sizeError);
+    const reader = stream.readable.getReader();
+    let readSettled = false;
+    reader.read().then(
+      () => {
+        readSettled = true;
+      },
+      () => {
+        readSettled = true;
+      },
+    );
+    for (let index = 0; index < 8; index++) await Promise.resolve();
+    assert.deepEqual(transformed, []);
+    assert.equal(readSettled, false);
+    assert.equal(await first, sizeError);
+  });
+
+  test("TransformStream refuses a null transformer with a TypeError and takes an undefined one", () => {
+    assert.throws(() => new TransformStream(null), TypeError);
+    assert(new TransformStream(undefined).readable instanceof ReadableStream);
+  });
+
+  test("a rejected transformer start rejects the writer's closed promise before the reader's", async () => {
+    const order = [];
+    const stream = new TransformStream({
+      start() {
+        return Promise.reject(new Error("start"));
+      },
+    });
+    const writerClosed = stream.writable.getWriter().closed.catch(() => order.push("writable"));
+    const readerClosed = stream.readable.getReader().closed.catch(() => order.push("readable"));
+    await Promise.all([writerClosed, readerClosed]);
+    assert.deepEqual(order, ["writable", "readable"]);
+  });
+
+  test("once start has settled, a second abort resolves at once while the first waits for the sink", async () => {
+    let resolveAbort = null;
+    const stream = new WritableStream({
+      abort() {
+        return new Promise(resolve => {
+          resolveAbort = resolve;
+        });
+      },
+    });
+    await Promise.resolve();
+    const first = stream.abort("first");
+    assert(resolveAbort !== null, "the sink's abort ran");
+    const second = stream.abort("second");
+    assert(second !== first, "the second abort returned the first abort's promise");
+    let firstSettled = false;
+    first.then(() => {
+      firstSettled = true;
+    });
+    assert.equal(await second, undefined);
+    assert.equal(firstSettled, false);
+    resolveAbort();
+    assert.equal(await first, undefined);
+  });
+
+  test("write runs the strategy's size callback before it refuses a write behind a queued close", async () => {
+    const sized = [];
+    const stream = new WritableStream(
+      {},
+      {
+        size(chunk) {
+          sized.push(chunk);
+          return 1;
+        },
+      },
+    );
+    const writer = stream.getWriter();
+    const closed = writer.close();
+    await assertRejects(writer.write("late"), TypeError);
+    assert.deepEqual(sized, ["late"]);
+    await closed;
+  });
+
+  test("once the close reaches the sink, a write asks no size callback and abort calls no sink abort", async () => {
+    let sized = 0;
+    let aborted = 0;
+    let resolveClose = null;
+    const stream = new WritableStream(
+      {
+        close() {
+          return new Promise(resolve => {
+            resolveClose = resolve;
+          });
+        },
+        abort() {
+          aborted++;
+        },
+      },
+      {
+        size() {
+          sized++;
+          return 1;
+        },
+      },
+    );
+    const writer = stream.getWriter();
+    writer.close().catch(() => {});
+    await waitForMicrotaskCondition("the sink's close", () => resolveClose !== null);
+    await assertRejects(writer.write("late"), TypeError);
+    assert.equal(sized, 0);
+    const abort = writer.abort("stop");
+    resolveClose();
+    assert.equal(await abort, undefined);
+    assert.equal(aborted, 0);
+  });
+
+  test("CompressionStream and DecompressionStream reject a SharedArrayBuffer chunk and a view on one", async () => {
+    const shared = new SharedArrayBuffer(8);
+    for (const create of [() => new CompressionStream("gzip"), () => new DecompressionStream("gzip")]) {
+      for (const chunk of [shared, new Uint8Array(shared), new DataView(shared)]) {
+        const stream = create();
+        // The codec sees the chunk only once a read waits.
+        stream.readable.getReader().read().catch(() => {});
+        const writer = stream.writable.getWriter();
+        const outcome = await outcomeAfterMicrotasks(writer.write(chunk));
+        assert(outcome.error instanceof TypeError, `a ${chunk.constructor.name} chunk was not refused`);
+      }
+    }
   });
 });

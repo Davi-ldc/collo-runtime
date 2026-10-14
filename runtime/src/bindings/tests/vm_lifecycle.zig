@@ -63,19 +63,20 @@ test "prepare_for_fork post_fork_child reseed roundtrip stays valid" {
     try support.expectValueString(&vm, &result, "pong");
 }
 
-/// Runs the fork sequence of the test above on `vm`, then evaluates a module and invokes it as
-/// request `request_id`. The zygote creates its VM with flags from its environment
-/// (`zygote_env_vm_flags` in `zygote/fork_loop.zig`), while the other tests here use
-/// `createDefault()`, so a fork-path branch that depends on a flag, such as the navigator
-/// refresh `collo_vm_post_fork_child` skips on a VM without web APIs, needs a VM built with it.
-fn expectForkLifecycleHolds(vm: *bindings.Vm, request_id: u64) !void {
-    const source =
-        \\export default function ping() {
-        \\    return "pong";
-        \\}
-    ;
+const forkable_specifier = "/forkable-flags.js";
+const forkable_source =
+    \\export default function ping() {
+    \\    return "pong";
+    \\}
+;
 
-    try support.registerModule(vm, "/forkable-flags.js", source);
+/// Runs the fork sequence of the test above on `vm`, whose pack holds `forkable_specifier`,
+/// then evaluates that module and invokes it as request `request_id`. The zygote creates its
+/// VM with the default flags (`zygote/state.zig:Zygote.init`), as the other tests here do, so a
+/// fork-path branch that depends on a flag, such as the navigator refresh
+/// `collo_vm_post_fork_child` skips on a VM without web APIs, runs only on a VM built with that
+/// flag.
+fn expectForkLifecycleHolds(vm: *bindings.Vm, request_id: u64) !void {
     try bindings.setHelperThreadsTimeoutOverrideNs(5_000_000);
     defer bindings.clearHelperThreadsOverrides();
 
@@ -87,9 +88,9 @@ fn expectForkLifecycleHolds(vm: *bindings.Vm, request_id: u64) !void {
         .heap_random_seed = 606,
     });
 
-    try support.evaluateOk(vm, "/forkable-flags.js");
+    try support.evaluateOk(vm, forkable_specifier);
 
-    var entry = try support.getExportOk(vm, "/forkable-flags.js", "default");
+    var entry = try support.getExportOk(vm, forkable_specifier, "default");
     defer entry.deinit();
 
     var exec_ctx = support.makeExecCtx(request_id);
@@ -106,16 +107,20 @@ test "fork lifecycle holds without web APIs and the flag really disables them" {
     var vm = try bindings.Vm.create(bindings.VmOptions.withoutWebApis());
     defer vm.deinit();
 
-    try expectForkLifecycleHolds(&vm, 8801);
-
-    // A flag the VM ignored would make the run above prove nothing, so the web APIs must be
-    // absent.
+    // A VM holds one pack, so the probe below travels in the forked module's pack.
     const probe_source =
         \\export default function probe() {
         \\    return typeof globalThis.fetch;
         \\}
     ;
-    try support.registerModule(&vm, "/webapi-probe.js", probe_source);
+    try support.registerModules(&vm, &.{
+        .{ .specifier = forkable_specifier, .source = forkable_source },
+        .{ .specifier = "/webapi-probe.js", .source = probe_source },
+    });
+    try expectForkLifecycleHolds(&vm, 8801);
+
+    // A flag the VM ignored would make the run above prove nothing, so the web APIs must be
+    // absent.
     try support.evaluateOk(&vm, "/webapi-probe.js");
 
     var probe = try support.getExportOk(&vm, "/webapi-probe.js", "default");

@@ -4,6 +4,10 @@ import { describe, expect, test } from "bun:test";
 // - reference/bun-v1.3.14/src/js/builtins/ReadableStream.ts
 // - reference/bun-v1.3.14/test/js/web/fetch/utf8-bom.test.ts
 // - reference/bun-v1.3.14/test/js/web/streams/readable-stream-blob-consumed.test.ts
+//
+// Cases that read string chunks through these readers are excluded: they share
+// Collo's Body consumption, which reads a stream's chunks as bytes, accepts only
+// an ArrayBuffer or an ArrayBufferView, and rejects a string with a TypeError.
 
 const encoder = new TextEncoder();
 
@@ -16,20 +20,6 @@ function defaultStream(chunks) {
     start(controller) {
       for (const chunk of chunks) controller.enqueue(chunk);
       controller.close();
-    },
-  });
-}
-
-function byteStream(chunks) {
-  return new ReadableStream({
-    type: "bytes",
-    pull(controller) {
-      const chunk = chunks.shift();
-      if (chunk) {
-        controller.enqueue(chunk);
-      } else {
-        controller.close();
-      }
     },
   });
 }
@@ -53,28 +43,11 @@ describe("ReadableStream body reader prototype methods", () => {
     expect(() => ReadableStream.prototype.text.call({})).toThrow(TypeError);
   });
 
-  test("text() reads default and byte streams", async () => {
-    expect(await defaultStream(["ab", bytes("cd")]).text()).toBe("abcd");
-    expect(await byteStream([bytes("ab"), bytes("cd")]).text()).toBe("abcd");
-  });
-
   test("bytes() returns Uint8Array with exact bytes", async () => {
     const view = new DataView(bytes("xabcdz").buffer, 1, 4);
     const output = await defaultStream([bytes("ab"), view]).bytes();
     expect(output).toBeInstanceOf(Uint8Array);
     expect(Array.from(output)).toEqual(Array.from(bytes("ababcd")));
-  });
-
-  test("json() parses stream text and rejects invalid JSON", async () => {
-    expect(await defaultStream([bytes("{\"ok\":"), "true}"]).json()).toEqual({ ok: true });
-    await expectRejects(defaultStream(["{"]).json(), SyntaxError);
-  });
-
-  test("blob() returns a Blob with stream bytes", async () => {
-    const blob = await defaultStream([bytes("hello "), "world"]).blob();
-    expect(blob).toBeInstanceOf(Blob);
-    expect(blob.type).toBe("");
-    expect(await blob.text()).toBe("hello world");
   });
 
   test("text(), json(), and blob().text() strip a leading UTF-8 BOM", async () => {

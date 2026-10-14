@@ -4,17 +4,15 @@
 // and empty the source, so no path releases a reference twice or drops one unreleased.
 
 #include "host_functions/server/fetch/body.h"
-#include "host_functions/server/fetch/body_utils.h"
-#include "host_functions/server/fetch/extracted_response.h"
+
 #include "host_functions/runtime/fetch_body.h"
 #include "host_functions/runtime/request_body.h"
-#include "host_functions/webapi/dom/dom_exception.h"
-#include "host_functions/webapi/limits.h"
+#include "host_functions/server/fetch/body_utils.h"
+#include "host_functions/server/fetch/extracted_response.h"
 #include "host_functions/webapi/buffer_source.h"
 #include "host_functions/webapi/files/blob.h"
 #include "host_functions/webapi/files/formdata.h"
 #include "host_functions/webapi/streams/readable_stream.h"
-#include "host_functions/webapi/streams/readable_stream_private.h"
 
 #include <JavaScriptCore/ArrayBufferSharingMode.h>
 #include <JavaScriptCore/Error.h>
@@ -542,29 +540,9 @@ bool BodyState::markUsed(JSC::JSGlobalObject* global_object, JSC::JSObject* stre
     return false;
 }
 
-// Counts one clone against the clone tree's budget, creating the budget at the tree's first clone, and throws a
-// QuotaExceededError DOMException once the tree has made WebApiBodyCloneFanoutMax clones. Only streaming sources call
-// it, because each branch buffers on its own; a Text, Bytes or SharedBytes clone takes one more reference to the
-// same storage.
-bool BodyState::consumeCloneBudget(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope)
-{
-    if (!m_clone_budget) {
-        m_clone_budget = BodyCloneBudget::create();
-        if (!m_clone_budget) {
-            JSC::throwOutOfMemoryError(global_object, scope);
-            return false;
-        }
-    }
-    if (m_clone_budget->clone_count >= WebApiBodyCloneFanoutMax) {
-        auto* exception = createDOMException(global_object, DOMExceptionCode::QuotaExceededError,
-            "body clone count exceeds the serverless clone limit"_s);
-        JSC::throwException(global_object, scope, exception);
-        return false;
-    }
-    m_clone_budget->clone_count++;
-    return true;
-}
-
+// A fetch stream clone counts because each branch buffers on its own. A Text, Bytes or SharedBytes clone takes one
+// more reference to the same storage, so it counts nothing, but it joins the tree's budget, created here when the
+// tree has none yet, which tees of either body's stream then count against.
 bool BodyState::clone(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSC::JSObject* stream,
     WTF::ASCIILiteral already_used_message, JSC::JSObject*& out_kept_stream, PendingBody& out)
 {
@@ -579,27 +557,39 @@ bool BodyState::clone(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope
         out.state = BodyState::empty();
         return true;
     case Source::Text:
+        if (!StreamCloneBudget::ensure(global_object, scope, m_clone_budget))
+            return false;
         out.state = BodyState::fromText(m_text);
+        out.state.m_clone_budget = m_clone_budget;
         return true;
     case Source::Bytes: {
+        if (!StreamCloneBudget::ensure(global_object, scope, m_clone_budget))
+            return false;
         out.state = BodyState {};
         out.state.m_source = Source::Bytes;
         out.state.m_bytes = m_bytes;
+        out.state.m_clone_budget = m_clone_budget;
         return true;
     }
     case Source::SharedBytes:
+        if (!StreamCloneBudget::ensure(global_object, scope, m_clone_budget))
+            return false;
         out.state
             = BodyState::fromSharedBytes(WTF::Ref<BlobStorage> { *m_shared_storage }, m_shared_offset, m_shared_size);
+        out.state.m_clone_budget = m_clone_budget;
         return true;
     case Source::RequestLazy:
         JSC::throwVMTypeError(global_object, scope, "lazy request bodies cannot be cloned yet"_s);
         return false;
     case Source::FetchStream: {
-        if (!consumeCloneBudget(global_object, scope))
+        // Checked before Zig clones and counted after, so a clone Zig refuses spends nothing.
+        if (!StreamCloneBudget::ensure(global_object, scope, m_clone_budget)
+            || !m_clone_budget->checkRoom(global_object, scope))
             return false;
         ColloFetchBodyIdentity cloned_identity {};
         if (!fetchBodyCloneForIdentity(global_object, scope, m_fetch_body_identity, cloned_identity))
             return false;
+        m_clone_budget->countClone();
         out.state
             = BodyState::fetchStream(uncheckedDowncast<Collo::GlobalObject>(global_object)->owner(), cloned_identity);
         out.state.m_clone_budget = m_clone_budget;
@@ -610,43 +600,14 @@ bool BodyState::clone(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope
             throwAlreadyUsedTypeError(global_object, scope, already_used_message);
             return false;
         }
-        if (!consumeCloneBudget(global_object, scope))
+        // The internal tee, not the stream's `tee` property, which script can replace. It counts the clone against
+        // the stream's budget, which both branches keep.
+        JSC::JSObject* kept_stream = nullptr;
+        JSC::JSObject* cloned_stream = nullptr;
+        if (!readableStreamTee(global_object, scope, stream, kept_stream, cloned_stream))
             return false;
-
-        auto tee = stream->get(global_object, JSC::Identifier::fromString(global_object->vm(), "tee"_s));
-        RETURN_IF_EXCEPTION(scope, false);
-        if (!bodyValueIsCallable(tee)) {
-            JSC::throwVMTypeError(global_object, scope, "ReadableStream body cannot be cloned"_s);
-            return false;
-        }
-        JSC::MarkedArgumentBuffer arguments;
-        if (arguments.hasOverflowed()) {
-            JSC::throwOutOfMemoryError(global_object, scope);
-            return false;
-        }
-        auto call_data = JSC::getCallData(tee);
-        auto branches_value = JSC::call(global_object, tee.getObject(), call_data, stream, arguments);
-        RETURN_IF_EXCEPTION(scope, false);
-        auto* branches = dynamicDowncast<JSC::JSObject>(branches_value);
-        if (!branches) {
-            JSC::throwVMTypeError(global_object, scope, "ReadableStream tee returned invalid branches"_s);
-            return false;
-        }
-
-        auto branch_a = branches->get(global_object, static_cast<unsigned>(0));
-        RETURN_IF_EXCEPTION(scope, false);
-        auto branch_b = branches->get(global_object, static_cast<unsigned>(1));
-        RETURN_IF_EXCEPTION(scope, false);
-        auto* stream_a = readableStreamFromValue(branch_a);
-        auto* stream_b = readableStreamFromValue(branch_b);
-        if (!stream_a || !stream_b) {
-            JSC::throwVMTypeError(global_object, scope, "ReadableStream tee returned invalid branches"_s);
-            return false;
-        }
-
-        out_kept_stream = stream_a;
-        out = PendingBody::fromStream(stream_b);
-        out.state.m_clone_budget = m_clone_budget;
+        out_kept_stream = kept_stream;
+        out = PendingBody::fromStream(cloned_stream);
         return true;
     }
     }
@@ -728,10 +689,19 @@ ColloFetchBodyIdentity JSColloBodyOwner::transferFetchStreamForHostResponse()
     return identity;
 }
 
-void JSColloBodyOwner::setBodyStream(JSC::VM& vm, JSC::JSObject* stream)
+JSC::JSObject* JSColloBodyOwner::createBodyStream(
+    JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, WTF::Ref<ReadableStreamNativeSource>&& source)
 {
     ASSERT(!m_body_stream);
-    m_body_stream.set(vm, this, stream);
+    if (!StreamCloneBudget::ensure(global_object, scope, m_body.m_clone_budget))
+        return nullptr;
+    auto* stream = createReadableStreamFromNativeSource(
+        global_object, scope, WTF::move(source), WTF::RefPtr<StreamCloneBudget> { m_body.m_clone_budget });
+    RETURN_IF_EXCEPTION(scope, nullptr);
+    if (!stream)
+        return nullptr;
+    m_body_stream.set(global_object->vm(), this, stream);
+    return stream;
 }
 
 bool JSColloBodyOwner::bodyUsed() const { return m_body.bodyUsed(bodyStream()); }

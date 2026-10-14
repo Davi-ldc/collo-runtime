@@ -1,7 +1,8 @@
 //! The worker's retirement: the one place that decides the worker should
 //! give way to a fresh one and tells the server so. A worker never stops on
-//! its own when its VM can run no JavaScript again or when none of its routes
-//! can serve. It sends one `worker_retiring` notice on its control socket
+//! its own when its VM can run no JavaScript again, when none of its routes
+//! can serve or when it detached from its egress session for a gateway
+//! defect. It sends one `worker_retiring` notice on its control socket
 //! (`common/ipc/worker_retiring.zig`) and goes on answering every request
 //! that reaches it: the server, which alone knows whether a begin is still
 //! on its way, takes the worker out of service and retires it once no lane
@@ -9,13 +10,15 @@
 //! and answers 503 `worker_retiring` (`serve/dispatch.zig`). Runs on the VM
 //! thread.
 //!
-//! The decision comes from two facts other files own, which the loop reads
+//! The decision comes from three facts other files own, which the loop reads
 //! at the top of every tick (`checkRetirement`): the sentinel's fire
-//! (`sentinel.zig`), which poisons the VM for good, and
+//! (`sentinel.zig`), which poisons the VM for good;
 //! `modules/state.zig:State.fresh_worker_may_serve`, which `modules/routes.zig`
-//! sets once every route failed and one of them on an await.
+//! sets once every route failed and one of them on an await; and
+//! `egress/state.zig:State.detached_for_gateway_fault`, which a detach the
+//! worker made on its own sets, since no gateway gives such a worker a
+//! session again.
 
-const std = @import("std");
 const ipc = @import("collo_ipc");
 const termination = @import("../serve/termination.zig");
 
@@ -24,7 +27,7 @@ pub const Retirement = struct {
     /// normally. Never cleared, since neither reason can be undone.
     reason: ?ipc.WorkerRetiringReason = null,
     /// The notice found the control socket full. While it holds, the loop
-    /// polls the socket for room (`scheduler/uring_backend.zig`) and sends
+    /// polls the socket for room (`scheduler/poll_backend.zig`) and sends
     /// the notice once the socket turns writable (`handleControlWritable` in
     /// `scheduler/loop.zig`).
     notice_pending: bool = false,
@@ -32,7 +35,7 @@ pub const Retirement = struct {
 
 pub fn Methods(comptime Runtime: type) type {
     return struct {
-        /// The loop's check, at the top of every tick, of the two facts that
+        /// The loop's check, at the top of every tick, of the three facts that
         /// retire the worker. The first time it finds the sentinel's fire it
         /// records that the VM is terminated, answers every request the fire
         /// left unable to finish (`termination.endAfterFire`) and asks to
@@ -44,10 +47,6 @@ pub fn Methods(comptime Runtime: type) type {
             if (!self.vm_terminated) {
                 if (self.observability.sentinel.fired()) |fired| {
                     self.vm_terminated = true;
-                    self.traceRuntimeEvent("worker.runtime.vm_terminated={d},{s}", .{
-                        fired.owner_id,
-                        @tagName(fired.cause),
-                    });
                     // The notice goes out ahead of the answers, so the server
                     // stops sending begins as early as it can; the answers
                     // are written whether or not it could be sent.
@@ -58,6 +57,8 @@ pub fn Methods(comptime Runtime: type) type {
             }
             if (self.modules.state.fresh_worker_may_serve)
                 try self.requestRetirement(.routes_failed);
+            if (self.egress.state.detached_for_gateway_fault)
+                try self.requestRetirement(.egress_detached);
         }
 
         /// Records `reason` as the worker's reason to retire and sends the
@@ -69,7 +70,6 @@ pub fn Methods(comptime Runtime: type) type {
                 return;
             self.retirement.reason = reason;
             self.retirement.notice_pending = true;
-            self.traceRuntimeEvent("worker.runtime.retiring={s}", .{@tagName(reason)});
             try self.sendRetirementNotice();
         }
 
@@ -93,7 +93,6 @@ pub fn Methods(comptime Runtime: type) type {
                 else => return err,
             };
             self.retirement.notice_pending = false;
-            self.traceRuntimeEvent("worker.runtime.retiring_sent={s}", .{@tagName(reason)});
         }
     };
 }

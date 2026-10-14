@@ -1,12 +1,11 @@
-//! I/O building blocks shared by the ingress server, the gateway and the
-//! worker. `buffer.zig` holds byte budgets and the stream buffer, `heap.zig`
-//! the intrusive priority heap behind timer and deadline queues, `uring.zig` a
-//! tagged io_uring wrapper for deadlines and readiness, and
-//! `restricted_uring.zig` the worker's restricted ring plus the restriction
-//! helpers the other sandboxed rings use. Every instance belongs to one
+//! I/O building blocks shared by the ingress server, the gateway, the egress
+//! client and the worker. `buffer.zig` holds byte budgets and the stream
+//! buffer, `heap.zig` the intrusive priority heap behind timer and deadline
+//! queues, `uring.zig` a tagged io_uring wrapper for deadlines and readiness,
+//! and `restricted_uring.zig` the restriction helpers behind the gateway's
+//! and the egress client's sandboxed rings. Every instance belongs to one
 //! thread; the only process-wide state is `uring.zig`'s count of undecodable
-//! completions. The worker ring's checks read socket options through
-//! `collo_os.socket`, the module's only import that links libc.
+//! completions.
 
 pub const heap = @import("heap.zig");
 pub const buffer = @import("buffer.zig");

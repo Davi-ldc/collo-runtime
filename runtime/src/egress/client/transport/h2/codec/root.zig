@@ -1,8 +1,9 @@
 //! HTTP/2 client codec for outbound fetch: request encoding (`request.zig`),
-//! response validation (`response.zig`), connection-wide session state
-//! (`session.zig`) and the multiplexed connection with its flow control
-//! (`client.zig`). The codec performs no I/O: callers hand it the frames they
-//! read and the writer that receives the frames it sends.
+//! response validation (`response.zig`), connection-wide session state and
+//! the shard's HPACK buffers (`session.zig`), and the multiplexed connection
+//! with its flow control (`client.zig`). The codec performs no I/O: callers
+//! hand it the frames they read and the writer that receives the frames it
+//! sends.
 
 pub const request = @import("request.zig");
 pub const response = @import("response.zig");
@@ -14,10 +15,11 @@ pub const EncodedRequest = request.EncodedRequest;
 pub const encodeRequest = request.encodeRequest;
 pub const validateRequestHead = request.validateRequestHead;
 
-pub const ResponseAccumulator = response.ResponseAccumulator;
+pub const ResponseState = response.ResponseState;
 pub const ResponseHead = response.ResponseHead;
 pub const parseResponseHead = response.parseResponseHead;
 
+pub const HpackScratch = session.HpackScratch;
 pub const Session = session.Session;
 pub const ClientSettings = session.ClientSettings;
 pub const Connection = client.Connection;

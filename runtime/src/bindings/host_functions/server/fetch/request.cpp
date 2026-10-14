@@ -528,37 +528,34 @@ namespace {
             return adoptRef(*source);
         }
 
-        EncodedJSValue pull(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope) override
+        ReadableStreamPull pull(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope) override
         {
             auto* request = m_request.get();
-            if (!request || request->body().source() == BodyState::Source::Empty) {
-                return resolvedPromise(
-                    global_object, createReadableStreamReadResult(global_object, JSC::jsUndefined(), true));
-            }
-            if (m_static_delivered) {
-                return resolvedPromise(
-                    global_object, createReadableStreamReadResult(global_object, JSC::jsUndefined(), true));
-            }
+            if (!request || request->body().source() == BodyState::Source::Empty)
+                return ReadableStreamPull::done();
+            if (m_static_delivered)
+                return ReadableStreamPull::done();
 
             if (request->body().source() == BodyState::Source::RequestLazy) {
                 if (!request->beginStreamRead(global_object, scope, "Body already used"_s))
-                    return {};
-                RETURN_IF_EXCEPTION(scope, {});
+                    return ReadableStreamPull::threw();
+                RETURN_IF_EXCEPTION(scope, ReadableStreamPull::threw());
                 m_static_delivered = true;
-                return requestLazyBodyPull(global_object, scope, request->body().requestIdentity());
+                return ReadableStreamPull::fromPromise(
+                    requestLazyBodyPull(global_object, scope, request->body().requestIdentity()));
             }
 
             WTF::RefPtr<ColloSharedBytes> bytes;
             if (!request->consumeToSharedBytes(global_object, scope, "Body already used"_s, bytes))
-                return {};
-            RETURN_IF_EXCEPTION(scope, {});
+                return ReadableStreamPull::threw();
+            RETURN_IF_EXCEPTION(scope, ReadableStreamPull::threw());
             m_static_delivered = true;
             auto* value
                 = createUint8ArrayCopy(global_object, scope, bytes ? bytes->span() : std::span<const uint8_t> {});
-            RETURN_IF_EXCEPTION(scope, {});
+            RETURN_IF_EXCEPTION(scope, ReadableStreamPull::threw());
             if (!value)
-                return {};
-            return resolvedPromise(global_object, createReadableStreamReadResult(global_object, value, false));
+                return ReadableStreamPull::threw();
+            return ReadableStreamPull::withChunk(value);
         }
 
         EncodedJSValue cancel(JSC::JSGlobalObject* global_object, JSC::ThrowScope&, JSValue) override
@@ -1120,11 +1117,10 @@ namespace {
             JSC::throwOutOfMemoryError(global_object, scope);
             return {};
         }
-        auto* stream = createReadableStreamFromNativeSource(global_object, scope, source.releaseNonNull());
+        auto* stream = request->createBodyStream(global_object, scope, source.releaseNonNull());
         RETURN_IF_EXCEPTION(scope, {});
         if (!stream)
             return {};
-        request->setBodyStream(vm, stream);
         return JSValue::encode(stream);
     }
 

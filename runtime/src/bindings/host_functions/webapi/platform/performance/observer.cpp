@@ -12,12 +12,12 @@
 #include <JavaScriptCore/Error.h>
 #include <JavaScriptCore/IdentifierInlines.h>
 #include <JavaScriptCore/IteratorOperations.h>
-#include <JavaScriptCore/JSCInlines.h>
-#include <JavaScriptCore/MicrotaskQueueInlines.h>
 #include <JavaScriptCore/JSArray.h>
+#include <JavaScriptCore/JSCInlines.h>
 #include <JavaScriptCore/JSFunction.h>
 #include <JavaScriptCore/JSObject.h>
 #include <JavaScriptCore/JSString.h>
+#include <JavaScriptCore/MicrotaskQueueInlines.h>
 #include <JavaScriptCore/ObjectConstructor.h>
 #include <JavaScriptCore/SlotVisitorMacros.h>
 #include <wtf/text/MakeString.h>
@@ -32,14 +32,16 @@ using JSC::JSValue;
 using WTF::String;
 using namespace JSC;
 
+JSC_DECLARE_HOST_FUNCTION(performanceObserverScheduleMicrotask);
+JSC_DECLARE_HOST_FUNCTION(performanceObserverDeliverMicrotask);
+
+// The observer mask of a supported entry type, or none for a type the timeline never records, which observe() ignores.
 static uint8_t maskForEntryType(const String& type)
 {
     if (type == "mark"_s)
         return PerformanceObserverTypeMark;
     if (type == "measure"_s)
         return PerformanceObserverTypeMeasure;
-    if (type == "resource"_s)
-        return PerformanceObserverTypeResource;
     return PerformanceObserverTypeNone;
 }
 
@@ -96,7 +98,7 @@ static JSColloPerformanceObserverEntryList* requirePerformanceObserverEntryList(
 static JSC::JSObject* frozenSupportedEntryTypes(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope)
 {
     auto& vm = global_object->vm();
-    auto* result = JSC::constructEmptyArray(global_object, nullptr, 3);
+    auto* result = JSC::constructEmptyArray(global_object, nullptr, 2);
     RETURN_IF_EXCEPTION(scope, nullptr);
     if (!result) {
         JSC::throwOutOfMemoryError(global_object, scope);
@@ -105,8 +107,6 @@ static JSC::JSObject* frozenSupportedEntryTypes(JSC::JSGlobalObject* global_obje
     result->putDirectIndex(global_object, 0, JSC::jsString(vm, WTF::String("mark"_s)));
     RETURN_IF_EXCEPTION(scope, nullptr);
     result->putDirectIndex(global_object, 1, JSC::jsString(vm, WTF::String("measure"_s)));
-    RETURN_IF_EXCEPTION(scope, nullptr);
-    result->putDirectIndex(global_object, 2, JSC::jsString(vm, WTF::String("resource"_s)));
     RETURN_IF_EXCEPTION(scope, nullptr);
     JSC::objectConstructorFreeze(global_object, result);
     RETURN_IF_EXCEPTION(scope, nullptr);
@@ -144,9 +144,6 @@ void JSColloPerformanceObserver::observe(
     JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSValue options_value)
 {
     auto& vm = global_object->vm();
-    if (auto* performance = m_performance.get())
-        performance->ensureTimeOriginForAccess();
-
     JSValue entry_types_value;
     JSValue type_value;
     bool buffered = false;

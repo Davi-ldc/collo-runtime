@@ -1,24 +1,29 @@
 //! The host side of one request: describe it, send it down the worker's
-//! control socket, and read the response back over the worker's two
-//! completion channels. It also builds the sealed module packs a host hands
-//! a worker. A worker registers its definition's pack and learns its routes
-//! before its first request, from WorkerInit (`LaunchOptions.routes` in
-//! `launch.zig`), so a request names its route by its index in the route
-//! table and carries no pack.
+//! control socket, and read the response back from the same socket. It also
+//! builds the sealed definition artifacts a host hands a worker. A worker
+//! registers its definition's artifact and learns its routes from it before
+//! its first request, from WorkerInit (`LaunchOptions.routes` in
+//! `launch.zig`), so a request names its route by its index and carries no
+//! module. Harnesses and benchmarks use it; the server's lanes read workers
+//! on their own.
 //!
 //! Response frames (head, chunks, end) arrive as ingress-channel packets on
-//! the control fd; the completion record is published on the shared metrics
-//! page and signaled through the completion eventfd. Every host reads the
-//! same two channels, in-process harnesses and forked workers alike. The
-//! reader grants the worker response credit for each chunk it takes, as the
-//! server does (`ResponseReadCredit`), so a worker's response may run past
-//! its first `common/ipc/response_credit.zig:window` chunks.
+//! the control socket, a chunk above the inline threshold through the
+//! worker's payload ring (`ResponseChannels.ingress_payload`), and the
+//! request's `request_done` closes them: the worker sends it after every
+//! other descriptor of the request, so the read ends there, with the
+//! worker's status and measures (`ipc.ingress_channel.RequestDone`). A
+//! `request_done` may come without a head, from a worker that failed the
+//! request before answering it. Every host reads the same way, in-process
+//! harnesses and forked workers alike. The reader grants the worker response
+//! credit for each chunk it takes, as the server does (`ResponseReadCredit`),
+//! so a worker's response may run past its first
+//! `common/ipc/response_credit.zig:window` chunks.
 
 const std = @import("std");
 const ipc = @import("collo_ipc");
 const body_limits = @import("collo_limits").http_body;
 const fd_mod = @import("collo_os").fd;
-const worker_shared_page = @import("collo_worker_state").page;
 
 pub const Request = struct {
     method: []const u8 = "GET",
@@ -38,8 +43,8 @@ pub const Request = struct {
 /// host that multiplexes must set them.
 pub const Dispatch = struct {
     request_id: u64,
-    /// The route's index in the worker's route table
-    /// (`ipc.DispatchWorkView.route_index`).
+    /// The route's index among the routes of the worker's definition
+    /// artifact, in route order (`ipc.DispatchWorkView.route_index`).
     route_index: u16 = 0,
     /// Absolute CLOCK_MONOTONIC deadline the worker enforces on the request.
     deadline_monotonic_ns: u64,
@@ -51,6 +56,10 @@ pub const Dispatch = struct {
     worker_generation: u64 = 1,
     request_lane_id: u16 = 0,
     request_slot: u32 = 0,
+    /// The worker's live slot the request runs in
+    /// (`ipc.DispatchWorkView.worker_slot`); a host that sends one request at
+    /// a time keeps 0.
+    worker_slot: u8 = 0,
     route_captures: []const ipc.RouteCapture = &.{},
     request: Request = .{},
 };
@@ -63,6 +72,7 @@ pub fn initDispatchWork(allocator: std.mem.Allocator, parts: Dispatch) !ipc.Disp
         .worker_generation = parts.worker_generation,
         .request_lane_id = parts.request_lane_id,
         .request_slot = parts.request_slot,
+        .worker_slot = parts.worker_slot,
         .authority = parts.authority,
         .deadline_monotonic_ns = parts.deadline_monotonic_ns,
         .method = parts.request.method,
@@ -81,23 +91,27 @@ pub fn bodyFraming(request: Request) ipc.RequestBodyFraming {
     return request.body_framing;
 }
 
-/// A sealed memfd holding a one-module pack whose entry is `specifier`.
+/// A sealed memfd holding a definition artifact with one module, `source`
+/// at `specifier`, and one route to it with no bindings
+/// (`module_pack.buildSingleRouteAlloc`): the smallest artifact a worker
+/// launches with. The caller owns the fd.
 pub fn createModulePackFd(allocator: std.mem.Allocator, specifier: []const u8, source: []const u8) !std.posix.fd_t {
-    const pack = try ipc.module_pack.buildSingleAlloc(allocator, specifier, source);
+    const pack = try ipc.module_pack.buildSingleRouteAlloc(allocator, specifier, source);
     defer allocator.free(pack);
-    return createSealedPackFd("collo-route-pack", pack);
+    return createSealedPackFd("collo-definition", pack);
 }
 
-/// A sealed memfd holding a multi-module pack; `entry_index` selects the
-/// module the route evaluates.
-pub fn createModulePackGraphFd(
+/// A sealed memfd holding a definition artifact with `modules` and
+/// `routes`, each route's `entry_module` an index into `modules`
+/// (`module_pack.buildAlloc`). The caller owns the fd.
+pub fn createDefinitionFd(
     allocator: std.mem.Allocator,
     modules: []const ipc.module_pack.Module,
-    entry_index: usize,
+    routes: []const ipc.route_table.RouteInput,
 ) !std.posix.fd_t {
-    const pack = try ipc.module_pack.buildAlloc(allocator, modules, entry_index);
+    const pack = try ipc.module_pack.buildAlloc(allocator, modules, routes);
     defer allocator.free(pack);
-    return createSealedPackFd("collo-route-pack-graph", pack);
+    return createSealedPackFd("collo-definition", pack);
 }
 
 fn createSealedPackFd(name: [*:0]const u8, pack: []const u8) !std.posix.fd_t {
@@ -153,22 +167,24 @@ pub fn sendRequest(
     }
 }
 
-/// The two channels one worker completes requests on, as the host holds
-/// them.
-pub const CompletionChannels = struct {
-    /// Host end of the worker control fd; -1 when the caller only wants the
-    /// completion record (response frames stay queued).
+/// Where a host reads one worker's responses.
+pub const ResponseChannels = struct {
+    /// Host end of the worker's control socket.
     control_fd: std.posix.fd_t,
-    completion_eventfd: std.posix.fd_t,
-    metrics: *worker_shared_page.WorkerWriterView,
+    /// The host's mapping of the worker's payload ring, through which the
+    /// worker sends a chunk above the inline threshold; null for a reader
+    /// whose worker sends every chunk inline.
     ingress_payload: ?*ipc.ingress_channel.SharedPayloadView = null,
 };
 
 pub const Response = struct {
     allocator: std.mem.Allocator,
+    /// The response head's status; 200 when the worker sent no head.
     status: u16 = 200,
-    /// The completion record published on the shared metrics page.
-    completion: worker_shared_page.WorkerCompletionRecord = std.mem.zeroes(worker_shared_page.WorkerCompletionRecord),
+    /// The worker's `request_done` for the request: its status and measures.
+    /// `readResponse` returns only after the `request_done` that ends the
+    /// read set it.
+    done: ipc.ingress_channel.RequestDone = undefined,
     /// `name: value\r\n` per header, in wire order.
     headers_wire: []u8 = &.{},
     body: []u8 = &.{},
@@ -178,11 +194,9 @@ pub const Response = struct {
     /// here.
     retiring: ?ipc.WorkerRetiringReason = null,
 
-    /// The status the worker published, read as the server reads it
-    /// (`request_finish.zig`): a value `RequestDoneStatus` does not name is
-    /// `worker_crash`.
+    /// The status the worker's `request_done` names.
     pub fn doneStatus(self: *const Response) ipc.RequestDoneStatus {
-        return std.enums.fromInt(ipc.RequestDoneStatus, self.completion.status) orelse .worker_crash;
+        return self.done.status;
     }
 
     pub fn deinit(self: *Response) void {
@@ -222,17 +236,19 @@ pub const ReadBudget = struct {
     progress_fn: ?*const fn (?*anyopaque) anyerror!void = null,
 };
 
-/// Bounded read of one request's response. Frames are drained from the
-/// control fd while the completion is awaited on the metrics ring; the
-/// eventfd is only a wakeup, so the ring is checked first because an earlier
-/// read may have consumed the counter for a record still queued. Records
-/// must arrive in read order: a foreign record is an error. Returns
-/// `error.ResponseNotFinalized` after `budget.wall_ms` instead of blocking,
-/// and `error.ResponseBodyTooLarge` / `error.ResponseHeadersTooLarge` the
-/// moment a frame would push the accumulated bytes past the byte caps.
+/// Bounded read of one request's response: takes packets from the control
+/// socket until the request's `request_done`, which the worker sends after
+/// every other descriptor of the request, so nothing of the request is left
+/// queued when the read returns. Returns `error.ResponseNotFinalized` after
+/// `budget.wall_ms` instead of blocking, `error.ResponseBodyTooLarge` /
+/// `error.ResponseHeadersTooLarge` the moment a frame would push the
+/// accumulated bytes past the byte caps, `error.ControlPeerClosed` when the
+/// worker closes its end before its `request_done`, and
+/// `error.DescriptorAfterRequestDone` for a descriptor a packet carries
+/// after it.
 pub fn readResponse(
     allocator: std.mem.Allocator,
-    channels: CompletionChannels,
+    channels: ResponseChannels,
     request_id: u64,
     budget: ReadBudget,
 ) !Response {
@@ -244,113 +260,46 @@ pub fn readResponse(
         response.headers_wire = &.{};
     };
 
-    var control_fd = channels.control_fd;
     var credit = ResponseReadCredit{ .request_id = request_id };
     var timer = try std.time.Timer.start();
     const budget_ns = @as(u64, budget.wall_ms) * std.time.ns_per_ms;
-    while (true) {
+    var done = false;
+    // Each turn waits at most until the budget runs out and returns once it
+    // has, so the loop ends by `budget.wall_ms` at the latest.
+    while (!done) {
         if (budget.progress_fn) |progress|
             try progress(budget.progress_context);
-        if (control_fd != -1)
-            credit.flush(control_fd) catch |err| switch (err) {
-                error.PeerClosed => credit.pending = false,
-                else => return err,
-            };
-        // Ring first: the completion may already be published.
-        var records: [1]worker_shared_page.WorkerCompletionRecord = undefined;
-        const drained = try channels.metrics.drainWorkerCompletions(&records);
-        if (drained != 0) {
-            if (records[0].external_request_id != request_id)
-                return error.UnexpectedCompletionRecord;
-            response.completion = records[0];
-            // The worker queued every response frame before publishing the
-            // completion; drain whatever is still pending on the control fd.
-            // A decode failure here is a real error: a malformed frame after
-            // the response must not be masked into a truncated success. Only
-            // the worker closing its end after publishing, and a spurious
-            // readiness wakeup, stop the drain early.
-            while (control_fd != -1) {
-                var control_poll = [1]std.posix.pollfd{.{
-                    .fd = control_fd,
-                    .events = std.posix.POLL.IN,
-                    .revents = 0,
-                }};
-                const control_ready = try std.posix.poll(&control_poll, 0);
-                if (control_ready == 0)
-                    break;
-                // POLLERR and POLLNVAL are channel failures, never "nothing
-                // more readable". POLLHUP without POLLIN is the worker
-                // closing after publishing, which is benign.
-                if ((control_poll[0].revents & (std.posix.POLL.ERR | std.posix.POLL.NVAL)) != 0)
-                    return error.ControlChannelBroken;
-                if ((control_poll[0].revents & std.posix.POLL.IN) == 0)
-                    break;
-                drainResponseControlPacket(allocator, channels, budget, &response, &body, &credit) catch |err| switch (err) {
-                    error.ControlPeerClosed, error.WouldBlock => break,
-                    else => return err,
-                };
-            }
-            response.body = try body.toOwnedSlice(allocator);
-            return response;
-        }
+        credit.flush(channels.control_fd) catch |err| switch (err) {
+            // The read below reports the hang-up.
+            error.PeerClosed => credit.pending = false,
+            else => return err,
+        };
 
         const elapsed_ns = timer.read();
         if (elapsed_ns >= budget_ns)
             return error.ResponseNotFinalized;
         const remaining_ms: i32 = @intCast(@divFloor(budget_ns - elapsed_ns, std.time.ns_per_ms) + 1);
-
-        var pollfds = [2]std.posix.pollfd{
-            .{
-                .fd = control_fd,
-                .events = std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR |
-                    (if (credit.pending) @as(i16, std.posix.POLL.OUT) else 0),
-                .revents = 0,
-            },
-            .{
-                .fd = channels.completion_eventfd,
-                .events = std.posix.POLL.IN,
-                .revents = 0,
-            },
-        };
+        var pollfds = [1]std.posix.pollfd{.{
+            .fd = channels.control_fd,
+            .events = std.posix.POLL.IN | (if (credit.pending) @as(i16, std.posix.POLL.OUT) else 0),
+            .revents = 0,
+        }};
+        // With a worker to run, each pass of it may queue what the next look
+        // finds, so a look waits no longer than a millisecond.
         const wait_ms = if (budget.progress_fn != null) @min(remaining_ms, 1) else remaining_ms;
         const ready = std.posix.poll(&pollfds, wait_ms) catch return error.ResponseChannelClosed;
-        if (ready == 0) {
-            if (budget.progress_fn != null)
-                continue;
-            return error.ResponseNotFinalized;
-        }
-
-        if ((pollfds[0].revents & (std.posix.POLL.ERR | std.posix.POLL.NVAL)) != 0 or
-            (pollfds[1].revents & (std.posix.POLL.ERR | std.posix.POLL.NVAL)) != 0)
-            return error.ControlChannelBroken;
-
-        if (control_fd != -1 and
-            (pollfds[0].revents & (std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR)) != 0)
-        {
-            // Drain the control packet first so response bytes sent before
-            // the completion was published are never lost to an early return.
-            drainResponseControlPacket(allocator, channels, budget, &response, &body, &credit) catch |err| switch (err) {
-                error.ControlPeerClosed => {
-                    // The worker may close after publishing; keep waiting on
-                    // the metrics channel for the completion.
-                    control_fd = -1;
-                },
-                error.WouldBlock => {},
-                else => return err,
-            };
+        if (ready == 0)
             continue;
-        }
-
-        if ((pollfds[1].revents & std.posix.POLL.IN) != 0) {
-            var counter_bytes: [8]u8 = undefined;
-            // A racing consumer of the counter makes this read WouldBlock,
-            // which is benign; anything else is a real channel failure.
-            _ = std.posix.read(channels.completion_eventfd, &counter_bytes) catch |err| switch (err) {
-                error.WouldBlock => {},
-                else => return err,
-            };
-        }
+        if ((pollfds[0].revents & (std.posix.POLL.ERR | std.posix.POLL.NVAL)) != 0)
+            return error.ControlChannelBroken;
+        // A hang-up with nothing queued reads as the peer closing, which the
+        // drain reports.
+        if ((pollfds[0].revents & (std.posix.POLL.IN | std.posix.POLL.HUP)) == 0)
+            continue;
+        done = try drainResponseControlPacket(allocator, channels, budget, &response, &body, &credit);
     }
+    response.body = try body.toOwnedSlice(allocator);
+    return response;
 }
 
 /// The response credit of one response a host reads. The response's
@@ -370,14 +319,10 @@ pub const ResponseReadCredit = struct {
     /// Checks `descriptor` against the response and charges a chunk. A chunk
     /// past the window fails with `error.ResponseCreditExceeded`.
     pub fn admit(self: *ResponseReadCredit, descriptor: ipc.ingress_channel.Descriptor) !void {
-        if (descriptor.request_id != self.request_id or self.ended)
+        if (self.ended)
             return error.InvalidH2StreamIdentity;
-        if (self.identity) |identity| {
-            if (identity.request_lane_id != descriptor.request_lane_id or
-                identity.request_slot != descriptor.request_slot or
-                identity.request_generation != descriptor.request_generation or
-                identity.stream_id != descriptor.stream_id)
-                return error.InvalidH2StreamIdentity;
+        try self.checkIdentity(descriptor);
+        if (self.identity != null) {
             if (descriptor.op == @intFromEnum(ipc.ingress_channel.Op.response_head))
                 return error.InvalidH2WorkerInboundDescriptor;
         } else {
@@ -404,6 +349,32 @@ pub const ResponseReadCredit = struct {
             self.ended = true;
     }
 
+    /// Checks that a `request_done` names this response. It may follow the
+    /// response's end, or come without a head from a worker that failed the
+    /// request first; nothing of the response follows it, so no grant is
+    /// sent after it.
+    pub fn admitDone(self: *ResponseReadCredit, descriptor: ipc.ingress_channel.Descriptor) !void {
+        try self.checkIdentity(descriptor);
+        self.ended = true;
+        self.pending = false;
+    }
+
+    /// The descriptor names this response's request and, once a head pinned
+    /// the response's identity, carries that identity whole.
+    fn checkIdentity(self: *const ResponseReadCredit, descriptor: ipc.ingress_channel.Descriptor) !void {
+        if (descriptor.request_id != self.request_id)
+            return error.InvalidH2StreamIdentity;
+        const identity = self.identity orelse return;
+        if (identity.request_lane_id != descriptor.request_lane_id)
+            return error.InvalidH2StreamIdentity;
+        if (identity.request_slot != descriptor.request_slot)
+            return error.InvalidH2StreamIdentity;
+        if (identity.request_generation != descriptor.request_generation)
+            return error.InvalidH2StreamIdentity;
+        if (identity.stream_id != descriptor.stream_id)
+            return error.InvalidH2StreamIdentity;
+    }
+
     /// Retires `count` admitted chunks; the grant is sent while the response
     /// has not ended.
     pub fn retire(self: *ResponseReadCredit, count: u64) void {
@@ -425,14 +396,16 @@ pub const ResponseReadCredit = struct {
     }
 };
 
+/// Takes one packet from the control socket into `response` and returns
+/// whether it carried the request's `request_done`.
 fn drainResponseControlPacket(
     allocator: std.mem.Allocator,
-    channels: CompletionChannels,
+    channels: ResponseChannels,
     budget: ReadBudget,
     response: *Response,
     body: *std.ArrayList(u8),
     credit: *ResponseReadCredit,
-) !void {
+) !bool {
     var scratch: [ipc.max_message_bytes]u8 = undefined;
     var packet = ipc.recvPacketWithFdsScratch(allocator, channels.control_fd, &scratch) catch |err| switch (err) {
         error.PeerClosed => return error.ControlPeerClosed,
@@ -448,6 +421,7 @@ fn drainResponseControlPacket(
     switch (kind) {
         .ingress_channel => {
             const spent_before = credit.window.spent;
+            var done = false;
             packet_alive = false;
             if (ipc.ingress_channel.isDescriptorBatchPacket(packet.bytes)) {
                 var batch = if (channels.ingress_payload) |ingress_payload|
@@ -459,10 +433,8 @@ fn drainResponseControlPacket(
                 else
                     try ipc.ingress_channel.decodeReceivedBatchPacket(allocator, &packet);
                 defer batch.deinit();
-                for (batch.items) |item| {
-                    try credit.admit(item.descriptor);
-                    try appendResponsePayload(allocator, budget, response, body, item.descriptor, item.payload);
-                }
+                for (batch.items) |item|
+                    done = try takeDescriptor(allocator, budget, response, body, credit, done, item.descriptor, item.payload);
             } else {
                 var received = if (channels.ingress_payload) |ingress_payload|
                     try ipc.ingress_channel.decodeReceivedPacketWithSharedPayload(
@@ -473,21 +445,50 @@ fn drainResponseControlPacket(
                 else
                     try ipc.ingress_channel.decodeReceivedPacket(allocator, &packet);
                 defer received.deinit();
-                try credit.admit(received.descriptor);
-                try appendResponsePayload(allocator, budget, response, body, received.descriptor, received.payload);
+                done = try takeDescriptor(allocator, budget, response, body, credit, false, received.descriptor, received.payload);
             }
             // The decoder's payloads and ring releases ended with the branch
             // above. The accumulated result is bounded separately by budget.
             credit.retire(credit.window.spent - spent_before);
+            return done;
         },
         .worker_retiring => {
             // A worker sends one notice; a second is a broken contract.
             if (response.retiring != null)
                 return error.DuplicateRetiringNotice;
             response.retiring = try ipc.worker_retiring.decode(&packet);
+            return false;
         },
         else => return error.InvalidMessageKind,
     }
+}
+
+/// Takes one descriptor of the response and returns whether it was the
+/// request's `request_done`. `done_before` says a `request_done` came first
+/// in the same packet, after which the worker may send nothing of the
+/// request.
+fn takeDescriptor(
+    allocator: std.mem.Allocator,
+    budget: ReadBudget,
+    response: *Response,
+    body: *std.ArrayList(u8),
+    credit: *ResponseReadCredit,
+    done_before: bool,
+    descriptor: ipc.ingress_channel.Descriptor,
+    payload: []const u8,
+) !bool {
+    if (done_before)
+        return error.DescriptorAfterRequestDone;
+    if (descriptor.op == @intFromEnum(ipc.ingress_channel.Op.request_done)) {
+        try credit.admitDone(descriptor);
+        // The channel's decoder checked the record; this decode only copies
+        // it out of the packet.
+        response.done = try ipc.ingress_channel.decodeRequestDone(payload);
+        return true;
+    }
+    try credit.admit(descriptor);
+    try appendResponsePayload(allocator, budget, response, body, descriptor, payload);
+    return false;
 }
 
 /// The head is bounded by its decoder before anything is allocated for it;

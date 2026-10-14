@@ -1,5 +1,6 @@
-//! HTTP/2 transport of the egress client. `codec` is the protocol state
-//! machine and does no I/O; the connection pool in `pool.zig` is the separate
-//! `collo_egress_pool` module, which drives the codec over gateway sockets.
+//! HTTP/2 transport of the egress client: `codec` is the protocol state
+//! machine and does no I/O; `pool` holds the engine's HTTP/2 connections and
+//! drives the codec over their wires.
 
-pub const codec = @import("collo_egress_http2");
+pub const codec = @import("codec/root.zig");
+pub const pool = @import("pool.zig");

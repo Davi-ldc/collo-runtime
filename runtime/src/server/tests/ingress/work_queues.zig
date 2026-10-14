@@ -100,7 +100,7 @@ test "a worker fault waits once per registration, and an index past the registra
     for (0..registration_count) |index|
         try Queues.enqueueDeath(&lane, @intCast(index));
     try std.testing.expectEqual(registration_count, lane.deferred_deaths.len);
-    try std.testing.expectError(error.InvalidCompletionRegistration, Queues.enqueueDeath(&lane, registration_count));
+    try std.testing.expectError(error.InvalidWorkerRegistration, Queues.enqueueDeath(&lane, registration_count));
 
     try std.testing.expectEqual(@as(?u32, 2), Queues.popDeath(&lane));
     try std.testing.expect(!Queues.deathQueued(&lane, 2));

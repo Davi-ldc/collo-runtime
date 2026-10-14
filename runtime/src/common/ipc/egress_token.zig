@@ -14,25 +14,21 @@
 //! A token names the worker session it was minted for, and the gateway admits it only from that
 //! session's command ring, so a worker cannot spend another worker's tokens. Inside one worker the
 //! process is the boundary, and the tokens of its requests are not kept apart. A token admits
-//! fetches until its deadline. The gateway keeps a budget for it from its first verified fetch
-//! and drops that budget at `request_ended` at the latest (`egress/gateway/budgets.zig`), and a
-//! token that comes back after its budget was dropped starts a new one. A worker that keeps a
-//! token after its request, or a `request_ended` that is lost, therefore costs fetches under the
-//! token's policy until its deadline, within the session's cap on active fetches, and nothing
-//! else.
+//! fetches until its deadline, within the caps the gateway keeps per session and per security
+//! cell, and nothing counts how many: the worker holds its own requests to the per-request limit
+//! (`worker/egress/fetch_runtime.zig`), and a worker that kept a token after its request could
+//! only spend it within those caps and that deadline anyway.
 //!
-//! `verify` compares the tag first, in constant time over all of it, and reads the version and the
-//! kind only once the tag has vouched for them, so a forged token cannot learn which field it got
-//! wrong. Tokens cross sockets and rings as raw native-endian bytes like the other IPC structs, and
+//! `verify` compares the tag first, in constant time over all of it, and reads the kind only once
+//! the tag has vouched for it, so a forged token cannot learn which field it got wrong. One binary
+//! mints and verifies every token under a key of one gateway, so the layout needs no version.
+//! Tokens cross sockets and rings as raw native-endian bytes like the other IPC structs, and
 //! `fromBytes` copies them out at any alignment. Every function is pure and runs on any thread.
 
 const std = @import("std");
 
 const assert = std.debug.assert;
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
-
-/// The layout `mint` writes and `verify` accepts.
-pub const version: u8 = 1;
 
 pub const key_bytes: usize = 32;
 /// The bytes the tag covers: every field of `Token` before `tag`.
@@ -60,14 +56,15 @@ pub const Kind = enum {
     boot,
 };
 
-/// The wire form of `Fields`, with the version first and the tag over everything before it
-/// last. Every field is a plain integer, so any bytes read as some token, and only `verify`
-/// says whether the server minted it.
+/// The wire form of `Fields`, with the kind first and the tag over everything before it last.
+/// Every field is a plain integer, so any bytes read as some token, and only `verify` says
+/// whether the server minted it. `mint` zeroes both reserved fields, which keep the 64-bit
+/// fields aligned.
 pub const Token = extern struct {
-    version: u8,
     kind: u8,
+    reserved0: u8,
     policy_id: u16,
-    budget: u32,
+    reserved1: u32,
     session_id: u64,
     request_id: u64,
     request_generation: u64,
@@ -80,10 +77,10 @@ comptime {
     // every field are wire facts; an edit that moves one edits these pins too.
     assert(@sizeOf(Token) == token_bytes);
     assert(@alignOf(Token) == 8);
-    assert(@offsetOf(Token, "version") == 0);
-    assert(@offsetOf(Token, "kind") == 1);
+    assert(@offsetOf(Token, "kind") == 0);
+    assert(@offsetOf(Token, "reserved0") == 1);
     assert(@offsetOf(Token, "policy_id") == 2);
-    assert(@offsetOf(Token, "budget") == 4);
+    assert(@offsetOf(Token, "reserved1") == 4);
     assert(@offsetOf(Token, "session_id") == 8);
     assert(@offsetOf(Token, "request_id") == 16);
     assert(@offsetOf(Token, "request_generation") == 24);
@@ -123,8 +120,6 @@ pub const Fields = struct {
     kind: Kind,
     /// The id of the route's network policy in the table the gateway received in its hello.
     policy_id: u16,
-    /// Fetches the gateway admits under the token, counted from its first verified fetch.
-    budget: u32,
     /// The worker session the token was minted for, the only one whose fetches may present it.
     session_id: u64,
     /// Both nonzero for a request token and both 0 for a boot token.
@@ -135,15 +130,14 @@ pub const Fields = struct {
     deadline_monotonic_ns: u64,
 };
 
-pub const VerifyError = error{ BadTag, BadVersion, BadKind };
+pub const VerifyError = error{ BadTag, BadKind };
 
 /// Mints a token for `fields` under `key`. The server calls it with values it owns, so a field
-/// out of shape (a zero session or deadline, a zero budget, request ids that do not match the
-/// kind) is a server bug and asserted.
+/// out of shape (a zero session or deadline, request ids that do not match the kind) is a server
+/// bug and asserted.
 pub fn mint(key: *const Key, fields: Fields) Token {
     assert(!key.isZero());
     assert(fields.session_id != 0);
-    assert(fields.budget != 0);
     assert(fields.deadline_monotonic_ns != 0);
     switch (fields.kind) {
         .request => {
@@ -156,10 +150,10 @@ pub fn mint(key: *const Key, fields: Fields) Token {
         },
     }
     var token = Token{
-        .version = version,
         .kind = encodeKind(fields.kind),
+        .reserved0 = 0,
         .policy_id = fields.policy_id,
-        .budget = fields.budget,
+        .reserved1 = 0,
         .session_id = fields.session_id,
         .request_id = fields.request_id,
         .request_generation = fields.request_generation,
@@ -172,21 +166,17 @@ pub fn mint(key: *const Key, fields: Fields) Token {
 
 /// Returns the fields of a token the server minted under `key`. A tag that does not match fails
 /// with `error.BadTag` whatever else the token holds, and so does every tag under the zero key; a
-/// matching tag over another layout fails with `error.BadVersion`, and over a kind this file does
-/// not know with `error.BadKind`. The caller still checks the session and the deadline
-/// (`expired`).
+/// matching tag over a kind this file does not know fails with `error.BadKind`, which only a
+/// server bug can mint. The caller still checks the session and the deadline (`expired`).
 pub fn verify(key: *const Key, token: *const Token) VerifyError!Fields {
     if (key.isZero())
         return error.BadTag;
     const expected = tagOf(key, token);
     if (!std.crypto.timing_safe.eql([tag_bytes]u8, expected, token.tag))
         return error.BadTag;
-    if (token.version != version)
-        return error.BadVersion;
     return .{
         .kind = try decodeKind(token.kind),
         .policy_id = token.policy_id,
-        .budget = token.budget,
         .session_id = token.session_id,
         .request_id = token.request_id,
         .request_generation = token.request_generation,
@@ -199,8 +189,8 @@ pub fn expired(token: *const Token, now_monotonic_ns: u64) bool {
     return deadlinePassed(token.deadline_monotonic_ns, now_monotonic_ns);
 }
 
-/// The one expiry rule: a deadline admits nothing from the instant it names. The gateway applies
-/// it to the deadline it keeps beside a token's budget as well.
+/// The one expiry rule: a deadline admits nothing from the instant it names, for a token and for
+/// anything the gateway holds until a token's deadline.
 pub fn deadlinePassed(deadline_monotonic_ns: u64, now_monotonic_ns: u64) bool {
     return now_monotonic_ns >= deadline_monotonic_ns;
 }
@@ -233,7 +223,7 @@ pub fn fromBytes(bytes: *const Bytes) Token {
     return token;
 }
 
-/// Whether `bytes` are `none`. A minted token never is, since its version byte is not zero.
+/// Whether `bytes` are `none`. A minted token never is, since its kind byte is not zero.
 pub fn isNone(bytes: *const Bytes) bool {
     return std.mem.allEqual(u8, bytes, 0);
 }

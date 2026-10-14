@@ -1,6 +1,7 @@
 // MessageChannel and MessagePort within one VM, and the hooks the event target and structured clone code use to
 // recognize and transfer ports. Runs on the VM thread. postMessage clones the message at once with the caller's
-// global object, and the peer receives it from a microtask.
+// global object, and the peer receives it from a microtask once its port message queue is enabled, which only start()
+// and setting onmessage do (HTML).
 
 #pragma once
 
@@ -19,12 +20,8 @@ struct WebApiMessagePortTransfer {
     JSC::JSObject* clone { nullptr };
 };
 
-// Fills the handle for a MessagePort, with onmessage as its attribute handler for "message"; false for other values.
+// Fills the handle for a MessagePort; false for other values.
 bool webApiMessagePortTargetHandle(JSC::JSValue, WebApiEventTargetHandle&);
-// Deliberately starts the port when a "message" listener is added, which the Bun-derived compatibility test
-// runtime/tests/webapi/message_channel/message_channel.test.js requires. HTML enables the port message queue only
-// through start() or onmessage.
-void webApiMessagePortDidAddListener(WebApiEventTargetHandle, const WTF::String& type);
 bool webApiMessagePortIsValue(JSC::JSValue);
 bool webApiMessagePortIsDetached(JSC::JSValue);
 // Converts the ports given to the MessageEvent constructor or initMessageEvent (undefined or an iterable of
@@ -36,9 +33,8 @@ JSC::JSObject* webApiNormalizeMessagePortsArray(JSC::JSGlobalObject*, JSC::Throw
 JSC::JSObject* webApiCreateMessagePortTransferClone(JSC::JSGlobalObject*, JSC::ThrowScope&, JSC::JSValue);
 bool webApiValidateMessagePortTransfers(
     JSC::JSGlobalObject*, JSC::ThrowScope&, const WTF::Vector<WebApiMessagePortTransfer>&);
-// Revalidates every transfer, then moves each source port's peer, queue and ref state to its clone and detaches the
-// source. Returns false with a DataCloneError on the ThrowScope when a source stopped being transferable after the
-// clone.
+// Revalidates every transfer, then moves each source port's peer and queue to its clone and detaches the source.
+// Returns false with a DataCloneError on the ThrowScope when a source stopped being transferable after the clone.
 bool webApiCommitMessagePortTransfers(JSC::JSGlobalObject*, JSC::ThrowScope&, WTF::Vector<WebApiMessagePortTransfer>&);
 // True when `source` is `sender` or its peer, which a port's own postMessage may not transfer.
 bool webApiMessagePortTransferConflictsWith(JSC::JSObject* source, JSC::JSObject* sender);

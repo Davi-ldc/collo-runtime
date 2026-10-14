@@ -63,28 +63,12 @@ bench("formdata.for-each", iterations => {
   return checksum;
 }, { iterations: 50000, warmup: 2000 });
 
-bench("formdata.to-json-and-length", iterations => {
-  const form = new FormData();
-  form.append("a", "1");
-  form.append("a", "2");
-  form.append("b", "3");
-
+bench("formdata.parse-urlencoded-blob", async iterations => {
+  const blob = new Blob(["a=1&b=2&a=3"], { type: "application/x-www-form-urlencoded" });
   let checksum = 0;
   for (let i = 0; i < iterations; i++) {
-    const json = form.toJSON();
-    checksum += form.length;
-    checksum += json.a.length;
-    checksum += json.b.length;
-  }
-  return checksum;
-}, { iterations: 100000, warmup: 10000 });
-
-bench("formdata.from-urlencoded", iterations => {
-  let checksum = 0;
-  for (let i = 0; i < iterations; i++) {
-    const form = FormData.from("a=1&b=2&a=3");
-    checksum += form.length;
+    const form = await blob.formData();
     checksum += form.getAll("a").length;
   }
   return checksum;
-}, { iterations: 60000, warmup: 5000 });
+}, { iterations: 20000, warmup: 1000 });

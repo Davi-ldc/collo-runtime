@@ -1,9 +1,7 @@
 //! The policy image (`common/network/table.zig`): the builder's round trip
 //! through `check` and `decode`, its deduplication and its refusals, the
 //! bounds of a table, every corruption `check` refuses with the reason it
-//! gives, and allocation failures in the builder and the decoder. A
-//! mutation that targets one structural rule reseals the digest after the
-//! change, so the digest does not hide the rule under test.
+//! gives, and allocation failures in the builder and the decoder.
 
 const std = @import("std");
 const network = @import("collo_network");
@@ -74,9 +72,6 @@ test "the builder's image passes its checks and decodes to what was added" {
 
     var decoded = try network.Table.decode(gpa, image);
     defer decoded.deinit(gpa);
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(image[table.digest_end..], &digest, .{});
-    try std.testing.expectEqualSlices(u8, &digest, &decoded.digest);
 
     try std.testing.expectEqual(@as(usize, 0), decoded.policy(0).?.grants.len);
     try std.testing.expectEqual(@as(?network.Policy, null), decoded.policy(5));
@@ -272,13 +267,10 @@ test "the builder stops at rules_max rules" {
     );
 }
 
-/// A copy of `image` changed by `mutation` and resealed, for a test that
-/// targets a rule the digest would otherwise hide.
+/// A copy of `image` changed by `mutation`; the caller frees it.
 fn mutated(image: []const u8, mutation: anytype) ![]u8 {
     const copy = try gpa.dupe(u8, image);
-    errdefer gpa.free(copy);
     mutation.apply(copy, referenceLayout(image));
-    table.seal(copy);
     return copy;
 }
 
@@ -477,30 +469,26 @@ test "a length that disagrees with the counts is refused" {
     defer gpa.free(longer);
     @memcpy(longer[0..image.len], image);
     longer[image.len] = 'x';
-    table.seal(longer);
     try expectProblem(longer, .length);
 
     const shorter = try gpa.dupe(u8, image[0 .. image.len - 1]);
     defer gpa.free(shorter);
-    table.seal(shorter);
     try expectProblem(shorter, .length);
 
     // Counted name bytes that no rule claims.
     putU32(longer, @offsetOf(table.Header, "name_bytes"), reference_name_bytes + 1);
-    table.seal(longer);
     try expectProblem(longer, .name_total);
 }
 
-test "the digest refuses a change to any byte past the magic, and the magic the rest" {
+test "an image shorter than a header is truncated, and a changed magic byte is refused" {
     const image = try buildReference(gpa);
     defer gpa.free(image);
     const copy = try gpa.dupe(u8, image);
     defer gpa.free(copy);
 
-    for (0..copy.len) |index| {
+    for (0..table.magic.len) |index| {
         copy[index] ^= 0x01;
-        const expected: Problem = if (index < @offsetOf(table.Header, "digest")) .magic else .digest;
-        try expectProblem(copy, expected);
+        try expectProblem(copy, .magic);
         copy[index] ^= 0x01;
     }
     try std.testing.expectEqual(@as(?Problem, null), table.check(copy));

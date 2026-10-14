@@ -48,12 +48,15 @@ test "the control reader decodes an attach acknowledgement and a removal report 
     const report_pair = try os.fd.socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
     defer std.posix.close(report_pair[0]);
     defer std.posix.close(report_pair[1]);
-    try control.sendSessionRemoved(report_pair[0], 41);
+    try control.sendSessionRemoved(report_pair[0], 41, .protocol_violation);
     var report_scratch: [ack_packet_bytes]u8 = undefined;
     var report = try ipc.recvPacketWithFdsScratch(std.testing.allocator, report_pair[1], &report_scratch);
     defer report.deinit();
     switch (try control.decodeGatewayToServerPacket(&report)) {
-        .session_removed => |removed| try std.testing.expectEqual(@as(u64, 41), removed.session_id),
+        .session_removed => |removed| {
+            try std.testing.expectEqual(@as(u64, 41), removed.session_id);
+            try std.testing.expectEqual(control.SessionRemovedCause.protocol_violation, removed.cause);
+        },
         .attach_ack => return error.TestUnexpectedControlPacket,
     }
 
@@ -68,7 +71,7 @@ test "the control reader decodes an attach acknowledgement and a removal report 
     // An acknowledgement's length under another kind, and a second ready report.
     try std.testing.expectError(
         error.InvalidEgressGatewayControl,
-        receiveAndDecode(&ackBytes(.request_ended, 5, 9), &.{}),
+        receiveAndDecode(&ackBytes(.boot_ended, 5, 9), &.{}),
     );
     const ready = control.Header{
         .magic = control.magic,

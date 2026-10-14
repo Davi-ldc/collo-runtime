@@ -146,6 +146,48 @@ test "a promise continuation runs under the request that registered it" {
     try std.testing.expectEqual(@as(?u64, request_a), capture.ownerOf("continuation-of-a"));
 }
 
+test "a stream reaction runs under the request that started the pipe, not the one that feeds it" {
+    var vm = try support.createVm();
+    defer vm.deinit();
+
+    var capture = OwnerCapture{};
+    try capture.install(&vm, 64);
+    defer vm.setConsoleSink(null, null, 4096, 64, 1 << 20) catch {};
+
+    const source =
+        \\let controller = null;
+        \\
+        \\export function startPipe() {
+        \\    const source = new ReadableStream({ start(c) { controller = c; } });
+        \\    const destination = new WritableStream({
+        \\        write(chunk) { console.log(`sink-wrote-${chunk}`); },
+        \\    });
+        \\    void source.pipeTo(destination);
+        \\}
+        \\
+        \\export function enqueueChunk() {
+        \\    controller.enqueue("chunk");
+        \\    console.log("enqueued-by-b");
+        \\}
+    ;
+    try support.registerModule(&vm, "/stream-owner.js", source);
+    try support.evaluateOk(&vm, "/stream-owner.js");
+
+    var requests = TwoRequests.init();
+    defer requests.deinit(&vm);
+
+    try runTurn(&vm, "/stream-owner.js", "startPipe", &requests.a);
+    // The source holds no chunk, so A's turn ended with the pipe's read pending.
+    try std.testing.expectEqual(@as(usize, 0), capture.kept_count);
+
+    try runTurn(&vm, "/stream-owner.js", "enqueueChunk", &requests.b);
+
+    // B's enqueue fulfills the read A's pipe registered; the pipe's read reaction writes the
+    // chunk under A, so the sink's line belongs to A.
+    try std.testing.expectEqual(@as(?u64, request_b), capture.ownerOf("enqueued-by-b"));
+    try std.testing.expectEqual(@as(?u64, request_a), capture.ownerOf("sink-wrote-chunk"));
+}
+
 test "every reaction on one promise carries its own registering request" {
     var vm = try support.createVm();
     defer vm.deinit();
@@ -383,17 +425,28 @@ test "a reaction turnless code registers runs under the turnless context that re
 
     // Two module evaluations, each under a turnless context of its own as a worker installs one
     // per evaluation, leave a reaction on a promise that request B settles later.
-    try support.registerModule(&vm, "/first.js",
-        \\new Promise((resolve) => { globalThis.settleFirst = resolve; })
-        \\    .then(() => { console.log("first-evaluation"); });
-    );
-    try support.registerModule(&vm, "/second.js",
-        \\new Promise((resolve) => { globalThis.settleSecond = resolve; })
-        \\    .then(() => { console.log("second-evaluation"); });
-    );
-    try support.registerModule(&vm, "/fire.js",
-        \\export function fire() { globalThis.settleFirst(1); globalThis.settleSecond(1); }
-    );
+    try support.registerModules(&vm, &.{
+        .{
+            .specifier = "/first.js",
+            .source =
+            \\new Promise((resolve) => { globalThis.settleFirst = resolve; })
+            \\    .then(() => { console.log("first-evaluation"); });
+            ,
+        },
+        .{
+            .specifier = "/second.js",
+            .source =
+            \\new Promise((resolve) => { globalThis.settleSecond = resolve; })
+            \\    .then(() => { console.log("second-evaluation"); });
+            ,
+        },
+        .{
+            .specifier = "/fire.js",
+            .source =
+            \\export function fire() { globalThis.settleFirst(1); globalThis.settleSecond(1); }
+            ,
+        },
+    });
 
     var first = support.makeExecCtx(evaluation_first);
     defer vm.releaseExecCtx(&first) catch {};
@@ -435,18 +488,26 @@ test "a reaction whose owner was released runs with no owner, never under the tu
     try vm.setOwnerTransitionHook(TransitionCapture.hook, &transitions);
     defer vm.setOwnerTransitionHook(null, null) catch {};
 
-    try support.registerModule(&vm, "/released.js",
-        \\export function arm() {
-        \\    new Promise((resolve) => { globalThis.settleReleased = resolve; })
-        \\        .then(() => { console.log("continuation-of-released"); });
-        \\}
-    );
-    // Settled from module top-level code, so the continuation runs in the evaluation's own drain,
-    // outside any turn, where the turnless context owns everything not restored.
-    try support.registerModule(&vm, "/settle-turnless.js",
-        \\globalThis.settleReleased(1);
-        \\console.log("evaluation-line");
-    );
+    try support.registerModules(&vm, &.{
+        .{
+            .specifier = "/released.js",
+            .source =
+            \\export function arm() {
+            \\    new Promise((resolve) => { globalThis.settleReleased = resolve; })
+            \\        .then(() => { console.log("continuation-of-released"); });
+            \\}
+            ,
+        },
+        // Settled from module top-level code, so the continuation runs in the evaluation's own
+        // drain, outside any turn, where the turnless context owns everything not restored.
+        .{
+            .specifier = "/settle-turnless.js",
+            .source =
+            \\globalThis.settleReleased(1);
+            \\console.log("evaluation-line");
+            ,
+        },
+    });
     try support.evaluateOk(&vm, "/released.js");
 
     var requests = TwoRequests.init();

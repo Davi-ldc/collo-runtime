@@ -66,10 +66,9 @@ pub const Options = struct {
     /// fails.
     routes: routes_mod.Routes,
     /// Existing directory the analytics sink appends `logs.jsonl`,
-    /// `access.jsonl`, `usage.jsonl` and `workers.jsonl` to
-    /// (`analytics/sink.zig`). null keeps only the console stream: worker
-    /// console lines still reach stderr, and the records are counted and
-    /// dropped.
+    /// `access.jsonl` and `workers.jsonl` to (`analytics/sink.zig`). null
+    /// keeps only the console stream: worker console lines still reach
+    /// stderr, and the records are counted and dropped.
     analytics_directory: ?[]const u8 = null,
     /// Port 0 binds an ephemeral port; `port` and `address` report the one
     /// the kernel chose. The address also picks the interface whose receive
@@ -87,7 +86,7 @@ pub const Options = struct {
     /// `arg0` (`gateway.Config.executable_path`). What the gateway enforces
     /// comes from the routes' `network` grants, never from here.
     egress_gateway_executable_path: ?[]const u8 = null,
-    /// The worker cgroup root and the tmpfs mount point every launch borrows
+    /// The worker cgroup root every launch borrows
     /// (`supervision.launcher.WorkerHost`), which the caller keeps alive past
     /// the server. The caller creates the root before spawning the zygote,
     /// because a delegated placement moves only the calling process out of
@@ -147,7 +146,7 @@ pub const Server = struct {
 
         var plan = try lane_plan_mod.build(allocator, .{
             .listen = options.listen,
-            .shape = ingress_mod.runner.laneMemoryShape(routes.definitionCount(), routes.slotsPerWorkerTotal()),
+            .shape = ingress_mod.runner.laneMemoryShape(ingress_mod.runner.servedDefinitions(routes)),
             .explicit_lane_count = options.ingress_lane_override,
         });
         defer plan.deinit(allocator);
@@ -274,7 +273,6 @@ pub const Server = struct {
     }
 
     pub fn deinit(self: *Server) void {
-        self.supervisor.drainAllWorkerUsage();
         self.listeners.deinit();
         self.supervisor.deinit();
         // After the supervisor: its teardown drains each worker's last console

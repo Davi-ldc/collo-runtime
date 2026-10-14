@@ -1,12 +1,14 @@
 //! The launcher (`server/supervisor/launcher.zig`) against a stand-in
 //! zygote and a stand-in supervisor and gateway: a submission claims a
 //! launch through `Deps.claim`, the fork request goes out with the cgroup leaf
-//! the launcher made, WorkerInit carries the egress session and a boot token
-//! minted under the key of the session's gateway, and the ready worker
-//! reaches `Deps.publish` with its session, its boot token's gateway, session
-//! and deadline, and its trace. Each way a launch fails reaches `Deps.failed`
-//! with its reason and the child and leaf it leaves behind, the child still
-//! running, because the launcher kills no worker and waits for no exit.
+//! the launcher made, the launch's local steps run while the request waits
+//! for its reply, WorkerInit carries the definition's artifact, the leaf, the
+//! egress session and a boot token minted under the key of the session's
+//! gateway, and the ready worker reaches `Deps.publish` with its session, its
+//! boot token's gateway, session and deadline, its leaf by name, and its
+//! trace. Each way a launch fails reaches `Deps.failed` with its reason and
+//! the child, leaf and page it leaves behind, the child still running,
+//! because the launcher kills no worker and waits for no exit.
 //! After a publish the launcher claims again, so
 //! waiters the new worker could not serve get a launch without another
 //! submission. A failed launch's leftovers keep their room in the launch
@@ -26,9 +28,9 @@
 //! server could not make, leave the worker detached on its old session, and
 //! the pass runs again, no sooner than `egress_prewarm_interval_ms` after the
 //! last spawn. A session the gateway removed (`Launcher.egressSessionLost`)
-//! takes its worker off it (`Deps.dropEgressSession`), and a pass attaches it
-//! to that gateway again, at most once per interval; a launch holding it gets
-//! another before its publish, and a report no one holds starts nothing. No
+//! retires the live worker that held it (`Deps.retireEgressSession`) with no
+//! new session, a launch holding it fails with `egress_attach` at
+//! `WorkerReady`, and a report no one holds starts nothing. No
 //! spawn runs while a fork request is outstanding, a late report of an older
 //! gateway's loss starts none, and a launch whose gateway is gone by
 //! `WorkerReady` is attached to the next one before its publish. A launch
@@ -67,7 +69,6 @@ const cgroup = @import("collo_cgroup");
 const fd_mod = @import("collo_os").fd;
 const process = @import("collo_os").process;
 const process_limits = @import("collo_limits").process;
-const egress_policy = @import("collo_egress_gateway").policy;
 const fixture = @import("supervisor_fixture");
 
 const egress_token = ipc.egress_token;
@@ -186,7 +187,6 @@ test "a submitted launch claims once, forks once into its leaf and publishes the
     try board.expectNoFailure();
     try testing.expectEqual(@as(usize, 1), board.claims_len);
     try testing.expectEqual(@as(usize, 1), board.fork_requests);
-    try testing.expectEqual(@as(usize, 1), board.fork_requests_with_leaf);
     try testing.expectEqual(@as(usize, 0), board.failed_len);
     const published = &board.published[0];
     try testing.expectEqual(launch_definition, published.definition);
@@ -201,21 +201,18 @@ test "a submitted launch claims once, forks once into its leaf and publishes the
     try testing.expectEqual(board.attached_session_id, published.worker.egress_session_id);
     try testing.expectEqual(ipc.max_message_bytes, published.worker.dispatch_send_scratch.len);
 
-    // WorkerInit carried the definition's route table and pack, the files
-    // the server built at boot, with the definition's realm mode, and the
-    // leaf the child was born in, and the handle cleans that same leaf.
+    // WorkerInit carried the definition's artifact, the file the server
+    // built at boot, with the definition's realm mode, and the leaf the child
+    // was born in, and the handle names that same leaf by its job id.
     const routes = &harness.routes.?.routes;
     const artifact = routes.artifact(launch_definition);
     const init_routes = board.init_routes;
-    try testing.expect(init_routes.serves_routes);
     try testing.expectEqual(routes.definition(launch_definition).settings.isolate_realm, init_routes.isolate_realm);
-    try testing.expectEqual(artifact.route_table.blob_len, init_routes.table_len);
-    try testing.expectEqual(try inodeOf(artifact.route_table.fd), init_routes.table_inode);
     try testing.expectEqual(try inodeOf(artifact.module_pack.fd()), init_routes.pack_inode);
     var leaf_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const leaf = try harness.leafPath(&leaf_buffer, child.fork_job_id);
     try testing.expectEqualStrings(leaf, board.initLeaf());
-    try testing.expectEqualStrings(leaf, published.worker.handle.cgroup_dir);
+    try harness.expectLeaf(published.worker.handle.leaf, child.fork_job_id);
 
     // The launcher makes the server's end of the control socket nonblocking
     // once, for the worker's life, so no lane does it per dispatch.
@@ -245,10 +242,38 @@ test "a submitted launch claims once, forks once into its leaf and publishes the
     try testing.expectEqual(@as(u64, 0), counters.failed);
 }
 
-test "the launcher claims again after a publish while waiters remain, so one submission gives two waiters at concurrency 1 a worker each" {
-    // One slot per worker and one launch in flight at a time, so the pool
-    // can grant the second waiter's launch only once the first worker is
-    // published.
+test "the launch's local steps run while its fork request waits for the reply" {
+    var harness: Harness = undefined;
+    try harness.init(.{ .root = .delegated });
+    defer harness.deinit();
+
+    // The pages this process already holds, which an earlier test may have
+    // left, so the one found below can only be this launch's.
+    var held_before: [own_memfds_max]u64 = undefined;
+    const held_before_len = try ownMemfdInodes(launch_page_memfd_name, &held_before);
+    harness.board.script(&.{.reply_on_release});
+    harness.board.grantClaims(launch_definition, 1);
+    harness.launcher.submit(launch_definition, .waiter);
+    try harness.board.waitFor(.fork_requests, 1, wait_bound_ns);
+    // The state page the launch shares with its worker exists while the
+    // stand-in holds the reply back: the launcher made it during the clone,
+    // not after the reply.
+    const page_inode = try waitForNewOwnMemfd(launch_page_memfd_name, held_before[0..held_before_len], wait_bound_ns);
+    try testing.expectEqual(@as(usize, 0), harness.board.count(.inits_received));
+    harness.board.release();
+    try harness.board.waitFor(.published, 1, wait_bound_ns);
+    harness.quiesce();
+
+    const board = &harness.board;
+    try board.expectNoFailure();
+    // That page is the one this launch's WorkerInit carried at the reply.
+    try testing.expectEqual(page_inode, board.init_page_inode);
+}
+
+test "the launcher claims again after a publish while waiters remain, watches the pool that wants a worker more, and claims it once a scale-out sample grants it (#157)" {
+    // One slot per worker and one launch in flight at a time, so the second
+    // waiter's worker is a scale-out beside the first, claimed only after
+    // the first is published and a sample of the watch granted it.
     const limits: fixture.RoutesOptions = .{ .concurrency = 1 };
     var definition_pool: DefinitionPool = undefined;
     try definition_pool.init(testing.allocator, .{
@@ -263,6 +288,9 @@ test "the launcher claims again after a publish while waiters remain, so one sub
     defer harness.deinit();
 
     harness.board.script(&.{ .ready, .ready });
+    harness.board.mutex.lock();
+    harness.board.scale_out_grants_left = 1;
+    harness.board.mutex.unlock();
     // Two requests wait with deadlines that never pass, and one submission
     // asks for their workers.
     for (0..2) |request| {
@@ -276,6 +304,8 @@ test "the launcher claims again after a publish while waiters remain, so one sub
     const board = &harness.board;
     try board.expectNoFailure();
     try testing.expectEqual(@as(usize, 2), board.claims_len);
+    try testing.expect(!board.claims[0].ticket.scale_out);
+    try testing.expect(board.claims[1].ticket.scale_out);
     try testing.expectEqual(@as(usize, 2), board.fork_requests);
     try testing.expectEqual(@as(usize, 0), board.failed_len);
     for (board.published[0..board.published_len]) |*published|
@@ -285,17 +315,65 @@ test "the launcher claims again after a publish while waiters remain, so one sub
     try testing.expectEqual(@as(u32, 2), pool_state.workers_live);
 
     // The second launch was claimed after the first worker was published,
-    // and no submission dates it.
+    // from a sample of the watch, which dates it.
     var traces: [launches_max]LaunchTrace = undefined;
     try testing.expectEqual(@as(usize, 2), harness.launcher.takeTraces(&traces));
     try testing.expect(traces[0].submitted_ns != 0);
     try testing.expect(traces[0].published_ns <= traces[1].claimed_ns);
-    try testing.expectEqual(@as(u64, 0), traces[1].submitted_ns);
+    try testing.expect(board.scale_out_sample_ns[0] != 0);
+    try testing.expect(traces[0].published_ns <= traces[1].submitted_ns);
     const counters = harness.launcher.countersSnapshot();
     try testing.expectEqual(@as(u64, 1), counters.submitted_waiter);
     try testing.expectEqual(@as(u64, 2), counters.claimed);
     try testing.expectEqual(@as(u64, 2), counters.published);
     try testing.expectEqual(@as(u64, 0), counters.deferred);
+    try testing.expectEqual(@as(u64, 1), counters.scale_out_grants);
+    try testing.expect(counters.scale_out_samples >= 1);
+}
+
+test "a pool that wants a worker more gets none while scale-out samples grant none, and leaves the watch once it wants none (#157)" {
+    const limits: fixture.RoutesOptions = .{ .concurrency = 1 };
+    var definition_pool: DefinitionPool = undefined;
+    try definition_pool.init(testing.allocator, .{
+        .concurrency = limits.concurrency,
+        .workers_max = 4,
+        .launches_max = 2,
+        .waiters_max = 4,
+    });
+    defer definition_pool.deinit();
+    var harness: Harness = undefined;
+    try harness.init(.{ .root = .delegated, .limits = limits, .pool = &definition_pool });
+    defer harness.deinit();
+
+    harness.board.script(&.{.ready});
+    var keys: [3]lifecycle.RequestKey = undefined;
+    for (&keys, 0..) |*key, request| {
+        key.* = .{ .lane_id = 0, .slot = @intCast(request), .generation = 1 };
+        try testing.expect(definition_pool.acquire(0, key.*, std.math.maxInt(u64)) == .wait);
+    }
+    harness.launcher.submit(launch_definition, .waiter);
+    try harness.board.waitFor(.published, 1, wait_bound_ns);
+    // The watch samples every `sample_interval_ns`; three samples show it
+    // keeps watching a pool whose waiters persist and claims nothing.
+    try harness.board.waitFor(.scale_out_samples, 3, wait_bound_ns);
+    try testing.expectEqual(@as(u32, 0), definition_pool.snapshot().launching);
+    try testing.expectEqual(@as(u32, 2), definition_pool.snapshot().waiters);
+
+    // Once the waiters are gone the next sample ends the watch, and no
+    // sample follows.
+    for (keys[1..]) |key|
+        try testing.expect(definition_pool.cancelWaiter(key));
+    harness.board.mutex.lock();
+    const samples_then = harness.board.scale_out_samples;
+    harness.board.mutex.unlock();
+    try harness.board.waitFor(.scale_out_samples, samples_then + 1, wait_bound_ns);
+    std.Thread.sleep(3 * supervision.scheduler_limits.scale_out.sample_interval_ns);
+    harness.quiesce();
+    const board = &harness.board;
+    try board.expectNoFailure();
+    try testing.expect(board.scale_out_samples <= samples_then + 1);
+    try testing.expectEqual(@as(usize, 1), board.claims_len);
+    try testing.expectEqual(pool.Growth.none, definition_pool.growthWanted(true));
 }
 
 test "a child that reports init failure fails the launch and is handed over alive, with its leaf, for the reaper" {
@@ -316,6 +394,13 @@ test "a child that reports init failure fails the launch and is handed over aliv
     try testing.expectEqual(board.claims[0].ticket, failed.ticket);
     try testing.expectEqual(@as(usize, 0), board.published_len);
     try harness.expectChildHandedOverAlive(failed, 0);
+    // The page WorkerInit carried goes with the child, so the reaper drains
+    // what the child logged there once it is dead; the stand-in wrote
+    // nothing, so it reads as the launch made it.
+    try testing.expectEqual(launch_definition, failed.leftovers.definition);
+    const page = failed.leftovers.child.page orelse return error.TestExpectedPage;
+    const state = page.loadLifecycle().knownState() orelse return error.TestExpectedState;
+    try testing.expect(state == .forked);
     // The launcher waits for no exit: the failure reached its dependents
     // well before the bound a wait for the child's own exit would take.
     try testing.expect(failed.at_ns -| board.answered_ns < exit_wait_ns);
@@ -354,7 +439,7 @@ test "a fork the zygote refuses fails the launch with its leaf for the reaper, a
     try testing.expectEqual(board.claims[0].ticket, failed.ticket);
     // No child exists for a refused fork, but the leaf made for it does.
     try testing.expect(!failed.leftovers.child.pidfd.isValid());
-    try harness.expectLeaf(&failed.leftovers.child.cgroup_dir, board.fork_job_ids[0]);
+    try harness.expectLeaf(failed.leftovers.child.leaf, board.fork_job_ids[0]);
     try testing.expectEqual(@as(usize, 1), board.published_len);
     try testing.expectEqual(board.claims[1].ticket, board.published[0].ticket);
 }
@@ -426,7 +511,7 @@ test "a child that exits before WorkerReady fails the launch at once instead of 
         failed.leftovers.child.pidfd.fd(),
         @intCast(process_limits.PROCESS_EXIT_WAIT_MS),
     ));
-    try harness.expectLeaf(&failed.leftovers.child.cgroup_dir, board.children[0].fork_job_id);
+    try harness.expectLeaf(failed.leftovers.child.leaf, board.children[0].fork_job_id);
     // The child's exit ended the wait, not the window.
     try testing.expect(failed.at_ns -| board.answered_ns < child_window_ns);
 }
@@ -452,7 +537,7 @@ test "an egress session the gateway refuses fails the launch before the fork, wi
     try testing.expectEqual(@as(usize, 0), board.fork_requests);
     try testing.expect(!failed.leftovers.child.pidfd.isValid());
     // The leaf was made for the job the launcher numbered last.
-    try harness.expectLeaf(&failed.leftovers.child.cgroup_dir, harness.spawned.next_fork_job_id - 1);
+    try harness.expectLeaf(failed.leftovers.child.leaf, harness.launcher.next_fork_job_id - 1);
 }
 
 test "the zygote's exit reaches the launcher's dependents" {
@@ -498,7 +583,7 @@ test "a fork reply that never comes fails the launch at the zygote's bound, and 
     try testing.expectEqual(@as(usize, 1), board.fork_requests);
     // The request carried a leaf, and no child was born into it.
     try testing.expect(!failed.leftovers.child.pidfd.isValid());
-    try harness.expectLeaf(&failed.leftovers.child.cgroup_dir, board.fork_job_ids[0]);
+    try harness.expectLeaf(failed.leftovers.child.leaf, board.fork_job_ids[0]);
     var traces: [launches_max]LaunchTrace = undefined;
     try testing.expectEqual(@as(usize, 1), harness.launcher.takeTraces(&traces));
     try testing.expectEqual(@as(?LaunchFailure, .fork_reply_timeout), traces[0].failure);
@@ -579,7 +664,6 @@ test "WorkerInit carries a boot token for the launch's session under its gateway
     try testing.expectEqual(egress_token.Fields{
         .kind = .boot,
         .policy_id = boot_policy,
-        .budget = @intCast(egress_policy.production.max_fetches_per_boot),
         .session_id = board.attached_session_id,
         .request_id = 0,
         .request_generation = 0,
@@ -997,41 +1081,69 @@ test "a loss reported for a gateway older than the one the pass attached to star
     try testing.expectEqual(@as(u64, 2), harness.launcher.countersSnapshot().gateway_losses);
 }
 
-test "a session its gateway removed leaves the live worker without one until the next pass attaches it to that gateway again" {
+test "a session its gateway removed retires the live worker that held it, and no pass gives it another" {
     var harness: Harness = undefined;
     try harness.init(.{ .root = .plain_directory });
     defer harness.deinit();
     const lost = try harness.board.addLiveWorker(0, test_gateway_generation, 101);
     const kept = try harness.board.addLiveWorker(1, test_gateway_generation, 102);
 
-    harness.launcher.egressSessionLost(test_gateway_generation, 101);
-    try harness.board.waitFor(.reattach_passes_finished, 1, wait_bound_ns);
+    harness.launcher.egressSessionLost(test_gateway_generation, 101, .protocol_violation);
+    try harness.awaitLauncherTurn();
     harness.quiesce();
 
     const board = &harness.board;
     try board.expectNoFailure();
-    // The gateway stayed current, so the pass attached the worker to it again.
-    try testing.expectEqual(test_gateway_generation, board.gateway_generation);
     const worker = &board.live[lost];
     try takeAttachPackets(worker.worker_end.fd(), &worker.attach_log);
-    try testing.expectEqual(@as(usize, 1), worker.drops);
-    try testing.expectEqual(@as(usize, 1), worker.sets);
-    try testing.expect(!worker.retired);
-    try testing.expectEqual(test_gateway_generation, worker.record.egress_gateway_generation);
-    const session = board.sessionById(worker.record.egress_gateway_session_id) orelse
-        return error.TestUnknownEgressSession;
-    try testing.expectEqual(@as(usize, 1), worker.attach_log.len);
-    try testing.expectEqual(session.command_data_inode, worker.attach_log.inodes[0]);
+    try testing.expect(worker.retired);
+    try testing.expectEqual(@as(usize, 1), worker.session_retires);
+    try testing.expectEqual(@as(usize, 0), worker.retires);
+    try testing.expectEqual(@as(usize, 0), worker.sets);
+    try testing.expectEqual(@as(usize, 0), worker.attach_log.len);
+    try testing.expectEqual(@as(usize, 0), board.prewarms);
+    try testing.expectEqual(@as(usize, 0), board.attaches);
     // The other worker kept its session.
     const other = &board.live[kept];
     try takeAttachPackets(other.worker_end.fd(), &other.attach_log);
+    try testing.expect(!other.retired);
     try testing.expectEqual(@as(usize, 0), other.sets);
     try testing.expectEqual(@as(u64, 102), other.record.egress_gateway_session_id);
     try testing.expectEqual(@as(usize, 0), other.attach_log.len);
     const counters = harness.launcher.countersSnapshot();
     try testing.expectEqual(@as(u64, 1), counters.egress_sessions_lost);
-    try testing.expectEqual(@as(u64, 1), counters.egress_reattached);
+    try testing.expectEqual(@as(u64, 0), counters.egress_reattached);
+    try testing.expectEqual(@as(u64, 0), counters.egress_reattach_retired);
     try testing.expectEqual(@as(u64, 0), counters.gateway_losses);
+}
+
+// Every exit of a worker hangs up the liveness pipe, so its pidfd and control socket record how it
+// died, and a worker that detached on its own asks to be retired itself (`worker_retiring`).
+test "a session whose worker closed its liveness end leaves the live worker to its own channels, and no pass gives it another" {
+    var harness: Harness = undefined;
+    try harness.init(.{ .root = .plain_directory });
+    defer harness.deinit();
+    const closed = try harness.board.addLiveWorker(0, test_gateway_generation, 101);
+
+    harness.launcher.egressSessionLost(test_gateway_generation, 101, .liveness_closed);
+    try harness.awaitLauncherTurn();
+    harness.quiesce();
+
+    const board = &harness.board;
+    try board.expectNoFailure();
+    const worker = &board.live[closed];
+    try takeAttachPackets(worker.worker_end.fd(), &worker.attach_log);
+    try testing.expect(!worker.retired);
+    try testing.expectEqual(@as(usize, 0), worker.session_retires);
+    try testing.expectEqual(@as(usize, 0), worker.retires);
+    try testing.expectEqual(@as(usize, 0), worker.sets);
+    try testing.expectEqual(@as(usize, 0), worker.attach_log.len);
+    try testing.expectEqual(@as(u64, 101), worker.record.egress_gateway_session_id);
+    try testing.expectEqual(@as(usize, 0), board.unmatched_session_retires);
+    try testing.expectEqual(@as(usize, 0), board.prewarms);
+    const counters = harness.launcher.countersSnapshot();
+    try testing.expectEqual(@as(u64, 0), counters.egress_sessions_lost);
+    try testing.expectEqual(@as(u64, 1), counters.egress_sessions_closed);
 }
 
 test "a removed session no live worker or launch holds starts no pass" {
@@ -1041,42 +1153,18 @@ test "a removed session no live worker or launch holds starts no pass" {
     const index = try harness.board.addLiveWorker(0, test_gateway_generation, 101);
 
     // A worker that exited leaves its session to be removed after its record went.
-    harness.launcher.egressSessionLost(test_gateway_generation, 999);
+    harness.launcher.egressSessionLost(test_gateway_generation, 999, .protocol_violation);
     try harness.awaitLauncherTurn();
     harness.quiesce();
 
     const board = &harness.board;
     try board.expectNoFailure();
-    try testing.expectEqual(@as(usize, 1), board.unmatched_drops);
+    try testing.expectEqual(@as(usize, 1), board.unmatched_session_retires);
     try testing.expectEqual(@as(usize, 0), board.prewarms);
+    try testing.expect(!board.live[index].retired);
     try testing.expectEqual(@as(usize, 0), board.live[index].sets);
     try testing.expectEqual(@as(u64, 101), board.live[index].record.egress_gateway_session_id);
     try testing.expectEqual(@as(u64, 0), harness.launcher.countersSnapshot().egress_sessions_lost);
-}
-
-test "a worker whose session keeps being removed is attached again no sooner than egress_prewarm_interval_ms after the last pass" {
-    var harness: Harness = undefined;
-    try harness.init(.{ .root = .plain_directory });
-    defer harness.deinit();
-    const index = try harness.board.addLiveWorker(0, test_gateway_generation, 101);
-
-    harness.launcher.egressSessionLost(test_gateway_generation, 101);
-    try harness.board.waitFor(.reattach_passes_finished, 1, wait_bound_ns);
-    // The gateway removes the new session at once too.
-    harness.launcher.egressSessionLost(test_gateway_generation, harness.board.sessionOf(index));
-    try harness.board.waitFor(.reattach_passes_finished, 2, prewarm_interval_ns + wait_bound_ns);
-    harness.quiesce();
-
-    const board = &harness.board;
-    try board.expectNoFailure();
-    const worker = &board.live[index];
-    try takeAttachPackets(worker.worker_end.fd(), &worker.attach_log);
-    try testing.expectEqual(@as(usize, 2), worker.drops);
-    try testing.expectEqual(@as(usize, 2), worker.sets);
-    try testing.expectEqual(@as(usize, 2), worker.attach_log.len);
-    try testing.expectEqual(@as(usize, 2), board.prewarms);
-    try testing.expect(board.prewarm_ns[1] + window_slack_ns >= board.prewarm_ns[0] + prewarm_interval_ns);
-    try testing.expectEqual(@as(u64, 2), harness.launcher.countersSnapshot().egress_sessions_lost);
 }
 
 test "a reattach target whose descriptors the server could not duplicate keeps its worker, which the pass reaches again after egress_prewarm_interval_ms" {
@@ -1105,7 +1193,7 @@ test "a reattach target whose descriptors the server could not duplicate keeps i
     try testing.expectEqual(@as(u64, 0), counters.egress_reattach_retired);
 }
 
-test "a launch whose session its gateway removed before WorkerReady gets another of that gateway before its publish" {
+test "a launch whose session its gateway removed before WorkerReady fails with egress_attach at WorkerReady, alive, for the reaper" {
     var harness: Harness = undefined;
     try harness.init(.{ .root = .delegated });
     defer harness.deinit();
@@ -1114,32 +1202,23 @@ test "a launch whose session its gateway removed before WorkerReady gets another
     harness.board.grantClaims(launch_definition, 1);
     harness.launcher.submit(launch_definition, .waiter);
     try harness.board.waitFor(.inits_received, 1, wait_bound_ns);
-    harness.launcher.egressSessionLost(test_gateway_generation, harness.board.sessionIdAt(0));
+    harness.launcher.egressSessionLost(test_gateway_generation, harness.board.sessionIdAt(0), .protocol_violation);
     try harness.awaitLauncherTurn();
     harness.board.release();
-    try harness.board.waitFor(.published, 1, wait_bound_ns);
+    try harness.board.waitFor(.failed, 1, wait_bound_ns);
     harness.quiesce();
 
     const board = &harness.board;
     try board.expectNoFailure();
-    try testing.expectEqual(@as(usize, 2), board.sessions_len);
-    const first = board.sessions[0];
-    const next = board.sessions[1];
-    try testing.expectEqual(test_gateway_generation, next.generation);
-    try testing.expect(next.session_id != first.session_id);
-    const published = &board.published[0];
-    try testing.expectEqual(next.generation, published.worker.egress_generation);
-    try testing.expectEqual(next.session_id, published.worker.egress_session_id);
-    try testing.expect(published.egress_attach_queued);
-    // The boot token stays the removed session's.
-    try testing.expectEqual(worker_table.BootToken{
-        .gateway_generation = first.generation,
-        .session_id = first.session_id,
-        .deadline_mono_ns = board.init_deadline_ns + process_limits.MODULE_EVAL_BUDGET_NS,
-    }, published.worker.boot_egress.?);
+    try testing.expectEqual(@as(usize, 0), board.published_len);
+    // No second session was asked for.
+    try testing.expectEqual(@as(usize, 1), board.sessions_len);
+    const failed = &board.failed[0];
+    try testing.expectEqual(LaunchFailure.egress_attach, failed.failure);
+    try harness.expectChildHandedOverAlive(failed, 0);
     const counters = harness.launcher.countersSnapshot();
     try testing.expectEqual(@as(u64, 1), counters.egress_sessions_lost);
-    try testing.expectEqual(@as(u64, 1), counters.egress_reattached);
+    try testing.expectEqual(@as(u64, 0), counters.egress_reattached);
 }
 
 test "a launch whose attach the gateway fails under boots its child detached and is published without a session" {
@@ -1225,13 +1304,11 @@ test "a WorkerReady that arrives while a gateway spawn holds the launcher past t
 /// set gains fails to compile here until it gets a row.
 fn failureFor(comptime error_name: []const u8) LaunchFailure {
     const rows = .{
-        .{ "WorkerCgroupNotPrepared", LaunchFailure.worker_cgroup_not_prepared },
-        .{ "InvalidBootOptions", LaunchFailure.invalid_boot_options },
+        .{ "LaunchResourcesUnavailable", LaunchFailure.launch_resources },
         .{ "EgressWakeUnavailable", LaunchFailure.egress_wake_set },
         .{ "WorkerInitTimeout", LaunchFailure.child_window_expired },
         .{ "WorkerInitFailed", LaunchFailure.worker_init_failed },
         .{ "ZygoteProtocol", LaunchFailure.zygote_protocol },
-        .{ "OutOfMemory", LaunchFailure.out_of_memory },
     };
     inline for (rows) |row| {
         if (comptime std.mem.eql(u8, row[0], error_name))
@@ -1307,10 +1384,12 @@ const StandInChild = struct {
 
 /// What the stand-in child read in WorkerInit.
 const InitSeen = struct {
-    /// The routes WorkerInit announced: the table's length and inode, the
-    /// pack's inode (0 without one), and the realm mode.
+    /// The routes WorkerInit carried: the artifact's inode and the realm
+    /// mode.
     routes: InitRoutes,
     leaf: []const u8,
+    /// The inode of the state page's memfd.
+    page_inode: u64,
     boot_egress_token: egress_token.Bytes,
     init_deadline_ns: u64,
     /// WorkerInit carried the worker's half of an egress session.
@@ -1321,10 +1400,7 @@ const InitSeen = struct {
 };
 
 const InitRoutes = struct {
-    serves_routes: bool = false,
     isolate_realm: bool = false,
-    table_len: u64 = 0,
-    table_inode: u64 = 0,
     pack_inode: u64 = 0,
 };
 
@@ -1368,8 +1444,9 @@ const LiveWorker = struct {
     worker_end: fd_mod.OwnedFd,
     /// The packets taken from `worker_end` so far.
     attach_log: AttachLog = .{},
-    /// The record no longer holds this worker: `retireForEgress` retired it,
-    /// or `setWorkerEgress` found it retired.
+    /// The record no longer holds this worker: `retireForEgress` or
+    /// `retireEgressSession` retired it, or `setWorkerEgress` found it
+    /// retired.
     retired: bool = false,
     /// `setWorkerEgress` finds the worker retired, as when the reaper retired
     /// it while its reattach waited for the gateway.
@@ -1382,8 +1459,8 @@ const LiveWorker = struct {
     dup_failures_left: usize = 0,
     sets: usize = 0,
     retires: usize = 0,
-    /// `dropEgressSession` calls that took this worker off its session.
-    drops: usize = 0,
+    /// `retireEgressSession` calls that retired this worker.
+    session_retires: usize = 0,
     /// When the last `setWorkerEgress` and `retireForEgress` for this worker
     /// ran (CLOCK_MONOTONIC).
     set_ns: u64 = 0,
@@ -1413,6 +1490,12 @@ const Board = struct {
     /// Claims asked for `probe_definition`, one per launcher turn that took a
     /// probe submission.
     probe_claims: usize = 0,
+    /// Scale-out samples taken (`scaleOut`), when the first of them ran
+    /// (CLOCK_MONOTONIC), and the launches the samples still grant
+    /// `launch_definition`.
+    scale_out_samples: usize = 0,
+    scale_out_sample_ns: [4]u64 = @splat(0),
+    scale_out_grants_left: usize = 0,
 
     /// The board's gateway: the generation `attachEgress` stamps on new
     /// sessions, and whether that gateway is up, which
@@ -1458,8 +1541,8 @@ const Board = struct {
     /// The `egressPrewarm` calls made before the last query that found no
     /// stale worker, which ends a pass: the passes that reached their end.
     reattach_passes_finished: usize = 0,
-    /// `dropEgressSession` calls that found no live worker on the session.
-    unmatched_drops: usize = 0,
+    /// `retireEgressSession` calls that found no live worker on the session.
+    unmatched_session_retires: usize = 0,
 
     published: [launches_max]Published = undefined,
     published_len: usize = 0,
@@ -1472,7 +1555,6 @@ const Board = struct {
     answers_len: usize = 0,
     answers_taken: usize = 0,
     fork_requests: usize = 0,
-    fork_requests_with_leaf: usize = 0,
     fork_job_ids: [launches_max]u64 = undefined,
     children: [launches_max]StandInChild = undefined,
     children_len: usize = 0,
@@ -1482,6 +1564,8 @@ const Board = struct {
     init_routes: InitRoutes = .{},
     init_leaf_buffer: [std.fs.max_path_bytes]u8 = undefined,
     init_leaf_len: usize = 0,
+    /// The inode of the state page's memfd WorkerInit carried.
+    init_page_inode: u64 = 0,
     init_boot_egress_token: egress_token.Bytes = egress_token.none,
     /// The child window's end as WorkerInit carried it.
     init_deadline_ns: u64 = 0,
@@ -1506,12 +1590,14 @@ const Board = struct {
         prewarms,
         reattach_passes_finished,
         probe_claims,
+        scale_out_samples,
     };
 
     fn deps(self: *Board) launcher_mod.Deps {
         return .{
             .ctx = self,
             .claim = claimLaunch,
+            .scaleOut = scaleOut,
             .attachEgress = attachEgress,
             .publish = publishWorker,
             .failed = launchFailed,
@@ -1521,7 +1607,7 @@ const Board = struct {
             .nextStaleEgressWorker = nextStaleEgressWorker,
             .setWorkerEgress = setWorkerEgress,
             .retireForEgress = retireForEgress,
-            .dropEgressSession = dropEgressSession,
+            .retireEgressSession = retireEgressSession,
         };
     }
 
@@ -1766,6 +1852,7 @@ const Board = struct {
             .prewarms => self.prewarms,
             .reattach_passes_finished => self.reattach_passes_finished,
             .probe_claims => self.probe_claims,
+            .scale_out_samples => self.scale_out_samples,
         };
     }
 
@@ -1791,14 +1878,14 @@ const Board = struct {
         return if (definition == launch_definition) self.pool else null;
     }
 
-    /// A ticket for a launch of `definition` when its pool, or else a grant,
-    /// allows one.
-    fn grantLocked(self: *Board, definition: DefinitionIndex) ?pool.LaunchTicket {
+    /// A launch of `definition` when its pool, or else a grant, allows one;
+    /// a pool answers a scale-out it was not allowed as `.watch`.
+    fn grantLocked(self: *Board, definition: DefinitionIndex, allow_scale_out: bool) pool.LaunchStart {
         if (self.poolFor(definition)) |definition_pool|
-            return definition_pool.launchStarted(true);
-        if (self.claims_left[definition] == 0) return null;
+            return definition_pool.launchStarted(true, allow_scale_out);
+        if (self.claims_left[definition] == 0) return .none;
         self.claims_left[definition] -= 1;
-        return .{ .entry = @intCast(self.claims_len) };
+        return .{ .started = .{ .entry = @intCast(self.claims_len) } };
     }
 
     /// Moves out the leftovers of the `index`-th failed launch, as the reaper
@@ -1808,21 +1895,19 @@ const Board = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         const leftovers = self.failed[index].leftovers;
-        self.failed[index].leftovers = .{};
+        self.failed[index].leftovers = .{ .definition = leftovers.definition };
         return leftovers;
     }
 
     /// Records a fork request and returns the answer the test scripted for
     /// it; an unscripted request is a failure, answered with a refusal.
-    fn takeAnswer(self: *Board, fork_job_id: u64, carries_leaf: bool) Answer {
+    fn takeAnswer(self: *Board, fork_job_id: u64) Answer {
         self.mutex.lock();
         defer self.mutex.unlock();
         defer self.condition.broadcast();
         if (self.fork_requests < self.fork_job_ids.len)
             self.fork_job_ids[self.fork_requests] = fork_job_id;
         self.fork_requests += 1;
-        if (carries_leaf)
-            self.fork_requests_with_leaf += 1;
         if (self.answers_taken == self.answers_len) {
             self.noteFailureLocked(error.TestUnscriptedForkRequest);
             return .refuse;
@@ -1867,6 +1952,7 @@ const Board = struct {
         self.init_routes = seen.routes;
         self.init_leaf_len = @min(seen.leaf.len, self.init_leaf_buffer.len);
         @memcpy(self.init_leaf_buffer[0..self.init_leaf_len], seen.leaf[0..self.init_leaf_len]);
+        self.init_page_inode = seen.page_inode;
         self.init_boot_egress_token = seen.boot_egress_token;
         self.init_deadline_ns = seen.init_deadline_ns;
         self.init_carried_egress = seen.carried_egress;
@@ -1905,25 +1991,60 @@ fn boardOf(ctx: *anyopaque) *Board {
     return @ptrCast(@alignCast(ctx));
 }
 
-fn claimLaunch(ctx: *anyopaque, definition: DefinitionIndex) ?pool.LaunchTicket {
+fn claimLaunch(ctx: *anyopaque, definition: DefinitionIndex, allow_scale_out: bool) pool.LaunchStart {
     const board = boardOf(ctx);
     board.mutex.lock();
     defer board.mutex.unlock();
-    if (definition >= board.claims_left.len) return null;
+    if (definition >= board.claims_left.len) return .none;
     if (definition == probe_definition) {
         board.probe_claims += 1;
         board.condition.broadcast();
     }
-    const ticket = board.grantLocked(definition) orelse return null;
+    const ticket = switch (board.grantLocked(definition, allow_scale_out)) {
+        .started => |ticket| ticket,
+        .watch => return .watch,
+        .none => return .none,
+    };
     if (board.claims_len == board.claims.len) {
         // The ticket stays taken, which only a test that already failed sees.
         board.noteFailureLocked(error.TestTooManyClaims);
-        return null;
+        return .none;
     }
     board.claims[board.claims_len] = .{ .definition = definition, .ticket = ticket };
     board.claims_len += 1;
     board.condition.broadcast();
-    return ticket;
+    return .{ .started = ticket };
+}
+
+/// A scale-out sample as `Supervisor.sampleScaleOut` takes one, from the
+/// board's script: a definition whose pool no longer wants a scale-out
+/// leaves the watch, and `launch_definition` is granted a launch while
+/// `scale_out_grants_left` lasts.
+fn scaleOut(ctx: *anyopaque, watch: *launcher_mod.DefinitionSet, granted: *launcher_mod.DefinitionSet, now_ns: u64) void {
+    const board = boardOf(ctx);
+    board.mutex.lock();
+    defer board.mutex.unlock();
+    defer board.condition.broadcast();
+    granted.* = .initEmpty();
+    if (board.scale_out_samples < board.scale_out_sample_ns.len)
+        board.scale_out_sample_ns[board.scale_out_samples] = now_ns;
+    board.scale_out_samples += 1;
+    const watched = watch.*;
+    var iterator = watched.iterator(.{});
+    while (iterator.next()) |index| {
+        const definition: DefinitionIndex = @intCast(index);
+        const definition_pool = board.poolFor(definition) orelse {
+            watch.unset(index);
+            continue;
+        };
+        if (!definition_pool.keepScaleOutWatch(true)) {
+            watch.unset(index);
+            continue;
+        }
+        if (board.scale_out_grants_left == 0) continue;
+        board.scale_out_grants_left -= 1;
+        granted.set(index);
+    }
 }
 
 /// A new session of the board's gateway on `wake_set`, as
@@ -1977,7 +2098,6 @@ fn attachEgress(
             .key = keyOf(generation),
             .session_id = board.attached_session_id,
             .policy_id = board.boot_policies[definition],
-            .budget = @intCast(egress_policy.production.max_fetches_per_boot),
         },
     };
 }
@@ -2106,9 +2226,9 @@ fn retireForEgress(ctx: *anyopaque, target: *const launcher_mod.ReattachTarget) 
     board.condition.broadcast();
 }
 
-/// Takes the live worker on session `session_id` of gateway `generation` off
-/// it, as `Supervisor.dropEgressSession` does.
-fn dropEgressSession(ctx: *anyopaque, generation: u64, session_id: u64) bool {
+/// Retires the live worker on session `session_id` of gateway `generation`,
+/// as `Supervisor.retireEgressSession` does.
+fn retireEgressSession(ctx: *anyopaque, generation: u64, session_id: u64) bool {
     const board = boardOf(ctx);
     board.mutex.lock();
     defer board.mutex.unlock();
@@ -2117,12 +2237,12 @@ fn dropEgressSession(ctx: *anyopaque, generation: u64, session_id: u64) bool {
         if (worker.retired) continue;
         if (worker.record.egress_gateway_generation != generation) continue;
         if (worker.record.egress_gateway_session_id != session_id) continue;
-        worker.record.egress_gateway_generation = 0;
-        worker.record.egress_gateway_session_id = 0;
-        worker.drops += 1;
+        worker.retired = true;
+        worker.session_retires += 1;
+        worker.retire_ns = process.monotonicNowNsOrZero();
         return true;
     }
-    board.unmatched_drops += 1;
+    board.unmatched_session_retires += 1;
     return false;
 }
 
@@ -2236,17 +2356,16 @@ fn takeAttachPackets(fd: std.posix.fd_t, log: *AttachLog) !void {
     }
 }
 
-/// A launcher over a stand-in zygote, its routes, a worker cgroup root, a
-/// tmpfs mount point and the board its dependencies report to. Initialized
-/// in place, since the launcher, the stand-in thread and the board hold
-/// pointers into it. `deinit` releases whatever `init` got to, in reverse,
-/// and plays the reaper for every failed launch's leftovers.
+/// A launcher over a stand-in zygote, its routes, a worker cgroup root and
+/// the board its dependencies report to. Initialized in place, since the
+/// launcher, the stand-in thread and the board hold pointers into it.
+/// `deinit` releases whatever `init` got to, in reverse, and plays the
+/// reaper for every failed launch's leftovers.
 const Harness = struct {
     routes: ?*fixture.OwnedRoutes,
     /// The directory a root over a plain directory sits in; null otherwise.
     plain_parent: ?std.testing.TmpDir,
     root: ?host.WorkerCgroupRoot,
-    tmp_mount_point: ?host.TmpMountPoint,
     board: Board,
     /// The process whose pidfd stands for the zygote's.
     zygote_process: ?StandInChild,
@@ -2285,7 +2404,6 @@ const Harness = struct {
             .routes = null,
             .plain_parent = null,
             .root = null,
-            .tmp_mount_point = null,
             .board = .{ .pool = options.pool },
             .zygote_process = null,
             .spawned = .{
@@ -2294,7 +2412,6 @@ const Harness = struct {
                 .control_fd = null,
                 .trace_read_fd = null,
                 .trace_write_fd = null,
-                .next_fork_job_id = 1,
             },
             .serve_fd = .{},
             .stand_in = null,
@@ -2313,9 +2430,6 @@ const Harness = struct {
                 self.root = try host.WorkerCgroupRoot.claimHostDir(testing.allocator, self.plain_parent.?.dir.fd);
             },
         }
-        var tmp_mount_point: host.TmpMountPoint = undefined;
-        try tmp_mount_point.init(host.tmp_mount.default_parent_dir);
-        self.tmp_mount_point = tmp_mount_point;
         self.routes = try fixture.OwnedRoutes.createWith(testing.allocator, options.limits);
         // The stand-in attach stamps each definition's boot policy, as
         // `worker_factory.attachLaunchEgress` does.
@@ -2335,9 +2449,8 @@ const Harness = struct {
             .deps = self.board.deps(),
             .zygote_process = &self.spawned,
             .routes = &self.routes.?.routes,
-            .worker_host = .{ .cgroup_root = &self.root.?, .tmp_mount_point = &self.tmp_mount_point.? },
-            .boot = ipc.WorkerRuntimeBootOptions.default(),
-            .tmpfs_size_bytes = null,
+            .worker_host = .{ .cgroup_root = &self.root.? },
+            .boot = .{},
             .launches_per_definition_max = launches_per_definition_max,
         });
         self.launcher_initialized = true;
@@ -2399,10 +2512,6 @@ const Harness = struct {
             std.posix.close(control_fd);
             self.spawned.control_fd = null;
         }
-        if (self.tmp_mount_point) |*tmp_mount_point| {
-            tmp_mount_point.deinit();
-            self.tmp_mount_point = null;
-        }
         if (self.root) |*root| {
             root.deinit(testing.allocator);
             self.root = null;
@@ -2443,15 +2552,15 @@ const Harness = struct {
         return std.fmt.bufPrint(buffer, "{s}/worker-{d}", .{ self.root.?.workers_dir_path, fork_job_id });
     }
 
-    /// Checks that `leaf` is the open leaf of fork job `fork_job_id`.
-    fn expectLeaf(self: *const Harness, leaf: *const fd_mod.OwnedFd, fork_job_id: u64) !void {
-        try testing.expect(leaf.isValid());
-        var expected_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        var actual_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        try testing.expectEqualStrings(
-            try self.leafPath(&expected_buffer, fork_job_id),
-            try fd_mod.procFdTarget(leaf.fd(), &actual_buffer),
-        );
+    /// Checks that `leaf` names the leaf of fork job `fork_job_id` under the
+    /// harness's root, and that the leaf still exists for its new holder to
+    /// remove.
+    fn expectLeaf(self: *const Harness, leaf: ?host.WorkerLeaf, fork_job_id: u64) !void {
+        const named = leaf orelse return error.TestExpectedLeaf;
+        try testing.expectEqual(self.root.?.workers_dir_fd, named.workers_dir_fd);
+        try testing.expectEqual(fork_job_id, named.job_id);
+        var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        try std.fs.accessAbsolute(try self.leafPath(&path_buffer, fork_job_id), .{});
     }
 
     /// Checks that a failed launch handed over the stand-in's child
@@ -2464,7 +2573,7 @@ const Harness = struct {
         try testing.expect(handed.pidfd.isValid());
         try testing.expectEqual(@as(u32, @intCast(child.pid)), handed.pid);
         try testing.expectEqual(child.pid, try pidOfPidFd(handed.pidfd.fd()));
-        try self.expectLeaf(&handed.cgroup_dir, child.fork_job_id);
+        try self.expectLeaf(handed.leaf, child.fork_job_id);
     }
 
     /// Checks that no `worker-*` leaf is left in the root's host directory.
@@ -2498,12 +2607,13 @@ fn serveForkRequests(harness: *Harness) !void {
 /// child's part of WorkerInit as the board's script says.
 fn serveForkRequest(harness: *Harness) !void {
     const board = &harness.board;
-    var request = try ipc.recvForkRequestWithFd(harness.serve_fd.fd());
+    // The codec refuses a request without exactly one descriptor, the leaf.
+    var request = try ipc.zygote_worker.recvForkRequest(harness.serve_fd.fd());
     defer request.deinit();
     const fork_job_id = request.message.fork_job_id;
-    const answer = board.takeAnswer(fork_job_id, request.cgroup_dir_fd != null);
+    const answer = board.takeAnswer(fork_job_id);
     switch (answer) {
-        .refuse => return ipc.sendForkFailed(harness.serve_fd.fd(), fork_job_id),
+        .refuse => return ipc.zygote_worker.sendForkFailed(harness.serve_fd.fd(), fork_job_id),
         .unanswered => return,
         .reply_on_release => if (!try awaitRelease(harness)) return,
         .ready, .ready_on_release, .init_failed, .child_exits, .silent => {},
@@ -2526,7 +2636,7 @@ fn serveForkRequest(harness: *Harness) !void {
     board.giveWorkerEnd(index, worker_end_owned);
     worker_end_owned = .{};
     const worker_end = init_pair[1];
-    try ipc.sendForkReply(harness.serve_fd.fd(), fork_job_id, @intCast(child_pid), server_end.fd(), child_pidfd);
+    try ipc.zygote_worker.sendForkReply(harness.serve_fd.fd(), fork_job_id, @intCast(child_pid), server_end.fd(), child_pidfd);
     // SCM_RIGHTS gave the launcher its own copy; closing this one lets the
     // launcher's close of the server's end reach the worker's end as a
     // hang-up.
@@ -2544,8 +2654,8 @@ fn serveForkRequest(harness: *Harness) !void {
     // dated before it.
     board.noteAnswered();
     switch (answer) {
-        .ready, .ready_on_release, .reply_on_release => try ipc.sendWorkerReady(worker_end),
-        .init_failed => try ipc.sendWorkerInitFailed(worker_end, .internal_error),
+        .ready, .ready_on_release, .reply_on_release => try ipc.zygote_worker.sendWorkerReady(worker_end),
+        .init_failed => try ipc.zygote_worker.sendWorkerInitFailed(worker_end, .internal_error),
         .child_exits => {
             // The stand-in's copy closes first, so the child's exit closes
             // the worker's end for good, as a worker's exit does.
@@ -2571,19 +2681,17 @@ fn awaitWorkerInit(harness: *Harness, worker_end: std.posix.fd_t) !InitOutcome {
             .quiet => {},
             .hung_up => return .abandoned,
             .readable => {
-                var init = try ipc.recvWorkerInit(worker_end);
+                var init = try ipc.zygote_worker.recvWorkerInit(worker_end);
                 defer init.deinit();
                 var leaf_buffer: [std.fs.max_path_bytes]u8 = undefined;
                 const leaf = try fd_mod.procFdTarget(init.cgroup_dir_fd, &leaf_buffer);
                 harness.board.noteInit(.{
                     .routes = .{
-                        .serves_routes = init.message.servesRoutes(),
                         .isolate_realm = init.message.isolatesRealms(),
-                        .table_len = init.message.route_table_len,
-                        .table_inode = try inodeOf(init.route_table_fd),
-                        .pack_inode = if (init.module_pack_fd) |fd| try inodeOf(fd) else 0,
+                        .pack_inode = try inodeOf(init.module_pack_fd),
                     },
                     .leaf = leaf,
+                    .page_inode = try inodeOf(init.metrics_fd),
                     .boot_egress_token = init.message.boot_egress_token,
                     .init_deadline_ns = init.message.init_deadline_mono_ns,
                     .carried_egress = init.egress_shared_fds.isValid(),
@@ -2703,6 +2811,53 @@ fn pidOfPidFd(pidfd: std.posix.fd_t) !std.posix.pid_t {
         return std.fmt.parseInt(std.posix.pid_t, std.mem.trim(u8, line["Pid:".len..], " \t"), 10);
     }
     return error.TestPidfdInfoMissing;
+}
+
+/// The name the launch gives its state page's memfd
+/// (`host/launch.zig:Machine.prepare`).
+const launch_page_memfd_name = "collo-shared-metrics";
+/// Memfds of one name this process may hold at once in a test.
+const own_memfds_max: usize = 64;
+
+/// The inodes of the memfds created with `name` that this process holds, by
+/// their `/proc/self/fd` links, `/memfd:<name> (deleted)`, into `out`.
+fn ownMemfdInodes(comptime name: []const u8, out: []u64) !usize {
+    const prefix = "/memfd:" ++ name ++ " ";
+    var dir = try std.fs.openDirAbsolute("/proc/self/fd", .{ .iterate = true });
+    defer dir.close();
+    var len: usize = 0;
+    var entries = dir.iterate();
+    while (try entries.next()) |entry| {
+        var link_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        // A descriptor closed since the listing has no link left.
+        const link = std.posix.readlinkat(dir.fd, entry.name, &link_buffer) catch continue;
+        if (!std.mem.startsWith(u8, link, prefix))
+            continue;
+        // Following the link stats the memfd itself.
+        const stat = std.posix.fstatat(dir.fd, entry.name, 0) catch continue;
+        if (len == out.len)
+            return error.TestTooManyMemfds;
+        out[len] = @intCast(stat.ino);
+        len += 1;
+    }
+    return len;
+}
+
+/// Waits until this process holds a memfd created with `name` whose inode is
+/// not in `held_before`, and returns that inode; fails once `bound_ns`
+/// passes without one.
+fn waitForNewOwnMemfd(comptime name: []const u8, held_before: []const u64, bound_ns: u64) !u64 {
+    var timer = try std.time.Timer.start();
+    while (timer.read() < bound_ns) {
+        var held: [own_memfds_max]u64 = undefined;
+        const held_len = try ownMemfdInodes(name, &held);
+        for (held[0..held_len]) |inode| {
+            if (std.mem.indexOfScalar(u64, held_before, inode) == null)
+                return inode;
+        }
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
+    return error.TestMemfdMissing;
 }
 
 fn isNonblocking(fd: std.posix.fd_t) !bool {

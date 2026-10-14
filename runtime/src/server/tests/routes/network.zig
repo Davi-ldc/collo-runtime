@@ -92,7 +92,7 @@ fn readImage(allocator: std.mem.Allocator, policies: *const routes.NetworkPolici
 test "routes that share one value share one grant and one policy" {
     var compiled: Compiled = undefined;
     try compiled.init(
-        \\{"globalSettings": {"network": {"allow": ["api.example.com"]}},
+        \\{"settings": {"network": {"allow": ["api.example.com"]}},
         \\ "workers": {
         \\   "a": {"routes": {"/a1": {"entry": "a.js"}, "/a2": {"entry": "a.js"}}},
         \\   "b": {"routes": {"/b": {"entry": "b.js"}}}
@@ -269,7 +269,7 @@ fn compile(allocator: std.mem.Allocator, definitions: []const config.WorkerDefin
 test "compiling the policies frees everything when any allocation fails" {
     var diagnostic: config.Diagnostic = .{};
     var parsed = try config.parse(std.testing.allocator,
-        \\{"globalSettings": {"network": {"allow": ["*", "10.0.0.5:8080"], "allowPrivateNetworks": true}},
+        \\{"settings": {"network": {"allow": ["*", "10.0.0.5:8080"], "allowPrivateNetworks": true}},
         \\ "workers": {"api": {"routes": {
         \\   "/a": {"entry": "a.js"},
         \\   "/b": {"entry": "a.js", "network": {"allow": ["*.example.com"], "allowHttp": true}}

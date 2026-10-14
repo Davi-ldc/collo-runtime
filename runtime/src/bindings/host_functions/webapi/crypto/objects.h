@@ -1,8 +1,7 @@
-// The JSC cells behind the Web Cryptography API objects: `Crypto`, which keeps an entropy cache, the stateless
-// `SubtleCrypto`, and `CryptoKey`. The cells are created and used on the VM thread and destroyed when the collector
-// sweeps them. A CryptoKey never changes after creation: a secret key keeps its bytes in `SecretBytes`, which zeroes
-// them when the cell is destroyed, and an asymmetric key owns an `EVP_PKEY` that crypto jobs read concurrently from
-// pool threads.
+// The JSC cells behind the Web Cryptography API objects: `Crypto`, `SubtleCrypto` and `CryptoKey`. They are created and
+// used on the VM thread and destroyed when the collector sweeps them. Crypto and SubtleCrypto hold no state. A
+// CryptoKey never changes after creation: a secret key keeps its bytes in a `SecretBytes`, which zeroes them when the
+// cell is destroyed, and an asymmetric key owns its `EVP_PKEY`, which every operation only reads.
 
 #pragma once
 
@@ -14,7 +13,6 @@
 #include <openssl/evp.h>
 #include <wtf/Vector.h>
 
-#include <array>
 #include <cstdint>
 #include <span>
 
@@ -35,25 +33,11 @@ public:
 
     DECLARE_INFO;
 
-    // Fills the span with random bytes from BoringSSL's RAND_bytes and returns false when it fails. A request of at
-    // most `max_cache_served_bytes` is served from a cache refilled `entropy_cache_bytes` at a time; a larger one reads
-    // RAND_bytes directly. `process_id` must be the VM's current process id (`ColloVm::process_id_at_creation`, which
-    // `collo_vm_post_fork_child` updates). The Crypto object is created in the zygote, so a worker inherits its cache;
-    // when the id differs from the one that filled the cache, the cache is zeroed before anything is served.
-    bool fillRandom(uint64_t process_id, std::span<uint8_t>);
-
 private:
     JSColloCrypto(JSC::VM&, JSC::Structure*);
-    ~JSColloCrypto();
+    ~JSColloCrypto() = default;
 
     void finishCreation(JSC::VM&);
-
-    static constexpr size_t entropy_cache_bytes = 4096;
-    static constexpr size_t max_cache_served_bytes = entropy_cache_bytes / 8;
-
-    std::array<uint8_t, entropy_cache_bytes> m_entropy_cache {};
-    size_t m_entropy_offset { entropy_cache_bytes };
-    uint64_t m_entropy_process_id { 0 };
 };
 
 class JSColloSubtleCrypto final : public JSC::JSDestructibleObject {
@@ -78,6 +62,20 @@ private:
     void finishCreation(JSC::VM&);
 };
 
+// What an asymmetric CryptoKey holds. The RSA fields are empty for an EC or OKP key, and `named_curve` is None for an
+// RSA key.
+struct AsymmetricKeyParts {
+    CryptoKeyAlgorithm algorithm { CryptoKeyAlgorithm::RsaPss };
+    WebCryptoHash hash { WebCryptoHash::SHA256 };
+    CryptoKeyType type { CryptoKeyType::Public };
+    CryptoKeyNamedCurve named_curve { CryptoKeyNamedCurve::None };
+    bssl::UniquePtr<EVP_PKEY> pkey;
+    size_t rsa_modulus_bits { 0 };
+    WTF::Vector<uint8_t> rsa_public_exponent;
+    bool extractable { false };
+    uint8_t usages { 0 };
+};
+
 class JSColloCryptoKey final : public JSC::JSDestructibleObject {
     using Base = JSC::JSDestructibleObject;
 
@@ -88,17 +86,11 @@ public:
     }
 
     static JSC::Structure* createStructure(JSC::VM&, JSC::JSGlobalObject*, JSC::JSValue prototype);
-    // The factories never return null: `allocateCell` crashes when allocation fails. `create` makes a secret key
-    // from `material`. `createRsa`, `createEc` and `createOkp` take ownership of the `EVP_PKEY`, which the cell frees
-    // when it is destroyed. Callers go through the validating factories in `keys.h`.
-    static JSColloCryptoKey* create(JSC::VM&, JSC::Structure*, CryptoKeyAlgorithm, WebCryptoHash,
-        SecretBytes&& material, bool extractable, uint8_t usages, size_t hmac_length_bits = 0);
-    static JSColloCryptoKey* createRsa(JSC::VM&, JSC::Structure*, CryptoKeyAlgorithm, WebCryptoHash, CryptoKeyType,
-        EVP_PKEY*, size_t modulus_bits, WTF::Vector<uint8_t>&& public_exponent, bool extractable, uint8_t usages);
-    static JSColloCryptoKey* createEc(JSC::VM&, JSC::Structure*, CryptoKeyAlgorithm, CryptoKeyNamedCurve, CryptoKeyType,
-        EVP_PKEY*, bool extractable, uint8_t usages);
-    static JSColloCryptoKey* createOkp(JSC::VM&, JSC::Structure*, CryptoKeyAlgorithm, CryptoKeyNamedCurve,
-        CryptoKeyType, EVP_PKEY*, bool extractable, uint8_t usages);
+    // The factories never return null: `allocateCell` crashes when allocation fails. Callers go through the validating
+    // factories in keys.h. `hmac_length_bits` is the `length` an HMAC import declared, or 0.
+    static JSColloCryptoKey* createSecret(JSC::VM&, JSC::Structure*, CryptoKeyAlgorithm, WebCryptoHash,
+        SecretBytes&& material, bool extractable, uint8_t usages, size_t hmac_length_bits);
+    static JSColloCryptoKey* createAsymmetric(JSC::VM&, JSC::Structure*, AsymmetricKeyParts&&);
     static void destroy(JSC::JSCell*);
 
     DECLARE_INFO;
@@ -109,9 +101,8 @@ public:
     WebCryptoHash hash() const { return m_hash; }
     // The secret bytes of an AES, HMAC, PBKDF2 or HKDF key; empty for an asymmetric key.
     std::span<const uint8_t> material() const { return m_material.span(); }
-    // Both return `m_rsa_key`, the key of any asymmetric algorithm.
-    EVP_PKEY* rsaKey() const { return m_rsa_key; }
-    EVP_PKEY* asymmetricKey() const { return m_rsa_key; }
+    // The key of an RSA, EC or OKP algorithm; null for a secret key.
+    EVP_PKEY* pkey() const { return m_pkey.get(); }
     size_t rsaModulusBits() const { return m_rsa_modulus_bits; }
     std::span<const uint8_t> rsaPublicExponent() const { return m_rsa_public_exponent.span(); }
     bool extractable() const { return m_extractable; }
@@ -124,11 +115,8 @@ public:
 private:
     JSColloCryptoKey(JSC::VM&, JSC::Structure*, CryptoKeyAlgorithm, WebCryptoHash, SecretBytes&& material,
         bool extractable, uint8_t usages, size_t hmac_length_bits);
-    JSColloCryptoKey(JSC::VM&, JSC::Structure*, CryptoKeyAlgorithm, WebCryptoHash, CryptoKeyType, EVP_PKEY*,
-        size_t modulus_bits, WTF::Vector<uint8_t>&& public_exponent, bool extractable, uint8_t usages);
-    JSColloCryptoKey(JSC::VM&, JSC::Structure*, CryptoKeyAlgorithm, WebCryptoHash, CryptoKeyType, CryptoKeyNamedCurve,
-        EVP_PKEY*, bool extractable, uint8_t usages);
-    ~JSColloCryptoKey();
+    JSColloCryptoKey(JSC::VM&, JSC::Structure*, AsymmetricKeyParts&&);
+    ~JSColloCryptoKey() = default;
 
     void finishCreation(JSC::VM&);
 
@@ -136,16 +124,13 @@ private:
     CryptoKeyType m_type { CryptoKeyType::Secret };
     CryptoKeyNamedCurve m_named_curve { CryptoKeyNamedCurve::None };
     WebCryptoHash m_hash { WebCryptoHash::SHA256 };
-    SecretBytes m_material;
-    size_t m_hmac_length_bits { 0 };
-    // Owned, and freed by the destructor. Despite the name it holds the key of every asymmetric algorithm: RSA, EC
-    // and OKP. Crypto jobs share it with pool threads through `retainSharedPkey`, and BoringSSL allows concurrent use
-    // of an `EVP_PKEY` only by non-mutating functions, so nothing may mutate it once the cell exists.
-    EVP_PKEY* m_rsa_key { nullptr };
-    size_t m_rsa_modulus_bits { 0 };
-    WTF::Vector<uint8_t> m_rsa_public_exponent;
     bool m_extractable { false };
     uint8_t m_usages { 0 };
+    SecretBytes m_material;
+    size_t m_hmac_length_bits { 0 };
+    bssl::UniquePtr<EVP_PKEY> m_pkey;
+    size_t m_rsa_modulus_bits { 0 };
+    WTF::Vector<uint8_t> m_rsa_public_exponent;
 };
 
 // Getters on `CryptoKey.prototype`; each throws a TypeError when the receiver is not a CryptoKey.
@@ -154,9 +139,8 @@ JSC_DECLARE_HOST_FUNCTION(cryptoKeyGetExtractable);
 JSC_DECLARE_HOST_FUNCTION(cryptoKeyGetType);
 JSC_DECLARE_HOST_FUNCTION(cryptoKeyGetUsages);
 
-// The interface constructors. Calling or constructing any of them throws a TypeError.
-JSC::JSFunction* createCryptoConstructor(JSC::JSGlobalObject*, JSC::VM&);
-JSC::JSFunction* createSubtleCryptoConstructor(JSC::JSGlobalObject*, JSC::VM&);
-JSC::JSFunction* createCryptoKeyConstructor(JSC::JSGlobalObject*, JSC::VM&);
+// The constructor of the interface `name`, `Crypto`, `SubtleCrypto` or `CryptoKey`, which throws a TypeError on every
+// call and construction.
+JSC::JSFunction* createInterfaceConstructor(JSC::JSGlobalObject*, JSC::VM&, WTF::ASCIILiteral name);
 
 }

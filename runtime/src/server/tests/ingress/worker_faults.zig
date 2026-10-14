@@ -1,16 +1,19 @@
 //! Worker faults on an ingress lane: every input from a worker the lane must
-//! refuse, from a malformed control or fault datagram to a corrupt completion
-//! ring or payload ring, and a worker that dies while its client uploads;
-//! and, set against them, the notice of a worker that asks to be retired,
-//! which ends no request and is no fault unless it is malformed. The
-//! lane marks the worker dead with the reason `fault.WorkerFaultReason` names,
-//! answers each of its requests in flight with 502, or resets a stream whose
-//! response head went out, queues the worker's retirement to the reaper, and
-//! keeps serving: no handler returns an error and nothing asks the server to
-//! stop. A send to a worker that would block is backpressure and never a
-//! fault. Lane `server-ingress-test`, through `lane_harness.zig`; the
-//! classification tables are pinned in `fault.zig`, and real workers dying
-//! mid-upload run in `local-e2e`.
+//! refuse, from a malformed control datagram to a `request_done` that fails
+//! to decode, names a request it was never sent, one whose begin never left,
+//! another stream, or another worker's request on the same lane (whose
+//! victim keeps its request and its record), or a corrupt payload ring, and
+//! a worker that dies while its client uploads; and, set against them, the
+//! notice of a worker that asks to be retired, which ends no request and is
+//! no fault unless it is malformed. The lane marks the worker dead with the
+//! reason `fault.WorkerFaultReason` names, answers each of its requests in
+//! flight with 502, or resets a stream whose response head went out, queues
+//! the worker's retirement to the reaper, and keeps serving: no handler
+//! returns an error and nothing asks the server to stop. A send to a worker
+//! that would block is backpressure and never a fault. Lane
+//! `server-ingress-test`, through `lane_harness.zig`; the classification
+//! tables are pinned in `fault.zig`, and real workers dying mid-upload run
+//! in `local-e2e`.
 
 const std = @import("std");
 const ipc = @import("collo_ipc");
@@ -109,44 +112,205 @@ test "a request_begin-shaped packet that carries a descriptor faults its worker 
     try scene.expectFaultAnswered(.unexpected_descriptor);
 }
 
-test "a fault datagram with 31 descriptors faults its worker (#34)" {
+test "a request_done whose record fails to decode faults its worker" {
     var scene: OneWorker = undefined;
     try scene.init(.{});
     defer scene.deinit();
-    _ = try scene.get(1);
+    const request = try scene.get(1);
 
-    const descriptors_before = try lane_harness.openDescriptorCount();
-    var packet: [32]u8 = @splat(0);
-    std.mem.writeInt(u32, packet[0..4], @intFromEnum(@import("collo_ipc").MessageKind.fs_fault_request), .little);
-    try scene.stub.sendFaultWithDescriptors(&packet, lane_harness.raw_descriptors_max);
-    try scene.harness.handleFsFault(0, scene.stub);
-    try scene.expectFaultAnswered(.too_many_descriptors);
-    try std.testing.expectEqual(descriptors_before, try lane_harness.openDescriptorCount());
+    // A payload one byte short of a `RequestDonePayload`.
+    var short: [@sizeOf(ingress_channel.RequestDonePayload) - 1]u8 = @splat(0);
+    try scene.stub.sendRawDone(request, &short);
+    try scene.harness.handleControl(0, scene.stub);
+    try scene.expectFaultAnswered(.ingress_channel_undecodable);
 }
 
-test "a completion ring the worker marked fatal faults its worker (#34)" {
+test "a request_done with a status the vocabulary does not name faults its worker" {
     var scene: OneWorker = undefined;
     try scene.init(.{});
     defer scene.deinit();
-    _ = try scene.get(1);
+    const request = try scene.get(1);
 
-    try scene.stub.markCompletionRingFatal();
-    try scene.harness.handleCompletions(0, scene.stub);
-    try scene.expectFaultAnswered(.completion_ring_fatal);
+    var payload = ingress_channel.encodeRequestDone((lane_harness.Done{}).record());
+    payload.status = 200;
+    try scene.stub.sendRawDone(request, std.mem.asBytes(&payload));
+    try scene.harness.handleControl(0, scene.stub);
+    try scene.expectFaultAnswered(.ingress_channel_undecodable);
 }
 
-test "a completion ring found fatal in the final drain of a dead worker leaves the lane serving (#34)" {
+test "a request_done naming a request its worker was never sent faults the worker" {
     var scene: OneWorker = undefined;
     try scene.init(.{});
     defer scene.deinit();
-    _ = try scene.get(1);
+    const request = try scene.get(1);
 
-    try scene.stub.markCompletionRingFatal();
-    try scene.stub.kill();
-    try scene.harness.handleWorkerExit(0, scene.stub);
-    // The exit is the fault; the corrupt ring the final drain meets ends that
-    // drain and nothing more.
-    try scene.expectFaultAnswered(.exited);
+    // The live request's key under another request id.
+    var forged = request;
+    forged.identity.request_id +%= 1000;
+    try scene.stub.sendDone(forged, .{});
+    try scene.harness.handleControl(0, scene.stub);
+    try scene.expectFaultAnswered(.descriptor_names_no_request);
+}
+
+test "a request_done naming its request's identity on another stream faults its worker" {
+    var scene: OneWorker = undefined;
+    try scene.init(.{});
+    defer scene.deinit();
+    const request = try scene.get(1);
+
+    var forged = request;
+    forged.stream_id += 2;
+    try scene.stub.sendDone(forged, .{});
+    try scene.harness.handleControl(0, scene.stub);
+    try scene.expectFaultAnswered(.descriptor_names_no_request);
+}
+
+test "a request_done naming a request whose begin never left faults its worker" {
+    var scene: OneWorker = undefined;
+    // The kernel doubles the value: 128 KiB in flight before a send would
+    // block, above the largest packet the lane sends.
+    try scene.init(.{ .control_send_buffer_bytes = 64 * 1024 });
+    defer scene.deinit();
+    const harness = &scene.harness;
+
+    // An upload the worker does not read fills its control socket, so the
+    // next request's begin waits in the lane.
+    const frame_bytes: usize = 16 * 1024;
+    const frame_count: usize = 24;
+    _ = try scene.post(1, frame_bytes * frame_count);
+    var frame: [frame_bytes]u8 = @splat('u');
+    for (0..frame_count) |index| {
+        try scene.client.data(1, &frame, index + 1 == frame_count);
+        try scene.client.drive();
+    }
+    const parked_key = try scene.client.getAdmitted(3);
+    const parked = harness.lane(0).requests.entries[parked_key.slot];
+    try std.testing.expect(parked.dispatched());
+    try std.testing.expect(!parked.begin_sent);
+
+    // The worker names that request exactly, which only a worker that read
+    // the lane's memory or guessed every field could.
+    const guessed: lane_harness.Dispatched = .{
+        .identity = .{
+            .request_id = parked.request_id,
+            .request_generation = parked_key.generation,
+            .request_lane_id = parked_key.lane_id,
+            .request_slot = parked_key.slot,
+        },
+        .stream_id = parked.ingress_channel_id,
+        .body_follows = false,
+        .deadline_monotonic_ns = parked.deadline_ns,
+        .egress_token = ipc.egress_token.none,
+        .worker_slot = parked.worker_slot,
+    };
+    try scene.stub.sendDone(guessed, .{ .http_status = 200 });
+    try harness.handleControl(0, scene.stub);
+    try harness.expectLanesRunning();
+    try harness.expectFaulted(scene.stub, .descriptor_names_no_request);
+    try scene.expectStatus(3, 502);
+}
+
+test "a request_done naming another worker's request on the same lane faults its sender and leaves the victim's request and record to the victim" {
+    var harness: lane_harness.Harness = undefined;
+    try harness.init(std.testing.allocator, .{ .routes = .{ .concurrency = 1 } });
+    defer harness.deinit();
+    // The sender's only slot goes to the first request; the victim, published
+    // next, serves the second. One lane reads both.
+    const sender = try harness.publishWorker(.{});
+    const client = try harness.connect(0, .{});
+    try client.get(1);
+    try client.drive();
+    _ = try sender.readRequestBegin();
+    const victim = try harness.publishWorker(.{});
+    try client.get(3);
+    try client.drive();
+    const target = try victim.readRequestBegin();
+
+    // The sender names the victim's request exactly: only the worker key the
+    // lane holds for the request tells the two workers apart.
+    try sender.sendDone(target, .{ .http_status = 200, .cpu_ns = 99 });
+    try harness.handleControl(0, sender);
+    try expectSenderFaultedVictimUntouched(&harness, client, sender, victim);
+
+    try victim.respond(target, 201, "victim");
+    try victim.sendDone(target, .{ .http_status = 201, .cpu_ns = 7 });
+    try harness.handleControl(0, victim);
+    try expectVictimRecord(&harness, client, victim, 7);
+}
+
+test "a response head naming another worker's request on the same lane faults its sender and leaves the victim's stream to the victim" {
+    var harness: lane_harness.Harness = undefined;
+    try harness.init(std.testing.allocator, .{ .routes = .{ .concurrency = 1 } });
+    defer harness.deinit();
+    const sender = try harness.publishWorker(.{});
+    const client = try harness.connect(0, .{});
+    try client.get(1);
+    try client.drive();
+    _ = try sender.readRequestBegin();
+    const victim = try harness.publishWorker(.{});
+    try client.get(3);
+    try client.drive();
+    const target = try victim.readRequestBegin();
+
+    try sender.sendHead(target, 200, true);
+    try harness.handleControl(0, sender);
+    try expectSenderFaultedVictimUntouched(&harness, client, sender, victim);
+
+    try victim.respond(target, 201, "victim");
+    try victim.sendDone(target, .{ .http_status = 201, .cpu_ns = 7 });
+    try harness.handleControl(0, victim);
+    try expectVictimRecord(&harness, client, victim, 7);
+}
+
+/// The sender of output that names the victim's request on stream 3 is out
+/// of service with its own request on stream 1 answered 502, and the
+/// victim still serves stream 3, which got nothing yet.
+fn expectSenderFaultedVictimUntouched(
+    harness: *lane_harness.Harness,
+    client: *lane_harness.Client,
+    sender: *const lane_harness.StubWorker,
+    victim: *const lane_harness.StubWorker,
+) !void {
+    try harness.expectLanesRunning();
+    try harness.expectFaulted(sender, .descriptor_names_no_request);
+    try client.expectStatus(1, 502);
+    const sender_record = harness.takeAccessRecord(0) orelse return error.AccessRecordMissing;
+    try std.testing.expectEqual(sender.key.worker_id, sender_record.facts.worker_id);
+    try harness.expectServing(victim);
+    try std.testing.expect(harness.requestKeyOf(client, 3) != null);
+    try client.collect();
+    try std.testing.expectEqual(@as(?u16, null), (try client.stream(3)).status);
+    try std.testing.expect(harness.takeAccessRecord(0) == null);
+}
+
+/// The victim's own answer reaches stream 3, and its request's record
+/// carries the victim's identity and the CPU it reported, `cpu_ns`.
+fn expectVictimRecord(
+    harness: *lane_harness.Harness,
+    client: *lane_harness.Client,
+    victim: *const lane_harness.StubWorker,
+    cpu_ns: u64,
+) !void {
+    try client.expectStatus(3, 201);
+    const record = harness.takeAccessRecord(0) orelse return error.AccessRecordMissing;
+    try std.testing.expectEqual(@as(u16, 201), record.status);
+    try std.testing.expectEqual(victim.key.worker_id, record.facts.worker_id);
+    const usage = record.usage orelse return error.UsageMissing;
+    try std.testing.expectEqual(cpu_ns, usage.cpu_ns);
+    try harness.expectServing(victim);
+}
+
+test "a request_done naming a lane the server does not have faults its worker" {
+    var scene: OneWorker = undefined;
+    try scene.init(.{});
+    defer scene.deinit();
+    const request = try scene.get(1);
+
+    var forged = request;
+    forged.identity.request_lane_id = 9;
+    try scene.stub.sendDone(forged, .{});
+    try scene.harness.handleControl(0, scene.stub);
+    try scene.expectFaultAnswered(.descriptor_names_no_request);
 }
 
 test "a response head shorter than its payload header faults its worker (#46)" {
@@ -226,7 +390,7 @@ test "a body upload against a full control socket waits behind the writability p
     try scene.harness.expectServing(scene.stub);
 }
 
-test "a send fault on a lane that only sends to its worker takes the worker out of service even when a forwarded completion ends the request in the same pass" {
+test "a send fault on a lane that only sends to its worker takes the worker out of service even when a forwarded request_done ends the request in the same pass" {
     var scene: lane_harness.TwoLanes = undefined;
     try scene.init(.{});
     defer scene.deinit();
@@ -240,13 +404,13 @@ test "a send fault on a lane that only sends to its worker takes the worker out 
     const upload = try scene.stub.readRequestBegin();
 
     // The worker answers the upload before it reads the body, and lane 0
-    // forwards the response and the completion to lane 1.
+    // forwards the response and its `request_done` to lane 1.
     try scene.stub.answer(upload, 200, "early");
-    try harness.serveWorker(0, scene.stub);
-    try harness.expectQueued(1, &.{ .forwarded_descriptor, .forwarded_descriptor, .forwarded_completion });
+    try harness.handleControl(0, scene.stub);
+    try harness.expectQueued(1, &.{ .forwarded_descriptor, .forwarded_descriptor, .forwarded_request_done });
 
     // One pass of lane 1: the body chunk meets a corrupt ring, a fault the
-    // send defers, and then the forwarded completion ends the request.
+    // send defers, and then the forwarded `request_done` ends the request.
     scene.stub.corruptServerToWorkerRing();
     const body = try std.testing.allocator.alloc(u8, body_len);
     defer std.testing.allocator.free(body);
@@ -314,9 +478,9 @@ test "two lanes whose bodies wait on one worker's full payload ring both send on
     try scene.stub.readBody(first, received, &body);
     try std.testing.expect(!try scene.stub.creditSignalled());
 
-    // The reader's completion wake raises both lanes' credit wake, and each
+    // The reader's ring credit wake raises both lanes' credit wake, and each
     // lane's next command wake retries its body. No client byte moves.
-    try harness.handleCompletions(0, scene.stub);
+    try harness.handleRingCredit(0, scene.stub);
     try harness.handleCommands(0);
     try harness.handleCommands(1);
     try std.testing.expect(harness.lane(0).requests.entries[first_key.slot].send_blocked == .none);
@@ -405,16 +569,15 @@ test "a dead worker's buffered response tail without END_STREAM gets RST_STREAM 
     try std.testing.expect(!received.ended);
 }
 
-test "a completion published before the worker died wins over the death" {
+test "a request_done sent before the worker died wins over the death" {
     var scene: OneWorker = undefined;
     try scene.init(.{});
     defer scene.deinit();
     const request = try scene.get(1);
 
-    // The whole response and its completion are out before the process
+    // The whole response and its `request_done` are out before the process
     // exits, and the lane has read neither yet.
-    try scene.stub.respond(request, 201, "made");
-    try scene.stub.publishCompletion(request, .{ .http_status = 201 });
+    try scene.stub.answer(request, 201, "made");
     try scene.stub.kill();
     try scene.harness.handleWorkerExit(0, scene.stub);
 
@@ -426,16 +589,16 @@ test "a completion published before the worker died wins over the death" {
     try std.testing.expectEqual(@as(?u16, 201), scene.harness.takeAccessStatus(0));
 }
 
-test "after corrupt output a published completion loses to the death" {
+test "a request_done behind corrupt output loses to the death" {
     var scene: OneWorker = undefined;
     try scene.init(.{});
     defer scene.deinit();
     const request = try scene.get(1);
 
-    // A completion is in the ring, but the control socket shows the worker
-    // is corrupt first, and nothing a corrupt worker wrote is applied.
-    try scene.stub.publishCompletion(request, .{ .http_status = 200 });
+    // The control socket shows the worker is corrupt before its
+    // `request_done`, and nothing a corrupt worker wrote after that is read.
     try scene.stub.sendControlBytes(&.{0x0b});
+    try scene.stub.sendDone(request, .{ .http_status = 200 });
     try scene.harness.handleControl(0, scene.stub);
     try scene.expectFaultAnswered(.packet_short);
 }
@@ -476,7 +639,7 @@ test "a worker_retiring packet takes its worker out of service without failing t
 
     // The worker keeps answering what it holds.
     try scene.stub.answer(held, 200, "after the notice");
-    try harness.serveWorker(0, scene.stub);
+    try harness.handleControl(0, scene.stub);
     try scene.expectStatus(1, 200);
     try std.testing.expectEqual(@as(?u16, 200), harness.takeAccessStatus(0));
 

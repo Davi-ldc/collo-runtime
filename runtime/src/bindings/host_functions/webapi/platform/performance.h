@@ -1,20 +1,15 @@
-// Declares the installer of `performance` and the performance timeline interfaces, and the hook through which
-// `event_target.cpp` dispatches events on `performance`. Both run on the VM thread; the implementation is under
-// `performance/`, with the shared cell classes in `performance/private.h`.
+// Declares the installer of `performance` and the performance timeline interfaces. It runs on the VM thread; the
+// implementation is under `performance/`, with the shared cell classes in `performance/private.h`.
 
 #pragma once
 
-#include "host_functions/webapi/events/event.h"
+#include "host_functions/support.h"
 
 namespace Collo::HostFunctions {
 
-// Returns true and fills `handle` with the event target data of the Performance cell when `value` is one; returns
-// false and leaves `handle` untouched otherwise.
-bool webApiPerformanceTargetHandle(JSC::JSValue, WebApiEventTargetHandle&);
 // Defines `performance` and the Performance, PerformanceEntry, PerformanceMark, PerformanceMeasure,
-// PerformanceObserver, PerformanceObserverEntryList and PerformanceTiming interfaces, and stores the realm's
-// Performance cell in its Web API cache. The host function registry (`globals.def`) calls it once per realm when the
-// VM installs Web APIs.
+// PerformanceObserver and PerformanceObserverEntryList interfaces, and stores the realm's Performance cell in its Web
+// API cache. The host function registry (`globals.def`) calls it once per realm when the VM installs Web APIs.
 void installWebApiPerformance(Collo::GlobalObject*, JSC::VM&);
 
 } // namespace Collo::HostFunctions

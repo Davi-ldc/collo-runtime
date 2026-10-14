@@ -212,7 +212,7 @@ pub fn reapWithPlan(reaper: *Reaper, now_ns: u64, plan: MemoryPressurePlan) usiz
 fn victimScore(reaper: *Reaper, worker: *WorkerRecord, idle_ns: u64) u128 {
     const ttl_ns = reaper.supervisor.worker_idle_ttl_ns;
     const bytes = memory.readWorkerPrivateRssBytes(reaper.gpa, worker.handle.pid) catch
-        (memory.readWorkerMemoryCurrent(reaper.gpa, worker.handle.cgroup_dir) catch 0);
+        (memory.readWorkerMemoryCurrent(worker.handle.leaf) catch 0);
     return memory.workerMemoryVictimScoreWithUnknownFallback(bytes, idle_ns, ttl_ns);
 }
 

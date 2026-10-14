@@ -20,23 +20,11 @@ describe("timers", () => {
     return desc;
   }
 
-  function assertImmediateHandle(handle) {
-    assert.equal(typeof handle, "object");
-    assert(handle !== null);
-    assert.equal(handle.constructor.name, "Immediate");
-    assert.equal(typeof handle.ref, "function");
-    assert.equal(typeof handle.unref, "function");
-    assert.equal(typeof handle.hasRef, "function");
-    assert.equal(typeof handle[Symbol.toPrimitive], "function");
-    assert.equal(typeof handle[Symbol.dispose], "function");
-    assert.equal(handle._destroyed, false);
-
-    const primitive = Number(handle);
-    assert(Number.isFinite(primitive));
-    assert(primitive > 0);
-    assert.equal(handle[Symbol.toPrimitive]("number"), primitive);
-    assert.equal(`${handle}`, String(primitive));
-    return primitive;
+  function assertTimerId(id) {
+    assert.equal(typeof id, "number");
+    assert(Number.isInteger(id));
+    assert(id > 0);
+    return id;
   }
 
   test("global descriptors and function shapes", () => {
@@ -101,46 +89,35 @@ describe("timers", () => {
     assert.equal(marker, "hello:timer:true");
   });
 
-  test("setImmediate returns Immediate handles and runs with handle this in FIFO order", async () => {
+  // setImmediate returns a numeric id as setTimeout does, not Node's Immediate object.
+  test("setImmediate returns a number", () => {
+    const id = setImmediate(() => {});
+    try {
+      assertTimerId(id);
+      assert.equal(typeof id, "number");
+    } finally {
+      clearImmediate(id);
+    }
+  });
+
+  test("setImmediate returns increasing ids and runs callbacks with args and global this in FIFO order", async () => {
     let marker = "";
     const order = [];
-    const handles = [];
-    let lastPrimitive = 0;
+    let lastId = 0;
     await new Promise(resolve => {
       for (let i = 0; i < 5; i++) {
-        const handle = setImmediate(function (value) {
+        const id = setImmediate(function (value) {
           order.push(value);
-          marker = value + ":" + (this === handle) + ":" + this._destroyed;
+          marker = value + ":" + (this === globalThis);
           if (order.length === 5)
             resolve();
         }, i);
-        const primitive = assertImmediateHandle(handle);
-        assert(primitive > lastPrimitive);
-        lastPrimitive = primitive;
-        handles.push(handle);
+        assert(assertTimerId(id) > lastId);
+        lastId = id;
       }
     });
     assert.deepEqual(order, [0, 1, 2, 3, 4]);
-    assert.equal(marker, "4:true:true");
-    for (const handle of handles)
-      assert.equal(handle._destroyed, true);
-  });
-
-  test("Immediate handles expose ref state and stable primitive ids", () => {
-    const handle = setImmediate(() => {});
-    try {
-      const primitive = assertImmediateHandle(handle);
-      assert.equal(handle.hasRef(), true);
-      assert.equal(handle.unref(), handle);
-      assert.equal(handle.hasRef(), false);
-      assert.equal(handle.unref(), handle);
-      assert.equal(handle.hasRef(), false);
-      assert.equal(handle.ref(), handle);
-      assert.equal(handle.hasRef(), true);
-      assert.equal(Number(handle), primitive);
-    } finally {
-      clearImmediate(handle);
-    }
+    assert.equal(marker, "4:true");
   });
 
   test("setTimeout treats omitted, negative, NaN, and object delays as zero-or-clamped timers", async () => {
@@ -194,35 +171,25 @@ describe("timers", () => {
 
   test("clearImmediate cancels pending callback and is idempotent", async () => {
     let called = false;
-    const handle = setImmediate(() => {
+    const id = setImmediate(() => {
       called = true;
     });
-    assertImmediateHandle(handle);
-    clearImmediate(handle);
-    assert.equal(handle._destroyed, true);
-    clearImmediate(handle);
+    assertTimerId(id);
+    clearImmediate(id);
+    clearImmediate(id);
     await new Promise(resolve => setImmediate(resolve));
     assert.equal(called, false);
   });
 
-  test("clearImmediate accepts numeric primitive ids and Symbol.dispose", async () => {
-    let numericCalled = false;
-    const numericHandle = setImmediate(() => {
-      numericCalled = true;
+  test("clearImmediate converts its argument to a number as clearTimeout does", async () => {
+    let called = false;
+    const id = setImmediate(() => {
+      called = true;
     });
-    clearImmediate(Number(numericHandle));
-    assert.equal(numericHandle._destroyed, true);
-
-    let disposedCalled = false;
-    const disposedHandle = setImmediate(() => {
-      disposedCalled = true;
-    });
-    assert.equal(disposedHandle[Symbol.dispose](), undefined);
-    assert.equal(disposedHandle._destroyed, true);
-
+    clearImmediate({ valueOf: () => id });
     await new Promise(resolve => setImmediate(resolve));
-    assert.equal(numericCalled, false);
-    assert.equal(disposedCalled, false);
+    assert.equal(called, false);
+    assert.throws(() => clearImmediate({ valueOf() { throw new TypeError("converted"); } }), TypeError);
   });
 
   test("clear functions are receiver independent, no-op invalid ids, and interchangeable", async () => {
@@ -243,18 +210,6 @@ describe("timers", () => {
     assert.equal(clearImmediate(NaN), undefined);
     assert.equal(clearImmediate(Infinity), undefined);
     assert.equal(clearImmediate.call(null, "not-a-timer"), undefined);
-    assert.equal(clearImmediate(new Number(1)), undefined);
-    assert.equal(clearImmediate({
-      valueOf() {
-        throw new Error("clearImmediate must not coerce valueOf");
-      },
-      toString() {
-        throw new Error("clearImmediate must not coerce toString");
-      },
-      [Symbol.toPrimitive]() {
-        throw new Error("clearImmediate must not coerce Symbol.toPrimitive");
-      },
-    }), undefined);
 
     let timeoutCalled = false;
     const timeoutId = setTimeout(() => {
@@ -281,10 +236,10 @@ describe("timers", () => {
     clearImmediate(timeoutId);
 
     let immediateCalled = false;
-    const immediateHandle = setImmediate(() => {
+    const immediateId = setImmediate(() => {
       immediateCalled = true;
     });
-    clearTimeout(immediateHandle);
+    clearTimeout(immediateId);
 
     await new Promise(resolve => setTimeout(resolve, 0));
     await new Promise(resolve => setImmediate(resolve));

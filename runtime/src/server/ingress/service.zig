@@ -1,7 +1,7 @@
 //! The server's HTTP/2 ingress service: one lane thread per listener, fixed
 //! for the service's life, and the threads around them. A metrics thread
-//! drains console lines, usage records and access records every tick, takes
-//! faulty workers out of service and flushes the analytics record files
+//! drains console lines and access records every tick, takes faulty workers
+//! out of service and flushes the analytics record files
 //! (`analytics_drain.zig`); a console thread is the only writer of console
 //! lines to stderr while the service runs; the launcher
 //! (`server/supervisor/launcher.zig`) turns pool claims into published
@@ -43,7 +43,6 @@
 //! joined.
 
 const std = @import("std");
-const ipc = @import("collo_ipc");
 const analytics_mod = @import("collo_server_analytics");
 const routes_mod = @import("collo_server_routes");
 const gateway = @import("collo_server_gateway");
@@ -92,10 +91,9 @@ pub const Service = struct {
     /// `egressSessionLost`) reach a launcher being set up or torn down.
     launcher_mutex: std.Thread.Mutex = .{},
     launcher_live: bool = false,
-    /// What every launch sends the worker, read from the environment once,
-    /// at `init`.
-    worker_boot: ipc.WorkerRuntimeBootOptions,
-    worker_tmpfs_size_bytes: ?u64,
+    /// What every launch sends the worker besides its definition's settings,
+    /// read from the environment once, at `init`.
+    worker_boot: launcher_mod.BootInputs,
     fatal_error: ?anyerror = null,
     fatal_error_mutex: std.Thread.Mutex = .{},
     next_request_id: std.atomic.Value(u64) = std.atomic.Value(u64).init(1),
@@ -143,9 +141,8 @@ pub const Service = struct {
     };
 
     /// Fails with `error.InvalidLaneCount` or `error.TooManyIngressLanes`
-    /// for a listener set the lanes cannot serve, with
-    /// `error.InvalidBootOptions` for boot options the environment sets
-    /// wrong, and with `error.OutOfMemory`.
+    /// for a listener set the lanes cannot serve, and with
+    /// `error.OutOfMemory`.
     pub fn init(allocator: std.mem.Allocator, options: Options) !Service {
         const listeners = options.listeners;
         const lane_cpu_ids = options.lane_cpu_ids;
@@ -157,8 +154,7 @@ pub const Service = struct {
         if (lane_cpu_ids.len != lane_count)
             return error.InvalidLaneCount;
 
-        const worker_boot = try launcher_mod.resolveWorkerRuntimeBootOptions();
-        const worker_tmpfs_size_bytes = launcher_mod.resolveWorkerTmpfsSizeBytes();
+        const worker_boot = launcher_mod.resolveBootInputs();
 
         const lanes = try allocator.alloc(LaneRunner, lane_count);
         errdefer allocator.free(lanes);
@@ -182,7 +178,6 @@ pub const Service = struct {
             .ingress_tcp_notsent_lowat_bytes = options.ingress_tcp_notsent_lowat_bytes,
             .lanes = lanes,
             .worker_boot = worker_boot,
-            .worker_tmpfs_size_bytes = worker_tmpfs_size_bytes,
             .analytics = options.analytics,
             .on_serving = options.on_serving,
         };
@@ -200,6 +195,7 @@ pub const Service = struct {
             .deps = .{
                 .ctx = self,
                 .claim = Deps.launchClaim,
+                .scaleOut = Deps.launchScaleOut,
                 .attachEgress = Deps.launchAttachEgress,
                 .publish = Deps.launchPublish,
                 .failed = Deps.launchFailed,
@@ -209,13 +205,12 @@ pub const Service = struct {
                 .nextStaleEgressWorker = Deps.launchNextStaleEgressWorker,
                 .setWorkerEgress = Deps.launchSetWorkerEgress,
                 .retireForEgress = Deps.launchRetireForEgress,
-                .dropEgressSession = Deps.launchDropEgressSession,
+                .retireEgressSession = Deps.launchRetireEgressSession,
             },
             .zygote_process = self.supervisor.zygote_process,
             .routes = self.routes,
             .worker_host = self.supervisor.worker_host,
             .boot = self.worker_boot,
-            .tmpfs_size_bytes = self.worker_tmpfs_size_bytes,
             .launches_per_definition_max = scheduler_limits.capacity.pool_cold_starts_in_flight_max,
         });
         defer self.launcher.deinit();
@@ -321,16 +316,21 @@ pub const Service = struct {
     }
 
     /// The egress manager's `Deps.sessionLost`, with the service as `ctx`:
-    /// hands session `session_id` of gateway `generation`, which that gateway
-    /// removed on its own, to the launcher, which gives its worker a new
-    /// session. Runs on the gateway's control reader and returns at once; a
-    /// loss reported while no launcher is set up has no worker to reattach.
-    pub fn egressSessionLost(ctx: *anyopaque, generation: u64, session_id: u64) void {
+    /// hands the session of gateway `generation` that the gateway removed on
+    /// its own, with the removal's cause, to the launcher, which decides what
+    /// it costs the worker (`Launcher.egressSessionLost`). Runs on the
+    /// gateway's control reader and returns at once; a loss reported while no
+    /// launcher is set up has no worker.
+    pub fn egressSessionLost(
+        ctx: *anyopaque,
+        generation: u64,
+        removed: gateway.control_client.protocol.RemovedSession,
+    ) void {
         const self: *Service = @ptrCast(@alignCast(ctx));
         self.launcher_mutex.lock();
         defer self.launcher_mutex.unlock();
         if (self.launcher_live)
-            self.launcher.egressSessionLost(generation, session_id);
+            self.launcher.egressSessionLost(generation, removed.session_id, removed.cause);
     }
 
     fn setLauncherLive(self: *Service, live: bool) void {

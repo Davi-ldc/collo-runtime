@@ -1,11 +1,12 @@
 //! The boot trace pipe: event lines from the host, the zygote and every
-//! worker child, read back by the host (the server's reader is
-//! `server/boot/trace_drain.zig`). The host creates the pipe (`tracePipe`)
-//! and keeps its read end and a write end for its own launch markers
-//! (`SpawnedZygote` in `host_client.zig`); the zygote inherits the write end
-//! at `inherited_trace_fd` (`fork_loop.zig`), and a worker child keeps it
-//! across the fork. The functions here keep no state, so any thread of the
-//! three processes may call them.
+//! worker child's boot, read back by the host (the server's reader is
+//! `server/boot/trace_drain.zig`). It exists only when the host asks for it
+//! (`SpawnOptions.trace` in `host_client.zig`). The host creates the pipe
+//! (`tracePipe`) and keeps its read end and a write end for its own launch
+//! markers; the zygote inherits the write end at `inherited_trace_fd`
+//! (`fork_loop.zig`), and a worker child keeps it across the fork only until
+//! its first tenant code (`child_boot.zig`). The functions here keep no
+//! state, so any thread of the three processes may call them.
 //!
 //! Invariants:
 //! - Tracing never blocks or fails its caller. Both ends of the pipe are
@@ -15,6 +16,8 @@
 //!   is below PIPE_BUF, so each line is one atomic write, and lines from
 //!   different writers never interleave.
 //! - A null descriptor means tracing is off.
+//! - No tenant code ever holds the write end, so every line was written by
+//!   the host, the zygote or a child's boot before its first tenant code.
 
 const std = @import("std");
 const process_limits = @import("collo_limits").process;

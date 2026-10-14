@@ -5,14 +5,24 @@
 //! a batch carries `batch_magic` where a single packet's `reserved0` must be
 //! zero, which is how `isDescriptorBatchPacket` tells them apart. A
 //! descriptor names its request by the host's identity and its stream, and
-//! `validateDescriptor` is what every decoded descriptor must satisfy. The
-//! comptime checks at the bottom pin the layout.
+//! `validateDescriptor` is what every decoded descriptor must satisfy.
+//!
+//! A request's completion is `request_done`, worker to server only: the last
+//! descriptor the worker sends for the request, with a `RequestDonePayload`
+//! inline as its payload, in a single packet or as a batch entry. Its order
+//! with the request's response descriptors is the socket's, so the server
+//! reads every descriptor the worker sent before it. The worker is
+//! untrusted: `validateDescriptor` checks the descriptor's operation, flags,
+//! length and `aux`, and `decodeRequestDone` checks every byte of the
+//! payload, the reserved ones included. A `RequestDone`, whose status is a
+//! `messages.RequestDoneStatus`, exists on the receiving side only as what
+//! `decodeRequestDone` returned. The comptime checks at the bottom pin the
+//! layout.
 
 const std = @import("std");
 
 const messages = @import("../messages.zig");
 
-/// Value 7 names no operation, and `decodeOp` refuses it.
 pub const Op = enum(u8) {
     request_begin = 1,
     request_body_chunk = 2,
@@ -20,6 +30,10 @@ pub const Op = enum(u8) {
     response_chunk = 4,
     response_end = 5,
     request_reset = 6,
+    /// Worker to server: the request's completion, `RequestDonePayload`
+    /// inline. A worker refuses it like any other operation the server never
+    /// sends.
+    request_done = 7,
     response_reset = 8,
 };
 
@@ -59,7 +73,8 @@ pub const Descriptor = extern struct {
     shared_offset: u64,
     byte_len: u32,
     /// The request begin's header count, the response head's status in the
-    /// high 16 bits and header count in the low 16, or a reset's error code.
+    /// high 16 bits and header count in the low 16, a reset's error code, or
+    /// 0 for a `request_done`.
     aux: u32,
 
     pub fn requestBegin(identity: RequestIdentity, stream_id: u32, header_offset: u64, header_len: u32, header_count: u32, end_stream: bool) Descriptor {
@@ -89,6 +104,13 @@ pub const Descriptor = extern struct {
 
     pub fn responseReset(identity: RequestIdentity, stream_id: u32, error_code: u32) Descriptor {
         return init(.response_reset, identity, stream_id, 0, 0, error_code, 0);
+    }
+
+    /// The descriptor of a `request_done`, whose `RequestDonePayload` the
+    /// encoder places inline and flags `inline_bytes` (`send.sendRequestDone`,
+    /// or a batch entry with the bytes of `encodeRequestDone` as its payload).
+    pub fn requestDone(identity: RequestIdentity, stream_id: u32) Descriptor {
+        return init(.request_done, identity, stream_id, 0, 0, 0, 0);
     }
 
     pub fn hasFlag(self: Descriptor, flag: u8) bool {
@@ -132,6 +154,104 @@ pub const RequestIdentity = struct {
     request_slot: u32,
 };
 
+/// How a worker finished a request and what the request measured: what the
+/// worker hands `send.sendRequestDone`, and what `decodeRequestDone` returns
+/// from the payload of its `request_done`. Every value is the worker's claim,
+/// which the server records only under a request it dispatched to that
+/// worker, so a false one reaches only that worker's own records.
+pub const RequestDone = struct {
+    status: messages.RequestDoneStatus,
+    /// The status of the response head the worker sent, 100 through 599, or
+    /// 0 when it sent none.
+    http_status: u16,
+    /// `exec_ns`, `waiting_ns` and `io_ns` partition the worker's span of the
+    /// request, from the decode of its begin to its finish: running, runnable
+    /// but not running, and waiting on I/O.
+    exec_ns: u64 = 0,
+    waiting_ns: u64 = 0,
+    io_ns: u64 = 0,
+    /// The request's CPU: the VM thread's while the request owned it.
+    cpu_ns: u64 = 0,
+    /// Bytes of the response served to the request's client.
+    client_served_bytes: u64 = 0,
+    /// Payload bytes of the request's outbound fetches, per direction.
+    fetch_sent_bytes: u64 = 0,
+    fetch_received_bytes: u64 = 0,
+};
+
+/// The payload of a `request_done`, exactly this struct: a `RequestDone` as
+/// it crosses the socket, with the same fields in this order. The reserved
+/// fields name the struct's padding, and `decodeRequestDone` refuses them
+/// nonzero.
+pub const RequestDonePayload = extern struct {
+    /// A `messages.RequestDoneStatus`.
+    status: u8,
+    reserved0: u8 = 0,
+    http_status: u16,
+    reserved1: u32 = 0,
+    exec_ns: u64,
+    waiting_ns: u64,
+    io_ns: u64,
+    cpu_ns: u64,
+    client_served_bytes: u64,
+    fetch_sent_bytes: u64,
+    fetch_received_bytes: u64,
+};
+
+/// The payload that carries `done`. An `http_status` the decoder refuses is
+/// encoded as it is; both senders decode what they would send and fail
+/// instead (`send.sendRequestDone`, `send.encodeDescriptorBatchPayloadsInto`).
+pub fn encodeRequestDone(done: RequestDone) RequestDonePayload {
+    return .{
+        .status = @intFromEnum(done.status),
+        .http_status = done.http_status,
+        .exec_ns = done.exec_ns,
+        .waiting_ns = done.waiting_ns,
+        .io_ns = done.io_ns,
+        .cpu_ns = done.cpu_ns,
+        .client_served_bytes = done.client_served_bytes,
+        .fetch_sent_bytes = done.fetch_sent_bytes,
+        .fetch_received_bytes = done.fetch_received_bytes,
+    };
+}
+
+/// The `RequestDone` a `request_done` carries, from its inline payload. Fails
+/// with `error.InvalidPacket` for a payload of another length, a nonzero
+/// reserved field, a status `messages.RequestDoneStatus` does not name, or an
+/// `http_status` other than 0 or 100 through 599.
+pub fn decodeRequestDone(payload: []const u8) error{InvalidPacket}!RequestDone {
+    if (payload.len != @sizeOf(RequestDonePayload))
+        return error.InvalidPacket;
+    const wire = std.mem.bytesToValue(RequestDonePayload, payload[0..@sizeOf(RequestDonePayload)]);
+    if (wire.reserved0 != 0)
+        return error.InvalidPacket;
+    if (wire.reserved1 != 0)
+        return error.InvalidPacket;
+    const status = std.enums.fromInt(messages.RequestDoneStatus, wire.status) orelse
+        return error.InvalidPacket;
+    if (!isValidHttpStatus(wire.http_status))
+        return error.InvalidPacket;
+    return .{
+        .status = status,
+        .http_status = wire.http_status,
+        .exec_ns = wire.exec_ns,
+        .waiting_ns = wire.waiting_ns,
+        .io_ns = wire.io_ns,
+        .cpu_ns = wire.cpu_ns,
+        .client_served_bytes = wire.client_served_bytes,
+        .fetch_sent_bytes = wire.fetch_sent_bytes,
+        .fetch_received_bytes = wire.fetch_received_bytes,
+    };
+}
+
+/// 0, for a request whose worker sent no response head, or a status a head
+/// can carry.
+fn isValidHttpStatus(http_status: u16) bool {
+    if (http_status == 0)
+        return true;
+    return http_status >= 100 and http_status <= 599;
+}
+
 /// A single-descriptor packet; an inline payload follows it.
 pub const Packet = extern struct {
     kind: u32,
@@ -165,13 +285,24 @@ pub fn batchPayloadOffset(descriptor_count: usize) !usize {
 }
 
 /// What every decoded descriptor must satisfy: a known operation, at most one
-/// payload location, and the ring only for chunks.
+/// payload location, and the ring only for chunks. A `request_done` carries
+/// `inline_bytes` and no other flag, exactly a `RequestDonePayload` of
+/// payload and a zero `aux`; its payload's bytes are `decodeRequestDone`'s
+/// to check.
 pub fn validateDescriptor(descriptor: Descriptor) !void {
-    _ = decodeOp(descriptor.op) catch return error.InvalidPacket;
+    const op = decodeOp(descriptor.op) catch return error.InvalidPacket;
     if (descriptor.hasFlag(flags.inline_bytes) and descriptor.hasFlag(flags.shared_ring))
         return error.InvalidPacket;
     if (descriptor.hasFlag(flags.shared_ring) and !descriptorCanUseSharedRing(descriptor))
         return error.InvalidPacket;
+    if (op == .request_done) {
+        if (descriptor.flag_bits != flags.inline_bytes)
+            return error.InvalidPacket;
+        if (descriptor.byte_len != @sizeOf(RequestDonePayload))
+            return error.InvalidPacket;
+        if (descriptor.aux != 0)
+            return error.InvalidPacket;
+    }
 }
 
 pub fn descriptorCanUseSharedRing(descriptor: Descriptor) bool {
@@ -186,6 +317,7 @@ pub fn decodeOp(raw: u8) !Op {
         @intFromEnum(Op.response_chunk) => .response_chunk,
         @intFromEnum(Op.response_end) => .response_end,
         @intFromEnum(Op.request_reset) => .request_reset,
+        @intFromEnum(Op.request_done) => .request_done,
         @intFromEnum(Op.response_reset) => .response_reset,
         else => error.InvalidPacket,
     };
@@ -214,4 +346,27 @@ comptime {
         @compileError("ipc.ingress_channel.BatchPacketHeader size mismatch");
     if (@offsetOf(BatchPacketHeader, "magic") != 4)
         @compileError("ipc.ingress_channel.BatchPacketHeader.magic offset mismatch");
+    if (@sizeOf(RequestDonePayload) != 64 or @alignOf(RequestDonePayload) != 8)
+        @compileError("ipc.ingress_channel.RequestDonePayload layout mismatch");
+    for (.{
+        .{ "status", 0 },
+        .{ "reserved0", 1 },
+        .{ "http_status", 2 },
+        .{ "reserved1", 4 },
+        .{ "exec_ns", 8 },
+        .{ "cpu_ns", 32 },
+        .{ "fetch_received_bytes", 56 },
+    }) |field| {
+        if (@offsetOf(RequestDonePayload, field[0]) != field[1])
+            @compileError("ipc.ingress_channel.RequestDonePayload field offset mismatch");
+    }
+    // The payload carries every field of `RequestDone` and, beside them,
+    // only its two reserved fields, so a measure added to one struct and not
+    // the other fails here.
+    for (@typeInfo(RequestDone).@"struct".fields) |field| {
+        if (!@hasField(RequestDonePayload, field.name))
+            @compileError("ipc.ingress_channel.RequestDonePayload misses a field of RequestDone");
+    }
+    if (@typeInfo(RequestDonePayload).@"struct".fields.len != @typeInfo(RequestDone).@"struct".fields.len + 2)
+        @compileError("ipc.ingress_channel.RequestDonePayload holds a field RequestDone lacks");
 }

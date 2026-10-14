@@ -1,34 +1,38 @@
 # Collo
 
-Collo is a blazingly fast JavaScript running for serverless envirments. Workers start in ~10ms using ~9 MiB while keeping a strong process isolation boundary and flexibility. 
+Collo is a blazingly fast JavaScript running for serverless envirments. Workers start in ~10ms using ~2 MiB* while keeping a strong process isolation boundary and flexibility. 
+
+* Benchmarked on ampere A1
 
 ## Getting started
 
-Write an ES module that accepts a standard `Request` and returns a `Response`, or a promise of one.
-
-`app.js`
+Write an ES module whose default export has a `fetch(request, env)`. It receives a standard `Request` and returns a `Response`, or a promise of one. A default export that is itself such a function works too :)
 
 ```js
-export default function handle(request, env = {}) {
-  return new Response(env.SECRET ?? "Hello, world!\n");
-}
+export default {
+  fetch(request, env) {
+    return new Response(env.SECRET ?? "Hello, world!\n");
+  },
+};
 ```
 
 Declare a worker, its routes and the server settings in `collo.json`.
 
 ```jsonc
 {
-  "globalSettings": {
+  "settings": {
     "listen": "127.0.0.1:8080",
     // Structured logs and usage records stay in this directory.
     "analytics": { "directory": "./usage" },
+    // Outbound fetch reaches only these hosts; without "network" it reaches none.
+    "network": { "allow": ["api.example.com", "*.example.org"] },
     // Defaults for every worker.
-    "isolateRealm": true,  // Each route gets its own realm.
+    "isolateRealm": true,  // A realm is basicly the globalthis + Global Scope and builtins
     "limits": {
       "memoryMiB": 64,     // Per worker process, shared by its routes.
-      "concurrency": 8,    // In-flight requests per worker process, across its routes.
-      "cpuMs": 50,         // CPU time per request.
-      "timeoutMs": 1000    // Wall-clock time per request, including I/O waits.
+      "concurrency": 8,    // In-flight requests per worker process, across its routes (default 2, at most 16).
+      "cpuMs": 50,         // CPU time per request; past it the request gets 503. No default.
+      "timeoutMs": 1000    // Wall-clock time per request
     }
   },
   "workers": {
@@ -55,23 +59,25 @@ Declare a worker, its routes and the server settings in `collo.json`.
 
 ```sh
 collo serve collo.json
-curl http://127.0.0.1:8080/
+curl -k https://127.0.0.1:8080/   # HTTPS and HTTP/2 only; self-signed unless settings.tls names a certificate
 ```
 
-For a single local invocation:
+To serve one module on every path without a `collo.json` (its `fetch` may reach any public host):
 
 ```sh
-collo run app.js
+collo serve app.js
 ```
 
 # Why 
 
-Currently, to run serverless JavaScript you can either use generic heavy systems (e.g. gVisor or Firecracker) that use a lot of memory (aka dollars) and take a long time to start, or use Cloudflare Workers, that are cheap and start fast but are incredibly limited and slow due to the lack of isolation (workers are threads in the same process).
+JavaScript is eating the world. With [sound types, aot compilation](https://github.com/oven-sh/WebKit/pull/757), [multithreading](https://github.com/oven-sh/WebKit/pull/249), and [jitcache](https://github.com/Davi-ldc/jitcache) JS will soon be faster them go and probabily > 50% of all agent writen code. 
 
-Collo's approach sits in between. It uses the same insight as Cloudflare (if you control the runtime, you can work with less isolation, saving a lot of memory). But instead of putting everyone in the same process, Collo optimizes for shared memory: every worker gets its own process, and JSC's GC and allocation strategy touch fewer pages, which maximizes the memory those processes share.[^1]
+One of the coolest part about it is that, because you control the runtime, [JS is (technically) extremely cheap to run](https://developers.cloudflare.com/workers/platform/pricing/). Sadly, current options today are either generic heavy systems (like gVisor or Firecracker) that use a lot of memory (aka dollars) and take a long time to start, or Cloudflare Workers, that are cheap and start fast but are incredibly limited and algorithmically slow. Also, because of the current architecture on top of v8, workers wont support AOT, jitcache or multithreading.
+
+Collo solves that. Its a serverless runtime build to isolate untrustable JavaScript code btween process keeping memory usage at ~x per worker with build in limits, analytics and configuration.
 
 ## How it works
 
-todo
+![How Collo works: a zygote forks workers that share its memory pages, and workers reach the network only through the egress gateway](assets/collo.gif)
 
-[^1]: 
+The core idea is to isolate workers between processes that come from a Linux fork and let them share as much memory as possible (JSC allocations favor this). Compared to workerd, (where I/O becomes a KJ promise and then its wrapped into a JS promise) 

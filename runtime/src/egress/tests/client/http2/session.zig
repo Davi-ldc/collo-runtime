@@ -1,7 +1,8 @@
 //! Tests of the codec's session and framing layer: the client preface and
 //! SETTINGS, the initial connection window, request encoding (pseudo-header
 //! order, synthesized content-length, forbidden headers), SETTINGS and idle
-//! control frames, and frames split across partial reads. Everything runs in
+//! control frames, the preface ahead of any answer to the server, and frames
+//! split across partial reads. Everything runs in
 //! memory: tests feed hand-built frames and decode what the client or the
 //! encoder wrote.
 
@@ -30,7 +31,7 @@ const clientFrameStreamIds = test_support.clientFrameStreamIds;
 const sumClientWindowUpdateIncrements = test_support.sumClientWindowUpdateIncrements;
 
 test "egress http2 session emits preface and client settings" {
-    var session = try egress_http2.Session.init(std.testing.allocator);
+    var session = try egress_http2.Session.init(std.testing.allocator, &test_support.scratch);
     defer session.deinit();
 
     const wire = try session.encodeConnectionPrefaceAndSettings(std.testing.allocator);
@@ -55,7 +56,7 @@ test "egress http2 session emits preface and client settings" {
 }
 
 test "egress http2 connection advertises bounded receive windows" {
-    var connection = try egress_http2.Connection.init(std.testing.allocator);
+    var connection = try egress_http2.Connection.init(std.testing.allocator, &test_support.scratch);
     defer connection.deinit();
     var sent_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer sent_wire.deinit();
@@ -81,7 +82,7 @@ test "egress http2 connection advertises bounded receive windows" {
 }
 
 test "egress http2 request encoder creates pseudo headers before regular headers" {
-    var session = try egress_http2.Session.init(std.testing.allocator);
+    var session = try egress_http2.Session.init(std.testing.allocator, &test_support.scratch);
     defer session.deinit();
     const stream_id = try session.openStream();
 
@@ -104,6 +105,7 @@ test "egress http2 request encoder creates pseudo headers before regular headers
     defer decoder.deinit();
     var decoded = try decoder.decodeBlock(
         std.testing.allocator,
+        test_support.scratch.decode,
         encoded.wire[h2.frame_header_len..],
         16,
         4096,
@@ -120,7 +122,7 @@ test "egress http2 request encoder creates pseudo headers before regular headers
 }
 
 test "egress http2 request encoder synthesizes content-length for bodies" {
-    var session = try egress_http2.Session.init(std.testing.allocator);
+    var session = try egress_http2.Session.init(std.testing.allocator, &test_support.scratch);
     defer session.deinit();
     var decoder = try hpack.Decoder.init();
     defer decoder.deinit();
@@ -137,6 +139,7 @@ test "egress http2 request encoder synthesizes content-length for bodies" {
     const with_body_header = try h2.FrameHeader.parse(with_body.wire[0..h2.frame_header_len]);
     var decoded_with_body = try decoder.decodeBlock(
         std.testing.allocator,
+        test_support.scratch.decode,
         with_body.wire[h2.frame_header_len..][0..with_body_header.length],
         16,
         4096,
@@ -158,6 +161,7 @@ test "egress http2 request encoder synthesizes content-length for bodies" {
     const declared_header = try h2.FrameHeader.parse(declared.wire[0..h2.frame_header_len]);
     var decoded_declared = try decoder.decodeBlock(
         std.testing.allocator,
+        test_support.scratch.decode,
         declared.wire[h2.frame_header_len..][0..declared_header.length],
         16,
         4096,
@@ -177,6 +181,7 @@ test "egress http2 request encoder synthesizes content-length for bodies" {
     const empty_post_header = try h2.FrameHeader.parse(empty_post.wire[0..h2.frame_header_len]);
     var decoded_empty_post = try decoder.decodeBlock(
         std.testing.allocator,
+        test_support.scratch.decode,
         empty_post.wire[h2.frame_header_len..][0..empty_post_header.length],
         16,
         4096,
@@ -196,6 +201,7 @@ test "egress http2 request encoder synthesizes content-length for bodies" {
     const get_header = try h2.FrameHeader.parse(get.wire[0..h2.frame_header_len]);
     var decoded_get = try decoder.decodeBlock(
         std.testing.allocator,
+        test_support.scratch.decode,
         get.wire[h2.frame_header_len..][0..get_header.length],
         16,
         4096,
@@ -206,7 +212,7 @@ test "egress http2 request encoder synthesizes content-length for bodies" {
 }
 
 test "egress http2 request encoder rejects connection scoped headers" {
-    var session = try egress_http2.Session.init(std.testing.allocator);
+    var session = try egress_http2.Session.init(std.testing.allocator, &test_support.scratch);
     defer session.deinit();
     const stream_id = try session.openStream();
 
@@ -258,7 +264,7 @@ test "egress http2 request validation admits te only with the value trailers" {
 }
 
 test "egress http2 settings frame updates peer settings and returns ack" {
-    var session = try egress_http2.Session.init(std.testing.allocator);
+    var session = try egress_http2.Session.init(std.testing.allocator, &test_support.scratch);
     defer session.deinit();
 
     var payload: [h2.setting_wire_len * 2]u8 = undefined;
@@ -293,10 +299,12 @@ test "egress http2 connection processes idle control frames" {
         .connection_receive_window = 4 * 1024 * 1024,
         .max_pending_body_credit_per_stream = 1024 * 1024,
         .max_pending_body_credit_per_connection = 4 * 1024 * 1024,
-    });
+    }, &test_support.scratch);
     defer connection.deinit();
     var sent_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer sent_wire.deinit();
+    try connection.start(&sent_wire.writer);
+    const preface_len = sent_wire.written().len;
 
     var settings = h2.FrameHeader{
         .length = 0,
@@ -311,7 +319,7 @@ test "egress http2 connection processes idle control frames" {
     defer settings_frame.deinit();
     try std.testing.expect((try connection.processEventFrame(&sent_wire.writer, &settings_frame)) == null);
     try std.testing.expect(connection.session.received_peer_settings);
-    try std.testing.expectEqual(@as(usize, h2.frame_header_len), sent_wire.written().len);
+    try std.testing.expectEqual(preface_len + h2.frame_header_len, sent_wire.written().len);
 
     var ping_wire: [h2.frame_header_len + 8]u8 = undefined;
     var ping = h2.FrameHeader{
@@ -326,7 +334,7 @@ test "egress http2 connection processes idle control frames" {
     var ping_frame = try frameFromWire(&ping_wire);
     defer ping_frame.deinit();
     try std.testing.expect((try connection.processEventFrame(&sent_wire.writer, &ping_frame)) == null);
-    const ping_ack = try h2.FrameHeader.parse(sent_wire.written()[h2.frame_header_len..][0..h2.frame_header_len]);
+    const ping_ack = try h2.FrameHeader.parse(sent_wire.written()[preface_len + h2.frame_header_len ..][0..h2.frame_header_len]);
     try std.testing.expectEqual(h2.FrameType.ping, ping_ack.frame_type);
     try std.testing.expect(ping_ack.flags.end_stream);
 
@@ -336,6 +344,41 @@ test "egress http2 connection processes idle control frames" {
     defer goaway_frame.deinit();
     try std.testing.expect((try connection.processEventFrame(&sent_wire.writer, &goaway_frame)) == null);
     try std.testing.expect(connection.closing);
+}
+
+test "a connection that reads the server's SETTINGS before its first stream answers after its preface" {
+    var connection = try egress_http2.Connection.init(std.testing.allocator, &test_support.scratch);
+    defer connection.deinit();
+    var sent_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer sent_wire.deinit();
+
+    var settings_wire: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer settings_wire.deinit();
+    try appendSettingsFrame(&settings_wire.writer);
+    var settings_frame = try frameFromWire(settings_wire.written());
+    defer settings_frame.deinit();
+    try std.testing.expect((try connection.processEventFrame(&sent_wire.writer, &settings_frame)) == null);
+
+    // A server drops a connection whose first bytes are not the preface.
+    const wire = sent_wire.written();
+    try std.testing.expect(std.mem.startsWith(u8, wire, h2.client_connection_preface));
+    // The local SETTINGS, the WINDOW_UPDATE that raises the connection
+    // window to its target, then the acknowledgement of the server's
+    // SETTINGS.
+    const expected = [_]struct { frame_type: h2.FrameType, ack: bool }{
+        .{ .frame_type = .settings, .ack = false },
+        .{ .frame_type = .window_update, .ack = false },
+        .{ .frame_type = .settings, .ack = true },
+    };
+    var cursor: usize = h2.client_connection_preface.len;
+    for (expected) |frame| {
+        const header = try h2.FrameHeader.parse(wire[cursor..][0..h2.frame_header_len]);
+        try std.testing.expectEqual(frame.frame_type, header.frame_type);
+        // `end_stream` is flag bit 0x1, the ACK flag on SETTINGS.
+        try std.testing.expectEqual(frame.ack, header.flags.end_stream);
+        cursor += h2.frame_header_len + header.length;
+    }
+    try std.testing.expectEqual(wire.len, cursor);
 }
 
 test "egress http2 frame reader waits across partial frames" {

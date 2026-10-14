@@ -1,12 +1,12 @@
 //! The ingress service's analytics drain, one pass per metrics tick: every
-//! worker's console lines, then every worker's usage records, then the
-//! workers to take out of service, then each lane's access records, then a
-//! flush of the record files. Runs on the service's metrics thread, and once
-//! more on the exiting thread after every producer has joined
-//! (`drainFinal`). Each pass also ends the boot token of a worker whose
-//! startup evaluations ended (`Supervisor.progressBootEgress`). Console lines
-//! reach stderr from the service's console thread (`Sink.flushConsole`), so
-//! a stalled stderr never holds this drain.
+//! worker's console lines, then the workers to take out of service, then
+//! each lane's access records, then a flush of the record files. Runs on the
+//! service's metrics thread, and once more on the exiting thread after every
+//! producer has joined (`drainFinal`). Each pass also ends the boot token of
+//! a worker whose startup evaluations ended
+//! (`Supervisor.progressBootEgress`). Console lines reach stderr from the
+//! service's console thread (`Sink.flushConsole`), so a stalled stderr never
+//! holds this drain.
 //!
 //! Invariants:
 //! - A worker's console ring is read only under its record's
@@ -15,16 +15,13 @@
 //!   unmaps the page. That mutex is also what keeps this drain and the final
 //!   one from reading the same ring at once (`analytics/logs.zig`).
 //! - A console line keeps the request id the worker wrote only when that
-//!   worker's request table confirms it (`analytics/logs.zig`). Console lines
-//!   drain before usage records, because the usage drain frees the table
-//!   entries of the requests whose records it writes, and a line of such a
-//!   request then has only the table's ring of ended requests to find it in.
-//! - A failed ring is fatal or corrupt, which the worker's own memory
-//!   caused, and is never read again: the console ring when its drain here
-//!   fails (`log_ring_failed`), the usage record ring when a usage drain on
-//!   any thread finds its head where no append puts it (`usage_ring_failed`,
-//!   `server/supervisor/usage_drain.zig`). The worker then takes a fault seen
-//!   off the lanes, `log_ring_corrupt` or `usage_record_protocol`:
+//!   worker's request table confirms it (`analytics/logs.zig`): among the
+//!   requests in flight, or in the table's ring of the requests that ended
+//!   after their begin reached the worker, which a lane fills when it
+//!   finishes one (`RequestTable.end`).
+//! - A console ring that fails is fatal or corrupt, which the worker's own
+//!   memory caused, and is never read again (`log_ring_failed`). The worker
+//!   then takes a fault seen off the lanes, `log_ring_corrupt`:
 //!   `Pool.markDead`, then `worker_died` to every lane the death names and
 //!   the retirement when none holds or reads the worker
 //!   (`Service.announceWorkerDeath`). `markDead` runs under the record's
@@ -57,7 +54,6 @@ const analytics = @import("collo_server_analytics");
 const config = @import("collo_server_config");
 const lifecycle = @import("collo_server_lifecycle");
 const supervision = @import("collo_server_supervisor");
-const page = @import("collo_worker_state").page;
 const fault = @import("fault.zig");
 const service_observability = @import("service_observability.zig");
 
@@ -98,19 +94,19 @@ pub fn ownerOverran(deadline_mono_ns: u64, now_ns: u64, grace_ns: u64) bool {
 }
 
 /// One metrics tick. `service` provides `supervisor` (its `records`,
-/// `routes`, `usage_counters`, `hard_timeout_grace_ns`, `usageDrain` and
-/// pools), `analytics`, `analytics_drain`, `lanes`, each lane with an
-/// `access_ring`, and `announceWorkerDeath`.
+/// `routes`, `hard_timeout_grace_ns` and pools), `analytics`,
+/// `analytics_drain`, `lanes`, each lane with an `access_ring`, and
+/// `announceWorkerDeath`.
 pub fn tick(service: anytype) void {
     const clock = analytics.Clock.capture();
     drainAt(service, clock, clock.mono_now_ns, .announce);
 }
 
 /// The last tick, from the exiting thread once the metrics thread, the
-/// lanes, the launcher and the reaper have joined: only then are the rings
-/// complete. No lane is left to tell and no reaper to retire a worker, and
-/// `Supervisor.deinit` tears down every worker still held, so a worker found
-/// faulty now is only marked.
+/// lanes, the launcher and the reaper have joined: only then are the console
+/// and access rings complete. No lane is left to tell and no reaper to
+/// retire a worker, and `Supervisor.deinit` tears down every worker still
+/// held, so a worker found faulty now is only marked.
 pub fn drainFinal(service: anytype) void {
     const clock = analytics.Clock.capture();
     drainAt(service, clock, clock.mono_now_ns, .mark_only);
@@ -138,10 +134,6 @@ pub fn drainAt(
         const first = service.analytics_drain.ticks % records.len;
         for (0..records.len) |offset|
             drainConsole(service, &records[(first + offset) % records.len], clock, on_fault);
-        // A full usage stream is written out and offered the batch again,
-        // and drops and counts only what a write-out leaves no room for
-        // (`usage_drain.zig`), so nothing here is fatal.
-        supervision.usage_drain.drainAll(service.supervisor.usageDrain(), records);
         const grace_ns = ownerOverrunGraceNs(service.supervisor.hard_timeout_grace_ns);
         for (records) |*worker| {
             service.supervisor.progressBootEgress(worker, clock.mono_now_ns);
@@ -193,7 +185,7 @@ fn drainConsoleLocked(
         .table = &worker.requests,
         .routes = service.supervisor.routes.definition(worker.definition_index).routes,
     };
-    const drained = analytics.logs.drainRing(
+    _ = analytics.logs.drainRing(
         view,
         &requests,
         analytics.Identity.ofWorker(worker),
@@ -209,8 +201,6 @@ fn drainConsoleLocked(
         });
         return takeOutOfService(service, worker, on_fault, .log_ring_corrupt);
     };
-    if (drained.ids_refused != 0)
-        _ = service.supervisor.usage_counters.console_ids_refused.fetchAdd(drained.ids_refused, .monotonic);
     return null;
 }
 
@@ -225,11 +215,12 @@ fn checkWorker(
     service.announceWorkerDeath(worker, worker_death.worker_key, worker_death.death, worker_death.reason);
 }
 
-/// Takes `worker` out of service, under its `metrics_mutex`, when a usage
-/// drain on any thread found its usage ring corrupt
-/// (`Record.usage_ring_failed`) or its VM thread overran its owner's
-/// deadline. Returns the death to announce when this call took the worker
-/// out of service, and null otherwise.
+/// Takes `worker` out of service, under its `metrics_mutex`, when its VM
+/// thread overran its owner's deadline. Returns the death to announce when
+/// this call took the worker out of service, and null otherwise. A worker
+/// that stays overrun is found again every tick until the reaper's final
+/// drain clears `page_mapped`; `markDead` answers null once the worker left
+/// service, so at most one tick announces the death.
 fn checkWorkerLocked(
     service: anytype,
     worker: *WorkerRecord,
@@ -241,13 +232,8 @@ fn checkWorkerLocked(
     defer worker.metrics_mutex.unlock();
     if (!worker.page_mapped)
         return null;
-    // Every tick finds the mark again until the reaper's final drain clears
-    // `page_mapped`; `markDead` answers null once the worker left service, so
-    // at most one tick announces the death.
-    if (worker.usage_ring_failed)
-        return takeOutOfService(service, worker, on_fault, .usage_record_protocol);
     const view = if (worker.handle.metrics) |*mapped| mapped else return null;
-    const owner = page.OwnerSnapshot.load(view.header);
+    const owner = view.loadOwner();
     if (!ownerOverran(owner.deadline_mono_ns, now_ns, grace_ns))
         return null;
     const worker_death = takeOutOfService(service, worker, on_fault, .owner_overran) orelse return null;

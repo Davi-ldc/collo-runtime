@@ -63,8 +63,6 @@ describe("URL", () => {
     for (const [name, length] of [
       ["parse", 1],
       ["canParse", 1],
-      ["createObjectURL", 1],
-      ["revokeObjectURL", 1],
     ]) {
       const property = descriptor(URL, name);
       assertDataDescriptor(property, URL[name], true, false, true, `URL.${name}`);
@@ -164,24 +162,11 @@ describe("URL", () => {
     assert.equal(URL.parse.length, 1);
   });
 
-  test("Blob object URLs are VM-local and revocable", () => {
-    assert.equal(URL.createObjectURL.length, 1);
-    assert.equal(URL.revokeObjectURL.length, 1);
-
-    const first = URL.createObjectURL(new Blob(["hello"], { type: "text/plain" }));
-    const second = URL.createObjectURL(new Blob(["hello"], { type: "text/plain" }));
-    assert(first.startsWith("blob:"), first);
-    assert(second.startsWith("blob:"), second);
-    assert(first !== second, "object URLs should be unique");
-    assert.equal(URL.canParse(first), true);
-
-    URL.revokeObjectURL(first);
-    URL.revokeObjectURL(first);
-    URL.revokeObjectURL("blob:not-registered");
-    URL.revokeObjectURL(second);
-
-    assert.throws(() => URL.createObjectURL({}), TypeError);
-    assert.throws(() => URL.revokeObjectURL(), TypeError);
+  test("has no object URL functions", () => {
+    // Nothing in the runtime resolves a blob: URL, so URL offers no way to make one.
+    assert.equal("createObjectURL" in URL, false);
+    assert.equal("revokeObjectURL" in URL, false);
+    assert.equal(URL.canParse("blob:https://example.com/1234"), true);
   });
 
   test("subclassing uses new.target structure", () => {

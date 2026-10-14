@@ -4,9 +4,9 @@
 //
 // A dependent signal holds its sources through WriteBarriers that visitChildren visits, while a source holds its
 // dependents through JSC::Weak entries that visitChildren never reads, so a source never keeps a dependent alive. The
-// lists the concurrent marker walks (cleanup records, abort algorithms, sources and the event target's listeners) are
-// Collo::CellEdgeList, which owns their lock and barrier protocol (jsc/runtime/cell_edges.h); the dependent list is
-// not walked and takes no lock.
+// lists the concurrent marker walks (cleanup records, abort algorithms, sources and the event target's listeners,
+// onabort's record among them) are Collo::CellEdgeList, which owns their lock and barrier protocol
+// (jsc/runtime/cell_edges.h); the dependent list is not walked and takes no lock.
 
 #pragma once
 
@@ -54,14 +54,10 @@ public:
     WebApiEventTargetData& eventTargetData() { return m_event_target; }
     bool aborted() const { return m_aborted; }
     JSC::JSValue reason() const { return m_reason.get(); }
-    JSC::JSValue onabort() const { return m_onabort.get(); }
     // This signal's sources, empty unless it is a dependent signal that has not aborted. A signal with sources is
     // never linked as a source itself, since callers link its sources instead, so the list never chains.
     const SourceSignals& sourceSignals() const { return m_source_signals; }
 
-    // Replaces the onabort handler; a value that is not callable clears it. Returns false, with a QuotaExceededError
-    // or an OutOfMemoryError thrown into the scope, when the handler's listener record cannot be stored.
-    bool setOnAbort(JSC::VM&, JSC::JSGlobalObject*, JSC::ThrowScope&, JSC::JSValue);
     // Aborts this signal and its dependents (DOM standard, signal abort); a no-op on a signal already aborted. An
     // undefined `reason` becomes an AbortError DOMException. An exception thrown while one signal runs its abort steps
     // does not stop the others; a termination stops the walk and stays pending for the caller to check.
@@ -73,15 +69,23 @@ public:
     void removeEventTargetCleanup(JSC::JSObject* target, const WTF::String& type, JSC::JSValue callback, bool capture);
     // Drops every record for `target`, whose listeners were all cleared.
     void removeEventTargetCleanupsForTarget(JSC::JSObject* target);
-    // Adds an abort algorithm: `callback`, which must be callable, runs with the signal as `this` and no arguments
-    // before the abort event fires. A callback already present is not added again. Returns false, with an
-    // OutOfMemoryError thrown into the scope, on allocation failure.
-    bool addInternalAbortAlgorithm(JSC::VM&, JSC::JSGlobalObject*, JSC::ThrowScope&, JSC::JSValue callback);
-    // Removes `callback`; while the algorithms are running it is only marked, and skipped.
-    void removeInternalAbortAlgorithm(JSC::JSValue callback);
-    // Runs the abort algorithms present when the run starts, in insertion order, then drops the list. An exception
-    // from one is cleared and the next runs; a termination ends the run and stays pending.
-    void runInternalAbortAlgorithms(JSC::VM&, JSC::JSGlobalObject*);
+    // An abort algorithm (DOM standard): native steps that run with the context they were added with, before the abort
+    // event fires. They run in the context's realm, which they find through context->globalObject(), and may run
+    // script.
+    using AbortAlgorithm = void (*)(JSC::JSObject* context);
+    // Adds `algorithm` with `context`, which the signal keeps alive until the algorithm runs or is removed. A pair
+    // already present is not added again. Returns false, with an OutOfMemoryError thrown into the scope, on allocation
+    // failure.
+    bool addInternalAbortAlgorithm(
+        JSC::VM&, JSC::JSGlobalObject*, JSC::ThrowScope&, AbortAlgorithm, JSC::JSObject* context);
+    // Removes the pair added with exactly this algorithm and context. During a run it does nothing, since the run calls
+    // every algorithm present when it started and drops the list afterwards; an algorithm removed by another during
+    // the run therefore still runs once, so its steps check their own state.
+    void removeInternalAbortAlgorithm(AbortAlgorithm, JSC::JSObject* context);
+    // Runs the abort algorithms present when the run starts, once each in insertion order, then drops the list. One
+    // added during the run never runs, as the DOM standard ignores an algorithm added to an aborted signal. An
+    // exception from one is cleared and the next runs; a termination ends the run and stays pending.
+    void runInternalAbortAlgorithms(JSC::VM&);
     // Links `signal` as a dependent of this source through a JSC::Weak. Returns false on allocation failure. Add this
     // edge before the matching addSourceSignal call: if that one fails, the caller drops the dependent and the weak
     // edge clears itself once the dependent is collected.
@@ -89,12 +93,6 @@ public:
     // Links `signal` as a source of this dependent signal, held strongly. Returns false on allocation failure.
     bool addSourceSignal(JSC::VM&, JSColloAbortSignal*);
     bool hasSourceSignal(const JSColloAbortSignal*) const;
-
-    // The id of AbortSignal.timeout()'s pending timer, or 0 for none: the scheduler numbers timers from 1. The timer
-    // callback clears the id before it aborts the signal.
-    void setTimeoutTimerId(uint64_t timer_id) { m_timeout_timer_id = timer_id; }
-    uint64_t timeoutTimerId() const { return m_timeout_timer_id; }
-    void clearTimeoutTimerId() { m_timeout_timer_id = 0; }
 
 private:
     // A listener added with this signal as its `signal` option, removed from `target` when the signal aborts.
@@ -112,11 +110,10 @@ private:
     };
 
     struct InternalAbortAlgorithm {
-        JSC::WriteBarrier<JSC::Unknown> callback;
-        // Marks a removal made while the algorithms run, since the run indexes the list.
-        bool removed { false };
+        AbortAlgorithm algorithm { nullptr };
+        JSC::WriteBarrier<JSC::JSObject> context;
 
-        template <typename Visitor> void visitEdges(Visitor& visitor) const { visitor.append(callback); }
+        template <typename Visitor> void visitEdges(Visitor& visitor) const { visitor.append(context); }
     };
 
     JSColloAbortSignal(JSC::VM&, JSC::Structure*, bool aborted);
@@ -141,12 +138,10 @@ private:
 
     WebApiEventTargetData m_event_target;
     JSC::WriteBarrier<JSC::Unknown> m_reason;
-    JSC::WriteBarrier<JSC::Unknown> m_onabort;
     Collo::CellEdgeList<EventTargetCleanup> m_cleanup_records;
     Collo::CellEdgeList<InternalAbortAlgorithm> m_abort_algorithms;
     SourceSignals m_source_signals;
     std::unique_ptr<DependentVector> m_dependent_signals;
-    uint64_t m_timeout_timer_id { 0 };
     bool m_aborted { false };
     bool m_dispatching_internal_abort_algorithms { false };
 };

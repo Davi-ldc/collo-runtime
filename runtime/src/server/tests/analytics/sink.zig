@@ -1,16 +1,14 @@
 //! The analytics sink (`server/analytics/sink.zig`) against real files in a
 //! temporary directory: one JSON Lines file per stream appended across opens,
-//! batched writes on flush, multi-line records and the room they take,
-//! whole-record refusal and drops at the buffer bound, the full flag and the
-//! one `err` line a full usage or workers stream logs, a refusal that a
-//! producer keeping its record asks for and that marks nothing, the reopen a
-//! rotation that renames the files asks for, a reopen that waits for a line a
-//! failed write cut and a reopen that fails, the sync interval, the final
-//! write at close, a missing directory, a planted symlink, a failed write,
-//! the console's own flusher and its line-aligned write batches, and the
-//! console-only mode without a directory. The record encoders are covered
-//! beside it in `logs.zig`, `access.zig`, `usage.zig` and `workers.zig`, the
-//! ingress drain in
+//! batched writes on flush, whole-record drops at the buffer bound, counted
+//! and logged at no `err`, a refusal that a producer keeping its record asks
+//! for and that counts nothing, the reopen a rotation that renames the files
+//! asks for, a reopen that waits for a line a failed write cut and a reopen
+//! that fails, the sync interval, the final write at close, a missing
+//! directory, a planted symlink, a failed write, the console's own flusher
+//! and its line-aligned write batches, and the console-only mode without a
+//! directory. The record encoders are covered beside it in `logs.zig`,
+//! `access.zig` and `workers.zig`, the ingress drain in
 //! `tests/ingress/analytics_drain.zig`, and the signal that asks for a reopen
 //! in `tests/boot/signals.zig`.
 
@@ -69,24 +67,24 @@ test "records land as JSON Lines in one file per stream, appended across opens" 
 
     var sink: Sink = undefined;
     try fixture.open(&sink);
-    try sink.append(.logs, "{\"n\":1}");
+    sink.appendLossy(.logs, "{\"n\":1}");
     sink.appendLossy(.logs, "{\"n\":2}");
-    try sink.append(.access, "{\"a\":1}");
-    try sink.append(.usage, "{\"u\":1}");
-    try sink.append(.workers, "{\"w\":1}");
+    sink.appendLossy(.access, "{\"a\":1}");
+    try std.testing.expect(sink.tryAppend(.workers, "{\"w\":1}"));
     sink.appendLossy(.console, "[w] hello");
     sink.flush(0);
     sink.close();
 
     try fixture.expectFile("logs.jsonl", "{\"n\":1}\n{\"n\":2}\n");
     try fixture.expectFile("access.jsonl", "{\"a\":1}\n");
-    try fixture.expectFile("usage.jsonl", "{\"u\":1}\n");
     try fixture.expectFile("workers.jsonl", "{\"w\":1}\n");
     try fixture.expectFile("console.txt", "[w] hello\n");
+    // Usage travels on the access lines; no other record file exists.
+    try std.testing.expectError(error.FileNotFound, fixture.tmp.dir.access("usage.jsonl", .{}));
 
     // A second open appends after what the first one wrote.
     try fixture.open(&sink);
-    try sink.append(.logs, "{\"n\":3}");
+    sink.appendLossy(.logs, "{\"n\":3}");
     sink.close();
     try fixture.expectFile("logs.jsonl", "{\"n\":1}\n{\"n\":2}\n{\"n\":3}\n");
 }
@@ -100,9 +98,9 @@ test "records wait in the buffer until a flush writes them in one batch" {
     try fixture.open(&sink);
     defer sink.close();
 
-    try sink.append(.access, "{\"r\":1}");
-    try sink.append(.access, "{\"r\":2}");
-    try sink.append(.access, "{\"r\":3}");
+    sink.appendLossy(.access, "{\"r\":1}");
+    sink.appendLossy(.access, "{\"r\":2}");
+    sink.appendLossy(.access, "{\"r\":3}");
     try fixture.expectFile("access.jsonl", "");
     try std.testing.expectEqual(@as(u64, 3), sink.stats(.access).appended);
     try std.testing.expectEqual(@as(u64, 0), sink.stats(.access).bytes_written);
@@ -122,26 +120,26 @@ test "a flush syncs a written file only once the sync interval has passed" {
     try fixture.open(&sink);
     defer sink.close();
 
-    try sink.append(.usage, "{\"u\":1}");
+    sink.appendLossy(.access, "{\"a\":1}");
     sink.flush(sink_mod.sync_interval_ns);
-    try std.testing.expectEqual(@as(u64, 1), sink.stats(.usage).syncs);
+    try std.testing.expectEqual(@as(u64, 1), sink.stats(.access).syncs);
 
     // Written inside the interval: on disk, not yet synced.
-    try sink.append(.usage, "{\"u\":2}");
+    sink.appendLossy(.access, "{\"a\":2}");
     sink.flush(sink_mod.sync_interval_ns + 1);
-    try fixture.expectFile("usage.jsonl", "{\"u\":1}\n{\"u\":2}\n");
-    try std.testing.expectEqual(@as(u64, 1), sink.stats(.usage).syncs);
+    try fixture.expectFile("access.jsonl", "{\"a\":1}\n{\"a\":2}\n");
+    try std.testing.expectEqual(@as(u64, 1), sink.stats(.access).syncs);
 
     sink.flush(2 * sink_mod.sync_interval_ns);
-    try std.testing.expectEqual(@as(u64, 2), sink.stats(.usage).syncs);
+    try std.testing.expectEqual(@as(u64, 2), sink.stats(.access).syncs);
 
     // A file with nothing new is not synced again.
     sink.flush(3 * sink_mod.sync_interval_ns);
-    try std.testing.expectEqual(@as(u64, 2), sink.stats(.usage).syncs);
+    try std.testing.expectEqual(@as(u64, 2), sink.stats(.access).syncs);
     try std.testing.expectEqual(@as(u64, 0), sink.stats(.logs).syncs);
 }
 
-test "a full buffer refuses or drops whole records and a flush frees the room" {
+test "a full buffer drops whole records and counts them, and a flush frees the room" {
     var fixture: Fixture = undefined;
     try fixture.init();
     defer fixture.deinit();
@@ -157,15 +155,13 @@ test "a full buffer refuses or drops whole records and a flush frees the room" {
 
     var appended: usize = 0;
     while (appended < fit) : (appended += 1)
-        try sink.append(.logs, record);
-    try std.testing.expectError(error.SinkBufferFull, sink.append(.logs, record));
+        sink.appendLossy(.logs, record);
     sink.appendLossy(.logs, record);
     var stats = sink.stats(.logs);
     try std.testing.expectEqual(@as(u64, fit), stats.appended);
-    try std.testing.expectEqual(@as(u64, 1), stats.refused);
     try std.testing.expectEqual(@as(u64, 1), stats.dropped);
     // A record that still fits the space left is taken.
-    try sink.append(.logs, "{}");
+    sink.appendLossy(.logs, "{}");
 
     sink.flush(0);
     const written = try fixture.read("logs.jsonl");
@@ -173,15 +169,16 @@ test "a full buffer refuses or drops whole records and a flush frees the room" {
     try std.testing.expectEqual(fit * (record.len + 1) + "{}\n".len, written.len);
     try std.testing.expectEqual(fit + 1, std.mem.count(u8, written, "\n"));
 
-    try sink.append(.logs, record);
+    sink.appendLossy(.logs, record);
     stats = sink.stats(.logs);
     try std.testing.expectEqual(@as(u64, fit + 2), stats.appended);
+    try std.testing.expectEqual(@as(u64, 1), stats.dropped);
 }
 
-test "a refusal makes a stream full until a flush makes room for the largest record it refused" {
-    // Only the start of a full usage or workers stream logs, once each, at
-    // `err`.
-    @import("root").expect_log_errors = 2;
+test "a worker line or an access line the stream has no room for is counted, and logs no err line" {
+    // Losses reach the log only as the warning `reportLosses` writes once per
+    // sync interval, whichever stream they hit; the test runner fails on any
+    // `err` line this test did not declare.
     var fixture: Fixture = undefined;
     try fixture.init();
     defer fixture.deinit();
@@ -193,48 +190,19 @@ test "a refusal makes a stream full until a flush makes room for the largest rec
     const record = try std.testing.allocator.alloc(u8, 64 * 1024);
     defer std.testing.allocator.free(record);
     @memset(record, 'x');
-
-    const usage_fit = sink_mod.usage_buffer_bytes_max / (record.len + 1);
-    var appended: usize = 0;
-    while (appended < usage_fit) : (appended += 1)
-        try sink.append(.usage, record);
-    try std.testing.expect(!sink.full(.usage));
-    try std.testing.expectError(error.SinkBufferFull, sink.append(.usage, record));
-    try std.testing.expect(sink.full(.usage));
-    // A record that still fits is taken without ending the episode, and a
-    // second refusal in it logs nothing more.
-    try sink.append(.usage, "{}");
-    try std.testing.expectError(error.SinkBufferFull, sink.append(.usage, record));
-    try std.testing.expect(sink.full(.usage));
-    try std.testing.expectEqual(@as(u64, 2), sink.stats(.usage).refused);
-
-    // Worker lines are lost for good too when their stream refuses one, so
-    // its full episode logs the same way.
-    const workers_fit = sink_mod.workers_buffer_bytes_max / (record.len + 1);
-    appended = 0;
-    while (appended < workers_fit) : (appended += 1)
-        try sink.append(.workers, record);
-    try std.testing.expect(!sink.full(.workers));
-    try std.testing.expectError(error.SinkBufferFull, sink.append(.workers, record));
-    try std.testing.expect(sink.full(.workers));
-
-    // A stream that drops instead of refusing is full the same way.
-    const logs_fit = sink_mod.logs_buffer_bytes_max / (record.len + 1);
-    appended = 0;
-    while (appended < logs_fit) : (appended += 1)
-        sink.appendLossy(.logs, record);
-    try std.testing.expect(!sink.full(.logs));
-    sink.appendLossy(.logs, record);
-    try std.testing.expect(sink.full(.logs));
-    try std.testing.expect(!sink.full(.access));
-
-    sink.flush(0);
-    try std.testing.expect(!sink.full(.usage));
-    try std.testing.expect(!sink.full(.workers));
-    try std.testing.expect(!sink.full(.logs));
+    inline for (.{ analytics.Stream.workers, analytics.Stream.access }) |stream| {
+        const fit = sink_mod.bufferBytesMax(stream) / (record.len + 1);
+        var appended: usize = 0;
+        while (appended < fit) : (appended += 1)
+            sink.appendLossy(stream, record);
+        sink.appendLossy(stream, record);
+        sink.appendLossy(stream, record);
+        try std.testing.expectEqual(@as(u64, 2), sink.stats(stream).dropped);
+    }
+    sink.flush(sink_mod.sync_interval_ns);
 }
 
-test "a producer that keeps its record is refused without a count or a full stream, and offers it again once written out" {
+test "a producer that keeps its record is refused without a count, and offers it again once written out" {
     var fixture: Fixture = undefined;
     try fixture.init();
     defer fixture.deinit();
@@ -243,28 +211,25 @@ test "a producer that keeps its record is refused without a count or a full stre
     try fixture.open(&sink);
     defer sink.close();
 
-    const record = try std.testing.allocator.alloc(u8, 64 * 1024);
+    const record = try std.testing.allocator.alloc(u8, 16 * 1024);
     defer std.testing.allocator.free(record);
     @memset(record, 'x');
-    const keep_free: usize = 1024;
-    const fit = (sink_mod.usage_buffer_bytes_max - keep_free) / (record.len + 1);
+    const fit = sink_mod.workers_buffer_bytes_max / (record.len + 1);
 
     var appended: usize = 0;
     while (appended < fit) : (appended += 1)
-        try std.testing.expect(sink.tryAppendKeepingFree(.usage, record, keep_free));
-    // No room for one more above the bytes kept free: the record stays the
-    // producer's, so the stream counts nothing, is not full and logs nothing.
-    try std.testing.expect(!sink.tryAppendKeepingFree(.usage, record, keep_free));
-    const stats = sink.stats(.usage);
+        try std.testing.expect(sink.tryAppend(.workers, record));
+    // No room for one more: the record stays the producer's, so the stream
+    // counts nothing.
+    try std.testing.expect(!sink.tryAppend(.workers, record));
+    const stats = sink.stats(.workers);
     try std.testing.expectEqual(@as(u64, fit), stats.appended);
-    try std.testing.expectEqual(@as(u64, 0), stats.refused);
     try std.testing.expectEqual(@as(u64, 0), stats.dropped);
-    try std.testing.expect(!sink.full(.usage));
 
     // Written out, the stream takes the record offered again.
     sink.flush(0);
-    try std.testing.expect(sink.tryAppendKeepingFree(.usage, record, keep_free));
-    try std.testing.expectEqual(@as(u64, fit + 1), sink.stats(.usage).appended);
+    try std.testing.expect(sink.tryAppend(.workers, record));
+    try std.testing.expectEqual(@as(u64, fit + 1), sink.stats(.workers).appended);
 }
 
 test "a requested reopen writes what was buffered to the renamed file and then appends under the name" {
@@ -276,35 +241,35 @@ test "a requested reopen writes what was buffered to the renamed file and then a
     try fixture.open(&sink);
     defer sink.close();
 
-    try sink.append(.usage, "{\"u\":1}");
-    try sink.append(.access, "{\"a\":1}");
+    sink.appendLossy(.workers, "{\"w\":1}");
+    sink.appendLossy(.access, "{\"a\":1}");
     sink.flush(0);
     // A rotation renames the files and then asks for the reopen, as logrotate
     // does with a postrotate SIGHUP.
-    try fixture.tmp.dir.rename("usage.jsonl", "usage.jsonl.1");
+    try fixture.tmp.dir.rename("workers.jsonl", "workers.jsonl.1");
     try fixture.tmp.dir.rename("access.jsonl", "access.jsonl.1");
-    try sink.append(.usage, "{\"u\":2}");
+    sink.appendLossy(.workers, "{\"w\":2}");
     sink.requestReopen();
     sink.flush(0);
     // What was buffered when the reopen was asked for went to the renamed
     // file, and the name is a new, empty file.
-    try fixture.expectFile("usage.jsonl.1", "{\"u\":1}\n{\"u\":2}\n");
-    try fixture.expectFile("usage.jsonl", "");
+    try fixture.expectFile("workers.jsonl.1", "{\"w\":1}\n{\"w\":2}\n");
+    try fixture.expectFile("workers.jsonl", "");
     try fixture.expectFile("access.jsonl", "");
 
-    try sink.append(.usage, "{\"u\":3}");
-    try sink.append(.access, "{\"a\":2}");
+    sink.appendLossy(.workers, "{\"w\":3}");
+    sink.appendLossy(.access, "{\"a\":2}");
     sink.flush(0);
-    try fixture.expectFile("usage.jsonl", "{\"u\":3}\n");
+    try fixture.expectFile("workers.jsonl", "{\"w\":3}\n");
     try fixture.expectFile("access.jsonl", "{\"a\":2}\n");
-    try fixture.expectFile("usage.jsonl.1", "{\"u\":1}\n{\"u\":2}\n");
+    try fixture.expectFile("workers.jsonl.1", "{\"w\":1}\n{\"w\":2}\n");
     try fixture.expectFile("access.jsonl.1", "{\"a\":1}\n");
 
     // Without a new request the next flush reopens nothing.
-    try fixture.tmp.dir.rename("usage.jsonl", "usage.jsonl.2");
-    try sink.append(.usage, "{\"u\":4}");
+    try fixture.tmp.dir.rename("workers.jsonl", "workers.jsonl.2");
+    sink.appendLossy(.workers, "{\"w\":4}");
     sink.flush(0);
-    try fixture.expectFile("usage.jsonl.2", "{\"u\":3}\n{\"u\":4}\n");
+    try fixture.expectFile("workers.jsonl.2", "{\"w\":3}\n{\"w\":4}\n");
 }
 
 test "a file whose last write stopped inside a line is reopened only once that line ends in it" {
@@ -332,22 +297,22 @@ test "a file whose last write stopped inside a line is reopened only once that l
     // Back to a soft limit the hard limit already allowed, which cannot fail.
     defer std.posix.setrlimit(.FSIZE, file_size_limit) catch unreachable;
 
-    try sink.append(.usage, "{\"u\":1}");
+    sink.appendLossy(.workers, "{\"w\":1}");
     sink.flush(0);
-    try fixture.expectFile("usage.jsonl", "{\"u\"");
-    try std.testing.expectEqual(@as(u64, 1), sink.stats(.usage).write_errors);
+    try fixture.expectFile("workers.jsonl", "{\"w\"");
+    try std.testing.expectEqual(@as(u64, 1), sink.stats(.workers).write_errors);
 
-    try fixture.tmp.dir.rename("usage.jsonl", "usage.jsonl.1");
+    try fixture.tmp.dir.rename("workers.jsonl", "workers.jsonl.1");
     sink.requestReopen();
     sink.flush(0);
-    // The cut line still waits for its rest, so the usage file keeps its
+    // The cut line still waits for its rest, so the workers file keeps its
     // descriptor while the other names open again.
-    try std.testing.expectError(error.FileNotFound, fixture.tmp.dir.access("usage.jsonl", .{}));
+    try std.testing.expectError(error.FileNotFound, fixture.tmp.dir.access("workers.jsonl", .{}));
 
     try std.posix.setrlimit(.FSIZE, file_size_limit);
     sink.flush(0);
-    try fixture.expectFile("usage.jsonl.1", "{\"u\":1}\n");
-    try fixture.expectFile("usage.jsonl", "");
+    try fixture.expectFile("workers.jsonl.1", "{\"w\":1}\n");
+    try fixture.expectFile("workers.jsonl", "");
 }
 
 test "a reopen that cannot open a name keeps writing to the file already open and logs it once at err" {
@@ -362,39 +327,17 @@ test "a reopen that cannot open a name keeps writing to the file already open an
 
     // A symlink planted under the name after the rename is refused, not
     // followed, so the records keep landing in the renamed file.
-    try fixture.tmp.dir.rename("usage.jsonl", "usage.jsonl.1");
-    try fixture.tmp.dir.symLink("elsewhere.txt", "usage.jsonl", .{});
+    try fixture.tmp.dir.rename("workers.jsonl", "workers.jsonl.1");
+    try fixture.tmp.dir.symLink("elsewhere.txt", "workers.jsonl", .{});
     sink.requestReopen();
     sink.flush(0);
-    try sink.append(.usage, "{\"u\":1}");
-    try sink.append(.logs, "{\"n\":1}");
+    sink.appendLossy(.workers, "{\"w\":1}");
+    sink.appendLossy(.logs, "{\"n\":1}");
     sink.flush(0);
-    try fixture.expectFile("usage.jsonl.1", "{\"u\":1}\n");
+    try fixture.expectFile("workers.jsonl.1", "{\"w\":1}\n");
     try std.testing.expectError(error.FileNotFound, fixture.tmp.dir.access("elsewhere.txt", .{}));
     // The other names opened again as asked.
     try fixture.expectFile("logs.jsonl", "{\"n\":1}\n");
-}
-
-test "a batch of lines is buffered whole and takes its size of the stream's room" {
-    var fixture: Fixture = undefined;
-    try fixture.init();
-    defer fixture.deinit();
-
-    var sink: Sink = undefined;
-    try fixture.open(&sink);
-    defer sink.close();
-
-    // A batch of two lines takes 16 bytes with the newline the sink adds,
-    // so 16 more bytes kept free than the rest of the stream are refused,
-    // and exactly the rest are not.
-    const batch = "{\"u\":1}\n{\"u\":2}";
-    try sink.append(.usage, batch);
-    try std.testing.expect(!sink.tryAppendKeepingFree(.usage, "{}", sink_mod.usage_buffer_bytes_max - 16 - "{}\n".len + 1));
-    try std.testing.expect(sink.tryAppendKeepingFree(.usage, "{}", sink_mod.usage_buffer_bytes_max - 16 - "{}\n".len));
-    sink.flush(0);
-    try fixture.expectFile("usage.jsonl", "{\"u\":1}\n{\"u\":2}\n{}\n");
-    // Written out, the whole stream is room again.
-    try std.testing.expect(sink.tryAppendKeepingFree(.usage, "{}", sink_mod.usage_buffer_bytes_max - "{}\n".len));
 }
 
 test "close writes and syncs what is still buffered" {
@@ -404,12 +347,12 @@ test "close writes and syncs what is still buffered" {
 
     var sink: Sink = undefined;
     try fixture.open(&sink);
-    try sink.append(.usage, "{\"u\":1}");
-    try sink.append(.access, "{\"a\":1}");
+    sink.appendLossy(.workers, "{\"w\":1}");
+    sink.appendLossy(.access, "{\"a\":1}");
     sink.appendLossy(.console, "[w] last words");
     sink.close();
 
-    try fixture.expectFile("usage.jsonl", "{\"u\":1}\n");
+    try fixture.expectFile("workers.jsonl", "{\"w\":1}\n");
     try fixture.expectFile("access.jsonl", "{\"a\":1}\n");
     try fixture.expectFile("console.txt", "[w] last words\n");
 }
@@ -479,20 +422,18 @@ test "without a directory record streams count what they discard and the console
 
     try std.testing.expect(!sink.enabled(.logs));
     try std.testing.expect(!sink.enabled(.access));
-    try std.testing.expect(!sink.enabled(.usage));
     try std.testing.expect(!sink.enabled(.workers));
     try std.testing.expect(sink.enabled(.console));
 
     // A disabled stream accepts the record, so a producer that retries on
     // refusal never stalls on it.
-    try sink.append(.usage, "{\"u\":1}");
-    try std.testing.expect(sink.tryAppendKeepingFree(.usage, "{\"u\":2}", sink_mod.usage_buffer_bytes_max));
+    try std.testing.expect(sink.tryAppend(.workers, "{\"w\":1}"));
     sink.appendLossy(.access, "{\"a\":1}");
     sink.noteDiscarded(.logs, 2);
-    try std.testing.expectEqual(@as(u64, 2), sink.stats(.usage).discarded);
+    try std.testing.expectEqual(@as(u64, 1), sink.stats(.workers).discarded);
     try std.testing.expectEqual(@as(u64, 1), sink.stats(.access).discarded);
     try std.testing.expectEqual(@as(u64, 2), sink.stats(.logs).discarded);
-    try std.testing.expectEqual(@as(u64, 0), sink.stats(.usage).appended);
+    try std.testing.expectEqual(@as(u64, 0), sink.stats(.workers).appended);
 
     // There is no file to reopen, so a reopen request changes nothing.
     sink.requestReopen();
@@ -512,12 +453,12 @@ test "a record flush leaves console lines to the console flusher" {
     try fixture.open(&sink);
     defer sink.close();
 
-    try sink.append(.usage, "{\"u\":1}");
+    sink.appendLossy(.access, "{\"a\":1}");
     sink.appendLossy(.console, "[w] waits");
     // The record files never wait on stderr, so a stalled stderr reader
-    // cannot hold the flush that frees the usage stream.
+    // cannot hold the flush that frees the access stream.
     sink.flush(0);
-    try fixture.expectFile("usage.jsonl", "{\"u\":1}\n");
+    try fixture.expectFile("access.jsonl", "{\"a\":1}\n");
     try fixture.expectFile("console.txt", "");
     try std.testing.expectEqual(@as(u64, 0), sink.stats(.console).bytes_written);
 

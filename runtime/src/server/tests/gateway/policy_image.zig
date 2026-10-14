@@ -9,7 +9,7 @@ const routes = @import("collo_server_routes");
 const gateway = @import("collo_server_gateway");
 
 const source =
-    \\{"globalSettings": {"network": {"allow": ["*"]}},
+    \\{"settings": {"network": {"allow": ["*"]}},
     \\ "workers": {"app": {"routes": {"/*": {"entry": "app.js"}}}}}
 ;
 

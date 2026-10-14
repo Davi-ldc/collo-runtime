@@ -21,7 +21,7 @@
 // template, around api/finalization_spin.js, api/memory_grow.js and
 // api/boot_rejects.js beside the handlers of this file.
 {
-  "globalSettings": {
+  "settings": {
     "limits": { "memoryMiB": 1024, "timeoutMs": 15000 }
   },
   "workers": {

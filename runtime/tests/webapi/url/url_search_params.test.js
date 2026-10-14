@@ -90,7 +90,6 @@ describe("URLSearchParams", () => {
       ["values", 0],
       ["forEach", 1],
       ["toString", 0],
-      ["toJSON", 0],
     ]) {
       const property = descriptor(URLSearchParams.prototype, name);
       assertDataDescriptor(property, URLSearchParams.prototype[name], true, true, true, `URLSearchParams.prototype.${name}`);
@@ -106,7 +105,7 @@ describe("URLSearchParams", () => {
     assert.throws(() => size.get.call({}), TypeError);
 
     assertDataDescriptor(descriptor(URLSearchParams.prototype, Symbol.iterator), URLSearchParams.prototype.entries, true, false, true, "URLSearchParams.prototype @@iterator");
-    assert.equal(Object.keys(URLSearchParams.prototype).join(","), "append,delete,get,getAll,has,set,sort,entries,keys,values,forEach,toString,toJSON,size");
+    assert.equal(Object.keys(URLSearchParams.prototype).join(","), "append,delete,get,getAll,has,set,sort,entries,keys,values,forEach,toString,size");
 
     const params = new URLSearchParams("i=1&i=2");
     const iterator = params.entries();
@@ -229,33 +228,23 @@ describe("URLSearchParams", () => {
     assert.equal(params.size, 0);
   });
 
-  test("size and toJSON preserve repeated keys", () => {
+  test("size counts repeated keys", () => {
     const empty = new URLSearchParams();
     assert.equal("length" in empty, false);
     assert.equal(empty.size, 0);
-    assert.deepEqual(empty.toJSON(), {});
-    assert.equal(JSON.stringify(empty), "{}");
 
     const params = new URLSearchParams("a=1&b=2&a=3&empty=");
     assert.equal(params.size, 4);
-    assert.deepEqual(params.toJSON(), { a: ["1", "3"], b: "2", empty: "" });
-    assert.equal(JSON.stringify(params), '{"a":["1","3"],"b":"2","empty":""}');
-    const tagged = params.toJSON();
-    assert.equal(Object.prototype.toString.call(tagged), "[object URLSearchParams]");
-    assert.equal(Object.getOwnPropertyDescriptor(tagged, Symbol.toStringTag).enumerable, false);
-
     params.append("b", "4");
-    assert.deepEqual(params.toJSON(), { a: ["1", "3"], b: ["2", "4"], empty: "" });
-    assert.throws(() => URLSearchParams.prototype.toJSON.call({}), TypeError);
+    assert.equal(params.size, 5);
+  });
 
-    const many = new URLSearchParams();
-    for (let index = 0; index < 256; index++)
-      many.append(`k${index}`, `${index}`);
-    many.append("k7", "again");
-    const json = many.toJSON();
-    assert.equal(Object.keys(json).length, 256);
-    assert.equal(json.k0, "0");
-    assert.deepEqual(json.k7, ["7", "again"]);
-    assert.equal(json.k255, "255");
+  test("has no toJSON, so JSON.stringify sees a plain object", () => {
+    // toJSON is a Bun extension outside the URL Standard.
+    assert.equal("toJSON" in URLSearchParams.prototype, false);
+    const params = new URLSearchParams("a=1&b=2&a=3");
+    assert.equal(params.toJSON, undefined);
+    assert.equal(JSON.stringify(params), "{}");
+    assert.equal(JSON.stringify({ params }), '{"params":{}}');
   });
 });

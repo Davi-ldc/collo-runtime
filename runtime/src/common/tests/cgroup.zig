@@ -1,13 +1,16 @@
 //! The cgroup v2 primitives in `collo_cgroup`, run on fixture strings and on a
 //! plain temporary directory standing in for a worker cgroup: parsing
-//! `/proc/<pid>/cgroup`, `cpu.max`, `cpu.stat` and `memory.events.local`,
+//! `/proc/<pid>/cgroup`, `cpu.max`, `cpu.stat` and `memory.events`,
 //! rejecting a missing cgroup root, deriving `memory.max`, and writing and
 //! validating a worker leaf's limits, swap included, through its directory
 //! fd. The writers open limit files without O_CREAT, so a fixture creates
 //! every file it expects written; fixtures leave out `memory.oom.group`,
 //! which the writers skip when it is missing, and leave out
-//! `memory.swap.max` unless the test is about swap. Limits on a real
-//! delegated cgroup are covered by the `zygote-integration` lane.
+//! `memory.swap.max` unless the test is about swap. The figures the server
+//! reads off a worker's leaf (`readLeafFigure`) run through a real
+//! `WorkerLeaf` in `server/tests/supervisor/worker_table.zig`, and limits on
+//! a real delegated cgroup in the `zygote-integration` lane. Lane
+//! `common-test`.
 
 const std = @import("std");
 const cgroup = @import("collo_cgroup");
@@ -171,20 +174,11 @@ test "worker cgroup cpu.stat parser extracts usage_usec" {
     );
 }
 
-test "worker cgroup memory.events.local reader classifies kernel oom_kill" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.writeFile(.{
-        .sub_path = "memory.events.local",
-        .data = "low 0\nhigh 4\nmax 2\noom 1\noom_kill 1\n",
-    });
-    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
-    defer std.testing.allocator.free(root);
-
-    const events = try cgroup.memory.readEventsLocal(std.testing.allocator, root);
-    try std.testing.expectEqual(@as(u64, 1), events.oom_kill);
-    try std.testing.expectEqual(@as(u64, 4), events.high);
+test "worker cgroup memory.events parser reads every count it knows and passes keys newer kernels add" {
+    // Linux 5.17 and later print `oom_group_kill` too.
+    const events = try cgroup.memory.parseEvents("low 0\nhigh 4\nmax 2\noom 1\noom_kill 1\noom_group_kill 1\n");
+    try std.testing.expectEqualDeep(cgroup.memory.Events{ .low = 0, .high = 4, .max = 2, .oom = 1, .oom_kill = 1 }, events);
+    try std.testing.expectError(error.InvalidMemoryEventsFile, cgroup.memory.parseEvents("oom_kill\n"));
 }
 
 test "worker cgroup base limits configure memory cpu and pids through a dir fd" {

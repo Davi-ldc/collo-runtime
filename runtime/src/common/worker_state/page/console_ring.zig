@@ -1,13 +1,14 @@
 //! The console line ring: a byte ring of frames, each a `LogFrameHeader`
 //! with its UTF-8 payload inline. The worker's threads append lines under
-//! one lock (`producer_mutex`) and never fail, and the host drains them
-//! through its `WorkerWriterView` of the worker, the ring's one consumer.
-//! The drain keeps
-//! the host's tail in host memory and stores it to the page without reading
-//! it back, loads the worker's head once, and copies each frame header once
-//! and validates the copy, so a worker that rewrites the ring during a drain
-//! can garble a line's text but never a length or a cursor; a corrupt cursor
-//! or frame turns the ring fatal.
+//! one lock (`producer_mutex`) and never fail; a thread that must never wait
+//! drops its line instead when another holds the lock
+//! (`tryPublishLogLineImpl`). The host drains the lines through its
+//! `HostReaderView` of the worker, the ring's one consumer. The drain keeps
+//! the host's tail in host memory and stores it to the page
+//! without reading it back, loads the worker's head once, and copies each
+//! frame header once and validates the copy, so a worker that rewrites the
+//! ring during a drain can garble a line's text but never a length or a
+//! cursor; a corrupt cursor or frame turns the ring fatal.
 
 const std = @import("std");
 
@@ -91,8 +92,11 @@ pub const DrainedLogLine = struct {
 /// the VM thread's console and exception lines and the runtime's log lines
 /// from any of its threads (`zygote/log_sink.zig`). A host only drains, and a
 /// process that writes several rings, as a test does, only waits longer.
-var producer_mutex: std.Thread.Mutex = .{};
+/// Public so a test can stand for a producer mid-line.
+pub var producer_mutex: std.Thread.Mutex = .{};
 
+/// Appends one line, waiting for the ring's lock
+/// (`WorkerWriterView.publishLogLine`).
 pub fn publishLogLineImpl(
     header: *LogRingHeader,
     log_bytes: []u8,
@@ -104,6 +108,41 @@ pub fn publishLogLineImpl(
 ) void {
     producer_mutex.lock();
     defer producer_mutex.unlock();
+    appendLocked(header, log_bytes, level, flags, request_id, ts_mono_ns, payload);
+}
+
+/// Appends one line only when no other producer holds the ring's lock, and
+/// otherwise drops it as a full ring would, counted unless the ring is fatal
+/// (`WorkerWriterView.tryPublishLogLine`). Returns whether it took the lock.
+pub fn tryPublishLogLineImpl(
+    header: *LogRingHeader,
+    log_bytes: []u8,
+    level: LogLevel,
+    flags: u8,
+    request_id: u64,
+    ts_mono_ns: u64,
+    payload: []const u8,
+) bool {
+    if (!producer_mutex.tryLock()) {
+        if (@atomicLoad(u32, &header.fatal, .acquire) == 0)
+            countDroppedLine(header, payload.len);
+        return false;
+    }
+    defer producer_mutex.unlock();
+    appendLocked(header, log_bytes, level, flags, request_id, ts_mono_ns, payload);
+    return true;
+}
+
+/// The append both publishes share. The caller holds `producer_mutex`.
+fn appendLocked(
+    header: *LogRingHeader,
+    log_bytes: []u8,
+    level: LogLevel,
+    flags: u8,
+    request_id: u64,
+    ts_mono_ns: u64,
+    payload: []const u8,
+) void {
     if (@atomicLoad(u32, &header.fatal, .acquire) != 0)
         return;
 
@@ -119,8 +158,7 @@ pub fn publishLogLineImpl(
     const tail = @atomicLoad(u64, &header.tail, .acquire);
     const occupancy = head -% tail;
     if (occupancy > LOG_RING_BYTES or LOG_RING_BYTES - @as(usize, @intCast(occupancy)) < needed) {
-        _ = @atomicRmw(u64, &header.dropped_lines, .Add, 1, .release);
-        _ = @atomicRmw(u64, &header.dropped_bytes, .Add, payload.len, .release);
+        countDroppedLine(header, payload.len);
         return;
     }
 
@@ -134,6 +172,11 @@ pub fn publishLogLineImpl(
     copyIntoLogRing(log_bytes, head, std.mem.asBytes(&frame));
     copyIntoLogRing(log_bytes, head +% @sizeOf(LogFrameHeader), line);
     @atomicStore(u64, &header.head, head +% needed, .release);
+}
+
+fn countDroppedLine(header: *LogRingHeader, payload_len: usize) void {
+    _ = @atomicRmw(u64, &header.dropped_lines, .Add, 1, .release);
+    _ = @atomicRmw(u64, &header.dropped_bytes, .Add, payload_len, .release);
 }
 
 /// Host side. `tail` is the host's own consumer cursor, which the drain moves

@@ -14,15 +14,14 @@
 //!   and a lane that takes a slot of a worker another lane reads only asks
 //!   that reader to give the role up (`release_worker`). A dead worker's role
 //!   goes back on its death path.
-//! - A reader polls the worker's completion eventfd, fault socket and pidfd
-//!   for the whole tenure, and its control socket while the worker's
-//!   forwarding window has room (`window_blocked`), reading the completion
-//!   ring through the record's mapping of the worker's page. Any
-//!   registration polls the control socket's writability while one of its
-//!   requests' sends waits for room there. A send that waits for room in the
-//!   worker's payload ring polls nothing: the reader wakes it
-//!   (`request_body.zig`). The launcher set the server's ends of the worker's
-//!   sockets non-blocking once, so no dispatch changes a descriptor's flags.
+//! - A reader polls the worker's completion eventfd and pidfd for the whole
+//!   tenure, and its control socket while the worker's forwarding window has
+//!   room (`window_blocked`). Any registration polls the control socket's
+//!   writability while one of its requests' sends waits for room there. A
+//!   send that waits for room in the worker's payload ring polls nothing:
+//!   the reader wakes it (`request_body.zig`). The launcher set the server's
+//!   end of the worker's control socket non-blocking once, so no dispatch
+//!   changes a descriptor's flags.
 //! - Every poll carries the registration's epoch, which is new each time
 //!   the registration is bound, stops reading or is freed (`newEpoch`), so
 //!   the completion of an earlier poll is ignored.
@@ -69,7 +68,7 @@ pub fn Methods(comptime Self: type) type {
                     // read the worker, and a tenure ends in this lane's own
                     // registration.
                     if (registration.reading())
-                        return error.InvalidCompletionRegistration;
+                        return error.InvalidWorkerRegistration;
                     registration.tenure = .{ .lane = self.lane.lane_id, .epoch = epoch };
                     try armWorkerPolls(self, registration_index);
                 },
@@ -131,17 +130,16 @@ pub fn Methods(comptime Self: type) type {
             registration.worker = worker;
             registration.worker_key = worker_key;
             registration.generation = newEpoch(self);
-            registration.event_fd = worker.handle.completion_eventfd;
+            registration.ring_credit_fd = worker.handle.completion_eventfd;
             registration.control_fd = worker.handle.control_fd;
             registration.pidfd = worker.handle.pidfd;
-            registration.fs_fault_fd = worker.handle.fs_fault_fd;
             registration.ingress_payload = &worker.handle.ingress_payload;
             registration.ingress_payload_credit_eventfd = worker.handle.ingress_payload_credit_eventfd;
-            self.lane.counters.worker_completion_registrations += 1;
+            self.lane.counters.worker_registrations += 1;
             return acquired.index;
         }
 
-        pub fn findCompletionRegistrationIndex(self: *Self, worker_key: lifecycle.WorkerKey) ?u32 {
+        pub fn findRegistrationIndex(self: *Self, worker_key: lifecycle.WorkerKey) ?u32 {
             for (self.registrations.touched(), 0..) |*registration, index| {
                 if (registration.inUse() and registration.worker_key.eql(worker_key))
                     return @intCast(index);
@@ -168,21 +166,20 @@ pub fn Methods(comptime Self: type) type {
         }
 
         /// Arms every poll registration `registration_index` should have and
-        /// has not: a reader's polls on the worker's completion eventfd,
-        /// fault socket and pidfd, and on its control socket unless the
-        /// forwarding window is full, and the writability poll while one of
-        /// this lane's requests waits on the worker's full control socket.
-        /// Every poll is one-shot; its completion clears its flag, and this
-        /// arms it again. Arming only prepares the submission, which the
-        /// pass's one `io_uring_enter` hands over.
+        /// has not: a reader's polls on the worker's completion eventfd and
+        /// pidfd, and on its control socket unless the forwarding window is
+        /// full, and the writability poll while one of this lane's requests
+        /// waits on the worker's full control socket. Every poll is one-shot;
+        /// its completion clears its flag, and this arms it again. Arming
+        /// only prepares the submission, which the pass's one `io_uring_enter`
+        /// hands over.
         pub fn armWorkerPolls(self: *Self, registration_index: u32) LaneFault!void {
             const registration = try registrationAt(self, registration_index);
             const ring = self.runtime_ring orelse return error.IngressRingUnavailable;
             if (registration.reading()) {
-                try armReadPoll(ring, registration, registration_index, .worker_completion, registration.event_fd, &registration.poll_registered);
+                try armReadPoll(ring, registration, registration_index, .worker_ring_credit, registration.ring_credit_fd, &registration.ring_credit_poll_registered);
                 if (!registration.window_blocked)
                     try armReadPoll(ring, registration, registration_index, .worker_control, registration.control_fd, &registration.control_poll_registered);
-                try armReadPoll(ring, registration, registration_index, .worker_fs_fault, registration.fs_fault_fd, &registration.fs_fault_poll_registered);
                 try armReadPoll(ring, registration, registration_index, .worker_pidfd, registration.pidfd, &registration.pidfd_poll_registered);
             }
             for (registration.inflight_request_keys[0..registration.inflight_request_len]) |request_key| {
@@ -198,8 +195,8 @@ pub fn Methods(comptime Self: type) type {
         /// `armWorkerPolls` for the registration of the worker of the
         /// dispatched request in `slot`.
         pub fn armWorkerPollsFor(self: *Self, slot: *const RequestSlot) LaneFault!void {
-            const registration_index = findCompletionRegistrationIndex(self, slot.worker_key) orelse
-                return error.WorkerCompletionRegistrationNotFound;
+            const registration_index = findRegistrationIndex(self, slot.worker_key) orelse
+                return error.WorkerRegistrationNotFound;
             try armWorkerPolls(self, registration_index);
         }
 
@@ -245,9 +242,8 @@ pub fn Methods(comptime Self: type) type {
         /// on its way reads as stale.
         fn cancelPolls(self: *Self, registration_index: u32) LaneFault!void {
             const registration = &self.registrations.entries[registration_index];
-            try cancelPoll(self, registration, registration_index, .worker_completion, &registration.poll_registered);
+            try cancelPoll(self, registration, registration_index, .worker_ring_credit, &registration.ring_credit_poll_registered);
             try cancelPoll(self, registration, registration_index, .worker_control, &registration.control_poll_registered);
-            try cancelPoll(self, registration, registration_index, .worker_fs_fault, &registration.fs_fault_poll_registered);
             try cancelPoll(self, registration, registration_index, .worker_pidfd, &registration.pidfd_poll_registered);
             try cancelPoll(self, registration, registration_index, .worker_control_writable, &registration.control_writable_poll_registered);
             registration.generation = newEpoch(self);
@@ -257,7 +253,7 @@ pub fn Methods(comptime Self: type) type {
         /// worker: a caller reaches one only through a completion or a call
         /// that checked it, so anything else is the lane's own mistake.
         pub fn registrationAt(self: *Self, registration_index: u32) LaneFault!*completions.Registration {
-            return self.registrations.get(registration_index) orelse error.InvalidCompletionRegistration;
+            return self.registrations.get(registration_index) orelse error.InvalidWorkerRegistration;
         }
 
         /// Stops reading the worker of registration `registration_index`:
@@ -323,7 +319,7 @@ pub fn Methods(comptime Self: type) type {
             if (registration.death_notice) |notice| {
                 registration.death_notice = null;
                 // A deferred fault records its reason with the notice.
-                const reason = registration.fault orelse return error.InvalidCompletionRegistration;
+                const reason = registration.fault orelse return error.InvalidWorkerRegistration;
                 try WorkerFault.announceDeath(self, worker, reason, notice);
             }
             if (registration.reading())

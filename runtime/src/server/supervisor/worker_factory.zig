@@ -23,7 +23,6 @@ const ipc = @import("collo_ipc");
 const host = @import("collo_host");
 const lifecycle = @import("collo_server_lifecycle");
 const config = @import("collo_server_config");
-const policy = @import("collo_egress_gateway").policy;
 
 const launcher = @import("launcher.zig");
 const pool = @import("pool.zig");
@@ -99,6 +98,5 @@ fn bootEgress(
         .key = key,
         .session_id = attachment.session_id,
         .policy_id = policy_id,
-        .budget = @intCast(policy.production.max_fetches_per_boot),
     };
 }

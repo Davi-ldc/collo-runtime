@@ -1,7 +1,9 @@
-//! Maps the sealed module-pack memfds a worker registers, on its VM thread.
-//! The mapping made here is the one the bridge keeps: registration consumes
-//! it, so a caller reads the bytes (parse, validation, bookkeeping) only
-//! before `MappedPack.take`.
+//! Maps the sealed definition artifact a worker boots from, on its VM
+//! thread. The mapping made here is the one the bridge keeps: registration
+//! consumes it, and once it succeeds the VM keeps the bytes valid until the
+//! pack is unregistered or the VM destroyed (`Vm.registerModulePackMapping`),
+//! which is how the worker's routes keep reading them after
+//! `MappedPack.take`.
 
 const std = @import("std");
 const bindings = @import("collo_bindings");
@@ -33,8 +35,9 @@ pub const MappedPack = struct {
 };
 
 /// Refuses an fd that is not a memfd sealed against writes and resizes before
-/// mapping it, because the bridge reads the mapping long after validation and
-/// another holder of the file must not be able to change the bytes under it.
+/// mapping it, because the worker parses the bytes once and the bridge reads
+/// the mapping long after, so another holder of the file must not be able to
+/// change the bytes under them.
 /// The caller may close `fd` once this returns. Fails with
 /// `error.MissingFdSeals` for a memfd without those seals, with
 /// `error.Unexpected` for an fd whose file cannot carry seals, with

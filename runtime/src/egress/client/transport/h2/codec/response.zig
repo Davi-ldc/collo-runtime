@@ -3,6 +3,9 @@
 //! content, a connection-specific field such as `te` included, is a stream
 //! error, so one bad response never fails the connection that other fetches
 //! share.
+//!
+//! Nothing here keeps a field or a body byte: the caller owns the decoded
+//! head, and body bytes travel as chunks the codec hands out.
 
 const std = @import("std");
 const hpack = @import("collo_hpack");
@@ -15,7 +18,8 @@ pub const max_response_header_count: usize = 512;
 pub const ResponseHead = struct {
     status_code: u16,
     content_length: ?usize = null,
-    headers: []const hpack.Header,
+    /// Every field after `:status`, which RFC 9113 §8.3 puts first.
+    regular_headers: []const hpack.Header,
     end_stream: bool,
 };
 
@@ -25,14 +29,14 @@ pub const ResponseHead = struct {
 /// session-state violations.
 pub fn parseResponseHead(headers: []const hpack.Header, end_stream: bool) !ResponseHead {
     var status_code: ?u16 = null;
-    var saw_regular = false;
+    var first_regular: usize = headers.len;
     var content_length: ?usize = null;
 
-    for (headers) |header| {
+    for (headers, 0..) |header, index| {
         if (header.name.len == 0)
             return error.InvalidHttp2ResponseHeader;
         if (header.name[0] == ':') {
-            if (saw_regular)
+            if (first_regular != headers.len)
                 return error.Http2MalformedResponse;
             if (!std.mem.eql(u8, header.name, ":status"))
                 return error.Http2MalformedResponse;
@@ -42,7 +46,8 @@ pub fn parseResponseHead(headers: []const hpack.Header, end_stream: bool) !Respo
             continue;
         }
 
-        saw_regular = true;
+        if (first_regular == headers.len)
+            first_regular = index;
         try validateRegularHeader(header);
         if (std.mem.eql(u8, header.name, "content-length")) {
             const parsed = http.framing.parseContentLengthValue(header.value) catch
@@ -59,7 +64,7 @@ pub fn parseResponseHead(headers: []const hpack.Header, end_stream: bool) !Respo
     return .{
         .status_code = status_code orelse return error.Http2MalformedResponse,
         .content_length = content_length,
-        .headers = headers,
+        .regular_headers = headers[first_regular..],
         .end_stream = end_stream,
     };
 }
@@ -74,36 +79,26 @@ pub fn validateTrailers(headers: []const hpack.Header) !void {
     }
 }
 
-/// One stream's response as it arrives. Interim (1xx) heads are dropped and
-/// 101 is refused. The body may not exceed `max_body_bytes` and must be empty
-/// for 204, 304 or when the caller sets `body_forbidden`, as it does for
-/// HEAD; any other body must match its content-length.
-pub const ResponseAccumulator = struct {
-    allocator: std.mem.Allocator,
+/// One stream's response as it arrives: whether its final head came, what
+/// that head declared, and how many body bytes followed. Interim (1xx) heads
+/// are dropped and 101 is refused. The body may not exceed `max_body_bytes`
+/// and must be empty for 204, 304 or when the caller sets `body_forbidden`,
+/// as it does for HEAD; any other body must match its content-length.
+pub const ResponseState = struct {
     max_body_bytes: usize,
-    body: std.array_list.Aligned(u8, null) = .empty,
-    headers: std.array_list.Aligned(hpack.Header, null) = .empty,
     status_code: ?u16 = null,
     content_length: ?usize = null,
     complete: bool = false,
     body_forbidden: bool = false,
     received_body_bytes: usize = 0,
 
-    pub fn init(allocator: std.mem.Allocator, max_body_bytes: usize) ResponseAccumulator {
-        return .{ .allocator = allocator, .max_body_bytes = max_body_bytes };
+    pub const HeadKind = enum { interim, final };
+
+    pub fn init(max_body_bytes: usize) ResponseState {
+        return .{ .max_body_bytes = max_body_bytes };
     }
 
-    pub fn deinit(self: *ResponseAccumulator) void {
-        self.body.deinit(self.allocator);
-        for (self.headers.items) |header| {
-            self.allocator.free(header.name);
-            self.allocator.free(header.value);
-        }
-        self.headers.deinit(self.allocator);
-        self.* = undefined;
-    }
-
-    pub fn receiveHead(self: *ResponseAccumulator, head: ResponseHead) !void {
+    pub fn receiveHead(self: *ResponseState, head: ResponseHead) !HeadKind {
         if (self.status_code != null)
             return error.Http2MalformedResponse;
         if (head.status_code == 101)
@@ -111,52 +106,34 @@ pub const ResponseAccumulator = struct {
         if (isInformational(head.status_code)) {
             if (head.end_stream)
                 return error.Http2MalformedResponse;
-            return;
+            return .interim;
         }
         self.status_code = head.status_code;
         self.content_length = head.content_length;
-        for (head.headers) |header| {
-            if (header.name[0] == ':')
-                continue;
-            const name = try self.allocator.dupe(u8, header.name);
-            errdefer self.allocator.free(name);
-            const value = try self.allocator.dupe(u8, header.value);
-            errdefer self.allocator.free(value);
-            try self.headers.append(self.allocator, .{ .name = name, .value = value });
-        }
         if (head.status_code == 204 or head.status_code == 304)
             self.body_forbidden = true;
         if (head.end_stream)
             try self.finish();
+        return .final;
     }
 
-    pub fn receiveData(self: *ResponseAccumulator, bytes: []const u8, end_stream: bool) !void {
-        try self.receiveDataMode(bytes, end_stream, true);
-    }
-
-    /// Validates and counts the bytes without keeping them, for callers that
-    /// deliver the body as chunks.
-    pub fn receiveDataNoStore(self: *ResponseAccumulator, bytes: []const u8, end_stream: bool) !void {
-        try self.receiveDataMode(bytes, end_stream, false);
-    }
-
-    fn receiveDataMode(self: *ResponseAccumulator, bytes: []const u8, end_stream: bool, store_body: bool) !void {
+    /// Counts and checks body bytes; DATA before the final head fails the
+    /// stream.
+    pub fn receiveData(self: *ResponseState, byte_count: usize, end_stream: bool) !void {
         if (self.status_code == null)
             return error.Http2MalformedResponse;
         if (self.complete)
             return error.Http2MalformedResponse;
-        if (self.body_forbidden and bytes.len != 0)
+        if (self.body_forbidden and byte_count != 0)
             return error.Http2ResponseBodyForbidden;
-        if (bytes.len > self.max_body_bytes -| self.received_body_bytes)
+        if (byte_count > self.max_body_bytes -| self.received_body_bytes)
             return error.FetchResponseTooLarge;
-        if (store_body)
-            try self.body.appendSlice(self.allocator, bytes);
-        self.received_body_bytes += bytes.len;
+        self.received_body_bytes += byte_count;
         if (end_stream)
             try self.finish();
     }
 
-    pub fn finish(self: *ResponseAccumulator) !void {
+    pub fn finish(self: *ResponseState) !void {
         if (self.status_code == null)
             return error.Http2MalformedResponse;
         // A HEAD or 304 response may declare the length of a body it never
@@ -166,18 +143,6 @@ pub const ResponseAccumulator = struct {
                 return error.Http2ContentLengthMismatch;
         };
         self.complete = true;
-    }
-
-    pub fn takeBody(self: *ResponseAccumulator) ![]u8 {
-        if (!self.complete)
-            return error.Http2ResponseIncomplete;
-        return self.body.toOwnedSlice(self.allocator);
-    }
-
-    pub fn takeHeaders(self: *ResponseAccumulator) ![]hpack.Header {
-        if (!self.complete)
-            return error.Http2ResponseIncomplete;
-        return self.headers.toOwnedSlice(self.allocator);
     }
 };
 

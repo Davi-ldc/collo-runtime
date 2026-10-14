@@ -1,12 +1,12 @@
 //! The configuration `collo serve <entry>` runs when it is given an entry
 //! module instead of a configuration file: one worker named after the
 //! file's stem, with one route `/*` that matches every path, the entry's
-//! absolute path, no bindings, every global default, and outbound access to
+//! absolute path, no bindings, every built-in default, and outbound access to
 //! any public host on the default ports of HTTPS. It is the same `Config`
 //! the parser builds from the equivalent `collo.json`, so the two forms boot
 //! and serve the same way:
 //!
-//!     { "globalSettings": { "network": { "allow": ["*"] } },
+//!     { "settings": { "network": { "allow": ["*"] } },
 //!       "workers": { "<stem>": { "routes": { "/*": { "entry": "<entry>" } } } } }
 
 const std = @import("std");
@@ -27,7 +27,7 @@ const any_public_host = [_]collo_network.Pattern{.{ .host = .any, .port = 0 }};
 /// over HTTPS on its default port, with neither flag.
 pub const network: model.Network = .{ .allow = &any_public_host };
 
-/// The global settings of the synthesized configuration.
+/// The top-level settings of the synthesized configuration.
 const settings: model.Settings = .{
     .isolate_realm = model.default_settings.isolate_realm,
     .limits = model.default_settings.limits,

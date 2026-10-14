@@ -1,30 +1,32 @@
 // MessageChannel and MessagePort: the two cells, delivery, transfer, and the constructors and methods. Runs on the
 // VM thread, except visitChildren, which marking threads run concurrently.
 //
-// Each port holds its peer, its queued messages and its handlers through WriteBarrier fields owned by the port. The
-// queue and the listener list are Collo::CellEdgeList (jsc/runtime/cell_edges.h), which owns the lock and barrier
-// protocol visitChildren relies on. A started port with queued messages has one delivery microtask pending at a time,
-// and each task dispatches one message. Closing a port drops its queue, listeners and handlers; transferring one moves
-// its queue to the new port and drops the rest.
+// Each port holds its peer and its queued messages through WriteBarrier fields owned by the port, and its onmessage
+// and onmessageerror handlers as event handler records in its listener list (event.h). The queue and the listener
+// list are Collo::CellEdgeList (jsc/runtime/cell_edges.h), which owns the lock and barrier protocol visitChildren
+// relies on. A started port with queued messages has one delivery microtask pending at a time, and each task
+// dispatches one message. Closing a port drops its queue, listeners and handlers; transferring one moves its queue to
+// the new port and drops the rest.
 
 #include "host_functions/webapi/messaging/message_channel.h"
 
 #include "host_functions/support.h"
-#include "host_functions/webapi/limits.h"
 #include "host_functions/webapi/dom/dom_exception.h"
 #include "host_functions/webapi/events/event.h"
+#include "host_functions/webapi/limits.h"
 #include "host_functions/webapi/messaging/structured_clone.h"
 
 #include <JavaScriptCore/Error.h>
 #include <JavaScriptCore/IdentifierInlines.h>
 #include <JavaScriptCore/InternalFunction.h>
 #include <JavaScriptCore/IteratorOperations.h>
-#include <JavaScriptCore/MicrotaskQueueInlines.h>
-#include <JavaScriptCore/JSCInlines.h>
 #include <JavaScriptCore/JSArray.h>
+#include <JavaScriptCore/JSCInlines.h>
 #include <JavaScriptCore/JSDestructibleObject.h>
 #include <JavaScriptCore/JSFunction.h>
 #include <JavaScriptCore/MarkedVector.h>
+#include <JavaScriptCore/MicrotaskQueue.h>
+#include <JavaScriptCore/MicrotaskQueueInlines.h>
 #include <JavaScriptCore/ObjectConstructor.h>
 #include <JavaScriptCore/SlotVisitorMacros.h>
 #include <wtf/Scope.h>
@@ -85,39 +87,17 @@ namespace {
         DECLARE_INFO;
         DECLARE_VISIT_CHILDREN;
 
-        WebApiEventTargetData& eventTargetData() { return m_event_target; }
+        WebApiEventTargetHandle eventTargetHandle() { return { this, this, &m_event_target }; }
         JSColloMessagePort* peer() const { return m_peer.get(); }
         bool isTransferable() const { return !m_detached && !m_closed && m_peer.get(); }
         bool detached() const { return m_detached; }
 
-        JSValue onmessage() const { return m_on_message.get() ? m_on_message.get() : JSC::jsNull(); }
-        JSValue onmessageerror() const { return m_on_message_error.get() ? m_on_message_error.get() : JSC::jsNull(); }
-        uint64_t onmessageOrder() const { return m_on_message_order; }
-        bool hasRef() const { return m_refed; }
         bool hasPendingMessageCapacity() const
         {
             return m_detached || m_closed || m_queue.size() < WebApiMessagePortPendingMessagesMax;
         }
 
         void entangle(JSC::VM& vm, JSColloMessagePort* peer) { m_peer.set(vm, this, peer); }
-
-        void setOnMessage(JSC::VM& vm, JSValue value)
-        {
-            auto normalized = normalizeEventHandler(value);
-            if (normalized.isNull())
-                m_on_message_order = WebApiEventAttributeHandlerBeforeListeners;
-            else if (!m_on_message_order)
-                m_on_message_order = m_event_target.allocateListenerOrder();
-            m_on_message.set(vm, this, normalized);
-            // HTML: setting onmessage enables the port message queue, as if start() had been called.
-            if (!m_on_message.get().isNull())
-                start();
-        }
-
-        void setOnMessageError(JSC::VM& vm, JSValue value)
-        {
-            m_on_message_error.set(vm, this, normalizeEventHandler(value));
-        }
 
         void start()
         {
@@ -127,10 +107,6 @@ namespace {
             scheduleDeliveryIfNeeded();
         }
 
-        void ref() { m_refed = true; }
-
-        void unref() { m_refed = false; }
-
         void close()
         {
             if (m_closed)
@@ -139,9 +115,7 @@ namespace {
             m_started = false;
             m_delivery_scheduled = false;
             m_queue.clear(this);
-            clearWebApiEventTargetListeners({ this, this, &m_event_target });
-            m_on_message.clear();
-            m_on_message_error.clear();
+            clearWebApiEventTargetListeners(eventTargetHandle());
 
             if (auto* peer = m_peer.get()) {
                 if (peer->m_peer.get() == this)
@@ -214,19 +188,15 @@ namespace {
             clone->m_closed = false;
             clone->m_detached = false;
             clone->m_delivery_scheduled = false;
-            clone->m_refed = m_refed;
 
             if (peer && peer->m_peer.get() == this)
                 peer->m_peer.set(vm, peer, clone);
 
-            clearWebApiEventTargetListeners({ this, this, &m_event_target });
-            m_on_message.clear();
-            m_on_message_error.clear();
+            clearWebApiEventTargetListeners(eventTargetHandle());
             m_peer.clear();
             m_detached = true;
             m_started = false;
             m_delivery_scheduled = false;
-            m_refed = false;
             return true;
         }
 
@@ -258,14 +228,7 @@ namespace {
 
             auto message = m_queue.takeFirst(this);
             auto* event = createWebApiMessageEvent(global_object, message.data.get(), message.ports.get());
-            if (!event)
-                return {};
-
-            WebApiEventTargetHandle handle { this, this, &m_event_target };
-            handle.attribute_handler = m_on_message.get();
-            handle.attribute_event_type = "message"_s;
-            handle.attribute_order = m_on_message_order;
-            dispatchWebApiEvent(global_object, scope, handle, event);
+            dispatchWebApiEvent(global_object, scope, eventTargetHandle(), event);
             RETURN_IF_EXCEPTION(scope, {});
 
             // The next delivery is queued after the microtasks the handlers queued, so those run between two messages.
@@ -285,15 +248,6 @@ namespace {
         {
             Base::finishCreation(vm);
             ASSERT(inherits(info()));
-            m_on_message.set(vm, this, JSC::jsNull());
-            m_on_message_error.set(vm, this, JSC::jsNull());
-        }
-
-        static JSValue normalizeEventHandler(JSValue value)
-        {
-            if (value.isUndefinedOrNull() || !value.isObject())
-                return JSC::jsNull();
-            return value;
         }
 
         bool queueIsEmpty() const { return m_queue.isEmpty(); }
@@ -301,24 +255,21 @@ namespace {
         WebApiEventTargetData m_event_target;
         JSC::WriteBarrier<JSColloMessagePort> m_peer;
         Collo::CellEdgeList<QueuedPortMessage> m_queue;
-        JSC::WriteBarrier<JSC::Unknown> m_on_message;
-        JSC::WriteBarrier<JSC::Unknown> m_on_message_error;
-        uint64_t m_on_message_order { WebApiEventAttributeHandlerBeforeListeners };
         bool m_started { false };
         bool m_closed { false };
         bool m_detached { false };
         bool m_delivery_scheduled { false };
-        // hasRef() reports this flag and a transfer copies it to the clone; delivery does not depend on it.
-        bool m_refed { false };
     };
 
-    class JSColloMessageChannel final : public JSC::JSDestructibleObject {
-        using Base = JSC::JSDestructibleObject;
+    // Holds its two ports through WriteBarriers only, so the cell needs no destructor and lives in the heap's plain
+    // cell space.
+    class JSColloMessageChannel final : public JSC::JSNonFinalObject {
+        using Base = JSC::JSNonFinalObject;
 
     public:
         template <typename CellType, JSC::SubspaceAccess> static JSC::CompleteSubspace* subspaceFor(JSC::VM& vm)
         {
-            return &vm.destructibleObjectSpace();
+            return &vm.cellSpace();
         }
 
         static JSC::Structure* createStructure(JSC::VM& vm, JSC::JSGlobalObject* global_object, JSValue prototype)
@@ -335,8 +286,6 @@ namespace {
             return object;
         }
 
-        static void destroy(JSC::JSCell* cell) { static_cast<JSColloMessageChannel*>(cell)->~JSColloMessageChannel(); }
-
         DECLARE_INFO;
         DECLARE_VISIT_CHILDREN;
 
@@ -348,8 +297,6 @@ namespace {
             : Base(vm, structure)
         {
         }
-
-        ~JSColloMessageChannel() = default;
 
         void finishCreation(JSC::VM& vm, JSC::Structure* port_structure)
         {
@@ -378,8 +325,6 @@ namespace {
         ASSERT_GC_OBJECT_INHERITS(this_object, info());
         Base::visitChildren(this_object, visitor);
         visitor.append(this_object->m_peer);
-        appendWebApiUnknown(visitor, this_object->m_on_message);
-        appendWebApiUnknown(visitor, this_object->m_on_message_error);
         this_object->m_queue.visit(this_object, visitor);
         this_object->m_event_target.visit(this_object, visitor);
     }
@@ -528,7 +473,7 @@ namespace {
         auto scope = DECLARE_THROW_SCOPE(vm);
         auto* port = requireMessagePort(global_object, scope, call_frame->thisValue(), "onmessage"_s);
         RETURN_IF_EXCEPTION(scope, {});
-        return JSValue::encode(port->onmessage());
+        return JSValue::encode(webApiEventHandler(port->eventTargetHandle(), "message"_s));
     }
 
     JSC_DEFINE_HOST_FUNCTION(messagePortSetOnMessage, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
@@ -537,7 +482,14 @@ namespace {
         auto scope = DECLARE_THROW_SCOPE(vm);
         auto* port = requireMessagePort(global_object, scope, call_frame->thisValue(), "onmessage"_s);
         RETURN_IF_EXCEPTION(scope, {});
-        port->setOnMessage(vm, call_frame->argument(0));
+        auto stored = setWebApiEventHandler(
+            global_object, scope, port->eventTargetHandle(), "message"_s, call_frame->argument(0));
+        RETURN_IF_EXCEPTION(scope, {});
+        if (!stored)
+            return {};
+        // HTML: setting onmessage enables the port message queue, as if start() had been called.
+        if (!stored.isNull())
+            port->start();
         return JSValue::encode(JSC::jsUndefined());
     }
 
@@ -548,7 +500,7 @@ namespace {
         auto scope = DECLARE_THROW_SCOPE(vm);
         auto* port = requireMessagePort(global_object, scope, call_frame->thisValue(), "onmessageerror"_s);
         RETURN_IF_EXCEPTION(scope, {});
-        return JSValue::encode(port->onmessageerror());
+        return JSValue::encode(webApiEventHandler(port->eventTargetHandle(), "messageerror"_s));
     }
 
     JSC_DEFINE_HOST_FUNCTION(
@@ -558,7 +510,11 @@ namespace {
         auto scope = DECLARE_THROW_SCOPE(vm);
         auto* port = requireMessagePort(global_object, scope, call_frame->thisValue(), "onmessageerror"_s);
         RETURN_IF_EXCEPTION(scope, {});
-        port->setOnMessageError(vm, call_frame->argument(0));
+        auto stored = setWebApiEventHandler(
+            global_object, scope, port->eventTargetHandle(), "messageerror"_s, call_frame->argument(0));
+        RETURN_IF_EXCEPTION(scope, {});
+        if (!stored)
+            return {};
         return JSValue::encode(JSC::jsUndefined());
     }
 
@@ -631,57 +587,15 @@ namespace {
         return JSValue::encode(JSC::jsUndefined());
     }
 
-    JSC_DEFINE_HOST_FUNCTION(messagePortRef, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
-    {
-        auto& vm = global_object->vm();
-        auto scope = DECLARE_THROW_SCOPE(vm);
-        auto* port = requireMessagePort(global_object, scope, call_frame->thisValue(), "ref"_s);
-        RETURN_IF_EXCEPTION(scope, {});
-        port->ref();
-        return JSValue::encode(JSC::jsUndefined());
-    }
-
-    JSC_DEFINE_HOST_FUNCTION(messagePortUnref, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
-    {
-        auto& vm = global_object->vm();
-        auto scope = DECLARE_THROW_SCOPE(vm);
-        auto* port = requireMessagePort(global_object, scope, call_frame->thisValue(), "unref"_s);
-        RETURN_IF_EXCEPTION(scope, {});
-        port->unref();
-        return JSValue::encode(JSC::jsUndefined());
-    }
-
-    JSC_DEFINE_HOST_FUNCTION(messagePortHasRef, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
-    {
-        auto& vm = global_object->vm();
-        auto scope = DECLARE_THROW_SCOPE(vm);
-        auto* port = requireMessagePort(global_object, scope, call_frame->thisValue(), "hasRef"_s);
-        RETURN_IF_EXCEPTION(scope, {});
-        return JSValue::encode(JSC::jsBoolean(port->hasRef()));
-    }
-
 } // namespace
 
 bool webApiMessagePortTargetHandle(JSC::JSValue value, WebApiEventTargetHandle& handle)
 {
     if (auto* port = dynamicDowncast<JSColloMessagePort>(value)) {
-        handle.object = port;
-        handle.listener_owner = port;
-        handle.data = &port->eventTargetData();
-        handle.attribute_handler = port->onmessage();
-        handle.attribute_event_type = "message"_s;
-        handle.attribute_order = port->onmessageOrder();
+        handle = port->eventTargetHandle();
         return true;
     }
     return false;
-}
-
-void webApiMessagePortDidAddListener(WebApiEventTargetHandle target, const WTF::String& type)
-{
-    if (type != "message"_s)
-        return;
-    if (auto* port = dynamicDowncast<JSColloMessagePort>(target.object))
-        port->start();
 }
 
 bool webApiMessagePortIsValue(JSC::JSValue value) { return dynamicDowncast<JSColloMessagePort>(value); }
@@ -764,8 +678,7 @@ JSC::JSObject* webApiCreateMessagePortTransferClone(
                 global_object, DOMExceptionCode::DataCloneError, "MessagePort could not be transferred"_s));
         return nullptr;
     }
-    auto* structure
-        = uncheckedDowncast<Collo::GlobalObject>(global_object)->webApiCache().message_port_structure.get();
+    auto* structure = uncheckedDowncast<Collo::GlobalObject>(global_object)->webApiCache().message_port_structure.get();
     RELEASE_ASSERT(structure);
     return JSColloMessagePort::create(global_object->vm(), structure);
 }
@@ -858,9 +771,6 @@ void installWebApiMessageChannel(Collo::GlobalObject* global_object, JSC::VM& vm
         global_object, port_prototype, vm, "postMessage"_s, 1, messagePortPostMessage, enumerableFunction);
     putWebApiFunction(global_object, port_prototype, vm, "start"_s, 0, messagePortStart, enumerableFunction);
     putWebApiFunction(global_object, port_prototype, vm, "close"_s, 0, messagePortClose, enumerableFunction);
-    putWebApiFunction(global_object, port_prototype, vm, "ref"_s, 0, messagePortRef, enumerableFunction);
-    putWebApiFunction(global_object, port_prototype, vm, "unref"_s, 0, messagePortUnref, enumerableFunction);
-    putWebApiFunction(global_object, port_prototype, vm, "hasRef"_s, 0, messagePortHasRef, enumerableFunction);
     port_prototype->putDirect(vm, vm.propertyNames->toStringTagSymbol, JSC::jsString(vm, WTF::String("MessagePort"_s)),
         JSC::PropertyAttribute::ReadOnly | JSC::PropertyAttribute::DontEnum);
 
@@ -874,10 +784,11 @@ void installWebApiMessageChannel(Collo::GlobalObject* global_object, JSC::VM& vm
     cache.message_port_prototype.set(vm, port_prototype);
     cache.message_port_structure.set(vm, port_structure);
 
+    // Web IDL defines interface objects as non-enumerable properties of the global object.
     global_object->putDirect(vm, JSC::Identifier::fromString(vm, "MessageChannel"_s), channel_constructor,
-        static_cast<unsigned>(JSC::PropertyAttribute::None));
+        static_cast<unsigned>(JSC::PropertyAttribute::DontEnum));
     global_object->putDirect(vm, JSC::Identifier::fromString(vm, "MessagePort"_s), port_constructor,
-        static_cast<unsigned>(JSC::PropertyAttribute::None));
+        static_cast<unsigned>(JSC::PropertyAttribute::DontEnum));
     RELEASE_ASSERT(global_object->getDirect(vm, JSC::Identifier::fromString(vm, "MessageChannel"_s)));
     RELEASE_ASSERT(global_object->getDirect(vm, JSC::Identifier::fromString(vm, "MessagePort"_s)));
 }

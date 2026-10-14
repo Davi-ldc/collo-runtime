@@ -1,15 +1,17 @@
 //! A worker's control socket, read on the ingress lane thread that is the
 //! worker's reader (`server/supervisor/pool.zig`). A worker sends two kinds
-//! of packet on it: ingress descriptors, and once at most the notice that it
-//! asks to be retired (`ipc.worker_retiring`). The drain decodes each
-//! descriptor packet with the reader's account of the worker's ring
-//! (`Registration.ring_payloads`), so a ring payload decodes from the end of
-//! the last one even while earlier ones wait for another lane, and hands the
-//! descriptors to `h2_worker_ipc.zig`, which queues those of this lane's
-//! requests and forwards the rest. The loop's drains receive a packet only
-//! while the worker's forwarding window has room for its descriptors
-//! (`h2_worker_ipc.windowHasRoom`); a full window stops them until the
-//! release that makes room wakes the lane.
+//! of packet on it: ingress descriptors, a request's `request_done` among
+//! them, and once at most the notice that it asks to be retired
+//! (`ipc.worker_retiring`). The drain decodes each descriptor packet with
+//! the reader's account of the worker's ring (`Registration.ring_payloads`),
+//! so a ring payload decodes from the end of the last one even while earlier
+//! ones wait for another lane, and hands the descriptors to
+//! `h2_worker_ipc.zig`, which applies those of this lane's requests in the
+//! order the worker sent them and forwards the rest. The loop's drains
+//! receive a packet only while the worker's forwarding window has room for
+//! its descriptors (`h2_worker_ipc.windowHasRoom`); a full window stops them
+//! until the release that makes room wakes the lane
+//! (`resumeWindowBlockedReaders`).
 //!
 //! A retiring notice takes the worker out of service with no death: the
 //! pool stops handing its slots out, the requests it holds finish on it, and
@@ -29,6 +31,8 @@ const completions = @import("../completions.zig");
 const fault = @import("../fault.zig");
 const admission = @import("admission.zig");
 const h2_worker_ipc = @import("h2_worker_ipc.zig");
+const worker_fault = @import("worker_fault.zig");
+const worker_registration = @import("worker_registration.zig");
 
 const LaneFault = fault.LaneFault;
 const WorkerOutcome = fault.WorkerOutcome;
@@ -43,8 +47,9 @@ pub const control_packets_per_drain_max: usize = 64;
 /// drains stop there and let the loop write the bytes first, or wait for
 /// the window. A drain that must take the worker's output now, the last read
 /// of a dead worker or the grace backstop, reads on: the connection's
-/// pending-response bound still caps what it buffers, and a descriptor that
-/// finds the window full drops (`h2_worker_ipc.zig`).
+/// pending-response bound still caps what it buffers, a response descriptor
+/// that finds the window full drops, and a `request_done`, which takes no
+/// unit of the window, still goes on (`h2_worker_ipc.zig`).
 pub const Pace = enum {
     yield_to_backlog,
     read_through,
@@ -53,7 +58,38 @@ pub const Pace = enum {
 pub fn Methods(comptime Self: type) type {
     return struct {
         const Admission = admission.Methods(Self);
+        const WorkerFault = worker_fault.Methods(Self);
         const WorkerIpc = h2_worker_ipc.Methods(Self);
+        const WorkerRegistration = worker_registration.Methods(Self);
+
+        /// The reader's read of the worker of registration
+        /// `registration_index` when its control socket's poll fires: a
+        /// bounded drain that yields to the connections it gave bytes to,
+        /// then the worker's polls armed again, or the death path on a
+        /// fault.
+        pub fn readWorkerControl(self: *Self, registration_index: u32) LaneFault!void {
+            switch (try drainWorkerControl(self, registration_index, .yield_to_backlog)) {
+                .ok, .would_block => try WorkerRegistration.armWorkerPolls(self, registration_index),
+                .fault => |reason| try WorkerFault.faultWorker(self, registration_index, reason),
+            }
+        }
+
+        /// Handles this lane's `window_reopened` wake: every registration
+        /// whose worker's forwarding window was full and has room again
+        /// reads the worker's control socket as its poll would. One whose
+        /// window is still full stays blocked, with its mark as the window's
+        /// waiter set again (`h2_worker_ipc.windowHasRoom`).
+        pub fn resumeWindowBlockedReaders(self: *Self) LaneFault!void {
+            for (self.registrations.touched(), 0..) |*registration, index| {
+                if (!registration.inUse() or !registration.reading() or !registration.window_blocked)
+                    continue;
+                const worker = registration.worker orelse return error.InvalidWorkerRegistration;
+                if (!h2_worker_ipc.windowHasRoom(worker, self.lane.lane_id))
+                    continue;
+                registration.window_blocked = false;
+                try readWorkerControl(self, @intCast(index));
+            }
+        }
 
         /// Reads the control socket of the worker that the registration at
         /// `registration_index` reads, until the socket is empty, a bounded
@@ -162,7 +198,7 @@ pub fn Methods(comptime Self: type) type {
             registration: *completions.Registration,
             reason: ipc.WorkerRetiringReason,
         ) LaneFault!void {
-            const worker = registration.worker orelse return error.InvalidCompletionRegistration;
+            const worker = registration.worker orelse return error.InvalidWorkerRegistration;
             const definition = worker.definition_index;
             self.lane.counters.retirement_notices += 1;
             std.log.info("worker asks to be retired worker_id={d} reason={s}", .{ worker.id, @tagName(reason) });
@@ -193,7 +229,7 @@ pub fn Methods(comptime Self: type) type {
         fn windowAllowsPacket(self: *Self, registration: *completions.Registration) LaneFault!bool {
             if (registration.window_blocked)
                 return false;
-            const worker = registration.worker orelse return error.InvalidCompletionRegistration;
+            const worker = registration.worker orelse return error.InvalidWorkerRegistration;
             if (h2_worker_ipc.windowHasRoom(worker, self.lane.lane_id))
                 return true;
             registration.window_blocked = true;
@@ -206,9 +242,9 @@ pub fn Methods(comptime Self: type) type {
         /// only its polls call the drain.
         fn readerRegistration(self: *Self, registration_index: u32) LaneFault!*completions.Registration {
             const registration = self.registrations.get(registration_index) orelse
-                return error.InvalidCompletionRegistration;
+                return error.InvalidWorkerRegistration;
             if (!registration.reading() or registration.control_fd < 0)
-                return error.InvalidCompletionRegistration;
+                return error.InvalidWorkerRegistration;
             return registration;
         }
     };

@@ -1,10 +1,10 @@
 //! A route's bindings section (`common/ipc/route_bindings.zig`): the name
 //! grammar, the encoder's checks on its input, the round trip, and the
 //! decode that re-checks every rule on bytes the encoder would refuse. The
-//! route table that carries one section per route is covered by
-//! `route_table.zig`, the worker building `env` from a section by
-//! `worker/tests/runtime/env.zig`, and WorkerInit delivering it by
-//! local-e2e.
+//! routes section of a definition artifact, which carries one bindings
+//! section per route, is covered by `route_table.zig`, the worker building
+//! `env` from a section by `worker/tests/runtime/env.zig`, and WorkerInit
+//! delivering it by local-e2e.
 
 const std = @import("std");
 const ipc = @import("collo_ipc");
@@ -12,8 +12,8 @@ const ipc = @import("collo_ipc");
 const route_bindings = ipc.route_bindings;
 const Entry = route_bindings.Entry;
 
-/// `entries` encoded as the route table builder writes a route's section;
-/// the caller frees the result.
+/// `entries` encoded as `route_table.write` writes a route's section; the
+/// caller frees the result.
 fn encodeSection(entries: []const Entry) ![]u8 {
     const bytes = try std.testing.allocator.alloc(u8, try route_bindings.encodedLen(entries));
     route_bindings.encode(bytes, entries);

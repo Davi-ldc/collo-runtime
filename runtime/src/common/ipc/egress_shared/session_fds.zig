@@ -3,10 +3,9 @@
 //! wake set for its life (`WakeSet`): the two eventfds that wake the sides and
 //! the read ends of the two liveness pipes. Each of its sessions, the one its
 //! launch attaches and each one a later gateway gives it, is new region
-//! memfds on that wake set (`createSessionForWorker`), because the worker's
-//! io_uring registers the completion eventfd and the liveness pipe it watches
-//! once, at boot, and can register no other file afterwards
-//! (`common/io/restricted_uring.zig`).
+//! memfds on that wake set (`createSessionForWorker`). The worker's loop
+//! watches the completion eventfd and liveness pipe of whatever session it
+//! holds at each wait (`worker/scheduler/poll_backend.zig`).
 //!
 //! Every memfd is sized and sealed against growing and shrinking, a meta also
 //! gets its magic, version, role and capacity, and each memfd gets a read-only

@@ -1,6 +1,7 @@
-//! The host's reads of three sections a worker writes on its page: the
-//! lifecycle header with its owner section, the live slots and the usage
-//! record ring. Every host reader of those sections goes through this file.
+//! The copies the host takes of two sections a worker writes on its page:
+//! the lifecycle header with its owner section, and the live slots. The host
+//! takes them through its `HostReaderView` (`mapping.zig`), which gives it no
+//! other way to those sections.
 //!
 //! The worker can rewrite any byte of its page at any moment, so two loads
 //! of one field can disagree, and a check made on the first says nothing
@@ -9,30 +10,24 @@
 //! validates that copy and uses only the copy. A tag stays the raw integer
 //! the page holds: it is compared with the value it should have, or
 //! converted with `std.enums.fromInt`, which yields null for a value its
-//! enum does not name, and never with `@enumFromInt`. A cursor the host owns
-//! lives in the host's memory: the host stores it to the page for the
-//! worker's room check and never loads it back. The completion and console
-//! rings keep the same rule inside their drains (`completion_ring.zig`,
-//! `console_ring.zig`), and the boot stamps and the benchmark record are
+//! enum does not name, and never with `@enumFromInt`. The console ring keeps
+//! the same rule inside its drain (`console_ring.zig`), with the host's
+//! cursor in host memory, and the boot stamps and the benchmark record are
 //! diagnostics loaded once each (`boot_stamps.zig`).
 //!
 //! A copy that passes its checks is still the worker's claim. A live slot
-//! that matches an identity names a request the host sent to that worker,
-//! and the CPU it reports reaches only that worker's records; the same holds
-//! for the owner section's deadline and CPU. A `RecordCursor` has one user
-//! at a time; the server's drains hold the worker record's `metrics_mutex`
-//! (`server/supervisor/worker_table.zig`).
+//! that matches the identity of a request the host sent to that worker
+//! reports CPU that reaches only that worker's records; the same holds for
+//! the owner section's deadline and CPU.
 
 const std = @import("std");
 
 const Header = @import("lifecycle.zig").Header;
 const State = @import("lifecycle.zig").State;
 const TerminationReason = @import("lifecycle.zig").TerminationReason;
-const LifecycleIdentity = @import("live_slots.zig").LifecycleIdentity;
+const LIVE_SLOT_COUNT = @import("live_slots.zig").LIVE_SLOT_COUNT;
 const LiveRequestSlot = @import("live_slots.zig").LiveRequestSlot;
-const LiveSlotState = @import("live_slots.zig").LiveSlotState;
-const CompletedRecord = @import("usage_records.zig").CompletedRecord;
-const RECORD_RING_COUNT = @import("usage_records.zig").RECORD_RING_COUNT;
+const Page = @import("mapping.zig").Page;
 
 /// The lifecycle header's two tags and its startup-end flag, each loaded
 /// once and kept raw.
@@ -116,163 +111,44 @@ pub const RunningOwnerSnapshot = struct {
     }
 };
 
-/// One live slot with each field loaded once. `state` stays the raw value
-/// the page holds, so a value outside `LiveSlotState` reads as inactive.
+/// One live slot with each field loaded once.
 pub const LiveSlotSnapshot = struct {
-    state: u32,
-    generation: u64,
     request_id: u64,
     request_generation: u64,
-    worker_id: u64,
-    worker_generation: u64,
-    request_slot: u32,
-    request_lane_id: u16,
     cpu_ns: u64,
 
-    /// Loads `state` first, with acquire ordering, then every other field
-    /// once. The worker stores `state` last when it claims a slot
-    /// (`WorkState.allocateLiveSlot` in `metrics.zig`), so an active copy
-    /// holds that claim's fields or later ones; `matches` checks the copy's
-    /// identity either way.
-    pub fn load(slot: *const LiveRequestSlot) LiveSlotSnapshot {
-        const state = @atomicLoad(u32, &slot.state, .acquire);
+    /// Loads the live slot at `index`, the pool slot the host dispatched a
+    /// request on, so below `LIVE_SLOT_COUNT`: the request's identity first,
+    /// then its CPU, each once with acquire ordering. The worker's begin
+    /// stores them in the reverse order with release ordering
+    /// (`WorkerWriterView.beginLiveSlot`). The copy is exact for the request
+    /// that holds the pool slot while the host reads: a copy with that
+    /// request's identity holds its CPU or a later store of it, never an
+    /// earlier request's. That rests on the caller, which reads a request's
+    /// slot before it gives the pool slot back, so no later begin runs
+    /// during the read (`server/supervisor/worker_table.zig:Record.usageFloor`);
+    /// a load racing a begin could pair the older identity with the newer
+    /// request's CPU.
+    pub fn at(page: *const Page, index: usize) LiveSlotSnapshot {
+        std.debug.assert(index < LIVE_SLOT_COUNT);
+        const slot: *const LiveRequestSlot = &page.live_slots[index];
+        const request_id = @atomicLoad(u64, &slot.request_id, .acquire);
+        const request_generation = @atomicLoad(u64, &slot.request_generation, .acquire);
         return .{
-            .state = state,
-            .generation = @atomicLoad(u64, &slot.generation, .monotonic),
-            .request_id = @atomicLoad(u64, &slot.request_id, .monotonic),
-            .request_generation = @atomicLoad(u64, &slot.request_generation, .monotonic),
-            .worker_id = @atomicLoad(u64, &slot.worker_id, .monotonic),
-            .worker_generation = @atomicLoad(u64, &slot.worker_generation, .monotonic),
-            .request_slot = @atomicLoad(u32, &slot.request_slot, .monotonic),
-            .request_lane_id = @atomicLoad(u16, &slot.request_lane_id, .monotonic),
-            .cpu_ns = @atomicLoad(u64, &slot.cpu_ns, .monotonic),
+            .request_id = request_id,
+            .request_generation = request_generation,
+            .cpu_ns = @atomicLoad(u64, &slot.cpu_ns, .acquire),
         };
     }
 
-    pub fn isActive(self: *const LiveSlotSnapshot) bool {
-        return self.state == @intFromEnum(LiveSlotState.active);
-    }
-
-    /// Whether the copy is an active slot that holds the request `identity`
-    /// names, every identity field compared.
-    pub fn matches(self: *const LiveSlotSnapshot, identity: LifecycleIdentity) bool {
-        if (!self.isActive())
+    /// Whether the copy holds the request the host knows by `request_id` and
+    /// `request_generation`; a slot that an earlier or a later request of the
+    /// same pool slot holds does not match, nor does one no request ever
+    /// held, since the host's request ids are never 0.
+    pub fn matches(self: *const LiveSlotSnapshot, request_id: u64, request_generation: u64) bool {
+        std.debug.assert(request_id != 0);
+        if (self.request_id != request_id)
             return false;
-        if (self.request_id != identity.external_request_id)
-            return false;
-        if (self.request_lane_id != identity.request_lane_id)
-            return false;
-        if (self.request_slot != identity.request_slot)
-            return false;
-        if (self.request_generation != identity.request_generation)
-            return false;
-        if (self.worker_id != identity.worker_id)
-            return false;
-        return self.worker_generation == identity.worker_generation;
-    }
-
-    /// The copy of the first slot in `slots` that matches `identity`, or
-    /// null when none does. Each slot is loaded once, and the copy returned
-    /// is the one the match ran on.
-    pub fn find(slots: []const LiveRequestSlot, identity: LifecycleIdentity) ?LiveSlotSnapshot {
-        for (slots) |*slot| {
-            const snapshot = load(slot);
-            if (snapshot.matches(identity))
-                return snapshot;
-        }
-        return null;
+        return self.request_generation == request_generation;
     }
 };
-
-/// The host's cursor of the usage record ring. The worker moves the page's
-/// `records_head` past each record it appends; the host's tail lives here,
-/// moves only in `advance`, and reaches the page's `records_tail` as a store
-/// the host never loads back, so a worker that rewrites `records_tail` only
-/// misleads its own room check.
-pub const RecordCursor = struct {
-    /// The ring position of the next record the host takes.
-    tail: u64 = 0,
-
-    /// What one peek saw: the records between the host's tail and the
-    /// worker's head as the peek loaded it.
-    pub const Peeked = struct {
-        tail: u64,
-        /// At most `RECORD_RING_COUNT`.
-        count: u64,
-
-        /// Copies the records of this peek from `skip` records past its tail
-        /// into `out`, each field loaded once, and returns how many it
-        /// copied: as many as fit, none when `skip` reaches `count`. `records`
-        /// is the page's ring.
-        pub fn copy(self: Peeked, records: []const CompletedRecord, skip: u64, out: []CompletedRecord) usize {
-            std.debug.assert(records.len == RECORD_RING_COUNT);
-            std.debug.assert(self.count <= RECORD_RING_COUNT);
-            if (skip >= self.count)
-                return 0;
-            const available: usize = @intCast(self.count - skip);
-            const copied = @min(out.len, available);
-            var position = self.tail +% skip;
-            for (out[0..copied]) |*record| {
-                const index: usize = @intCast(position % RECORD_RING_COUNT);
-                record.* = loadCompletedRecord(&records[index]);
-                position +%= 1;
-            }
-            return copied;
-        }
-    };
-
-    /// Loads the worker's `records_head` once. Null when the head stands
-    /// behind the host's tail or more than `RECORD_RING_COUNT` records past
-    /// it: no append puts it there, so the worker broke the ring's protocol.
-    pub fn peek(self: *const RecordCursor, header: *const Header) ?Peeked {
-        const head = @atomicLoad(u64, &header.records_head, .acquire);
-        const count = head -% self.tail;
-        if (count > RECORD_RING_COUNT)
-            return null;
-        return .{ .tail = self.tail, .count = count };
-    }
-
-    /// Consumes the first `count` records of `peeked`, which must be this
-    /// cursor's latest peek: moves the tail past them and stores it to the
-    /// page's `records_tail`, where the worker's room check reads it. The new
-    /// tail comes from `peeked` alone, so a head the worker moves after the
-    /// peek changes nothing here, and the next peek finds the contradiction.
-    pub fn advance(self: *RecordCursor, header: *Header, peeked: Peeked, count: u64) void {
-        std.debug.assert(peeked.tail == self.tail);
-        std.debug.assert(count <= peeked.count);
-        if (count == 0)
-            return;
-        self.tail = peeked.tail +% count;
-        @atomicStore(u64, &header.records_tail, self.tail, .release);
-    }
-
-    /// Peeks, copies up to `out.len` records and consumes them. Returns how
-    /// many it took, or null for a corrupt ring (`peek`), which it leaves
-    /// untouched.
-    pub fn drain(self: *RecordCursor, header: *Header, records: []const CompletedRecord, out: []CompletedRecord) ?usize {
-        const peeked = self.peek(header) orelse return null;
-        const copied = peeked.copy(records, 0, out);
-        self.advance(header, peeked, copied);
-        return copied;
-    }
-};
-
-fn loadCompletedRecord(src: *const CompletedRecord) CompletedRecord {
-    return .{
-        .request_id = @atomicLoad(u64, &src.request_id, .monotonic),
-        .request_generation = @atomicLoad(u64, &src.request_generation, .monotonic),
-        .exec_ns = @atomicLoad(u64, &src.exec_ns, .monotonic),
-        .waiting_ns = @atomicLoad(u64, &src.waiting_ns, .monotonic),
-        .io_ns = @atomicLoad(u64, &src.io_ns, .monotonic),
-        .cpu_ns = @atomicLoad(u64, &src.cpu_ns, .monotonic),
-        .client_served_bytes = @atomicLoad(u64, &src.client_served_bytes, .monotonic),
-        .fetch_sent_bytes = @atomicLoad(u64, &src.fetch_sent_bytes, .monotonic),
-        .fetch_received_bytes = @atomicLoad(u64, &src.fetch_received_bytes, .monotonic),
-        .fetch_wire_bytes = @atomicLoad(u64, &src.fetch_wire_bytes, .monotonic),
-        .request_slot = @atomicLoad(u32, &src.request_slot, .monotonic),
-        .request_lane_id = @atomicLoad(u16, &src.request_lane_id, .monotonic),
-        ._reserved1 = @atomicLoad(u16, &src._reserved1, .monotonic),
-        .status = @atomicLoad(u32, &src.status, .monotonic),
-        ._reserved2 = @atomicLoad(u32, &src._reserved2, .monotonic),
-    };
-}

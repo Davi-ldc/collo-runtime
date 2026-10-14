@@ -117,8 +117,8 @@ bench("global-event-target.dispatch-handler-listener", iterations => {
     checksum += event.type.length;
   }
   try {
-    globalThis.onerror = event => {
-      checksum += event.error === "bench" ? 1 : 0;
+    globalThis.onerror = (message, filename, lineno, colno, error) => {
+      checksum += error === "bench" ? 1 : 0;
     };
     addEventListener("error", listener);
     for (let i = 0; i < iterations; i++)

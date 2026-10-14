@@ -1,9 +1,10 @@
 //! Support for tests that drive a real zygote (`zygote_support`): where test
-//! workers' cgroup leaves go, a worker launched through the host path to
-//! ready, zygote spawns with test options, the zygote's trace pipe read back
-//! as lines, and the host's end of the fs fault channel. The
-//! zygote-integration and local-e2e lanes, the forked web API suites and the
-//! zygote's sandbox tests use it, on the test's own thread.
+//! workers' cgroup leaves go, the blocking fork driver and init-outcome wait
+//! a host that owns its thread uses, a worker launched through the host path
+//! to ready, a child forked into a leaf with no WorkerInit, zygote spawns
+//! with and without the boot trace, and that trace read back as lines. The
+//! zygote-integration and local-e2e lanes, the forked web API suites and
+//! the zygote's unit suites use it, on the test's own thread.
 //!
 //! Every zygote starts from the installed `collo` binary at
 //! `collo_process_options.collo_executable_path`, a plain path, so a run step
@@ -14,7 +15,6 @@
 
 const std = @import("std");
 const process_options = @import("collo_process_options");
-const fd_mod = @import("collo_os").fd;
 const process = @import("collo_os").process;
 const worker = @import("collo_worker");
 
@@ -23,6 +23,7 @@ pub const zygote = @import("collo_zygote");
 pub const host = @import("collo_host");
 
 const ipc = zygote.ipc;
+const host_client = zygote.host_client;
 
 comptime {
     _ = worker;
@@ -54,6 +55,58 @@ pub fn cgroupRoot(allocator: std.mem.Allocator) !host.WorkerCgroupRoot {
     return host.WorkerCgroupRoot.init(allocator, cgroupPlacement());
 }
 
+/// Forks the child of `fork_job_id` into the leaf `leaf_fd` and waits for
+/// the reply: `sendForkRequest`, a wait of at most `fork_reply_timeout_ms`,
+/// then `receiveForkReply` (`zygote/host_client.zig`). A zygote that misses
+/// the reply is killed and the call fails with `ZygoteDied`. The leaf stays
+/// the caller's. Blocks, so only a host that owns its thread calls it.
+pub fn requestFork(
+    spawned: *host_client.SpawnedZygote,
+    fork_job_id: u64,
+    leaf_fd: std.posix.fd_t,
+) host_client.ForkError!host_client.ForkedWorker {
+    try host_client.sendForkRequest(spawned, fork_job_id, leaf_fd);
+    const control_fd = spawned.control_fd orelse return error.ZygoteProtocol;
+    var pollfds = [_]std.posix.pollfd{.{
+        .fd = control_fd,
+        .events = std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR,
+        .revents = 0,
+    }};
+    const ready = std.posix.poll(&pollfds, host_client.fork_reply_timeout_ms) catch |err|
+        return host_client.zygoteFailure(spawned, err);
+    if (ready == 0) {
+        host_client.killUnresponsiveZygote(spawned, fork_job_id);
+        return error.ZygoteDied;
+    }
+    // HUP and ERR fall through, so the receive reports the exact error.
+    return host_client.receiveForkReply(spawned, fork_job_id);
+}
+
+/// Waits up to `timeout_ms` for a child's answer to WorkerInit on `fd`, or
+/// its exit on `pidfd`. An exit with no answer queued fails with
+/// `error.WorkerInitFailed` and a silent child with `error.WorkerInitTimeout`.
+pub fn receiveWorkerInitOutcomeBeforeTimeout(
+    fd: std.posix.fd_t,
+    pidfd: std.posix.fd_t,
+    timeout_ms: i32,
+) !ipc.InitOutcome {
+    const ready_events = std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR;
+    var pollfds = [2]std.posix.pollfd{
+        .{ .fd = fd, .events = ready_events, .revents = 0 },
+        .{ .fd = pidfd, .events = ready_events, .revents = 0 },
+    };
+    if (try std.posix.poll(&pollfds, timeout_ms) == 0)
+        return error.WorkerInitTimeout;
+    // A queued answer wins over the exit that follows it.
+    if ((pollfds[0].revents & std.posix.POLL.IN) != 0)
+        return host_client.receiveWorkerInitOutcome(fd);
+    if ((pollfds[1].revents & ready_events) != 0)
+        return error.WorkerInitFailed;
+    if ((pollfds[0].revents & (std.posix.POLL.HUP | std.posix.POLL.ERR)) != 0)
+        return host_client.receiveWorkerInitOutcome(fd);
+    return error.WorkerInitTimeout;
+}
+
 /// A worker launched through the whole host path: its own cgroup leaf,
 /// forked into it, handed its WorkerInit, ready. `deinit` tears the worker
 /// down, which removes its leaf, before the root that holds the leaf.
@@ -64,16 +117,11 @@ pub const LaunchedWorker = struct {
     /// on; empty when the caller chose the worker's egress (`none`,
     /// `detached` or `attached`) and keeps any wake set it needs.
     wake_set: ipc.egress_shared.WakeSet,
-    /// The mount point of a worker launched without one, held until
-    /// `deinit`, which removes it after stopping the worker; null when the
-    /// caller brought its own, as a test of workers sharing one does.
-    tmp_mount_point: ?host.TmpMountPoint,
     handle: host.WorkerHandle,
     handle_alive: bool = true,
 
     /// Tears the worker down ahead of `deinit`, for tests that observe the
-    /// teardown (leaf removed, mount point left empty) while the root still
-    /// exists.
+    /// teardown, such as the leaf's removal, while the root still exists.
     pub fn stopWorker(self: *LaunchedWorker) void {
         if (!self.handle_alive)
             return;
@@ -83,36 +131,34 @@ pub const LaunchedWorker = struct {
 
     pub fn deinit(self: *LaunchedWorker) void {
         self.stopWorker();
-        if (self.tmp_mount_point) |*tmp_mount_point|
-            tmp_mount_point.deinit();
         self.wake_set.deinit();
         self.root.deinit(self.allocator);
         self.* = undefined;
     }
 };
 
-/// `host.LaunchOptions` with `egress` and `tmp_mount_point_fd` optional. A
-/// null `egress` launches the worker detached on a wake set the launched
-/// worker keeps (`LaunchedWorker.wake_set`), so a test that makes no fetch
-/// states nothing about egress; a null `tmp_mount_point_fd` gives the worker
-/// a mount point of its own (`LaunchedWorker.tmp_mount_point`), as a host
-/// with one worker has. Every other field is the host's, default included,
+/// `host.LaunchOptions` with `egress` optional and without
+/// `memory_limit_bytes`, which `launchWorker` takes on its own. A null
+/// `egress` launches the worker detached on a wake set the launched worker
+/// keeps (`LaunchedWorker.wake_set`), so a test that makes no fetch states
+/// nothing about egress. Every other field is the host's, default included,
 /// since the type is built from the host's.
 pub const LaunchOptions = blk: {
     const info = @typeInfo(host.LaunchOptions).@"struct";
-    var fields = info.fields[0..info.fields.len].*;
-    for (&fields) |*field| {
+    var fields: [info.fields.len - 1]std.builtin.Type.StructField = undefined;
+    var count: usize = 0;
+    for (info.fields) |host_field| {
+        if (std.mem.eql(u8, host_field.name, "memory_limit_bytes"))
+            continue;
+        var field = host_field;
         if (std.mem.eql(u8, field.name, "egress")) {
             const no_egress: ?host.launch.LaunchEgress = null;
             field.type = ?host.launch.LaunchEgress;
             field.default_value_ptr = &no_egress;
             field.alignment = @alignOf(?host.launch.LaunchEgress);
-        } else if (std.mem.eql(u8, field.name, "tmp_mount_point_fd")) {
-            const no_mount_point: ?std.posix.fd_t = null;
-            field.type = ?std.posix.fd_t;
-            field.default_value_ptr = &no_mount_point;
-            field.alignment = @alignOf(?std.posix.fd_t);
         }
+        fields[count] = field;
+        count += 1;
     }
     break :blk @Type(.{ .@"struct" = .{
         .layout = .auto,
@@ -122,19 +168,19 @@ pub const LaunchOptions = blk: {
     } });
 };
 
-/// The host's options for `options`, with `egress` as the launch's egress
-/// and `tmp_mount_point_fd` as its mount point.
+/// The host's options for `options`, with `memory_limit_bytes` and `egress`
+/// as the launch's.
 fn hostLaunchOptions(
     options: LaunchOptions,
+    memory_limit_bytes: u64,
     egress: host.launch.LaunchEgress,
-    tmp_mount_point_fd: std.posix.fd_t,
 ) host.LaunchOptions {
     var launch_options: host.LaunchOptions = undefined;
     inline for (@typeInfo(host.LaunchOptions).@"struct".fields) |field| {
-        if (comptime std.mem.eql(u8, field.name, "egress")) {
+        if (comptime std.mem.eql(u8, field.name, "memory_limit_bytes")) {
+            launch_options.memory_limit_bytes = memory_limit_bytes;
+        } else if (comptime std.mem.eql(u8, field.name, "egress")) {
             launch_options.egress = egress;
-        } else if (comptime std.mem.eql(u8, field.name, "tmp_mount_point_fd")) {
-            launch_options.tmp_mount_point_fd = tmp_mount_point_fd;
         } else {
             @field(launch_options, field.name) = @field(options, field.name);
         }
@@ -142,35 +188,15 @@ fn hostLaunchOptions(
     return launch_options;
 }
 
-/// Fails unless the directory `dir_fd` names holds no entry, as a host's
-/// mount point does whatever its workers mounted over it in their own mount
-/// namespaces.
-pub fn expectDirEmpty(dir_fd: std.posix.fd_t) !void {
-    const reopened = try std.posix.openat(dir_fd, ".", .{
-        .ACCMODE = .RDONLY,
-        .DIRECTORY = true,
-        .CLOEXEC = true,
-    }, 0);
-    var dir: std.fs.Dir = .{ .fd = reopened };
-    defer dir.close();
-    var entries = dir.iterate();
-    if (try entries.next()) |entry| {
-        std.debug.print("expected an empty directory, found {s}\n", .{entry.name});
-        return error.DirectoryNotEmpty;
-    }
-}
-
 /// Creates the leaf `worker-<fork_job_id>` with `memory_limit_bytes`, forks
 /// into it and runs the launch to ready; the caller owns the result. When
 /// `options` brings no egress, the worker boots detached on a wake set the
-/// result owns, and when it brings no mount point, the worker mounts its
-/// tmpfs over one the result owns. On any failure the forked child is
-/// terminated and every resource released;
-/// `error.WorkerCgroupDelegationUnavailable` means this environment cannot
-/// place workers at all.
+/// result owns. On any failure the forked child is killed, its leaf removed
+/// and every resource released; `error.WorkerCgroupDelegationUnavailable`
+/// means this environment cannot place workers at all.
 pub fn launchWorker(
     allocator: std.mem.Allocator,
-    spawned: *zygote.host_client.SpawnedZygote,
+    spawned: *host_client.SpawnedZygote,
     memory_limit_bytes: u64,
     fork_job_id: u64,
     options: LaunchOptions,
@@ -184,64 +210,106 @@ pub fn launchWorker(
         wake_set = try ipc.egress_shared.WakeSet.create();
         break :blk .{ .detached = &wake_set };
     };
-    var tmp_mount_point: ?host.TmpMountPoint = null;
-    errdefer if (tmp_mount_point) |*owned| owned.deinit();
-    if (options.tmp_mount_point_fd == null) {
-        var claimed: host.TmpMountPoint = undefined;
-        try claimed.init(host.tmp_mount.default_parent_dir);
-        tmp_mount_point = claimed;
-    }
-    const tmp_mount_point_fd = options.tmp_mount_point_fd orelse tmp_mount_point.?.fd();
-    const launch_options = hostLaunchOptions(options, egress, tmp_mount_point_fd);
+    const launch_options = hostLaunchOptions(options, memory_limit_bytes, egress);
 
-    const prepared_fd = try root.createWorkerDir(fork_job_id, .{
-        .memory_limit_bytes = memory_limit_bytes,
-    });
-    var prepared_fd_owned = true;
-    errdefer if (prepared_fd_owned) {
-        std.posix.close(prepared_fd);
-        root.removeWorkerDir(fork_job_id);
+    const leaf_fd = try root.createWorkerDir(fork_job_id, .{ .memory_limit_bytes = memory_limit_bytes });
+    // The machine owns the leaf's descriptor from here, and a launch that
+    // fails hands the leaf back for removal.
+    var machine = host.launch.Machine.init(root.leaf(fork_job_id), leaf_fd, spawned.trace_write_fd);
+    var forked = requestFork(spawned, fork_job_id, leaf_fd) catch |err| {
+        var abandoned = machine.abandon();
+        abandoned.reap();
+        return err;
     };
-
-    var forked = try zygote.host_client.requestForkWithJobId(spawned, fork_job_id, prepared_fd);
-    forked.fork_job_id = fork_job_id;
-    forked.cgroup_dir_fd = prepared_fd;
-    prepared_fd_owned = false;
-    errdefer host.terminateForkedWorkerBestEffort(&forked);
-
-    const handle = try host.runToReady(allocator, spawned, &forked, memory_limit_bytes, launch_options);
-    // The launch took every fd `forked` held, the cgroup leaf's included, so
-    // only the struct is left to release.
-    forked.deinit();
+    // The launch takes every descriptor `forked` holds, whatever its outcome.
+    defer forked.deinit();
+    const handle = try host.runToReady(&machine, &forked, &launch_options);
     return .{
         .allocator = allocator,
         .root = root,
         .wake_set = wake_set,
-        .tmp_mount_point = tmp_mount_point,
         .handle = handle,
     };
 }
 
-pub fn spawnZygote() !zygote.host_client.SpawnedZygote {
-    return spawnZygoteWithOptions(.{});
+/// A child forked into a leaf of its own that gets no WorkerInit from this
+/// module, for tests that hand-build one or send none. `deinit` kills the
+/// child if it still runs, waits for its exit, then removes the leaf and
+/// the root.
+pub const BareChild = struct {
+    allocator: std.mem.Allocator,
+    root: host.WorkerCgroupRoot,
+    forked: host_client.ForkedWorker,
+    /// The leaf's directory, which a hand-built WorkerInit carries; the
+    /// child already left it behind.
+    leaf_fd: std.posix.fd_t,
+
+    pub fn initFd(self: *const BareChild) std.posix.fd_t {
+        return self.forked.worker_init_fd.?;
+    }
+
+    pub fn pidfd(self: *const BareChild) std.posix.fd_t {
+        return self.forked.pidfd.?;
+    }
+
+    pub fn deinit(self: *BareChild) void {
+        const child_pidfd = self.pidfd();
+        process.pidFdSendSignal(child_pidfd, std.posix.SIG.KILL) catch |err| switch (err) {
+            error.ProcessNotFound => {},
+            else => std.log.warn("failed to kill a bare test child: {s}", .{@errorName(err)}),
+        };
+        _ = process.waitForPidFdExit(child_pidfd, 1_000) catch false;
+        const fork_job_id = self.forked.fork_job_id;
+        self.forked.deinit();
+        std.posix.close(self.leaf_fd);
+        // The leaf refuses its removal while the child is a member.
+        self.root.leaf(fork_job_id).remove();
+        self.root.deinit(self.allocator);
+        self.* = undefined;
+    }
+};
+
+/// Creates the leaf `worker-<fork_job_id>` with `memory_limit_bytes` and
+/// forks a child into it; the caller owns the result.
+/// `error.WorkerCgroupDelegationUnavailable` means this environment cannot
+/// place workers at all.
+pub fn forkBareChild(
+    allocator: std.mem.Allocator,
+    spawned: *host_client.SpawnedZygote,
+    memory_limit_bytes: u64,
+    fork_job_id: u64,
+) !BareChild {
+    var root = try cgroupRoot(allocator);
+    errdefer root.deinit(allocator);
+    const leaf_fd = try root.createWorkerDir(fork_job_id, .{ .memory_limit_bytes = memory_limit_bytes });
+    errdefer {
+        std.posix.close(leaf_fd);
+        root.leaf(fork_job_id).remove();
+    }
+    const forked = try requestFork(spawned, fork_job_id, leaf_fd);
+    return .{
+        .allocator = allocator,
+        .root = root,
+        .forked = forked,
+        .leaf_fd = leaf_fd,
+    };
 }
 
-pub fn spawnZygoteWithExitProbe(exit_probe_path: []const u8) !zygote.host_client.SpawnedZygote {
-    return spawnZygoteWithOptions(.{ .postfork_exit_probe_path = exit_probe_path });
+/// Spawns a zygote that writes the boot trace, as every test reads it.
+pub fn spawnZygote() !host_client.SpawnedZygote {
+    return host_client.spawnZygote(.{
+        .executable_path = process_options.collo_executable_path,
+        .trace = true,
+    });
 }
 
-/// Spawns a zygote that runs the warmup corpus at boot, as the server's
-/// always does (`server/boot/root.zig`); the other spawns here leave it off.
-/// A corpus exception fails the zygote's boot, and with it every worker
-/// launch on the node.
-pub fn spawnZygoteWithWarmupCorpus() !zygote.host_client.SpawnedZygote {
-    return spawnZygoteWithOptions(.{ .warmup_corpus = true });
-}
-
-fn spawnZygoteWithOptions(options: zygote.state.ZygoteOptions) !zygote.host_client.SpawnedZygote {
-    var resolved_options = options;
-    resolved_options.executable_path = process_options.collo_executable_path;
-    return zygote.host_client.spawnZygote(resolved_options);
+/// Spawns a zygote with no trace pipe, as `collo serve` does unless an
+/// operator asks for the trace.
+pub fn spawnZygoteWithoutTrace() !host_client.SpawnedZygote {
+    return host_client.spawnZygote(.{
+        .executable_path = process_options.collo_executable_path,
+        .trace = false,
+    });
 }
 
 /// Trace lines read back from a zygote's trace pipe, in the order they were
@@ -311,10 +379,11 @@ pub fn waitForPidFdExit(pidfd: std.posix.fd_t) !void {
 }
 
 /// Reads every line written so far to the trace pipe of `spawned`, which the
-/// zygote, its workers and the host's launch all write to; the caller owns
-/// the log. The read never blocks, so a test drains only after the events it
-/// checks. A zygote without a trace pipe yields an empty log.
-pub fn drainTrace(spawned: *const zygote.host_client.SpawnedZygote, allocator: std.mem.Allocator) !TraceLog {
+/// zygote, each worker child's boot and the host's launch write to; the
+/// caller owns the log. The read never blocks, so a test drains only after
+/// the events it checks. A zygote spawned without a trace yields an empty
+/// log.
+pub fn drainTrace(spawned: *const host_client.SpawnedZygote, allocator: std.mem.Allocator) !TraceLog {
     const trace_fd = spawned.trace_read_fd orelse return .{
         .allocator = allocator,
         .messages = try allocator.alloc([]u8, 0),
@@ -362,87 +431,12 @@ pub fn expectTraceBefore(trace: TraceLog, first: []const u8, second: []const u8)
     try std.testing.expect(first_index < second_index);
 }
 
-// ---------------------------------------------------------------------------
-// The host's end of `WorkerHandle.fs_fault_fd`, the wire `ipc.fs_fault`
-// defines. The worker speaks first with an FsFaultRequest; these helpers
-// receive it and answer with an FsFaultResponse, which on `.ok` carries one
-// sealed memfd of the file's bytes over SCM_RIGHTS. In these tests the
-// harness is the host; in the server, `server/ingress/runner/fs_fault_control.zig`
-// meets the worker on the same wire.
-
-/// Polls `fs_fault_fd` for up to `timeout_ms` and decodes one FsFaultRequest,
-/// which the caller owns and frees with `deinit`. Fails with
-/// `error.MissingFsFaultRequest` when none arrives in time and with
-/// `error.UnexpectedFsFaultRequestFds` when descriptors ride along.
-pub fn readFsFaultRequest(
-    allocator: std.mem.Allocator,
-    fs_fault_fd: std.posix.fd_t,
-    timeout_ms: i32,
-) !ipc.FsFaultRequest {
-    var pollfds = [1]std.posix.pollfd{.{
-        .fd = fs_fault_fd,
-        .events = std.posix.POLL.IN,
-        .revents = 0,
-    }};
-    const ready = try std.posix.poll(&pollfds, timeout_ms);
-    if (ready == 0 or (pollfds[0].revents & std.posix.POLL.IN) == 0)
-        return error.MissingFsFaultRequest;
-    var scratch: [ipc.max_message_bytes]u8 = undefined;
-    // `decodeRequest` copies the bytes it keeps, so the packet is freed here.
-    var packet = try ipc.recvPacketWithFdsScratch(allocator, fs_fault_fd, &scratch);
-    defer packet.deinit();
-    if (packet.fd_count != 0)
-        return error.UnexpectedFsFaultRequestFds;
-    return try ipc.fs_fault.decodeRequest(allocator, packet.bytes);
-}
-
-/// Fails with `error.UnexpectedFsFaultRequest` when a request becomes
-/// readable on `fs_fault_fd` within `timeout_ms`. Tests use it to show the
-/// worker answered a read without asking the host.
-pub fn expectNoFsFaultRequest(fs_fault_fd: std.posix.fd_t, timeout_ms: i32) !void {
-    var pollfds = [1]std.posix.pollfd{.{
-        .fd = fs_fault_fd,
-        .events = std.posix.POLL.IN,
-        .revents = 0,
-    }};
-    const ready = try std.posix.poll(&pollfds, timeout_ms);
-    if (ready != 0 and (pollfds[0].revents & std.posix.POLL.IN) != 0)
-        return error.UnexpectedFsFaultRequest;
-}
-
-/// Answers fault `fault_id` with `.ok` and a sealed memfd holding `bytes`,
-/// the one descriptor an `.ok` response carries; the memfd is closed here
-/// once sent.
-pub fn respondFsFaultOk(fs_fault_fd: std.posix.fd_t, fault_id: u64, bytes: []const u8) !void {
-    const memfd = try createSealedFsFaultMemfd(bytes);
-    defer std.posix.close(memfd);
-    try ipc.sendFsFaultResponse(
-        fs_fault_fd,
-        .{ .fault_id = fault_id, .status = .ok },
-        fd_mod.FdRef.fromRaw(memfd),
-    );
-}
-
-/// Answers fault `fault_id` with `status`, which must not be `.ok`; such a
-/// response carries no descriptor.
-pub fn respondFsFaultStatus(
-    fs_fault_fd: std.posix.fd_t,
-    fault_id: u64,
-    status: ipc.FsFaultResponseStatus,
-) !void {
-    try ipc.sendFsFaultResponse(fs_fault_fd, .{ .fault_id = fault_id, .status = status }, null);
-}
-
-fn createSealedFsFaultMemfd(bytes: []const u8) !std.posix.fd_t {
-    const fd = try std.posix.memfd_create(
-        "collo-test-fs-fault-bytes",
-        std.os.linux.MFD.CLOEXEC | std.os.linux.MFD.ALLOW_SEALING,
-    );
-    errdefer std.posix.close(fd);
-    try fd_mod.writeAllRaw(fd, bytes);
-    try std.posix.lseek_SET(fd, 0);
-    try fd_mod.addSeals(fd, fd_mod.memfd_readonly_seals);
-    return fd;
+/// The unsigned number the leaf's file `file_name` holds, such as
+/// `memory.current`, read without a path.
+pub fn readLeafUnsigned(leaf: host.WorkerLeaf, file_name: []const u8) !u64 {
+    var buffer: [64]u8 = undefined;
+    const contents = try leaf.readFile(file_name, &buffer);
+    return std.fmt.parseUnsigned(u64, std.mem.trim(u8, contents, &std.ascii.whitespace), 10);
 }
 
 pub fn readFileAlloc(path: []const u8, allocator: std.mem.Allocator) ![]u8 {
@@ -451,25 +445,10 @@ pub fn readFileAlloc(path: []const u8, allocator: std.mem.Allocator) ![]u8 {
     return file.readToEndAlloc(allocator, 4096);
 }
 
-pub fn readUnsignedFile(path: []const u8) !u64 {
-    var file = try std.fs.openFileAbsolute(path, .{});
-    defer file.close();
-
-    var buffer: [64]u8 = undefined;
-    const len = try file.readAll(&buffer);
-    const trimmed = std.mem.trim(u8, buffer[0..len], &std.ascii.whitespace);
-    return std.fmt.parseUnsigned(u64, trimmed, 10);
-}
-
 pub fn makeTempPath(allocator: std.mem.Allocator, prefix: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "/tmp/{s}-{d}-{d}", .{
         prefix,
         std.c.getpid(),
         try process.monotonicNowNs(),
     });
-}
-
-pub fn cleanupTmpRoot(path: []const u8) void {
-    std.fs.deleteTreeAbsolute(path) catch |err|
-        std.log.warn("failed to remove zygote test tmp root {s}: {s}", .{ path, @errorName(err) });
 }

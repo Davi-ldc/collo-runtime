@@ -6,17 +6,12 @@
 test("Performance globals and descriptors", () => {
   assert.equal(typeof performance, "object");
   assert.equal(typeof Performance, "function");
-  assert.equal(typeof PerformanceTiming, "function");
   assert(performance instanceof Performance);
-  assert(performance instanceof EventTarget);
   assert.equal(Object.prototype.toString.call(performance), "[object Performance]");
 
   assert.equal(Performance.length, 0);
-  assert.equal(PerformanceTiming.length, 0);
   assert.throws(() => Performance(), TypeError);
   assert.throws(() => new Performance(), TypeError);
-  assert.throws(() => PerformanceTiming(), TypeError);
-  assert.throws(() => new PerformanceTiming(), TypeError);
 
   const performanceDescriptor = Object.getOwnPropertyDescriptor(globalThis, "performance");
   assert.equal(performanceDescriptor.enumerable, false);
@@ -29,7 +24,7 @@ test("Performance globals and descriptors", () => {
   assert.equal(constructorDescriptor.writable, true);
 
   const proto = Performance.prototype;
-  assert.equal(Object.getPrototypeOf(proto), EventTarget.prototype);
+  assert.equal(Object.getPrototypeOf(proto), Object.prototype);
   assert.equal(proto.constructor, Performance);
   assert.equal(proto[Symbol.toStringTag], "Performance");
 
@@ -43,19 +38,12 @@ test("Performance globals and descriptors", () => {
   assert.equal(originDescriptor.set, undefined);
   assert.equal(originDescriptor.enumerable, true);
 
-  const timingDescriptor = Object.getOwnPropertyDescriptor(proto, "timing");
-  assert.equal(typeof timingDescriptor.get, "function");
-  assert.equal(timingDescriptor.set, undefined);
-  assert.equal(timingDescriptor.enumerable, true);
-
   const jsonDescriptor = Object.getOwnPropertyDescriptor(proto, "toJSON");
   assert.equal(typeof jsonDescriptor.value, "function");
   assert.equal(jsonDescriptor.value.length, 0);
   assert.equal(jsonDescriptor.enumerable, true);
 
   for (const [key, length] of [
-    ["clearResourceTimings", 0],
-    ["setResourceTimingBufferSize", 1],
     ["mark", 1],
     ["measure", 1],
     ["getEntries", 0],
@@ -63,66 +51,43 @@ test("Performance globals and descriptors", () => {
     ["getEntriesByType", 1],
     ["clearMarks", 0],
     ["clearMeasures", 0],
-    ["markResourceTiming", 7],
   ]) {
     const descriptor = Object.getOwnPropertyDescriptor(proto, key);
     assert.equal(typeof descriptor.value, "function", `${key} is a function`);
     assert.equal(descriptor.value.length, length, `${key}.length`);
     assert.equal(descriptor.enumerable, true, `${key} enumerable`);
   }
-
-  const resourceHandlerDescriptor = Object.getOwnPropertyDescriptor(proto, "onresourcetimingbufferfull");
-  assert.equal(typeof resourceHandlerDescriptor.get, "function");
-  assert.equal(typeof resourceHandlerDescriptor.set, "function");
-  assert.equal(resourceHandlerDescriptor.enumerable, true);
 });
 
-test("performance.timing exposes Bun-compatible zeroed legacy timing object", () => {
-  const timing = performance.timing;
-  assert(timing instanceof PerformanceTiming);
-  assert.equal(timing, performance.timing);
-  assert.equal(Object.prototype.toString.call(timing), "[object PerformanceTiming]");
-  assert.equal(PerformanceTiming.prototype[Symbol.toStringTag], "PerformanceTiming");
-
-  const keys = [
-    "navigationStart",
-    "unloadEventStart",
-    "unloadEventEnd",
-    "redirectStart",
-    "redirectEnd",
-    "fetchStart",
-    "domainLookupStart",
-    "domainLookupEnd",
-    "connectStart",
-    "connectEnd",
-    "secureConnectionStart",
-    "requestStart",
-    "responseStart",
-    "responseEnd",
-    "domLoading",
-    "domInteractive",
-    "domContentLoadedEventStart",
-    "domContentLoadedEventEnd",
-    "domComplete",
-    "loadEventStart",
-    "loadEventEnd",
-  ];
-
-  for (const key of keys) {
-    const descriptor = Object.getOwnPropertyDescriptor(PerformanceTiming.prototype, key);
-    assert.equal(typeof descriptor.get, "function", `${key} getter`);
-    assert.equal(descriptor.set, undefined, `${key} setter`);
-    assert.equal(descriptor.enumerable, true, `${key} enumerable`);
-    assert.equal(timing[key], 0, `${key} value`);
-  }
-
-  const json = timing.toJSON();
-  assert.deepEqual(Object.keys(json), keys);
-  for (const key of keys)
-    assert.equal(json[key], 0, `${key} json value`);
-  assert.throws(() => Object.getOwnPropertyDescriptor(Performance.prototype, "timing").get.call({}), TypeError);
-  assert.throws(() => timing.toJSON.call({}), TypeError);
-  assert.throws(() => Object.getOwnPropertyDescriptor(PerformanceTiming.prototype, "responseEnd").get.call({}), TypeError);
+// The timeline records User Timing only: no resource timing, no legacy performance.timing, and `performance` is not
+// an EventTarget, since nothing ever fires an event at it.
+test("Performance has neither resource timing, nor performance.timing, nor EventTarget members", () => {
+  assert.deepEqual(Object.getOwnPropertyNames(Performance.prototype).sort(), [
+    "clearMarks",
+    "clearMeasures",
+    "constructor",
+    "getEntries",
+    "getEntriesByName",
+    "getEntriesByType",
+    "mark",
+    "measure",
+    "now",
+    "timeOrigin",
+    "toJSON",
+  ]);
+  assert.equal("PerformanceTiming" in globalThis, false);
+  assert.equal(performance.timing, undefined);
+  assert.equal(performance instanceof EventTarget, false);
+  for (const key of [
+    "onresourcetimingbufferfull",
+    "clearResourceTimings",
+    "setResourceTimingBufferSize",
+    "markResourceTiming",
+    "addEventListener",
+    "removeEventListener",
+    "dispatchEvent",
+  ])
+    assert.equal(performance[key], undefined, `${key} is not a Performance member`);
 });
 
 test("performance.now is monotonic and close to wall clock through timeOrigin", () => {
@@ -156,24 +121,6 @@ test("Performance methods enforce native receiver brand", () => {
   assert.throws(() => Performance.prototype.mark.call({}, "x"), TypeError);
   assert.throws(() => PerformanceEntry.prototype.toJSON.call({}), TypeError);
   assert.throws(() => Object.getOwnPropertyDescriptor(PerformanceEntry.prototype, "name").get.call({}), TypeError);
-});
-
-test("performance is an EventTarget", () => {
-  let called = 0;
-  function listener(event) {
-    called++;
-    assert.equal(event.type, "collo-performance");
-    assert.equal(event.target, performance);
-    assert.equal(event.currentTarget, performance);
-  }
-
-  performance.addEventListener("collo-performance", listener);
-  assert.equal(performance.dispatchEvent(new Event("collo-performance")), true);
-  assert.equal(called, 1);
-
-  performance.removeEventListener("collo-performance", listener);
-  assert.equal(performance.dispatchEvent(new Event("collo-performance")), true);
-  assert.equal(called, 1);
 });
 
 test("PerformanceEntry, PerformanceMark, and PerformanceMeasure descriptors", () => {
@@ -221,19 +168,20 @@ test("PerformanceEntry, PerformanceMark, and PerformanceMeasure descriptors", ()
 });
 
 test("PerformanceObserver descriptors and validation match server runtime baseline", () => {
+  // Web IDL interface objects are non-enumerable properties of the global object.
   const observerDescriptor = Object.getOwnPropertyDescriptor(globalThis, "PerformanceObserver");
-  assert.equal(observerDescriptor.enumerable, true);
+  assert.equal(observerDescriptor.enumerable, false);
   assert.equal(observerDescriptor.configurable, true);
   assert.equal(observerDescriptor.writable, true);
 
   const listDescriptor = Object.getOwnPropertyDescriptor(globalThis, "PerformanceObserverEntryList");
-  assert.equal(listDescriptor.enumerable, true);
+  assert.equal(listDescriptor.enumerable, false);
   assert.equal(listDescriptor.configurable, true);
   assert.equal(listDescriptor.writable, true);
 
   const supportedA = PerformanceObserver.supportedEntryTypes;
   const supportedB = PerformanceObserver.supportedEntryTypes;
-  assert.deepEqual(supportedA, ["mark", "measure", "resource"]);
+  assert.deepEqual(supportedA, ["mark", "measure"]);
   assert.equal(Object.isFrozen(supportedA), true);
   assert.equal(supportedA === supportedB, false);
 
@@ -271,6 +219,9 @@ test("PerformanceObserver descriptors and validation match server runtime baseli
   assert.throws(() => observer.observe({ entryTypes: ["mark"], type: "mark" }), TypeError);
   assert.equal(observer.observe({ entryTypes: ["not-real"] }), undefined);
   assert.equal(observer.observe({ type: "not-real" }), undefined);
+  // A type the timeline never records is ignored, as observe() ignores any unsupported type.
+  assert.equal(observer.observe({ type: "resource" }), undefined);
+  assert.deepEqual(observer.takeRecords(), []);
 
   const byEntryTypes = new PerformanceObserver(() => {});
   byEntryTypes.observe({ entryTypes: ["mark"] });
@@ -281,21 +232,6 @@ test("PerformanceObserver descriptors and validation match server runtime baseli
   byType.observe({ type: "mark" });
   const switchToEntryTypes = assert.throws(() => byType.observe({ entryTypes: ["mark"] }), DOMException);
   assert.equal(switchToEntryTypes.name, "InvalidModificationError");
-});
-
-test("performance resource timing compatibility methods are callable", () => {
-  assert.equal(performance.clearResourceTimings(), undefined);
-  assert.equal(performance.setResourceTimingBufferSize(10), undefined);
-  assert.equal(performance.markResourceTiming({}, "https://example.test", "fetch", globalThis, "", {}, 200), undefined);
-
-  assert.equal(performance.onresourcetimingbufferfull, null);
-  performance.onresourcetimingbufferfull = 1;
-  assert.equal(performance.onresourcetimingbufferfull, null);
-  const handler = { handleEvent() {} };
-  performance.onresourcetimingbufferfull = handler;
-  assert.equal(performance.onresourcetimingbufferfull, handler);
-  performance.onresourcetimingbufferfull = null;
-  assert.equal(performance.onresourcetimingbufferfull, null);
 });
 
 test("performance marks create entries and are queryable by name and type", () => {
@@ -336,18 +272,20 @@ test("performance marks create entries and are queryable by name and type", () =
   assert.equal(end.name, "collo-end");
 });
 
-test("performance entries are capped", () => {
+// The timeline outlives every request on its realm, so it keeps at most WebApiPerformanceEntriesMax entries and drops
+// the oldest beyond it.
+test("performance entries are capped at 1000", () => {
   performance.clearMarks();
   performance.clearMeasures();
-  for (let i = 0; i < 10050; i++)
+  for (let i = 0; i < 1050; i++)
     performance.mark(`cap-${i}`, { startTime: i });
 
   const entries = performance.getEntriesByType("mark");
-  assert.equal(entries.length, 10000);
+  assert.equal(entries.length, 1000);
   assert.equal(entries[0].name, "cap-50");
-  assert.equal(entries[entries.length - 1].name, "cap-10049");
-  assert.equal(performance.getEntriesByName("cap-0").length, 0);
-  assert.equal(performance.getEntriesByName("cap-10049").length, 1);
+  assert.equal(entries[entries.length - 1].name, "cap-1049");
+  assert.equal(performance.getEntriesByName("cap-49").length, 0);
+  assert.equal(performance.getEntriesByName("cap-1049").length, 1);
   performance.clearMarks();
 });
 

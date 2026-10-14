@@ -39,9 +39,19 @@ pub fn makeExecCtx(request_id: u64) bindings.ExecCtx {
 }
 
 /// Builds a pack holding one module and registers it on `vm`. Registration
-/// copies the pack, so nothing stays borrowed after the call.
+/// copies the pack, so nothing stays borrowed after the call. A VM holds one
+/// pack, so a test that needs several modules registers them together with
+/// `registerModules`.
 pub fn registerModule(vm: *bindings.Vm, specifier: []const u8, source: []const u8) !void {
     const pack = try ipc.module_pack.buildSingleAlloc(std.testing.allocator, specifier, source);
+    defer std.testing.allocator.free(pack);
+    try vm.registerModulePack(pack);
+}
+
+/// Builds one pack holding `modules`, with no route, and registers it on
+/// `vm`, as `registerModule` does for one module.
+pub fn registerModules(vm: *bindings.Vm, modules: []const ipc.module_pack.Module) !void {
+    const pack = try ipc.module_pack.buildAlloc(std.testing.allocator, modules, &.{});
     defer std.testing.allocator.free(pack);
     try vm.registerModulePack(pack);
 }

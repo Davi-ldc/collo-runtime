@@ -6,23 +6,26 @@
 //! JavaScript and moves a request's timeline. A request that already spent
 //! its CPU budget or passed its deadline is answered instead of running the
 //! item's JavaScript, and one a window took past its budget is answered
-//! after the item (`serve/termination.zig`). An fs fault item has no single
-//! owner; its settle opens a window per waiter (`fs/fault_completion.zig`).
-//! The deferred-work pump always runs under the worker owner.
+//! after the item (`serve/termination.zig`). The deferred-work pump always
+//! runs under the worker owner. The loop waits in `ppoll`
+//! (`poll_backend.zig`).
 //!
 //! Each tick starts with the retirement check (`runtime/retirement.zig`): a
-//! sentinel fire or a worker none of whose routes can serve sends the
-//! server one `worker_retiring` notice, and the loop goes on serving until
-//! the server closes the control channel. The loop returns when the control
-//! channel hangs up or `core.running` turns false, which only a failure the
-//! server's synthesis covers sets. An egress gateway that closes only
-//! detaches the worker (`egress/gateway_runtime.zig`), and an
-//! `egress_attach` packet on the control channel attaches it again. The
-//! worker's end of the control channel does not block
-//! (`zygote/child_boot.zig`): a response or a notice that finds it full
-//! waits. When the socket turns writable or the payload ring gets room, the
-//! loop queues the advance of each response that waited for it
-//! (`serve/response.zig:notifyTransport`) and sends the notice.
+//! sentinel fire, a worker none of whose routes can serve, or one that
+//! detached from its egress session on its own sends the server one
+//! `worker_retiring` notice, and the loop goes on serving until the server
+//! closes the control channel. The loop returns when the control channel
+//! hangs up or `core.running` turns false, which only a failure that leaves
+//! the server to end the worker's requests itself sets. An egress gateway
+//! that closes only detaches the worker (`egress/gateway_runtime.zig`), and an
+//! `egress_attach` packet on the control channel attaches it again. The worker's end of the control
+//! channel does not block (`zygote/child_boot.zig`): a response, a finished
+//! request's `request_done` or a notice that finds it full waits. When the
+//! socket turns writable the loop sends the `request_done` packets that
+//! waited alone (`serve/response_finish.zig:flushPendingRequestDones`),
+//! queues the advance of each response that waited for room in it or in the
+//! payload ring, a finished request's last packet among them
+//! (`serve/response.zig:notifyTransport`), and sends the notice.
 
 const std = @import("std");
 const bindings = @import("collo_bindings");
@@ -30,29 +33,29 @@ const ipc = @import("collo_ipc");
 const worker_limits = @import("collo_limits").worker;
 const state = @import("../runtime/root.zig");
 const runtime_owner = @import("../runtime/owner.zig");
-const uring_backend = @import("uring_backend.zig");
+const poll_backend = @import("poll_backend.zig");
 const ready_queue = @import("queue.zig");
 const immediates = @import("immediates.zig");
 const timers = @import("timers.zig");
 const request_dispatch = @import("../serve/dispatch.zig");
 const termination = @import("../serve/termination.zig");
 const response_flow = @import("../serve/response.zig");
+const response_finish = @import("../serve/response_finish.zig");
 const request_ingress = @import("collo_worker_request").ingress.runtime;
 const egress_completion = @import("../egress/completion_runtime.zig");
 const egress_gateway = @import("../egress/gateway_runtime.zig");
 const exception_log = @import("collo_worker_js").exception_log;
 
 /// Runs the loop until the control channel hangs up or `core.running` turns
-/// false. Fails when the ring, a collector or the control channel fails.
+/// false. Fails when the wait, a collector or the control channel fails.
 pub fn run(runtime: *state.Runtime) !void {
-    var backend = try uring_backend.UringBackend.init(runtime);
-    defer backend.deinit();
+    var backend: poll_backend.PollBackend = .{};
 
     // JSC queues async wasm settlement (WebAssembly.instantiate and compile)
     // on its DeferredWorkTimer, which schedules through a RunLoop this worker
     // never runs. The wakeup eventfd replaces the RunLoop's wake: when the
     // wasm worklist thread schedules a settle task, it sets the gate's
-    // pending flag and writes the eventfd, which a blocked ring wait sees as
+    // pending flag and writes the eventfd, which a blocked wait sees as
     // `wakeup_ready`. The fd and the VM both exist here, so a failure is a
     // bug and fails the loop. `Runtime.deinit` unregisters the fd before the
     // scheduler closes it.
@@ -60,9 +63,7 @@ pub fn run(runtime: *state.Runtime) !void {
         try runtime.core.vm.setDeferredWorkWakeupFd(wakeup_fd);
     var deferred_pending_imminent = false;
 
-    var egress_completion_debt = false;
     while (runtime.core.running) {
-        runtime.scheduler.metrics.worker_loop_ticks += 1;
         // Two loads in the common case. A fire in the last tick's work item
         // answers the requests it stopped and sends the notice here, before
         // this tick reads any begin.
@@ -74,10 +75,6 @@ pub fn run(runtime: *state.Runtime) !void {
         // the worker here, where none runs. The wait below checks again
         // first, so a failure in this tick never waits for the next wake.
         runtime.detachEgressAfterFailedRelease();
-        // A death record reads the live slot, so each tick publishes the CPU
-        // used so far; a worker killed mid-request still accounts for the
-        // windows it already ran.
-        runtime.flushLiveRequestCpuBestEffort();
         try collectFast(runtime);
         if (!runtime.core.running)
             break;
@@ -90,22 +87,24 @@ pub fn run(runtime: *state.Runtime) !void {
         deferred_pending_imminent = pumpDeferredWork(runtime, deferred_pending_imminent);
         runtime.endSpentBudgets();
         backend.deferred_backstop_deadline_ns = if (deferred_pending_imminent)
-            runtime.nowMonoNs() + uring_backend.deferred_work_backstop_ns
+            runtime.nowMonoNs() + poll_backend.deferred_work_backstop_ns
         else
             0;
         if (!runtime.core.running)
             break;
 
-        if (egress_completion_debt and runtime.egress.state.shared != null) {
-            egress_completion_debt = try runtime.collectEgressGatewayPacketsBounded(gatewayIpcDrainBatch(runtime));
+        // Packets a drain left past its batch bound have no eventfd count of
+        // their own, so the wait does not block while they may remain
+        // (`PollBackend.egress_completion_debt`).
+        if (backend.egress_completion_debt and runtime.egress.state.shared != null) {
+            backend.egress_completion_debt = try runtime.collectEgressGatewayPacketsBounded(gatewayIpcDrainBatch(runtime));
         } else {
-            egress_completion_debt = false;
+            backend.egress_completion_debt = false;
         }
         if (!runtime.core.running)
             break;
 
-        try backend.arm(runtime);
-        var drained_events: [8]uring_backend.Event = undefined;
+        var drained_events: [poll_backend.events_max]poll_backend.Event = undefined;
         const drained = backend.drain(runtime, &drained_events) catch |err| switch (err) {
             error.ControlPeerClosed => return,
             else => return err,
@@ -114,7 +113,7 @@ pub fn run(runtime: *state.Runtime) !void {
         for (drained_events[0..drained]) |event| {
             if (std.meta.activeTag(event) == .wakeup_ready)
                 drained_wakeup = true;
-            handleEvent(runtime, event, &egress_completion_debt) catch |err| switch (err) {
+            handleEvent(runtime, event, &backend.egress_completion_debt) catch |err| switch (err) {
                 error.ControlPeerClosed => return,
                 else => return err,
             };
@@ -145,13 +144,9 @@ pub fn run(runtime: *state.Runtime) !void {
             error.ControlPeerClosed => return,
             else => return err,
         };
-        // Published again before blocking, so the CPU of this tick's windows
-        // is not lost if the worker is killed during the wait.
-        runtime.flushLiveRequestCpuBestEffort();
         runtime.detachEgressAfterFailedRelease();
         backend.idle_cache_release_deadline_ns = idleCacheReleaseDeadline(runtime);
-        try backend.arm(runtime);
-        var events: [8]uring_backend.Event = undefined;
+        var events: [poll_backend.events_max]poll_backend.Event = undefined;
         const ready = backend.wait(runtime, &events) catch |err| switch (err) {
             error.ControlPeerClosed => return,
             else => return err,
@@ -162,7 +157,7 @@ pub fn run(runtime: *state.Runtime) !void {
             continue;
 
         for (events[0..ready]) |event|
-            handleEvent(runtime, event, &egress_completion_debt) catch |err| switch (err) {
+            handleEvent(runtime, event, &backend.egress_completion_debt) catch |err| switch (err) {
                 error.ControlPeerClosed => return,
                 else => return err,
             };
@@ -198,7 +193,7 @@ fn releaseIdleThreadCache(runtime: *state.Runtime) void {
 
 fn handleEvent(
     runtime: *state.Runtime,
-    event: uring_backend.Event,
+    event: poll_backend.Event,
     egress_completion_debt: *bool,
 ) !void {
     switch (event) {
@@ -222,37 +217,40 @@ fn handleEvent(
             runtime.drainIngressPayloadCredit();
             response_flow.notifyTransport(runtime, .ring);
         },
-        .fs_fault_ready => try runtime.collectFsFaultResponse(),
         .timer_deadline => try collectFast(runtime),
     }
 }
 
-/// Handles the control socket turning writable: queues the advance of every
+/// Handles the control socket turning writable: sends the `request_done`
+/// packets that found it full, oldest first, queues the advance of every
 /// response that waited for room in it (`serve/response.zig:notifyTransport`),
 /// then sends a retirement notice that found the socket full
-/// (`runtime/retirement.zig`). A notice whose send finds the server gone
-/// fails with `error.ControlPeerClosed`, which stops the loop as a hangup
-/// does; a response's send finds it in its advance (`runItem`).
+/// (`runtime/retirement.zig`). A send that finds the server gone fails with
+/// `error.ControlPeerClosed`, which stops the loop as a hangup does; a
+/// response's send finds it in its advance (`runItem`).
 pub fn handleControlWritable(runtime: *state.Runtime) !void {
+    try response_finish.flushPendingRequestDones(runtime);
     response_flow.notifyTransport(runtime, .socket);
     try runtime.sendRetirementNotice();
 }
 
 /// One pass of the loop for a caller that drives the runtime on its own
 /// thread instead of `run`, as a bench does: takes one control packet when
-/// the socket holds one, which may be a response grant, resumes every
-/// response that waited for room in the control socket or the payload ring,
-/// collects what became ready and runs at most one work item. Such a caller
-/// polls neither the socket nor the ring, so each pass retries what waits
-/// for them, and a retry that finds no room waits again. The worker's end of
-/// the control socket must not block, as `zygote/child_boot.zig` leaves it,
-/// so a pass waits on no event. Fails as `collectControlPacket` and the
-/// collectors do.
+/// the socket holds one, which may be a response grant, sends the
+/// `request_done` packets that wait, resumes every response that waited for
+/// room in the control socket or the payload ring, collects what became
+/// ready and runs at most one work item. Such a caller polls neither the
+/// socket nor the ring, so each pass retries what waits for them, and a
+/// retry that finds no room waits again. The worker's end of the control
+/// socket must not block, as `zygote/child_boot.zig` leaves it, so a pass
+/// waits on no event. Fails as `collectControlPacket`, the `request_done`
+/// sends and the collectors do.
 pub fn runPass(runtime: *state.Runtime) !void {
     collectControlPacket(runtime) catch |err| switch (err) {
         error.WouldBlock => {},
         else => return err,
     };
+    try response_finish.flushPendingRequestDones(runtime);
     response_flow.notifyTransport(runtime, .socket);
     response_flow.notifyTransport(runtime, .ring);
     try collectFast(runtime);
@@ -262,20 +260,16 @@ pub fn runPass(runtime: *state.Runtime) !void {
 
 fn gatewayIpcDrainBatch(runtime: *const state.Runtime) usize {
     return if (runtime.scheduler.ready_queue.isEmpty())
-        uring_backend.gateway_ipc_drain_batch_body_heavy
+        poll_backend.gateway_ipc_drain_batch_body_heavy
     else
-        uring_backend.gateway_ipc_drain_batch_interactive;
+        poll_backend.gateway_ipc_drain_batch_interactive;
 }
 
 fn collectFast(runtime: *state.Runtime) !void {
     runtime.drainReadyBacklog();
     runtime.collectModuleSettlements();
-    try runtime.collectCompletedCryptoJobs();
-    try runtime.collectCompletedFetches();
-    try runtime.collectReadyFetchBodies();
     runtime.collectReadyIngressRequests();
     runtime.collectReadyRequestCompletions();
-    runtime.collectFsFaultCompletions();
     try runtime.collectDueTimers();
     try runtime.collectReadyImmediates();
     try runtime.collectDueRequestDeadlines();
@@ -363,8 +357,7 @@ pub fn collectControlPacket(runtime: *state.Runtime) !void {
             packet.deinit();
             packet_alive = false;
             defer fds.close();
-            var egress_ctx = runtime.egressContext();
-            try egress_gateway.attach(&egress_ctx, &fds);
+            try egress_gateway.attach(runtime, &fds);
         },
         else => {
             packet.deinit();
@@ -382,23 +375,26 @@ pub fn collectControlPacket(runtime: *state.Runtime) !void {
 /// the item runs. A skipped item is released as if its request were gone:
 /// a fetch completion frees its task here, since only its own run would,
 /// and the request's finish frees what every other kind held. An item with
-/// no owner opens no window: an fs fault completion, or one whose entry was
-/// gone at enqueue or whose work vanished, among them a withdrawn response
-/// advance, which does nothing, since its response was dropped. A request a
+/// no owner opens no window: one whose entry was gone at enqueue or whose
+/// work vanished, among them a withdrawn response advance, which does
+/// nothing, since its response was dropped. A request a
 /// window of the item took past its budget is answered after it. Each
 /// handler's failure is answered or logged per item, except a response send
 /// that finds the server gone, which stops the loop as a hangup does.
 pub fn executeWorkItem(runtime: *state.Runtime, item: ready_queue.WorkItem) !void {
     const owner_id = runtime.scheduler.ready_queue.last_popped_meta.owner_request_id;
     runtime.scheduler.ready_queue.last_popped_meta = .{};
+    // Every popped egress item gives its place in the queue back, whether or
+    // not it runs below: the egress producers bound their queued items by the
+    // places they hold (`worker/egress/state.zig:State.noteReadyItemPopped`).
+    runtime.egress.state.noteReadyItemPopped(item);
     if (owner_id != 0) {
         const previous_owner_id = runtime_owner.enter(runtime, owner_id, .{ .consumes_ready_item = true });
         defer runtime_owner.leave(runtime, previous_owner_id);
         if (termination.admitAtBoundary(runtime, owner_id, itemRole(runtime, owner_id, item))) {
             runItem(runtime, item);
         } else if (item == .fetch_completion) {
-            var egress_ctx = runtime.egressContext();
-            egress_completion.discard(&egress_ctx, item.fetch_completion);
+            egress_completion.discard(runtime, item.fetch_completion);
         }
     } else if (item != .response_advance) {
         runItem(runtime, item);
@@ -425,7 +421,6 @@ fn itemRole(runtime: *state.Runtime, owner_id: u64, item: ready_queue.WorkItem) 
         .timer_callback,
         .immediate_callback,
         .fetch_completion,
-        .fs_fault_completion,
         => .other,
     };
 }
@@ -449,15 +444,10 @@ fn runItem(runtime: *state.Runtime, item: ready_queue.WorkItem) void {
             request_dispatch.handleLocalFailure(runtime, request_id, err),
         .request_deadline => |request_id| request_dispatch.deadlineTimeout(runtime, request_id) catch |err|
             request_dispatch.handleLocalFailure(runtime, request_id, err),
-        .fetch_completion => |fetch_id| {
-            var egress_ctx = runtime.egressContext();
-            egress_completion.execute(&egress_ctx, fetch_id) catch |err|
-                egress_completion.handleFailure(&egress_ctx, fetch_id, err);
-        },
+        .fetch_completion => |fetch_id| egress_completion.execute(runtime, fetch_id) catch |err|
+            egress_completion.handleFailure(runtime, fetch_id, err),
         .fetch_body_ready => |body_id| runtime.executeFetchBodyReady(body_id) catch |err|
             runtime.handleFetchBodyReadyFailure(body_id, err),
-        .fs_fault_completion => |fault_id| runtime.executeFsFaultCompletion(fault_id) catch |err|
-            runtime.handleFsFaultCompletionFailure(fault_id, err),
         .response_advance => |request_id| response_flow.executeAdvance(runtime, request_id) catch |err| switch (err) {
             error.PeerClosed => runtime.core.running = false,
             else => request_dispatch.handleLocalFailure(runtime, request_id, err),

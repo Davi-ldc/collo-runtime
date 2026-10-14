@@ -1,4 +1,4 @@
-// The native sources behind Response.body, with the read-result helpers and body-used messages response.cpp shares.
+// The native sources behind Response.body, with the body-used messages response.cpp shares.
 // Only response.cpp includes this file. Runs on the VM thread. A ResponseBodySource reads its Response's body through
 // the cell, which it holds in a WriteBarrier that the owning stream visits. A FetchBodyIdentitySource owns one fetch
 // body reference outright: a tee hands it to the first branch, and otherwise cancel, release() or destruction drops
@@ -11,7 +11,7 @@
 #include "host_functions/server/fetch/body_utils.h"
 #include "host_functions/server/fetch/response_object.h"
 #include "host_functions/support.h"
-#include "host_functions/webapi/streams/readable_stream_private.h"
+#include "host_functions/webapi/streams/readable_stream.h"
 
 #include <JavaScriptCore/JSCInlines.h>
 #include <JavaScriptCore/JSTypedArrays.h>
@@ -29,25 +29,6 @@ inline WTF::ASCIILiteral bodyAlreadyUsedMessage() { return "Body already used"_s
 
 inline WTF::ASCIILiteral bodyStreamAlreadyUsedMessage() { return "body stream already used"_s; }
 
-inline JSC::JSObject* createReadResultObject(JSC::JSGlobalObject* global_object, JSC::JSValue value, bool done)
-{
-    auto& vm = global_object->vm();
-    auto* object = JSC::constructEmptyObject(global_object, global_object->objectPrototype(), 2);
-    object->putDirect(vm, vm.propertyNames->value, value);
-    object->putDirect(vm, vm.propertyNames->done, JSC::jsBoolean(done));
-    return object;
-}
-
-inline JSC::EncodedJSValue resolvedReadResult(JSC::JSGlobalObject* global_object, JSC::JSValue value, bool done)
-{
-    return resolvedPromise(global_object, createReadResultObject(global_object, value, done));
-}
-
-inline JSC::EncodedJSValue resolvedDoneReadResult(JSC::JSGlobalObject* global_object)
-{
-    return resolvedReadResult(global_object, JSC::jsUndefined(), true);
-}
-
 // The source of each branch when the stream over a fetch-stream body is teed. It holds no cell, so it has nothing
 // for the stream to visit.
 class FetchBodyIdentitySource final : public ReadableStreamNativeSource {
@@ -63,11 +44,11 @@ public:
 
     ~FetchBodyIdentitySource() override { release(); }
 
-    EncodedJSValue pull(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope) override
+    ReadableStreamPull pull(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope) override
     {
         if (m_released)
-            return resolvedDoneReadResult(global_object);
-        return fetchBodyPullForIdentity(global_object, scope, m_identity);
+            return ReadableStreamPull::done();
+        return ReadableStreamPull::fromPromise(fetchBodyPullForIdentity(global_object, scope, m_identity));
     }
 
     EncodedJSValue cancel(JSC::JSGlobalObject* global_object, JSC::ThrowScope&, JSValue) override
@@ -155,33 +136,34 @@ public:
         return adoptRef(*source);
     }
 
-    EncodedJSValue pull(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope) override
+    ReadableStreamPull pull(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope) override
     {
         auto* response = m_response.get();
         if (!response || response->body().source() == BodyState::Source::Empty)
-            return resolvedDoneReadResult(global_object);
+            return ReadableStreamPull::done();
 
         if (response->body().source() == BodyState::Source::FetchStream) {
             if (!response->beginStreamRead(global_object, scope, bodyStreamAlreadyUsedMessage()))
-                return {};
-            RETURN_IF_EXCEPTION(scope, {});
-            return fetchBodyPullForIdentity(global_object, scope, response->body().fetchBodyIdentity());
+                return ReadableStreamPull::threw();
+            RETURN_IF_EXCEPTION(scope, ReadableStreamPull::threw());
+            return ReadableStreamPull::fromPromise(
+                fetchBodyPullForIdentity(global_object, scope, response->body().fetchBodyIdentity()));
         }
 
         if (m_static_delivered)
-            return resolvedDoneReadResult(global_object);
+            return ReadableStreamPull::done();
 
         WTF::RefPtr<ColloSharedBytes> bytes;
         if (!response->consumeToSharedBytes(global_object, scope, bodyStreamAlreadyUsedMessage(), bytes))
-            return {};
-        RETURN_IF_EXCEPTION(scope, {});
+            return ReadableStreamPull::threw();
+        RETURN_IF_EXCEPTION(scope, ReadableStreamPull::threw());
         m_static_delivered = true;
         auto* value
             = createBodyUint8ArrayCopy(global_object, scope, bytes ? bytes->span() : std::span<const uint8_t> {});
-        RETURN_IF_EXCEPTION(scope, {});
+        RETURN_IF_EXCEPTION(scope, ReadableStreamPull::threw());
         if (!value)
-            return {};
-        return resolvedReadResult(global_object, value, false);
+            return ReadableStreamPull::threw();
+        return ReadableStreamPull::withChunk(value);
     }
 
     EncodedJSValue cancel(JSC::JSGlobalObject* global_object, JSC::ThrowScope&, JSValue) override

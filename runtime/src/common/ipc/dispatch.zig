@@ -5,16 +5,19 @@
 //! An encoded packet is a `messages.DispatchPacketHeader` followed by, in
 //! order, the authority, method, path and raw query, and the request headers
 //! and the route captures as `NameValuePacket` sections. The header names the
-//! request's route by its index in the route table of the worker's
-//! definition, which the worker checks against its table. The decoder treats
+//! request's route by its index in the routes of the worker's definition,
+//! which the worker checks against its routes, and the pool slot the request
+//! holds, the index of its live slot on the worker's page. The decoder treats
 //! the bytes as hostile: it checks every length against the packet before
 //! reading the section, and refuses a packet with bytes after the route
-//! captures, a header whose reserved field is not zero, and an empty
-//! authority. The header's egress token is copied unread: the worker never
-//! interprets it and only the gateway can verify it, and `egress_token.none`
-//! is valid here, for a worker without an egress session.
+//! captures, a header whose reserved fields are not zero, a worker slot at or
+//! above `limits.server.worker_concurrency_max`, and an empty authority. The
+//! header's egress token is copied unread: the worker never interprets it and
+//! only the gateway can verify it, and `egress_token.none` is valid here, for
+//! a worker without an egress session.
 
 const std = @import("std");
+const limits = @import("collo_limits");
 const packet = @import("packet.zig");
 const messages = @import("messages.zig");
 const egress_token = @import("egress_token.zig");
@@ -54,11 +57,12 @@ pub const DispatchWork = struct {
     request_lane_id: u16 = 0,
     request_slot: u32 = 0,
     request_generation: u64 = 0,
+    /// As `messages.DispatchWorkView.worker_slot`.
+    worker_slot: u8,
     /// As `messages.DispatchWorkView.egress_token`.
     egress_token: egress_token.Bytes = egress_token.none,
     worker_id: u64 = 0,
     worker_generation: u64 = 0,
-    accounting_flags: u32 = 0,
     authority: []const u8,
     deadline_monotonic_ns: u64,
     method: []const u8,
@@ -74,6 +78,7 @@ pub const DispatchWork = struct {
     /// the result.
     pub fn initOwned(allocator: std.mem.Allocator, input: DispatchWorkView) !DispatchWork {
         try messages.validateRequestBodyFraming(input.body_framing);
+        try validateWorkerSlot(input.worker_slot);
 
         const storage_len = try dispatchWorkStorageLen(
             input.authority,
@@ -117,10 +122,10 @@ pub const DispatchWork = struct {
             .request_lane_id = input.request_lane_id,
             .request_slot = input.request_slot,
             .request_generation = input.request_generation,
+            .worker_slot = input.worker_slot,
             .egress_token = input.egress_token,
             .worker_id = input.worker_id,
             .worker_generation = input.worker_generation,
-            .accounting_flags = input.accounting_flags,
             .authority = owned_authority,
             .deadline_monotonic_ns = input.deadline_monotonic_ns,
             .method = owned_method,
@@ -139,7 +144,8 @@ pub const DispatchWork = struct {
     /// `worker/request/context.zig`). It carries nothing a real dispatch reads
     /// from the wire: an evaluation never dispatches, and its fetches present
     /// `boot_egress_token`, WorkerInit's boot token, whose request id and
-    /// generation are 0.
+    /// generation are 0. It holds no pool slot and writes no live slot, so
+    /// its `worker_slot` is 0 and read by nothing.
     pub fn initBoot(
         allocator: std.mem.Allocator,
         request_id: u64,
@@ -152,6 +158,7 @@ pub const DispatchWork = struct {
         return .{
             .allocator = allocator,
             .request_id = request_id,
+            .worker_slot = 0,
             .egress_token = boot_egress_token.*,
             .authority = "",
             .deadline_monotonic_ns = 0,
@@ -180,10 +187,10 @@ pub const DispatchWork = struct {
             .request_lane_id = self.request_lane_id,
             .request_slot = self.request_slot,
             .request_generation = self.request_generation,
+            .worker_slot = self.worker_slot,
             .egress_token = self.egress_token,
             .worker_id = self.worker_id,
             .worker_generation = self.worker_generation,
-            .accounting_flags = self.accounting_flags,
             .authority = self.authority,
             .deadline_monotonic_ns = self.deadline_monotonic_ns,
             .method = self.method,
@@ -200,8 +207,9 @@ pub const DispatchWork = struct {
 /// Encodes `message` into `scratch`, which must hold `messages.max_message_bytes`,
 /// and returns the encoded prefix. Fails with `error.DispatchScratchTooSmall`
 /// for a shorter scratch, `error.MessageTooLarge` for a packet above
-/// `messages.max_message_bytes`, and `error.TooManyRouteCaptures` or
-/// `error.TooManyRequestHeaders` above their counts in `messages.zig`.
+/// `messages.max_message_bytes`, `error.TooManyRouteCaptures` or
+/// `error.TooManyRequestHeaders` above their counts in `messages.zig`, and
+/// `error.InvalidWorkerSlot` for a slot the decoder refuses.
 pub fn encodeDispatchWorkInto(scratch: []u8, message: *const DispatchWorkView) ![]u8 {
     if (scratch.len < messages.max_message_bytes)
         return error.DispatchScratchTooSmall;
@@ -210,6 +218,7 @@ pub fn encodeDispatchWorkInto(scratch: []u8, message: *const DispatchWorkView) !
     if (message.request_headers.len > messages.max_request_header_count)
         return error.TooManyRequestHeaders;
     try messages.validateRequestBodyFraming(message.body_framing);
+    try validateWorkerSlot(message.worker_slot);
 
     const captures_bytes_len = try capturesByteLenChecked(message.route_captures);
     const request_headers_bytes_len = try requestHeadersByteLenChecked(message.request_headers);
@@ -230,11 +239,11 @@ pub fn encodeDispatchWorkInto(scratch: []u8, message: *const DispatchWorkView) !
     header.request_lane_id = message.request_lane_id;
     header.request_slot = message.request_slot;
     header.request_generation = message.request_generation;
+    header.worker_slot = message.worker_slot;
     header.egress_token = message.egress_token;
     header.worker_id = message.worker_id;
     header.worker_generation = message.worker_generation;
     header.deadline_monotonic_ns = message.deadline_monotonic_ns;
-    header.accounting_flags = message.accounting_flags;
     header.route_index = message.route_index;
     header.authority_len = @intCast(message.authority.len);
     header.method_len = @intCast(message.method.len);
@@ -280,10 +289,10 @@ fn materializeDispatchWorkFromStorage(allocator: std.mem.Allocator, storage: []u
         .request_lane_id = layout.header.request_lane_id,
         .request_slot = layout.header.request_slot,
         .request_generation = layout.header.request_generation,
+        .worker_slot = layout.header.worker_slot,
         .egress_token = layout.header.egress_token,
         .worker_id = layout.header.worker_id,
         .worker_generation = layout.header.worker_generation,
-        .accounting_flags = layout.header.accounting_flags,
         .authority = layout.authority.slice(storage),
         .deadline_monotonic_ns = layout.header.deadline_monotonic_ns,
         .method = layout.method.slice(storage),
@@ -305,6 +314,11 @@ fn parseDispatchLayout(encoded: []const u8) !DispatchLayout {
         return error.InvalidMessageKind;
     if (header._reserved0 != 0)
         return error.InvalidPacket;
+    if (header._reserved1 != 0)
+        return error.InvalidPacket;
+    if (header._reserved2 != 0)
+        return error.InvalidPacket;
+    try validateWorkerSlot(header.worker_slot);
 
     var cursor: usize = @sizeOf(DispatchPacketHeader);
     const authority = try readRange(encoded, &cursor, header.authority_len);
@@ -346,6 +360,13 @@ fn parseDispatchLayout(encoded: []const u8) !DispatchLayout {
         .request_headers = request_headers,
         .route_captures = route_captures,
     };
+}
+
+/// A worker has one live slot per pool slot, `limits.server.worker_concurrency_max`
+/// of them, and writes a request's at the index its dispatch names.
+fn validateWorkerSlot(worker_slot: u8) error{InvalidWorkerSlot}!void {
+    if (worker_slot >= limits.server.worker_concurrency_max)
+        return error.InvalidWorkerSlot;
 }
 
 fn readRange(encoded: []const u8, cursor: *usize, len: u32) !Range {

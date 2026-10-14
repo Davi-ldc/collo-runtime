@@ -32,14 +32,3 @@ bench("url.parse-static", iterations => {
   }
   return checksum;
 }, { iterations: 80000, warmup: 5000 });
-
-bench("url.blob-object-url", iterations => {
-  const blob = new Blob(["hello"], { type: "text/plain" });
-  let checksum = 0;
-  for (let i = 0; i < iterations; i++) {
-    const url = URL.createObjectURL(blob);
-    checksum += url.length;
-    URL.revokeObjectURL(url);
-  }
-  return checksum;
-}, { iterations: 60000, warmup: 5000 });

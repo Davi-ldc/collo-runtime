@@ -25,10 +25,8 @@ const request_bridge = @import("../js/server_api/request.zig");
 const response_bridge = @import("../js/server_api/response.zig");
 const js_value = @import("collo_worker_js").value;
 const request_task = @import("collo_worker_request").task;
-const worker_shared_page = @import("collo_worker_state").page;
 const response_flow = @import("response.zig");
 const termination = @import("termination.zig");
-const tracing = @import("trace.zig");
 const module_routes = @import("../modules/routes.zig");
 
 /// Starts the request's run. A request already answered, as one the
@@ -60,10 +58,15 @@ pub fn executeBodyReady(runtime: *state.Runtime, request_id: u64) !void {
 }
 
 /// The client reset the stream: the request ends as client-closed and no
-/// response is written.
+/// response is written. A request that finished while its last packet
+/// waits for room ends without that packet, which no client would receive.
 pub fn cancelClientReset(runtime: *state.Runtime, request_id: u64) !void {
     const request_ctx = runtime.requests.active.get(request_id) orelse return;
     request_ctx.cancel_queued = false;
+    if (request_ctx.last_packet_done != null) {
+        try response_flow.dropParkedLast(runtime, request_ctx, .client_closed, 499);
+        return;
+    }
     request_ctx.client_reset = true;
     request_ctx.body.pipe.fail("http2 stream reset");
     if (request_ctx.request_task) |token| {
@@ -72,7 +75,7 @@ pub fn cancelClientReset(runtime: *state.Runtime, request_id: u64) !void {
             task.state = .canceled;
         }
     }
-    _ = try response_flow.finishRequest(runtime, request_ctx, .client_closed, 499);
+    _ = try response_flow.finishRequest(runtime, request_ctx, .client_closed, 499, .none);
 }
 
 /// The request's deadline passed. It answers 504 in place of a response
@@ -104,24 +107,12 @@ pub fn deadlineTimeout(runtime: *state.Runtime, request_id: u64) !void {
     try termination.end(runtime, request_ctx, termination.endingOf(runtime, request_ctx) orelse .deadline);
 }
 
-/// The funnel for an error a request's work returned. A full record ring or
-/// completion ring stops the worker, so the server synthesizes the records
-/// of the requests in flight; any other error ends the request with a 500,
-/// or with a reset when its response is already committed.
+/// The funnel for an error a request's work returned. A failure that already
+/// stopped the worker, as a `request_done` it could not send
+/// (`response_finish.zig`), leaves the server to end the requests in flight;
+/// any other error ends the request with a 500, or with a reset when its
+/// response is already committed.
 pub fn handleLocalFailure(runtime: *state.Runtime, request_id: u64, err: anyerror) void {
-    runtime.traceRuntimeEvent("worker.request.failure={d},{s}", .{ request_id, @errorName(err) });
-    if (err == error.CompletedRecordRingFull) {
-        runtime.traceRuntimeEvent("worker.runtime.stop=completed_record_ring_full,{d}", .{request_id});
-        runtime.core.running = false;
-        std.log.err("worker completed-record ring full request_id={d}; stopping worker for host-side synthesis", .{request_id});
-        return;
-    }
-    if (err == error.WorkerCompletionRingOverflow) {
-        runtime.traceRuntimeEvent("worker.runtime.stop=worker_completion_ring_overflow,{d}", .{request_id});
-        runtime.core.running = false;
-        std.log.err("worker completion ring overflow request_id={d}; stopping worker for host-side synthesis", .{request_id});
-        return;
-    }
     if (!runtime.core.running) {
         std.log.warn("request-local failure after worker stop request_id={d}: {s}", .{
             request_id,
@@ -166,36 +157,24 @@ pub fn handleCompletionFailure(runtime: *state.Runtime, token: request_task.Task
 }
 
 /// Answers a request whose handler returned a thenable, once it settled. A
-/// token that no longer names the waiting task is counted as stale and
-/// ignored.
+/// token that no longer names the waiting task is stale and ignored.
 pub fn executeCompletion(runtime: *state.Runtime, token: request_task.TaskToken) !void {
-    const task = runtime.requests.tasks.get(token) orelse {
-        runtime.observability.stale_task_completion_count += 1;
-        return;
-    };
+    const task = runtime.requests.tasks.get(token) orelse return;
     task.completion_queued = false;
     const request_id = task.request_id;
     const removed = runtime.requests.pending_completions.fetchRemove(request_id) orelse return error.RequestCompletionNotFound;
     var completion = removed.value;
     defer completion.deinit();
-    if (completion.token.slot != token.slot or completion.token.generation != token.generation) {
-        runtime.observability.stale_task_completion_count += 1;
+    if (completion.token.slot != token.slot or completion.token.generation != token.generation)
         return;
-    }
 
-    const request_ctx = runtime.requests.active.get(request_id) orelse {
-        runtime.observability.stale_task_completion_count += 1;
+    const request_ctx = runtime.requests.active.get(request_id) orelse return;
+    if (task.state != .waiting_thenable or task.canceled or task.timed_out)
         return;
-    };
-    if (task.state != .waiting_thenable or task.canceled or task.timed_out) {
-        runtime.observability.stale_task_completion_count += 1;
-        return;
-    }
     if (task.pending_thenable) |*pending| {
         pending.deinit();
         task.pending_thenable = null;
     }
-    tracing.mark(runtime, request_ctx, "completion_received_ns");
     if (termination.endingOf(runtime, request_ctx)) |ending| {
         task.timed_out = true;
         try termination.end(runtime, request_ctx, ending);
@@ -211,27 +190,19 @@ pub fn executeCompletion(runtime: *state.Runtime, token: request_task.TaskToken)
 }
 
 fn executeLoaded(runtime: *state.Runtime, request_ctx: *request_context.RequestContext) !void {
-    tracing.mark(runtime, request_ctx, "execute_request_start_ns");
     try runtime.armRequestDeadline(request_ctx);
     if (termination.endingOf(runtime, request_ctx)) |ending| {
         try termination.end(runtime, request_ctx, ending);
         return;
     }
 
-    const route = switch (try runtime.ensureRouteHandler(request_ctx)) {
+    const route = switch (try runtime.lookupRouteHandler(request_ctx)) {
         .ready => |route| route,
         // The entry's evaluation (a top-level await) is still running: the
         // request waits in the module's waiter list, settlement queues it
         // again, and its armed deadline bounds the wait.
         .pending => return,
-        .exception => |exception| {
-            var owned = exception;
-            defer owned.deinit();
-            try termination.answerException(runtime, request_ctx, &owned, "js exception");
-            return;
-        },
     };
-    tracing.mark(runtime, request_ctx, "get_export_done_ns");
     try invokeHandlerAfterParse(runtime, request_ctx, route);
 }
 
@@ -281,7 +252,7 @@ fn finishAfterFailedAnswer(
     const active_request = runtime.requests.active.get(request_id) orelse return;
     if (active_request.finish_started)
         return;
-    _ = response_flow.finishRequest(runtime, active_request, done_status, http_status) catch |finish_err| {
+    _ = response_flow.finishRequest(runtime, active_request, done_status, http_status, .none) catch |finish_err| {
         std.log.warn("failed to finalize failed request request_id={d}: {s}", .{ request_id, @errorName(finish_err) });
     };
 }
@@ -305,14 +276,12 @@ fn invokeHandlerAfterParse(
         try writeRequestParseError(runtime, request_ctx, err);
         return;
     };
-    tracing.mark(runtime, request_ctx, "parse_request_done_ns");
     if (!request_ctx.body.isInitialized())
         try request_ctx.body.initFromHead(request_ctx.requestAllocator(), &parsed);
 
     // Built in the route's realm, so `request instanceof Request` holds in
     // the handler whichever realm the route runs in.
     var request_value = try request_bridge.makeRequestObject(route.realm, request_ctx, &parsed);
-    tracing.mark(runtime, request_ctx, "make_request_done_ns");
     defer request_value.deinit();
 
     try invokeHandlerOrFinish(runtime, request_ctx, route, &request_value);
@@ -320,7 +289,10 @@ fn invokeHandlerAfterParse(
 
 /// Calls `handler(request, env)` in the route's realm, where `env` is the
 /// route's frozen bindings object (`worker/modules/route_env.zig`), the same
-/// object for every request of the route.
+/// object for every request of the route, and `this` is the handler's
+/// receiver: the default export when the handler is its `fetch`, else
+/// undefined (`RouteHandler` in `worker/runtime/types.zig`). No third
+/// argument follows, since the worker offers no execution context object.
 fn invokeHandlerOrFinish(
     runtime: *state.Runtime,
     request_ctx: *request_context.RequestContext,
@@ -333,13 +305,14 @@ fn invokeHandlerOrFinish(
 
     const bench_handler = runtime.observability.bench_handler;
     var handler_started_ns: u64 = 0;
+    const handler = &route.module.handler;
     const invocation = turn.invokeWithTiming(
         runtime.core.vm,
         route.realm,
         request_ctx.requestAllocator(),
         &request_ctx.exec,
-        route.module.handler.ptr(),
-        null,
+        handler.function.ptr(),
+        if (handler.receiver) |*receiver| receiver.inner.ptr() else null,
         &.{ request_value, route.module.env.inner.ptr() },
         if (bench_handler) &handler_started_ns else null,
     );
@@ -362,20 +335,17 @@ fn invokeHandlerOrFinish(
             return;
         },
     };
-    tracing.mark(runtime, request_ctx, "handler_invoke_done_ns");
     var result_moved = false;
     defer if (!result_moved)
         result.deinit();
 
     if (try handler_thenable.isThenableValue(runtime, request_ctx, &result)) {
-        runtime.observability.thenable_handler_count += 1;
         task.state = .waiting_thenable;
         task.pending_thenable = js_value.JsValueOwned.fromOwnedValue(result);
         result_moved = true;
         try handler_thenable.settleRequestThenable(runtime, request_ctx, token, task.pending_thenable.?.ptr());
         return;
     }
-    runtime.observability.sync_handler_fast_path_count += 1;
     task.state = .completed_sync;
     try response_bridge.writeValueResponse(runtime, request_ctx, &result);
 }
@@ -383,24 +353,23 @@ fn invokeHandlerOrFinish(
 fn ensureRequestTask(runtime: *state.Runtime, request_ctx: *request_context.RequestContext) !request_task.TaskToken {
     if (request_ctx.request_task) |token|
         return token;
-    // Every live request needs a live slot on the shared page, so the worker
-    // admits at most `LIVE_SLOT_COUNT` at once, the
-    // `worker_concurrency_max` of `common/limits/server.zig` that count is
-    // defined from. The server sends a worker at most its definition's
-    // `concurrency` requests at a time, and the worker still checks the
-    // bound instead of trusting the server. Requests can share the VM
-    // because each microtask runs under the request that registered it,
+    // The worker runs at most `request_task_capacity` handlers at once, one
+    // per live slot of its page (`common/limits/worker.zig`). Each request it
+    // holds has a pool slot of its own, since a begin on a held one is
+    // refused (`request/ingress/runtime.zig:requireUnheld`), so a runtime
+    // with the default capacity always finds a task; one built with less, as
+    // a test may build, answers the begin past it 500. Requests can share the
+    // VM because each microtask runs under the request that registered it,
     // which `runtime/patches/webkit/0004-microtask-owner-context.patch`
     // carries from registration to execution
     // (`worker/tests/runtime/multiplexing.zig` covers it).
-    if (runtime.requests.tasks.activeCount() >= worker_shared_page.LIVE_SLOT_COUNT)
+    if (runtime.requests.tasks.activeCount() >= runtime.core.limits.request_task_capacity)
         return error.RequestSlotsExhausted;
     const token = try runtime.requests.tasks.create(.{
         .request_id = request_ctx.exec.request_id,
         .request_generation = request_ctx.request_generation,
         .request_ctx = request_ctx,
         .deadline_ns = request_ctx.exec.deadline_monotonic_ns,
-        .trace = if (request_ctx.trace_enabled) &request_ctx.trace else null,
     });
     request_ctx.request_task = token;
     return token;

@@ -308,9 +308,10 @@ test "exception lines reach the owning runtime with a second runtime attached" {
 
     const page_fd = try worker_shared_page.createMemfd("console-ring-two-runtimes");
     defer std.posix.close(page_fd);
-    var view = try worker_shared_page.mapReadWrite(page_fd);
+    var view = try worker_shared_page.mapWorkerWriter(page_fd);
     defer view.deinit();
-    view.initializeCrashDefault();
+    var reader = try worker_shared_page.mapHostReader(page_fd);
+    defer reader.deinit();
 
     var now_a: u64 = 1_000;
     var runtime_a = try worker.Runtime.init(std.testing.allocator, &vm_a, pair_a[0], &view, try rt.createCompletionEventfd(), .{
@@ -346,7 +347,7 @@ test "exception lines reach the owning runtime with a second runtime attached" {
 
     var scratch: [worker_shared_page.LOG_LINE_BYTES_MAX]u8 = undefined;
     var out: [8]worker_shared_page.DrainedLogLine = undefined;
-    const drained = try view.drainLogLinesChecked(&scratch, &out);
+    const drained = try reader.drainLogLinesChecked(&scratch, &out);
     try std.testing.expect(drained >= 1);
     try std.testing.expect(out[0].header.flags & worker_shared_page.LogLineFlags.js_exception != 0);
     try std.testing.expect(std.mem.containsAtLeast(u8, out[0].payload, 1, "owned-by-a"));
@@ -363,9 +364,10 @@ test "per-request line cap drops the 257th line into the ring counter and resets
 
     const page_fd = try worker_shared_page.createMemfd("console-request-line-cap");
     defer std.posix.close(page_fd);
-    var view = try worker_shared_page.mapReadWrite(page_fd);
+    var view = try worker_shared_page.mapWorkerWriter(page_fd);
     defer view.deinit();
-    view.initializeCrashDefault();
+    var reader = try worker_shared_page.mapHostReader(page_fd);
+    defer reader.deinit();
 
     var now_mono_ns: u64 = 9_000;
     var runtime = try worker.Runtime.init(std.testing.allocator, &vm, control_pair[0], &view, try rt.createCompletionEventfd(), .{
@@ -379,12 +381,24 @@ test "per-request line cap drops the 257th line into the ring counter and resets
     // end to end.
     try runtime.attachHostRuntime();
 
-    const response = try rt.runRouteAndReadBody(&runtime, control_pair[1],
+    const capped_source =
         \\export default function handle() {
         \\    for (let i = 0; i < 300; i++) console.log("l" + i);
         \\    return new Response("cap-ok");
         \\}
-    , 61, "/console-line-cap.js");
+    ;
+    const after_source =
+        \\export default function handle() {
+        \\    console.log("after");
+        \\    return new Response("cap-ok-2");
+        \\}
+    ;
+    try rt.bootRoutes(&runtime, &.{
+        .{ .specifier = "/console-line-cap.js", .source = capped_source },
+        .{ .specifier = "/console-line-cap-2.js", .source = after_source },
+    });
+
+    const response = try rt.runRouteAndReadBody(&runtime, control_pair[1], capped_source, 61, "/console-line-cap.js");
     defer std.testing.allocator.free(response);
     try std.testing.expect(std.mem.containsAtLeast(u8, response, 1, "cap-ok"));
 
@@ -396,7 +410,7 @@ test "per-request line cap drops the 257th line into the ring counter and resets
     var last_line_buf: [32]u8 = undefined;
     var last_line_len: usize = 0;
     while (true) {
-        const count = try view.drainLogLinesChecked(&scratch, &out);
+        const count = try reader.drainLogLinesChecked(&scratch, &out);
         if (count == 0)
             break;
         drained_total += count;
@@ -406,22 +420,17 @@ test "per-request line cap drops the 257th line into the ring counter and resets
     }
     try std.testing.expectEqual(@as(usize, log_limits.CONSOLE_REQUEST_LINES_MAX), drained_total);
     try std.testing.expectEqualStrings("l255", last_line_buf[0..last_line_len]);
-    try std.testing.expectEqual(@as(u64, 44), view.loadLogDropCounters().lines);
+    try std.testing.expectEqual(@as(u64, 44), reader.loadLogDropCounters().lines);
 
     // A second request starts with a fresh budget, since request cleanup
     // clears the spent one, and the counter does not move again.
-    const response2 = try rt.runRouteAndReadBody(&runtime, control_pair[1],
-        \\export default function handle() {
-        \\    console.log("after");
-        \\    return new Response("cap-ok-2");
-        \\}
-    , 62, "/console-line-cap-2.js");
+    const response2 = try rt.runRouteAndReadBody(&runtime, control_pair[1], after_source, 62, "/console-line-cap-2.js");
     defer std.testing.allocator.free(response2);
-    const count2 = try view.drainLogLinesChecked(&scratch, &out);
+    const count2 = try reader.drainLogLinesChecked(&scratch, &out);
     try std.testing.expectEqual(@as(usize, 1), count2);
     try std.testing.expectEqualStrings("after", out[0].payload);
     try std.testing.expectEqual(@as(u64, 62), out[0].header.request_id);
-    try std.testing.expectEqual(@as(u64, 44), view.loadLogDropCounters().lines);
+    try std.testing.expectEqual(@as(u64, 44), reader.loadLogDropCounters().lines);
 }
 
 test "per-request byte budget stops emission and surfaces drop markers" {
@@ -487,9 +496,10 @@ test "console and uncaught exception lines land in the shared page log ring" {
 
     const page_fd = try worker_shared_page.createMemfd("console-ring-e2e");
     defer std.posix.close(page_fd);
-    var view = try worker_shared_page.mapReadWrite(page_fd);
+    var view = try worker_shared_page.mapWorkerWriter(page_fd);
     defer view.deinit();
-    view.initializeCrashDefault();
+    var reader = try worker_shared_page.mapHostReader(page_fd);
+    defer reader.deinit();
 
     var now_mono_ns: u64 = 7_000;
     var runtime = try worker.Runtime.init(std.testing.allocator, &vm, control_pair[0], &view, try rt.createCompletionEventfd(), .{
@@ -514,7 +524,7 @@ test "console and uncaught exception lines land in the shared page log ring" {
 
     var scratch: [worker_shared_page.LOG_LINE_BYTES_MAX]u8 = undefined;
     var out: [8]worker_shared_page.DrainedLogLine = undefined;
-    const drained = try view.drainLogLinesChecked(&scratch, &out);
+    const drained = try reader.drainLogLinesChecked(&scratch, &out);
     try std.testing.expect(drained >= 2);
 
     try std.testing.expectEqual(@intFromEnum(worker_shared_page.LogLevel.info), out[0].header.level);

@@ -158,7 +158,7 @@ namespace {
             value = array;
         }
 
-        auto* object = createReadResultObject(realm->global_object, value, done);
+        auto* object = createReadableStreamReadResult(realm->global_object, value, done);
         return Collo::makeValueHandle(owner, object, out_value);
     }
 
@@ -868,11 +868,10 @@ namespace {
             JSC::throwOutOfMemoryError(global_object, scope);
             return {};
         }
-        auto* stream = createReadableStreamFromNativeSource(global_object, scope, source.releaseNonNull());
+        auto* stream = response->createBodyStream(global_object, scope, source.releaseNonNull());
         RETURN_IF_EXCEPTION(scope, {});
         if (!stream)
             return {};
-        response->setBodyStream(vm, stream);
         return JSValue::encode(stream);
     }
 

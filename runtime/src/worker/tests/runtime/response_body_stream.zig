@@ -1,7 +1,7 @@
 //! Covers a response whose body is a ReadableStream the handler built: the
 //! head goes out before the stream yields anything, each chunk follows while
-//! the stream is still open, and the request finishes, with a usage record
-//! for every byte, only when the stream closes. A TransformStream's readable
+//! the stream is still open, and the request finishes, with a `request_done`
+//! that counts every byte, only when the stream closes. A TransformStream's readable
 //! streams what the handler writes after it returned. A stream that errors,
 //! or yields a chunk that is not bytes, a string included, resets the
 //! client's stream instead of ending it, and a client's reset cancels the
@@ -17,7 +17,6 @@ const support = @import("bindings_support");
 const bindings = @import("collo_bindings");
 const h2 = @import("collo_http").http2;
 const ipc = @import("collo_ipc");
-const worker_shared_page = @import("collo_worker_state").page;
 const worker = @import("collo_worker");
 const rt = @import("collo_test_harness");
 
@@ -84,13 +83,11 @@ test "a handler's ReadableStream sends its head first and each chunk as the stre
     try std.testing.expect(response.reset_code == null);
     try std.testing.expectEqualStrings("data: one\n\ndata: two\n\n", response.body.items);
 
-    const done = try rt.readWorkerCompletion(&fixture.runtime, fixture.control_pair[1], 901);
-    try std.testing.expectEqual(@intFromEnum(ipc.RequestDoneStatus.ok), done.status);
+    const done = response.done orelse return error.RequestDoneMissing;
+    try std.testing.expectEqual(ipc.RequestDoneStatus.ok, done.status);
     try std.testing.expectEqual(@as(u16, 200), done.http_status);
-    // The record is written when the stream closes, so it counts both events.
-    const record = try fixture.takeUsageRecord();
-    try std.testing.expectEqual(@as(u64, 901), record.request_id);
-    try std.testing.expectEqual(@as(u64, "data: one\n\ndata: two\n\n".len), record.client_served_bytes);
+    // The packet goes out when the stream closes, so it counts both events.
+    try std.testing.expectEqual(@as(u64, "data: one\n\ndata: two\n\n".len), done.client_served_bytes);
 }
 
 test "a TransformStream's readable streams what the handler writes after it returned" {
@@ -129,8 +126,8 @@ test "a TransformStream's readable streams what the handler writes after it retu
     try std.testing.expect(response.reset_code == null);
     try std.testing.expectEqualStrings("first second", response.body.items);
 
-    const done = try rt.readWorkerCompletion(&fixture.runtime, fixture.control_pair[1], 902);
-    try std.testing.expectEqual(@intFromEnum(ipc.RequestDoneStatus.ok), done.status);
+    const done = response.done orelse return error.RequestDoneMissing;
+    try std.testing.expectEqual(ipc.RequestDoneStatus.ok, done.status);
     try std.testing.expectEqual(@as(u16, 201), done.http_status);
 }
 
@@ -164,8 +161,8 @@ test "a stream that errors after the head resets the client's stream instead of 
     try std.testing.expectEqualStrings("before", response.body.items);
     try std.testing.expectEqual(@as(?u32, @intFromEnum(h2.ErrorCode.internal_error)), response.reset_code);
 
-    const done = try rt.readWorkerCompletion(&fixture.runtime, fixture.control_pair[1], 903);
-    try std.testing.expectEqual(@intFromEnum(ipc.RequestDoneStatus.js_exception), done.status);
+    const done = response.done orelse return error.RequestDoneMissing;
+    try std.testing.expectEqual(ipc.RequestDoneStatus.js_exception, done.status);
     try std.testing.expectEqual(@as(u16, 200), done.http_status);
 }
 
@@ -200,10 +197,11 @@ test "a string chunk resets the client's stream after the head and cancels the s
     try std.testing.expectEqual(@as(?u16, 200), response.status);
     try std.testing.expectEqual(@as(usize, 0), response.body.items.len);
     try std.testing.expectEqual(@as(?u32, @intFromEnum(h2.ErrorCode.internal_error)), response.reset_code);
-    const done = try rt.readWorkerCompletion(&fixture.runtime, fixture.control_pair[1], 904);
-    try std.testing.expectEqual(@intFromEnum(ipc.RequestDoneStatus.js_exception), done.status);
+    const done = response.done orelse return error.RequestDoneMissing;
+    try std.testing.expectEqual(ipc.RequestDoneStatus.js_exception, done.status);
 
-    try fixture.expectReason(route_index, 905, "TypeError: Response body stream chunks must be an ArrayBuffer or an ArrayBufferView");
+    // The reason the stream is canceled with names the chunk as the error the read threw does.
+    try fixture.expectReason(route_index, 905, "TypeError: ReadableStream chunks must be an ArrayBuffer or an ArrayBufferView");
 }
 
 test "a client's reset cancels the response stream with the reset as its reason" {
@@ -243,12 +241,13 @@ test "a client's reset cancels the response stream with the reset as its reason"
     try fixture.resetStream(906);
     try fixture.runReady();
     try std.testing.expect(!fixture.runtime.requests.active.contains(906));
-    const done = try rt.readWorkerCompletion(&fixture.runtime, fixture.control_pair[1], 906);
-    try std.testing.expectEqual(@intFromEnum(ipc.RequestDoneStatus.client_closed), done.status);
-    // Nothing follows the reset: the stream is gone on the server's side.
+    // Only the `request_done` follows the reset: the stream is gone on the
+    // server's side, so it gets no end and no reset.
     try response.readAvailable(&fixture);
     try std.testing.expectEqualStrings("partial", response.body.items);
     try std.testing.expect(!response.ended);
+    const done = response.done orelse return error.RequestDoneMissing;
+    try std.testing.expectEqual(ipc.RequestDoneStatus.client_closed, done.status);
 
     try fixture.expectReason(route_index, 907, "AbortError: The client reset the response stream");
 }
@@ -263,14 +262,12 @@ const StreamFixture = struct {
     vm: bindings.Vm,
     completion_fixture: rt.CompletionFixture,
     runtime: worker.Runtime,
-    usage_cursor: worker_shared_page.RecordCursor,
 
     /// The stream id every dispatch here names, which a reset must repeat.
     const stream_id: u32 = 3;
 
     fn init(self: *StreamFixture) !void {
         self.now_mono_ns = 0;
-        self.usage_cursor = .{};
         self.scratch = try std.testing.allocator.alloc(u8, ipc.max_message_bytes);
         errdefer std.testing.allocator.free(self.scratch);
         self.control_pair = try rt.socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
@@ -362,19 +359,6 @@ const StreamFixture = struct {
         try self.runReady();
     }
 
-    /// Takes the one usage record the worker wrote since the last call.
-    fn takeUsageRecord(self: *StreamFixture) !worker_shared_page.CompletedRecord {
-        var records: [2]worker_shared_page.CompletedRecord = undefined;
-        const count = self.usage_cursor.drain(
-            self.completion_fixture.view.header,
-            self.completion_fixture.view.completed_records,
-            &records,
-        ) orelse return error.TestUnexpectedUsageRingCorruption;
-        if (count != 1)
-            return error.TestUnexpectedResult;
-        return records[0];
-    }
-
     /// Runs request `request_id` for "/reason" on the route at `route_index`,
     /// whose handler answers with the reason its last stream was cancelled
     /// with, and expects `expected`.
@@ -391,13 +375,15 @@ const StreamFixture = struct {
 };
 
 /// What the test, playing the server, read of one response from the
-/// control socket. A second head fails the read, since it would answer the
-/// request twice.
+/// control socket, up to its `request_done`. A second head fails the read,
+/// since it would answer the request twice, and so does any descriptor after
+/// the `request_done`, which the worker sends last.
 const ReceivedResponse = struct {
     status: ?u16 = null,
     body: std.ArrayList(u8) = .empty,
     reset_code: ?u32 = null,
     ended: bool = false,
+    done: ?ipc.RequestDone = null,
 
     fn deinit(self: *ReceivedResponse) void {
         self.body.deinit(std.testing.allocator);
@@ -422,6 +408,11 @@ const ReceivedResponse = struct {
     }
 
     fn take(self: *ReceivedResponse, descriptor: ipc.ingress_channel.Descriptor, payload: []const u8) !void {
+        try std.testing.expect(self.done == null);
+        if (descriptor.op == @intFromEnum(ipc.ingress_channel.Op.request_done)) {
+            self.done = try ipc.ingress_channel.decodeRequestDone(payload);
+            return;
+        }
         try std.testing.expect(!self.ended);
         if (descriptor.op == @intFromEnum(ipc.ingress_channel.Op.response_head)) {
             try std.testing.expect(self.status == null);

@@ -9,7 +9,7 @@ comptime {
     _ = @import("boot_eval.zig");
     _ = @import("console.zig");
     _ = @import("core.zig");
-    _ = @import("crypto_pool.zig");
+    _ = @import("crypto.zig");
     _ = @import("env.zig");
     _ = @import("fetch.zig");
     _ = @import("lifecycle.zig");

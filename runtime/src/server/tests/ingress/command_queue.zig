@@ -1,12 +1,12 @@
 //! The lane command queue (`ingress/commands.zig`): a command keeps its
 //! payload through the queue, a full queue refuses a command and keeps the
 //! ones it holds, and the queue's ordinary places and its reserve fill
-//! apart: a reader's forwarded output takes only reserved places, a worker's
-//! death and a reader grant take a reserved place first and an ordinary one
-//! once the reserve is full, and every other command takes only ordinary
-//! ones. A command the
-//! queue refuses, abandons at teardown or cannot wake the lane for frees what
-//! it owns. The queue writes only the places it used, and one eventfd wake
+//! apart: a reader's forwarded response output takes only reserved places, a
+//! worker's death, a reader grant and a forwarded `request_done` take a
+//! reserved place first and an ordinary one once the reserve is full, and
+//! every other command takes only ordinary ones. A command the queue
+//! refuses, abandons at teardown or cannot wake the lane for frees what it
+//! owns. The queue writes only the places it used, and one eventfd wake
 //! covers several commands. Lane `server-ingress-test`; what a lane does with
 //! each command is tested in `lane_commands.zig`.
 
@@ -79,6 +79,24 @@ fn forwardedDescriptor(gpa: std.mem.Allocator, payload: []const u8) !Command {
     } };
 }
 
+/// A forwarded `request_done` of the request `forwardedDescriptor` names,
+/// decoded as the reader forwards it, which owns nothing.
+fn forwardedRequestDone() Command {
+    const identity = ipc.ingress_channel.RequestIdentity{
+        .request_id = 9,
+        .request_generation = 1,
+        .request_lane_id = 0,
+        .request_slot = 1,
+    };
+    return .{ .forwarded_request_done = .{
+        .request_key = .{ .lane_id = 0, .slot = 1, .generation = 1 },
+        .worker_key = .{ .worker_id = 1, .worker_generation = 1 },
+        .worker = &forwarding_record,
+        .descriptor = ipc.ingress_channel.Descriptor.requestDone(identity, 1),
+        .done = .{ .status = .ok, .http_status = 204 },
+    } };
+}
+
 test "a worker_died keeps its worker key and reason through the queue" {
     var queue = try Queue.init(2, 1);
     defer queue.deinit();
@@ -103,8 +121,7 @@ test "a full queue refuses a command and keeps the ones it holds" {
 }
 
 test "deaths and reader grants fill a one-definition lane's reserve, which the other commands never reach" {
-    // One definition at the default `concurrency` of 2.
-    const reserve = ingress.lane.obligationReserve(1, 2);
+    const reserve = ingress.lane.obligationReserve(.{ .count = 1, .slots_per_worker_total = 2 });
     var queue = try Queue.init(1, reserve);
     defer queue.deinit();
     var record: supervision.worker_table.Record = .{
@@ -153,6 +170,22 @@ test "worker output never takes an ordinary place, a death takes one once the re
     try std.testing.expect(!try queue.post(.shutdown));
     try std.testing.expect(try queue.post(workerDied(.{ .worker_id = 4, .worker_generation = 1 })));
     try std.testing.expectEqual(@as(usize, 1), queue.reserved_used);
+}
+
+test "a forwarded request_done takes a reserved place first and an ordinary one once the reserve is full, where a forwarded response descriptor is refused" {
+    var queue = try Queue.init(1, 1);
+    defer queue.deinit();
+
+    try std.testing.expect(try queue.post(forwardedRequestDone()));
+    try std.testing.expectEqual(@as(usize, 1), queue.reserved_used);
+    try std.testing.expectEqual(@as(usize, 0), queue.ordinary_used);
+    try std.testing.expect(!try queue.post(try forwardedDescriptor(std.testing.allocator, "refused")));
+    try std.testing.expect(try queue.post(forwardedRequestDone()));
+    try std.testing.expectEqual(@as(usize, 1), queue.ordinary_used);
+    // The `request_done` keeps its decoded record through the queue.
+    const command = queue.dequeue() orelse return error.MissingCommand;
+    try std.testing.expectEqual(ipc.RequestDoneStatus.ok, command.forwarded_request_done.done.status);
+    try std.testing.expectEqual(@as(u16, 204), command.forwarded_request_done.done.http_status);
 }
 
 test "a death takes a reserved place before an ordinary one, leaving the ordinary places to the commands that can take nothing else" {

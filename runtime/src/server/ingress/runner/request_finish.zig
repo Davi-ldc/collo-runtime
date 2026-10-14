@@ -1,29 +1,42 @@
 //! The end of an ingress lane's requests and the worker slots they give back,
 //! on the lane thread: the one finish of every request whatever ended it,
-//! with its access record, its usage settle and the answer or reset its
-//! stream gets, and the handoff of a freed worker slot to the next waiter.
+//! with its access record and the answer or reset its stream gets, and the
+//! handoff of a freed worker slot to the next waiter.
 //!
 //! Invariants:
 //! - A request finishes once and emits one access record. The lane writes
-//!   the record's identity, duration and every status it synthesizes; a
-//!   worker's completion supplies only its status and error code, and not
-//!   even those once the lane answered the client itself
+//!   the record's identity, times and every status it synthesizes, and the
+//!   status of the worker's response head it queued, which is what the
+//!   client received (`AccessFacts.response_status`); a worker's
+//!   `request_done` supplies its error code and its measures, and its status
+//!   only when no head of the worker went out, and neither status nor error
+//!   code once the lane answered the client itself
 //!   (`RequestSlot.local_answer`).
-//! - A completion parked on a request means the worker answered, so the
-//!   request ends with it whatever else ended it: a deadline, a death, a
-//!   reset or the lane's shutdown.
-//! - A dispatched request settles its usage and its request table entry
-//!   (`Supervisor.settleRequest` in `server/supervisor/supervisor.zig`)
-//!   before its worker slot goes back, so a worker never has more entries
-//!   than slots. A request whose begin never reached the worker leaves no
-//!   usage. The settle carries the lane's end of the request, the instant
-//!   its access record ends at, so the usage record's wall time and the
-//!   access record's duration end together.
-//! - A request that carried an egress token notes its end on the lane's
-//!   lease (`Lease.noteEnded` in `server/gateway/lease.zig`). The loop sends
-//!   the noted entries to the gateway at the end of the pass
-//!   (`ring_driver.runQueuedWork`), which then drops each token's budget and
-//!   cancels its fetches; a finish never waits for the gateway.
+//! - A dispatched request's record carries its usage (`access.Usage` in
+//!   `server/analytics/access.zig`): the measures of its `request_done`,
+//!   origin `worker`; for a request the server ended after its begin reached
+//!   the worker, the CPU the worker's page holds for it
+//!   (`Record.usageFloor` in `server/supervisor/worker_table.zig`), origin
+//!   `server`; and no measures for one whose begin never reached the worker.
+//!   Its wall time runs from the dispatch the lane stamped
+//!   (`AccessFacts.dispatched_mono_ns`) to the instant the record's duration
+//!   ends at. The floor is read while the request still holds its worker
+//!   slot, which keeps the worker's page mapped, and a worker cannot choose
+//!   whose record its measures enter: the lane names the request and the
+//!   socket names the worker.
+//! - A dispatched request leaves its worker's request table
+//!   (`RequestTable.end`, or `remove` when its begin never reached the
+//!   worker, in `server/supervisor/request_table.zig`) before its worker
+//!   slot goes back, so a worker never has more entries than slots.
+//! - A request whose begin reached the worker finishes only at its
+//!   `request_done`, at its worker's death or at the lane's teardown, so its
+//!   pool slot comes back only once the worker holds the request no more,
+//!   and a worker never holds more requests than its `concurrency`. The lane
+//!   still answers the client at once whatever the worker does: a client's
+//!   reset and a body the lane refuses leave the request to its
+//!   `request_done` after a `request_reset` (`dispatch.cancelRequestToWorker`),
+//!   and the worker answers 504 itself at the deadline, which the grace
+//!   backstop enforces with the worker's death (`deadline_driver.zig`).
 //! - A freed slot goes to the oldest waiter at once (`Pool.release` in
 //!   `server/supervisor/pool.zig`): this lane's own waiter is dispatched on
 //!   it here, another lane's gets `dispatch_ready`, and a worker the pool
@@ -31,7 +44,8 @@
 //! - Whether a response head went out is the lane's own HTTP/2 record
 //!   (`responseHeadQueued`), never a flag the worker wrote: a request that
 //!   ends without its response gets a 5xx before a head and RST_STREAM after
-//!   one.
+//!   one, and a `request_done` ahead of its response's end resets the
+//!   stream at once (`leaveStream`), since nothing of the worker follows it.
 //! - Every finish but the teardown's queues the request's connection for a
 //!   turn, so the connection's deadline follows the requests it still
 //!   serves (`deadline_driver.zig`) whatever ended this one.
@@ -42,7 +56,6 @@ const ipc = @import("collo_ipc");
 const supervision = @import("collo_server_supervisor");
 const pool_limits = @import("collo_limits").pool;
 const access_log = @import("collo_server_analytics").access;
-const worker_shared_page = @import("collo_worker_state").page;
 const fault = @import("../fault.zig");
 const server_responses = @import("../server_responses.zig");
 const http2_writing = @import("../http2/writing.zig");
@@ -56,12 +69,12 @@ const worker_registration = @import("worker_registration.zig");
 
 const pool = supervision.pool;
 const WorkerPool = supervision.WorkerPool;
-const SettleOutcome = supervision.SettleOutcome;
 const WorkerRecord = supervision.worker_table.Record;
 const ConnectionSlot = connection_slot.Slot;
 const RequestSlot = request_slot_mod.RequestSlot;
 const LaneFault = fault.LaneFault;
-const CompletedStatus = worker_shared_page.CompletedStatus;
+const ErrorCode = access_log.ErrorCode;
+const RequestDone = ipc.ingress_channel.RequestDone;
 
 /// The status an access record reports for a request whose client went away
 /// before it was answered, the one a worker reports for `client_closed`.
@@ -69,9 +82,9 @@ pub const client_closed_status: u16 = 499;
 
 /// What ended a request.
 pub const RequestOutcome = union(enum) {
-    /// The worker published the request's completion, drained by this lane
-    /// or forwarded by the worker's reader.
-    worker_completion: worker_shared_page.WorkerCompletionRecord,
+    /// The worker's `request_done`, read by this lane or forwarded by the
+    /// worker's reader (`request_done.zig`).
+    worker_done: RequestDone,
     /// The request waited for a worker slot past its deadline: 503.
     waiter_expired,
     /// No worker slot serves the waiting request: the pool's waiter FIFO is
@@ -101,21 +114,21 @@ pub const RequestOutcome = union(enum) {
     shutdown,
 };
 
-/// Why a request's worker died, as the request's records carry it.
+/// Why a request's worker died, as the request's access record carries it.
 pub const WorkerDeath = struct {
     /// The error code (`worker_fault.deathStatus`).
-    status: CompletedStatus,
+    status: ErrorCode,
     reason: fault.WorkerFaultReason,
 };
 
 /// How a request that ends as an outcome is reported: the response the lane
 /// writes when the stream is open and no response head went out (null for
 /// none), the status and error code of its access record, and the worker
-/// fault that ended it, which its access record and usage floor name.
+/// fault that ended it, which its access record names.
 pub const Ending = struct {
     response: ?server_responses.Id,
     status: u16,
-    error_code: CompletedStatus,
+    error_code: ErrorCode,
     worker_fault: ?fault.WorkerFaultReason = null,
 };
 
@@ -123,12 +136,13 @@ pub const Ending = struct {
 /// the mapping is testable without a lane.
 pub fn endingFor(outcome: RequestOutcome) Ending {
     return switch (outcome) {
-        // The worker's own status is recorded whether or not its response
-        // went out, including the 499 it reports for `client_closed`.
-        .worker_completion => |completion| .{
+        // The worker's own status, the 499 it reports for `client_closed`
+        // included; the finish replaces it with the status of the head the
+        // lane queued, when one went out (`workerDoneStatus`).
+        .worker_done => |done| .{
             .response = null,
-            .status = completion.http_status,
-            .error_code = errorCodeFromDoneStatus(doneStatus(completion)),
+            .status = doneHttpStatus(done),
+            .error_code = errorCodeFromDoneStatus(done.status),
         },
         // A request that reached no worker ends as `done` in the worker's
         // vocabulary, whatever the lane answered.
@@ -172,10 +186,42 @@ pub fn endingFor(outcome: RequestOutcome) Ending {
     };
 }
 
-/// The access record's error code for a completion status. The switch has no
-/// `else`, so a new `RequestDoneStatus` does not compile until it is given a
-/// code here.
-pub fn errorCodeFromDoneStatus(status: ipc.RequestDoneStatus) CompletedStatus {
+/// The status a `request_done` reports, which the access record of its
+/// request carries when no response head of the worker went out
+/// (`workerDoneStatus`): the worker's own, or, when the worker answered with
+/// no status (`http_status` 0), the 499 of a client that went away for
+/// `client_closed` and otherwise the 502 the lane answers a stream the
+/// worker left without a head (`requestDoneLeftNoAnswer`).
+pub fn doneHttpStatus(done: RequestDone) u16 {
+    if (done.http_status != 0)
+        return done.http_status;
+    return switch (done.status) {
+        .client_closed => client_closed_status,
+        else => server_responses.get(.bad_gateway).status,
+    };
+}
+
+/// The usage the access record of a request its `request_done` ended
+/// carries: the worker's measures, its claim about its own request, which
+/// no other request's record reads. Pure and file-level, so the copy is
+/// testable without a lane.
+pub fn usageOfDone(done: RequestDone) access_log.Usage {
+    return .{
+        .origin = .worker,
+        .exec_ns = done.exec_ns,
+        .waiting_ns = done.waiting_ns,
+        .io_ns = done.io_ns,
+        .cpu_ns = done.cpu_ns,
+        .client_served_bytes = done.client_served_bytes,
+        .fetch_sent_bytes = done.fetch_sent_bytes,
+        .fetch_received_bytes = done.fetch_received_bytes,
+    };
+}
+
+/// The access record's error code for a `request_done` status. The switch
+/// has no `else`, so a new `RequestDoneStatus` does not compile until it is
+/// given a code here.
+pub fn errorCodeFromDoneStatus(status: ipc.RequestDoneStatus) ErrorCode {
     return switch (status) {
         .ok => .done,
         .bad_request => .bad_request,
@@ -190,34 +236,20 @@ pub fn errorCodeFromDoneStatus(status: ipc.RequestDoneStatus) CompletedStatus {
     };
 }
 
-/// The usage settle of a dispatched request that ended as `ended`: a
-/// completion means the worker appended its own record first; a request the
-/// server ended gets a floor with its error code and the worker fault that
-/// ended it, unless its begin never reached the worker, which then never ran
-/// it.
-pub fn settleOutcomeFor(begin_sent: bool, ended: RequestOutcome) SettleOutcome {
-    switch (ended) {
-        .worker_completion => return .completed,
-        else => {
-            if (!begin_sent)
-                return .abandoned;
-            const ending = endingFor(ended);
-            return .{ .floor = .{
-                .status = ending.error_code,
-                .worker_fault = workerFaultLabel(ending.worker_fault),
-            } };
-        },
-    }
+/// Whether `outcome` may end a request its worker holds, one whose begin
+/// reached the worker: its `request_done`, its worker's death, or the lane's
+/// teardown.
+fn endsRequestTheWorkerHolds(outcome: RequestOutcome) bool {
+    return switch (outcome) {
+        .worker_done, .deadline_expired, .worker_died, .shutdown => true,
+        .waiter_expired, .unserved, .rejected, .stream_gone, .send_expired => false,
+    };
 }
 
 /// The label a record carries for `reason`, "" for none.
 fn workerFaultLabel(reason: ?fault.WorkerFaultReason) []const u8 {
     const known = reason orelse return "";
     return known.label();
-}
-
-fn doneStatus(completion: worker_shared_page.WorkerCompletionRecord) ipc.RequestDoneStatus {
-    return std.meta.intToEnum(ipc.RequestDoneStatus, completion.status) catch .worker_crash;
 }
 
 pub fn Methods(comptime Self: type) type {
@@ -229,7 +261,8 @@ pub fn Methods(comptime Self: type) type {
         const WorkerRegistration = worker_registration.Methods(Self);
 
         /// Ends the request in `request_slot` for `outcome`: emits its access
-        /// record, settles a dispatched request's usage and notes the end of
+        /// record, with a dispatched request's usage, takes a dispatched
+        /// request out of its worker's request table and notes the end of
         /// the egress token it carried, answers or resets its stream as the
         /// outcome and the lane's own record of the stream say, frees the
         /// lane's slot and its wheel entry, and gives a worker slot back to
@@ -263,19 +296,6 @@ pub fn Methods(comptime Self: type) type {
             }
         }
 
-        /// Ends the dispatched request in `request_slot` with the completion
-        /// parked on it, and returns whether one was parked.
-        pub fn finishParkedCompletion(self: *Self, request_slot: u32) LaneFault!bool {
-            if (request_slot >= self.requests.capacity())
-                return error.RequestSlotOutOfRange;
-            const slot = self.requests.get(request_slot) orelse return false;
-            if (!slot.dispatched())
-                return false;
-            const outcome: RequestOutcome = .{ .worker_completion = slot.pending_worker_completion orelse return false };
-            try finishRequest(self, request_slot, outcome);
-            return true;
-        }
-
         fn finishWaiting(self: *Self, request_slot: u32, outcome: RequestOutcome) LaneFault!void {
             const slot = &self.requests.entries[request_slot];
             // False when a handoff already took the waiter: its
@@ -283,7 +303,7 @@ pub fn Methods(comptime Self: type) type {
             _ = self.service.supervisor.poolFor(slot.route.definition).cancelWaiter(slot.request_key);
             const ending = endingFor(outcome);
             slot.access.error_code = ending.error_code;
-            emitAccessRecord(self, slot, ending.status, .server, self.monotonicNowNs());
+            emitAccessRecord(self, slot, ending.status, .server, self.monotonicNowNs(), null);
             if (outcome != .shutdown) {
                 if (Admission.requestConnection(self, slot)) |runtime| {
                     const stream_id = slot.ingress_channel_id;
@@ -304,30 +324,23 @@ pub fn Methods(comptime Self: type) type {
             outcome: RequestOutcome,
         ) LaneFault!void {
             const slot = &self.requests.entries[request_slot];
-            var ended = outcome;
-            if (slot.pending_worker_completion) |parked| {
-                ended = .{ .worker_completion = parked };
-                slot.pending_worker_completion = null;
-            }
-
-            const runtime: ?*ConnectionSlot = if (ended == .shutdown) null else Admission.requestConnection(self, slot);
-            var ending = endingFor(ended);
-            // A worker that completed without a response head on an open
-            // stream gets its client a 502, and the record says so.
-            const answer: ?server_responses.Id = switch (ended) {
-                .worker_completion => if (runtime) |connection|
-                    if (completionLeftNoAnswer(connection, slot)) .bad_gateway else null
+            // Every other outcome is only ever given to a request whose begin
+            // never left (the header).
+            if (slot.begin_sent) std.debug.assert(endsRequestTheWorkerHolds(outcome));
+            const runtime: ?*ConnectionSlot = if (outcome == .shutdown) null else Admission.requestConnection(self, slot);
+            var ending = endingFor(outcome);
+            // A worker that ended its request without a response head on an
+            // open stream gets its client a 502, and the record says so.
+            const answer: ?server_responses.Id = switch (outcome) {
+                .worker_done => if (runtime) |connection|
+                    if (requestDoneLeftNoAnswer(connection, slot)) .bad_gateway else null
                 else
                     null,
                 else => ending.response,
             };
-            switch (ended) {
-                .worker_completion => {
-                    if (answer) |response_id|
-                        ending.status = server_responses.get(response_id).status;
-                },
-                else => self.lane.counters.completed_requests += 1,
-            }
+            if (outcome == .worker_done)
+                ending.status = workerDoneStatus(slot, ending.status, answer);
+            self.lane.counters.completed_requests += 1;
             var answered_by: access_log.AnsweredBy = .worker;
             if (slot.local_answer) |local| {
                 // The client got the lane's refusal of its body, and nothing
@@ -338,23 +351,14 @@ pub fn Methods(comptime Self: type) type {
             }
             slot.access.error_code = ending.error_code;
             slot.access.worker_fault = workerFaultLabel(ending.worker_fault);
-            // One end for both records: the usage record's wall time ends
-            // where the access record's duration does, and a drain writes
-            // the worker's usage record only once this end is noted.
-            const finished_ns = self.monotonicNowNs();
-            emitAccessRecord(self, slot, ending.status, answered_by, finished_ns);
-            self.service.supervisor.settleRequest(
-                worker,
-                slot.request_id,
-                settleOutcomeFor(slot.begin_sent, ended),
-                finished_ns,
-            );
-            if (slot.egress_gateway_session_id != 0) {
-                self.egress_lease.noteEnded(slot.egress_gateway_generation, .{
-                    .session_id = slot.egress_gateway_session_id,
-                    .request_id = slot.request_id,
-                    .request_generation = slot.request_key.generation,
-                });
+            const usage = usageOf(slot, worker, outcome, ending.error_code);
+            emitAccessRecord(self, slot, ending.status, answered_by, self.monotonicNowNs(), usage);
+            // Only a request the worker heard of can name itself in the
+            // worker's console lines, so only its entry is remembered.
+            if (slot.begin_sent) {
+                worker.requests.end(slot.request_id);
+            } else {
+                worker.requests.remove(slot.request_id);
             }
             if (runtime) |connection| {
                 if (answer) |response_id|
@@ -362,8 +366,8 @@ pub fn Methods(comptime Self: type) type {
                 try leaveStream(self, connection, slot);
             }
 
-            const registration_index = WorkerRegistration.findCompletionRegistrationIndex(self, slot.worker_key) orelse
-                return error.WorkerCompletionRegistrationNotFound;
+            const registration_index = WorkerRegistration.findRegistrationIndex(self, slot.worker_key) orelse
+                return error.WorkerRegistrationNotFound;
             self.registrations.entries[registration_index].removeInflight(slot.request_key);
             const worker_slot = slot.worker_slot;
             freeRequestSlot(self, request_slot);
@@ -405,7 +409,9 @@ pub fn Methods(comptime Self: type) type {
         /// Gives back a slot of `worker` handed to this lane that it will not
         /// use, with the reader grant the handoff carried: a `dispatch_ready`
         /// still queued when the lane tears down
-        /// (`command_flow.returnQueuedHandoffs`). The slot may go on to
+        /// (`command_flow.returnQueuedHandoffs`), or one whose worker left
+        /// service while it travelled (`command_flow.handleDispatchReady`).
+        /// The slot may go on to
         /// another lane's waiter as `releaseWorkerSlot` hands one on.
         pub fn returnHandoff(
             self: *Self,
@@ -494,27 +500,26 @@ pub fn Methods(comptime Self: type) type {
         }
 
         /// Pushes the request's one access record, ended at `finished_ns` on
-        /// the lane's clock, onto this lane's ring and clears the slot's
-        /// facts, so no path emits twice. Facts never stamped (`request_id`
-        /// 0) emit nothing. The worker identity is the slot's own, the
-        /// worker this lane dispatched the request to.
+        /// the lane's clock and carrying `usage` for a dispatched request,
+        /// onto this lane's ring and clears the slot's facts, so no path
+        /// emits twice. Facts never stamped (`request_id` 0) emit nothing.
+        /// The worker identity is the slot's own, the worker this lane
+        /// dispatched the request to.
         fn emitAccessRecord(
             self: *Self,
             slot: *RequestSlot,
             http_status: u16,
             answered_by: access_log.AnsweredBy,
             finished_ns: u64,
+            usage: ?access_log.Usage,
         ) void {
             if (slot.access.request_id == 0)
                 return;
             slot.access.worker_id = slot.worker_key.worker_id;
             slot.access.worker_generation = slot.worker_key.worker_generation;
-            _ = self.access_ring.push(access_log.recordFromFacts(
-                slot.access,
-                http_status,
-                answered_by,
-                finished_ns,
-            ));
+            var record = access_log.recordFromFacts(slot.access, http_status, answered_by, finished_ns);
+            record.usage = usage;
+            _ = self.access_ring.push(record);
             slot.access.request_id = 0;
         }
 
@@ -547,10 +552,49 @@ pub fn Methods(comptime Self: type) type {
     };
 }
 
-/// Whether a worker's completion leaves its client without an answer: the
-/// stream is still the request's and open, and no response head of the
+/// The usage of a dispatched request that ended as `ended` with
+/// `error_code` (the file header's rule): its `request_done`'s, the
+/// worker's own count of a request the server ended after its begin reached
+/// the worker, read from the worker's page while the request still holds
+/// its worker slot (`Record.usageFloor` in
+/// `server/supervisor/worker_table.zig`), or no measures for a request the
+/// worker never heard of, which ran none of it.
+fn usageOf(
+    slot: *const RequestSlot,
+    worker: *WorkerRecord,
+    ended: RequestOutcome,
+    error_code: ErrorCode,
+) access_log.Usage {
+    switch (ended) {
+        .worker_done => |done| return usageOfDone(done),
+        else => {},
+    }
+    if (!slot.begin_sent)
+        return .{ .origin = .server };
+    return worker.usageFloor(slot.worker_slot, .{
+        .request_id = slot.request_id,
+        .request_generation = slot.request_key.generation,
+    }, error_code);
+}
+
+/// The status the access record of a request its `request_done` ended
+/// carries: the lane's answer when the worker left the stream without one
+/// (`answer`), else the status of the response head the lane queued for the
+/// worker, which is what the client received, and only when no head went
+/// out the worker's own report (`reported`, `doneHttpStatus`), its claim
+/// about a response nobody saw.
+fn workerDoneStatus(slot: *const RequestSlot, reported: u16, answer: ?server_responses.Id) u16 {
+    if (answer) |response_id|
+        return server_responses.get(response_id).status;
+    if (slot.access.response_status != 0)
+        return slot.access.response_status;
+    return reported;
+}
+
+/// Whether a worker's `request_done` leaves its client without an answer:
+/// the stream is still the request's and open, and no response head of the
 /// worker went out on it.
-fn completionLeftNoAnswer(runtime: *const ConnectionSlot, slot: *const RequestSlot) bool {
+fn requestDoneLeftNoAnswer(runtime: *const ConnectionSlot, slot: *const RequestSlot) bool {
     if (slot.h2_client_reset)
         return false;
     switch (runtime.h2StreamState(slot.ingress_channel_id) orelse .vacant) {

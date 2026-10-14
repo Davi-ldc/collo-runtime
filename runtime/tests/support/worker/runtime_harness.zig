@@ -1,22 +1,21 @@
 //! The worker runtime harness (`collo_test_harness`): a host for tests that
 //! run a worker runtime in process, or talk to a forked worker through the
 //! host client (`host.dispatch`). A dispatch names its route by its index in
-//! the worker's route table and carries no pack, so the routes and their
-//! pack reach the worker first: a forked worker takes them in WorkerInit
-//! (`host.launch.LaunchOptions.routes`, which `SingleRoute` builds for one
-//! route), and an in-process runtime through `registerRoutePack`, which
-//! registers the pack as a worker's boot does, adds the route unless the
-//! runtime already has one with that entry, and leaves the entry for the
-//! route's first request to evaluate. The harness builds
-//! dispatches with test defaults, each carrying an egress token minted under
-//! `test_egress_key` for `LocalEgressGateway`'s session, reads responses and
-//! completion records back within a bounded budget, and stands in for the
-//! egress gateway and for an HTTP/1.1 origin where a test needs them. The
-//! worker runtime suites, the zygote integration lane and the web API suites
-//! share it.
+//! the routes section of the worker's definition artifact and carries no
+//! pack, so the artifact reaches the worker first: a forked worker takes it
+//! in WorkerInit (`host.launch.LaunchOptions.routes`, which `launchRoutes`
+//! builds), and an in-process runtime boots it once, as a worker's boot does
+//! (`bootDefinition`, or `registerRoute` for a one-route artifact). The
+//! harness builds dispatches with test defaults, each carrying an egress
+//! token minted under `test_egress_key` for `LocalEgressGateway`'s session
+//! and a pool slot of its own, reads each response back through its
+//! `request_done` within a bounded budget, and runs the real egress gateway
+//! in process and an HTTP/1.1 origin where a test needs them. The worker
+//! runtime suites, the zygote integration lane and the web API suites share
+//! it.
 //!
 //! Everything runs on the test's thread except `LocalEgressGateway`, whose
-//! packet loop has a thread of its own besides the threads its engine
+//! loop has a thread of its own besides the threads its shard's engine
 //! starts, and `LocalOrigin`, which serves from one thread. In-process
 //! runtimes read a fake clock through `fakeNow`, and the dispatch defaults
 //! here are instants on such a clock; a forked worker reads the real clock
@@ -37,7 +36,8 @@ const worker_shared_page = @import("collo_worker_state").page;
 const worker_testing = @import("collo_worker_test_support");
 
 const egress_transport = egress_client.transport;
-const gateway_engine = egress_gateway.engine;
+const gateway_runtime = egress_gateway.runtime;
+const os_process = @import("collo_os").process;
 
 /// The `now_fn` of a fake `worker.Clock`: `ctx` points at a `u64` that the
 /// test sets to the current monotonic time in nanoseconds.
@@ -55,9 +55,10 @@ pub const shared_page = worker_shared_page;
 
 pub const default_request_headers = [_]ipc.RequestHeader{.{ .name = "host", .value = "demo.test" }};
 
-/// The key the harness mints egress tokens under. `LocalEgressGateway` submits
-/// fetches without admission, so it never checks a tag; a test that reads a
-/// recorded token back verifies it with this key (`verifyEgressToken`).
+/// The key the harness mints egress tokens under, which `LocalEgressGateway`'s
+/// hello hands its gateway, so the gateway verifies every token under it; a
+/// test that reads a recorded token back verifies it with the same key
+/// (`verifyEgressToken`).
 pub const test_egress_key: ipc.egress_token.Key = .{ .bytes = @splat(0x5c) };
 
 /// The worker session `LocalEgressGateway` serves, which every harness token
@@ -83,38 +84,44 @@ pub const local_origin_network: LocalNetwork = .local_origins;
 
 /// The policy id every token the harness mints names: the first id a policy
 /// image's builder gives a granted policy (`collo_network.table.Builder`),
-/// which a configuration with one granted route mints for it.
-/// `LocalEgressGateway` runs no admission and reads no image, so the id
-/// only has to be one a server could mint.
+/// which a configuration with one granted route mints for it, and the policy
+/// `LocalEgressGateway`'s hello grants.
 pub const harness_policy_id: collo_network.PolicyId = 1;
+
+/// The deadline of every request token the harness mints: an instant on the
+/// real monotonic clock, which `LocalEgressGateway`'s admission reads, that
+/// no test outlives. A dispatch's own deadline cannot serve: an in-process
+/// runtime's deadlines are instants on a fake clock the gateway never sees.
+/// The worker copies a token without reading it.
+pub const live_token_deadline_ns: u64 = std.math.maxInt(u64) / 2;
 
 /// The token the server's lane mints for a request dispatched to a worker
 /// attached to `LocalEgressGateway`'s session: kind request, the harness's
-/// policy, the production budget, and the request's own id, generation and
-/// deadline.
+/// policy, the request's own id and generation, and
+/// `live_token_deadline_ns`.
 pub fn requestEgressToken(parts: DispatchParts) ipc.egress_token.Bytes {
     const token = ipc.egress_token.mint(&test_egress_key, .{
         .kind = .request,
         .policy_id = harness_policy_id,
-        .budget = @intCast(egress_gateway.policy.production.max_fetches_per_request),
         .session_id = local_egress_session_id,
         .request_id = parts.request_id,
         .request_generation = parts.request_generation,
-        .deadline_monotonic_ns = parts.deadline_monotonic_ns,
+        .deadline_monotonic_ns = live_token_deadline_ns,
     });
     return ipc.egress_token.asBytes(&token).*;
 }
 
 /// The boot token a launch with an egress grant hands its worker in
 /// WorkerInit, minted as `host/launch.zig` mints it, with
-/// `deadline_monotonic_ns` standing for the end of the child window. An
-/// in-process runtime takes it as `RuntimeOptions.boot_egress_token`, and
-/// every evaluation presents it.
+/// `deadline_monotonic_ns` standing for the end of the child window on the
+/// real monotonic clock, which `LocalEgressGateway`'s admission reads; an
+/// in-process test that has no window passes `live_token_deadline_ns`. An
+/// in-process runtime takes the token as `RuntimeOptions.boot_egress_token`,
+/// and every evaluation presents it.
 pub fn bootEgressToken(deadline_monotonic_ns: u64) ipc.egress_token.Bytes {
     const token = ipc.egress_token.mint(&test_egress_key, .{
         .kind = .boot,
         .policy_id = harness_policy_id,
-        .budget = @intCast(egress_gateway.policy.production.max_fetches_per_boot),
         .session_id = local_egress_session_id,
         .request_id = 0,
         .request_generation = 0,
@@ -132,7 +139,6 @@ pub fn localBootEgress() host.launch.BootEgress {
         .key = test_egress_key,
         .session_id = local_egress_session_id,
         .policy_id = harness_policy_id,
-        .budget = @intCast(egress_gateway.policy.production.max_fetches_per_boot),
     };
 }
 
@@ -157,10 +163,15 @@ pub const RequestParts = struct {
 
 pub const DispatchParts = struct {
     request_id: u64,
-    /// The route's index in the worker's route table: what
-    /// `registerRoutePack` returned for an in-process runtime, or the
-    /// route's position in the table a forked worker launched with.
+    /// The route's index in the routes section of the worker's artifact:
+    /// what `registerRoute` returned for an in-process runtime, or the
+    /// route's position in the artifact a forked worker launched with.
     route_index: u16 = 0,
+    /// The worker's pool slot the request holds, which names its live slot
+    /// on the page (`DispatchWork.worker_slot`). null picks
+    /// `request_id % LIVE_SLOT_COUNT`, so requests with consecutive ids hold
+    /// slots of their own, as the server's pool gives them.
+    worker_slot: ?u8 = null,
     request_generation: u64 = 1,
     worker_id: u64 = 1,
     worker_generation: u64 = 1,
@@ -208,11 +219,15 @@ pub fn initDispatchWork(allocator: std.mem.Allocator, parts: DispatchParts) !ipc
         .request = toHostRequest(parts.request),
     });
     work.egress_token = parts.egress_token orelse requestEgressToken(parts);
+    work.worker_slot = parts.worker_slot orelse
+        @intCast(parts.request_id % worker_shared_page.LIVE_SLOT_COUNT);
     return work;
 }
 
 /// A request that is really live in `runtime.requests.active`, with a real
-/// `RequestContext` behind its entry; `deinit` removes and frees it.
+/// `RequestContext` behind its entry and its live slot begun on the page;
+/// `deinit` removes and frees the context and leaves the slot naming it, as
+/// a finished request's does.
 ///
 /// Every entry of that map must point at a usable context: each work item
 /// queued as ready is booked against its owner (`Runtime.noteOwnerReady`
@@ -237,13 +252,8 @@ pub const ActiveRequest = struct {
 
         const ctx = try allocator.create(worker_testing.RequestContext);
         errdefer allocator.destroy(ctx);
-        ctx.* = worker_testing.RequestContext.initOwnedDispatch(
-            allocator,
-            0,
-            dispatch,
-            .{ .index = 0, .generation = 0 },
-            started_mono_ns,
-        );
+        runtime.observability.metrics_view.beginLiveSlot(dispatch.worker_slot, request_id, dispatch.request_generation);
+        ctx.* = worker_testing.RequestContext.initOwnedDispatch(allocator, 0, dispatch, started_mono_ns);
         dispatch_owned = false;
         errdefer ctx.deinit();
 
@@ -265,36 +275,69 @@ pub fn writeAllFd(fd: std.posix.fd_t, bytes: []const u8) !void {
     try fd_mod.writeAllRaw(fd, bytes);
 }
 
+/// A sealed memfd holding a definition artifact with one module, `source`
+/// at `specifier`, and one route to it with no bindings
+/// (`module_pack.buildSingleRouteAlloc`). The caller owns the fd.
 pub fn createModulePackFd(specifier: []const u8, source: []const u8) !std.posix.fd_t {
-    return host.dispatch.createModulePackFd(std.testing.allocator, specifier, source);
+    const pack = try ipc.module_pack.buildSingleRouteAlloc(std.testing.allocator, specifier, source);
+    defer std.testing.allocator.free(pack);
+    return createSealedPackFd(pack);
 }
 
-pub fn createModulePackGraphFd(modules: []const ipc.module_pack.Module, entry_index: usize) !std.posix.fd_t {
-    return host.dispatch.createModulePackGraphFd(std.testing.allocator, modules, entry_index);
+/// A sealed memfd holding a definition artifact with `modules` and `routes`
+/// (`module_pack.buildAlloc`). The caller owns the fd.
+pub fn createDefinitionFd(
+    modules: []const ipc.module_pack.Module,
+    routes: []const ipc.route_table.RouteInput,
+) !std.posix.fd_t {
+    const pack = try ipc.module_pack.buildAlloc(std.testing.allocator, modules, routes);
+    defer std.testing.allocator.free(pack);
+    return createSealedPackFd(pack);
 }
 
-/// Registers the pack in `route_fd`, which stays the caller's, with the
-/// in-process `runtime` as permanent, as a worker's boot registers its
-/// definition's pack (`registerRoutePack` in `worker/modules/routes.zig`),
-/// and returns the index of the runtime's route whose entry is `specifier`,
-/// added with no bindings when the runtime has none. The entry stays
-/// unevaluated: the route's first request evaluates it. Registers nothing
-/// when a registered pack already holds `specifier`. Fails as that
-/// registration does, for instance on an fd that is not a sealed memfd or a
-/// pack that does not hold `specifier`.
-pub fn registerRoutePack(runtime: *worker.Runtime, route_fd: std.posix.fd_t, specifier: []const u8) !u16 {
-    var modules_ctx = runtime.modulesContext();
-    try worker.testing.module_routes.registerRoutePack(&modules_ctx, route_fd, specifier);
-    return routeIndex(runtime, specifier) orelse addRoute(runtime, specifier);
+fn createSealedPackFd(pack: []const u8) !std.posix.fd_t {
+    const fd = try std.posix.memfd_create("collo-test-definition", std.os.linux.MFD.CLOEXEC | std.os.linux.MFD.ALLOW_SEALING);
+    errdefer std.posix.close(fd);
+    try fd_mod.writeAllRaw(fd, pack);
+    try std.posix.lseek_SET(fd, 0);
+    try fd_mod.addSeals(fd, fd_mod.memfd_readonly_seals);
+    return fd;
 }
 
-/// Adds a route whose entry is `specifier`, with no bindings, to the
-/// in-process `runtime`, as the route table WorkerInit carries declares a
-/// forked worker's routes, and returns its index. Its pack is registered
-/// apart: by `registerRoutePack`, or by a boot evaluation
-/// (`Runtime.evaluateBootRoutes`).
-pub fn addRoute(runtime: *worker.Runtime, specifier: []const u8) !u16 {
-    return runtime.modules.state.addRoute(runtime.core.allocator, specifier, &ipc.route_bindings.empty_blob);
+/// Boots the in-process `runtime` on the artifact in `pack_fd`, which stays
+/// the caller's, as a worker's boot does: registers it and evaluates every
+/// route's entry (`Runtime.evaluateBootRoutes`). A runtime boots once.
+pub fn bootDefinition(runtime: *worker.Runtime, pack_fd: std.posix.fd_t) !void {
+    try runtime.evaluateBootRoutes(pack_fd, 0, null);
+}
+
+/// One route of a definition a test boots: the source of its one module and
+/// the specifier `routeSpecifier` keys it under.
+pub const RouteSource = struct {
+    specifier: []const u8,
+    source: []const u8,
+};
+
+/// Boots `runtime` on one artifact with a module and a route per entry of
+/// `routes`, in order, so route `i` serves `routes[i]` and the run helpers
+/// find it by its specifier. A runtime boots once, so a test that runs
+/// several routes on one runtime boots them all here first.
+pub fn bootRoutes(runtime: *worker.Runtime, routes: []const RouteSource) !void {
+    std.debug.assert(routes.len <= ipc.route_table.routes_max);
+    var keys: [ipc.route_table.routes_max][]u8 = undefined;
+    var key_count: usize = 0;
+    defer for (keys[0..key_count]) |key| std.testing.allocator.free(key);
+    var modules: [ipc.route_table.routes_max]ipc.module_pack.Module = undefined;
+    var route_inputs: [ipc.route_table.routes_max]ipc.route_table.RouteInput = undefined;
+    for (routes, 0..) |route, index| {
+        keys[index] = try routeSpecifier(std.testing.allocator, route.specifier);
+        key_count += 1;
+        modules[index] = .{ .specifier = keys[index], .source = route.source };
+        route_inputs[index] = .{ .entry_module = @intCast(index) };
+    }
+    const pack_fd = try createDefinitionFd(modules[0..routes.len], route_inputs[0..routes.len]);
+    defer std.posix.close(pack_fd);
+    try bootDefinition(runtime, pack_fd);
 }
 
 /// The module state of the first route of `runtime` whose entry is
@@ -304,12 +347,18 @@ pub fn routeModule(runtime: *worker.Runtime, specifier: []const u8) ?*const work
     return &runtime.modules.state.routes.items[index].module;
 }
 
-/// Registers a one-module pack of `source` at `specifier` with `runtime`
-/// and returns the route's index (`registerRoutePack`).
+/// Boots `runtime` on a one-route artifact of `source` at `specifier` and
+/// returns the route's index, 0; a runtime that already serves a route with
+/// that entry returns its index and boots nothing. Fails with
+/// `error.AlreadyExists` for a runtime that booted another artifact, since a
+/// VM holds one, or as `bootDefinition` does.
 pub fn registerRoute(runtime: *worker.Runtime, specifier: []const u8, source: []const u8) !u16 {
+    if (routeIndex(runtime, specifier)) |index|
+        return index;
     const route_fd = try createModulePackFd(specifier, source);
     defer std.posix.close(route_fd);
-    return registerRoutePack(runtime, route_fd, specifier);
+    try bootDefinition(runtime, route_fd);
+    return routeIndex(runtime, specifier) orelse error.TestRouteMissing;
 }
 
 /// The index of the first route of `runtime` whose entry is `specifier`.
@@ -321,39 +370,22 @@ pub fn routeIndex(runtime: *const worker.Runtime, specifier: []const u8) ?u16 {
     return null;
 }
 
-/// The routes of a forked worker that serves one route with no bindings:
-/// the sealed table of that route, which this owns, and the pack holding
-/// its entry, which stays the caller's.
-pub const SingleRoute = struct {
-    table: ipc.route_table.Sealed,
-    pack_fd: std.posix.fd_t,
+/// What `host.launch.LaunchOptions.routes` takes for a forked worker that
+/// serves the routes of the artifact in `pack_fd`, which stays the caller's,
+/// all in the VM's main realm.
+pub fn launchRoutes(pack_fd: std.posix.fd_t) host.launch.LaunchRoutes {
+    return .{ .module_pack_fd = pack_fd, .isolate_realm = false };
+}
 
-    pub fn init(pack_fd: std.posix.fd_t, specifier: []const u8) !SingleRoute {
-        const table = try ipc.route_table.buildSealed(std.testing.allocator, &.{.{
-            .entry_specifier = specifier,
-            .bindings = &.{},
-        }});
-        return .{ .table = table, .pack_fd = pack_fd };
-    }
-
-    /// What `host.launch.LaunchOptions.routes` takes; borrows both memfds.
-    pub fn launchRoutes(self: *const SingleRoute) host.launch.LaunchRoutes {
-        return .{ .table = self.table, .module_pack_fd = self.pack_fd, .isolate_realm = false };
-    }
-
-    pub fn deinit(self: *SingleRoute) void {
-        self.table.close();
-        self.* = undefined;
-    }
-};
-
-/// `specifier` itself when it already carries a pack hash, otherwise the
-/// same path under `/__collo_route/test/`; the caller frees the result.
+/// `specifier` itself when it already lies under `module_pack.task_root`,
+/// otherwise the same path below it, as the server keys a definition's
+/// modules; the caller frees the result.
 pub fn routeSpecifier(allocator: std.mem.Allocator, specifier: []const u8) ![]u8 {
-    if (ipc.module_pack.deployHashFromSpecifier(specifier) != null)
+    const task_prefix = ipc.module_pack.task_root ++ "/";
+    if (std.mem.startsWith(u8, specifier, task_prefix))
         return allocator.dupe(u8, specifier);
     const suffix = if (std.mem.startsWith(u8, specifier, "/")) specifier[1..] else specifier;
-    return std.fmt.allocPrint(allocator, "/__collo_route/test/{s}", .{suffix});
+    return std.fmt.allocPrint(allocator, task_prefix ++ "{s}", .{suffix});
 }
 
 /// Wall budget of the readers that take a runtime. An in-process flow has
@@ -362,23 +394,27 @@ pub fn routeSpecifier(allocator: std.mem.Allocator, specifier: []const u8) ![]u8
 pub const default_read_budget_ms: u32 = 10_000;
 
 /// In-process stand-in for the shared state page a host launch builds
-/// (`host.launch.Machine`): the memfd and its writer view. Tests hand
-/// `&fixture.view` and a fresh eventfd from `createCompletionEventfd()` to
-/// `Runtime.init`, the completion channel every forked worker receives too.
+/// (`host.launch.Machine`): the memfd, the worker's writer view of it, which
+/// holds the live slots, and the host's reader view, which drains the
+/// console ring and reads the benchmark record. Tests hand `&fixture.view`
+/// and a fresh eventfd from `createCompletionEventfd()` to `Runtime.init`,
+/// as every forked worker receives both in WorkerInit. The fixture must not
+/// move once a drain ran, since the reader keeps the host's console cursor.
 pub const CompletionFixture = struct {
     memfd: std.posix.fd_t,
     view: worker_shared_page.WorkerWriterView,
+    reader: worker_shared_page.HostReaderView,
 
     pub fn init() !CompletionFixture {
         const memfd = try worker_shared_page.createMemfd("collo-test-worker-metrics");
         errdefer std.posix.close(memfd);
-        var view = try worker_shared_page.mapReadWrite(memfd);
+        var view = try worker_shared_page.mapWorkerWriter(memfd);
         errdefer view.deinit();
-        view.initializeCrashDefault();
-        return .{ .memfd = memfd, .view = view };
+        return .{ .memfd = memfd, .view = view, .reader = try worker_shared_page.mapHostReader(memfd) };
     }
 
     pub fn deinit(self: *CompletionFixture) void {
+        self.reader.deinit();
         self.view.deinit();
         std.posix.close(self.memfd);
         self.* = undefined;
@@ -392,36 +428,102 @@ pub fn createCompletionEventfd() !std.posix.fd_t {
     return std.posix.eventfd(0, std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK);
 }
 
-/// The two completion channels of one worker, as the host client reads
-/// them; the in-process and the forked topologies share the shape.
-pub const CompletionChannels = host.dispatch.CompletionChannels;
+/// Where the host client reads one worker's responses; the in-process and
+/// the forked topologies share the shape.
+pub const ResponseChannels = host.dispatch.ResponseChannels;
 
-pub fn runtimeCompletionChannels(
+pub fn runtimeResponseChannels(
     runtime: *worker.Runtime,
     server_control_fd: std.posix.fd_t,
-) CompletionChannels {
+) ResponseChannels {
     return .{
         .control_fd = server_control_fd,
-        .completion_eventfd = runtime.egress.completion_eventfd,
-        .metrics = runtime.observability.metrics_view,
         .ingress_payload = if (runtime.requests.ingress_payload) |*ingress_payload| ingress_payload else null,
     };
 }
 
-/// Waits up to `default_read_budget_ms` for the completion record of
-/// `request_id` on the metrics page and returns it. The control fd is left
-/// unread, so response frames stay queued on it. `host.dispatch.readResponse`
-/// owns the read order.
-pub fn readWorkerCompletion(
+/// A `request_done` the server's end of a control socket read: the
+/// descriptor that carried it, with the identity the worker sent it under,
+/// and the record.
+pub const ReadRequestDone = struct {
+    descriptor: ipc.ingress_channel.Descriptor,
+    done: ipc.RequestDone,
+};
+
+/// Reads packets from `server_fd`, the server's end of a worker's control
+/// socket, until it holds the `request_done` of every request in
+/// `request_ids`, and writes each into `out` at the index of its id. Every
+/// other descriptor is read and dropped, so responses that interleave come
+/// out in any order. The runtime is not driven meanwhile: the requests ran
+/// to their finish before the call. Fails with `error.RequestDoneMissing`
+/// when the socket stays empty for `default_read_budget_ms` before every
+/// one came.
+pub fn readRequestDones(server_fd: std.posix.fd_t, request_ids: []const u64, out: []ReadRequestDone) !void {
+    std.debug.assert(request_ids.len == out.len);
+    std.debug.assert(request_ids.len <= worker_shared_page.LIVE_SLOT_COUNT);
+    var seen = [_]bool{false} ** worker_shared_page.LIVE_SLOT_COUNT;
+    var seen_count: usize = 0;
+    const scratch = try std.testing.allocator.alloc(u8, ipc.max_message_bytes);
+    defer std.testing.allocator.free(scratch);
+    while (seen_count < request_ids.len) {
+        var polls = [_]std.posix.pollfd{.{ .fd = server_fd, .events = std.posix.POLL.IN, .revents = 0 }};
+        if (try std.posix.poll(&polls, @intCast(default_read_budget_ms)) == 0)
+            return error.RequestDoneMissing;
+        var packet = try ipc.recvPacketWithFdsScratch(std.testing.allocator, server_fd, scratch);
+        if (ipc.ingress_channel.isDescriptorBatchPacket(packet.bytes)) {
+            var batch = try ipc.ingress_channel.decodeReceivedBatchPacket(std.testing.allocator, &packet);
+            defer batch.deinit();
+            for (batch.items) |item|
+                seen_count += try noteRequestDone(item.descriptor, item.payload, request_ids, out, &seen);
+        } else {
+            var single = try ipc.ingress_channel.decodeReceivedPacket(std.testing.allocator, &packet);
+            defer single.deinit();
+            seen_count += try noteRequestDone(single.descriptor, single.payload, request_ids, out, &seen);
+        }
+    }
+}
+
+/// `readRequestDones` for the one request `request_id`.
+pub fn readRequestDoneOf(server_fd: std.posix.fd_t, request_id: u64) !ReadRequestDone {
+    var out: [1]ReadRequestDone = undefined;
+    try readRequestDones(server_fd, &.{request_id}, &out);
+    return out[0];
+}
+
+/// 1 when `descriptor` is the first `request_done` of one of `request_ids`,
+/// which it writes into `out`; 0 for any other descriptor. A second
+/// `request_done` of one request fails the test.
+fn noteRequestDone(
+    descriptor: ipc.ingress_channel.Descriptor,
+    payload: []const u8,
+    request_ids: []const u64,
+    out: []ReadRequestDone,
+    seen: []bool,
+) !usize {
+    if (descriptor.op != @intFromEnum(ipc.ingress_channel.Op.request_done))
+        return 0;
+    const index = std.mem.indexOfScalar(u64, request_ids, descriptor.request_id) orelse return 0;
+    try std.testing.expect(!seen[index]);
+    seen[index] = true;
+    out[index] = .{ .descriptor = descriptor, .done = try ipc.ingress_channel.decodeRequestDone(payload) };
+    return 1;
+}
+
+/// Reads the response of `request_id` from the server's end of the control
+/// socket up to its `request_done`, within `default_read_budget_ms`, and
+/// returns the record: the status the worker ended the request with and
+/// what it measured. The response's frames are read and dropped
+/// (`host.dispatch.readResponse` owns the read order, which needs the
+/// request's response first on the socket; `readRequestDones` reads
+/// interleaved ones).
+pub fn readRequestDone(
     runtime: *worker.Runtime,
     server_control_fd: std.posix.fd_t,
     request_id: u64,
-) !worker_shared_page.WorkerCompletionRecord {
-    var channels = runtimeCompletionChannels(runtime, server_control_fd);
-    channels.control_fd = -1;
-    var response = try readIngressResponseBounded(channels, request_id, default_read_budget_ms);
+) !ipc.RequestDone {
+    var response = try readIngressResponse(runtime, server_control_fd, request_id);
     defer response.deinit();
-    return response.completion;
+    return response.done;
 }
 
 pub fn runRouteAndExpectBody(
@@ -493,9 +595,10 @@ pub fn runRouteAndReadIngressResponse(
     );
 }
 
-/// Registers `source` as the route at `specifier` (`routeSpecifier`) unless
-/// the runtime already holds it, runs one request against it to completion
-/// and reads the response; the caller owns the response.
+/// Boots `runtime` on `source` as the route at `specifier`
+/// (`routeSpecifier`) unless it already serves that route
+/// (`registerRoute`), runs one request against it to completion and reads
+/// the response; the caller owns the response.
 pub fn runRouteAndReadIngressResponseWithRequest(
     runtime: *worker.Runtime,
     server_control_fd: std.posix.fd_t,
@@ -576,8 +679,8 @@ pub fn runRegisteredRouteAndReadBody(
 
 /// Hands `dispatch` to the in-process `runtime` as a request begin with its
 /// encoded bytes inline, then `request.body` as one chunk when it is not
-/// empty. The runtime must hold the route already (`registerRoutePack`).
-/// The caller keeps `dispatch`.
+/// empty. The runtime must serve the route already (`registerRoute`). The
+/// caller keeps `dispatch`.
 pub fn enqueueIngressRoute(
     runtime: *worker.Runtime,
     dispatch: *ipc.DispatchWork,
@@ -629,7 +732,7 @@ pub fn enqueueIngressRoute(
 }
 
 /// Sends `dispatch` and `request.body` on a forked worker's control socket
-/// (`host.dispatch.sendRequest`). The worker took its routes and their pack
+/// (`host.dispatch.sendRequest`). The worker took its definition's artifact
 /// in WorkerInit.
 pub fn sendIngressRoute(
     control_fd: std.posix.fd_t,
@@ -658,7 +761,7 @@ pub fn readIngressResponse(
     server_control_fd: std.posix.fd_t,
     request_id: u64,
 ) !IngressResponse {
-    return host.dispatch.readResponse(std.testing.allocator, runtimeCompletionChannels(runtime, server_control_fd), request_id, .{
+    return host.dispatch.readResponse(std.testing.allocator, runtimeResponseChannels(runtime, server_control_fd), request_id, .{
         .wall_ms = default_read_budget_ms,
         .max_body_bytes = default_read_max_body_bytes,
         .max_headers_bytes = default_read_max_headers_bytes,
@@ -669,10 +772,12 @@ pub fn readIngressResponse(
 
 /// One pass of the in-process worker for `host.dispatch.readResponse`, which
 /// grants the response's credit itself. The harness polls neither the
-/// control socket nor the payload ring, so every pass retries the responses
-/// that wait for them, and a retry that still finds no room waits again.
+/// control socket nor the payload ring, so every pass retries what waits
+/// for them, the `request_done` packets first, and a retry that still finds
+/// no room waits again.
 fn progressResponse(context: ?*anyopaque) !void {
     const runtime: *worker.Runtime = @ptrCast(@alignCast(context.?));
+    try worker.testing.response_finish.flushPendingRequestDones(runtime);
     worker.testing.response_flow.notifyTransport(runtime, .socket);
     worker.testing.response_flow.notifyTransport(runtime, .ring);
     try pumpOnce(runtime);
@@ -699,9 +804,9 @@ pub fn pumpOnce(runtime: *worker.Runtime) !void {
 pub const default_read_max_body_bytes: usize = 64 * 1024 * 1024;
 pub const default_read_max_headers_bytes: usize = 1024 * 1024;
 
-/// The host client's bounded two-channel reader, with the harness allocator.
+/// The host client's bounded reader, with the harness allocator.
 pub fn readIngressResponseBounded(
-    channels: CompletionChannels,
+    channels: ResponseChannels,
     request_id: u64,
     budget_ms: u32,
 ) !IngressResponse {
@@ -712,9 +817,10 @@ pub fn readIngressResponseBounded(
     });
 }
 
-/// Registers `source` as the route at `specifier` (`routeSpecifier`) unless
-/// the runtime already holds it, and runs one request against it on
-/// `stream_id` to completion. The response stays queued for the caller.
+/// Boots `runtime` on `source` as the route at `specifier`
+/// (`routeSpecifier`) unless it already serves that route, and runs one
+/// request against it on `stream_id` to completion. The response and its
+/// `request_done` stay queued for the caller.
 pub fn runH2Route(
     runtime: *worker.Runtime,
     source: []const u8,
@@ -788,7 +894,7 @@ pub const FakeClockPace = struct {
 /// `now_mono_ns`, which the loop moves: by `pace.work_item_ns` for each work
 /// item it runs, and while nothing is ready, by the millisecond it sleeps.
 /// Idle time therefore passes at the real rate, so work another thread
-/// finishes in real time (a crypto job, a gateway packet) is never overtaken
+/// finishes in real time (a gateway packet) is never overtaken
 /// by a fake timer, and a timer still fires however long its delay. Fails with
 /// `error.RequestDidNotComplete` once `pace.budget_ns` of fake time passed: a
 /// request that neither finishes nor is ended by its own timers, such as
@@ -824,9 +930,6 @@ fn collectReadyWork(runtime: *worker.Runtime) !void {
     // A worker without a gateway session has no packets to collect.
     _ = try runtime.collectEgressGatewayPacketsBounded(64);
     runtime.collectModuleSettlements();
-    try runtime.collectCompletedCryptoJobs();
-    try runtime.collectCompletedFetches();
-    try runtime.collectReadyFetchBodies();
     try runtime.collectDueTimers();
     try runtime.collectReadyImmediates();
     try runtime.collectDueRequestDeadlines();
@@ -926,60 +1029,84 @@ pub const RawSession = struct {
     }
 };
 
-/// A gateway engine (`egress/gateway/engine.zig`) whose packet loop runs on
-/// its own thread in the test process, serving one worker session over a
-/// real egress shared session (`ipc.egress_shared`). It runs no admission: it
-/// records each start's token and submits the fetch under the policy
-/// `Options.network` gives its URL, as a real gateway does once the token
-/// verified and named that policy, so the transport checks every hop as in
-/// production. `start` returns it heap-allocated; the caller gives the
-/// worker the fds `takeWorkerSharedFds` returns and ends the gateway with
-/// `deinit`, which panics if that thread failed. Ending it closes the
-/// gateway's end of the session's liveness pipe, which a forked worker sees
-/// as its gateway gone.
+/// The real egress gateway (`egress/gateway/runtime/root.zig:Gateway`) in
+/// the test process, with one shard, serving one worker session over a real
+/// egress shared session (`ipc.egress_shared`) from a thread of its own. Its
+/// hello carries `test_egress_key` and a policy image whose policy
+/// `harness_policy_id` grants what `Options.network` names, so every fetch
+/// start passes the gateway's own admission, and the transport checks every
+/// hop as in production. The thread runs the gateway's loop pass for pass,
+/// except that it reads the worker's command ring itself and hands each
+/// packet to `command_flow.handlePacket`, recording the token of each fetch
+/// start on the way (`recordedFetchStarts`). `start` returns it
+/// heap-allocated; the caller gives the worker the fds `takeWorkerSharedFds`
+/// returns and ends the gateway with `deinit`, which panics if that thread
+/// failed. Ending it closes the gateway's end of the session's liveness
+/// pipe, which a forked worker sees as its gateway gone.
 pub const LocalEgressGateway = struct {
     allocator: std.mem.Allocator,
     worker_fds: ?ipc.egress_shared.SessionFds,
-    endpoint: ipc.egress_shared.Endpoint,
-    publish_mutex: std.Thread.Mutex = .{},
+    /// Touched only by the gateway thread between `start` and `deinit`.
+    gateway: *gateway_runtime.Gateway,
+    /// The server's end of the gateway's control socket. It sends the hello,
+    /// and the gateway's removal reports wait there unread.
+    server_fd: std.posix.fd_t,
     stop_fd: std.posix.fd_t,
-    engine: gateway_engine.Engine,
     network: LocalNetwork,
-    /// The grants `.local_origins` made, one per IPv4 origin, oldest first.
-    /// Only the gateway's thread adds one, before the submit that hands its
-    /// policy to the engine, whose queue orders the write before every
-    /// shard's read, and none changes afterwards.
+    /// Policy `harness_policy_id` under `.local_origins`: the public HTTPS
+    /// grant, then one grant per IPv4 origin a fetch start named, oldest
+    /// first. Only the gateway thread adds one, before the admission that
+    /// copies the policy into that fetch, and none changes afterwards, so a
+    /// fetch keeps the prefix it was admitted under.
+    local_members: [local_grants_max + 1]*const collo_network.Grant = undefined,
+    local_member_count: usize = 0,
     local_grants: [local_grants_max]LocalGrant = undefined,
-    local_grant_count: usize = 0,
-    scratch: []u8,
-    /// Where the gateway thread decodes fetch starts; a decoded view points
-    /// into it until the next decode. It is on the heap because its arrays,
-    /// sized by the protocol's limits, are too large for a stack.
-    decode_scratch: *ipc.GatewayEgressDecodeScratch,
     thread: std.Thread,
     thread_error: ?anyerror = null,
     fetch_start_mutex: std.Thread.Mutex = .{},
-    fetch_start_log: std.ArrayListUnmanaged(FetchStartIdentity) = .empty,
-    /// Body-end packets the engine published, so a test can wait until the
-    /// worker has been sent a whole body.
-    body_ends_published: std.atomic.Value(usize) = .init(0),
+    fetch_starts: [fetch_starts_recorded_max]FetchStartIdentity = undefined,
+    /// Every fetch start the worker sent, the recorded ones and any past
+    /// `fetch_starts_recorded_max`.
+    fetch_start_count: usize = 0,
+    mailbox: Mailbox,
 
-    const worker_session_id: u64 = local_egress_session_id;
     /// Distinct IPv4 origins one gateway grants under `.local_origins`; a
-    /// test starts a handful. A fetch to one more fails.
+    /// test starts a handful. A fetch to one more is refused by the
+    /// transport.
     const local_grants_max: usize = 32;
+    /// Fetch starts whose tokens `recordedFetchStarts` keeps, above any
+    /// test's count. A start past them is counted but not kept, so a test
+    /// that expects more sees too few.
+    const fetch_starts_recorded_max: usize = 256;
+    /// How long `queueCompletionPacket` waits for the gateway thread, which
+    /// answers within one pass of its loop.
+    const mailbox_timeout_ns: u64 = 5 * std.time.ns_per_s;
+    const wait_tick_ms: i32 = @intCast(egress_gateway.readiness.wait_tick_ns / std.time.ns_per_ms);
+    const security_cell_id: egress_gateway.policy.SecurityCellId = @splat(1);
 
-    /// The grant of one IPv4 literal on one port with both flags, and the
-    /// policy of that grant alone. It points into itself, so it lives in the
-    /// gateway's heap allocation, which never moves, until `deinit`.
+    /// The grant of one IPv4 literal on one port with both flags. Policy
+    /// members point into it, so it lives in the harness's heap allocation,
+    /// which never moves, until `deinit`.
     const LocalGrant = struct {
         rule: [1]collo_network.Pattern,
         grant: collo_network.Grant,
-        members: [1]*const collo_network.Grant,
+    };
+
+    /// A completion packet the test thread hands the gateway thread, which
+    /// is the ring's only producer, as in production.
+    const Mailbox = struct {
+        mutex: std.Thread.Mutex = .{},
+        condition: std.Thread.Condition = .{},
+        /// Written by the test thread once `packet` is set; the gateway
+        /// thread polls it.
+        fd: std.posix.fd_t,
+        packet: ?[]const u8 = null,
+        done: bool = false,
+        failure: ?anyerror = null,
     };
 
     pub const Options = struct {
-        /// The engine's limits.
+        /// The gateway's limits.
         policy: egress_gateway.policy.Policy = .{},
         /// What the fetches may reach. `local_origin_network` reaches a
         /// `LocalOrigin`; the default admits public HTTPS hosts only.
@@ -998,6 +1125,8 @@ pub const LocalEgressGateway = struct {
     /// `wake_set` (`ipc.egress_shared.createSessionForWorker`): a test that
     /// moves a worker to a new gateway starts both gateways on the worker's
     /// one wake set, whose descriptors the worker's ring registered at boot.
+    /// Each gateway's first session has id `local_egress_session_id`, which
+    /// every harness token names.
     pub fn startOnWakeSet(
         allocator: std.mem.Allocator,
         options: Options,
@@ -1008,45 +1137,53 @@ pub const LocalEgressGateway = struct {
         var gateway_raw = try dupSharedFds(worker_fds.rawForGateway());
         errdefer gateway_raw.close();
         var endpoint = try ipc.egress_shared.mapEndpointTakeForGateway(&gateway_raw);
-        errdefer endpoint.deinit();
-        endpoint.command.setSession(worker_session_id, worker_session_id);
-        endpoint.completion.setSession(worker_session_id, worker_session_id);
-        endpoint.body_pool.setSession(worker_session_id, worker_session_id);
-        endpoint.upload_pool.setSession(worker_session_id, worker_session_id);
-
-        const stop_fd = try std.posix.eventfd(0, std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK);
-        errdefer std.posix.close(stop_fd);
-        var engine = try gateway_engine.Engine.init(allocator, .{
-            .queue_capacity = 64,
-            .h2_connector_count = 1,
-            .policy = options.policy,
-        });
-        errdefer engine.deinit();
-        const scratch = try allocator.alloc(u8, ipc.max_message_bytes);
-        errdefer allocator.free(scratch);
-        const decode_scratch = try allocator.create(ipc.GatewayEgressDecodeScratch);
-        errdefer allocator.destroy(decode_scratch);
-        decode_scratch.* = .{};
+        var endpoint_owned = true;
+        errdefer if (endpoint_owned) endpoint.deinit();
 
         const self = try allocator.create(LocalEgressGateway);
         errdefer allocator.destroy(self);
+        const stop_fd = try std.posix.eventfd(0, std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK);
+        errdefer std.posix.close(stop_fd);
+        const mailbox_fd = try std.posix.eventfd(0, std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK);
+        errdefer std.posix.close(mailbox_fd);
+        const control_pair = try fd_mod.socketPairType(
+            std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC | std.posix.SOCK.NONBLOCK,
+        );
+        errdefer std.posix.close(control_pair[1]);
+        const gateway = allocator.create(gateway_runtime.Gateway) catch |err| {
+            std.posix.close(control_pair[0]);
+            return err;
+        };
+        errdefer allocator.destroy(gateway);
+        // The gateway owns its end of the control socket from this call on.
+        try gateway.init(allocator, control_pair[0], .{
+            .shard_count = 1,
+            .sessions_max = 1,
+            .policy = options.policy,
+        });
+        errdefer gateway.deinit();
+
         self.* = .{
             .allocator = allocator,
             .worker_fds = worker_fds,
-            .endpoint = endpoint,
+            .gateway = gateway,
+            .server_fd = control_pair[1],
             .stop_fd = stop_fd,
-            .engine = engine,
             .network = options.network,
-            .scratch = scratch,
-            .decode_scratch = decode_scratch,
             .thread = undefined,
+            .mailbox = .{ .fd = mailbox_fd },
         };
-        self.engine.setPacketSender(self, sendPacketCallback);
-        self.engine.setBodyChunkBatchSender(publishBodyChunkBatchCallback);
-        try self.engine.start();
+        try self.sendHello();
+        const attached = try gateway_runtime.session_flow.attachSession(gateway, &endpoint, security_cell_id);
+        endpoint_owned = false;
+        if (attached.session_id != local_egress_session_id)
+            return error.UnexpectedLocalEgressSession;
+        switch (options.network) {
+            .public_https => {},
+            .local_origins => self.installLocalPolicy(),
+        }
+        try gateway.startShards();
         self.thread = try std.Thread.spawn(.{}, threadMain, .{self});
-        worker_fds = .{};
-        endpoint = undefined;
         return self;
     }
 
@@ -1065,43 +1202,48 @@ pub const LocalEgressGateway = struct {
         self.thread.join();
         if (self.thread_error) |err|
             std.debug.panic("local egress gateway test thread exited with {s}", .{@errorName(err)});
-        self.engine.deinit();
-        self.endpoint.deinit();
-        self.allocator.free(self.scratch);
-        self.allocator.destroy(self.decode_scratch);
-        self.fetch_start_log.deinit(self.allocator);
+        // Ends the session's fetches, stops the shard and closes the gateway's control end.
+        self.gateway.deinit();
+        self.allocator.destroy(self.gateway);
+        std.posix.close(self.server_fd);
         std.posix.close(self.stop_fd);
+        std.posix.close(self.mailbox.fd);
         const allocator = self.allocator;
         self.* = undefined;
         allocator.destroy(self);
     }
 
-    /// Copies the recorded FetchStart identities (in arrival order) into
-    /// `out`; returns how many were copied. A recording dropped on OOM fails
-    /// the fixture's count assertion, so that assertion never passes
-    /// vacuously.
+    /// Copies the tokens of the fetch starts the worker sent, in arrival
+    /// order, into `out` and returns how many it copied.
     pub fn recordedFetchStarts(self: *LocalEgressGateway, out: []FetchStartIdentity) usize {
         self.fetch_start_mutex.lock();
         defer self.fetch_start_mutex.unlock();
-        const count = @min(out.len, self.fetch_start_log.items.len);
-        @memcpy(out[0..count], self.fetch_start_log.items[0..count]);
+        const kept = @min(self.fetch_start_count, self.fetch_starts.len);
+        const count = @min(out.len, kept);
+        @memcpy(out[0..count], self.fetch_starts[0..count]);
         return count;
-    }
-
-    /// The body-end packets the engine has written on the worker's
-    /// completion ring so far.
-    pub fn publishedBodyEnds(self: *const LocalEgressGateway) usize {
-        return self.body_ends_published.load(.acquire);
     }
 
     /// Writes `bytes` on the worker's completion ring as one packet and wakes
     /// the worker, for a test that plays a gateway breaking the protocol.
+    /// The gateway thread writes it, so the ring keeps one producer, and the
+    /// call returns once it did. Fails with the ring's error, or when the
+    /// gateway thread no longer answers or holds no session.
     pub fn queueCompletionPacket(self: *LocalEgressGateway, bytes: []const u8) !void {
-        const result = try egress_gateway.publisher.queuePacketForTarget(
-            self.publisherTarget(),
-            bytes,
-        );
-        self.notifyCompletionIfNeeded(result);
+        self.mailbox.mutex.lock();
+        defer self.mailbox.mutex.unlock();
+        self.mailbox.packet = bytes;
+        self.mailbox.done = false;
+        self.mailbox.failure = null;
+        defer self.mailbox.packet = null;
+        signalEventFd(self.mailbox.fd);
+        while (!self.mailbox.done) {
+            self.mailbox.condition.timedWait(&self.mailbox.mutex, mailbox_timeout_ns) catch |err| switch (err) {
+                error.Timeout => return error.LocalEgressGatewayUnresponsive,
+            };
+        }
+        if (self.mailbox.failure) |err|
+            return err;
     }
 
     fn threadMain(self: *LocalEgressGateway) void {
@@ -1110,121 +1252,188 @@ pub const LocalEgressGateway = struct {
         };
     }
 
+    /// The gateway's loop (`Gateway.step`) on a `poll` of the descriptors one
+    /// session and one shard bring, with the tap of `handleCommands`. Returns
+    /// when `deinit` asks; fails, which `deinit` reports, where the
+    /// gateway's own loop would end the process.
     fn run(self: *LocalEgressGateway) !void {
-        var pollfds = [_]std.posix.pollfd{
-            .{ .fd = self.stop_fd, .events = std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR, .revents = 0 },
-            .{ .fd = self.engine.wake_fd, .events = std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR, .revents = 0 },
-            .{ .fd = self.endpoint.command_eventfd, .events = std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR, .revents = 0 },
-        };
+        const gateway = self.gateway;
+        const shard_wake_fd = gateway.shards.get(0).engine.wake_fd;
+        const watched = std.posix.POLL.IN;
         while (true) {
-            for (&pollfds) |*pollfd|
-                pollfd.revents = 0;
-            _ = try std.posix.poll(&pollfds, -1);
-
-            if ((pollfds[0].revents & (std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR)) != 0) {
-                drainEventFd(self.stop_fd);
+            var pollfds: [5]std.posix.pollfd = .{
+                .{ .fd = self.stop_fd, .events = watched, .revents = 0 },
+                .{ .fd = self.mailbox.fd, .events = watched, .revents = 0 },
+                .{ .fd = shard_wake_fd, .events = watched, .revents = 0 },
+                undefined,
+                undefined,
+            };
+            var watched_count: usize = 3;
+            if (gateway.sessions.byId(local_egress_session_id)) |session| {
+                pollfds[3] = .{ .fd = session.endpoint.command_eventfd, .events = watched, .revents = 0 };
+                // The liveness descriptor reports only its hang-up.
+                pollfds[4] = .{ .fd = session.endpoint.peer_liveness_fd, .events = 0, .revents = 0 };
+                watched_count = 5;
+            }
+            _ = try std.posix.poll(pollfds[0..watched_count], wait_tick_ms);
+            if (pollfds[0].revents != 0)
                 return;
-            }
-            if ((pollfds[1].revents & std.posix.POLL.IN) != 0)
-                try self.engine.collectReady();
-            if ((pollfds[2].revents & (std.posix.POLL.HUP | std.posix.POLL.ERR)) != 0) {
-                self.engine.detachWorker(worker_session_id);
-                return;
-            }
-            if ((pollfds[2].revents & std.posix.POLL.IN) != 0) {
-                try self.handleWorkerPackets();
-                try self.engine.collectReady();
-            }
-        }
-    }
 
-    /// Reads every command the worker queued. The worker signals the command
-    /// eventfd only when the ring may have been empty
-    /// (`notifyAfterPacketWrite` in `common/ipc/egress_shared/wake.zig`), so
-    /// a wake that left a packet behind would strand it, and every command
-    /// after it, until an unrelated wake.
-    fn handleWorkerPackets(self: *LocalEgressGateway) !void {
-        ipc.egress_shared.drainEventfd(self.endpoint.command_eventfd);
-        while (try self.endpoint.command.readPacket(self.scratch)) |bytes| {
-            try self.handleCommand(bytes);
-        }
-    }
-
-    /// Handles one command packet `bytes`, which lives in `scratch` until the
-    /// next read.
-    fn handleCommand(self: *LocalEgressGateway, bytes: []const u8) !void {
-        if (bytes.len < @sizeOf(u32))
-            return error.ShortRead;
-
-        const kind = try ipc.decodeMessageKind(ipc.packet.readStruct(u32, bytes[0..@sizeOf(u32)]));
-        switch (kind) {
-            .egress_fetch_start => {
-                const fetch = try ipc.decodeEgressFetchStart(self.decode_scratch, bytes);
-                {
-                    self.fetch_start_mutex.lock();
-                    defer self.fetch_start_mutex.unlock();
-                    self.fetch_start_log.append(self.allocator, .{
-                        .egress_token = fetch.egress_token,
-                    }) catch {};
+            if (pollfds[2].revents != 0)
+                try gateway_runtime.shard_flow.handleShardReady(gateway, 0, pollfds[2].revents);
+            // A shard pass marks a session for drop and never removes it, so the session the poll
+            // watched is still registered.
+            if (watched_count == 5) {
+                const index = gateway.sessions.indexOf(local_egress_session_id).?;
+                if ((pollfds[4].revents & (std.posix.POLL.HUP | std.posix.POLL.ERR)) != 0) {
+                    try gateway_runtime.session_flow.removeSession(gateway, index, .liveness_closed);
+                } else if ((pollfds[3].revents & std.posix.POLL.IN) != 0) {
+                    if (!self.handleCommands(gateway.sessions.byIndex(index)))
+                        try gateway_runtime.session_flow.removeSession(gateway, index, .command_ring_failed);
                 }
-                // Without admission the token is read unverified: its fields
-                // only name the fetch's request inside the engine.
-                const token = ipc.egress_token.fromBytes(&fetch.egress_token);
-                const network = self.policyFor(fetch.url) catch |err| {
-                    try self.sendFetchError(fetch.fetch_id, fetch.body_id, @errorName(err));
-                    return;
-                };
-                self.engine.submit(worker_session_id, fetch, .{
-                    // One session: every fetch shares the zero pool key,
-                    // which a test with one origin per policy never splits.
-                    .isolation = .{},
-                    .network = network,
-                    .budget_key = .{
-                        .session_id = token.session_id,
-                        .request_id = token.request_id,
-                        .request_generation = token.request_generation,
-                    },
-                }) catch |err| {
-                    try self.sendFetchError(fetch.fetch_id, fetch.body_id, @errorName(err));
-                };
-            },
-            .egress_cancel => {
-                if (bytes.len < @sizeOf(ipc.EgressCancel))
-                    return error.InvalidEgressPacket;
-                const cancel = ipc.packet.readStruct(ipc.EgressCancel, bytes[0..@sizeOf(ipc.EgressCancel)]);
-                const expected_len = @sizeOf(ipc.EgressCancel) + @as(usize, @intCast(cancel.reason_len));
-                if (expected_len != bytes.len)
-                    return error.InvalidEgressPacket;
-                self.engine.cancelFetch(worker_session_id, cancel);
-            },
-            .egress_release_body => {
-                if (bytes.len != @sizeOf(ipc.EgressReleaseBody))
-                    return error.InvalidEgressPacket;
-                const release = ipc.packet.readStruct(ipc.EgressReleaseBody, bytes);
-                self.engine.releaseBody(worker_session_id, release);
-            },
-            else => return error.InvalidEgressPacket,
+            }
+            if (pollfds[1].revents != 0)
+                self.answerMailbox();
+
+            gateway_runtime.upload_flow.expire(gateway, os_process.monotonicNowNsOrZero());
+            try gateway_runtime.session_flow.processAttention(gateway, os_process.monotonicNowNsOrZero());
+            try gateway_runtime.session_flow.removeDroppedSessions(gateway);
         }
     }
 
-    /// The policy a fetch of `url` runs under: `public_https` for every URL
-    /// under `.public_https` and for a URL whose host is no IPv4 literal,
-    /// else the grant of that literal on the URL's port, made on the first
-    /// fetch to it.
-    fn policyFor(self: *LocalEgressGateway, url: []const u8) error{TooManyLocalOrigins}!collo_network.Policy {
+    /// `command_flow.handleCommands`, step for step, with each fetch start
+    /// noted before the gateway handles it (`noteCommand`). Returns false
+    /// when the session must be removed.
+    fn handleCommands(self: *LocalEgressGateway, session: *egress_gateway.sessions.Session) bool {
+        const gateway = self.gateway;
+        ipc.egress_shared.drainEventfd(session.endpoint.command_eventfd);
+        gateway_runtime.release_flow.drainReleases(gateway, session);
+        defer gateway_runtime.session_flow.wakeWorkerAfterCommandDrops(session);
+        var drained: usize = 0;
+        while (drained < gateway_runtime.command_flow.command_drain_batch) : (drained += 1) {
+            // A ring that fails its checks breaks the protocol, as in `command_flow.handleCommands`.
+            const read = session.endpoint.command.readPacket(gateway.read_scratch) catch return false;
+            const packet = read orelse return true;
+            self.noteCommand(packet);
+            if (!gateway_runtime.command_flow.handlePacket(gateway, session, packet))
+                return false;
+        }
+        ipc.egress_shared.notify(session.endpoint.command_eventfd);
+        return true;
+    }
+
+    /// Records the token of a fetch start and, under `.local_origins`,
+    /// grants the origin its URL names before admission reads the policy. A
+    /// packet that is no fetch start, or does not decode, is left to the
+    /// gateway, which removes the session for one it cannot decode.
+    fn noteCommand(self: *LocalEgressGateway, packet: []const u8) void {
+        if (packet.len < @sizeOf(u32))
+            return;
+        const kind = ipc.decodeMessageKind(ipc.packet.readStruct(u32, packet[0..@sizeOf(u32)])) catch return;
+        if (kind != .egress_fetch_start)
+            return;
+        const fetch = ipc.decodeEgressFetchStart(self.gateway.decode_scratch, packet) catch return;
+        self.grantLocalOrigin(fetch.url);
+        self.fetch_start_mutex.lock();
+        defer self.fetch_start_mutex.unlock();
+        if (self.fetch_start_count < self.fetch_starts.len)
+            self.fetch_starts[self.fetch_start_count] = .{ .egress_token = fetch.egress_token };
+        self.fetch_start_count += 1;
+    }
+
+    /// Writes the packet the test thread handed over, if any, and wakes the
+    /// test thread with the outcome.
+    fn answerMailbox(self: *LocalEgressGateway) void {
+        drainEventFd(self.mailbox.fd);
+        self.mailbox.mutex.lock();
+        defer self.mailbox.mutex.unlock();
+        const bytes = self.mailbox.packet orelse return;
+        if (self.mailbox.done)
+            return;
+        self.mailbox.failure = self.writeCompletion(bytes);
+        self.mailbox.done = true;
+        self.mailbox.condition.signal();
+    }
+
+    fn writeCompletion(self: *LocalEgressGateway, bytes: []const u8) ?anyerror {
+        const session = self.gateway.sessions.byId(local_egress_session_id) orelse
+            return error.LocalEgressSessionRemoved;
+        const result = egress_gateway.publisher.queuePacket(&session.endpoint, bytes) catch |err|
+            return err;
+        ipc.egress_shared.notifyAfterPacketWrite(session.endpoint.completion_eventfd, result);
+        return null;
+    }
+
+    /// Sends the hello a server sends, carrying `test_egress_key` and
+    /// `helloImage`, and has the gateway take it.
+    fn sendHello(self: *LocalEgressGateway) !void {
+        const image = try helloImage(self.allocator);
+        defer self.allocator.free(image);
+        var memfd = fd_mod.OwnedFd.fromRaw(try std.posix.memfd_create(
+            "collo-test-policy-image",
+            std.os.linux.MFD.CLOEXEC | std.os.linux.MFD.ALLOW_SEALING,
+        ));
+        defer memfd.deinit();
+        try fd_mod.writeAllRaw(memfd.fd(), image);
+        try fd_mod.addSeals(memfd.fd(), fd_mod.memfd_readonly_seals);
+        try egress_gateway.control.sendHello(self.server_fd, &test_egress_key, memfd.fd(), @intCast(image.len));
+        if (try gateway_runtime.control_flow.drainControl(self.gateway))
+            return error.LocalEgressGatewayStopped;
+        if (!self.gateway.hello.received)
+            return error.LocalEgressGatewayHelloLost;
+    }
+
+    /// The hello's policy image, built as a server builds one: policy
+    /// `harness_policy_id` grants any public host over HTTPS on the default
+    /// port, as a `"*"` grant does.
+    fn helloImage(allocator: std.mem.Allocator) ![]u8 {
+        var builder = collo_network.Builder.init(allocator);
+        defer builder.deinit();
+        const any_host = [_]collo_network.Pattern{.{ .host = .any, .port = 0 }};
+        const grant = try builder.addGrant(.{ .allow = &any_host });
+        const policy_id = try builder.addPolicy(&[_]collo_network.table.GrantId{grant});
+        if (policy_id != harness_policy_id)
+            return error.UnexpectedLocalEgressPolicyId;
+        return builder.encode(allocator);
+    }
+
+    /// Makes policy `harness_policy_id` the public HTTPS grant alone, the
+    /// start of what `.local_origins` extends.
+    fn installLocalPolicy(self: *LocalEgressGateway) void {
+        self.local_members[0] = collo_network.public_https.grants[0];
+        self.local_member_count = 1;
+        self.publishLocalPolicy();
+    }
+
+    /// Puts the members so far in the gateway's decoded table, where
+    /// admission finds the policy a token names and copies it into the
+    /// fetch.
+    fn publishLocalPolicy(self: *LocalEgressGateway) void {
+        self.gateway.hello.table.?.policies[harness_policy_id] = .{
+            .grants = self.local_members[0..self.local_member_count],
+        };
+    }
+
+    /// Under `.local_origins`, adds the grant of `url`'s IPv4 literal on its
+    /// port to policy `harness_policy_id` unless it holds one. A URL whose
+    /// host is no IPv4 literal gets nothing, nor does one origin past
+    /// `local_grants_max`, and the transport judges it on the grants there
+    /// are.
+    fn grantLocalOrigin(self: *LocalEgressGateway, url: []const u8) void {
         switch (self.network) {
-            .public_https => return collo_network.public_https,
+            .public_https => return,
             .local_origins => {},
         }
-        const origin = ipv4OriginOf(url) orelse return collo_network.public_https;
-        for (self.local_grants[0..self.local_grant_count]) |*slot| {
+        const origin = ipv4OriginOf(url) orelse return;
+        const granted = self.local_member_count - 1;
+        for (self.local_grants[0..granted]) |*slot| {
             const rule = slot.rule[0];
             if (std.mem.eql(u8, &rule.host.ipv4, &origin.bytes) and rule.port == origin.port)
-                return .{ .grants = &slot.members };
+                return;
         }
-        if (self.local_grant_count == local_grants_max)
-            return error.TooManyLocalOrigins;
-        const slot = &self.local_grants[self.local_grant_count];
+        if (granted == local_grants_max)
+            return;
+        const slot = &self.local_grants[granted];
         slot.rule = .{.{ .host = .{ .ipv4 = origin.bytes }, .port = origin.port }};
         slot.grant = .{
             .allow_http = true,
@@ -1235,9 +1444,9 @@ pub const LocalEgressGateway = struct {
             .ipv4 = &slot.rule,
             .ipv6 = &.{},
         };
-        slot.members = .{&slot.grant};
-        self.local_grant_count += 1;
-        return .{ .grants = &slot.members };
+        self.local_members[self.local_member_count] = &slot.grant;
+        self.local_member_count += 1;
+        self.publishLocalPolicy();
     }
 
     const Ipv4Origin = struct { bytes: [4]u8, port: u16 };
@@ -1256,73 +1465,6 @@ pub const LocalEgressGateway = struct {
         const host_text = uri.getHost(&host_buffer) catch return null;
         const address = std.net.Address.parseIp4(host_text, 0) catch return null;
         return .{ .bytes = collo_network.address.ipv4Bytes(address), .port = uri.port orelse default_port };
-    }
-
-    fn sendFetchError(self: *LocalEgressGateway, fetch_id: u64, body_id: u64, message: []const u8) !void {
-        const bytes = try ipc.encodeEgressFetchErrorInto(self.scratch, .{
-            .fetch_id = fetch_id,
-            .body_id = body_id,
-            .message = message,
-        });
-        const result = try egress_gateway.publisher.queuePacketForTarget(
-            self.publisherTarget(),
-            bytes,
-        );
-        self.notifyCompletionIfNeeded(result);
-    }
-
-    fn sendPacketCallback(ctx: ?*anyopaque, session_id: u64, bytes: []const u8) !void {
-        if (session_id != LocalEgressGateway.worker_session_id)
-            return error.InvalidEgressPacket;
-        const self: *LocalEgressGateway = @ptrCast(@alignCast(ctx orelse return error.InvalidEgressPacket));
-        const result = try egress_gateway.publisher.queuePacketForTarget(
-            self.publisherTarget(),
-            bytes,
-        );
-        self.notifyCompletionIfNeeded(result);
-        // Counted once the packet is on the ring, so a test that sees the
-        // count can collect the end.
-        const body_end_kind: u32 = @intFromEnum(ipc.MessageKind.egress_body_end);
-        if (bytes.len >= @sizeOf(u32) and ipc.packet.readStruct(u32, bytes[0..@sizeOf(u32)]) == body_end_kind)
-            _ = self.body_ends_published.fetchAdd(1, .release);
-    }
-
-    fn publishBodyChunkBatchCallback(
-        ctx: ?*anyopaque,
-        session_id: u64,
-        fetch_id: u64,
-        body_id: u64,
-        chunks: []const gateway_engine.BodyChunkPayload,
-        scratch: []u8,
-    ) !usize {
-        if (session_id != LocalEgressGateway.worker_session_id)
-            return error.InvalidEgressPacket;
-        const self: *LocalEgressGateway = @ptrCast(@alignCast(ctx orelse return error.InvalidEgressPacket));
-        var extents: [ipc.egress_shared.body_pool_slot_count]egress_gateway.publisher.PublishedExtent = undefined;
-        const result = try egress_gateway.publisher.publishBodyChunkBatchForTarget(
-            self.publisherTarget(),
-            fetch_id,
-            body_id,
-            chunks,
-            scratch,
-            &extents,
-        );
-        self.notifyCompletionIfNeeded(result.write);
-        return result.extents;
-    }
-
-    fn notifyCompletionIfNeeded(
-        self: *LocalEgressGateway,
-        result: ipc.egress_shared.PacketWriteResult,
-    ) void {
-        ipc.egress_shared.notifyAfterPacketWrite(self.endpoint.completion_eventfd, result);
-    }
-
-    fn publisherTarget(self: *LocalEgressGateway) egress_gateway.publisher.Target {
-        return .{
-            .endpoint = &self.endpoint,
-            .publish_mutex = &self.publish_mutex,
-        };
     }
 };
 

@@ -58,7 +58,6 @@ const healthy: server_responses.HealthState = .{
     .zygote_alive = true,
     .lanes_running = 7,
     .lanes_total = 7,
-    .usage_stream_full = false,
 };
 
 fn expectHealth(state: server_responses.HealthState, status: u16, body: []const u8) !void {
@@ -73,21 +72,11 @@ fn expectHealth(state: server_responses.HealthState, status: u16, body: []const 
     try std.testing.expect(parsed.value == .object);
 }
 
-test "the health answer is 200 with every lane counted while the server can serve" {
+test "the health answer is 200 with every lane counted while the server can serve, and reports no usage stream" {
     try expectHealth(
         healthy,
         200,
-        "{\"status\":\"ok\",\"zygote\":\"alive\",\"lanes\":{\"running\":7,\"total\":7},\"usage_stream\":\"ok\"}",
-    );
-
-    // A full usage stream drops usage records but sheds no request, so it is
-    // reported and the status stays ok.
-    var usage_full = healthy;
-    usage_full.usage_stream_full = true;
-    try expectHealth(
-        usage_full,
-        200,
-        "{\"status\":\"ok\",\"zygote\":\"alive\",\"lanes\":{\"running\":7,\"total\":7},\"usage_stream\":\"full\"}",
+        "{\"status\":\"ok\",\"zygote\":\"alive\",\"lanes\":{\"running\":7,\"total\":7}}",
     );
 }
 
@@ -97,7 +86,7 @@ test "the health answer is 503 and degraded once the zygote exited or a lane sto
     try expectHealth(
         zygote_exited,
         503,
-        "{\"status\":\"degraded\",\"zygote\":\"exited\",\"lanes\":{\"running\":7,\"total\":7},\"usage_stream\":\"ok\"}",
+        "{\"status\":\"degraded\",\"zygote\":\"exited\",\"lanes\":{\"running\":7,\"total\":7}}",
     );
 
     var lane_stopped = healthy;
@@ -105,7 +94,7 @@ test "the health answer is 503 and degraded once the zygote exited or a lane sto
     try expectHealth(
         lane_stopped,
         503,
-        "{\"status\":\"degraded\",\"zygote\":\"alive\",\"lanes\":{\"running\":6,\"total\":7},\"usage_stream\":\"ok\"}",
+        "{\"status\":\"degraded\",\"zygote\":\"alive\",\"lanes\":{\"running\":6,\"total\":7}}",
     );
 }
 
@@ -115,14 +104,14 @@ test "the health answer is 503 and stopping while the server drains, whatever el
     try expectHealth(
         stopping,
         503,
-        "{\"status\":\"stopping\",\"zygote\":\"alive\",\"lanes\":{\"running\":7,\"total\":7},\"usage_stream\":\"ok\"}",
+        "{\"status\":\"stopping\",\"zygote\":\"alive\",\"lanes\":{\"running\":7,\"total\":7}}",
     );
 
     stopping.zygote_alive = false;
     try expectHealth(
         stopping,
         503,
-        "{\"status\":\"stopping\",\"zygote\":\"exited\",\"lanes\":{\"running\":7,\"total\":7},\"usage_stream\":\"ok\"}",
+        "{\"status\":\"stopping\",\"zygote\":\"exited\",\"lanes\":{\"running\":7,\"total\":7}}",
     );
 }
 
@@ -132,7 +121,6 @@ test "the widest health body fits its bound exactly" {
         .zygote_alive = false,
         .lanes_running = std.math.maxInt(u16),
         .lanes_total = std.math.maxInt(u16),
-        .usage_stream_full = true,
     };
     var buffer: [server_responses.health_body_bytes_max]u8 = undefined;
     const response = server_responses.health(widest, &buffer);

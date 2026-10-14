@@ -1,5 +1,6 @@
 // Host functions for the `SubtleCrypto` methods, which `installWebApiCrypto` puts on `SubtleCrypto.prototype`. Each
-// returns a promise, and a bad argument rejects it rather than throwing.
+// runs its operation on the VM thread before it returns and gives back a promise already settled with the result; a
+// step that throws rejects the promise instead (`promiseFromThrowingSteps` in js_support.h).
 
 #pragma once
 

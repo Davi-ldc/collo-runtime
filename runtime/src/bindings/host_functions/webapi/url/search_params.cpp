@@ -14,22 +14,21 @@
 #include <JavaScriptCore/IdentifierInlines.h>
 #include <JavaScriptCore/InternalFunction.h>
 #include <JavaScriptCore/IteratorOperations.h>
-#include <JavaScriptCore/JSCInlines.h>
 #include <JavaScriptCore/JSArray.h>
+#include <JavaScriptCore/JSCInlines.h>
 #include <JavaScriptCore/JSFunction.h>
 #include <JavaScriptCore/JSObject.h>
 #include <JavaScriptCore/JSString.h>
 #include <JavaScriptCore/ObjectConstructor.h>
 #include <JavaScriptCore/PropertyNameArray.h>
 #include <JavaScriptCore/SlotVisitorMacros.h>
-#include <wtf/HashMap.h>
+#include <wtf/SaturatingArithmetic.h>
 #include <wtf/URLParser.h>
 #include <wtf/text/MakeString.h>
 #include <wtf/text/StringImpl.h>
 #include <wtf/text/WTFString.h>
 
 #include <algorithm>
-#include <limits>
 
 namespace Collo::HostFunctions {
 namespace {
@@ -44,20 +43,6 @@ namespace {
         Keys,
         Values,
     };
-
-    static size_t saturatingAdd(size_t left, size_t right)
-    {
-        if (right > std::numeric_limits<size_t>::max() - left)
-            return std::numeric_limits<size_t>::max();
-        return left + right;
-    }
-
-    static size_t saturatingMultiply(size_t left, size_t right)
-    {
-        if (left && right > std::numeric_limits<size_t>::max() / left)
-            return std::numeric_limits<size_t>::max();
-        return left * right;
-    }
 
     static size_t stringMemoryCost(const String& value)
     {
@@ -140,8 +125,8 @@ namespace {
         if (pair_count <= WebApiUrlSearchParamsPairsMax)
             return false;
         JSC::throwException(global_object, scope,
-            createDOMException(global_object, DOMExceptionCode::QuotaExceededError,
-                "URLSearchParams exceeds the serverless pair count limit"_s));
+            createDOMException(
+                global_object, DOMExceptionCode::QuotaExceededError, "URLSearchParams exceeds its pair count limit"_s));
         return true;
     }
 
@@ -606,57 +591,6 @@ namespace {
         return JSValue::encode(JSC::jsString(vm, WTF::URLParser::serialize(params->pairs())));
     }
 
-    // toJSON is not part of the URL Standard. It returns one property per name, holding a string for a name that
-    // occurs once and an array of values, in order, for a repeated name.
-    struct SearchParamsJSONGroup {
-        String key;
-        WTF::Vector<String, 2> values;
-    };
-
-    JSC_DEFINE_HOST_FUNCTION(urlSearchParamsToJSON, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
-    {
-        auto& vm = global_object->vm();
-        auto scope = DECLARE_THROW_SCOPE(vm);
-        auto* params = requireSearchParams(global_object, scope, call_frame->thisValue());
-        RETURN_IF_EXCEPTION(scope, {});
-
-        WTF::Vector<SearchParamsJSONGroup, 4> groups;
-        WTF::HashMap<String, unsigned> group_indices;
-        for (auto& pair : params->pairs()) {
-            auto add_result = group_indices.add(pair.key, groups.size());
-            auto* group = add_result.isNewEntry ? nullptr : &groups[add_result.iterator->value];
-            if (add_result.isNewEntry) {
-                if (!groups.tryAppend(SearchParamsJSONGroup { pair.key, {} })) {
-                    JSC::throwOutOfMemoryError(global_object, scope);
-                    return {};
-                }
-                group = &groups.last();
-            }
-            if (!group->values.tryAppend(pair.value)) {
-                JSC::throwOutOfMemoryError(global_object, scope);
-                return {};
-            }
-        }
-
-        auto* output = JSC::constructEmptyObject(global_object, global_object->objectPrototype(), groups.size());
-        output->putDirect(vm, vm.propertyNames->toStringTagSymbol, JSC::jsNontrivialString(vm, "URLSearchParams"_s),
-            JSC::PropertyAttribute::ReadOnly | JSC::PropertyAttribute::DontEnum);
-        for (auto& group : groups) {
-            auto identifier = JSC::Identifier::fromString(vm, group.key);
-            if (group.values.size() == 1) {
-                output->putDirectMayBeIndex(global_object, identifier, JSC::jsString(vm, group.values[0]));
-                continue;
-            }
-
-            auto* array = JSC::constructEmptyArray(global_object, nullptr, group.values.size());
-            for (unsigned value_index = 0; value_index < group.values.size(); value_index++)
-                array->putDirectIndex(global_object, value_index, JSC::jsString(vm, group.values[value_index]));
-            output->putDirectMayBeIndex(global_object, identifier, array);
-        }
-
-        return JSValue::encode(output);
-    }
-
     JSC_DEFINE_HOST_FUNCTION(
         urlSearchParamsIteratorNext, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
     {
@@ -701,18 +635,18 @@ const JSC::ClassInfo JSColloURLSearchParamsIterator::s_info = { "URLSearchParams
 size_t JSColloURLSearchParams::estimatedSize(JSC::JSCell* cell, JSC::VM& vm)
 {
     auto* this_object = static_cast<JSColloURLSearchParams*>(cell);
-    return saturatingAdd(Base::estimatedSize(cell, vm), this_object->memoryCost());
+    return WTF::saturatingSum<size_t>(Base::estimatedSize(cell, vm), this_object->memoryCost());
 }
 
+// The pair vector's capacity times the pair size is the size of a buffer Vector allocated, so the product cannot
+// overflow; the sums of String costs saturate instead of wrapping.
 size_t JSColloURLSearchParams::memoryCost() const
 {
     using Pair = WTF::URLParser::URLEncodedForm::ValueType;
 
-    size_t cost = saturatingMultiply(m_pairs.capacity(), sizeof(Pair));
-    for (auto& pair : m_pairs) {
-        cost = saturatingAdd(cost, stringMemoryCost(pair.key));
-        cost = saturatingAdd(cost, stringMemoryCost(pair.value));
-    }
+    size_t cost = m_pairs.capacity() * sizeof(Pair);
+    for (auto& pair : m_pairs)
+        cost = WTF::saturatingSum<size_t>(cost, stringMemoryCost(pair.key), stringMemoryCost(pair.value));
     return cost;
 }
 
@@ -724,10 +658,10 @@ bool JSColloURLSearchParams::tryAppendPair(WTF::String key, WTF::String value)
     if (!m_pairs.tryAppend(Pair { WTF::move(key), WTF::move(value) }))
         return false;
     const auto& pair = m_pairs.last();
-    size_t added = saturatingAdd(stringMemoryCost(pair.key), stringMemoryCost(pair.value));
+    size_t added = WTF::saturatingSum<size_t>(stringMemoryCost(pair.key), stringMemoryCost(pair.value));
     if (m_pairs.capacity() > old_capacity)
-        added = saturatingAdd(added, saturatingMultiply(m_pairs.capacity() - old_capacity, sizeof(Pair)));
-    m_gc_reported_cost.store(saturatingAdd(gcReportedCost(), added), std::memory_order_relaxed);
+        added = WTF::saturatingSum<size_t>(added, (m_pairs.capacity() - old_capacity) * sizeof(Pair));
+    m_gc_reported_cost.store(WTF::saturatingSum<size_t>(gcReportedCost(), added), std::memory_order_relaxed);
     vm().heap.reportExtraMemoryAllocated(this, added);
     return true;
 }
@@ -804,7 +738,6 @@ URLSearchParamsApi createURLSearchParamsApi(Collo::GlobalObject* global_object, 
     putWebApiFunction(global_object, params_prototype, vm, "forEach"_s, 1, urlSearchParamsForEach, enumerableFunction);
     putWebApiFunction(
         global_object, params_prototype, vm, "toString"_s, 0, urlSearchParamsToString, enumerableFunction);
-    putWebApiFunction(global_object, params_prototype, vm, "toJSON"_s, 0, urlSearchParamsToJSON, enumerableFunction);
     putWebApiAccessor(
         global_object, params_prototype, vm, "size"_s, urlSearchParamsGetSize, nullptr, enumerableAccessor);
     params_prototype->putDirect(vm, vm.propertyNames->toStringTagSymbol,

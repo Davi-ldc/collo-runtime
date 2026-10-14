@@ -130,7 +130,8 @@ fn expectClientRequestPathDecodes(path: [:0]const u8) !void {
     }
     var decoder = try hpack.Decoder.init();
     defer decoder.deinit();
-    var decoded = try decoder.decodeBlock(std.testing.allocator, block[0..@intCast(block_len)], h2_request.max_header_count, 16 * 1024);
+    var scratch: [hpack.max_single_header_decode_bytes]u8 = undefined;
+    var decoded = try decoder.decodeBlock(std.testing.allocator, &scratch, block[0..@intCast(block_len)], h2_request.max_header_count, 16 * 1024);
     defer decoded.deinit(std.testing.allocator);
     const parsed = try h2_request.parse(decoded.headers, true, 0);
     try std.testing.expectEqualStrings(path, parsed.path);

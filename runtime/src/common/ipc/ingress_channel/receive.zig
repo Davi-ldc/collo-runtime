@@ -17,6 +17,13 @@
 //! from a packet is checked before it is used. A decode starts from the
 //! reader's own read cursor, and each payload's check loads the writer's
 //! cursor once (`payload_ring.zig`).
+//!
+//! Both decoders refuse a `request_done` whose descriptor or payload the
+//! framing refuses (`framing.validateDescriptor`, `framing.decodeRequestDone`),
+//! so a refused one never reaches the caller, which takes the `RequestDone`
+//! from the item's payload with `decodeRequestDone` and handles its error.
+//! Which direction may carry an operation is the receiver's to enforce: a
+//! worker refuses every operation the server never sends it.
 
 const std = @import("std");
 
@@ -31,6 +38,7 @@ const Packet = @import("framing.zig").Packet;
 const batchPayloadOffset = @import("framing.zig").batchPayloadOffset;
 const batch_magic = @import("framing.zig").batch_magic;
 const decodeOp = @import("framing.zig").decodeOp;
+const decodeRequestDone = @import("framing.zig").decodeRequestDone;
 const flags = @import("framing.zig").flags;
 const max_batch_descriptors = @import("framing.zig").max_batch_descriptors;
 const validateDescriptor = @import("framing.zig").validateDescriptor;
@@ -577,6 +585,8 @@ fn decodePacketView(bytes: []const u8) !PacketView {
     } else if (payload.len != 0) {
         return error.InvalidPacket;
     }
+    if (decoded.descriptor.op == @intFromEnum(Op.request_done))
+        _ = try decodeRequestDone(payload);
     return .{ .descriptor = decoded.descriptor, .payload = payload };
 }
 
@@ -606,6 +616,8 @@ fn decodeBatchView(bytes: []const u8) !BatchView {
             const end = std.math.add(usize, start, len) catch return error.InvalidPacket;
             if (end > header.payload_bytes_len)
                 return error.InvalidPacket;
+            if (descriptor.op == @intFromEnum(Op.request_done))
+                _ = try decodeRequestDone(bytes[payload_start + start .. payload_start + end]);
         } else if (descriptor.byte_len != 0 and !descriptor.hasFlag(flags.shared_ring)) {
             return error.InvalidPacket;
         }

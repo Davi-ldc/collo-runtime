@@ -1,11 +1,11 @@
 //! The control protocol between the server and the egress gateway, over the one SEQPACKET
 //! socket each gateway inherits (`launch.zig`): the gateway's ready report, the server's hello
 //! with the token key and the network policy image, worker attaches with their session's ring
-//! memfds, eventfds and liveness descriptors (`egress_shared.RawFds`) and their acks, the batched
-//! `request_ended` notices, the gateway's report of each session it removed on its own, and
+//! memfds, eventfds and liveness descriptors (`egress_shared.RawFds`) and their acks, the end of a
+//! session's boot token, the gateway's report of each session it removed on its own and why, and
 //! shutdown. On the server, the thread that spawns the gateway reads the ready report and sends
 //! the hello (`server/gateway/process.zig`), the control client's reader thread reads the acks and
-//! the removal reports, and the lanes and the launcher send `request_ended`; on the gateway, the
+//! the removal reports, and the supervisor's metrics pass sends `boot_ended`; on the gateway, the
 //! main loop thread owns the socket.
 //!
 //! Both processes compile this file, and the gateway is the server's own binary run under
@@ -24,16 +24,17 @@ const egress_token = ipc.egress_token;
 pub const magic: u32 = 0x43454231; // "CEB1" little-endian.
 
 pub const Kind = enum(u32) {
-    attach_worker = 1,
-    shutdown = 2,
-    attach_worker_ack = 5,
-    gateway_ready = 7,
+    /// From the gateway, once, as its last boot step.
+    gateway_ready = 1,
     /// From the server, once and first after `gateway_ready` (`HelloHeader`).
-    hello = 9,
-    /// From the server, one way and best effort (`RequestEndedHeader`).
-    request_ended = 10,
+    hello = 2,
+    attach_worker = 3,
+    attach_worker_ack = 4,
+    /// From the server, one way (`BootEnded`).
+    boot_ended = 5,
     /// From the gateway, one way (`SessionRemoved`).
-    session_removed = 11,
+    session_removed = 6,
+    shutdown = 7,
 };
 
 pub const Header = extern struct {
@@ -71,13 +72,35 @@ pub const AttachAck = extern struct {
     worker_session_id: u64 = 0,
 };
 
-/// A worker session the gateway removed while it keeps running: the worker closed its end of the
-/// liveness pipe the gateway watches, or the gateway dropped the session for what the worker sent
-/// or left unread (`removeWorker` in `runtime/worker_flow.zig`). Nothing else tells the server that
-/// the worker lost its session, and a worker without one refuses every fetch until the server
-/// attaches it again, so the gateway reports each such removal once. A session whose attach ack
-/// never left is not reported, since the server never learned its id.
+/// A worker session the gateway removed while it keeps running, and why (`SessionRemovedCause`,
+/// validated on decode). Nothing else tells the server that the worker lost its session. The
+/// gateway reports each such removal once (`removeSession` in `runtime/session_flow.zig`). A
+/// session whose attach ack never left is not reported, since the server never learned its id.
 pub const SessionRemoved = extern struct {
+    session_id: u64,
+    cause: u32,
+    _reserved0: u32 = 0,
+};
+
+/// Why the gateway removed a session. The liveness pipe cannot tell an exit from a detach, so the
+/// server leaves `liveness_closed` to the worker's own channels; only `protocol_violation` blames
+/// the worker for the removal (`Launcher.egressSessionLost` in `server/supervisor/launcher.zig`).
+pub const SessionRemovedCause = enum(u32) {
+    /// The worker closed its end of the liveness pipe the gateway watches: it exited, or it
+    /// detached on its own after a packet only a gateway defect produces.
+    liveness_closed = 1,
+    /// The gateway removed the session for what the worker sent or left unread: a command ring
+    /// that failed its checks, a command that does not decode, an extent the pools reject, or a
+    /// completion ring left at the hard mark (`runtime/session_flow.zig`).
+    protocol_violation = 2,
+};
+
+/// The end of a session's boot token: from this packet on, the gateway admits no fetch under the
+/// session's boot token although its deadline has not passed. The server sends it once the
+/// worker's startup evaluations closed (`Manager.endBoot` in `server/gateway/manager.zig`). It only
+/// shortens what the token admits, so a lost or repeated packet costs nothing but fetches the
+/// token's deadline already bounds.
+pub const BootEnded = extern struct {
     session_id: u64,
 };
 
@@ -105,93 +128,6 @@ pub const Hello = struct {
     table_bytes: u32,
 };
 
-/// The fixed part of a `request_ended` packet: `count` entries follow it and end the packet.
-pub const RequestEndedHeader = extern struct {
-    count: u32,
-    _reserved0: u32 = 0,
-};
-
-/// A request whose running fetches the gateway cancels and whose budget it drops, named as its
-/// token names it. A boot token's entry has request id and generation 0.
-pub const RequestEndedEntry = extern struct {
-    session_id: u64,
-    request_id: u64,
-    request_generation: u64,
-};
-
-/// Entries one packet carries at most. A lane appends one for each request it finishes that
-/// carried a token and sends them once per loop pass, sooner when the batch fills; a pass rarely
-/// finishes this many. A full packet is 24 KiB and a few bytes, far below the default AF_UNIX
-/// send buffer, so no batch fails for its size.
-pub const request_ended_entries_max: usize = 1024;
-
-pub const request_ended_bytes_max: usize = request_ended_entries_offset +
-    request_ended_entries_max * @sizeOf(RequestEndedEntry);
-
-const request_ended_entries_offset: usize = @sizeOf(Header) + @sizeOf(RequestEndedHeader);
-
-/// A decoded `request_ended` packet. It borrows the packet's bytes, so the gateway handles every
-/// entry before it releases the packet.
-pub const RequestEnded = struct {
-    entries: []const u8,
-    count: usize,
-
-    pub fn entry(self: RequestEnded, index: usize) RequestEndedEntry {
-        std.debug.assert(index < self.count);
-        return ipc.packet.readStruct(
-            RequestEndedEntry,
-            self.entries[index * @sizeOf(RequestEndedEntry) ..][0..@sizeOf(RequestEndedEntry)],
-        );
-    }
-};
-
-/// The entries one sending thread collects between sends, kept as the packet they go out as.
-/// Each lane owns one; nothing else touches it.
-pub const RequestEndedBatch = struct {
-    packet: [request_ended_bytes_max]u8 align(8) = undefined,
-    count: usize = 0,
-
-    /// Appends `entry` and returns true, or returns false when the batch is full and must be
-    /// sent first.
-    pub fn append(self: *RequestEndedBatch, entry: RequestEndedEntry) bool {
-        if (self.count < request_ended_entries_max) {
-            const offset = request_ended_entries_offset + self.count * @sizeOf(RequestEndedEntry);
-            _ = ipc.packet.writeStruct(self.packet[offset..], &entry);
-            self.count += 1;
-            return true;
-        }
-        return false;
-    }
-
-    pub fn isEmpty(self: *const RequestEndedBatch) bool {
-        return self.count == 0;
-    }
-
-    /// Sends the batch as one packet on the control socket `fd`, which is nonblocking, and
-    /// empties it whether the send worked or not. A batch the socket refuses is lost, which costs
-    /// the fetches of its requests until their tokens' deadlines and nothing else, so the caller
-    /// only counts the error.
-    pub fn sendAndClear(self: *RequestEndedBatch, fd: std.posix.fd_t) !void {
-        std.debug.assert(self.count > 0);
-        defer self.count = 0;
-        const header = Header{
-            .magic = magic,
-            .kind = @intFromEnum(Kind.request_ended),
-        };
-        const fixed = RequestEndedHeader{ .count = @intCast(self.count) };
-        var cursor = ipc.packet.writeStruct(&self.packet, &header);
-        cursor += ipc.packet.writeStruct(self.packet[cursor..], &fixed);
-        std.debug.assert(cursor == request_ended_entries_offset);
-        const len = request_ended_entries_offset + self.count * @sizeOf(RequestEndedEntry);
-        try ipc.packet.sendWithFds(fd, self.packet[0..len], &.{});
-    }
-
-    /// Drops what the batch holds without sending it, for entries of a gateway that is gone.
-    pub fn clear(self: *RequestEndedBatch) void {
-        self.count = 0;
-    }
-};
-
 comptime {
     // Every fixed struct crosses the socket as raw bytes, and the decoders compute exact lengths
     // from these sizes, so a layout change is an explicit edit here.
@@ -203,27 +139,32 @@ comptime {
     std.debug.assert(@offsetOf(HelloHeader, "_reserved0") == 36);
     // The hello holds the image's length in a u32.
     std.debug.assert(network.table.image_bytes_max <= std.math.maxInt(u32));
-    std.debug.assert(@sizeOf(SessionRemoved) == 8);
-    std.debug.assert(@sizeOf(RequestEndedHeader) == 8);
-    std.debug.assert(@sizeOf(RequestEndedEntry) == 24);
-    std.debug.assert(@offsetOf(RequestEndedEntry, "request_id") == 8);
-    std.debug.assert(@offsetOf(RequestEndedEntry, "request_generation") == 16);
+    std.debug.assert(@sizeOf(SessionRemoved) == 16);
+    std.debug.assert(@offsetOf(SessionRemoved, "session_id") == 0);
+    std.debug.assert(@offsetOf(SessionRemoved, "cause") == 8);
+    std.debug.assert(@offsetOf(SessionRemoved, "_reserved0") == 12);
+    std.debug.assert(@sizeOf(BootEnded) == 8);
     std.debug.assert(hello_bytes <= ipc.max_message_bytes);
-    std.debug.assert(request_ended_bytes_max <= ipc.max_message_bytes);
 }
 
 /// A packet the gateway decoded (`decode`).
 pub const Message = union(enum) {
     hello: Hello,
     attach_worker: AttachWorker,
-    request_ended: RequestEnded,
+    boot_ended: BootEnded,
     shutdown,
 };
 
 /// A packet the server's control reader decoded (`decodeGatewayToServerPacket`).
 pub const GatewayToServer = union(enum) {
     attach_ack: AttachAck,
-    session_removed: SessionRemoved,
+    session_removed: RemovedSession,
+};
+
+/// A decoded `SessionRemoved`: a nonzero session id and a cause the enum names.
+pub const RemovedSession = struct {
+    session_id: u64,
+    cause: SessionRemovedCause,
 };
 
 pub fn sendAttachWorker(
@@ -288,15 +229,15 @@ pub fn decodeAttachAck(bytes: []const u8) !AttachAck {
     return body;
 }
 
-/// Sends the report that the gateway removed session `session_id`, which is never 0.
-pub fn sendSessionRemoved(fd: std.posix.fd_t, session_id: u64) !void {
+/// Sends the report that the gateway removed session `session_id`, which is never 0, for `cause`.
+pub fn sendSessionRemoved(fd: std.posix.fd_t, session_id: u64, cause: SessionRemovedCause) !void {
     if (session_id == 0)
         return error.InvalidEgressGatewayControl;
     const header = Header{
         .magic = magic,
         .kind = @intFromEnum(Kind.session_removed),
     };
-    const body = SessionRemoved{ .session_id = session_id };
+    const body = SessionRemoved{ .session_id = session_id, .cause = @intFromEnum(cause) };
     var buffer: [@sizeOf(Header) + @sizeOf(SessionRemoved)]u8 = undefined;
     var cursor = ipc.packet.writeStruct(&buffer, &header);
     cursor += ipc.packet.writeStruct(buffer[cursor..], &body);
@@ -323,15 +264,42 @@ pub fn decodeGatewayToServerPacket(packet: *ipc.ReceivedPacket) !GatewayToServer
         .shutdown,
         .gateway_ready,
         .hello,
-        .request_ended,
+        .boot_ended,
         => error.InvalidEgressGatewayControl,
     };
 }
 
-fn decodeSessionRemoved(bytes: []const u8) !SessionRemoved {
+fn decodeSessionRemoved(bytes: []const u8) !RemovedSession {
     if (bytes.len != @sizeOf(Header) + @sizeOf(SessionRemoved))
         return error.InvalidEgressGatewayControl;
     const body = ipc.packet.readStruct(SessionRemoved, bytes[@sizeOf(Header)..][0..@sizeOf(SessionRemoved)]);
+    if (body.session_id == 0 or body._reserved0 != 0)
+        return error.InvalidEgressGatewayControl;
+    const cause = std.enums.fromInt(SessionRemovedCause, body.cause) orelse
+        return error.InvalidEgressGatewayControl;
+    return .{ .session_id = body.session_id, .cause = cause };
+}
+
+/// Sends the end of session `session_id`'s boot token, which is never 0, on the nonblocking control
+/// socket `fd`. Fails with `error.WouldBlock` when the socket is full; the caller tries again later.
+pub fn sendBootEnded(fd: std.posix.fd_t, session_id: u64) !void {
+    if (session_id == 0)
+        return error.InvalidEgressGatewayControl;
+    const header = Header{
+        .magic = magic,
+        .kind = @intFromEnum(Kind.boot_ended),
+    };
+    const body = BootEnded{ .session_id = session_id };
+    var buffer: [@sizeOf(Header) + @sizeOf(BootEnded)]u8 = undefined;
+    var cursor = ipc.packet.writeStruct(&buffer, &header);
+    cursor += ipc.packet.writeStruct(buffer[cursor..], &body);
+    try ipc.packet.sendWithFds(fd, buffer[0..cursor], &.{});
+}
+
+fn decodeBootEnded(packet: *const ipc.ReceivedPacket) !BootEnded {
+    if (packet.fd_count != 0 or packet.bytes.len != @sizeOf(Header) + @sizeOf(BootEnded))
+        return error.InvalidEgressGatewayControl;
+    const body = ipc.packet.readStruct(BootEnded, packet.bytes[@sizeOf(Header)..][0..@sizeOf(BootEnded)]);
     if (body.session_id == 0)
         return error.InvalidEgressGatewayControl;
     return body;
@@ -415,7 +383,7 @@ pub fn decode(packet: *ipc.ReceivedPacket) !Message {
 
     switch (kind) {
         .hello => return .{ .hello = try decodeHello(packet) },
-        .request_ended => return .{ .request_ended = try decodeRequestEnded(packet) },
+        .boot_ended => return .{ .boot_ended = try decodeBootEnded(packet) },
         .attach_worker => {
             if (packet.bytes.len != attach_worker_message_bytes)
                 return error.InvalidEgressGatewayControl;
@@ -499,35 +467,6 @@ fn decodeHello(packet: *ipc.ReceivedPacket) !Hello {
         .table_fd = packet.takeFd(0),
         .table_bytes = fixed.table_bytes,
     };
-}
-
-/// Checks a `request_ended` packet completely: between one and `request_ended_entries_max`
-/// entries, each with a nonzero session and request ids that are both zero, for a boot token, or
-/// both nonzero.
-fn decodeRequestEnded(packet: *const ipc.ReceivedPacket) !RequestEnded {
-    if (packet.fd_count != 0 or packet.bytes.len < request_ended_entries_offset)
-        return error.InvalidEgressGatewayControl;
-    const fixed_bytes = packet.bytes[@sizeOf(Header)..][0..@sizeOf(RequestEndedHeader)];
-    const fixed = ipc.packet.readStruct(RequestEndedHeader, fixed_bytes);
-    if (fixed._reserved0 != 0)
-        return error.InvalidEgressGatewayControl;
-    const count: usize = fixed.count;
-    if (count == 0 or count > request_ended_entries_max)
-        return error.InvalidEgressGatewayControl;
-    if (packet.bytes.len != request_ended_entries_offset + count * @sizeOf(RequestEndedEntry))
-        return error.InvalidEgressGatewayControl;
-    const ended = RequestEnded{
-        .entries = packet.bytes[request_ended_entries_offset..],
-        .count = count,
-    };
-    for (0..count) |index| {
-        const entry = ended.entry(index);
-        if (entry.session_id == 0)
-            return error.InvalidEgressGatewayControl;
-        if ((entry.request_id == 0) != (entry.request_generation == 0))
-            return error.InvalidEgressGatewayControl;
-    }
-    return ended;
 }
 
 fn validateAttachAckFields(

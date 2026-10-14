@@ -1,13 +1,44 @@
 //! Connection-wide HTTP/2 client state: the HPACK encoder and decoder, the
 //! local and peer SETTINGS, client stream ids and GOAWAY. `client.Connection`
 //! drives it, and nothing here performs I/O.
+//!
+//! The coders keep their dynamic tables here, one pair per connection, while
+//! the buffers they code through belong to `HpackScratch`, which one owner
+//! thread lends to every connection it serves.
 
 const std = @import("std");
 const h2 = @import("collo_http").http2;
 const hpack = @import("collo_hpack");
 const limits = @import("collo_limits");
 const request = @import("request.zig");
-const response = @import("response.zig");
+
+/// The HPACK buffers of one engine shard: room for the field being decoded
+/// and for the request header block being encoded. The shard's owner thread
+/// codes one block at a time for every connection it serves, so it owns one
+/// of these and lends it to each connection for that connection's life; the
+/// buffers carry nothing from one call to the next.
+pub const HpackScratch = struct {
+    decode: []u8,
+    encode: []u8,
+
+    pub const decode_bytes: usize = hpack.max_single_header_decode_bytes;
+    pub const encode_bytes: usize = limits.headers.EGRESS_H2_REQUEST_HEADER_BLOCK_BYTES;
+
+    pub fn init(allocator: std.mem.Allocator) !HpackScratch {
+        const decode = try allocator.alloc(u8, decode_bytes);
+        errdefer allocator.free(decode);
+        return .{
+            .decode = decode,
+            .encode = try allocator.alloc(u8, encode_bytes),
+        };
+    }
+
+    pub fn deinit(self: *HpackScratch, allocator: std.mem.Allocator) void {
+        allocator.free(self.decode);
+        allocator.free(self.encode);
+        self.* = undefined;
+    }
+};
 
 pub const ClientSettings = struct {
     header_table_size: u32 = h2.default_header_table_size,
@@ -22,6 +53,8 @@ pub const ClientSettings = struct {
 
 pub const Session = struct {
     allocator: std.mem.Allocator,
+    /// Borrowed from the shard for the session's life.
+    scratch: *const HpackScratch,
     encoder: hpack.Encoder,
     decoder: hpack.Decoder,
     peer_settings: h2.SettingsState = .{},
@@ -34,10 +67,13 @@ pub const Session = struct {
     /// stream may already have run.
     goaway_last_stream_id: ?u32 = null,
 
-    pub fn init(allocator: std.mem.Allocator) !Session {
+    pub fn init(allocator: std.mem.Allocator, scratch: *const HpackScratch) !Session {
+        var encoder = try hpack.Encoder.init();
+        errdefer encoder.deinit();
         return .{
             .allocator = allocator,
-            .encoder = try hpack.Encoder.init(),
+            .scratch = scratch,
+            .encoder = encoder,
             .decoder = try hpack.Decoder.init(),
         };
     }
@@ -114,6 +150,7 @@ pub const Session = struct {
         return request.encodeRequest(
             self.allocator,
             &self.encoder,
+            self.scratch.encode,
             stream_id,
             self.peer_settings.max_frame_size,
             head,

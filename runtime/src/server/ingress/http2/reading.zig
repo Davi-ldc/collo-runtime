@@ -609,7 +609,7 @@ fn takesTrailers(runtime: *const Slot, stream_id: u32) bool {
 fn decodeHeaderBlock(comptime Worker: type, worker: *Worker, runtime: *Slot, block: []const u8) Http2Failure!hpack.DecodedBlock {
     if (block.len > limits.headers.INGRESS_H2_REQUEST_HEADER_BLOCK_BYTES)
         return error.Http2HeaderBlockTooLarge;
-    return runtime.h2_hpack_decoder.decodeBlockScratch(
+    return runtime.h2_hpack_decoder.decodeBlock(
         worker.service.allocator,
         worker.h2_lane.decode_scratch,
         block,
@@ -700,14 +700,14 @@ fn processTrailers(
 /// Decompresses a block on a stream that takes no more headers, only so
 /// both ends' header tables stay in step, in the lane's decode scratch. No
 /// field is kept, so no count or size cap applies and nothing is allocated
-/// (`Decoder.skipBlockScratch`). A block past
+/// (`Decoder.skipBlock`). A block past
 /// `INGRESS_H2_REQUEST_HEADER_BLOCK_BYTES` still fails undecoded, as in
 /// `decodeHeaderBlock`, and one the decoder cannot decompress leaves its
 /// table out of step, so either error closes the connection.
 fn discardHeaderBlock(comptime Worker: type, worker: *Worker, runtime: *Slot, block: []const u8) Http2Failure!void {
     if (block.len > limits.headers.INGRESS_H2_REQUEST_HEADER_BLOCK_BYTES)
         return error.Http2HeaderBlockTooLarge;
-    try runtime.h2_hpack_decoder.skipBlockScratch(worker.h2_lane.decode_scratch, block);
+    try runtime.h2_hpack_decoder.skipBlock(worker.h2_lane.decode_scratch, block);
 }
 
 /// Resets a stream the table holds on an error the stream alone caused. The

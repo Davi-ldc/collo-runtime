@@ -1,6 +1,7 @@
 //! Tests for request plans, redirect rewriting, content-encoding parsing, and
-//! the limits a transport config derives for HTTP/2 and the HTTP/1 pump. They
-//! call the builders directly and never touch the network.
+//! the limits a transport config derives for HTTP/2 and for the body pump
+//! both protocols share. They call the builders directly and never touch the
+//! network.
 
 const std = @import("std");
 const network_policy = @import("../network_policy.zig");
@@ -35,6 +36,20 @@ test "egress client core rejects unsupported protocols without a task runtime" {
     ));
 }
 
+test "egress request plan does not resolve network addresses" {
+    var plan = try transport.prepareRequest(
+        std.testing.allocator,
+        "https://does-not-exist.invalid/hello",
+        "GET",
+        &.{},
+        https_only,
+    );
+    defer plan.deinit();
+
+    try std.testing.expectEqualStrings("does-not-exist.invalid", plan.target.authority_host);
+    try std.testing.expectEqualStrings("/hello", plan.request_target);
+}
+
 test "egress request plan prepares shared http1 and http2 request state" {
     var origins: network_policy.Origins = .{};
     try origins.init("93.184.216.34", &.{8443});
@@ -52,9 +67,15 @@ test "egress request plan prepares shared http1 and http2 request state" {
     try std.testing.expectEqualStrings("/hello?x=1", plan.request_target);
     try std.testing.expectEqualStrings("93.184.216.34:8443", plan.request_authority);
     try std.testing.expectEqual(@as(usize, 2), plan.parsed_headers.headers.items.len);
-    try std.testing.expectEqual(@as(usize, 2), plan.h2_headers.len);
-    try std.testing.expectEqualStrings("accept", plan.h2_headers[0].name);
-    try std.testing.expectEqualStrings("text/plain", plan.h2_headers[0].value);
+    // The HTTP/2 head carries the same validated fields the HTTP/1 head
+    // serializes, the default accept-encoding included.
+    const h2_head = plan.h2RequestHead("");
+    try std.testing.expectEqualStrings("https", h2_head.scheme);
+    try std.testing.expectEqualStrings("93.184.216.34:8443", h2_head.authority);
+    try std.testing.expectEqualStrings("/hello?x=1", h2_head.path);
+    try std.testing.expectEqual(@as(usize, 2), h2_head.headers.len);
+    try std.testing.expectEqualStrings("accept", h2_head.headers[0].name);
+    try std.testing.expectEqualStrings("text/plain", h2_head.headers[0].value);
 }
 
 test "egress request plan accepts uppercase schemes and HTTP method tokens" {
@@ -282,8 +303,8 @@ test "egress config exposes HTTP2 limits for pooled sessions" {
         https_only.http2_max_outgoing_buffer_bytes,
     );
     try std.testing.expectEqual(
-        transport.default_tls_ciphertext_buffer_bytes,
-        https_only.tls_ciphertext_buffer_bytes,
+        transport.default_wire_buffer_bytes,
+        https_only.wire_buffer_bytes,
     );
 }
 
@@ -305,16 +326,14 @@ test "egress config does not advertise h2 stream credit above decoded queue budg
     try std.testing.expectEqual(@as(usize, 128 * 1024), clamped.max_pending_body_credit_per_stream);
 }
 
-test "egress http1 pump uses decoded queue watermark for backpressure" {
+test "egress body pump limits use the decoded queue watermark for backpressure" {
     const config = transport.Config{
         .network = network_policy.public_https,
         .max_response_body_bytes = 1024 * 1024,
         .max_pending_decoded_body_bytes = 64 * 1024,
     };
-    const h2_pump_limits = try config.streamPumpLimits().normalized();
-    const http1_pump_limits = try config.http1StreamPumpLimits().normalized();
+    const pump_limits = try config.streamPumpLimits().normalized();
 
-    try std.testing.expectEqual(@as(usize, 64 * 1024), h2_pump_limits.max_pending_decoded_bytes);
-    try std.testing.expectEqual(@as(usize, 64 * 1024), http1_pump_limits.max_pending_decoded_bytes);
-    try std.testing.expectEqual(@as(usize, 1024 * 1024), http1_pump_limits.max_decoded_bytes);
+    try std.testing.expectEqual(@as(usize, 64 * 1024), pump_limits.max_pending_decoded_bytes);
+    try std.testing.expectEqual(@as(usize, 1024 * 1024), pump_limits.max_decoded_bytes);
 }

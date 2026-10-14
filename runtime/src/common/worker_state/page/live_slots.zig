@@ -1,77 +1,52 @@
-//! The live slots, one per request a worker can have in flight. The worker's
-//! VM thread claims, updates and frees a slot through `WorkState` in
-//! `metrics.zig`, which publishes a claim by storing `state` last. Every
-//! field is the worker's claim to the host, which reads a slot only through
-//! `LiveSlotSnapshot` (`snapshots.zig`): one copy of the slot, its state
-//! compared as the raw integer it is.
+//! The live slots, one per pool slot of the worker
+//! (`server/supervisor/pool.zig`). A dispatch names the pool slot its request
+//! holds (`DispatchWork.worker_slot`), and the worker's VM thread writes the
+//! request's live slot at that index through `WorkerWriterView`
+//! (`beginLiveSlot`, `storeLiveSlotCpu` in `mapping.zig`). The host reads a
+//! slot only through `HostReaderView.liveSlot` (`LiveSlotSnapshot.at` in
+//! `snapshots.zig`): one copy of the slot, which it matches against the
+//! identity of the request it ends.
+//!
+//! A slot holds the last request begun on its pool slot, with that request's
+//! last CPU, until the next begin on the pool slot replaces it; nothing
+//! empties it. The server dispatches another request on a pool slot only
+//! after the worker's `request_done` for the one holding it, so while the
+//! host reads a request's slot, before it gives the pool slot back, no later
+//! begin lands there. A CPU store for a request the slot no longer holds
+//! changes nothing.
 
-const std = @import("std");
 const limits = @import("collo_limits");
 
-/// Requests a worker can have in flight at once, one live slot each: the
-/// largest `concurrency` a definition may set, whatever the worker's own
-/// definition sets, so every worker's page has one layout.
+/// Pool slots a worker has, one live slot each: the largest `concurrency` a
+/// definition may set, whatever the worker's own definition sets, so every
+/// worker's page has one layout.
 pub const LIVE_SLOT_COUNT: usize = limits.server.worker_concurrency_max;
 
-pub const LiveSlotState = enum(u32) {
-    empty = 0,
-    active = 1,
-};
+/// The largest `LIVE_SLOT_COUNT` the layout is proven to keep in the page's
+/// first 4 KiB, which the host's launch writes anyway, together with every
+/// other section before the console bytes (`mapping.zig`): a concurrency
+/// maximum up to this costs no page a worker touches. A design ceiling, not
+/// the most slots that would fit.
+pub const live_slot_count_page_zero_max: usize = 64;
 
-/// One request in flight on the worker, written when it starts and cleared
-/// when it finishes. The host reads it when it ends a request the worker did
-/// not complete, for the CPU the request used until then.
+/// The last request begun on one pool slot. A zero-filled slot names no
+/// request, since request ids are never 0. Every field is the worker's claim.
 pub const LiveRequestSlot = extern struct {
-    generation: u64,
     request_id: u64,
-    request_generation: u64 = 0,
-    worker_id: u64 = 0,
-    worker_generation: u64 = 0,
-    /// The request's CPU so far (`cpu_ns` of `CompletedRecord` in
-    /// `usage_records.zig`), as the VM thread last published it between the
-    /// request's owner windows.
-    cpu_ns: u64,
-    request_slot: u32 = 0,
-    request_lane_id: u16 = 0,
-    _reserved1: u16 = 0,
-    state: u32,
-    _reserved2: u32 = 0,
-};
-
-/// The identity of one dispatched request on one worker, as the worker
-/// copies it into a live slot and the host matches a slot against it.
-pub const LifecycleIdentity = struct {
-    external_request_id: u64,
-    request_lane_id: u16,
-    request_slot: u32,
     request_generation: u64,
-    worker_id: u64,
-    worker_generation: u64,
+    /// The request's CPU so far (`RequestDone.cpu_ns` in
+    /// `common/ipc/ingress_channel/framing.zig`), as the VM thread last
+    /// stored it.
+    cpu_ns: u64,
 };
 
 comptime {
-    if (@sizeOf(LiveRequestSlot) != 64)
+    if (@sizeOf(LiveRequestSlot) != 24)
         @compileError("worker_state.page.LiveRequestSlot size mismatch");
-    if (@offsetOf(LiveRequestSlot, "cpu_ns") != 40)
+    if (@offsetOf(LiveRequestSlot, "request_generation") != 8)
+        @compileError("worker_state.page.LiveRequestSlot request_generation offset mismatch");
+    if (@offsetOf(LiveRequestSlot, "cpu_ns") != 16)
         @compileError("worker_state.page.LiveRequestSlot cpu_ns offset mismatch");
-    if (@offsetOf(LiveRequestSlot, "state") != 56)
-        @compileError("worker_state.page.LiveRequestSlot state offset mismatch");
-    if (@intFromEnum(LiveSlotState.empty) != 0)
-        @compileError("worker_state.page zero-filled live slots must be empty");
-
-    const zero_slot = std.mem.zeroes(LiveRequestSlot);
-    if (zero_slot.generation != 0 or
-        zero_slot.request_id != 0 or
-        zero_slot.request_generation != 0 or
-        zero_slot.worker_id != 0 or
-        zero_slot.worker_generation != 0 or
-        zero_slot.cpu_ns != 0 or
-        zero_slot.request_slot != 0 or
-        zero_slot.request_lane_id != 0 or
-        zero_slot._reserved1 != 0 or
-        zero_slot.state != @intFromEnum(LiveSlotState.empty) or
-        zero_slot._reserved2 != 0)
-    {
-        @compileError("worker_state.page zero-filled LiveRequestSlot is not a valid empty slot");
-    }
+    if (LIVE_SLOT_COUNT > live_slot_count_page_zero_max)
+        @compileError("worker_state.page the live slots must stay within the first 4 KiB page");
 }

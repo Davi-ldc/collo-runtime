@@ -5,18 +5,20 @@
 //! analytics consumers read are pinned, unique, lowercase words joined by
 //! underscores; the lane-fault set holds no error a client or a worker
 //! produces; every error the classified callees return today is in their
-//! table or is a lane fault; and the loop-handler check accepts a lane that
-//! declares every handler. Lane `server-ingress-test`; the tables run alone
+//! table or is a lane fault; an egress session its gateway removed for the
+//! worker's doing counts against the tenant, unlike one no gateway could
+//! replace; and the loop-handler check accepts a lane that declares every
+//! handler. Lane `server-ingress-test`; the tables run alone
 //! here, with no lane, socket or worker.
 
 const std = @import("std");
 const server_main = @import("collo_server_main");
 const ipc = @import("collo_ipc");
-const page = @import("collo_worker_state").page;
 const ktls = @import("collo_ktls");
 const os = @import("collo_os");
 
 const fault = server_main.ingress.fault;
+const event_sources = server_main.ingress.runner.event_sources;
 const ErrorCode = @import("collo_http").http2.ErrorCode;
 const connection = server_main.http2.connection;
 const writing = server_main.http2.writing;
@@ -37,9 +39,7 @@ test "every worker error classifies as its table row expects" {
     try expectTable(receive_table);
     try expectTable(ingress_decode_table);
     try expectTable(retiring_decode_table);
-    try expectTable(fs_fault_decode_table);
     try expectTable(wake_table);
-    try expectTable(completion_table);
     try expectTable(send_table);
 }
 
@@ -99,6 +99,17 @@ test "fault and close labels are pinned, unique, lowercase words joined by under
     try expectLabels(fault.ConnectionCloseReason, &connection_close_labels);
 }
 
+test "an egress session its gateway removed for the worker's own doing counts against the tenant, and one no gateway could replace does not" {
+    const worker_fault = server_main.ingress.runner.worker_fault;
+    const access = @import("collo_server_analytics").access;
+    try std.testing.expectEqual(access.ErrorCode.crash, worker_fault.errorCodeForFault(.egress_session_removed));
+    try std.testing.expectEqual(access.ErrorCode.internal_error, worker_fault.errorCodeForFault(.egress_session_failed));
+    // The removal breaks the egress protocol only, so the worker's ingress output is read to its
+    // end, as for a worker that lost its gateway.
+    try std.testing.expect(worker_fault.finalDrainTrusted(.egress_session_removed));
+    try std.testing.expect(worker_fault.finalDrainTrusted(.egress_session_failed));
+}
+
 test "the lane fault set names no error a client or a worker produces" {
     // Errors that come from a client or a worker, never from the lane's own
     // state.
@@ -109,8 +120,6 @@ test "the lane fault set names no error a client or a worker produces" {
         "ShortRead",
         "InvalidMessageKind",
         "TruncatedControlMessage",
-        "WorkerCompletionRingFatal",
-        "WorkerCompletionRingCorrupt",
         "InvalidIngressSharedPayloadRing",
         "PeerClosed",
         "WouldBlock",
@@ -130,13 +139,9 @@ test "the lane fault set names no error a client or a worker produces" {
         "IngressSharedPayloadUnavailable",
         "IngressSharedPayloadTooLarge",
         "IngressSharedPayloadRingFull",
-        "InvalidFsFaultRequest",
-        "UnexpectedFsFaultFd",
         "ResponseHeadersTooLarge",
         "InvalidH2WorkerOutboundDescriptor",
         "InvalidH2StreamIdentity",
-        "WorkerCompletionSequenceMismatch",
-        "InvalidWorkerCompletionRecord",
         "InvalidWorkerRetiringReason",
     };
     inline for (client_or_worker_errors) |name| {
@@ -193,12 +198,9 @@ test "every error the classified callees return today is in their table or is a 
         assertCovered(ErrorsOf(ipc.ingress_channel.decodeReceivedBatchPacketWithSharedPayload), fault.IngressDecodeError, "IngressDecodeError");
 
         assertCovered(ErrorsOf(ipc.worker_retiring.decode), fault.RetiringDecodeError, "RetiringDecodeError");
-        assertCovered(ErrorsOf(ipc.fs_fault.decodeRequest), fault.FsFaultDecodeError, "FsFaultDecodeError");
 
-        assertCovered(ErrorsOf(page.drainCompletionEventfd), fault.WakeError, "WakeError");
+        assertCovered(ErrorsOf(event_sources.drainEventFd), fault.WakeError, "WakeError");
         assertCovered(std.posix.ReadError, fault.WakeError, "WakeError");
-
-        assertCovered(ErrorsOf(page.WorkerWriterView.drainWorkerCompletions), fault.CompletionError, "CompletionError");
 
         assertCovered(ErrorsOf(ipc.packet.sendWithFds), fault.WorkerSendError, "WorkerSendError");
         assertCovered(ErrorsOf(ipc.ingress_channel.SharedPayloadView.write), fault.WorkerSendError, "WorkerSendError");
@@ -209,7 +211,6 @@ test "every error the classified callees return today is in their table or is a 
         assertCovered(ErrorsOf(ipc.ingress_channel.sendDescriptorBatchPayloads), fault.WorkerSendError, "WorkerSendError");
         assertCovered(ErrorsOf(ipc.ingress_channel.sendDescriptorBatchPayloadsWithRing), fault.WorkerSendError, "WorkerSendError");
         assertCovered(ErrorsOf(ipc.ingress_channel.sendDescriptorBatchRingPayloads), fault.WorkerSendError, "WorkerSendError");
-        assertCovered(ErrorsOf(ipc.fs_fault.sendResponse), fault.WorkerSendError, "WorkerSendError");
 
         assertCovered(ErrorsOfCall(@TypeOf(writing.queueWorkerResponseDescriptor(StubLane, stub_lane, stub_slot, stub_received))), fault.ResponseQueueError, "ResponseQueueError");
 
@@ -491,23 +492,6 @@ const retiring_decode_table = struct {
     };
 };
 
-const fs_fault_decode_table = struct {
-    const Set = fault.FsFaultDecodeError;
-    const Outcome = fault.WorkerOutcome;
-    fn classify(err: (fault.LaneFault || Set)) fault.LaneFault!Outcome {
-        return fault.classifyWorkerError(.{ .fs_fault_decode = err });
-    }
-    const rows = [_]Row(Set, Outcome){
-        .{ .expected = workerFault(.unknown_kind), .errors = &.{error.InvalidMessageKind} },
-        .{ .expected = workerFault(.fs_fault_request_undecodable), .errors = &.{
-            error.ShortRead,
-            error.InvalidPacket,
-            error.InvalidFsFaultRequest,
-        } },
-        .{ .expected = workerFault(.allocation_failed), .errors = &.{error.OutOfMemory} },
-    };
-};
-
 const wake_table = struct {
     const Set = fault.WakeError;
     const Outcome = fault.WorkerOutcome;
@@ -518,7 +502,6 @@ const wake_table = struct {
         .{ .expected = .{ .outcome = .would_block }, .errors = &.{error.WouldBlock} },
         .{ .expected = .same_lane_fault, .errors = &.{error.NotOpenForReading} },
         .{ .expected = workerFault(.channel_failed), .errors = &.{
-            error.ShortRead,
             error.EventfdShortRead,
             error.InputOutput,
             error.AccessDenied,
@@ -533,23 +516,6 @@ const wake_table = struct {
             error.ConnectionTimedOut,
             error.SocketNotConnected,
             error.Canceled,
-        } },
-    };
-};
-
-const completion_table = struct {
-    const Set = fault.CompletionError;
-    const Outcome = fault.WorkerOutcome;
-    fn classify(err: (fault.LaneFault || Set)) fault.LaneFault!Outcome {
-        return fault.classifyWorkerError(.{ .completion = err });
-    }
-    const rows = [_]Row(Set, Outcome){
-        .{ .expected = workerFault(.completion_ring_fatal), .errors = &.{error.WorkerCompletionRingFatal} },
-        .{ .expected = workerFault(.completion_ring_corrupt), .errors = &.{error.WorkerCompletionRingCorrupt} },
-        .{ .expected = workerFault(.completion_sequence_mismatch), .errors = &.{error.WorkerCompletionSequenceMismatch} },
-        .{ .expected = workerFault(.completion_record_invalid), .errors = &.{
-            error.InvalidWorkerCompletionRecord,
-            error.InvalidWorkerCompletionStatus,
         } },
     };
 };
@@ -584,8 +550,6 @@ const send_table = struct {
             error.TooManyFds,
             error.IngressSharedPayloadUnavailable,
             error.IngressSharedPayloadTooLarge,
-            error.MissingFsFaultFd,
-            error.UnexpectedFsFaultFd,
         } },
     };
 };
@@ -646,14 +610,9 @@ const worker_fault_labels = [_]Label(fault.WorkerFaultReason){
     .{ .too_many_descriptors, "too_many_descriptors" },
     .{ .zero_length_datagram_with_descriptors, "zero_length_datagram_with_descriptors" },
     .{ .ingress_channel_undecodable, "ingress_channel_undecodable" },
-    .{ .fs_fault_request_undecodable, "fs_fault_request_undecodable" },
     .{ .descriptor_names_no_request, "descriptor_names_no_request" },
     .{ .response_head_invalid, "response_head_invalid" },
     .{ .response_descriptor_invalid, "response_descriptor_invalid" },
-    .{ .completion_ring_fatal, "completion_ring_fatal" },
-    .{ .completion_ring_corrupt, "completion_ring_corrupt" },
-    .{ .completion_sequence_mismatch, "completion_sequence_mismatch" },
-    .{ .completion_record_invalid, "completion_record_invalid" },
     .{ .payload_ring_invalid, "payload_ring_invalid" },
     .{ .allocation_failed, "allocation_failed" },
     .{ .channel_failed, "channel_failed" },
@@ -661,9 +620,9 @@ const worker_fault_labels = [_]Label(fault.WorkerFaultReason){
     .{ .exited, "exited" },
     .{ .deadline_grace_expired, "deadline_grace_expired" },
     .{ .owner_overran, "owner_overran" },
-    .{ .usage_record_protocol, "usage_record_protocol" },
     .{ .log_ring_corrupt, "log_ring_corrupt" },
     .{ .egress_session_failed, "egress_session_failed" },
+    .{ .egress_session_removed, "egress_session_removed" },
     .{ .retiring_notice_invalid, "retiring_notice_invalid" },
 };
 
@@ -894,8 +853,7 @@ const HandlerLane = struct {
     pub fn handleCommands(_: *HandlerLane) fault.LaneFault!void {}
     pub fn handleWorkerControlReadable(_: *HandlerLane, _: u32) fault.LaneFault!void {}
     pub fn handleWorkerControlWritable(_: *HandlerLane, _: u32) fault.LaneFault!void {}
-    pub fn handleWorkerCompletions(_: *HandlerLane, _: u32) fault.LaneFault!void {}
-    pub fn handleWorkerFsFault(_: *HandlerLane, _: u32) fault.LaneFault!void {}
+    pub fn handleWorkerRingCredit(_: *HandlerLane, _: u32) fault.LaneFault!void {}
     pub fn handleWorkerPidfd(_: *HandlerLane, _: u32) fault.LaneFault!void {}
     pub fn handleDeadlineTimer(_: *HandlerLane) fault.LaneFault!void {}
     pub fn handleStop(_: *HandlerLane) fault.LaneFault!void {}

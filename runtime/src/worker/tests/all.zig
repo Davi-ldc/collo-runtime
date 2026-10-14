@@ -4,9 +4,7 @@
 //! by `request/transport.zig` instead and run in `worker-fast-test`.
 
 comptime {
-    _ = @import("fs_fault.zig");
-    _ = @import("fs_index.zig");
-    _ = @import("host/crypto.zig");
+    _ = @import("egress/all.zig");
     _ = @import("scheduler.zig");
     _ = @import("sentinel.zig");
     _ = @import("request/all.zig");

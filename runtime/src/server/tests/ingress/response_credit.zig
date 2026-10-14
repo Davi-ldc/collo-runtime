@@ -166,8 +166,9 @@ test "a chunk written after its request ended gives no credit to the request tha
     const request = try scene.get(1);
     try scene.stub.sendHead(request, 200, false);
     try scene.stub.sendChunk(request, "old", true);
-    try scene.stub.publishCompletion(request, .{});
-    try scene.harness.serveWorker(0, scene.stub);
+    try scene.stub.sendDone(request, .{});
+    // The client's window is closed, so the reader reads one packet a pass.
+    try scene.harness.drainControl(0, scene.stub);
     try std.testing.expect(scene.harness.requestKeyOf(scene.client, 1) == null);
 
     try replacement.get(1);
@@ -258,8 +259,9 @@ test "one WINDOW_UPDATE drains a completed response without another writable eve
     const body = "abcd";
     for (body, 0..) |_, index|
         try scene.stub.sendChunk(request, body[index..][0..1], index + 1 == body.len);
-    try scene.stub.publishCompletion(request, .{});
-    try scene.harness.serveWorker(0, scene.stub);
+    try scene.stub.sendDone(request, .{});
+    // The client's window is closed, so the reader reads one packet a pass.
+    try scene.harness.drainControl(0, scene.stub);
 
     const connection = scene.harness.lane(0).connections.get(scene.client.slot) orelse
         return error.TestUnexpectedResult;
@@ -417,8 +419,8 @@ test "a full worker control socket keeps the newest credit total, and the lane a
     try std.testing.expectEqual(@as(u64, 9), (try ipc.response_credit.decode(&packet)).grant_chunks_total);
     try std.testing.expect(!try scene.stub.controlReadable());
     try scene.stub.sendChunk(request, "", true);
-    try scene.stub.publishCompletion(request, .{});
-    try scene.harness.serveWorker(0, scene.stub);
+    try scene.stub.sendDone(request, .{});
+    try scene.harness.handleControl(0, scene.stub);
     try scene.harness.expectServing(scene.stub);
 }
 
@@ -444,7 +446,7 @@ test "a slow response frees the shared ring while a sibling finishes through ano
     const cursors = stub.responseRingCursors();
     try std.testing.expectEqual(cursors.write, cursors.read);
     try stub.answer(fast, 200, "fast");
-    try harness.serveWorker(0, stub);
+    try harness.handleControl(0, stub);
     try harness.handleCommands(1);
     try fast_client.expectStatus(1, 200);
     const fast_stream = try fast_client.stream(1);
@@ -457,8 +459,8 @@ test "a slow response frees the shared ring while a sibling finishes through ano
     std.mem.writeInt(u32, &reset, 8, .big);
     try slow_client.writeFrame(.rst_stream, 0, 1, &reset);
     try slow_client.drive();
-    try stub.publishCompletion(slow, .{ .done = .client_closed, .http_status = 499 });
-    try harness.handleCompletions(0, stub);
+    try stub.sendDone(slow, .{ .done = .client_closed, .http_status = 499 });
+    try harness.handleControl(0, stub);
     try harness.expectServing(stub);
 }
 

@@ -1,8 +1,8 @@
 //! Realms (`ColloRealm` in `bindings/jsc/runtime/state.h`): a realm the VM
-//! adds has globals, intrinsics, a module registry, console labels, a blob:
-//! URL registry and a performance timeline of its own and every install the
-//! VM made; an object the ABI creates belongs to the realm it was created in,
-//! and an error it raises for a primitive to the realm that asked; a reseed
+//! adds has globals, intrinsics, a module registry, console labels and a
+//! performance timeline of its own and every install the VM made; an object
+//! the ABI creates belongs to the realm it was created in, and an error it
+//! raises for a primitive to the realm that asked; a reseed
 //! gives every realm a Math.random sequence of its own; and globals past the
 //! subspace's precise cells keep their own state across a full collection.
 //! The worker serving its routes from their realms is covered by
@@ -37,29 +37,6 @@ const probe_source =
     \\    console.time("t");
     \\    console.group();
     \\    return "done";
-    \\}
-    \\export function fillObjectURLs() {
-    \\    const blob = new Blob(["x"]);
-    \\    globalThis.objectURLs = [];
-    \\    try {
-    \\        while (globalThis.objectURLs.length <= 4096) globalThis.objectURLs.push(URL.createObjectURL(blob));
-    \\        return "no quota";
-    \\    } catch (error) {
-    \\        return `${globalThis.objectURLs.length}|${error.name}`;
-    \\    }
-    \\}
-    \\export function objectURLList() { return globalThis.objectURLs.join(" "); }
-    \\export function revokeObjectURLs(list) {
-    \\    for (const url of list.split(" ")) URL.revokeObjectURL(url);
-    \\    return "revoked";
-    \\}
-    \\export function createObjectURLStatus() {
-    \\    try {
-    \\        URL.createObjectURL(new Blob(["y"]));
-    \\        return "created";
-    \\    } catch (error) {
-    \\        return error.name;
-    \\    }
     \\}
     \\export function performanceProbe(name) {
     \\    performance.mark(name);
@@ -456,55 +433,6 @@ test "each realm keeps its own console counts, timers and groups" {
         try std.testing.expectEqualStrings(want, got);
 }
 
-// `ColloBlobObjectURLRegistry::entries_max`, which fillObjectURLs reaches with
-// one shared Blob, so the byte bound never applies first.
-const object_urls_full = "4096|QuotaExceededError";
-
-test "each realm has a blob URL registry of its own, with its own quota and revocations" {
-    var vm = try probeVm();
-    defer vm.deinit();
-    const main = vm.mainRealm();
-    const second = try vm.createRealm();
-    for ([_]bindings.Realm{ main, second }) |realm|
-        try support.evaluateInRealmOk(realm, probe_specifier);
-
-    // A full main realm leaves the second realm its whole quota.
-    try expectCall(&vm, main, "fillObjectURLs", &.{}, object_urls_full);
-    try expectCall(&vm, second, "fillObjectURLs", &.{}, object_urls_full);
-
-    // The main realm revoking the second realm's URLs frees nothing there;
-    // the second realm revoking them frees its own table.
-    var second_urls = try call(&vm, second, "objectURLList", &.{});
-    defer second_urls.deinit();
-    try expectCall(&vm, main, "revokeObjectURLs", &.{&second_urls}, "revoked");
-    try expectCall(&vm, second, "createObjectURLStatus", &.{}, "QuotaExceededError");
-    try expectCall(&vm, second, "revokeObjectURLs", &.{&second_urls}, "revoked");
-    try expectCall(&vm, second, "createObjectURLStatus", &.{}, "created");
-    try expectCall(&vm, main, "createObjectURLStatus", &.{}, "QuotaExceededError");
-}
-
-test "request cleanup revokes the blob URLs its request created in every realm" {
-    var vm = try probeVm();
-    defer vm.deinit();
-    const main = vm.mainRealm();
-    const second = try vm.createRealm();
-    for ([_]bindings.Realm{ main, second }) |realm|
-        try support.evaluateInRealmOk(realm, probe_specifier);
-
-    const main_request_id: u64 = 81;
-    const second_request_id: u64 = 82;
-    const probe_request_id: u64 = 83;
-    try expectCallAs(&vm, main, main_request_id, "fillObjectURLs", &.{}, object_urls_full);
-    try expectCallAs(&vm, second, second_request_id, "fillObjectURLs", &.{}, object_urls_full);
-
-    try vm.cleanupWebApiRequest(second_request_id);
-    try expectCallAs(&vm, second, probe_request_id, "createObjectURLStatus", &.{}, "created");
-    try expectCallAs(&vm, main, probe_request_id, "createObjectURLStatus", &.{}, "QuotaExceededError");
-
-    try vm.cleanupWebApiRequest(main_request_id);
-    try expectCallAs(&vm, main, probe_request_id, "createObjectURLStatus", &.{}, "created");
-}
-
 test "each realm records into a performance timeline of its own, which outlives its global property" {
     var vm = try probeVm();
     defer vm.deinit();
@@ -529,16 +457,4 @@ test "a realm is added outside a turn only" {
     try vm.turnEnter(&exec_ctx);
     try std.testing.expectError(error.InvalidArgument, vm.createRealm());
     try vm.turnExit();
-}
-
-test "evicting a specifier drops its namespace from every realm that evaluated it" {
-    var vm = try probeVm();
-    defer vm.deinit();
-    const second = try vm.createRealm();
-    try support.evaluateInRealmOk(vm.mainRealm(), probe_specifier);
-    try support.evaluateInRealmOk(second, probe_specifier);
-
-    const stats = try vm.evictModuleSpecifier(probe_specifier);
-    try std.testing.expectEqual(@as(usize, 1), stats.sources_removed);
-    try std.testing.expectEqual(@as(usize, 2), stats.namespaces_removed);
 }

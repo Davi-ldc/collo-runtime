@@ -1,22 +1,26 @@
 //! The launcher: the node's one thread that turns a pool's claim for a worker
 //! into a published worker, and that attaches live workers to a new egress
 //! gateway when the one they had is lost. A cold start is fork, launch,
-//! deliver. For each launch the launcher creates the worker's cgroup leaf
-//! and, when its definition has a `network` grant (`worker_factory.zig`), its
-//! egress wake set and session, runs the fork RPC, sends `WorkerInit` with
-//! the definition's limits and
-//! waits for `WorkerReady` in one `poll` set over every launch in flight,
-//! then hands the ready worker to `Deps.publish`, whose pool handoffs carry
-//! its slots to the lanes of the waiting requests. The zygote serves one fork
-//! at a time on one thread, so a single launcher thread loses no fork
-//! throughput. One fork request at most is outstanding, and a claimed launch
-//! waits for its turn holding no leaf and no session.
+//! deliver. For each launch the launcher numbers the fork job, creates the
+//! worker's cgroup leaf `worker-<job id>` and, when its definition has a
+//! `network` grant (`worker_factory.zig`), its egress wake set and session,
+//! sends the fork request, runs the launch's local steps
+//! (`host.launch.Machine.prepare`) while the zygote clones, sends
+//! `WorkerInit` with the definition's limits at the fork reply and waits for
+//! `WorkerReady` in one `poll` set over every launch in flight, then hands
+//! the ready worker to `Deps.publish`, whose pool handoffs carry its slots to
+//! the lanes of the waiting requests. The zygote serves one fork at a time on
+//! one thread, so a single launcher thread loses no fork throughput. One fork
+//! request at most is outstanding, and a claimed launch waits for its turn
+//! holding no leaf and no session. The launcher alone numbers fork jobs, so
+//! a job id names one leaf for the launcher's life.
 //!
 //! The launcher never kills a worker, waits for an exit or removes a cgroup:
 //! a failed launch goes to `Deps.failed` with its reason and what the child
 //! left (`Leftovers`), a live worker whose new session the gateway refuses or
-//! its control socket does not take goes to `Deps.retireForEgress`, and the
-//! reaper does the rest. Besides its `poll`,
+//! its control socket does not take goes to `Deps.retireForEgress`, one whose
+//! session the gateway removed for a protocol violation goes to
+//! `Deps.retireEgressSession`, and the reaper does the rest. Besides its `poll`,
 //! bounded by `fork_reply_timeout_ms`, `child_window_ms` and
 //! `egress_attach_send_timeout_ms`, it waits only inside the gateway calls of
 //! `Deps`: an attach round trip (`Deps.attachEgress`) or a gateway spawn
@@ -29,10 +33,13 @@
 //! `zygote/host_client.zig`).
 //!
 //! Every session of a worker is built on its wake set
-//! (`ipc.egress_shared.WakeSet`), because the worker's io_uring registers the
-//! set's completion eventfd and liveness pipe at boot and no other file
-//! afterwards. The launch's set goes to the worker's record at the publish,
-//! which keeps it for the worker's life. A worker of a definition without a
+//! (`ipc.egress_shared.WakeSet`), so the completion eventfd and liveness
+//! pipe its WorkerInit carried stay the worker's for its life. A new session
+//! opens its own write end of that pipe before its `egress_attach` is sent,
+//! so the hang-up a lost session left on the pipe has ended before the
+//! worker can read the attach, and no wait of the worker reports both. The
+//! launch's set goes to the worker's record at the publish, which keeps it
+//! for the worker's life. A worker of a definition without a
 //! grant has no set, gets `WorkerInit` without egress descriptors, attaches
 //! nothing and is never named by the reattach pass, so no gateway is spawned
 //! on its account.
@@ -45,12 +52,17 @@
 //! worker half on its control socket (`egress_attach`); the record changes
 //! first so that no token minted after the worker attached names the old
 //! session. A gateway that fails under an attach leaves the worker detached on
-//! its old session and starts the pass over. A session the current gateway
-//! removed on its own (`egressSessionLost`) leaves its worker detached as
-//! well: the launcher takes the worker's record off the session
-//! (`Deps.dropEgressSession`) and starts the pass over, which attaches it
-//! again. A launch whose session's gateway is gone, or whose session was
-//! removed, by `WorkerReady` takes the same steps before it publishes.
+//! its old session and starts the pass over. A launch whose session's gateway
+//! is gone by `WorkerReady` takes the same steps before it publishes. A
+//! session the gateway removed on its own (`egressSessionLost`) is never
+//! replaced, and the report's cause (`control.SessionRemovedCause` in
+//! `egress/gateway/control.zig`) says what it costs. A launch that held it
+//! fails with `egress_attach` at `WorkerReady`. A live worker that broke the
+//! protocol or stopped reading its completions is retired
+//! (`Deps.retireEgressSession`). A live worker that closed its end of the
+//! liveness pipe is left to its own channels: every exit closes that end,
+//! and the worker's pidfd or control socket records how it died, while a
+//! worker that detached on its own asks to be retired (`worker_retiring`).
 //!
 //! After a loss, gateways spawn only in the pass, at least
 //! `egress_prewarm_interval_ms` apart. An attach spawns a gateway when none is
@@ -60,22 +72,27 @@
 //! instead of attaching, as it does when its attach fails for any reason but
 //! the gateway's refusal of the session, and the pass attaches the worker
 //! after its publish. A gateway that dies at every attach therefore costs one
-//! spawn per interval, and a worker whose session keeps being removed costs
-//! one attach per interval.
+//! spawn per interval.
 //!
 //! Growth follows the pools. A submit names a definition, and the launcher
 //! claims launches for it while its pool wants them (`Deps.claim`), and again
 //! after each worker of it publishes, since waiters the new worker could not
-//! serve submit nothing more. A failure starts no launch by itself: a
+//! serve submit nothing more. A pool with live workers gets a worker more
+//! only on a scale-out sample's verdict: a claim that finds one wanted puts
+//! the definition in the watch, and while the watch holds one the thread
+//! samples every `scheduler_limits.scale_out.sample_interval_ns` and claims
+//! for each definition the verdict grants (`stepScaleOut`, `Deps.scaleOut`).
+//! A failure starts no launch by itself: a
 //! definition whose boot always fails then waits for the next request to try
 //! again. Launches whose leftovers the reaper has not torn down count against
 //! the launch table until `leftoversReaped`, which bounds the reaper's retire
 //! queue by the table.
 //!
-//! The boot inputs every launch sends, `WorkerRuntimeBootOptions` and the
-//! tmpfs size, are read from the server's environment once, by the service
-//! before `init` (`resolveWorkerRuntimeBootOptions`,
-//! `resolveWorkerTmpfsSizeBytes`).
+//! The boot inputs every launch sends, the tmpfs size and the benchmark's
+//! handler stamp (`BootInputs`), are read from the server's environment
+//! once, by the service before `init` (`resolveBootInputs`). Every other
+//! runtime limit is a constant of `common/limits/worker.zig` the worker reads
+//! itself.
 //!
 //! Threads: `submit`, `stop`, `gatewayLost`, `egressSessionLost`,
 //! `leftoversReaped`, `takeTraces` and `countersSnapshot` run on any thread,
@@ -88,7 +105,6 @@
 //! server.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const fd_mod = @import("collo_os").fd;
 const process = @import("collo_os").process;
 const ipc = @import("collo_ipc");
@@ -101,9 +117,11 @@ const host = @import("collo_host");
 const config = @import("collo_server_config");
 const routes_mod = @import("collo_server_routes");
 const lifecycle = @import("collo_server_lifecycle");
+const egress_control = @import("collo_egress_gateway").control;
 const egress_sizing = @import("collo_egress_gateway").sizing;
 
 const pool = @import("pool.zig");
+const scheduler_limits = @import("scheduler_limits.zig");
 const worker_table = @import("worker_table.zig");
 
 pub const DefinitionIndex = config.DefinitionIndex;
@@ -114,10 +132,9 @@ pub const DefinitionIndex = config.DefinitionIndex;
 pub const fork_reply_timeout_ms: i32 = zygote.host_client.fork_reply_timeout_ms;
 
 /// The child window, from the `WorkerInit` send to `WorkerReady`:
-/// `WORKER_INIT_TIMEOUT_MS` in `common/limits/process.zig`. `host/launch.zig`
-/// fixes the deadline at the send, and a launch for a pool has no owner
-/// deadline to clamp it, so the window is exactly this long. A miss fails the
-/// launch with `child_window_expired`.
+/// `WORKER_INIT_TIMEOUT_MS` in `common/limits/process.zig`, which
+/// `host/launch.zig` fixes at the send. A miss fails the launch with
+/// `child_window_expired`.
 pub const child_window_ms: i32 = process_limits.WORKER_INIT_TIMEOUT_MS;
 
 /// How long the reattach waits for a live worker's control socket to take its
@@ -143,11 +160,6 @@ const lost_sessions_max: usize = 2 * egress_sizing.sessions_max;
 
 /// Finished launches `takeTraces` can return; older ones are dropped first.
 pub const trace_capacity: usize = 256;
-
-/// The CPU quota every launch gives its worker's cgroup leaf and checks the
-/// leaf against at adoption, so the adoption's probe matches without a
-/// rewrite.
-const launch_cpu_max_cores: u32 = limits.worker.cpu_max_cores;
 
 /// How long the thread waits before polling again after poll(2) failed,
 /// which it does only when the kernel lacks memory for the poll table.
@@ -183,17 +195,17 @@ pub const LaunchState = enum {
     /// session yet.
     queued,
     /// The cgroup leaf is created, the egress session attached when the
-    /// definition has a grant, and the fork request sent with the leaf; the
-    /// reply is awaited until `fork_reply_timeout_ms`. One launch at most is
-    /// here.
+    /// definition has a grant, the fork request sent with the leaf and the
+    /// launch's local steps run; the reply is awaited until
+    /// `fork_reply_timeout_ms`. One launch at most is here.
     fork_requested,
     /// `WorkerInit` is sent, and `WorkerReady` is awaited on the init socket,
     /// with the child's pidfd, until the child window closes.
     init_sent,
-    /// The child reported `WorkerReady`, but the session the launch attached
-    /// is gone: its gateway is no longer current, or the gateway removed it.
-    /// The next turn with no fork request outstanding attaches the worker to
-    /// the current gateway and publishes it.
+    /// The child reported `WorkerReady`, but the gateway of the session the
+    /// launch attached is no longer current. The next turn with no fork
+    /// request outstanding attaches the worker to the current gateway and
+    /// publishes it.
     awaiting_reattach,
 };
 
@@ -208,7 +220,8 @@ pub const LaunchFailure = enum {
     egress_wake_set,
     /// The zygote exited, or its control socket closed, before it replied.
     zygote_died,
-    /// The zygote's reply or the child's init outcome broke the protocol.
+    /// The zygote's reply or the child's init outcome broke the protocol, or
+    /// `WorkerInit` could not be sent for any reason but the child's end.
     zygote_protocol,
     /// The zygote refused this fork and stays up to serve the next one
     /// (`error.ForkTransientFailure`).
@@ -218,20 +231,21 @@ pub const LaunchFailure = enum {
     /// server stops.
     fork_reply_timeout,
     /// The gateway refused the launch's egress session
-    /// (`error.EgressGatewayAttachRejected` from `Deps.attachEgress`), or a
-    /// launch whose session was lost before `WorkerReady` was refused one by
-    /// the current gateway or could not be sent it.
+    /// (`error.EgressGatewayAttachRejected` from `Deps.attachEgress`), the
+    /// gateway removed the launch's session on its own, or a launch whose
+    /// gateway was lost before `WorkerReady` was refused a session by the
+    /// current gateway or could not be sent it.
     egress_attach,
     /// The definition has an egress grant and no gateway gave its launch a
     /// session: none is wired, or the attachment came back incomplete.
     egress_gateway_required,
-    /// The child came without the cgroup leaf it must be born in.
-    worker_cgroup_not_prepared,
-    /// The boot options failed `WorkerRuntimeBootOptions.validate`.
-    invalid_boot_options,
-    /// The child reported init failure or ended before `WorkerReady`. The
-    /// launcher's log of the failure names the child's reason, or whether it
-    /// ended for memory (`host.launch.InitFailure`).
+    /// The launch could not create or map what the worker shares with the
+    /// server (the state page, the payload ring and their eventfds).
+    launch_resources,
+    /// The child reported init failure or ended before `WorkerReady`, its
+    /// end found at the `WorkerInit` send or during the wait. The launcher's
+    /// log of the failure names the child's reason, or whether it ended for
+    /// memory (`host.launch.InitFailure`).
     worker_init_failed,
     /// No `WorkerReady` within `child_window_ms`.
     child_window_expired,
@@ -247,13 +261,11 @@ pub const LaunchFailure = enum {
     /// a failure here.
     pub fn fromLaunchError(err: host.launch.LaunchError) LaunchFailure {
         return switch (err) {
-            error.WorkerCgroupNotPrepared => .worker_cgroup_not_prepared,
-            error.InvalidBootOptions => .invalid_boot_options,
+            error.LaunchResourcesUnavailable => .launch_resources,
             error.EgressWakeUnavailable => .egress_wake_set,
             error.WorkerInitTimeout => .child_window_expired,
             error.WorkerInitFailed => .worker_init_failed,
             error.ZygoteProtocol => .zygote_protocol,
-            error.OutOfMemory => .out_of_memory,
         };
     }
 
@@ -276,8 +288,7 @@ pub const LaunchFailure = enum {
             .fork_refused,
             .egress_attach,
             .egress_gateway_required,
-            .worker_cgroup_not_prepared,
-            .invalid_boot_options,
+            .launch_resources,
             .worker_init_failed,
             .child_window_expired,
             .control_socket,
@@ -289,8 +300,9 @@ pub const LaunchFailure = enum {
 };
 
 /// What a failed launch leaves for the reaper, which kills the child, waits
-/// for its exit and removes its cgroup leaf (`AbandonedChild.reap` in
-/// `host/launch.zig`). Each descriptor is owned and moves to the callee of
+/// for its exit, drains what the child logged into its console ring, unmaps
+/// its page and removes its cgroup leaf (`AbandonedChild` in
+/// `host/launch.zig`). The pidfd, the leaf and the page move to the callee of
 /// `Deps.failed`; an unset one was never created. The callee hands a
 /// `Leftovers` that `holdsChild` to the reaper, whose teardown ends with
 /// `Launcher.leftoversReaped`. The launch's egress session needs no
@@ -299,13 +311,21 @@ pub const LaunchFailure = enum {
 /// session and the wake set, which holds no write end, while the reaper ends
 /// the child's.
 pub const Leftovers = struct {
-    /// The child's pidfd from its fork reply and its cgroup leaf, created
-    /// before the fork.
+    /// The definition the launch was for, whose name the child's console
+    /// lines carry.
+    definition: DefinitionIndex,
+    /// The child's pidfd from its fork reply, its cgroup leaf, created before
+    /// the fork, and the state page the launch mapped.
     child: host.launch.AbandonedChild = .{},
 
-    /// Whether the reaper has a process or a cgroup leaf to tear down.
+    /// Whether the reaper has a process, a cgroup leaf or a page to tear
+    /// down.
     pub fn holdsChild(self: *const Leftovers) bool {
-        return self.child.pidfd.isValid() or self.child.cgroup_dir.isValid();
+        if (self.child.pidfd.isValid())
+            return true;
+        if (self.child.leaf != null)
+            return true;
+        return self.child.page != null;
     }
 };
 
@@ -400,8 +420,15 @@ pub const ReadyWorker = struct {
 pub const Deps = struct {
     ctx: *anyopaque,
     /// Claims a launch for `definition` when its pool wants one
-    /// (`Pool.launchStarted` with the memory gate), or returns null.
-    claim: *const fn (ctx: *anyopaque, definition: DefinitionIndex) ?pool.LaunchTicket,
+    /// (`Pool.launchStarted` with the memory gate), a worker more beside
+    /// live ones only with `allow_scale_out`; `.watch` says the pool wants a
+    /// scale-out it was not allowed.
+    claim: *const fn (ctx: *anyopaque, definition: DefinitionIndex, allow_scale_out: bool) pool.LaunchStart,
+    /// One scale-out sample at `now_ns` over the definitions in `watch`
+    /// (`Supervisor.sampleScaleOut`): removes from `watch` each one whose
+    /// pool no longer wants a scale-out and sets `granted` to the ones the
+    /// verdict grants a launch.
+    scaleOut: *const fn (ctx: *anyopaque, watch: *DefinitionSet, granted: *DefinitionSet, now_ns: u64) void,
     /// One attach round trip for a new egress session of a worker of
     /// `definition`, built on `wake_set`, the worker's wake set, or null
     /// without one when the definition has no egress grant
@@ -453,39 +480,44 @@ pub const Deps = struct {
     /// Retires the worker through the reaper with reason `egress_reattach`. The worker may have
     /// left service since the target was taken, and the callee then does nothing.
     retireForEgress: *const fn (ctx: *anyopaque, target: *const ReattachTarget) void,
-    /// Takes the live worker whose record names session `session_id` of gateway `generation`
-    /// off that session, under its pool's mutex, so that it has no session and the next
-    /// `nextStaleEgressWorker` returns it (`Supervisor.dropEgressSession`). False when no live
-    /// worker holds that session.
-    dropEgressSession: *const fn (ctx: *anyopaque, generation: u64, session_id: u64) bool,
+    /// Retires the live worker whose record names session `session_id` of gateway `generation`,
+    /// which that gateway removed for a protocol violation, through the reaper with reason
+    /// `egress_session_removed` (`Supervisor.retireEgressSession`). False when no live worker holds
+    /// that session.
+    retireEgressSession: *const fn (ctx: *anyopaque, generation: u64, session_id: u64) bool,
 };
 
-/// What the host prepared at boot for every worker it launches, both
-/// borrowed until the launcher and every worker are gone: the delegated
-/// cgroup subtree each worker's leaf is created under (`host/cgroup_root.zig`)
-/// and the one directory every worker mounts its tmpfs over, whose descriptor
-/// each `WorkerInit` carries (`host/tmp_mount.zig`). Every launch needs both.
+/// What the host prepared at boot for every worker it launches, borrowed
+/// until the launcher and every worker are gone: the delegated cgroup
+/// subtree each worker's leaf is created under (`host/cgroup_root.zig`).
 pub const WorkerHost = struct {
     cgroup_root: *host.WorkerCgroupRoot,
-    tmp_mount_point: *const host.TmpMountPoint,
+};
+
+/// What every launch sends besides its definition's settings, read from the
+/// server's environment once at boot (`resolveBootInputs`).
+pub const BootInputs = struct {
+    /// The worker's tmpfs size, or null for the launch's default; the launch
+    /// clamps it to the worker's memory limit.
+    tmpfs_size_bytes: ?u64 = null,
+    /// Every worker stamps its first handler call on its page, for the
+    /// cold-start benchmark (`host.launch.LaunchOptions.bench_handler`).
+    bench_handler: bool = false,
 };
 
 pub const Options = struct {
     deps: Deps,
     /// Borrowed; outlives the launcher. The launcher thread alone sends fork
-    /// requests on its control socket and assigns its fork job ids.
+    /// requests on its control socket.
     zygote_process: *zygote.host_client.SpawnedZygote,
-    /// Borrowed: a launch hands its child the definition's limits and route
-    /// artifacts (pack, bindings, fs index).
+    /// Borrowed: a launch hands its child the definition's limits and its
+    /// sealed artifact.
     routes: *const routes_mod.Routes,
     /// Null only in fixtures that never fork, since a worker is born only
     /// into a prepared leaf and a launch without a worker host fails with
     /// `cgroup_leaf`.
     worker_host: ?WorkerHost,
-    /// What every launch sends, read once at boot
-    /// (`resolveWorkerRuntimeBootOptions`, `resolveWorkerTmpfsSizeBytes`).
-    boot: ipc.WorkerRuntimeBootOptions,
-    tmpfs_size_bytes: ?u64,
+    boot: BootInputs,
     /// Each pool's `launches_max`, which sizes the launch table to every
     /// launch the pools can have in flight together.
     launches_per_definition_max: u32,
@@ -498,6 +530,10 @@ pub const Counters = struct {
     claimed: u64 = 0,
     published: u64 = 0,
     failed: u64 = 0,
+    /// Scale-out samples taken (`Deps.scaleOut`), and the launches their
+    /// verdicts granted.
+    scale_out_samples: u64 = 0,
+    scale_out_grants: u64 = 0,
     /// Submits that found no room in the launch table, because launches in
     /// flight and leftovers the reaper has not torn down filled it; their
     /// definitions are claimed again once room frees.
@@ -514,17 +550,22 @@ pub const Counters = struct {
     /// reported ready after their gateway was lost.
     egress_reattached: u64 = 0,
     /// Live workers handed to `Deps.retireForEgress`: the gateway refused
-    /// their session, or their control socket did not take it.
+    /// their session, or their control socket did not take it. Workers
+    /// retired for a removed session count in `egress_sessions_lost`.
     egress_reattach_retired: u64 = 0,
     /// Workers and launches no gateway could attach: none was current while
     /// the pass waited to spawn one, the gateway failed under their attach,
     /// or the server could not duplicate their descriptors. They stay
     /// detached, with every `fetch` refused, until the pass reaches them.
     egress_left_detached: u64 = 0,
-    /// Sessions the current gateway removed on its own from a live worker or
-    /// a launch (`Launcher.egressSessionLost`), each of which a pass or the
-    /// launch's `WorkerReady` replaces.
+    /// Sessions a gateway removed on its own from a launch, which fails at
+    /// its `WorkerReady`, or for a protocol violation from a live worker,
+    /// which was retired (`Launcher.egressSessionLost`).
     egress_sessions_lost: u64 = 0,
+    /// Removals a gateway reported because the worker closed its end of the
+    /// liveness pipe, for no launch, which the worker's own channels answer
+    /// (`Launcher.egressSessionLost`).
+    egress_sessions_closed: u64 = 0,
     /// Session loss reports dropped because `lost_sessions_max` waited
     /// already, which only a gateway that reports sessions it never held can
     /// cause; the worker of each stays detached until its gateway is lost.
@@ -558,7 +599,6 @@ pub const LaunchTrace = struct {
     /// The child's own account of its boot, read from its shared page when it
     /// reported ready.
     child_stamps: [worker_shared_page.BOOT_PHASE_COUNT]u64 = @splat(0),
-    spans: host.launch.LaunchSpans = .{},
 
     pub const Outcome = enum(u8) { published, failed };
 };
@@ -570,11 +610,9 @@ const Launch = struct {
     ticket: pool.LaunchTicket,
     /// Claim order: the oldest queued launch forks first.
     sequence: u64,
-    /// The zygote's job id, which names the cgroup leaf; 0 before the fork.
+    /// The fork job id the launcher numbered for this launch, which names
+    /// the cgroup leaf; 0 before `startFork`.
     fork_job_id: u64 = 0,
-    /// The cgroup leaf, from its creation until `Machine.start` takes it
-    /// with the child.
-    cgroup_dir: fd_mod.OwnedFd = .{},
     /// The worker's wake set, from `startFork` until the publish hands it to
     /// the worker's record or `endFailed` closes it: the launch's session is
     /// built on it, and a launch without one sends `WorkerInit` the worker's
@@ -589,13 +627,18 @@ const Launch = struct {
     /// `WorkerReady` that its gateway is still current; 0 without one.
     egress_generation: u64 = 0,
     egress_session_id: u64 = 0,
+    /// The session's gateway removed it (`dropLostSession`), so the launch
+    /// fails at `WorkerReady` instead of publishing or reattaching.
+    egress_session_removed: bool = false,
     /// `ReadyWorker.boot_egress`, set once `Machine.start` minted the token;
     /// a loss or reattach that changes the session above leaves it.
     boot_egress: ?worker_table.BootToken = null,
     /// `ReadyWorker.dispatch_send_scratch`, from before the fork until the
     /// publish takes it.
     dispatch_send_scratch: []u8 = &.{},
-    /// The `WorkerInit` handoff, from the fork reply until ready or failed.
+    /// The `WorkerInit` handoff, from the leaf's creation, whose descriptor
+    /// it owns, until the publish or the failure; `endFailed` takes the leaf
+    /// and the child from it.
     machine: ?host.launch.Machine = null,
     /// When the current state's wait ends (CLOCK_MONOTONIC): the fork reply
     /// deadline, then the end of the child window.
@@ -603,7 +646,7 @@ const Launch = struct {
     trace: LaunchTrace,
 };
 
-/// The reattach of live workers after a gateway loss or a session loss, one
+/// The reattach of live workers after a gateway loss, one
 /// gateway call per launcher turn. Launcher thread only.
 const EgressPass = struct {
     phase: Phase = .idle,
@@ -648,12 +691,13 @@ const EgressSend = struct {
 const LostSession = struct {
     generation: u64,
     session_id: u64,
+    cause: egress_control.SessionRemovedCause,
 };
 
-const DefinitionSet = std.bit_set.StaticBitSet(server_limits.worker_definitions_max);
+/// A set of worker definitions, a bit per definition index.
+pub const DefinitionSet = std.bit_set.StaticBitSet(server_limits.worker_definitions_max);
 
-pub const InitError = error{ OutOfMemory, InvalidLauncherOptions, InvalidBootOptions } ||
-    std.posix.EventFdError;
+pub const InitError = error{ OutOfMemory, InvalidLauncherOptions } || std.posix.EventFdError;
 
 pub const Launcher = struct {
     gpa: std.mem.Allocator,
@@ -661,8 +705,7 @@ pub const Launcher = struct {
     zygote_process: *zygote.host_client.SpawnedZygote,
     routes: *const routes_mod.Routes,
     worker_host: ?WorkerHost,
-    boot: ipc.WorkerRuntimeBootOptions,
-    tmpfs_size_bytes: ?u64,
+    boot: BootInputs,
     /// `definitionCount() * launches_per_definition_max` entries, allocated
     /// at `init`. Launcher thread only.
     launches: []?Launch,
@@ -711,9 +754,19 @@ pub const Launcher = struct {
     /// The launch whose fork request is outstanding.
     forking: ?u32,
     next_sequence: u64,
+    /// The job id of the next fork, from 1 up: it names the fork's cgroup
+    /// leaf, so no two forks of this launcher share one.
+    next_fork_job_id: u64,
     /// Definitions to claim for on the next turn: submitted while the table
     /// had no room, or with a worker just published.
     deferred: DefinitionSet,
+    /// Definitions whose pools want a worker more beside their live ones,
+    /// which a scale-out sample weighs every
+    /// `scheduler_limits.scale_out.sample_interval_ns` (`stepScaleOut`).
+    scale_out_watch: DefinitionSet,
+    /// When the next scale-out sample is due, while `scale_out_watch` holds
+    /// a definition.
+    scale_out_due_ns: u64,
     /// `submitted_ns` of the definitions taken from `submitted` and not yet
     /// answered by a claim that found nothing to start.
     pending_since_ns: [server_limits.worker_definitions_max]u64,
@@ -729,20 +782,16 @@ pub const Launcher = struct {
 
     /// Prepares the launcher in place: the launch table, the poll set, the
     /// trace ring, the session loss buffers and the wake eventfd. The thread
-    /// starts at `start`. `gpa`
-    /// must be the supervisor's allocator, since every worker's send scratch
-    /// comes from it and its record frees it. Fails with
-    /// `error.InvalidLauncherOptions` for a table that could hold no launch
-    /// or more definitions than `worker_definitions_max`, with
-    /// `error.InvalidBootOptions` when `options.boot` fails its validation,
-    /// and with `error.OutOfMemory` or the eventfd's error, leaving nothing
-    /// allocated.
+    /// starts at `start`. `gpa` must be the supervisor's allocator, since
+    /// every worker's send scratch comes from it and its record frees it.
+    /// Fails with `error.InvalidLauncherOptions` for a table that could hold
+    /// no launch or more definitions than `worker_definitions_max`, and with
+    /// `error.OutOfMemory` or the eventfd's error, leaving nothing allocated.
     pub fn init(self: *Launcher, gpa: std.mem.Allocator, options: Options) InitError!void {
         const definition_count: usize = options.routes.definitionCount();
         if (definition_count == 0) return error.InvalidLauncherOptions;
         if (definition_count > server_limits.worker_definitions_max) return error.InvalidLauncherOptions;
         if (options.launches_per_definition_max == 0) return error.InvalidLauncherOptions;
-        options.boot.validate() catch return error.InvalidBootOptions;
 
         const launch_capacity = definition_count * options.launches_per_definition_max;
         const launches = try gpa.alloc(?Launch, launch_capacity);
@@ -768,7 +817,6 @@ pub const Launcher = struct {
             .routes = options.routes,
             .worker_host = options.worker_host,
             .boot = options.boot,
-            .tmpfs_size_bytes = options.tmpfs_size_bytes,
             .launches = launches,
             .pollfds = pollfds,
             .poll_launches = poll_launches,
@@ -788,7 +836,10 @@ pub const Launcher = struct {
             .in_flight = 0,
             .forking = null,
             .next_sequence = 1,
+            .next_fork_job_id = 1,
             .deferred = .initEmpty(),
+            .scale_out_watch = .initEmpty(),
+            .scale_out_due_ns = 0,
             .pending_since_ns = @splat(0),
             .zygote_dead = false,
             .zygote_exit_seen = false,
@@ -839,19 +890,28 @@ pub const Launcher = struct {
         self.signalWake();
     }
 
-    /// Gateway `generation` removed session `session_id` on its own
-    /// (`Manager.Deps.sessionLost`): the launcher thread takes the launch or
-    /// the live worker that holds it off the session, and the worker gets a
-    /// new one, from the next pass or before its publish. Any thread, from
-    /// `init` until `deinit`; never blocks beyond `mutex`. A report past
-    /// `lost_sessions_max` waiting ones is dropped, counted and logged at
-    /// `err`.
-    pub fn egressSessionLost(self: *Launcher, generation: u64, session_id: u64) void {
+    /// Gateway `generation` removed session `session_id` on its own for
+    /// `cause` (`Manager.Deps.sessionLost`): the launcher thread fails the
+    /// launch that holds it at its `WorkerReady`, or retires the live worker
+    /// that holds it when the cause is a protocol violation
+    /// (`dropLostSession`). Any thread, from `init` until `deinit`; never
+    /// blocks beyond `mutex`. A report past `lost_sessions_max` waiting ones
+    /// is dropped, counted and logged at `err`.
+    pub fn egressSessionLost(
+        self: *Launcher,
+        generation: u64,
+        session_id: u64,
+        cause: egress_control.SessionRemovedCause,
+    ) void {
         std.debug.assert(generation != 0);
         self.mutex.lock();
         const kept = self.lost_sessions_len < self.lost_sessions.len;
         if (kept) {
-            self.lost_sessions[self.lost_sessions_len] = .{ .generation = generation, .session_id = session_id };
+            self.lost_sessions[self.lost_sessions_len] = .{
+                .generation = generation,
+                .session_id = session_id,
+                .cause = cause,
+            };
             self.lost_sessions_len += 1;
         } else {
             self.counters.egress_session_reports_dropped += 1;
@@ -928,6 +988,7 @@ pub const Launcher = struct {
         // worker, so it never spins.
         while (!self.stop_requested.load(.acquire)) {
             self.claimSubmitted();
+            self.stepScaleOut();
             self.stepEgress();
             self.forkNext();
             self.waitAndHandle();
@@ -984,26 +1045,71 @@ pub const Launcher = struct {
         self.deferred = .initEmpty();
         var iterator = wanted.iterator(.{});
         while (iterator.next()) |definition| {
-            if (self.claimFor(@intCast(definition))) continue;
+            if (self.claimFor(@intCast(definition), false)) continue;
             self.deferred.set(definition);
             if (!previously_deferred.isSet(definition))
                 self.noteCounter("deferred");
         }
     }
 
-    /// Claims launches for `definition` while its pool wants them, and
-    /// returns false when the table ran out of room first. The pool refuses
-    /// a claim once it has `launches_max` in flight, so the loop runs at most
-    /// that many times plus one.
-    fn claimFor(self: *Launcher, definition: DefinitionIndex) bool {
+    /// Claims launches for `definition` while its pool wants them, one of
+    /// them a worker more beside live ones when `allow_scale_out`, the
+    /// verdict of a scale-out sample, and returns false when the table ran
+    /// out of room first. A pool that wants a scale-out the claim may not
+    /// start joins the watch. The pool refuses a claim once it has
+    /// `launches_max` in flight, so the loop runs at most that many times
+    /// plus one.
+    fn claimFor(self: *Launcher, definition: DefinitionIndex, allow_scale_out: bool) bool {
+        var scale_out_allowed = allow_scale_out;
         while (self.hasRoom()) {
-            const ticket = self.deps.claim(self.deps.ctx, definition) orelse {
-                self.pending_since_ns[definition] = 0;
-                return true;
-            };
-            self.queueLaunch(definition, ticket);
+            switch (self.deps.claim(self.deps.ctx, definition, scale_out_allowed)) {
+                .started => |ticket| {
+                    if (ticket.scale_out) scale_out_allowed = false;
+                    self.queueLaunch(definition, ticket);
+                },
+                .watch => {
+                    self.pending_since_ns[definition] = 0;
+                    self.watchScaleOut(definition);
+                    return true;
+                },
+                .none => {
+                    self.pending_since_ns[definition] = 0;
+                    return true;
+                },
+            }
         }
         return false;
+    }
+
+    /// Puts `definition` in the scale-out watch. A watch that was empty
+    /// samples at once, so the sample that may grant a launch comes one
+    /// interval later, after the waiters persisted that long.
+    fn watchScaleOut(self: *Launcher, definition: DefinitionIndex) void {
+        if (self.scale_out_watch.count() == 0)
+            self.scale_out_due_ns = process.monotonicNowNsOrZero();
+        self.scale_out_watch.set(definition);
+    }
+
+    /// Takes a scale-out sample over the watched definitions once it is due
+    /// and claims a worker more for each definition the verdict grants one
+    /// (`Deps.scaleOut`, `skills/runtime/references/internals/scheduler.md`).
+    /// A grant the launch table has no room for is dropped, and the
+    /// definition stays watched for the next sample.
+    fn stepScaleOut(self: *Launcher) void {
+        if (self.scale_out_watch.count() == 0) return;
+        const now_ns = process.monotonicNowNsOrZero();
+        if (now_ns < self.scale_out_due_ns) return;
+        self.scale_out_due_ns = now_ns +| scheduler_limits.scale_out.sample_interval_ns;
+        var granted: DefinitionSet = .initEmpty();
+        self.deps.scaleOut(self.deps.ctx, &self.scale_out_watch, &granted, now_ns);
+        self.noteCounter("scale_out_samples");
+        var iterator = granted.iterator(.{});
+        while (iterator.next()) |definition| {
+            self.noteCounter("scale_out_grants");
+            if (self.pending_since_ns[definition] == 0)
+                self.pending_since_ns[definition] = now_ns;
+            _ = self.claimFor(@intCast(definition), true);
+        }
     }
 
     fn queueLaunch(self: *Launcher, definition: DefinitionIndex, ticket: pool.LaunchTicket) void {
@@ -1062,8 +1168,8 @@ pub const Launcher = struct {
         self.egress.phase = .prewarm;
     }
 
-    /// Takes the sessions reported lost since the last turn off the launches
-    /// and live workers that hold them.
+    /// Ends the launches and live workers holding the sessions reported lost
+    /// since the last turn.
     fn takeSessionLosses(self: *Launcher) void {
         self.mutex.lock();
         const taken = self.lost_sessions[0..self.lost_sessions_len];
@@ -1076,25 +1182,39 @@ pub const Launcher = struct {
             self.dropLostSession(lost);
     }
 
-    /// Takes the launch or the live worker holding `lost` off that session.
-    /// A launch then goes to `awaiting_reattach` at `WorkerReady`, as one
-    /// whose gateway was lost does. A live worker's record names no session
-    /// from then on, and the pass, started over, attaches it again no sooner
-    /// than `egress_prewarm_interval_ms` after its last prewarm, so a worker
-    /// whose session keeps being removed gets one attach per interval.
+    /// Ends what holds `lost`, whose session no gateway replaces: a launch is
+    /// marked to fail at `WorkerReady`, which it may not have reached, and a
+    /// live worker whose gateway removed the session for what it sent or
+    /// left unread is retired. A live worker that closed its end of the
+    /// liveness pipe is left alone: every exit closes it, and the worker's
+    /// pidfd and control socket then record how it died, while a worker that
+    /// detached on its own asks to be retired itself (`worker_retiring`).
     fn dropLostSession(self: *Launcher, lost: LostSession) void {
         for (self.launches) |*slot| {
             const launch = if (slot.*) |*held| held else continue;
             if (launch.egress_session_id != lost.session_id) continue;
             if (launch.egress_generation != lost.generation) continue;
-            launch.egress_generation = 0;
+            // A child that exited fails its launch on its init socket or
+            // pidfd before `WorkerReady`, so the mark matters only to one
+            // still running, which lost the session either way.
+            launch.egress_session_removed = true;
             self.noteCounter("egress_sessions_lost");
             return;
         }
-        if (!self.deps.dropEgressSession(self.deps.ctx, lost.generation, lost.session_id))
+        switch (lost.cause) {
+            .liveness_closed => {
+                self.noteCounter("egress_sessions_closed");
+                return;
+            },
+            .protocol_violation => {},
+        }
+        if (!self.deps.retireEgressSession(self.deps.ctx, lost.generation, lost.session_id))
             return;
+        std.log.warn("egress gateway generation={d} removed session {d}; its worker is retired", .{
+            lost.generation,
+            lost.session_id,
+        });
         self.noteCounter("egress_sessions_lost");
-        self.egress.phase = .prewarm;
     }
 
     /// Whether the pass waits to spawn a gateway while none is current. A
@@ -1248,10 +1368,13 @@ pub const Launcher = struct {
     /// `egress_attach`; any other attach failure is no fault of the worker,
     /// so it is published detached and the pass that failure starts over
     /// reaches it. While the pass waits to spawn a gateway the launch is
-    /// published detached without an attach.
+    /// published detached without an attach. A launch whose old session its
+    /// gateway reported removed while it waited fails as `onReady` fails it.
     fn reattachReady(self: *Launcher, index: u32) void {
         const launch = &self.launches[index].?;
         std.debug.assert(launch.state == .awaiting_reattach);
+        if (launch.egress_session_removed)
+            return self.endFailed(index, .egress_attach);
         if (self.awaitsEgressGateway()) {
             self.noteCounter("egress_left_detached");
             return self.publishReady(index);
@@ -1310,10 +1433,12 @@ pub const Launcher = struct {
     }
 
     /// The send scratch, the wake set when the definition has a grant, the
-    /// cgroup leaf, the egress session when the definition has a grant, then
-    /// the fork request: everything the fork needs, cheapest first, so a
-    /// launch that cannot get one of them never forks. Leaves `forking` set
-    /// when the request went out; ends the launch otherwise.
+    /// cgroup leaf with the launch's machine, which owns it from then on, the
+    /// egress session when the definition has a grant, then the fork request:
+    /// everything the fork needs, cheapest first, so a launch that cannot get
+    /// one of them never forks. Leaves `forking` set when the request went
+    /// out, and runs the machine's local steps while the zygote clones; ends
+    /// the launch otherwise.
     fn startFork(self: *Launcher, index: u32) void {
         const launch = &self.launches[index].?;
         std.debug.assert(launch.state == .queued);
@@ -1336,23 +1461,28 @@ pub const Launcher = struct {
             };
         }
 
-        const fork_job_id = self.zygote_process.next_fork_job_id;
-        self.zygote_process.next_fork_job_id += 1;
+        const fork_job_id = self.next_fork_job_id;
+        self.next_fork_job_id += 1;
         launch.fork_job_id = fork_job_id;
         const leaf_fd = worker_host.cgroup_root.createWorkerDir(fork_job_id, .{
             .memory_limit_bytes = definition.settings.limits.memoryBytes(),
-            .cpu_max_cores = launch_cpu_max_cores,
+            .cpu_max_cores = limits.worker.cpu_max_cores,
         }) catch |err| {
             std.log.warn("worker cgroup leaf for {s} failed: {s}", .{ definition.name, @errorName(err) });
             return self.endFailed(index, .cgroup_leaf);
         };
-        launch.cgroup_dir = fd_mod.OwnedFd.fromRaw(leaf_fd);
+        launch.machine = host.launch.Machine.init(
+            worker_host.cgroup_root.leaf(fork_job_id),
+            leaf_fd,
+            self.zygote_process.trace_write_fd,
+        );
 
         if (granted) {
             if (self.attachForLaunch(index)) |failure|
                 return self.endFailed(index, failure);
         }
 
+        // The machine owns the leaf's descriptor; the request borrows it.
         zygote.host_client.sendForkRequest(self.zygote_process, fork_job_id, leaf_fd) catch |err|
             return self.endFailed(index, LaunchFailure.fromForkError(err));
         const now_ns = process.monotonicNowNsOrZero();
@@ -1360,6 +1490,11 @@ pub const Launcher = struct {
         launch.deadline_ns = now_ns + msToNs(fork_reply_timeout_ms);
         launch.trace.fork_sent_ns = now_ns;
         self.forking = index;
+        // The local steps need no child, so they overlap the zygote's clone.
+        // A failure waits in the machine until the fork reply, which must be
+        // read before the next request goes out and brings the child the
+        // reaper then tears down.
+        launch.machine.?.prepare();
     }
 
     /// Attaches the egress session of launch `index`, whose definition has a
@@ -1459,7 +1594,7 @@ pub const Launcher = struct {
             // was built.
             const launch = if (self.launches[index]) |*waiting| waiting else continue;
             if (launch.state != .init_sent) continue;
-            self.applyEffects(index, launch.machine.?.onEvent(event));
+            self.applyOutcome(index, launch.machine.?.onEvent(event));
         }
     }
 
@@ -1513,6 +1648,10 @@ pub const Launcher = struct {
     /// on a deadline.
     fn pollTimeoutMs(self: *const Launcher, now_ns: u64) i32 {
         var earliest_ns: ?u64 = self.egressDeadlineNs(now_ns);
+        if (self.scale_out_watch.count() != 0) {
+            if (earliest_ns == null or self.scale_out_due_ns < earliest_ns.?)
+                earliest_ns = self.scale_out_due_ns;
+        }
         for (self.launches) |*slot| {
             const waiting = if (slot.*) |*launch| launch else continue;
             switch (waiting.state) {
@@ -1559,7 +1698,7 @@ pub const Launcher = struct {
                 .fork_requested => if (now_ns >= waiting.deadline_ns)
                     self.endFailed(index, .fork_reply_timeout),
                 .init_sent => if (now_ns >= waiting.deadline_ns)
-                    self.applyEffects(index, waiting.machine.?.onEvent(.child_deadline_expired)),
+                    self.applyOutcome(index, waiting.machine.?.onEvent(.child_deadline_expired)),
             }
         }
     }
@@ -1593,11 +1732,11 @@ pub const Launcher = struct {
             return self.endFailed(index, LaunchFailure.fromForkError(err));
         launch.trace.fork_reply_ns = process.monotonicNowNsOrZero();
         launch.trace.pid = forked.pid;
-        forked.cgroup_dir_fd = launch.cgroup_dir.release();
 
         const definition = self.routes.definition(launch.definition);
+        const definition_limits = definition.settings.limits;
         // Every worker of the definition serves all of its routes, so every
-        // launch carries the definition's whole route table and pack.
+        // launch carries the definition's whole artifact.
         const artifact = self.routes.artifact(launch.definition);
         // WorkerInit carries no egress descriptor for a definition without a
         // grant; for a granted one it carries the worker's wake descriptors,
@@ -1605,60 +1744,43 @@ pub const Launcher = struct {
         // `host/launch.zig`). A session whose gateway was gone when its key
         // was read has no token, so the child boots detached and gets a
         // session of the current gateway at `WorkerReady`.
-        var launch_egress: host.launch.LaunchEgress = if (launch.wake_set.isValid())
-            .{ .detached = &launch.wake_set }
-        else
-            .none;
-        // The machine takes a copy of the boot grant, which it scrubs once
-        // the token is minted, and this frame keeps none.
-        defer switch (launch_egress) {
+        var options: host.launch.LaunchOptions = .{
+            .memory_limit_bytes = definition_limits.memoryBytes(),
+            .egress = if (launch.wake_set.isValid()) .{ .detached = &launch.wake_set } else .none,
+            .routes = .{
+                .module_pack_fd = artifact.module_pack.fd(),
+                .isolate_realm = definition.settings.isolate_realm,
+            },
+            .tmpfs_size_bytes = self.boot.tmpfs_size_bytes,
+            .bench_handler = self.boot.bench_handler,
+            .request_cpu_budget_ns = definition_limits.cpuBudgetNs(),
+            // No JavaScript in the worker runs longer than a request could
+            // without its owner's deadline stopping it.
+            .unowned_time_limit_ns = definition_limits.timeoutNs(),
+        };
+        // The machine mints the boot token from this frame's copy of the
+        // grant and keeps none, so this frame scrubs it whatever the outcome.
+        defer switch (options.egress) {
             .attached => |*attached| std.crypto.secureZero(u8, &attached.boot.key.bytes),
             .detached, .none => {},
         };
         if (launch.egress) |*attached| {
             if (attached.boot) |*boot| {
-                launch_egress = .{ .attached = .{
+                options.egress = .{ .attached = .{
                     .shared_fds = egressSharedFds(&attached.attachment),
                     .boot = boot.*,
                 } };
             }
         }
-        const definition_limits = definition.settings.limits;
-        // `startFork` ends every launch of a launcher without a worker host
-        // before its fork request goes out.
-        const worker_host = self.worker_host.?;
-        launch.machine = host.launch.Machine.init(
-            self.gpa,
-            self.zygote_process,
-            definition_limits.memoryBytes(),
-            .{
-                .egress = launch_egress,
-                .routes = .{
-                    .table = artifact.route_table,
-                    .module_pack_fd = artifact.module_pack.fd(),
-                    .isolate_realm = definition.settings.isolate_realm,
-                },
-                .tmpfs_size_bytes = self.tmpfs_size_bytes,
-                .tmp_mount_point_fd = worker_host.tmp_mount_point.fd(),
-                .cpu_max_cores = launch_cpu_max_cores,
-                .boot = self.boot,
-                .fs_index_memfd = artifact.fs_index.fd(),
-                .request_cpu_budget_ns = definition_limits.cpuBudgetNs(),
-                // No JavaScript in the worker runs longer than a request
-                // could without its owner's deadline stopping it.
-                .unowned_time_limit_ns = definition_limits.timeoutNs(),
-            },
-        );
-        const result = launch.machine.?.start(&forked);
-        if (launch.machine.?.boot_egress_deadline_abs_ns != 0) {
-            // Only an attached launch mints, under its attachment's gateway,
-            // which `dropLostSession` may already have cleared from
-            // `egress_generation`.
+        const machine = &launch.machine.?;
+        const started = machine.start(&forked, &options);
+        if (machine.boot_egress_deadline_abs_ns != 0) {
+            // Only an attached launch mints, under its attachment's gateway.
             const attached = launch.egress.?;
             launch.boot_egress = .{
                 .gateway_generation = attached.attachment.generation,
                 .session_id = attached.attachment.session_id,
-                .deadline_mono_ns = launch.machine.?.boot_egress_deadline_abs_ns,
+                .deadline_mono_ns = machine.boot_egress_deadline_abs_ns,
             };
         }
         // `start` took every descriptor `forked` held, and the child holds
@@ -1669,40 +1791,34 @@ pub const Launcher = struct {
         if (launch.egress) |*egress|
             egress.deinit();
         launch.egress = null;
-        if (launch.machine.?.phase == .awaiting_ready) {
-            launch.state = .init_sent;
-            launch.deadline_ns = launch.machine.?.child_init_deadline_abs_ns;
-            launch.trace.init_sent_ns = process.monotonicNowNsOrZero();
-        }
-        self.applyEffects(index, result);
+        started catch |err| return self.endFailed(index, LaunchFailure.fromLaunchError(err));
+        launch.state = .init_sent;
+        launch.deadline_ns = machine.child_init_deadline_abs_ns;
+        launch.trace.init_sent_ns = process.monotonicNowNsOrZero();
     }
 
-    /// Acts on what the launch's machine reported. The launcher polls the
-    /// init socket and the pidfd of every launch waiting for `WorkerReady`,
-    /// so the arm effects need nothing more.
-    fn applyEffects(self: *Launcher, index: u32, result: host.launch.StepResult) void {
-        for (result.effects[0..result.count]) |effect| switch (effect) {
-            .none, .arm_init_poll, .arm_pidfd_poll => {},
-            .report_ready => return self.onReady(index),
-            .report_failed => |err| return self.endFailed(index, LaunchFailure.fromLaunchError(err)),
-            // Every launch passes `fault_serve = .none`, so the machine never
-            // serves boot faults and never asks for these.
-            .arm_fault_poll, .start_fault_drain_job, .arm_grace_timer => unreachable,
-        };
+    /// Acts on how a launch's ready wait ended; null means it goes on. The
+    /// launcher polls the init socket and the pidfd of every launch waiting
+    /// for `WorkerReady` and feeds the machine their events.
+    fn applyOutcome(self: *Launcher, index: u32, outcome: ?host.launch.Outcome) void {
+        const ended = outcome orelse return;
+        switch (ended) {
+            .ready => self.onReady(index),
+            .failed => |err| self.endFailed(index, LaunchFailure.fromLaunchError(err)),
+        }
     }
 
     /// The child reported `WorkerReady`. A launch whose session's gateway is
     /// still current publishes, and its boot token stays valid for the
     /// startup evaluations still pending (`Supervisor.progressBootEgress`
-    /// ends it). A launch whose gateway was lost since its attach, or whose
-    /// session the gateway removed (`dropLostSession` left its generation 0),
-    /// waits for a turn of `stepEgress`, which attaches the worker to the
-    /// current gateway first.
+    /// ends it). A launch whose gateway was lost since its attach waits for a
+    /// turn of `stepEgress`, which attaches the worker to the current gateway
+    /// first. A launch whose session the gateway removed fails with
+    /// `egress_attach`.
     fn onReady(self: *Launcher, index: u32) void {
         const launch = &self.launches[index].?;
         const machine = &launch.machine.?;
         launch.trace.ready_received_ns = machine.ready_received_ns;
-        launch.trace.spans = machine.spans;
         if (machine.metrics) |*metrics| {
             for (&launch.trace.child_stamps, 0..) |*stamp, phase|
                 stamp.* = metrics.loadBootPhaseStampNs(@enumFromInt(@as(u32, @intCast(phase))));
@@ -1714,9 +1830,10 @@ pub const Launcher = struct {
             std.log.warn("worker control socket could not be made non-blocking: {s}", .{@errorName(err)});
             return self.endFailed(index, .control_socket);
         };
+        if (launch.egress_session_removed)
+            return self.endFailed(index, .egress_attach);
         if (launch.egress_session_id != 0) {
-            const lost = launch.egress_generation == 0 or
-                launch.egress_generation != self.deps.egressCurrentGeneration(self.deps.ctx);
+            const lost = launch.egress_generation != self.deps.egressCurrentGeneration(self.deps.ctx);
             if (lost) {
                 launch.state = .awaiting_reattach;
                 return;
@@ -1727,8 +1844,7 @@ pub const Launcher = struct {
 
     fn publishReady(self: *Launcher, index: u32) void {
         const launch = &self.launches[index].?;
-        const handle = launch.machine.?.takeHandle() catch |err|
-            return self.endFailed(index, LaunchFailure.fromLaunchError(err));
+        const handle = launch.machine.?.takeHandle();
         launch.machine = null;
         const definition = launch.definition;
         const ready: ReadyWorker = .{
@@ -1756,23 +1872,19 @@ pub const Launcher = struct {
     }
 
     /// Ends a launch without a worker: releases what the launch holds,
-    /// hands its child and leaf to `Deps.failed` and frees its entry.
+    /// hands its child, leaf and page to `Deps.failed` and frees its entry.
+    /// The machine holds the leaf from its creation, so a launch whose fork
+    /// request failed or got no reply hands it over too, and a child born
+    /// into it meanwhile dies with it.
     fn endFailed(self: *Launcher, index: u32, failure: LaunchFailure) void {
         const launch = &self.launches[index].?;
-        var leftovers: Leftovers = .{};
+        var leftovers: Leftovers = .{ .definition = launch.definition };
         // What failed the child's init, which only the machine knows.
         var init_failure: ?host.launch.InitFailure = null;
         if (launch.machine) |*machine| {
             init_failure = machine.init_failure;
             leftovers.child = machine.abandon();
             launch.machine = null;
-        }
-        // A leaf the machine never took: the fork request failed or got no
-        // reply, and a child born into the leaf meanwhile dies with it.
-        if (launch.cgroup_dir.isValid()) {
-            std.debug.assert(!leftovers.child.cgroup_dir.isValid());
-            leftovers.child.cgroup_dir = launch.cgroup_dir;
-            launch.cgroup_dir = .{};
         }
         if (launch.egress) |*egress| {
             egress.deinit();
@@ -1890,7 +2002,7 @@ fn egressSharedFds(attachment: *const lifecycle.EgressGatewayAttachment) ipc.egr
 /// stamp is missing.
 fn childBootWorkNs(stamps: *const [worker_shared_page.BOOT_PHASE_COUNT]u64) u64 {
     const entered = stamps[@intFromEnum(worker_shared_page.BootPhase.namespaces_entered)];
-    const ready = stamps[@intFromEnum(worker_shared_page.BootPhase.ready_sent)];
+    const ready = stamps[@intFromEnum(worker_shared_page.BootPhase.ready)];
     if (entered == 0 or ready == 0)
         return 0;
     return ready -| entered;
@@ -1902,84 +2014,34 @@ fn msToNs(milliseconds: i32) u64 {
 }
 
 // The boot inputs, read from the server's own environment once at boot.
-// `COLLO_DEBUG` also enables the boot trace in `server/boot/trace_drain.zig`.
 
 const tmpfs_size_env = "COLLO_WORKER_FS_TMPFS_MIB";
+const bench_handler_env = "COLLO_BENCH_HANDLER";
 
-/// The boot options every worker receives in WorkerInit: the defaults with
-/// the environment's overrides applied. A malformed number keeps its default;
-/// a combination `WorkerRuntimeBootOptions.validate` rejects fails the call.
-pub fn resolveWorkerRuntimeBootOptions() error{InvalidBootOptions}!ipc.WorkerRuntimeBootOptions {
-    var options = ipc.WorkerRuntimeBootOptions.default();
-    options.crypto_thread_count = envCryptoThreadCount(
-        "COLLO_WORKER_CRYPTO_THREADS",
-        options.crypto_thread_count,
-    );
-    options.crypto_max_in_flight_per_request = envU64(
-        "COLLO_WORKER_CRYPTO_MAX_PENDING_PER_REQUEST",
-        options.crypto_max_in_flight_per_request,
-    );
-    options.crypto_max_in_flight_per_worker = options.deriveCryptoMaxInFlightPerWorker();
-    options.runtime_flags |= resolveTraceRuntimeFlags(
-        hasEnv("COLLO_BENCH_TRACE_REQUEST"),
-        hasEnv("COLLO_BENCH_TRACE_ALL_REQUESTS"),
-    );
-    if (envFlagEnabled("COLLO_BENCH_HANDLER"))
-        options.runtime_flags |= ipc.WorkerRuntimeBootOptions.flag_bench_handler;
-    options.runtime_flags |= resolveFullJsExceptionRuntimeFlags(
-        hasEnv("COLLO_LOG_FULL_JS_EXCEPTIONS") or envFlagEnabled("COLLO_DEBUG"),
-        builtin.mode == .Debug,
-    );
-    options.validate() catch return error.InvalidBootOptions;
-    return options;
+/// What every launch sends besides its definition's settings: the tmpfs size
+/// `COLLO_WORKER_FS_TMPFS_MIB` asks for in MiB, null for the launch's default
+/// when it is unset, malformed, 0 or too large to hold in bytes, and the
+/// handler stamp `COLLO_BENCH_HANDLER=1` asks for.
+pub fn resolveBootInputs() BootInputs {
+    return .{
+        .tmpfs_size_bytes = tmpfsSizeBytes(std.posix.getenv(tmpfs_size_env)),
+        .bench_handler = envFlagEnabled(std.posix.getenv(bench_handler_env)),
+    };
 }
 
-/// The tmpfs size the environment asks for, or null for the launch default.
-/// The launch clamps whatever this returns to the worker's memory limit.
-pub fn resolveWorkerTmpfsSizeBytes() ?u64 {
-    const requested_mib = envU64(tmpfs_size_env, 0);
+/// The bytes a `COLLO_WORKER_FS_TMPFS_MIB` value asks for, or null for the
+/// launch's default.
+pub fn tmpfsSizeBytes(value: ?[]const u8) ?u64 {
+    const text = value orelse return null;
+    const requested_mib = std.fmt.parseInt(u64, std.mem.trim(u8, text, " \t\r\n"), 10) catch return null;
     if (requested_mib == 0)
         return null;
     return std.math.mul(u64, requested_mib, 1024 * 1024) catch null;
 }
 
-pub fn resolveTraceRuntimeFlags(trace_request: bool, trace_all_requests: bool) u32 {
-    var flags: u32 = 0;
-    if (trace_request)
-        flags |= ipc.WorkerRuntimeBootOptions.flag_trace_requests;
-    if (trace_all_requests)
-        flags |= ipc.WorkerRuntimeBootOptions.flag_trace_all_requests;
-    return flags;
-}
-
-pub fn resolveFullJsExceptionRuntimeFlags(requested: bool, debug_build: bool) u32 {
-    if (!requested and !debug_build)
-        return 0;
-    return ipc.WorkerRuntimeBootOptions.flag_log_full_js_exceptions;
-}
-
-fn envCryptoThreadCount(name: [:0]const u8, default_value: u64) u64 {
-    const value = std.posix.getenv(name) orelse return default_value;
-    const trimmed = std.mem.trim(u8, value, " \t\r\n");
-    if (std.ascii.eqlIgnoreCase(trimmed, "auto"))
-        return ipc.WorkerRuntimeBootOptions.default().crypto_thread_count;
-    const parsed = std.fmt.parseInt(u64, trimmed, 10) catch return default_value;
-    return @min(parsed, ipc.WorkerRuntimeBootOptions.max_crypto_thread_count);
-}
-
-fn envU64(name: [:0]const u8, default_value: u64) u64 {
-    const value = std.posix.getenv(name) orelse return default_value;
-    const trimmed = std.mem.trim(u8, value, " \t\r\n");
-    return std.fmt.parseInt(u64, trimmed, 10) catch default_value;
-}
-
-fn hasEnv(name: [:0]const u8) bool {
-    return std.posix.getenv(name) != null;
-}
-
-/// True only for the value `1`, as `COLLO_BOOT_TRACE` reads, so that
-/// `COLLO_DEBUG=0` stays inert.
-fn envFlagEnabled(name: [:0]const u8) bool {
-    const value = std.posix.getenv(name) orelse return false;
-    return std.mem.eql(u8, std.mem.trim(u8, value, " \t\r\n"), "1");
+/// True only for the value `1`, as `COLLO_BOOT_TRACE` reads, so that `0`
+/// stays inert.
+pub fn envFlagEnabled(value: ?[]const u8) bool {
+    const text = value orelse return false;
+    return std.mem.eql(u8, std.mem.trim(u8, text, " \t\r\n"), "1");
 }

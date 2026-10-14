@@ -1,5 +1,6 @@
-//! Runtime limits, one file per domain. Each domain file is a leaf that
-//! imports nothing, so any module can cite these without a layering cycle.
+//! Runtime limits, one file per domain. The module imports nothing, so any
+//! module can cite these without a layering cycle; a domain file imports at
+//! most its siblings, where one limit is defined by another domain's.
 //! Moving a constant here never changes its value: where two modules hold
 //! different (or coincidentally equal) numbers they get distinct names side
 //! by side, and unifying the values is a separate decision.
@@ -11,14 +12,14 @@
 //! - runtime/src/server/supervisor/scheduler_limits.zig — scheduler policy
 //!   (memory ladder, launches in flight per pool); the pool's own bounds are
 //!   in pool.zig here.
-//! - runtime/src/egress/gateway/supervisor_limits.zig — shard
-//!   containment (restart backstop, memory budget).
+//! - runtime/src/egress/gateway/containment.zig — shard restarts, shard
+//!   memory and upload memory.
 //! - runtime/src/common/ipc/fetch_limits.zig — fetch IPC wire shape
 //!   (packet/url/header caps, the pooled request-body ceiling and the pooled
 //!   bytes one session may have in flight).
 //! - runtime/src/egress/gateway/policy.zig — per-fetch gateway policy
 //!   defaults (cite http_body and fetch_limits).
-//! - runtime/src/egress/gateway/sizing.zig — the gateway's worker cap
+//! - runtime/src/egress/gateway/sizing.zig — the gateway's session cap
 //!   and the descriptor budget that bounds it and the shard count; the
 //!   gateway's resource limits are in process.zig here.
 //! - runtime/src/server/analytics/sink.zig — analytics stream buffers, the
@@ -30,9 +31,8 @@
 //!   drains.
 //! - runtime/src/server/ingress/analytics_drain.zig — console lines drained
 //!   per worker per metrics tick.
-//! - runtime/src/server/supervisor/usage_log.zig (usage batch and
-//!   synthesis reserve), usage_drain.zig (`write_outs_per_drain_max`) and
-//!   request_table.zig (entries per worker) — the usage path.
+//! - runtime/src/server/supervisor/request_table.zig (entries per worker) —
+//!   the requests in flight on one worker.
 //! - runtime/src/server/config/parse.zig (`KeyPath.depth_max`) and
 //!   diagnostic.zig (`Diagnostic.message_bytes_max`) — reading the
 //!   configuration; the bounds on what it declares are in server.zig here.
@@ -43,9 +43,9 @@
 //!   `rules_max`, `members_max` and the image's byte bounds) — the policy
 //!   table the server hands each gateway, sized from the `network_*` bounds
 //!   in server.zig here.
-//! - runtime/src/common/ipc/fs_index.zig (`path_bytes_max`, `entries_max`)
-//!   and route_bindings.zig (`bytes_max`, `entries_max`, both equal to
-//!   server.zig's per-route binding bounds) — the WorkerInit memfds.
+//! - runtime/src/common/ipc/route_bindings.zig (`bytes_max`, `entries_max`,
+//!   both equal to server.zig's per-route binding bounds) — a route's
+//!   bindings in the definition artifact.
 //! Cross-domain relations between those centrals and these domain files are
 //! comptime-asserted in runtime/tests/contracts/limits.zig, compiled by the
 //! aggregate `zig build test` suite — drift is a compile error there.
@@ -57,6 +57,5 @@ pub const headers = @import("headers.zig");
 pub const ingress = @import("ingress.zig");
 pub const worker = @import("worker.zig");
 pub const runtime_logs = @import("runtime_logs.zig");
-pub const fs_fault = @import("fs_fault.zig");
 pub const server = @import("server.zig");
 pub const pool = @import("pool.zig");

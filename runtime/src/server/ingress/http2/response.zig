@@ -40,7 +40,7 @@ pub fn encodeResponseHeadersScratch(
         try validateResponseHeader(header);
         hpack_headers[index + 1] = .{ .name = header.name, .value = header.value };
     }
-    return encoder.encodeHeadersWithScratch(scratch, hpack_headers, limits.headers.INGRESS_H2_RESPONSE_HEADER_BLOCK_BYTES);
+    return encoder.encodeHeaders(scratch, hpack_headers, limits.headers.INGRESS_H2_RESPONSE_HEADER_BLOCK_BYTES);
 }
 
 fn validateResponseHeader(header: ipc.ingress_channel.ResponseHeader) !void {

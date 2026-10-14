@@ -23,13 +23,14 @@ const cachefs = @import("runtime/build/cachefs.zig");
 pub fn build(b: *std.Build) void {
     cachefs.assertCacheNotOnDrvfs(b);
     const opts = options_mod.parse(b);
+    const cxx_sysroot = options_mod.cxxSysrootFor(b, &opts, opts.target);
 
     const toolchain = b.allocator.create(toolchain_mod.ToolchainPaths) catch @panic("OOM");
     toolchain.* = toolchain_mod.discover(
         b,
         opts.target,
         opts.cxx_stdlib_version,
-        opts.cxx_sysroot,
+        cxx_sysroot,
         opts.native_cxx_linker,
         opts.compiler_rt_builtins,
     ) orelse std.process.fatal(
@@ -49,7 +50,7 @@ pub fn build(b: *std.Build) void {
     // ICU and BoringSSL for this target, built or admitted by their stamps.
     const native_target: deps_mod.Target = .{
         .target = opts.target,
-        .cxx_sysroot = opts.cxx_sysroot,
+        .cxx_sysroot = cxx_sysroot,
         .mcpu = toolchain.target_mcpu,
     };
     const icu = native.icu(native_target);
@@ -69,7 +70,7 @@ pub fn build(b: *std.Build) void {
         .cmake_build_type = jsc_cmake_build_type,
         .jsc_build_dir = opts.jsc_build_dir,
         .webkit_source_dir = opts.webkit_source_dir,
-        .cxx_sysroot = opts.cxx_sysroot,
+        .cxx_sysroot = cxx_sysroot,
         .mcpu = toolchain.target_mcpu,
         .icu = icu,
     };

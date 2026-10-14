@@ -82,7 +82,8 @@ describe("crypto", () => {
     assert.equal(crypto.subtle.sign.length, 3);
     assert.equal(crypto.subtle.verify.length, 4);
     assert.equal(crypto.subtle.deriveKey.length, 5);
-    assert.equal(crypto.subtle.deriveBits.length, 3);
+    // deriveBits' length is optional and defaults to null.
+    assert.equal(crypto.subtle.deriveBits.length, 2);
     assert.equal(crypto.subtle.wrapKey.length, 4);
     assert.equal(crypto.subtle.unwrapKey.length, 7);
 
@@ -122,7 +123,7 @@ describe("crypto", () => {
       ["digest", 2],
       ["generateKey", 3],
       ["deriveKey", 5],
-      ["deriveBits", 3],
+      ["deriveBits", 2],
       ["importKey", 5],
       ["exportKey", 2],
       ["wrapKey", 4],
@@ -541,12 +542,17 @@ describe("crypto", () => {
     const pbkdf2 = await crypto.subtle.importKey("raw", raw, "PBKDF2", false, ["deriveBits"]);
     const hkdf = await crypto.subtle.importKey("raw", raw, "HKDF", false, ["deriveBits"]);
     await expectRejectsName(crypto.subtle.exportKey("raw", pbkdf2), "NotSupportedError");
-    await expectRejectsName(crypto.subtle.deriveBits({ name: "PBKDF2", salt: raw, iterations: 1, hash: "SHA-256" }, pbkdf2), "TypeError");
+    // A missing length is null, which PBKDF2 refuses.
+    await expectRejectsName(crypto.subtle.deriveBits({ name: "PBKDF2", salt: raw, iterations: 1, hash: "SHA-256" }, pbkdf2), "OperationError");
     assert.equal((await crypto.subtle.deriveBits({ name: "PBKDF2", salt: raw, iterations: 1, hash: "SHA-256" }, pbkdf2, 0)).byteLength, 0);
     assert.equal((await crypto.subtle.deriveBits({ name: "HKDF", hash: "SHA-256", salt: raw, info: raw }, hkdf, 0)).byteLength, 0);
     await expectRejectsName(crypto.subtle.deriveBits({ name: "PBKDF2", salt: raw, iterations: 1, hash: "SHA-256" }, pbkdf2, 7), "OperationError");
     await expectRejectsName(crypto.subtle.deriveBits({ name: "PBKDF2", salt: raw, iterations: 0, hash: "SHA-256" }, pbkdf2, 8), "OperationError");
     await expectRejectsName(crypto.subtle.deriveBits({ name: "PBKDF2", salt: raw, iterations: 1_000_001, hash: "SHA-256" }, pbkdf2, 8), "OperationError");
+    // The cap is on work, iterations times output blocks weighted by the hash, so two SHA-256 blocks halve the
+    // iterations, and a SHA-512 iteration counts about four SHA-256 ones.
+    await expectRejectsName(crypto.subtle.deriveBits({ name: "PBKDF2", salt: raw, iterations: 500_001, hash: "SHA-256" }, pbkdf2, 512), "OperationError");
+    await expectRejectsName(crypto.subtle.deriveBits({ name: "PBKDF2", salt: raw, iterations: 300_000, hash: "SHA-512" }, pbkdf2, 512), "OperationError");
     await expectRejectsName(crypto.subtle.deriveBits({ name: "PBKDF2", salt: raw, iterations: -1, hash: "SHA-256" }, pbkdf2, 8), "TypeError");
     await expectRejectsName(crypto.subtle.deriveBits({ name: "PBKDF2", salt: raw, iterations: 1, hash: "SHA-999" }, pbkdf2, 8), "NotSupportedError");
     await expectRejectsName(crypto.subtle.deriveBits({ name: "PBKDF2", iterations: 1, hash: "SHA-256" }, pbkdf2, 8), "TypeError");
@@ -1042,6 +1048,9 @@ describe("crypto", () => {
     await expectRejectsName(crypto.subtle.generateKey({ name: "RSA-PSS", modulusLength: 1024, publicExponent, hash: "SHA-256" }, true, []), "SyntaxError");
     await expectRejectsName(crypto.subtle.generateKey({ name: "RSA-PSS", modulusLength: 512, publicExponent, hash: "SHA-256" }, true, ["sign"]), "OperationError");
     await expectRejectsName(crypto.subtle.generateKey({ name: "RSA-PSS", modulusLength: 16384, publicExponent, hash: "SHA-256" }, true, ["sign"]), "OperationError");
+    // generateKey stops at 4096 bits, where its time already reaches seconds; an imported key may be larger.
+    await expectRejectsName(crypto.subtle.generateKey({ name: "RSA-PSS", modulusLength: 4104, publicExponent, hash: "SHA-256" }, true, ["sign"]), "OperationError");
+    await expectRejectsName(crypto.subtle.generateKey({ name: "RSA-OAEP", modulusLength: 8192, publicExponent, hash: "SHA-256" }, true, ["encrypt", "decrypt"]), "OperationError");
     await expectRejectsName(crypto.subtle.sign("RSASSA-PKCS1-v1_5", rsassa.publicKey, data), "InvalidAccessError");
     await expectRejectsName(crypto.subtle.importKey("pkcs8", pkcs8, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, true, []), "SyntaxError");
     await expectRejectsName(crypto.subtle.importKey("jwk", privateJwk, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, true, []), "SyntaxError");
@@ -1328,7 +1337,8 @@ describe("crypto", () => {
     assert.equal(hex(aliceBits), hex(bobBits));
 
     assert.equal((await crypto.subtle.deriveBits({ name: "ECDH", public: bob.publicKey }, alice.privateKey, null)).byteLength, 32);
-    assert.equal((await crypto.subtle.deriveBits({ name: "ECDH", public: bob.publicKey }, alice.privateKey, 0)).byteLength, 32);
+    assert.equal((await crypto.subtle.deriveBits({ name: "ECDH", public: bob.publicKey }, alice.privateKey)).byteLength, 32);
+    assert.equal((await crypto.subtle.deriveBits({ name: "ECDH", public: bob.publicKey }, alice.privateKey, 0)).byteLength, 0);
     assert.equal((await crypto.subtle.deriveBits({ name: "ECDH", public: bob.publicKey }, alice.privateKey, 1)).byteLength, 1);
     assert.equal((await crypto.subtle.deriveBits({ name: "ECDH", public: bob.publicKey }, alice.privateKey, 128)).byteLength, 16);
 
@@ -1469,7 +1479,8 @@ describe("crypto", () => {
     assert.equal(aliceBits.byteLength, 32);
     assert.equal(hex(aliceBits), hex(bobBits));
     assert.equal((await crypto.subtle.deriveBits({ name: "X25519", public: bob.publicKey }, alice.privateKey, null)).byteLength, 32);
-    assert.equal((await crypto.subtle.deriveBits({ name: "X25519", public: bob.publicKey }, alice.privateKey, 0)).byteLength, 32);
+    assert.equal((await crypto.subtle.deriveBits({ name: "X25519", public: bob.publicKey }, alice.privateKey)).byteLength, 32);
+    assert.equal((await crypto.subtle.deriveBits({ name: "X25519", public: bob.publicKey }, alice.privateKey, 0)).byteLength, 0);
     assert.equal((await crypto.subtle.deriveBits({ name: "X25519", public: bob.publicKey }, alice.privateKey, 1)).byteLength, 1);
     assert.equal((await crypto.subtle.deriveBits({ name: "X25519", public: bob.publicKey }, alice.privateKey, 128)).byteLength, 16);
 
@@ -1563,8 +1574,9 @@ describe("crypto", () => {
     const invalidJson = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, wrappingKey, new TextEncoder().encode("not json {{{"));
     await expectRejectsName(crypto.subtle.unwrapKey("jwk", invalidJson, wrappingKey, { name: "AES-GCM", iv }, { name: "AES-GCM" }, true, ["encrypt", "decrypt"]), "DataError");
 
+    // The parse a JWK step requires kty, a DataError, where importKey's dictionary is a TypeError.
     const invalidJwk = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, wrappingKey, new TextEncoder().encode(JSON.stringify({ foo: "bar" })));
-    await expectRejectsName(crypto.subtle.unwrapKey("jwk", invalidJwk, wrappingKey, { name: "AES-GCM", iv }, { name: "AES-GCM" }, true, ["encrypt", "decrypt"]), "TypeError");
+    await expectRejectsName(crypto.subtle.unwrapKey("jwk", invalidJwk, wrappingKey, { name: "AES-GCM", iv }, { name: "AES-GCM" }, true, ["encrypt", "decrypt"]), "DataError");
 
     const invalidKeyOps = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, wrappingKey, new TextEncoder().encode(JSON.stringify({
       kty: "oct",
@@ -1627,7 +1639,7 @@ describe("crypto", () => {
     const hmacKey = await crypto.subtle.importKey("jwk", { ...hmacJwk, use: "sig" }, { name: "HMAC", hash: "SHA-256" }, true, ["sign"]);
     assert.equal(hmacKey.algorithm.name, "HMAC");
 
-    // Unwrapped JWKs hit the native parser; same rule applies.
+    // Unwrapped JWKs go through the same reader; the same rule applies.
     const gcmWrapKey = await crypto.subtle.importKey("raw", new Uint8Array(32).fill(1), { name: "AES-GCM" }, false, ["encrypt", "unwrapKey"]);
     const iv = new Uint8Array(12).fill(2);
     const wrongUse = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, gcmWrapKey, new TextEncoder().encode(JSON.stringify({ ...aesJwk, use: "sig" })));
@@ -1754,50 +1766,55 @@ describe("crypto", () => {
     }
   });
 
-  test("subtle deriveBits null length derives the full hash output for HKDF/PBKDF2", async () => {
-    const ikm = fromHex("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b");
-    const salt = fromHex("000102030405060708090a0b0c");
-    const info = fromHex("f0f1f2f3f4f5f6f7f8f9");
-
-    // HKDF: null length must yield the digest length of the chosen hash.
-    const hkdf = await crypto.subtle.importKey("raw", ikm, "HKDF", false, ["deriveBits"]);
-    const hkdfDigestBytes = {
-      "SHA-224": 28,
-      "SHA-256": 32,
-      "SHA-384": 48,
-      "SHA-512": 64,
-      "SHA3-224": 28,
-      "SHA3-256": 32,
-      "SHA3-384": 48,
-      "SHA3-512": 64,
-    };
-    for (const [hash, bytes] of Object.entries(hkdfDigestBytes)) {
-      const full = await crypto.subtle.deriveBits({ name: "HKDF", hash, salt, info }, hkdf, null);
-      assert.equal(full.byteLength, bytes, `HKDF ${hash} null length`);
-      // Same result as asking for exactly that many bits explicitly.
-      const explicit = await crypto.subtle.deriveBits({ name: "HKDF", hash, salt, info }, hkdf, bytes * 8);
-      assert.equal(hex(full), hex(explicit));
-      // undefined behaves the same as null.
-      const undef = await crypto.subtle.deriveBits({ name: "HKDF", hash, salt, info }, hkdf, undefined);
-      assert.equal(hex(undef), hex(full));
+  test("subtle deriveBits with a null or missing length is an OperationError for HKDF and PBKDF2", async () => {
+    // The HKDF and PBKDF2 derive bits operations refuse a null length; ECDH and X25519 derive their whole shared
+    // secret for it, which their own tests pin.
+    const hkdf = await crypto.subtle.importKey("raw", new Uint8Array(22).fill(0x0b), "HKDF", false, ["deriveBits"]);
+    const pbkdf2 = await crypto.subtle.importKey("raw", new TextEncoder().encode("password"), "PBKDF2", false, ["deriveBits"]);
+    const hkdfParams = { name: "HKDF", hash: "SHA-256", salt: new Uint8Array(13), info: new Uint8Array(10) };
+    const pbkdf2Params = { name: "PBKDF2", salt: new TextEncoder().encode("salt"), iterations: 2, hash: "SHA-256" };
+    for (const length of [null, undefined]) {
+      await expectRejectsName(crypto.subtle.deriveBits(hkdfParams, hkdf, length), "OperationError");
+      await expectRejectsName(crypto.subtle.deriveBits(pbkdf2Params, pbkdf2, length), "OperationError");
     }
-
-    // PBKDF2: null length must yield the digest length of the chosen hash.
-    const password = new TextEncoder().encode("password");
-    const pbkdf2 = await crypto.subtle.importKey("raw", password, "PBKDF2", false, ["deriveBits"]);
-    for (const [hash, bytes] of Object.entries(hkdfDigestBytes)) {
-      const params = { name: "PBKDF2", salt: new TextEncoder().encode("salt"), iterations: 2, hash };
-      const full = await crypto.subtle.deriveBits(params, pbkdf2, null);
-      assert.equal(full.byteLength, bytes, `PBKDF2 ${hash} null length`);
-      const explicit = await crypto.subtle.deriveBits(params, pbkdf2, bytes * 8);
-      assert.equal(hex(full), hex(explicit));
-    }
+    await expectRejectsName(crypto.subtle.deriveBits(hkdfParams, hkdf), "OperationError");
+    await expectRejectsName(crypto.subtle.deriveBits(pbkdf2Params, pbkdf2), "OperationError");
+    assert.equal((await crypto.subtle.deriveBits(hkdfParams, hkdf, 256)).byteLength, 32);
   });
 
-  test("native JWK unwrap parser matches the importKey base64url and ext semantics", async () => {
-    // The native (unwrapKey) JWK parser must accept the same inputs the JSC
-    // importKey front-end accepts. We inject custom JWK JSON by AES-GCM
-    // encrypting it ourselves and feeding the ciphertext to unwrapKey.
+  test("deriveKey into HKDF or PBKDF2 imports every bit the derivation gives", async () => {
+    // Their "get key length" is null, so an ECDH or X25519 base derives its whole shared secret, the usual ECDH then
+    // HKDF pattern, and an HKDF or PBKDF2 base, which refuses a null length, is an OperationError.
+    const alice = await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveKey"]);
+    const bob = await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"]);
+    const shared = await crypto.subtle.deriveKey({ name: "ECDH", public: bob.publicKey }, alice.privateKey, "HKDF", false,
+      ["deriveBits"]);
+    assert.deepEqual(shared.algorithm, { name: "HKDF" });
+    assert.equal(shared.extractable, false);
+    const sharedBits = await crypto.subtle.deriveBits({ name: "ECDH", public: alice.publicKey }, bob.privateKey);
+    const hkdfParams = { name: "HKDF", hash: "SHA-256", salt: new Uint8Array(16), info: new Uint8Array(4) };
+    const expected = await crypto.subtle.deriveBits(hkdfParams,
+      await crypto.subtle.importKey("raw", sharedBits, "HKDF", false, ["deriveBits"]), 256);
+    assert.equal(hex(await crypto.subtle.deriveBits(hkdfParams, shared, 256)), hex(expected));
+
+    const x25519 = await crypto.subtle.generateKey("X25519", true, ["deriveKey"]);
+    const pbkdf2 = await crypto.subtle.deriveKey({ name: "X25519", public: x25519.publicKey }, x25519.privateKey,
+      "PBKDF2", false, ["deriveBits"]);
+    assert.deepEqual(pbkdf2.algorithm, { name: "PBKDF2" });
+
+    const hkdf = await crypto.subtle.importKey("raw", new Uint8Array(16), "HKDF", false, ["deriveKey"]);
+    for (const name of ["HKDF", "PBKDF2"])
+      await expectRejectsName(crypto.subtle.deriveKey(hkdfParams, hkdf, name, false, ["deriveBits"]), "OperationError");
+    // A PBKDF2 or HKDF key is never extractable.
+    await expectRejectsName(crypto.subtle.deriveKey({ name: "ECDH", public: bob.publicKey }, alice.privateKey, "HKDF",
+      true, ["deriveBits"]), "SyntaxError");
+  });
+
+  test("unwrapKey parses a JWK as JSON and reads it as importKey reads a JsonWebKey", async () => {
+    // unwrapKey parses the decrypted text with JSON.parse and reads the result
+    // with importKey's JsonWebKey reader, so it accepts exactly what importKey
+    // accepts. We inject custom JWK JSON by AES-GCM encrypting it ourselves and
+    // feeding the ciphertext to unwrapKey.
     const kekBytes = new Uint8Array(16).fill(7);
     const iv = new Uint8Array(12).fill(9);
     const encoder = new TextEncoder();
@@ -1812,8 +1829,8 @@ describe("crypto", () => {
     // The canonical (unpadded) base64url AES key, as importKey accepts.
     const baseJwk = { kty: "oct", k: "AAECAwQFBgcICQoLDA0ODw", alg: "A128GCM", ext: true, key_ops: ["encrypt"] };
 
-    // importKey accepts '=' padding (WTF::base64URLDecode does not validate it);
-    // the native parser must accept it identically, yielding the same key bytes.
+    // importKey accepts '=' padding of any count; unwrapKey accepts it
+    // identically, yielding the same key bytes.
     const padded = await unwrapJson(JSON.stringify({ ...baseJwk, k: "AAECAwQFBgcICQoLDA0ODw==" }), { name: "AES-GCM" }, ["encrypt"]);
     assert.equal(hex(await crypto.subtle.exportKey("raw", padded)), "000102030405060708090a0b0c0d0e0f");
 
@@ -1833,10 +1850,45 @@ describe("crypto", () => {
       ["encrypt"]);
     assert.equal(hex(await crypto.subtle.exportKey("raw", withUnicodeMember)), "000102030405060708090a0b0c0d0e0f");
 
-    // A lone (unpaired) surrogate escape is invalid JSON and must be rejected.
+    // A lone surrogate escape is valid JSON, as JSON.parse reads it, and an
+    // ignored member holding one imports like any other.
+    const withLoneSurrogate = await unwrapJson(
+      '{"kty":"oct","k":"AAECAwQFBgcICQoLDA0ODw","alg":"A128GCM","ext":true,"key_ops":["encrypt"],"kid":"\\ud83d"}',
+      { name: "AES-GCM" },
+      ["encrypt"]);
+    assert.equal(hex(await crypto.subtle.exportKey("raw", withLoneSurrogate)), "000102030405060708090a0b0c0d0e0f");
+
+    // Text that is not JSON, or not UTF-8, is a DataError.
+    await expectRejectsName(unwrapJson("{\"kty\":", { name: "AES-GCM" }, ["encrypt"]), "DataError");
+    const notUtf8 = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, encryptKey, new Uint8Array([0x7b, 0xff, 0x7d]));
     await expectRejectsName(
-      unwrapJson('{"kty":"oct","k":"AAECAwQFBgcICQoLDA0ODw","alg":"A128GCM","ext":true,"key_ops":["encrypt"],"kid":"\\ud83d"}', { name: "AES-GCM" }, ["encrypt"]),
+      crypto.subtle.unwrapKey("jwk", notUtf8, unwrapKeyHandle, { name: "AES-GCM", iv }, { name: "AES-GCM" }, true, ["encrypt"]),
       "DataError");
+  });
+
+  test("unwrapKey accepts every JWK importKey accepts, and ext is read with ToBoolean in both", async () => {
+    const kek = await crypto.subtle.importKey("raw", new Uint8Array(32).fill(3), { name: "AES-GCM" }, false,
+      ["wrapKey", "unwrapKey", "encrypt"]);
+    const iv = new Uint8Array(12).fill(4);
+    const hmac = { name: "HMAC", hash: "SHA-256" };
+
+    // A 16 KiB HMAC key: its "k" is far longer than any bound a JWK reader
+    // could put on one member.
+    const large = await crypto.subtle.importKey("raw", crypto.getRandomValues(new Uint8Array(16384)), hmac, true, ["sign"]);
+    const wrapped = await crypto.subtle.wrapKey("jwk", large, kek, { name: "AES-GCM", iv });
+    const unwrapped = await crypto.subtle.unwrapKey("jwk", wrapped, kek, { name: "AES-GCM", iv }, hmac, true, ["sign"]);
+    assert.equal(hex(await crypto.subtle.exportKey("raw", unwrapped)), hex(await crypto.subtle.exportKey("raw", large)));
+    assert.equal(unwrapped.algorithm.length, 16384 * 8);
+
+    // 0e5 is the number 0, which ToBoolean reads as false, so an extractable
+    // import refuses the JWK in both front ends.
+    const jwkText = '{"kty":"oct","k":"AAECAwQFBgcICQoLDA0ODw","ext":0e5}';
+    await expectRejectsName(crypto.subtle.importKey("jwk", JSON.parse(jwkText), hmac, true, ["sign"]), "DataError");
+    const sealed = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, kek, new TextEncoder().encode(jwkText));
+    await expectRejectsName(crypto.subtle.unwrapKey("jwk", sealed, kek, { name: "AES-GCM", iv }, hmac, true, ["sign"]), "DataError");
+    // A nonextractable import of the same JWK is allowed in both.
+    await crypto.subtle.importKey("jwk", JSON.parse(jwkText), hmac, false, ["sign"]);
+    await crypto.subtle.unwrapKey("jwk", sealed, kek, { name: "AES-GCM", iv }, hmac, false, ["sign"]);
   });
 
   test("subtle AES-GCM decrypt verifies the authentication tag", async () => {
@@ -1917,8 +1969,8 @@ describe("crypto", () => {
   });
 
   test("a wrapped RSA private JWK carries exactly the members exportKey returns", async () => {
-    // wrapKey measures the JSON of a private key before writing it, so the text lands in one buffer of its exact
-    // length; the decrypted text must parse to the same JWK exportKey builds, CRT members included.
+    // wrapKey serializes the object exportKey builds, so the decrypted text parses to the same JWK, CRT members
+    // included.
     const pair = await crypto.subtle.generateKey(
       { name: "RSA-PSS", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" },
       true,
@@ -1939,5 +1991,290 @@ describe("crypto", () => {
     const data = new TextEncoder().encode("wrapped key");
     const signature = await crypto.subtle.sign({ name: "RSA-PSS", saltLength: 32 }, unwrapped, data);
     assert.equal(await crypto.subtle.verify({ name: "RSA-PSS", saltLength: 32 }, pair.publicKey, signature, data), true);
+  });
+
+  test("SubtleCrypto promises are settled when the method returns", async () => {
+    // A reaction to a settled promise is queued at once, so it runs before one
+    // queued after the call returned.
+    const order = [];
+    const digested = crypto.subtle.digest("SHA-256", new Uint8Array(4096)).then(() => order.push("digest"));
+    Promise.resolve().then(() => order.push("next microtask"));
+    await digested;
+    assert.deepEqual(order, ["digest", "next microtask"]);
+
+    const rejectionOrder = [];
+    const rejected = crypto.subtle.digest("SHA-999", new Uint8Array(1)).catch(() => rejectionOrder.push("rejected"));
+    Promise.resolve().then(() => rejectionOrder.push("next microtask"));
+    await rejected;
+    assert.deepEqual(rejectionOrder, ["rejected", "next microtask"]);
+  });
+
+  test("every operation refuses an algorithm it does not register with NotSupportedError", async () => {
+    const key = await crypto.subtle.importKey("raw", new Uint8Array(16), { name: "HMAC", hash: "SHA-256" }, true, ["sign"]);
+    const hkdf = await crypto.subtle.importKey("raw", new Uint8Array(16), "HKDF", false, ["deriveKey"]);
+    const hkdfParams = { name: "HKDF", hash: "SHA-256", salt: new Uint8Array(), info: new Uint8Array() };
+    const data = new Uint8Array(16);
+    const cases = [];
+    for (const name of ["HMAC", "ECDSA", "AES-KW", "PBKDF2", "Ed25519", "RSA-PSS", "SHA-256"]) {
+      cases.push([`encrypt ${name}`, () => crypto.subtle.encrypt(name, key, data)]);
+      cases.push([`decrypt ${name}`, () => crypto.subtle.decrypt(name, key, data)]);
+    }
+    for (const name of ["AES-GCM", "RSA-OAEP", "RSAES-PKCS1-v1_5", "ECDH", "X25519", "HKDF"]) {
+      cases.push([`sign ${name}`, () => crypto.subtle.sign(name, key, data)]);
+      cases.push([`verify ${name}`, () => crypto.subtle.verify(name, key, data, data)]);
+    }
+    for (const name of ["AES-GCM", "HMAC", "ECDSA", "RSA-PSS", "Ed25519"]) {
+      cases.push([`deriveBits ${name}`, () => crypto.subtle.deriveBits(name, key, 256)]);
+      cases.push([`deriveKey ${name}`, () => crypto.subtle.deriveKey(name, key, { name: "AES-GCM", length: 128 }, true, ["encrypt"])]);
+    }
+    for (const name of ["ECDSA", "RSA-PSS", "X25519"])
+      cases.push([`deriveKey into ${name}`, () => crypto.subtle.deriveKey(hkdfParams, hkdf, name, true, ["sign"])]);
+    for (const name of ["PBKDF2", "HKDF", "SHA-256"])
+      cases.push([`generateKey ${name}`, () => crypto.subtle.generateKey(name, false, ["deriveBits"])]);
+    for (const name of ["SHA-256", "AES-CFB-128"])
+      cases.push([`importKey ${name}`, () => crypto.subtle.importKey("raw", data, name, true, ["sign"])]);
+    for (const name of ["RSAES-PKCS1-v1_5", "HMAC", "ECDSA", "RSA-PSS"]) {
+      cases.push([`wrapKey ${name}`, () => crypto.subtle.wrapKey("raw", key, key, name)]);
+      cases.push([`unwrapKey ${name}`, () => crypto.subtle.unwrapKey("raw", data, key, name, "AES-GCM", true, ["encrypt"])]);
+    }
+    cases.push(["unwrapKey into SHA-256", () => crypto.subtle.unwrapKey("raw", data, key, "AES-KW", "SHA-256", true, ["sign"])]);
+    cases.push(["digest HMAC", () => crypto.subtle.digest("HMAC", data)]);
+    // Formats an algorithm has no import or export for.
+    cases.push(["importKey spki AES-GCM", () => crypto.subtle.importKey("spki", data, "AES-GCM", true, ["encrypt"])]);
+    cases.push(["importKey pkcs8 HMAC", () => crypto.subtle.importKey("pkcs8", data, { name: "HMAC", hash: "SHA-256" }, true, ["sign"])]);
+    cases.push(["importKey jwk PBKDF2", () => crypto.subtle.importKey("jwk", { kty: "oct", k: "AA" }, "PBKDF2", false, ["deriveBits"])]);
+    cases.push(["importKey raw RSA-PSS", () => crypto.subtle.importKey("raw", data, { name: "RSA-PSS", hash: "SHA-256" }, true, ["verify"])]);
+    cases.push(["exportKey spki HMAC", () => crypto.subtle.exportKey("spki", key)]);
+
+    for (const [label, call] of cases) {
+      const error = await call().then(() => null, error => error);
+      assert(error, `${label} should reject`);
+      assert.equal(error.name, "NotSupportedError", label);
+    }
+  });
+
+  test("an ECDSA P-521 signature whose r starts with a zero byte verifies", async () => {
+    // P-521's group order has 521 bits, so r is padded to 66 bytes and its first byte is zero about half the time.
+    const pair = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-521" }, true, ["sign", "verify"]);
+    const data = new TextEncoder().encode("p1363 padding");
+    let padded = null;
+    for (let attempt = 0; attempt < 64 && !padded; attempt++) {
+      const signature = new Uint8Array(await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-512" }, pair.privateKey, data));
+      assert.equal(signature.length, 132);
+      if (signature[0] === 0)
+        padded = signature;
+    }
+    assert(padded, "64 signatures should include one whose r starts with a zero byte");
+    assert.equal(await crypto.subtle.verify({ name: "ECDSA", hash: "SHA-512" }, pair.publicKey, padded, data), true);
+    // Without its zero byte the signature is not P1363 and verifies as false.
+    assert.equal(await crypto.subtle.verify({ name: "ECDSA", hash: "SHA-512" }, pair.publicKey, padded.subarray(1), data), false);
+  });
+
+  test("unwrapKey reads a parsed JWK's own members only, so script on Object.prototype neither runs nor changes the key", async () => {
+    // JSON.parse builds the JWK in the caller's realm. A getter on Object.prototype for a member the JWK lacks would
+    // otherwise run with the parsed key as `this` and read the material of a key unwrapped as non-extractable, and a
+    // data property there would add a member.
+    const kek = await crypto.subtle.importKey("raw", new Uint8Array(16).fill(1), { name: "AES-GCM" }, false, ["wrapKey", "unwrapKey"]);
+    const iv = new Uint8Array(12).fill(3);
+    const hmac = await crypto.subtle.importKey("raw", new Uint8Array(32).fill(7), { name: "HMAC", hash: "SHA-256" }, true, ["sign"]);
+    const wrapped = await crypto.subtle.wrapKey("jwk", hmac, kek, { name: "AES-GCM", iv });
+    const ecdsa = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
+    const wrappedPublic = await crypto.subtle.wrapKey("jwk", ecdsa.publicKey, kek, { name: "AES-GCM", iv });
+
+    let getterCalls = 0;
+    let leaked;
+    Object.defineProperty(Object.prototype, "crv", {
+      configurable: true,
+      get() {
+        getterCalls++;
+        leaked = this.k;
+        return undefined;
+      },
+    });
+    let unwrapped;
+    try {
+      unwrapped = await crypto.subtle.unwrapKey("jwk", wrapped, kek, { name: "AES-GCM", iv }, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+    } finally {
+      delete Object.prototype.crv;
+    }
+    assert.equal(getterCalls, 0);
+    assert.equal(leaked, undefined);
+    assert.equal(unwrapped.extractable, false);
+
+    Object.prototype.d = "AAAA";
+    let publicKey;
+    try {
+      publicKey = await crypto.subtle.unwrapKey("jwk", wrappedPublic, kek, { name: "AES-GCM", iv }, { name: "ECDSA", namedCurve: "P-256" }, true, ["verify"]);
+    } finally {
+      delete Object.prototype.d;
+    }
+    assert.equal(publicKey.type, "public");
+  });
+
+  test("wrapKey's JWK text is the key's own, whatever toJSON script defines", async () => {
+    const kek = await crypto.subtle.importKey("raw", new Uint8Array(16).fill(2), { name: "AES-GCM" }, false, ["wrapKey", "decrypt"]);
+    const iv = new Uint8Array(12).fill(4);
+    const key = await crypto.subtle.importKey("raw", new Uint8Array(16).fill(9), { name: "AES-GCM" }, true, ["encrypt"]);
+    const exported = await crypto.subtle.exportKey("jwk", key);
+    Object.prototype.toJSON = function () {
+      return { replaced: true };
+    };
+    let wrapped;
+    try {
+      wrapped = await crypto.subtle.wrapKey("jwk", key, kek, { name: "AES-GCM", iv });
+    } finally {
+      delete Object.prototype.toJSON;
+    }
+    const text = new TextDecoder().decode(await crypto.subtle.decrypt({ name: "AES-GCM", iv }, kek, wrapped));
+    assert.equal(text, JSON.stringify(exported));
+  });
+
+  test("unwrapKey refuses JWK text over 1 MiB and a parsed JWK that is not an object of primitives with DataError", async () => {
+    const kekBytes = new Uint8Array(16).fill(5);
+    const iv = new Uint8Array(12).fill(6);
+    const encoder = new TextEncoder();
+    const encryptKey = await crypto.subtle.importKey("raw", kekBytes, { name: "AES-GCM" }, false, ["encrypt"]);
+    const unwrapKeyHandle = await crypto.subtle.importKey("raw", kekBytes, { name: "AES-GCM" }, false, ["unwrapKey"]);
+    async function unwrapText(text) {
+      const ciphertext = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, encryptKey, encoder.encode(text));
+      return crypto.subtle.unwrapKey("jwk", ciphertext, unwrapKeyHandle, { name: "AES-GCM", iv }, { name: "HMAC", hash: "SHA-256" }, true, ["sign"]);
+    }
+
+    // The JWK below is 51 bytes of JSON around its padding, so the first text is exactly 1 MiB.
+    const k = "AAECAwQFBgcICQoLDA0ODw";
+    const fits = await unwrapText(JSON.stringify({ kty: "oct", k, pad: "x".repeat(1024 * 1024 - 51) }));
+    assert.equal(fits.algorithm.name, "HMAC");
+    await expectRejectsName(unwrapText(JSON.stringify({ kty: "oct", k, pad: "x".repeat(1024 * 1024 - 50) })), "DataError");
+
+    for (const text of [
+      "5",
+      "\"oct\"",
+      "null",
+      "[]",
+      `{"k":"${k}"}`,
+      `{"kty":["oct"],"k":"${k}"}`,
+      `{"kty":"oct","k":{"toString":"${k}"}}`,
+      `{"kty":"oct","k":"${k}","key_ops":"sign"}`,
+      `{"kty":"oct","k":"${k}","key_ops":[["sign"]]}`,
+    ])
+      await expectRejectsName(unwrapText(text), "DataError");
+  });
+
+  test("an RSA JWK whose public exponent is longer than 33 bits is a DataError", async () => {
+    // A public exponent near the modulus would make every verification a full-size exponentiation, so import bounds it
+    // as spki and pkcs8 import do.
+    const pair = await crypto.subtle.generateKey(
+      { name: "RSASSA-PKCS1-v1_5", modulusLength: 1024, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" },
+      true,
+      ["sign", "verify"]);
+    const jwk = await crypto.subtle.exportKey("jwk", pair.publicKey);
+    const algorithm = { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" };
+    // 2^64 + 1 is odd and far below the modulus.
+    await expectRejectsName(crypto.subtle.importKey("jwk", { ...jwk, e: base64Url(Uint8Array.of(1, 0, 0, 0, 0, 0, 0, 0, 1)) }, algorithm, true, ["verify"]), "DataError");
+    // 2^32 + 1 has 33 bits.
+    const allowed = await crypto.subtle.importKey("jwk", { ...jwk, e: base64Url(Uint8Array.of(1, 0, 0, 0, 1)) }, algorithm, true, ["verify"]);
+    assert.equal(allowed.type, "public");
+  });
+
+  test("generateKey refuses an RSA modulus length that is not a multiple of 128", async () => {
+    // BoringSSL would round 1032 bits down to a 1024-bit key.
+    const params = { name: "RSA-PSS", modulusLength: 1032, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" };
+    await expectRejectsName(crypto.subtle.generateKey(params, true, ["sign", "verify"]), "OperationError");
+    const pair = await crypto.subtle.generateKey({ ...params, modulusLength: 1152 }, true, ["sign", "verify"]);
+    assert.equal(pair.privateKey.algorithm.modulusLength, 1152);
+  });
+
+  test("an input BoringSSL hashes or wraps in one call is at most 1 MiB", async () => {
+    // An Ed25519 message, an RSA-OAEP label, an AES-GCM IV and AES key wrap's data each run in one call nothing can
+    // interrupt, so each is bounded; 1 MiB passes.
+    const bound = 1024 * 1024;
+    const over = new Uint8Array(bound + 1);
+    const atBound = over.subarray(0, bound);
+
+    const ed = await crypto.subtle.generateKey("Ed25519", true, ["sign", "verify"]);
+    const error = await expectRejectsName(crypto.subtle.sign("Ed25519", ed.privateKey, over), "OperationError");
+    assert.equal(error.message, "Ed25519 message exceeds Collo WebCrypto limits");
+    const signature = await crypto.subtle.sign("Ed25519", ed.privateKey, atBound);
+    assert.equal(await crypto.subtle.verify("Ed25519", ed.publicKey, signature, atBound), true);
+    await expectRejectsName(crypto.subtle.verify("Ed25519", ed.publicKey, signature, over), "OperationError");
+
+    const oaep = await crypto.subtle.generateKey(
+      { name: "RSA-OAEP", modulusLength: 1024, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" },
+      true,
+      ["encrypt", "decrypt"]);
+    await expectRejectsName(crypto.subtle.encrypt({ name: "RSA-OAEP", label: over }, oaep.publicKey, new Uint8Array(16)), "OperationError");
+    const sealed = await crypto.subtle.encrypt({ name: "RSA-OAEP", label: atBound }, oaep.publicKey, new Uint8Array(16));
+    assert.equal((await crypto.subtle.decrypt({ name: "RSA-OAEP", label: atBound }, oaep.privateKey, sealed)).byteLength, 16);
+
+    const gcm = await crypto.subtle.importKey("raw", new Uint8Array(16), { name: "AES-GCM" }, false, ["encrypt"]);
+    await expectRejectsName(crypto.subtle.encrypt({ name: "AES-GCM", iv: over }, gcm, new Uint8Array(16)), "OperationError");
+    assert.equal((await crypto.subtle.encrypt({ name: "AES-GCM", iv: atBound }, gcm, new Uint8Array(16))).byteLength, 32);
+
+    const kw = await crypto.subtle.importKey("raw", new Uint8Array(16), { name: "AES-KW" }, false, ["wrapKey"]);
+    const hmac = { name: "HMAC", hash: "SHA-256" };
+    const overKey = await crypto.subtle.importKey("raw", new Uint8Array(bound + 8), hmac, true, ["sign"]);
+    await expectRejectsName(crypto.subtle.wrapKey("raw", overKey, kw, "AES-KW"), "OperationError");
+    const boundKey = await crypto.subtle.importKey("raw", new Uint8Array(bound), hmac, true, ["sign"]);
+    assert.equal((await crypto.subtle.wrapKey("raw", boundKey, kw, "AES-KW")).byteLength, bound + 8);
+  });
+
+  test("PBKDF2's work cap counts the salt, hashed once per output block", async () => {
+    const key = await crypto.subtle.importKey("raw", new Uint8Array(16), "PBKDF2", false, ["deriveBits"]);
+    // 1 MiB of output is 52,429 SHA-1 blocks, and each hashes the 64 KiB salt once: seconds of work, although one
+    // iteration per block is far below the cap.
+    const error = await expectRejectsName(
+      crypto.subtle.deriveBits({ name: "PBKDF2", hash: "SHA-1", iterations: 1, salt: new Uint8Array(64 * 1024) }, key, 8 * 1024 * 1024),
+      "OperationError");
+    assert.equal(error.message, "PBKDF2 work exceeds Collo WebCrypto limits");
+    // The first HMAC of a block hashes the salt and a 4-byte index where later ones hash a 32-byte digest. A salt of
+    // up to 51 bytes fits that HMAC's one SHA-256 block with its padding and costs nothing extra, so 1,000,000
+    // iterations stay allowed; one byte more takes another block and passes the cap.
+    const params = { name: "PBKDF2", hash: "SHA-256", iterations: 1_000_000 };
+    assert.equal((await crypto.subtle.deriveBits({ ...params, salt: new Uint8Array(51) }, key, 256)).byteLength, 32);
+    await expectRejectsName(crypto.subtle.deriveBits({ ...params, salt: new Uint8Array(52) }, key, 256), "OperationError");
+  });
+
+  test("dictionary members and arguments are read in WebIDL's order", async () => {
+    // RsaHashedKeyGenParams inherits RsaKeyGenParams, whose members WebIDL reads first. The even exponent fails the
+    // generation after every member was read.
+    const log = [];
+    const algorithm = {
+      name: "RSA-PSS",
+      get hash() {
+        log.push("hash");
+        return "SHA-256";
+      },
+      get modulusLength() {
+        log.push("modulusLength");
+        return 1024;
+      },
+      get publicExponent() {
+        log.push("publicExponent");
+        return new Uint8Array([2]);
+      },
+    };
+    await expectRejectsName(crypto.subtle.generateKey(algorithm, false, ["sign"]), "OperationError");
+    assert.deepEqual(log, ["modulusLength", "publicExponent", "hash"]);
+
+    // deriveBits converts its length argument before its steps normalize the algorithm.
+    log.length = 0;
+    const hkdf = await crypto.subtle.importKey("raw", new Uint8Array(16), "HKDF", false, ["deriveBits"]);
+    const params = {
+      get name() {
+        log.push("name");
+        return "HKDF";
+      },
+      hash: "SHA-256",
+      salt: new Uint8Array(),
+      info: new Uint8Array(),
+    };
+    const length = {
+      valueOf() {
+        log.push("length");
+        return 256;
+      },
+    };
+    assert.equal((await crypto.subtle.deriveBits(params, hkdf, length)).byteLength, 32);
+    assert.deepEqual(log, ["length", "name"]);
   });
 });

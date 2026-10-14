@@ -18,36 +18,38 @@
 //! `lane_commands.zig` says for that command. The queue has ordinary places
 //! and reserved ones, and each command's `Command.placement` says which it
 //! may take:
-//! - Worker output, a descriptor a reader forwards and the answer for its
-//!   ring payload, takes only reserved places, so no worker's bytes can take
-//!   a place the lane's own exchanges need.
+//! - Worker output, a response descriptor a reader forwards and the answer
+//!   for its ring payload, takes only reserved places, so no worker's bytes
+//!   can take a place the lane's own exchanges need.
 //! - Three obligations take a reserved place, or an ordinary one once the
 //!   reserve is full, because a refusal would cost more than the command: a
 //!   worker's death, which the lane's requests on that worker would otherwise
 //!   wait out to their deadlines; a slot whose grant makes the lane the
 //!   worker's reader, which a refused post would hand back with the slot,
-//!   leaving its waiting request to its deadline; and a completion a reader
-//!   forwards, whose loss would leave a worker that answered in time to the
-//!   grace backstop's fault.
+//!   leaving its waiting request to its deadline; and a request's
+//!   `request_done` a reader forwards, whose loss would leave a worker that
+//!   answered in time to its request's grace backstop, which faults it.
 //! - Every other command takes only ordinary places.
 //!
 //! A lane serving the configuration reserves, per worker table entry of every
 //! pool, one place for a death, one for a reader grant, one per slot of its
-//! definition's `concurrency` for a completion, and the entry's forwarding
-//! window (`lane.obligationReserve`):
-//! a worker dies once, the pool grants its reader role to one lane at a time,
-//! a reader forwards at most one completion per request it was sent
-//! (`RequestTable.claimCompletion`), and an entry's forwarded descriptors and
-//! answers waiting in all lanes' queues together never pass
-//! `limits.ingress.forwarded_commands_per_worker_max`
+//! definition's `concurrency` for a forwarded `request_done`, and the entry's
+//! forwarding window (`lane.obligationReserve`): a worker dies once, the pool
+//! grants its reader role to one lane at a time, a reader forwards at most
+//! one `request_done` per request in flight (`RequestTable.markDoneForwarded`),
+//! and a worker has at most its `concurrency` requests in flight, since a
+//! request holds its pool slot until its owner applies its `request_done` or
+//! the worker dies (`runner/request_finish.zig`); an entry's other forwarded
+//! descriptors and their answers, waiting in all lanes' queues together,
+//! never pass `limits.ingress.forwarded_commands_per_worker_max`
 //! (`runner/h2_worker_ipc.zig`). So the reserve holds every obligation and
 //! all worker output at once, and an obligation takes it first, leaving the
 //! ordinary places to the commands that can take nothing else. The
 //! obligations pass their share only when one entry's worker is launched,
 //! dies and is retired again while the lane leaves an earlier command of that
 //! entry unprocessed. The excess then fills ordinary places once the reserve
-//! is full, and a forwarded descriptor that finds the reserve full meanwhile
-//! is refused.
+//! is full, and a forwarded response descriptor that finds the reserve full
+//! meanwhile is refused.
 //!
 //! The queue's places are a fault-in slab of nodes threaded on a FIFO
 //! (`slab.zig`), so its memory follows the most commands it ever held at
@@ -61,8 +63,8 @@ const slab = @import("slab.zig");
 
 pub const WorkerDied = struct {
     worker_key: lifecycle.WorkerKey,
-    /// Why the worker is dead, as the access records and usage floors of the
-    /// requests its death ends carry it.
+    /// Why the worker is dead, as the access records of the requests its
+    /// death ends carry it.
     reason: fault.WorkerFaultReason,
 };
 
@@ -74,7 +76,7 @@ pub const Command = union(enum) {
     dispatch_ready: lane_commands.DispatchReady,
     dispatch_failed: lane_commands.DispatchFailed,
     forwarded_descriptor: lane_commands.ForwardedDescriptor,
-    forwarded_completion: lane_commands.ForwardedCompletion,
+    forwarded_request_done: lane_commands.ForwardedRequestDone,
     payload_consumed: lane_commands.PayloadConsumed,
     release_worker: lane_commands.ReleaseWorker,
     /// Wakes the lane once the service is stopping; the stop flag itself is
@@ -91,7 +93,7 @@ pub const Command = union(enum) {
             .worker_died,
             .dispatch_ready,
             .dispatch_failed,
-            .forwarded_completion,
+            .forwarded_request_done,
             .payload_consumed,
             .release_worker,
             .shutdown,
@@ -108,7 +110,7 @@ pub const Command = union(enum) {
             .payload_consumed,
             => .reserved_only,
             .worker_died,
-            .forwarded_completion,
+            .forwarded_request_done,
             => .reserved_first,
             .dispatch_ready => |*ready| switch (ready.reader) {
                 .you_become_reader => .reserved_first,

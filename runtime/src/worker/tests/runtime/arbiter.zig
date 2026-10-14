@@ -104,7 +104,7 @@ test "a hung timer callback is stopped by its request's deadline, which answers 
     // The callback's busy-wait ends on its own after 8 s, so a callback turn
     // published under the wrong owner fails the elapsed-time check below
     // instead of hanging the lane.
-    const route_index = try rt.registerRoute(runtime, "/__collo_route/demo/arbiter-hung-timer.js",
+    const route_index = try rt.registerRoute(runtime, "/var/task/arbiter-hung-timer.js",
         \\export default function handle(request) {
         \\    globalThis.__handled = (globalThis.__handled ?? 0) + 1;
         \\    setTimeout(() => {
@@ -172,9 +172,9 @@ test "a top-level turn that never yields is stopped by its own evaluation's budg
     // Route 1's top-level timer busy-waits 8 s before it settles the await,
     // so a turn published under the wrong owner fails the elapsed-time check
     // below instead of hanging the lane.
-    const ok_entry = "/__collo_route/demo/arbiter-boot-ok.js";
-    const hung_entry = "/__collo_route/demo/arbiter-boot-hung.js";
-    const pack_fd = try rt.createModulePackGraphFd(&.{
+    const ok_entry = "/var/task/arbiter-boot-ok.js";
+    const hung_entry = "/var/task/arbiter-boot-hung.js";
+    const pack_fd = try rt.createDefinitionFd(&.{
         .{ .specifier = ok_entry, .source = "export default () => \"ok\";" },
         .{
             .specifier = hung_entry,
@@ -187,11 +187,9 @@ test "a top-level turn that never yields is stopped by its own evaluation's budg
             \\export default () => "never";
             ,
         },
-    }, 0);
+    }, &.{ .{ .entry_module = 0 }, .{ .entry_module = 1 } });
     defer std.posix.close(pack_fd);
-    _ = try rt.addRoute(runtime, ok_entry);
-    _ = try rt.addRoute(runtime, hung_entry);
-    try runtime.evaluateBootRoutes(pack_fd, 0, null);
+    try rt.bootDefinition(runtime, pack_fd);
     runtime.sealStartupEvaluations();
     const hung_evaluation_id = request_context.evaluationId(1);
     const evaluation = runtime.requests.active.get(hung_evaluation_id) orelse
@@ -229,7 +227,7 @@ test "a request already past its deadline when its timer comes up answers 504 wi
     defer fixture.deinit();
     const runtime = &fixture.runtime;
 
-    const route_index = try rt.registerRoute(runtime, "/__collo_route/demo/arbiter-boundary.js",
+    const route_index = try rt.registerRoute(runtime, "/var/task/arbiter-boundary.js",
         \\export default function handle(request) {
         \\    if (new URL(request.url).pathname.endsWith("/next"))
         \\        return new Response(String(globalThis.__callbackRan === true));
@@ -288,7 +286,7 @@ test "a stream source whose pull hangs with a read pending is stopped by its req
     // The pull's busy-wait ends on its own after 8 s, as in the timer test
     // above, so a missed fire fails the elapsed-time check instead of
     // hanging the lane.
-    const route_index = try rt.registerRoute(runtime, "/__collo_route/demo/arbiter-hung-pull.js",
+    const route_index = try rt.registerRoute(runtime, "/var/task/arbiter-hung-pull.js",
         \\export default function handle(request) {
         \\    const stream = new ReadableStream({
         \\        pull() {
@@ -319,7 +317,7 @@ test "a pipe's sink whose abort hangs inside an AbortController's abort is stopp
 
     // The source never enqueues, so no write is in flight when the signal
     // aborts the pipe, and the sink's abort runs inside `abort()` itself.
-    const route_index = try rt.registerRoute(runtime, "/__collo_route/demo/arbiter-hung-sink-abort.js",
+    const route_index = try rt.registerRoute(runtime, "/var/task/arbiter-hung-sink-abort.js",
         \\export default function handle(request) {
         \\    const controller = new AbortController();
         \\    const readable = new ReadableStream({ pull() {} });
@@ -378,10 +376,10 @@ fn expectDeadlineFireRetires(
     defer response.deinit();
     try std.testing.expectEqual(@as(u16, 504), response.status);
     try std.testing.expectEqual(ipc.RequestDoneStatus.deadline_timeout, response.doneStatus());
-    // The reader drains the socket after the completion, so a notice behind
-    // the answer reaches it there.
+    // The read ends at the request's `request_done`, so a notice behind the
+    // answer is the next packet.
     if (order == .answer_first)
-        try std.testing.expectEqual(ipc.WorkerRetiringReason.vm_terminated, response.retiring.?);
+        try std.testing.expectEqual(ipc.WorkerRetiringReason.vm_terminated, try retirement_notice.read(fixture.serverFd()));
 
     const late_id = request_id + 1;
     try enqueue(runtime, late_id, route_index, 3, process.monotonicNowNsOrZero() + std.time.ns_per_min);

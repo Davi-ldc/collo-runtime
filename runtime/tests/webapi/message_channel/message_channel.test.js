@@ -39,8 +39,9 @@ test("MessageChannel and MessagePort globals/descriptors", () => {
   assert.throws(() => MessagePort(), TypeError);
   assert.throws(() => new MessagePort(), TypeError);
 
-  assertDataDescriptor(descriptor(globalThis, "MessageChannel"), MessageChannel, true, true, true, "global MessageChannel");
-  assertDataDescriptor(descriptor(globalThis, "MessagePort"), MessagePort, true, true, true, "global MessagePort");
+  // Web IDL interface objects are non-enumerable properties of the global object.
+  assertDataDescriptor(descriptor(globalThis, "MessageChannel"), MessageChannel, true, false, true, "global MessageChannel");
+  assertDataDescriptor(descriptor(globalThis, "MessagePort"), MessagePort, true, false, true, "global MessagePort");
   assertFunctionShape(MessageChannel, "MessageChannel", 0, true);
   assertFunctionShape(MessagePort, "MessagePort", 0, true);
   assertDataDescriptor(descriptor(MessageChannel, "prototype"), MessageChannel.prototype, false, false, false, "MessageChannel.prototype");
@@ -72,7 +73,7 @@ test("MessageChannel and MessagePort globals/descriptors", () => {
     assert.throws(() => property.get.call({}), TypeError);
     assert.throws(() => property.set.call({}, null), TypeError);
   }
-  for (const key of ["postMessage", "start", "close", "ref", "unref", "hasRef"]) {
+  for (const key of ["postMessage", "start", "close"]) {
     const property = descriptor(MessagePort.prototype, key);
     assert.equal(typeof property.value, "function");
     assert.equal(property.value.length, key === "postMessage" ? 1 : 0, `${key} length`);
@@ -97,16 +98,14 @@ test("MessageChannel and MessagePort globals/descriptors", () => {
   channel.port2.close();
 });
 
-test("MessagePort ref unref and hasRef match Bun server-side shape", () => {
+test("MessagePort has only HTML's members, without Node's ref unref and hasRef", () => {
+  assert.deepEqual(
+    Object.getOwnPropertyNames(MessagePort.prototype).sort(),
+    ["close", "constructor", "onmessage", "onmessageerror", "postMessage", "start"],
+  );
   const { port1, port2 } = new MessageChannel();
-  assert.equal(port1.hasRef(), false);
-  assert.equal(port1.ref(), undefined);
-  assert.equal(port1.hasRef(), true);
-  assert.equal(port1.unref(), undefined);
-  assert.equal(port1.hasRef(), false);
-  assert.throws(() => MessagePort.prototype.ref.call({}), TypeError);
-  assert.throws(() => MessagePort.prototype.unref.call({}), TypeError);
-  assert.throws(() => MessagePort.prototype.hasRef.call({}), TypeError);
+  for (const key of ["ref", "unref", "hasRef"])
+    assert.equal(port1[key], undefined, `${key} is not a MessagePort member`);
   port1.close();
   port2.close();
 });
@@ -123,27 +122,29 @@ test("MessagePort delivers onmessage and buffered messages in FIFO order", async
   port2.close();
 });
 
-test("MessagePort handler attributes accept callable object null and non-callable values", () => {
+// Web IDL's EventHandler is a [LegacyTreatNonObjectAsNull] callback function: any object is kept, but only a callable
+// one runs, so an object with handleEvent is not called the way an addEventListener listener would be.
+test("MessagePort handler attributes keep objects, call only callables, and turn other values into null", () => {
   const { port1, port2 } = new MessageChannel();
   const calls = [];
   const objectHandler = {
     handleEvent(event) {
-      calls.push(`object:${event.data}:${this === objectHandler}`);
+      calls.push(`object:${event.data}`);
     },
   };
   port2.onmessage = objectHandler;
   assert.equal(port2.onmessage, objectHandler);
+  port2.dispatchEvent(new MessageEvent("message", { data: "object" }));
+
+  port2.onmessage = function (event) {
+    calls.push(`function:${event.data}:${this === port2}`);
+  };
   port2.dispatchEvent(new MessageEvent("message", { data: "a" }));
 
-  const plain = { value: 1 };
-  port2.onmessage = plain;
-  assert.equal(port2.onmessage, plain);
-  port2.dispatchEvent(new MessageEvent("message", { data: "ignored" }));
-
-  port2.onmessage = null;
+  port2.onmessage = "not an object";
   assert.equal(port2.onmessage, null);
   port2.dispatchEvent(new MessageEvent("message", { data: "ignored" }));
-  assert.deepEqual(calls, ["object:a:true"]);
+  assert.deepEqual(calls, ["function:a:true"]);
   port1.close();
   port2.close();
 });
@@ -164,11 +165,38 @@ test("MessagePort onmessage keeps EventTarget ordering", () => {
   handlerFirst.port1.addEventListener("message", () => handlerFirstEvents.push("listener"));
   handlerFirst.port1.dispatchEvent(new MessageEvent("message"));
   assert.deepEqual(handlerFirstEvents, ["handler", "listener"]);
+
+  // HTML: replacing a handler keeps the position its first value took; null removes it, and a later value starts at
+  // the end.
+  handlerFirstEvents.length = 0;
+  handlerFirst.port1.onmessage = () => handlerFirstEvents.push("replaced");
+  handlerFirst.port1.dispatchEvent(new MessageEvent("message"));
+  assert.deepEqual(handlerFirstEvents, ["replaced", "listener"]);
+  handlerFirstEvents.length = 0;
+  handlerFirst.port1.onmessage = null;
+  handlerFirst.port1.onmessage = () => handlerFirstEvents.push("reattached");
+  handlerFirst.port1.dispatchEvent(new MessageEvent("message"));
+  assert.deepEqual(handlerFirstEvents, ["listener", "reattached"]);
   handlerFirst.port1.close();
   handlerFirst.port2.close();
 });
 
-test("MessagePort addEventListener starts delivery and close stops queued delivery", async () => {
+// HTML enables a port's message queue only through start() or by setting onmessage; addEventListener alone does not.
+test("a MessagePort with only an addEventListener listener stays paused until start()", async () => {
+  const { port1, port2 } = new MessageChannel();
+  const got = [];
+  port2.addEventListener("message", event => got.push(event.data));
+  port1.postMessage("queued");
+  await flushMessages();
+  assert.deepEqual(got, [], "no delivery before start()");
+  port2.start();
+  await flushMessages();
+  assert.deepEqual(got, ["queued"]);
+  port1.close();
+  port2.close();
+});
+
+test("MessagePort start() delivers to addEventListener listeners and close stops queued delivery", async () => {
   const { port1, port2 } = new MessageChannel();
   const got = [];
   port2.addEventListener("message", event => {
@@ -176,6 +204,7 @@ test("MessagePort addEventListener starts delivery and close stops queued delive
     if (event.data === 2)
       port2.close();
   });
+  port2.start();
   for (let i = 1; i <= 5; i++)
     port1.postMessage(i);
   await flushMessages();
@@ -239,6 +268,8 @@ test("MessagePort transfers MessagePort through event.ports and cloned data iden
   channel.port1.postMessage({ port: carried.port1 }, [carried.port1]);
   const event = await received;
   assert(event instanceof MessageEvent);
+  // HTML fires a port's message events trusted.
+  assert.equal(event.isTrusted, true);
   assert.equal(event.origin, "");
   assert.equal(event.lastEventId, "");
   assert.equal(event.source, null);

@@ -1,6 +1,7 @@
 // The FormData surface the rest of the bridge uses: recognizing a FormData, parsing a form body into one, and
 // serializing one into a multipart body. The Body methods of Request and Response, Blob.formData(), ReadableStream
-// consumption and fetch's BodyInit extraction call these on the VM thread; formdata.cpp holds the FormData cell.
+// consumption and fetch's BodyInit extraction call these on the VM thread; formdata.cpp holds the FormData cell and
+// multipart.cpp the multipart codec.
 
 #pragma once
 
@@ -15,12 +16,13 @@
 namespace Collo::HostFunctions {
 
 // True when the parse error, as createFormDataFromBodyBytes stores it, reports an exceeded cap (body size, entry
-// count, part count or headers per part). The caller then rejects with a QuotaExceededError DOMException carrying
-// that text, instead of a TypeError.
+// count or headers per part). The caller then rejects with a QuotaExceededError DOMException carrying that text,
+// instead of a TypeError.
 bool isFormDataQuotaParseError(WTF::ASCIILiteral);
 
-// The QuotaExceededError for a form body over WebApiMaterializedBodyBytesMax. Blob.formData() rejects with it before
-// copying an oversized blob, so that early rejection matches the one the parser produces after the copy.
+// The QuotaExceededError for a form body over WebApiMaterializedBodyBytesMax, parsed or serialized. Blob.formData()
+// rejects with it before copying an oversized blob, so that early rejection matches the one the parser produces after
+// the copy, and serializeFormDataToMultipartBody throws it for a FormData whose body would not fit.
 JSC::JSObject* createFormDataBodyQuotaExceeded(JSC::JSGlobalObject*);
 
 // True for a FormData instance. Fetch's BodyInit extraction (body_init.cpp) uses it to pick the multipart serializer,
@@ -36,13 +38,11 @@ bool isColloFormData(JSC::JSValue);
 JSC::JSObject* createFormDataFromBodyBytes(JSC::JSGlobalObject*, JSC::ThrowScope&, std::span<const uint8_t> bytes,
     WTF::String content_type, WTF::ASCIILiteral* out_parse_error = nullptr);
 
-// Serializes a FormData into a multipart/form-data body with the HTML Standard's multipart/form-data encoding
-// algorithm, which Fetch runs to extract a body from a FormData. A File or Blob part shares the bytes of its entry's
-// BlobStorage, and the returned storage owns only the headers, the text values and the framing. On success
-// `out_size` is the body's length and `out_content_type` is `multipart/form-data; boundary=...`, with a random
-// boundary that occurs in no entry name, value, filename, type or file content. Returns null and throws when the body
-// would exceed WebApiMaterializedBodyBytesMax, on allocation or entropy failure, and when every boundary attempt
-// collided. Returns null without throwing when `form_data_value` is not a FormData.
+// Serializes a FormData into a multipart/form-data body (serializeMultipartFormBody in multipart.h says how). A File or
+// Blob part shares the bytes of its entry's BlobStorage. On success `out_size` is the body's length and
+// `out_content_type` is `multipart/form-data; boundary=...`. Returns null and throws when the body would exceed
+// WebApiMaterializedBodyBytesMax (createFormDataBodyQuotaExceeded's error, before any byte is copied), and on
+// allocation or entropy failure. Returns null without throwing when `form_data_value` is not a FormData.
 WTF::RefPtr<BlobStorage> serializeFormDataToMultipartBody(JSC::JSGlobalObject*, JSC::ThrowScope&,
     JSC::JSValue form_data_value, size_t& out_size, WTF::String& out_content_type);
 

@@ -1,8 +1,8 @@
 //! Scheduling policy over the runtime's scheduler state, on the worker's VM
-//! thread: setting up the worker ring, arming request deadlines, and
-//! scheduling, collecting and cancelling timers and immediates. `Runtime`
-//! forwards to it through thin methods. The owner the sentinel may
-//! terminate, with its deadline, is published by `runtime/owner.zig` alone.
+//! thread: arming request deadlines, and scheduling, collecting and
+//! cancelling timers and immediates. `Runtime` forwards to it through thin
+//! methods. The owner the sentinel may terminate, with its deadline, is
+//! published by `runtime/owner.zig` alone.
 //!
 //! Timers and immediates share one budget, `RuntimeLimits.max_timers_per_worker`,
 //! counted over the timer heap, the pending immediates, both ready maps and
@@ -15,96 +15,11 @@
 //! if even that fails, the worker stops.
 
 const std = @import("std");
-const restricted_uring = @import("collo_common_io").restricted_uring;
-const worker_fs = @import("../fs/index.zig");
 const js_value = @import("collo_worker_js").value;
 const request_context = @import("collo_worker_request").context;
 const runtime_owner = @import("../runtime/owner.zig");
-const runtime_types = @import("../runtime/types.zig");
 const immediates = @import("immediates.zig");
 const timers = @import("timers.zig");
-
-/// Creates the timerfd and the worker ring over its complete fixed-file
-/// table; a second call does nothing. For a worker with a network grant the
-/// two egress slots take the completion eventfd and the liveness pipe of its
-/// wake descriptors, held by its endpoint or, for a worker launched without
-/// a session, by its egress state (`State.wakeFds` in `egress/state.zig`).
-/// Every later session of the worker carries the same two files, so the
-/// ring watches it without registering another. A worker without a grant
-/// leaves both slots empty, which the kernel accepts in a sparse fixed-file
-/// set, and the loop never polls them, since such a worker never holds a
-/// session (`uring_backend.zig`). Fails with a `error.WorkerRingMissing*`
-/// error when a fixed file is absent, or with the validation or ring setup
-/// error, leaving no ring behind.
-pub fn initRestrictedWorkerRing(runtime: anytype) !void {
-    if (runtime.scheduler.worker_ring != null)
-        return;
-    const control_fd = runtime.core.control_fd orelse return error.WorkerRingMissingControlFd;
-    const wakeup_fd = runtime.scheduler.wakeup_fd orelse return error.WorkerRingMissingWakeupFd;
-    const egress_slots: restricted_uring.EgressSlots = switch (runtime.egress.state.grant()) {
-        .granted => .granted,
-        .none => .none,
-    };
-    var egress_completion_fd: std.posix.fd_t = restricted_uring.empty_slot;
-    var egress_liveness_fd: std.posix.fd_t = restricted_uring.empty_slot;
-    switch (egress_slots) {
-        .granted => {
-            const egress_wake = runtime.egress.state.wakeFds() orelse
-                return error.WorkerRingMissingEgressWake;
-            egress_completion_fd = egress_wake.completion_eventfd;
-            egress_liveness_fd = egress_wake.liveness_fd;
-        },
-        .none => {},
-    }
-    const ingress_payload_credit_eventfd = runtime.requests.ingress_payload_credit_eventfd orelse
-        return error.WorkerRingMissingIngressPayloadCreditEventFd;
-    // The fault channel is a required fixed file. The worker boot installs
-    // the fs index before the ring (`zygote/child_boot.zig`), and a worker
-    // without the channel could never fault a file in.
-    const fs_fault_fd = worker_fs.faultFd() orelse
-        return error.WorkerRingMissingFsFaultFd;
-    const timer_fd = try std.posix.timerfd_create(.MONOTONIC, .{
-        .CLOEXEC = true,
-        .NONBLOCK = true,
-    });
-    errdefer std.posix.close(timer_fd);
-    const fixed_files = [_]std.posix.fd_t{
-        control_fd,
-        wakeup_fd,
-        egress_completion_fd,
-        egress_liveness_fd,
-        timer_fd,
-        ingress_payload_credit_eventfd,
-        fs_fault_fd,
-    };
-    try restricted_uring.validateWorkerFixedFiles(&fixed_files, egress_slots);
-    runtime.scheduler.worker_ring = try restricted_uring.WorkerRing.init(.{ .files = fixed_files });
-    errdefer {
-        if (runtime.scheduler.worker_ring) |*ring|
-            ring.deinit();
-        runtime.scheduler.worker_ring = null;
-    }
-    runtime.scheduler.worker_ring_fixed_files = fixed_files;
-    runtime.scheduler.worker_timer_fd = timer_fd;
-}
-
-pub fn workerRingFd(runtime: anytype) ?std.posix.fd_t {
-    return if (runtime.scheduler.worker_ring) |*ring| ring.fd() else null;
-}
-
-pub fn workerTimerFd(runtime: anytype) ?std.posix.fd_t {
-    return runtime.scheduler.worker_timer_fd;
-}
-
-pub fn workerRingFixedFiles(
-    runtime: anytype,
-) ?[restricted_uring.FixedFile.count]std.posix.fd_t {
-    return runtime.scheduler.worker_ring_fixed_files;
-}
-
-pub fn workerSchedulerMetricsSnapshot(runtime: anytype) runtime_types.WorkerSchedulerMetrics {
-    return runtime.scheduler.metrics;
-}
 
 /// Arms the deadline of `request`, a dispatched request or an evaluation, at
 /// `exec.deadline_monotonic_ns`: the loop's deadline heap answers it when it
@@ -418,12 +333,10 @@ pub fn cancelTimersForRequest(runtime: anytype, request_id: u64) void {
     }
 }
 
-/// Frees every immediate of `request_id`, pending or ready, and marks each
-/// Immediate object destroyed.
+/// Frees every immediate of `request_id`, pending or ready.
 pub fn cancelImmediatesForRequest(runtime: anytype, request_id: u64) void {
     while (runtime.scheduler.pending_immediate_callbacks.takeForRequest(request_id)) |entry| {
         var immediate = entry;
-        immediates.markDestroyed(runtime, &immediate);
         immediate.deinit(runtime.core.allocator);
     }
     while (true) {
@@ -438,7 +351,6 @@ pub fn cancelImmediatesForRequest(runtime: anytype, request_id: u64) void {
         const immediate_id = remove_id orelse return;
         if (runtime.scheduler.ready_immediate_callbacks.fetchRemove(immediate_id)) |removed| {
             var immediate = removed.value;
-            immediates.markDestroyed(runtime, &immediate);
             immediate.deinit(runtime.core.allocator);
         }
     }
@@ -470,14 +382,13 @@ pub fn cancelTimeout(runtime: anytype, request_id: u64, timer_id: u64) void {
 }
 
 /// clearImmediate: frees immediate `immediate_id` when `request_id` owns it,
-/// ready or pending, and marks its Immediate object destroyed.
+/// ready or pending.
 pub fn cancelImmediate(runtime: anytype, request_id: u64, immediate_id: u64) void {
     if (runtime.scheduler.ready_immediate_callbacks.getPtr(immediate_id)) |immediate| {
         if (immediate.request_id != request_id)
             return;
         if (runtime.scheduler.ready_immediate_callbacks.fetchRemove(immediate_id)) |removed| {
             var removed_immediate = removed.value;
-            immediates.markDestroyed(runtime, &removed_immediate);
             removed_immediate.deinit(runtime.core.allocator);
         }
         // Its item is queued and will find nothing to run.
@@ -489,7 +400,6 @@ pub fn cancelImmediate(runtime: anytype, request_id: u64, immediate_id: u64) voi
         request_id,
     )) |entry| {
         var immediate = entry;
-        immediates.markDestroyed(runtime, &immediate);
         immediate.deinit(runtime.core.allocator);
     }
 }

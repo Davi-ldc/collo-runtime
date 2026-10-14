@@ -2,9 +2,11 @@
 //! the extra memory `collo_vm_heap_stats` returns. A Request or Response built from bytes keeps
 //! them in a native buffer, so its cell reports them when it is created and again at every full
 //! collection, and a body over a Blob's storage counts that storage once however many cells view
-//! it. A CompressionStream reports what its codec library holds. Each case holds objects in a
-//! module global across the end of a request, collects, reads the extra memory, then drops them
-//! and collects again. Lane: `bindings-test`; body and stream semantics are covered by the
+//! it. A CompressionStream reports what its codec library holds once a write reaches the codec.
+//! A FormData's serialized body keeps no spare capacity, and the Files parsed from one multipart
+//! body count its copy once. Each case holds objects in a module global across the end of a
+//! request, collects, reads the extra memory, then drops them and collects again. Lane:
+//! `bindings-test`; body and stream semantics are covered by the
 //! `webapi` lane's `runtime/tests/webapi/body/` and `runtime/tests/webapi/streams/`.
 
 const std = @import("std");
@@ -42,11 +44,39 @@ const source =
     \\    for (let i = 0; i < 32; i++) held.push(new Response(blob));
     \\}
     \\
-    \\// zlib's deflate allocates its window, hash chains and pending buffer when the stream is
-    \\// created, about 256 KiB at the default window and memory level.
+    \\// zlib's deflate allocates its window, hash chains and pending buffer when the stream's
+    \\// first write reaches it, about 256 KiB at the default window and memory level. A write
+    \\// waits for a read, so each stream starts one; the stream never closes, so the codec stays
+    \\// open.
     \\export function holdGzipCompressionStreams() {
     \\    held = [];
-    \\    for (let i = 0; i < 16; i++) held.push(new CompressionStream("gzip"));
+    \\    for (let i = 0; i < 16; i++) {
+    \\        const stream = new CompressionStream("gzip");
+    \\        void stream.readable.getReader().read().catch(() => {});
+    \\        void stream.writable.getWriter().write(new Uint8Array(64)).catch(() => {});
+    \\        held.push(stream);
+    \\    }
+    \\}
+    \\
+    \\// Sixteen Responses, each serialized from a FormData of one 2 MiB text value.
+    \\export function holdSerializedForms() {
+    \\    held = [];
+    \\    const form = new FormData();
+    \\    form.append("text", "x".repeat(2 * 1024 * 1024));
+    \\    for (let i = 0; i < 16; i++) held.push(new Response(form));
+    \\}
+    \\
+    \\// One multipart body of a 3 MiB text part and 999 one-byte file parts. The turn's
+    \\// microtask drain stores the parsed FormData before the request ends.
+    \\export function holdParsedFiles() {
+    \\    held = [];
+    \\    let body = '--b\r\nContent-Disposition: form-data; name="text"\r\n\r\n' + "x".repeat(3 * 1024 * 1024) + "\r\n";
+    \\    for (let i = 0; i < 999; i++)
+    \\        body += `--b\r\nContent-Disposition: form-data; name="f${i}"; filename="f"\r\n\r\ny\r\n`;
+    \\    body += "--b--\r\n";
+    \\    new Response(body, { headers: { "content-type": "multipart/form-data; boundary=b" } })
+    \\        .formData()
+    \\        .then((form) => { held = [form]; });
     \\}
 ;
 
@@ -139,4 +169,30 @@ test "CompressionStreams count their codec state until they die" {
     const streams = try measureHoldAndRelease(&vm, 300, "holdGzipCompressionStreams");
     try std.testing.expect(streams.held_bytes >= 16 * deflate_state_bytes_min);
     try std.testing.expect(streams.released_bytes >= 15 * deflate_state_bytes_min);
+}
+
+test "a FormData body keeps no spare capacity" {
+    var vm = try createVm();
+    defer vm.deinit();
+
+    // 16 bodies of a little over 2 MiB each. A body buffer grown by appends would keep up to
+    // half its length again, about 48 MiB in all; the upper bound leaves room for the FormData
+    // and its 2 MiB string, which a stale stack slot may keep through the collection.
+    const forms = try measureHoldAndRelease(&vm, 400, "holdSerializedForms");
+    try std.testing.expect(forms.held_bytes >= 32 * mib);
+    try std.testing.expect(forms.held_bytes < 40 * mib);
+    try std.testing.expect(forms.released_bytes >= 30 * mib);
+}
+
+test "Files parsed from one multipart body count the body's copy once" {
+    var vm = try createVm();
+    defer vm.deinit();
+
+    // The FormData holds a 3 MiB string and 999 Files over one copy of the body, a little over
+    // 3 MiB. One count per File would pass 2 GiB; the upper bound leaves room for the Response
+    // and the body string, which a stale stack slot may keep through the collection.
+    const files = try measureHoldAndRelease(&vm, 500, "holdParsedFiles");
+    try std.testing.expect(files.held_bytes >= 6 * mib);
+    try std.testing.expect(files.held_bytes < 32 * mib);
+    try std.testing.expect(files.released_bytes >= 6 * mib);
 }

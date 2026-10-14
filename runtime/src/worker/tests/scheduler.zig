@@ -1,26 +1,31 @@
-//! The scheduler's structures and the worker ring: ready queue order,
+//! The scheduler's structures and the loop's wait: ready queue order,
 //! wrap-around and slot metadata, timer heap order and cancellation,
 //! immediate generations and cancellation, the fixed capacity of each, and
-//! the worker ring's fixed-file table, with both egress slots empty and
-//! never polled for a worker without a network grant, its idle re-arm and
-//! the control socket's write poll, armed only while a send waits, whose
-//! hangup fails the wait as the read poll's does. The one loop run here meets a hangup
-//! before its first wait and stops cleanly. The loop running real turns, and
-//! resuming a parked response, is covered by `worker/tests/runtime/` in the
-//! same worker-test lane, and inside a sandboxed worker by the
-//! zygote-integration lane.
+//! the `ppoll` wait (`scheduler/poll_backend.zig`): it asks the control
+//! socket for room only while a send, the retirement notice or a
+//! `request_done` waits for it, sends a waiting `request_done` once the
+//! socket has room, fails with the control peer closed on a hangup, reports
+//! the wakeup and payload credit eventfds, a deadline already due and a
+//! session whose gateway hung up, whether the worker held it from boot or
+//! took it from an `egress_attach`, watches nothing of an `egress_attach`
+//! that a worker without a network grant refuses, closing every descriptor
+//! it brought, and does not block while a gateway drain may have left
+//! packets past its batch bound. The one loop run here meets a hangup before
+//! its first wait and stops cleanly. The loop running real turns, and
+//! resuming a parked response, is covered by
+//! `worker/tests/runtime/` in the same worker-test lane, and inside a
+//! sandboxed worker by the zygote-integration lane.
 
 const std = @import("std");
 const bindings = @import("collo_bindings");
 const fd_mod = @import("collo_os").fd;
 const ipc = @import("collo_ipc");
-const restricted_uring = @import("collo_common_io").restricted_uring;
 const worker = @import("collo_worker");
 const worker_testing = @import("collo_worker_test_support");
 const rt = @import("collo_test_harness");
 const immediates = worker_testing.scheduler.immediates;
 const ready_queue = worker_testing.scheduler.queue;
-const scheduler_uring_backend = worker_testing.scheduler.uring_backend;
+const poll_backend = worker_testing.scheduler.poll_backend;
 const timers = worker_testing.scheduler.timers;
 
 test "ready queue preserves fifo order" {
@@ -272,107 +277,26 @@ test "immediate queue push never grows implicitly and reuses capacity" {
     try std.testing.expectEqual(@as(u64, 3), reused.id);
 }
 
-test "worker scheduler requires restricted ring" {
-    const control_pair = try fd_mod.socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
-    defer std.posix.close(control_pair[0]);
-    defer std.posix.close(control_pair[1]);
-
-    var vm = try bindings.Vm.createDefault();
-    defer vm.deinit();
-
-    var completion_fixture = try rt.CompletionFixture.init();
-    defer completion_fixture.deinit();
-    var runtime = try worker.Runtime.init(std.testing.allocator, &vm, control_pair[0], &completion_fixture.view, try rt.createCompletionEventfd(), worker.RuntimeOptions{});
-    defer runtime.deinit();
-
-    try std.testing.expectError(error.WorkerRingUnavailable, scheduler_uring_backend.UringBackend.init(&runtime));
-}
-
-// The worker ring's `fs_fault` fixed file comes from the installed fs index,
-// so ring tests install the placeholder index with a live SEQPACKET pair.
-const ring_index_bytes: []const u8 = &worker.fs.fs_index.placeholder_bytes;
-
-test "worker ring arm is idempotent while polls stay armed" {
-    const control_pair = try fd_mod.socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
-    defer std.posix.close(control_pair[0]);
-    defer std.posix.close(control_pair[1]);
-    var wake_set = try ipc.egress_shared.WakeSet.create();
-    defer wake_set.deinit();
-    var shared = try ipc.egress_shared.createSessionForWorker(&wake_set);
-    defer shared.deinit();
-    var worker_raw = shared.takeWorkerHalf();
-    const ingress_payload_credit_fd = try std.posix.eventfd(0, std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK);
-    var ingress_payload_credit_owned_by_runtime = false;
-    errdefer if (!ingress_payload_credit_owned_by_runtime)
-        std.posix.close(ingress_payload_credit_fd);
-
-    const fault_pair = try fd_mod.socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
-    defer std.posix.close(fault_pair[0]);
-    defer std.posix.close(fault_pair[1]);
-    try worker.fs.installForTestWithFault(ring_index_bytes, worker.fs.deploy_root, fault_pair[0], worker.fs.deploy_root);
-    defer worker.fs.uninstallForTest();
-
-    var vm = try bindings.Vm.createDefault();
-    defer vm.deinit();
-
-    ingress_payload_credit_owned_by_runtime = true;
-    var completion_fixture = try rt.CompletionFixture.init();
-    defer completion_fixture.deinit();
-    var runtime = try worker.Runtime.init(std.testing.allocator, &vm, control_pair[0], &completion_fixture.view, try rt.createCompletionEventfd(), worker.RuntimeOptions{
-        .egress_shared_fds = &worker_raw,
-        .ingress_payload_credit_eventfd = ingress_payload_credit_fd,
-    });
-    defer runtime.deinit();
-
-    try runtime.initRestrictedWorkerRing();
-
-    var backend = try scheduler_uring_backend.UringBackend.init(&runtime);
-    defer backend.deinit();
-
-    const after_init = runtime.workerSchedulerMetricsSnapshot();
-    try std.testing.expectEqual(@as(u64, 1), after_init.worker_ring_arm_calls);
-    try std.testing.expect(after_init.worker_ring_sqe_submits >= 2);
-    try std.testing.expectEqual(@as(u64, 1), after_init.worker_ring_submit_syscalls);
-
-    for (0..32) |_|
-        try backend.arm(&runtime);
-
-    const after_idle_rearms = runtime.workerSchedulerMetricsSnapshot();
-    try std.testing.expectEqual(after_init.worker_ring_arm_calls + 32, after_idle_rearms.worker_ring_arm_calls);
-    try std.testing.expectEqual(after_init.worker_ring_sqe_submits, after_idle_rearms.worker_ring_sqe_submits);
-    try std.testing.expectEqual(after_init.worker_ring_submit_syscalls, after_idle_rearms.worker_ring_submit_syscalls);
-    try std.testing.expectEqual(after_init.worker_ring_cqes, after_idle_rearms.worker_ring_cqes);
-}
-
-/// A worker runtime with its restricted ring, built as the idempotent-arm
-/// test builds it. `control_pair[1]` is the server's end.
-const RingRuntime = struct {
+/// A worker runtime on a control socket pair with a payload credit eventfd,
+/// and, when `egress` brings one, a session. `control_pair[1]` is the
+/// server's end.
+const PollRuntime = struct {
     control_pair: [2]std.posix.fd_t,
-    fault_pair: [2]std.posix.fd_t,
-    wake_set: ipc.egress_shared.WakeSet,
-    shared: ipc.egress_shared.SessionFds,
+    credit_fd: std.posix.fd_t,
     vm: bindings.Vm,
     completion_fixture: rt.CompletionFixture,
     runtime: worker.Runtime,
     server_end_open: bool,
 
-    fn init(self: *RingRuntime) !void {
+    fn init(self: *PollRuntime, egress: *ipc.egress_shared.RawFds) !void {
         self.control_pair = try fd_mod.socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
         errdefer for (self.control_pair) |fd| std.posix.close(fd);
         self.server_end_open = true;
-        self.wake_set = try ipc.egress_shared.WakeSet.create();
-        errdefer self.wake_set.deinit();
-        self.shared = try ipc.egress_shared.createSessionForWorker(&self.wake_set);
-        errdefer self.shared.deinit();
-        var worker_raw = self.shared.takeWorkerHalf();
-        const ingress_payload_credit_fd = try std.posix.eventfd(0, std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK);
+        // The worker's end does not block, as the child leaves it.
+        try fd_mod.setNonblocking(self.control_pair[0], true);
+        self.credit_fd = try std.posix.eventfd(0, std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK);
         var credit_owned_by_runtime = false;
-        errdefer if (!credit_owned_by_runtime) std.posix.close(ingress_payload_credit_fd);
-
-        self.fault_pair = try fd_mod.socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
-        errdefer for (self.fault_pair) |fd| std.posix.close(fd);
-        try worker.fs.installForTestWithFault(ring_index_bytes, worker.fs.deploy_root, self.fault_pair[0], worker.fs.deploy_root);
-        errdefer worker.fs.uninstallForTest();
+        errdefer if (!credit_owned_by_runtime) std.posix.close(self.credit_fd);
 
         self.vm = try bindings.Vm.createDefault();
         errdefer self.vm.deinit();
@@ -380,253 +304,287 @@ const RingRuntime = struct {
         errdefer self.completion_fixture.deinit();
         credit_owned_by_runtime = true;
         self.runtime = try worker.Runtime.init(std.testing.allocator, &self.vm, self.control_pair[0], &self.completion_fixture.view, try rt.createCompletionEventfd(), worker.RuntimeOptions{
-            .egress_shared_fds = &worker_raw,
-            .ingress_payload_credit_eventfd = ingress_payload_credit_fd,
+            .egress_shared_fds = egress,
+            .ingress_payload_credit_eventfd = self.credit_fd,
         });
-        errdefer self.runtime.deinit();
-        try self.runtime.initRestrictedWorkerRing();
     }
 
-    fn closeServerEnd(self: *RingRuntime) void {
+    fn closeServerEnd(self: *PollRuntime) void {
         std.posix.close(self.control_pair[1]);
         self.server_end_open = false;
     }
 
-    fn deinit(self: *RingRuntime) void {
+    fn deinit(self: *PollRuntime) void {
         self.runtime.deinit();
         self.completion_fixture.deinit();
         self.vm.deinit();
-        worker.fs.uninstallForTest();
-        for (self.fault_pair) |fd| std.posix.close(fd);
-        self.shared.deinit();
-        self.wake_set.deinit();
         std.posix.close(self.control_pair[0]);
         if (self.server_end_open) std.posix.close(self.control_pair[1]);
     }
 };
 
-test "worker ring polls the control socket for room only while a send waits for it" {
-    var fixture: RingRuntime = undefined;
-    try fixture.init();
+/// Whether `events` holds an event with the tag `tag`.
+fn hasEvent(events: []const poll_backend.Event, tag: std.meta.Tag(poll_backend.Event)) bool {
+    for (events) |event| {
+        if (std.meta.activeTag(event) == tag)
+            return true;
+    }
+    return false;
+}
+
+test "the loop's wait asks the control socket for room only while a send waits for it" {
+    var no_egress: ipc.egress_shared.RawFds = .{};
+    var fixture: PollRuntime = undefined;
+    try fixture.init(&no_egress);
     defer fixture.deinit();
     const runtime = &fixture.runtime;
+    const backend: poll_backend.PollBackend = .{};
+    var events: [poll_backend.events_max]poll_backend.Event = undefined;
 
-    var backend = try scheduler_uring_backend.UringBackend.init(runtime);
-    defer backend.deinit();
-    const idle = runtime.workerSchedulerMetricsSnapshot();
-    try backend.arm(runtime);
-    try std.testing.expectEqual(idle.worker_ring_sqe_submits, runtime.workerSchedulerMetricsSnapshot().worker_ring_sqe_submits);
+    // Nothing is queued toward the server, so the socket has room, which the
+    // wait does not ask about while nothing waits for it.
+    var ready = try backend.drain(runtime, &events);
+    try std.testing.expect(!hasEvent(events[0..ready], .control_writable));
 
     runtime.requests.control_send_blocked = true;
-    try backend.arm(runtime);
-    try backend.arm(runtime);
-    try std.testing.expectEqual(idle.worker_ring_sqe_submits + 1, runtime.workerSchedulerMetricsSnapshot().worker_ring_sqe_submits);
-
-    // Nothing is queued toward the server, so the socket has room at once.
-    var events: [8]scheduler_uring_backend.Event = undefined;
-    const ready = try backend.wait(runtime, &events);
-    var writable = false;
-    for (events[0..ready]) |event| {
-        if (event == .control_writable) writable = true;
-    }
-    try std.testing.expect(writable);
+    ready = try backend.drain(runtime, &events);
+    try std.testing.expect(hasEvent(events[0..ready], .control_writable));
 
     // The event's handler finds no response waiting and clears the flag, so
-    // the next arm queues no write poll. It may queue others: the wait reaps
-    // every poll that completed, not only the write poll.
+    // the next wait asks no more.
     try worker_testing.scheduler.loop.handleControlWritable(runtime);
     try std.testing.expect(!runtime.requests.control_send_blocked);
-    try backend.arm(runtime);
-    try std.testing.expect(!backend.control_writable_poll_armed);
+    ready = try backend.drain(runtime, &events);
+    try std.testing.expect(!hasEvent(events[0..ready], .control_writable));
+}
+
+test "a request_done waiting in the outbox makes the wait ask for room, and goes out once the socket has it" {
+    var no_egress: ipc.egress_shared.RawFds = .{};
+    var fixture: PollRuntime = undefined;
+    try fixture.init(&no_egress);
+    defer fixture.deinit();
+    const runtime = &fixture.runtime;
+    const backend: poll_backend.PollBackend = .{};
+    var events: [poll_backend.events_max]poll_backend.Event = undefined;
+
+    // A finished request whose packet found the socket full.
+    try runtime.requests.done_outbox.push(.{
+        .identity = .{ .request_id = 77, .request_generation = 5, .request_lane_id = 2, .request_slot = 9 },
+        .stream_id = 11,
+        .done = .{ .status = .ok, .http_status = 200, .cpu_ns = 900 },
+    });
+
+    var ready = try backend.drain(runtime, &events);
+    try std.testing.expect(hasEvent(events[0..ready], .control_writable));
+
+    try worker_testing.scheduler.loop.handleControlWritable(runtime);
+    try std.testing.expect(runtime.requests.done_outbox.isEmpty());
+    ready = try backend.drain(runtime, &events);
+    try std.testing.expect(!hasEvent(events[0..ready], .control_writable));
+
+    // The server reads the packet under the request's identity.
+    var scratch: [4096]u8 = undefined;
+    var packet = try ipc.recvPacketWithFdsScratch(std.testing.allocator, fixture.control_pair[1], &scratch);
+    var received = try ipc.ingress_channel.decodeReceivedPacket(std.testing.allocator, &packet);
+    defer received.deinit();
+    try std.testing.expectEqual(@as(u8, @intFromEnum(ipc.ingress_channel.Op.request_done)), received.descriptor.op);
+    try std.testing.expectEqual(@as(u64, 77), received.descriptor.request_id);
+    try std.testing.expectEqual(@as(u64, 5), received.descriptor.request_generation);
+    try std.testing.expectEqual(@as(u32, 11), received.descriptor.stream_id);
+    const done = try ipc.ingress_channel.decodeRequestDone(received.payload);
+    try std.testing.expectEqual(@as(u64, 900), done.cpu_ns);
+    try std.testing.expectEqual(@as(u16, 200), done.http_status);
 }
 
 test "worker loop stops without error when the server hung up before the loop waits" {
-    var fixture: RingRuntime = undefined;
-    try fixture.init();
+    var no_egress: ipc.egress_shared.RawFds = .{};
+    var fixture: PollRuntime = undefined;
+    try fixture.init(&no_egress);
     defer fixture.deinit();
 
-    // The read poll completes with the hangup as soon as it is armed, so the
-    // loop's non-blocking drain reaps it before any blocking wait.
+    // The socket reports the hangup at once, so the loop's non-blocking
+    // drain meets it before any blocking wait.
     fixture.closeServerEnd();
     try worker_testing.scheduler.loop.run(&fixture.runtime);
 }
 
-test "worker ring fails the wait with the control peer closed when the write poll meets a hangup" {
-    var fixture: RingRuntime = undefined;
-    try fixture.init();
+test "the wait fails with the control peer closed when the server hangs up while a send waits for room" {
+    var no_egress: ipc.egress_shared.RawFds = .{};
+    var fixture: PollRuntime = undefined;
+    try fixture.init(&no_egress);
     defer fixture.deinit();
     const runtime = &fixture.runtime;
 
-    // Only the write poll watches the control socket: this backend counts the
-    // read poll as in flight and never queues it. A closed peer reports room
-    // and the hangup together, and the hangup wins.
-    var backend: scheduler_uring_backend.UringBackend = .{ .control_poll_armed = true };
-    defer backend.deinit();
+    // A closed peer reports room and the hangup together, and the hangup
+    // wins.
     runtime.requests.control_send_blocked = true;
     fixture.closeServerEnd();
-    try backend.arm(runtime);
-    try std.testing.expect(backend.control_writable_poll_armed);
-    var events: [8]scheduler_uring_backend.Event = undefined;
+    const backend: poll_backend.PollBackend = .{};
+    var events: [poll_backend.events_max]poll_backend.Event = undefined;
     try std.testing.expectError(error.ControlPeerClosed, backend.wait(runtime, &events));
 }
 
-test "worker ring fixed table contains only expected control wakeup egress timer ingress-credit and fs-fault fds" {
-    const control_pair = try fd_mod.socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
-    defer std.posix.close(control_pair[0]);
-    defer std.posix.close(control_pair[1]);
+test "the wait reports the wakeup and payload credit eventfds once written, and not after their drain" {
+    var no_egress: ipc.egress_shared.RawFds = .{};
+    var fixture: PollRuntime = undefined;
+    try fixture.init(&no_egress);
+    defer fixture.deinit();
+    const runtime = &fixture.runtime;
+    const backend: poll_backend.PollBackend = .{};
+    var events: [poll_backend.events_max]poll_backend.Event = undefined;
 
+    runtime.wake();
+    const one: u64 = 1;
+    _ = try std.posix.write(fixture.credit_fd, std.mem.asBytes(&one));
+    var ready = try backend.wait(runtime, &events);
+    try std.testing.expect(hasEvent(events[0..ready], .wakeup_ready));
+    try std.testing.expect(hasEvent(events[0..ready], .ingress_payload_credit_ready));
+
+    runtime.drainWakeup();
+    runtime.drainIngressPayloadCredit();
+    ready = try backend.drain(runtime, &events);
+    try std.testing.expect(!hasEvent(events[0..ready], .wakeup_ready));
+    try std.testing.expect(!hasEvent(events[0..ready], .ingress_payload_credit_ready));
+}
+
+test "the wait returns at once with the deadline event for a deadline already due" {
+    var no_egress: ipc.egress_shared.RawFds = .{};
+    var fixture: PollRuntime = undefined;
+    try fixture.init(&no_egress);
+    defer fixture.deinit();
+    const runtime = &fixture.runtime;
+
+    // Nothing else is ready, so a wait that ignored the deadline would block
+    // for good.
+    const backend: poll_backend.PollBackend = .{ .deferred_backstop_deadline_ns = runtime.nowMonoNs() };
+    var events: [poll_backend.events_max]poll_backend.Event = undefined;
+    const ready = try backend.wait(runtime, &events);
+    try std.testing.expect(hasEvent(events[0..ready], .timer_deadline));
+}
+
+test "the wait does not block while a gateway drain may have left packets past its batch bound" {
+    var no_egress: ipc.egress_shared.RawFds = .{};
+    var fixture: PollRuntime = undefined;
+    try fixture.init(&no_egress);
+    defer fixture.deinit();
+    const runtime = &fixture.runtime;
+
+    // The drain that stopped at its bound had drained the completion eventfd,
+    // so nothing the wait watches is ready. A wait that blocked would sleep
+    // until the deadline far ahead and report it.
+    const backend: poll_backend.PollBackend = .{
+        .egress_completion_debt = true,
+        .deferred_backstop_deadline_ns = runtime.nowMonoNs() + 10 * std.time.ns_per_s,
+    };
+    var events: [poll_backend.events_max]poll_backend.Event = undefined;
+    try std.testing.expectEqual(@as(usize, 0), try backend.wait(runtime, &events));
+}
+
+test "a session whose gateway hung up is reported closed at the next wait" {
     var wake_set = try ipc.egress_shared.WakeSet.create();
     defer wake_set.deinit();
-    var shared = try ipc.egress_shared.createSessionForWorker(&wake_set);
-    defer shared.deinit();
-    var worker_raw = shared.takeWorkerHalf();
-    const ingress_payload_credit_fd = try std.posix.eventfd(0, std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK);
-    var ingress_payload_credit_owned_by_runtime = false;
-    errdefer if (!ingress_payload_credit_owned_by_runtime)
-        std.posix.close(ingress_payload_credit_fd);
-    const released_completion_eventfd = worker_raw.completion_eventfd;
-    const released_liveness_fd = worker_raw.liveness_fd;
-    const released_command_eventfd = worker_raw.command_eventfd;
+    var session = try ipc.egress_shared.createSessionForWorker(&wake_set);
+    defer session.deinit();
+    // Taking the worker's half closes every gateway descriptor the session
+    // held, the write end of the liveness pipe the worker watches among them,
+    // so the worker sees its gateway gone.
+    var worker_raw = session.takeWorkerHalf();
+    defer worker_raw.close();
+    var fixture: PollRuntime = undefined;
+    try fixture.init(&worker_raw);
+    defer fixture.deinit();
+    const runtime = &fixture.runtime;
+    try std.testing.expect(runtime.egress.state.shared != null);
 
-    const fault_pair = try fd_mod.socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
-    defer std.posix.close(fault_pair[0]);
-    defer std.posix.close(fault_pair[1]);
-    try worker.fs.installForTestWithFault(ring_index_bytes, worker.fs.deploy_root, fault_pair[0], worker.fs.deploy_root);
-    defer worker.fs.uninstallForTest();
-
-    var vm = try bindings.Vm.createDefault();
-    defer vm.deinit();
-
-    ingress_payload_credit_owned_by_runtime = true;
-    var completion_fixture = try rt.CompletionFixture.init();
-    defer completion_fixture.deinit();
-    var runtime = try worker.Runtime.init(std.testing.allocator, &vm, control_pair[0], &completion_fixture.view, try rt.createCompletionEventfd(), worker.RuntimeOptions{
-        .egress_shared_fds = &worker_raw,
-        .ingress_payload_credit_eventfd = ingress_payload_credit_fd,
-    });
-    defer runtime.deinit();
-
-    try runtime.initRestrictedWorkerRing();
-
-    const fixed_files = runtime.workerRingFixedFiles() orelse return error.MissingWorkerRingFixedFiles;
-    try std.testing.expectEqual(control_pair[0], fixed_files[@intFromEnum(restricted_uring.FixedFile.control)]);
-    try std.testing.expectEqual(runtime.scheduler.wakeup_fd.?, fixed_files[@intFromEnum(restricted_uring.FixedFile.wakeup)]);
-    try std.testing.expectEqual(released_completion_eventfd, fixed_files[@intFromEnum(restricted_uring.FixedFile.egress_completion)]);
-    try std.testing.expectEqual(released_liveness_fd, fixed_files[@intFromEnum(restricted_uring.FixedFile.egress_liveness)]);
-    try std.testing.expectEqual(runtime.workerTimerFd().?, fixed_files[@intFromEnum(restricted_uring.FixedFile.timer)]);
-    try std.testing.expectEqual(ingress_payload_credit_fd, fixed_files[@intFromEnum(restricted_uring.FixedFile.ingress_payload_credit)]);
-    try std.testing.expectEqual(fault_pair[0], fixed_files[@intFromEnum(restricted_uring.FixedFile.fs_fault)]);
-
-    try std.testing.expect(fixed_files[@intFromEnum(restricted_uring.FixedFile.egress_completion)] != released_command_eventfd);
-    for (fixed_files) |fd|
-        try expectNotRegularFileOrDirectory(fd);
+    const backend: poll_backend.PollBackend = .{};
+    var events: [poll_backend.events_max]poll_backend.Event = undefined;
+    const ready = try backend.drain(runtime, &events);
+    var closed_count: usize = 0;
+    for (events[0..ready]) |event| {
+        switch (event) {
+            .egress_closed => |reason| {
+                closed_count += 1;
+                try std.testing.expectEqual(poll_backend.EgressClosedReason.liveness_hup, reason);
+            },
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), closed_count);
 }
 
-// A worker whose definition grants no network access gets no egress
-// descriptor with WorkerInit. Its runtime used to refuse the empty set
-// (`InvalidEgressSharedEndpoint`), and its ring had nothing to register in
-// the two egress slots (`WorkerRingMissingEgressWake`).
-test "a worker without a network grant registers its ring with both egress slots empty and every other slot filled" {
-    const control_pair = try fd_mod.socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
-    defer std.posix.close(control_pair[0]);
-    defer std.posix.close(control_pair[1]);
-    const ingress_payload_credit_fd = try std.posix.eventfd(0, std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK);
-    var ingress_payload_credit_owned_by_runtime = false;
-    errdefer if (!ingress_payload_credit_owned_by_runtime)
-        std.posix.close(ingress_payload_credit_fd);
+test "the wait watches the session an egress_attach brings from the next wait on" {
+    // A worker booted without a session holds only its wake descriptors,
+    // which the wait does not watch: the liveness pipe has no write end yet,
+    // so a watch on the boot's read end would report a hangup at once.
+    var wake_set = try ipc.egress_shared.WakeSet.create();
+    defer wake_set.deinit();
+    var boot_fds = ipc.egress_shared.RawFds.wakeOnly(try wake_set.openWorkerWake());
+    defer boot_fds.close();
+    var fixture: PollRuntime = undefined;
+    try fixture.init(&boot_fds);
+    defer fixture.deinit();
+    const runtime = &fixture.runtime;
+    try std.testing.expect(runtime.egress.state.shared == null);
 
-    const fault_pair = try fd_mod.socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
-    defer std.posix.close(fault_pair[0]);
-    defer std.posix.close(fault_pair[1]);
-    try worker.fs.installForTestWithFault(ring_index_bytes, worker.fs.deploy_root, fault_pair[0], worker.fs.deploy_root);
-    defer worker.fs.uninstallForTest();
+    const backend: poll_backend.PollBackend = .{};
+    var events: [poll_backend.events_max]poll_backend.Event = undefined;
+    var ready = try backend.drain(runtime, &events);
+    try std.testing.expect(!hasEvent(events[0..ready], .egress_closed));
 
-    var vm = try bindings.Vm.createDefault();
-    defer vm.deinit();
+    // A session on the worker's wake set whose gateway is already gone:
+    // taking the worker's half closes the gateway's write end of the pipe
+    // the worker watches.
+    var session = try ipc.egress_shared.createSessionForWorker(&wake_set);
+    defer session.deinit();
+    var worker_half = session.takeWorkerHalf();
+    defer worker_half.close();
+    try ipc.egress_attach.send(fixture.control_pair[1], worker_half);
+    try worker_testing.scheduler.loop.collectControlPacket(runtime);
+    try std.testing.expect(runtime.egress.state.shared != null);
 
-    // The egress descriptors a launch without a grant sends: none at all, as
-    // `zygote/child_boot.zig` passes them.
+    ready = try backend.drain(runtime, &events);
+    var closed_count: usize = 0;
+    for (events[0..ready]) |event| {
+        switch (event) {
+            .egress_closed => |reason| {
+                closed_count += 1;
+                try std.testing.expectEqual(poll_backend.EgressClosedReason.liveness_hup, reason);
+            },
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), closed_count);
+}
+
+test "a worker without a network grant refuses an egress_attach, closes every descriptor it brought and watches none of them" {
     var no_egress: ipc.egress_shared.RawFds = .{};
-    ingress_payload_credit_owned_by_runtime = true;
-    var completion_fixture = try rt.CompletionFixture.init();
-    defer completion_fixture.deinit();
-    var runtime = try worker.Runtime.init(std.testing.allocator, &vm, control_pair[0], &completion_fixture.view, try rt.createCompletionEventfd(), worker.RuntimeOptions{
-        .egress_shared_fds = &no_egress,
-        .ingress_payload_credit_eventfd = ingress_payload_credit_fd,
-    });
-    defer runtime.deinit();
+    var fixture: PollRuntime = undefined;
+    try fixture.init(&no_egress);
+    defer fixture.deinit();
+    const runtime = &fixture.runtime;
     try std.testing.expect(runtime.egress.state.grant() == .none);
 
-    try runtime.initRestrictedWorkerRing();
+    // The half's write end of the pipe a gateway watches is the pipe's only
+    // write end once the test closes its own copy, so the pipe hangs up
+    // exactly when the worker has closed the copy it received.
+    var wake_set = try ipc.egress_shared.WakeSet.create();
+    defer wake_set.deinit();
+    var session = try ipc.egress_shared.createSessionForWorker(&wake_set);
+    defer session.deinit();
+    var worker_half = session.takeWorkerHalf();
+    defer worker_half.close();
+    try ipc.egress_attach.send(fixture.control_pair[1], worker_half);
+    worker_half.close();
 
-    const fixed_files = runtime.workerRingFixedFiles() orelse return error.MissingWorkerRingFixedFiles;
-    try std.testing.expectEqual(restricted_uring.empty_slot, fixed_files[@intFromEnum(restricted_uring.FixedFile.egress_completion)]);
-    try std.testing.expectEqual(restricted_uring.empty_slot, fixed_files[@intFromEnum(restricted_uring.FixedFile.egress_liveness)]);
-    try std.testing.expectEqual(control_pair[0], fixed_files[@intFromEnum(restricted_uring.FixedFile.control)]);
-    try std.testing.expectEqual(runtime.workerTimerFd().?, fixed_files[@intFromEnum(restricted_uring.FixedFile.timer)]);
-    try std.testing.expectEqual(fault_pair[0], fixed_files[@intFromEnum(restricted_uring.FixedFile.fs_fault)]);
+    try std.testing.expectError(error.EgressNotGranted, worker_testing.scheduler.loop.collectControlPacket(runtime));
+    try std.testing.expect(runtime.egress.state.shared == null);
+    var peer_liveness = [_]std.posix.pollfd{.{ .fd = wake_set.peer_liveness_read.fd(), .events = 0, .revents = 0 }};
+    try std.testing.expectEqual(@as(usize, 1), try std.posix.poll(&peer_liveness, 0));
+    try std.testing.expect((peer_liveness[0].revents & std.posix.POLL.HUP) != 0);
 
-    // The loop arms no egress poll on the empty slots.
-    var backend = try scheduler_uring_backend.UringBackend.init(&runtime);
-    defer backend.deinit();
-    try backend.arm(&runtime);
-    try std.testing.expect(!backend.egress_completion_poll_armed);
-    try std.testing.expect(!backend.egress_liveness_poll_armed);
-}
-
-test "worker ring fixed table rejects sockets outside the control slot" {
-    const control_pair = try fd_mod.socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
-    defer std.posix.close(control_pair[0]);
-    defer std.posix.close(control_pair[1]);
-    const wrong_socket_pair = try fd_mod.socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
-    defer std.posix.close(wrong_socket_pair[0]);
-    defer std.posix.close(wrong_socket_pair[1]);
-
-    const fault_pair = try fd_mod.socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
-    defer std.posix.close(fault_pair[0]);
-    defer std.posix.close(fault_pair[1]);
-
-    const wakeup_fd = try std.posix.eventfd(0, std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK);
-    defer std.posix.close(wakeup_fd);
-    const completion_fd = try std.posix.eventfd(0, std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK);
-    defer std.posix.close(completion_fd);
-    const liveness_fd = try std.posix.eventfd(0, std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK);
-    defer std.posix.close(liveness_fd);
-    const ingress_payload_credit_fd = try std.posix.eventfd(0, std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK);
-    defer std.posix.close(ingress_payload_credit_fd);
-    const timer_fd = try std.posix.timerfd_create(.MONOTONIC, .{
-        .CLOEXEC = true,
-        .NONBLOCK = true,
-    });
-    defer std.posix.close(timer_fd);
-
-    var fixed_files = [_]std.posix.fd_t{
-        control_pair[0],
-        wakeup_fd,
-        wrong_socket_pair[0],
-        liveness_fd,
-        timer_fd,
-        ingress_payload_credit_fd,
-        fault_pair[0],
-    };
-    try std.testing.expectError(error.InvalidWorkerRingFixedFile, restricted_uring.validateWorkerFixedFiles(&fixed_files, .granted));
-
-    fixed_files[@intFromEnum(restricted_uring.FixedFile.egress_completion)] = completion_fd;
-    try restricted_uring.validateWorkerFixedFiles(&fixed_files, .granted);
-
-    fixed_files[@intFromEnum(restricted_uring.FixedFile.timer)] = wrong_socket_pair[0];
-    try std.testing.expectError(error.InvalidWorkerRingFixedFile, restricted_uring.validateWorkerFixedFiles(&fixed_files, .granted));
-    fixed_files[@intFromEnum(restricted_uring.FixedFile.timer)] = liveness_fd;
-    try std.testing.expectError(error.InvalidWorkerRingFixedFile, restricted_uring.validateWorkerFixedFiles(&fixed_files, .granted));
-    fixed_files[@intFromEnum(restricted_uring.FixedFile.timer)] = timer_fd;
-
-    fixed_files[@intFromEnum(restricted_uring.FixedFile.wakeup)] = control_pair[0];
-    try std.testing.expectError(error.InvalidWorkerRingFixedFile, restricted_uring.validateWorkerFixedFiles(&fixed_files, .granted));
-}
-
-fn expectNotRegularFileOrDirectory(fd: std.posix.fd_t) !void {
-    const stat = try std.posix.fstat(fd);
-    const file_type = stat.mode & std.os.linux.S.IFMT;
-    try std.testing.expect(file_type != std.os.linux.S.IFREG);
-    try std.testing.expect(file_type != std.os.linux.S.IFDIR);
+    // The session's gateway end is closed too, so a watch on its liveness
+    // pipe would report a hangup.
+    const backend: poll_backend.PollBackend = .{};
+    var events: [poll_backend.events_max]poll_backend.Event = undefined;
+    try std.testing.expectEqual(@as(usize, 0), try backend.drain(runtime, &events));
 }

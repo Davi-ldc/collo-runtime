@@ -1,9 +1,10 @@
 //! Shared construction kit for supervisor tests, run on the test thread: a
 //! supervisor over routes and an analytics sink of its own, worker records
-//! whose handles can actually be torn down, the publish a launch makes into a
+//! whose handles can actually be torn down, cgroup leaves that name nothing
+//! or hold the files a test writes (`LeafDir`), a worker page a test writes
+//! as the worker would (`WorkerPage`), the publish a launch makes into a
 //! definition's pool, the egress attachment a gateway hands a launch, and a
-//! temporary analytics directory whose `usage.jsonl` and `workers.jsonl` a
-//! test reads back.
+//! temporary analytics directory whose `workers.jsonl` a test reads back.
 //!
 //! The routes come from a configuration of `definition_names.len` worker
 //! definitions, one route each, built from entry modules written to a
@@ -29,7 +30,6 @@ const ipc = @import("collo_ipc");
 const process = @import("collo_os").process;
 const os_fd = @import("collo_os").fd;
 const worker_shared_page = @import("collo_worker_state").page;
-const worker_metrics = @import("collo_worker_state").metrics;
 
 const Supervisor = supervision.Supervisor;
 const worker_table = supervision.worker_table;
@@ -60,11 +60,10 @@ var inert_zygote = zygote_mod.host_client.SpawnedZygote{
     .control_fd = null,
     .trace_read_fd = null,
     .trace_write_fd = null,
-    .next_fork_job_id = 1,
 };
 
 /// The settings every fixture definition gets, through the configuration's
-/// global settings.
+/// top-level `settings`.
 pub const RoutesOptions = struct {
     /// Requests one worker runs at once: the pool's slots per worker.
     concurrency: u8 = 2,
@@ -74,7 +73,7 @@ pub const RoutesOptions = struct {
     /// Each request's CPU budget, or none.
     cpu_ms: ?u32 = null,
     /// Whether each definition, in `definition_names` order, keeps the
-    /// global `network` grant of any public host; one without it drops the
+    /// top-level `network` grant of any public host; one without it drops the
     /// grant with an empty allow list, so its workers get no egress session.
     granted: [definition_names.len]bool = @splat(true),
 };
@@ -102,7 +101,7 @@ pub const OwnedRoutes = struct {
         defer source.deinit(allocator);
         try source.print(
             allocator,
-            "{{\"globalSettings\": {{\"network\": {{\"allow\": [\"*\"]}}, \"limits\": {{\"concurrency\": {d}, \"timeoutMs\": {d}, \"memoryMiB\": {d}",
+            "{{\"settings\": {{\"network\": {{\"allow\": [\"*\"]}}, \"limits\": {{\"concurrency\": {d}, \"timeoutMs\": {d}, \"memoryMiB\": {d}",
             .{ options.concurrency, options.timeout_ms, options.memory_mib },
         );
         if (options.cpu_ms) |cpu_ms|
@@ -150,7 +149,7 @@ pub const OwnedRoutes = struct {
 
 /// A supervisor built by `Supervisor.init` over the fixture routes and a sink
 /// of its own with no analytics directory: console lines go to stderr and
-/// usage records are counted and dropped. One empty pool per definition. The
+/// worker lines are counted and dropped. One empty pool per definition. The
 /// counterpart teardown is `deinitMinimal`.
 pub fn minimalSupervisor(allocator: std.mem.Allocator) !Supervisor {
     return minimalSupervisorWith(allocator, .{});
@@ -246,17 +245,121 @@ pub fn openScratchDir(allocator: std.mem.Allocator, out_path: *[]u8) !std.fs.Dir
     const path = try uniqueTempPath(allocator, "collo-test-cgroup");
     errdefer allocator.free(path);
     try std.fs.makeDirAbsolute(path);
-    errdefer std.fs.deleteTreeAbsolute(path) catch {};
+    errdefer removeScratchDir(path);
     const dir = try std.fs.openDirAbsolute(path, .{ .iterate = true });
     out_path.* = path;
     return dir;
 }
 
-/// A worker handle `handle.deinit` can take apart end to end: the owned cgroup
-/// path is a real allocation, and every descriptor teardown unconditionally
-/// closes is real. The one exception is
-/// `fs_fault_fd`, left at -1: teardown guards it, and it names the host end
-/// of a channel a worker that never launched never had.
+/// Removes a scratch directory a failed setup made, or reports that it stays
+/// on disk.
+fn removeScratchDir(path: []const u8) void {
+    std.fs.deleteTreeAbsolute(path) catch |err|
+        std.log.warn("supervisor fixture left {s} on disk: {s}", .{ path, @errorName(err) });
+}
+
+/// The workers directory every inert handle names its cgroup leaf under: a
+/// directory made, opened and removed again at first use, so its descriptor
+/// stays valid while every lookup inside it fails with ENOENT, no leaf can
+/// ever exist there, and nothing stays on disk. The descriptor lives as long
+/// as the test process. Test thread only.
+var inert_workers_dir_fd: std.posix.fd_t = -1;
+
+fn inertWorkersDir(allocator: std.mem.Allocator) !std.posix.fd_t {
+    if (inert_workers_dir_fd >= 0)
+        return inert_workers_dir_fd;
+    const path = try uniqueTempPath(allocator, "collo-test-inert-leaves");
+    defer allocator.free(path);
+    try std.fs.makeDirAbsolute(path);
+    const dir_fd = std.posix.open(path, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0) catch |err| {
+        removeScratchDir(path);
+        return err;
+    };
+    std.fs.deleteDirAbsolute(path) catch |err| {
+        std.posix.close(dir_fd);
+        return err;
+    };
+    inert_workers_dir_fd = dir_fd;
+    return dir_fd;
+}
+
+/// A cgroup leaf that names nothing (`inertWorkersDir`), under a job id no
+/// other inert leaf of the process has.
+pub fn inertLeaf(allocator: std.mem.Allocator) !host.cgroup_root.WorkerLeaf {
+    return .{
+        .workers_dir_fd = try inertWorkersDir(allocator),
+        .job_id = handle_sequence.fetchAdd(1, .monotonic),
+    };
+}
+
+/// A temporary workers directory whose cgroup leaves are plain directories
+/// holding files a test writes, so the figures the server reads off a leaf
+/// (`cgroup.readLeafFigure` through `WorkerLeaf.readFile`) and the death
+/// classification (`Record.classifyDeath`) read real files. A handle that
+/// names one of these leaves removes it at its teardown
+/// (`WorkerHandle.deinit`) with an rmdir, which a plain directory allows only
+/// once empty and which otherwise retries and warns: the owner empties each
+/// leaf (`emptyLeaf`) before the teardown of the handle that names it, and
+/// deinits the directory only after every such handle is gone, since each
+/// keeps the directory's descriptor. Test thread only.
+pub const LeafDir = struct {
+    tmp: std.testing.TmpDir,
+
+    /// A file of a leaf and what it holds.
+    pub const File = struct {
+        name: []const u8,
+        data: []const u8,
+    };
+
+    /// The `memory.events.local` of a worker that met no memory event.
+    pub const quiet_memory_events: File = .{
+        .name = "memory.events.local",
+        .data = "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n",
+    };
+
+    pub fn init() LeafDir {
+        return .{ .tmp = std.testing.tmpDir(.{}) };
+    }
+
+    pub fn deinit(self: *LeafDir) void {
+        self.tmp.cleanup();
+        self.* = undefined;
+    }
+
+    /// A new leaf holding `files`, under a job id no other fixture leaf of
+    /// the process has.
+    pub fn leaf(self: *LeafDir, files: []const File) !host.cgroup_root.WorkerLeaf {
+        const made: host.cgroup_root.WorkerLeaf = .{
+            .workers_dir_fd = self.tmp.dir.fd,
+            .job_id = handle_sequence.fetchAdd(1, .monotonic),
+        };
+        var name_buffer: [host.cgroup_root.WorkerLeaf.name_bytes_max]u8 = undefined;
+        try self.tmp.dir.makeDir(made.name(&name_buffer));
+        for (files) |file|
+            try self.writeFile(made, file);
+        return made;
+    }
+
+    /// Writes `file` into `target`, replacing what it held.
+    pub fn writeFile(self: *LeafDir, target: host.cgroup_root.WorkerLeaf, file: File) !void {
+        var name_buffer: [host.cgroup_root.WorkerLeaf.name_bytes_max]u8 = undefined;
+        var leaf_dir = try self.tmp.dir.openDir(target.name(&name_buffer), .{});
+        defer leaf_dir.close();
+        try leaf_dir.writeFile(.{ .sub_path = file.name, .data = file.data });
+    }
+
+    /// Leaves `target` an empty directory, which its handle's teardown then
+    /// removes with one rmdir.
+    pub fn emptyLeaf(self: *LeafDir, target: host.cgroup_root.WorkerLeaf) !void {
+        var name_buffer: [host.cgroup_root.WorkerLeaf.name_bytes_max]u8 = undefined;
+        const name = target.name(&name_buffer);
+        try self.tmp.dir.deleteTree(name);
+        try self.tmp.dir.makeDir(name);
+    }
+};
+
+/// A worker handle `handle.deinit` can take apart end to end: every
+/// descriptor teardown closes is real, and its cgroup leaf names nothing.
 ///
 /// The pidfd names a child that has already exited, which is the state every
 /// teardown path here assumes: the exit poll returns immediately instead of
@@ -275,12 +378,19 @@ pub fn openScratchDir(allocator: std.mem.Allocator, out_path: *[]u8) !std.fs.Dir
 /// which is exactly true here and makes the score depend only on idle age
 /// and pool position.
 ///
-/// The cgroup directory is a path under /tmp that is never created, so a test
-/// never reaches into the delegated cgroup subtree the kernel lanes own and
-/// leaves nothing on disk: the teardown's cgroup kill and rmdir find nothing,
-/// and neither do the victim score's fallback reading of `memory.current` and
-/// the worker line's readings of `cpu.stat` and `memory.peak`.
+/// The cgroup leaf lies in a workers directory no leaf can exist in
+/// (`inertWorkersDir`), so a test never reaches into the delegated cgroup
+/// subtree the kernel lanes own and leaves nothing on disk: the teardown's
+/// cgroup kill and rmdir find nothing, and neither do the death
+/// classification's reading of `memory.events.local` and the worker line's
+/// readings of `cpu.stat` and `memory.peak`.
 pub fn inertHandle(allocator: std.mem.Allocator) !WorkerHandle {
+    return inertHandleWithLeaf(try inertLeaf(allocator));
+}
+
+/// `inertHandle` naming `leaf` as its cgroup leaf, for a test whose leaf
+/// reads find real files (`LeafDir`).
+pub fn inertHandleWithLeaf(leaf: host.cgroup_root.WorkerLeaf) !WorkerHandle {
     const child_pid = try std.posix.fork();
     if (child_pid == 0) {
         // `exit_group`, never libc `exit`: this binary links libc and may be
@@ -301,38 +411,27 @@ pub fn inertHandle(allocator: std.mem.Allocator) !WorkerHandle {
     errdefer std.posix.close(pair[0]);
     std.posix.close(pair[1]);
 
-    const cgroup_dir = try uniqueTempPath(allocator, "collo-test-worker-cgroup");
-    defer allocator.free(cgroup_dir);
-
     const completion_eventfd = try std.posix.eventfd(0, 0);
     errdefer std.posix.close(completion_eventfd);
     const credit_eventfd = try std.posix.eventfd(0, 0);
     errdefer std.posix.close(credit_eventfd);
-    const payload_fd = try worker_shared_page.createMemfd("collo-test-payload");
-    errdefer std.posix.close(payload_fd);
 
+    // Mapped, then closed, as a launch does once the child holds its copy.
     const metrics_fd = try worker_shared_page.createMemfd("collo-test-metrics");
-    errdefer std.posix.close(metrics_fd);
-    var metrics = try worker_shared_page.mapReadWrite(metrics_fd);
+    defer std.posix.close(metrics_fd);
+    var metrics = try worker_shared_page.mapHostReader(metrics_fd);
     errdefer metrics.deinit();
-    metrics.initializeCrashDefault();
 
-    return WorkerHandle.init(
-        allocator,
-        0,
-        pidfd,
-        pair[0],
-        cgroup_dir,
-        64 * 1024 * 1024,
-        1,
-        metrics_fd,
-        completion_eventfd,
-        payload_fd,
-        credit_eventfd,
-        .{ .bytes = &inert_payload_bytes, .header = &inert_payload_header, .side = .server },
-        metrics,
-        -1,
-    );
+    return .{
+        .pid = 0,
+        .pidfd = pidfd,
+        .control_fd = pair[0],
+        .leaf = leaf,
+        .completion_eventfd = completion_eventfd,
+        .ingress_payload_credit_eventfd = credit_eventfd,
+        .ingress_payload = .{ .bytes = &inert_payload_bytes, .header = &inert_payload_header, .side = .server },
+        .metrics = metrics,
+    };
 }
 
 pub const WorkerOptions = struct {
@@ -340,13 +439,17 @@ pub const WorkerOptions = struct {
     generation: u64 = 1,
     definition_index: config.DefinitionIndex = default_definition,
     created_mono_ns: u64 = 0,
+    /// The worker's cgroup leaf, one that names nothing (`inertLeaf`) when
+    /// null. A `LeafDir` leaf must be emptied before `destroyWorker`
+    /// (`LeafDir.emptyLeaf`).
+    leaf: ?host.cgroup_root.WorkerLeaf = null,
 };
 
 /// A heap worker record occupied by a worker with a handle `handle.deinit`
 /// can take apart, in no pool. The test owns it: `destroyWorker` takes it
 /// apart.
 pub fn newWorker(allocator: std.mem.Allocator, options: WorkerOptions) !*WorkerRecord {
-    var handle = try inertHandle(allocator);
+    var handle = try inertHandleWithLeaf(options.leaf orelse try inertLeaf(allocator));
     errdefer handle.deinit();
     const worker = try allocator.create(WorkerRecord);
     worker.* = WorkerRecord.vacant(options.definition_index, definition_names[options.definition_index]);
@@ -363,20 +466,48 @@ pub fn newWorker(allocator: std.mem.Allocator, options: WorkerOptions) !*WorkerR
 }
 
 /// Takes apart a record `newWorker` built, as the reaper's teardown does once
-/// its final drain is done.
+/// its last console drain is done.
 pub fn destroyWorker(allocator: std.mem.Allocator, worker: *WorkerRecord) void {
     unmapForDrains(worker);
     worker.vacate(allocator);
     allocator.destroy(worker);
 }
 
-/// Marks the worker's page unmapped for every drain, which the final drain
-/// does before a record is vacated.
+/// Marks the worker's page unmapped for every drain, which the teardown's
+/// last console drain does before a record is vacated.
 pub fn unmapForDrains(worker: *WorkerRecord) void {
     worker.metrics_mutex.lock();
     defer worker.metrics_mutex.unlock();
     worker.page_mapped = false;
 }
+
+/// A worker page a test writes as the worker would: `attach` gives a record
+/// a fresh page, whose host reader replaces the one its handle holds and
+/// whose writer the result keeps. The record's teardown unmaps the reader;
+/// `deinit` unmaps the writer.
+pub const WorkerPage = struct {
+    fd: std.posix.fd_t,
+    writer: worker_shared_page.WorkerWriterView,
+
+    pub fn attach(worker: *WorkerRecord) !WorkerPage {
+        const fd = try worker_shared_page.createMemfd("collo-test-worker-page");
+        errdefer std.posix.close(fd);
+        var writer = try worker_shared_page.mapWorkerWriter(fd);
+        errdefer writer.deinit();
+        const reader = try worker_shared_page.mapHostReader(fd);
+        worker.metrics_mutex.lock();
+        defer worker.metrics_mutex.unlock();
+        if (worker.handle.metrics) |*previous|
+            previous.deinit();
+        worker.handle.metrics = reader;
+        return .{ .fd = fd, .writer = writer };
+    }
+
+    pub fn deinit(self: *WorkerPage) void {
+        self.writer.deinit();
+        std.posix.close(self.fd);
+    }
+};
 
 /// Where a definition's pool keeps the record of table entry `entry`, the
 /// entry a `LaunchTicket` names.
@@ -452,6 +583,16 @@ pub const PublishOptions = struct {
     record: RecordOptions = .{},
 };
 
+/// The ticket of a launch `worker_pool` starts under an open memory gate, a
+/// worker more beside live ones allowed as a scale-out verdict would, or
+/// null when the pool wants none.
+pub fn startLaunch(worker_pool: *supervision.WorkerPool) ?supervision.pool.LaunchTicket {
+    return switch (worker_pool.launchStarted(true, true)) {
+        .started => |ticket| ticket,
+        .watch, .none => null,
+    };
+}
+
 /// Publishes a worker holding `handle` into its definition's pool the way a
 /// launch does (`launchStarted`, the record built in the ticket's entry,
 /// `publish`) and returns its record, idle on the free list with no reader.
@@ -472,7 +613,7 @@ pub fn publishWorker(supervisor: *Supervisor, handle: WorkerHandle, options: Pub
         .wait => {},
         .acquired, .full => return error.PoolNotQuiet,
     }
-    const ticket = worker_pool.launchStarted(true) orelse {
+    const ticket = startLaunch(worker_pool) orelse {
         _ = worker_pool.cancelWaiter(placeholder_waiter);
         return error.PoolTableFull;
     };
@@ -506,7 +647,7 @@ pub fn publishLaunchedWorker(supervisor: *Supervisor, handle: WorkerHandle, opti
     var owned_wake_set = options.record.egress_wake_set;
     errdefer owned_wake_set.deinit();
     const worker_pool = supervisor.poolFor(options.definition_index);
-    const ticket = worker_pool.launchStarted(true) orelse return error.LaunchNotClaimed;
+    const ticket = startLaunch(worker_pool) orelse return error.LaunchNotClaimed;
     const record = buildRecord(supervisor, options.definition_index, ticket, owned_handle, options.record) catch |err| {
         worker_pool.launchEnded(ticket) catch unreachable;
         return err;
@@ -563,47 +704,18 @@ pub fn egressAttachment(
 }
 
 /// The request table entry a lane records for `request_id` dispatched to the
-/// first route of the worker's definition: lane 0, a slot and generation
-/// derived from the id, started at 1 ns.
+/// first route of the worker's definition: lane 0, with a slot derived from
+/// the id and generation 1.
 pub fn dispatchedRequest(request_id: u64) supervision.request_table.Dispatched {
     return .{
         .request_id = request_id,
         .request_key = .{ .lane_id = 0, .slot = @truncate(request_id), .generation = 1 },
         .route = 0,
-        .accounting_flags = 0,
-        .started_mono_ns = 1,
     };
 }
 
-/// When the lanes of the fixtures end a request (CLOCK_MONOTONIC), after its
-/// dispatch at `dispatchedRequest`'s 1 ns.
-pub const request_ended_ns: u64 = 2;
-
-/// One request the server dispatched to `worker` and the worker completed: its
-/// entry in the worker's request table, ended and settled to wait for the
-/// record, and the record on the worker's shared page, so a drain has
-/// something real to consume and keep.
-pub fn publishCompletedRecord(worker: *WorkerRecord, request_id: u64) !void {
-    const view = &(worker.handle.metrics orelse return error.NoSharedPage);
-    try worker.requests.record(dispatchedRequest(request_id));
-    var work_state = worker_metrics.WorkState.init(view);
-    try work_state.appendCompletedRecord(completedRecord(request_id));
-    worker.requests.noteEnded(request_id, request_ended_ns);
-    if (worker.requests.settle(request_id, true) != .parked)
-        return error.RequestTableFull;
-}
-
-/// A successful completion record for `request_id`, as a well-behaved worker
-/// writes it.
-pub fn completedRecord(request_id: u64) worker_shared_page.CompletedRecord {
-    return std.mem.zeroInit(worker_shared_page.CompletedRecord, .{
-        .request_id = request_id,
-        .status = @intFromEnum(worker_shared_page.CompletedStatus.done),
-    });
-}
-
 /// A temporary analytics directory. A test hands `path` to a sink, then reads
-/// back exactly what reached `usage.jsonl` or `workers.jsonl`.
+/// back exactly what reached `workers.jsonl`.
 pub const AnalyticsDir = struct {
     tmp: std.testing.TmpDir,
     path: []u8,
@@ -620,18 +732,11 @@ pub const AnalyticsDir = struct {
         self.tmp.cleanup();
     }
 
-    /// Flushes `sink`, then parses every usage record in `usage.jsonl`. A line
-    /// that is not exactly one usage record, with every field and no other,
-    /// fails the call, so the parse doubles as a check of the record format.
-    /// The lines `fillStream` wrote are skipped.
-    pub fn readUsage(self: *AnalyticsDir, allocator: std.mem.Allocator, sink: *analytics.Sink) !UsageLines {
-        sink.flush(process.monotonicNowNsOrZero());
-        return self.readLines(UsageLine, allocator, .usage);
-    }
-
-    /// Parses every worker line in `workers.jsonl` as `readUsage` parses
-    /// usage records, after flushing `sink`; a test whose sink is already
-    /// closed, which wrote everything out, passes null.
+    /// Parses every worker line in `workers.jsonl`, after flushing `sink`; a
+    /// test whose sink is already closed, which wrote everything out, passes
+    /// null. A line that is not exactly one worker line, with every field and
+    /// no other, fails the call, so the parse doubles as a check of the line
+    /// format. The lines `fillStream` wrote are skipped.
     pub fn readWorkers(self: *AnalyticsDir, allocator: std.mem.Allocator, sink: ?*analytics.Sink) !WorkerLines {
         if (sink) |open_sink|
             open_sink.flush(process.monotonicNowNsOrZero());
@@ -661,23 +766,22 @@ pub const AnalyticsDir = struct {
 
 const filler_prefix = "{\"filler\"";
 
-/// Takes all but `leave_free` bytes of the sink's `stream` with filler lines,
-/// as if producers had appended that much since the last flush. The sink must
-/// keep a file for `stream` whose buffer is empty, as it is when opened or
-/// just flushed; `AnalyticsDir` skips the filler when it reads the file.
+/// Takes all but `leave_free` bytes of the sink's `stream` with one filler
+/// line, as if producers had appended that much since the last flush. The
+/// sink must keep a file for `stream` whose buffer is empty, as it is when
+/// opened or just flushed; one that holds more than `leave_free` bytes fails
+/// with `error.StreamNotEmpty`. `AnalyticsDir` skips the filler when it reads
+/// the file.
 pub fn fillStream(allocator: std.mem.Allocator, sink: *analytics.Sink, stream: analytics.Stream, leave_free: usize) !void {
     const buffer_bytes = analytics.sink.bufferBytesMax(stream);
-    // Each filler line takes its bytes plus the newline the sink adds. The
-    // first one keeps every other byte free, so only an empty stream takes it.
-    const first_bytes = filler_prefix.len + 1;
-    if (!sink.tryAppendKeepingFree(stream, filler_prefix, buffer_bytes - first_bytes))
-        return error.StreamNotEmpty;
-    std.debug.assert(buffer_bytes - first_bytes > leave_free + first_bytes);
-    const filler = try allocator.alloc(u8, buffer_bytes - first_bytes - leave_free - 1);
+    std.debug.assert(buffer_bytes > leave_free + filler_prefix.len + 1);
+    // The line takes its bytes plus the newline the sink adds.
+    const filler = try allocator.alloc(u8, buffer_bytes - leave_free - 1);
     defer allocator.free(filler);
     @memset(filler, ' ');
     @memcpy(filler[0..filler_prefix.len], filler_prefix);
-    try sink.append(stream, filler);
+    if (!sink.tryAppend(stream, filler))
+        return error.StreamNotEmpty;
 }
 
 /// Makes every write to a regular file fail, as a file system that takes no
@@ -710,29 +814,6 @@ pub const FileWritesRefused = struct {
     }
 };
 
-/// One line of `usage.jsonl`, field for field.
-pub const UsageLine = struct {
-    ts: u64,
-    worker: []const u8,
-    route: []const u8,
-    worker_id: u64,
-    worker_generation: u64,
-    origin: []const u8,
-    request_id: u64,
-    error_code: []const u8,
-    cold_start: bool,
-    wall_ns: u64,
-    exec_ns: u64,
-    waiting_ns: u64,
-    io_ns: u64,
-    cpu_ns: u64,
-    client_served_bytes: u64,
-    fetch_sent_bytes: u64,
-    fetch_received_bytes: u64,
-    fetch_wire_bytes: u64,
-    worker_fault: []const u8,
-};
-
 /// One line of `workers.jsonl`, field for field.
 pub const WorkerLine = struct {
     ts: u64,
@@ -758,5 +839,4 @@ pub fn Lines(comptime Line: type) type {
     };
 }
 
-pub const UsageLines = Lines(UsageLine);
 pub const WorkerLines = Lines(WorkerLine);

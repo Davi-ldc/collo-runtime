@@ -135,6 +135,7 @@ comptime {
 
 pub const TestH2Origin = opaque {};
 pub const TestTlsResumptionOrigin = opaque {};
+pub const TestTlsHttp1Origin = opaque {};
 
 /// The ALPN answer `collo_test_h2_origin_start` gives its client.
 pub const test_h2_origin_alpn_h2: c_int = 0;
@@ -368,3 +369,26 @@ pub extern fn collo_test_tls_resumption_origin_stop(origin: *TestTlsResumptionOr
 pub extern fn collo_test_tls_resumption_origin_resumed_count(origin: *TestTlsResumptionOrigin) u32;
 pub extern fn collo_test_tls_resumption_origin_handshakes(origin: *TestTlsResumptionOrigin) u32;
 pub extern fn collo_test_tls_resumption_origin_last_error(origin: *TestTlsResumptionOrigin) [*:0]const u8;
+
+/// How `collo_test_tls_http1_origin_start`'s origin ends a connection at its
+/// second request, without answering it and without a close_notify.
+pub const test_tls_http1_origin_close_second: c_int = 0;
+pub const test_tls_http1_origin_reset_second: c_int = 1;
+
+/// Starts a TLS origin on an ephemeral port of every IPv4 address, presenting
+/// material of its own that the test CA signed, whose thread serves HTTP/1.1
+/// on keep-alive connections one after another. It selects http/1.1 whatever
+/// the client offers, answers each connection's first request with `kept ok`
+/// and keeps the connection, and ends the connection at its second request as
+/// `mode` names: with a FIN, or with a reset. Requests carry no body. 0 with
+/// `out` and `out_port` set, or nonzero with the reason in
+/// `collo_test_tls_last_error`. The caller owns the origin until
+/// `collo_test_tls_http1_origin_stop`.
+pub extern fn collo_test_tls_http1_origin_start(mode: c_int, out: *?*TestTlsHttp1Origin, out_port: *u16) c_int;
+/// Shuts the listener and the connection down, joins the origin's thread and
+/// frees the origin with its material.
+pub extern fn collo_test_tls_http1_origin_stop(origin: *TestTlsHttp1Origin) void;
+/// The connections the origin accepted so far.
+pub extern fn collo_test_tls_http1_origin_accepted(origin: *TestTlsHttp1Origin) u32;
+/// The origin thread's failure, or an empty string.
+pub extern fn collo_test_tls_http1_origin_last_error(origin: *TestTlsHttp1Origin) [*:0]const u8;

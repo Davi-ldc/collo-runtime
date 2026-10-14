@@ -17,18 +17,17 @@
 #include <JavaScriptCore/GetterSetter.h>
 #include <JavaScriptCore/IdentifierInlines.h>
 #include <JavaScriptCore/InternalFunction.h>
-#include <JavaScriptCore/JSCInlines.h>
 #include <JavaScriptCore/JSArray.h>
+#include <JavaScriptCore/JSCInlines.h>
 #include <JavaScriptCore/JSDestructibleObject.h>
 #include <JavaScriptCore/JSFunction.h>
 #include <JavaScriptCore/JSObject.h>
 #include <JavaScriptCore/JSString.h>
+#include <wtf/SaturatingArithmetic.h>
 #include <wtf/URL.h>
 #include <wtf/Variant.h>
 #include <wtf/text/MakeString.h>
 #include <wtf/text/StringImpl.h>
-
-#include <limits>
 
 namespace Collo::HostFunctions {
 namespace {
@@ -37,20 +36,6 @@ namespace {
     using JSC::JSValue;
     using WTF::String;
     using namespace JSC;
-
-    static size_t saturatingAdd(size_t left, size_t right)
-    {
-        if (right > std::numeric_limits<size_t>::max() - left)
-            return std::numeric_limits<size_t>::max();
-        return left + right;
-    }
-
-    static size_t saturatingMultiply(size_t left, size_t right)
-    {
-        if (left && right > std::numeric_limits<size_t>::max() / left)
-            return std::numeric_limits<size_t>::max();
-        return left * right;
-    }
 
     static size_t stringMemoryCost(const String& value)
     {
@@ -364,9 +349,10 @@ namespace {
         if (!fast_pathname)
             return 0;
 
-        size_t cost = saturatingMultiply(fast_pathname->parts.capacity(), sizeof(FastPathnamePart));
+        // The capacity times the part size is the size of a buffer Vector allocated, so the product cannot overflow.
+        size_t cost = fast_pathname->parts.capacity() * sizeof(FastPathnamePart);
         for (auto& part : fast_pathname->parts)
-            cost = saturatingAdd(cost, stringMemoryCost(part.value));
+            cost = WTF::saturatingSum<size_t>(cost, stringMemoryCost(part.value));
         return cost;
     }
 
@@ -430,12 +416,12 @@ namespace {
     size_t JSColloURLPattern::estimatedSize(JSC::JSCell* cell, JSC::VM& vm)
     {
         auto* this_object = static_cast<JSColloURLPattern*>(cell);
-        return saturatingAdd(Base::estimatedSize(cell, vm), this_object->memoryCost());
+        return WTF::saturatingSum<size_t>(Base::estimatedSize(cell, vm), this_object->memoryCost());
     }
 
     size_t JSColloURLPattern::memoryCost() const
     {
-        return saturatingAdd(m_pattern.get().memoryCost(), fastPathnameMemoryCost(m_fast_pathname));
+        return WTF::saturatingSum<size_t>(m_pattern.get().memoryCost(), fastPathnameMemoryCost(m_fast_pathname));
     }
 
     static JSColloURLPattern* requireURLPattern(
@@ -470,14 +456,6 @@ namespace {
         return structure;
     }
 
-    static bool shouldTreatAsInitDictionary(JSC::JSGlobalObject* global_object, JSValue value)
-    {
-        UNUSED_PARAM(global_object);
-        if (!value.isObject() || value.isNull())
-            return false;
-        return true;
-    }
-
     static bool readUSVStringProperty(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSC::JSObject* object,
         WTF::ASCIILiteral name, String& output)
     {
@@ -490,24 +468,20 @@ namespace {
         return true;
     }
 
-    static bool readURLPatternInit(
-        JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSValue value, WebCore::URLPatternInit& init)
+    // WebIDL converts a dictionary's members in lexicographic order of their names, so a getter on the init object
+    // runs in that order, not in the order URLPatternInit declares them.
+    static bool readURLPatternInit(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSC::JSObject* object,
+        WebCore::URLPatternInit& init)
     {
-        if (!value.isObject() || value.isNull()) {
-            JSC::throwVMTypeError(global_object, scope, "URLPattern init must be an object"_s);
-            return false;
-        }
-
-        auto* object = JSC::asObject(value);
-        return readUSVStringProperty(global_object, scope, object, "protocol"_s, init.protocol)
-            && readUSVStringProperty(global_object, scope, object, "username"_s, init.username)
-            && readUSVStringProperty(global_object, scope, object, "password"_s, init.password)
-            && readUSVStringProperty(global_object, scope, object, "hostname"_s, init.hostname)
-            && readUSVStringProperty(global_object, scope, object, "port"_s, init.port)
-            && readUSVStringProperty(global_object, scope, object, "pathname"_s, init.pathname)
-            && readUSVStringProperty(global_object, scope, object, "search"_s, init.search)
+        return readUSVStringProperty(global_object, scope, object, "baseURL"_s, init.baseURL)
             && readUSVStringProperty(global_object, scope, object, "hash"_s, init.hash)
-            && readUSVStringProperty(global_object, scope, object, "baseURL"_s, init.baseURL);
+            && readUSVStringProperty(global_object, scope, object, "hostname"_s, init.hostname)
+            && readUSVStringProperty(global_object, scope, object, "password"_s, init.password)
+            && readUSVStringProperty(global_object, scope, object, "pathname"_s, init.pathname)
+            && readUSVStringProperty(global_object, scope, object, "port"_s, init.port)
+            && readUSVStringProperty(global_object, scope, object, "protocol"_s, init.protocol)
+            && readUSVStringProperty(global_object, scope, object, "search"_s, init.search)
+            && readUSVStringProperty(global_object, scope, object, "username"_s, init.username);
     }
 
     static bool readURLPatternOptions(
@@ -528,12 +502,15 @@ namespace {
         return true;
     }
 
+    // An object is a URLPatternInit dictionary; anything else converts to a USVString.
+    // FIXME: WebIDL converts null to an empty URLPatternInit, as it does for any union that includes a dictionary;
+    // here null becomes the string "null".
     static bool readURLPatternInput(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSValue value,
         WebCore::URLPattern::URLPatternInput& input)
     {
-        if (shouldTreatAsInitDictionary(global_object, value)) {
+        if (auto* object = value.getObject()) {
             WebCore::URLPatternInit init;
-            if (!readURLPatternInit(global_object, scope, value, init))
+            if (!readURLPatternInit(global_object, scope, object, init))
                 return false;
             input = WTF::move(init);
             return true;
@@ -889,9 +866,9 @@ void installWebApiURLPattern(Collo::GlobalObject* global_object, JSC::VM& vm)
     cache.url_pattern_prototype.set(vm, prototype);
     cache.url_pattern_structure.set(vm, structure);
 
+    // An interface object is not enumerable on the global object, as WebIDL defines it.
     global_object->putDirect(vm, JSC::Identifier::fromString(vm, "URLPattern"_s), constructor,
-        static_cast<unsigned>(JSC::PropertyAttribute::None));
-    RELEASE_ASSERT(global_object->getDirect(vm, JSC::Identifier::fromString(vm, "URLPattern"_s)));
+        static_cast<unsigned>(JSC::PropertyAttribute::DontEnum));
 }
 
 } // namespace Collo::HostFunctions

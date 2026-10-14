@@ -44,11 +44,11 @@ const bench_common = @import("common.zig");
 const bench_metadata = @import("metadata.zig");
 const proc_memory = @import("proc_memory.zig");
 
-/// The box every worker boots in. Stated, not defaulted: per-worker numbers
-/// only compare across runs while the workers keep booting under the same
-/// limits.
+/// The memory every worker boots with. Stated, not defaulted: per-worker
+/// numbers only compare across runs while the workers keep booting under the
+/// same limits. Its CPU quota is the one every launch gives a worker
+/// (`common/limits/worker.zig:cpu_max_cores`).
 const worker_memory_limit_bytes: u64 = 512 * 1024 * 1024;
-const worker_cpu_max_cores: u32 = 1;
 /// What the boot token beside every worker's session carries, since a launch
 /// that sends a session sends a boot token with it (`host.launch.LaunchEgress`). No
 /// gateway serves the session, so nothing ever verifies the token.
@@ -56,12 +56,11 @@ const bench_boot_egress: host.launch.BootEgress = .{
     .key = .{ .bytes = @splat(0x5a) },
     .session_id = 1,
     .policy_id = 0,
-    .budget = 1,
 };
 /// Deadline the worker enforces on each request.
 const request_budget_ns: u64 = 30 * std.time.ns_per_s;
 /// The host outlives the worker's deadline by this margin, so a request that
-/// times out surfaces as the worker's own completion status instead of the
+/// times out surfaces as the status of the worker's own `request_done` instead of the
 /// host giving up first with `ResponseNotFinalized`.
 const response_wall_grace_ms: u32 = 5_000;
 const response_wall_ms: u32 =
@@ -88,14 +87,14 @@ const default_route_counts = [_]usize{ 1, 4, 16, 64 };
 const default_route_workers: usize = 4;
 const route_workers_max: usize = 64;
 /// Streams multiplex requests on one ingress connection; this host keeps one
-/// request in flight per worker, and the request id is the identity the
-/// completion record is matched on.
+/// request in flight per worker, and the request id is the identity its
+/// `request_done` is matched on.
 const stream_id: u32 = 1;
 const authority = "localhost";
 const request_path_max: usize = 64;
 const expected_body_max: usize = 128;
 
-const entry_specifier = ipc.module_pack.route_specifier_prefix ++ "bench/host_lifecycle.js";
+const entry_specifier = ipc.module_pack.task_root ++ "/bench/host_lifecycle.js";
 /// Echoes method and pathname, so the body proves the handler ran for this
 /// very request rather than that some worker answered something.
 const entry_source =
@@ -121,23 +120,14 @@ pub fn main() !void {
     const settings = try Settings.fromEnv(allocator);
     defer settings.deinit(allocator);
 
+    // The single-route definition: one module and route 0 on it.
     const pack_fd = try host.dispatch.createModulePackFd(allocator, entry_specifier, entry_source);
     defer std.posix.close(pack_fd);
-    const route_table = try ipc.route_table.buildSealed(allocator, &.{.{
-        .entry_specifier = entry_specifier,
-        .bindings = &.{},
-    }});
-    defer route_table.close();
 
     // Every worker is born inside its own leaf of this subtree; without a
     // delegated subtree there is no worker to measure.
     var cgroup_root = try host.WorkerCgroupRoot.init(allocator, cgroupPlacement());
     defer cgroup_root.deinit(allocator);
-    // The one directory every worker of this host mounts its tmpfs over, as
-    // a server holds one for its life.
-    var tmp_mount: host.TmpMountPoint = undefined;
-    try tmp_mount.init(host.tmp_mount.default_parent_dir);
-    defer tmp_mount.deinit();
 
     // The machine before anything of ours exists: the zygote's own
     // system-wide cost is measured over this reading.
@@ -148,7 +138,7 @@ pub fn main() !void {
     var spawn_timer = try std.time.Timer.start();
     var spawned = try zygote.host_client.spawnZygote(.{
         .executable_path = executable_path,
-        .warmup_corpus = true,
+        .trace = false,
     });
     defer spawned.deinit();
     const spawn_to_serving_ns = spawn_timer.read();
@@ -167,10 +157,8 @@ pub fn main() !void {
         .allocator = allocator,
         .spawned = &spawned,
         .cgroup_root = &cgroup_root,
-        .tmp_mount_point_fd = tmp_mount.fd(),
         .ids = &ids,
         .pack_fd = pack_fd,
-        .route_table = route_table,
         .system_zygote = system_zygote,
     };
     for (settings.worker_counts) |worker_count| {
@@ -246,13 +234,12 @@ const Settings = struct {
 };
 
 /// The routes of a multi-route definition: `count` routes, route `i` on an
-/// entry of its own, `/__collo_route/bench/route<i>.js`, whose body names
-/// it, with every entry in one pack and the routes in one table, as the
-/// server builds them for a definition.
+/// entry of its own, `/var/task/bench/route<i>.js`, whose body names it,
+/// with every entry and every route in one artifact, as the server builds it
+/// for a definition.
 const RouteSet = struct {
     count: usize,
     pack_fd: std.posix.fd_t,
-    table: ipc.route_table.Sealed,
 
     fn build(allocator: std.mem.Allocator, count: usize) !RouteSet {
         std.debug.assert(count != 0 and count <= ipc.route_table.routes_max);
@@ -262,7 +249,7 @@ const RouteSet = struct {
         const modules = try arena.alloc(ipc.module_pack.Module, count);
         const inputs = try arena.alloc(ipc.route_table.RouteInput, count);
         for (modules, inputs, 0..) |*module, *input, index| {
-            const specifier = try std.fmt.allocPrint(arena, "{s}bench/route{d}.js", .{ ipc.module_pack.route_specifier_prefix, index });
+            const specifier = try std.fmt.allocPrint(arena, "{s}/bench/route{d}.js", .{ ipc.module_pack.task_root, index });
             module.* = .{
                 .specifier = specifier,
                 .source = try std.fmt.allocPrint(arena,
@@ -273,29 +260,25 @@ const RouteSet = struct {
                     \\  }});
                     \\}}
                 , .{index}),
-                .dependencies = &.{},
             };
-            input.* = .{ .entry_specifier = specifier, .bindings = &.{} };
+            input.* = .{ .entry_module = @intCast(index) };
         }
-        const pack_fd = try host.dispatch.createModulePackGraphFd(allocator, modules, 0);
-        errdefer std.posix.close(pack_fd);
-        const table = try ipc.route_table.buildSealed(allocator, inputs);
-        return .{ .count = count, .pack_fd = pack_fd, .table = table };
+        const pack_fd = try host.dispatch.createDefinitionFd(allocator, modules, inputs);
+        return .{ .count = count, .pack_fd = pack_fd };
     }
 
     fn deinit(self: *RouteSet) void {
         std.posix.close(self.pack_fd);
-        self.table.close();
         self.* = undefined;
     }
 
     fn launchRoutes(self: *const RouteSet, isolate_realm: bool) host.launch.LaunchRoutes {
-        return .{ .table = self.table, .module_pack_fd = self.pack_fd, .isolate_realm = isolate_realm };
+        return .{ .module_pack_fd = self.pack_fd, .isolate_realm = isolate_realm };
     }
 };
 
 /// Identities this host hands out. A fork job id names a cgroup leaf and a
-/// request id names a completion record, so neither is ever reused.
+/// request id names a request's `request_done`, so neither is ever reused.
 const Ids = struct {
     next_fork_job_id: u64 = 1,
     next_request_id: u64 = 1,
@@ -329,25 +312,22 @@ const Worker = struct {
 };
 
 /// What every scenario needs from the host: the zygote that forks, the
-/// subtree the leaves go under, the identities handed out, and the entry
-/// pack and one-route table every worker boots with. One per run;
-/// scenarios share it.
+/// subtree the leaves go under, the identities handed out, and the
+/// single-route artifact every worker of the single-route scenarios boots
+/// with. One per run; scenarios share it.
 const Context = struct {
     allocator: std.mem.Allocator,
     spawned: *zygote.host_client.SpawnedZygote,
     cgroup_root: *host.WorkerCgroupRoot,
-    /// The host's mount point (`host.TmpMountPoint.fd`), borrowed.
-    tmp_mount_point_fd: std.posix.fd_t,
     ids: *Ids,
     pack_fd: std.posix.fd_t,
-    route_table: ipc.route_table.Sealed,
     /// The machine with the idle zygote and nothing else of ours: every
     /// system-wide increment a round reports is over this reading.
     system_zygote: proc_memory.SystemMemory,
 
     /// The one route of the single-route scenarios.
     fn singleRoute(self: Context) host.launch.LaunchRoutes {
-        return .{ .table = self.route_table, .module_pack_fd = self.pack_fd, .isolate_realm = true };
+        return .{ .module_pack_fd = self.pack_fd, .isolate_realm = true };
     }
 };
 
@@ -582,17 +562,14 @@ fn launchWorker(ctx: Context, routes: host.launch.LaunchRoutes) !Worker {
     const leaf_fd = try ctx.cgroup_root.createWorkerDir(fork_job_id, .{
         .memory_limit_bytes = worker_memory_limit_bytes,
     });
-    var leaf_owned = true;
-    errdefer if (leaf_owned) {
-        std.posix.close(leaf_fd);
-        ctx.cgroup_root.removeWorkerDir(fork_job_id);
+    // The machine owns the leaf from here on; abandoning it removes the leaf
+    // and reaps any child it took.
+    var machine = host.launch.Machine.init(ctx.cgroup_root.leaf(fork_job_id), leaf_fd, ctx.spawned.trace_write_fd);
+    var machine_owned = true;
+    errdefer if (machine_owned) {
+        var child = machine.abandon();
+        child.reap();
     };
-    var forked = try zygote.host_client.requestForkWithJobId(ctx.spawned, fork_job_id, leaf_fd);
-    forked.fork_job_id = fork_job_id;
-    forked.cgroup_dir_fd = leaf_fd;
-    leaf_owned = false;
-    var forked_owned = true;
-    errdefer if (forked_owned) host.terminateForkedWorkerBestEffort(&forked);
 
     // The session holds its own copy of every wake descriptor, so the set
     // closes once the session is built.
@@ -600,29 +577,48 @@ fn launchWorker(ctx: Context, routes: host.launch.LaunchRoutes) !Worker {
     defer wake_set.deinit();
     var egress = try ipc.egress_shared.createSessionForWorker(&wake_set);
     errdefer egress.deinit();
-    const handle = try host.runToReady(
-        ctx.allocator,
-        ctx.spawned,
-        &forked,
-        worker_memory_limit_bytes,
-        .{
-            .cpu_max_cores = worker_cpu_max_cores,
-            .egress = .{ .attached = .{
-                .shared_fds = egress.rawForWorker(),
-                .boot = bench_boot_egress,
-            } },
-            .tmp_mount_point_fd = ctx.tmp_mount_point_fd,
-            .routes = routes,
-        },
-    );
-    // The launch took every fd the fork reply carried.
-    forked_owned = false;
-    forked.deinit();
+
+    var forked = try forkWorker(ctx.spawned, fork_job_id, leaf_fd);
+    defer forked.deinit();
+    // `runToReady` abandons and reaps the launch itself when it fails.
+    machine_owned = false;
+    const handle = try host.runToReady(&machine, &forked, &.{
+        .memory_limit_bytes = worker_memory_limit_bytes,
+        .egress = .{ .attached = .{
+            .shared_fds = egress.rawForWorker(),
+            .boot = bench_boot_egress,
+        } },
+        .routes = routes,
+    });
     return .{
         .handle = handle,
         .egress = egress,
         .fork_to_ready_ns = timer.read(),
     };
+}
+
+/// Asks the zygote to fork the child of `fork_job_id` into the leaf
+/// `leaf_fd` and reads its reply, as the server's launcher does without
+/// blocking: a zygote that sends no reply within
+/// `zygote.host_client.fork_reply_timeout_ms` is killed.
+fn forkWorker(
+    spawned: *zygote.host_client.SpawnedZygote,
+    fork_job_id: u64,
+    leaf_fd: std.posix.fd_t,
+) !zygote.host_client.ForkedWorker {
+    try zygote.host_client.sendForkRequest(spawned, fork_job_id, leaf_fd);
+    const control_fd = spawned.control_fd orelse return error.ZygoteProtocol;
+    var pollfds = [_]std.posix.pollfd{.{
+        .fd = control_fd,
+        .events = std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR,
+        .revents = 0,
+    }};
+    if (try std.posix.poll(&pollfds, zygote.host_client.fork_reply_timeout_ms) == 0) {
+        zygote.host_client.killUnresponsiveZygote(spawned, fork_job_id);
+        return error.ZygoteDied;
+    }
+    // HUP and ERR fall through, so the receive reports the exact error.
+    return zygote.host_client.receiveForkReply(spawned, fork_job_id);
 }
 
 /// One GET to `path` on the single-route entry, timed from the send to the
@@ -678,7 +674,7 @@ fn readOne(
     handle: *host.WorkerHandle,
     request_id: u64,
 ) !host.dispatch.Response {
-    return host.dispatch.readResponse(allocator, handle.completionChannels(), request_id, .{
+    return host.dispatch.readResponse(allocator, handle.responseChannels(), request_id, .{
         .wall_ms = response_wall_ms,
         .max_body_bytes = max_response_body_bytes,
         .max_headers_bytes = max_response_headers_bytes,

@@ -1,24 +1,22 @@
-// CompressionStream and DecompressionStream (Compression standard): the codec steps and the cell that joins a
-// readable and a writable stream around one codec. Runs on the VM thread.
+// CompressionStream and DecompressionStream (Compression Standard): the codec steps, the native transformer that a
+// transform stream drives, and the two interfaces. Runs on the VM thread.
 //
-// At most one write or close is pending, because the writable side waits for each sink promise before its next call.
-// pump runs the pending operation in two alternating phases. fillOutput runs the codec, with no script, until its
-// output reaches WebApiCompressionStreamOutputChunkBytes, its input runs out or the stream ends. deliverOutput then
-// enqueues that output as one chunk, which can run script. Output is delivered only while the readable side wants it;
-// what it does not want waits in the cell, the unconsumed input waits in the pending operation, and the readable
-// side's pull resumes both. The output that ends the compressed stream is the exception: it is enqueued whether or
-// not a read waits, as the standard's flush does, so the close can complete.
+// The stream hands the transformer a chunk only once the readable side has pulled since the last output. The
+// transformer copies it into its pending input and turns it into output only when the stream asks, which it does while
+// the readable side wants output:
+// one produce() fills at most WebApiCompressionStreamOutputChunkBytes of output with no script running, and the stream
+// enqueues it. So what the readable side does not want stays as input in the transformer, and a write settles once its
+// input is consumed and its output enqueued; the input buffer is freed once consumed, so its peak does not outlive the
+// write. What close() leaves is what the codec buffered plus its end, bounded by the codec's own state and not by the
+// input: a decompressor has produced all its output by then and only checks that the compressed data ended. The codec
+// opens on the first write the stream hands over or on close, so a stream nobody reads holds no library state.
+
 #include "host_functions/webapi/streams/compression_stream_private.h"
 
 #include "host_functions/webapi/limits.h"
-#include "host_functions/webapi/streams/shared_bytes.h"
-
-#include <brotli/decode.h>
-#include <brotli/encode.h>
-#include <zlib.h>
+#include "host_functions/webapi/streams/transform_stream.h"
 
 #include <wtf/FastMalloc.h>
-#include <wtf/SetForScope.h>
 
 #include <algorithm>
 #include <cstddef>
@@ -38,9 +36,24 @@ namespace {
 
     static_assert(sizeof(size_t) >= 2 * sizeof(uInt), "a zlib allocation's byte count fits in size_t");
 
+    // The Brotli encoder's library defaults (quality 11 with a 4 MiB window) build hash tables and a ring buffer far
+    // larger than one stream should hold in a worker. Quality 5 keeps a hasher whose tables are sized by the window,
+    // and a 64 KiB window bounds them, so the encoder's state stays within a few MiB whatever the body's size, while
+    // its output stays smaller than gzip's.
+    constexpr int brotli_encoder_quality = 5;
+    constexpr int brotli_encoder_window_bits = 16;
+    static_assert(brotli_encoder_window_bits >= BROTLI_MIN_WINDOW_BITS);
+    static_assert(brotli_encoder_window_bits <= BROTLI_MAX_WINDOW_BITS);
+
+    // zlib's windowBits: 15 is the largest window, adding 16 selects the gzip wrapper and negating it selects raw
+    // deflate. zlib_memory_level is zlib's default memLevel.
+    constexpr int zlib_window_bits = 15;
+    constexpr int zlib_gzip_wrapper_bits = 16;
+    constexpr int zlib_memory_level = 8;
+
 } // namespace
 
-bool parseCompressionFormat(WTF::String format, CompressionFormat& out)
+bool parseCompressionFormat(const WTF::String& format, CompressionFormat& out)
 {
     if (format == "gzip"_s) {
         out = CompressionFormat::Gzip;
@@ -111,21 +124,25 @@ bool CompressionCodec::open(CompressionFormat format, bool decompressing)
             m_brotli_encoder_state = BrotliEncoderCreateInstance(allocate, deallocate, this);
             if (!m_brotli_encoder_state)
                 return false;
+            if (!BrotliEncoderSetParameter(m_brotli_encoder_state, BROTLI_PARAM_QUALITY, brotli_encoder_quality)
+                || !BrotliEncoderSetParameter(m_brotli_encoder_state, BROTLI_PARAM_LGWIN, brotli_encoder_window_bits)) {
+                BrotliEncoderDestroyInstance(m_brotli_encoder_state);
+                m_brotli_encoder_state = nullptr;
+                return false;
+            }
         }
         m_kind = Kind::Brotli;
         return true;
     }
 
-    // zlib's windowBits: 15 is the largest window, adding 16 selects the gzip wrapper and negating it selects raw
-    // deflate. The 8 passed to deflateInit2 below is zlib's default memLevel.
     const int window_bits = [format] {
         switch (format) {
         case CompressionFormat::Gzip:
-            return 15 + 16;
+            return zlib_window_bits + zlib_gzip_wrapper_bits;
         case CompressionFormat::Deflate:
-            return 15;
+            return zlib_window_bits;
         case CompressionFormat::DeflateRaw:
-            return -15;
+            return -zlib_window_bits;
         case CompressionFormat::Brotli:
             return 0;
         }
@@ -136,9 +153,9 @@ bool CompressionCodec::open(CompressionFormat format, bool decompressing)
     m_zlib_stream.zfree = zlibDeallocate;
     m_zlib_stream.opaque = this;
     // A failed init frees whatever it allocated.
-    const int status = decompressing
-        ? inflateInit2(&m_zlib_stream, window_bits)
-        : deflateInit2(&m_zlib_stream, Z_DEFAULT_COMPRESSION, Z_DEFLATED, window_bits, 8, Z_DEFAULT_STRATEGY);
+    const int status = decompressing ? inflateInit2(&m_zlib_stream, window_bits)
+                                     : deflateInit2(&m_zlib_stream, Z_DEFAULT_COMPRESSION, Z_DEFLATED, window_bits,
+                                           zlib_memory_level, Z_DEFAULT_STRATEGY);
     if (status != Z_OK) {
         m_zlib_stream = {};
         return false;
@@ -303,623 +320,310 @@ CodecStep CompressionCodec::stepBrotliDecoder(std::span<const uint8_t> input, bo
     return result;
 }
 
-static JSColloCompressionStream* compressionStreamFromFunction(
-    JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSC::JSFunction* function)
-{
-    JSC::JSValue value = function->get(global_object, compressionStreamStateIdentifier(global_object));
-    RETURN_IF_EXCEPTION(scope, nullptr);
-    auto* stream = dynamicDowncast<JSColloCompressionStream>(value);
-    if (!stream)
-        JSC::throwVMTypeError(global_object, scope, "CompressionStream state is unavailable"_s);
-    return stream;
-}
+namespace {
 
-struct CompressionInputBytes {
-    std::span<const uint8_t> bytes;
-};
-
-// The span borrows the chunk's buffer: it stays valid only until script runs.
-static bool compressionInputBytes(
-    JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSC::JSValue value, CompressionInputBytes& out)
-{
-    out = {};
-    if (auto* view = dynamicDowncast<JSC::JSArrayBufferView>(value)) {
-        if (!validateArrayBufferViewForCopy(
-                global_object, scope, view, "CompressionStream chunk view is detached or out of bounds"_s))
-            return false;
-        out.bytes = arrayBufferViewBytes(view);
-        return true;
-    }
-
-    if (auto* array_buffer = dynamicDowncast<JSC::JSArrayBuffer>(value)) {
-        if (!validateArrayBufferForCopy(global_object, scope, array_buffer,
-                "CompressionStream chunk must be a fixed-length attached ArrayBuffer"_s))
-            return false;
-        out.bytes = arrayBufferBytes(array_buffer);
-        return true;
-    }
-
-    // "compress and enqueue a chunk" and "decompress and enqueue a chunk"
-    // accept only a BufferSource and throw a TypeError for anything else.
-    JSC::throwVMTypeError(global_object, scope, "CompressionStream chunk must be a BufferSource"_s);
-    return false;
-}
-
-JSC_DEFINE_HOST_FUNCTION(compressionWriteCallback, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
-{
-    auto& vm = global_object->vm();
-    auto scope = DECLARE_THROW_SCOPE(vm);
-    auto* stream = compressionStreamFromFunction(
-        global_object, scope, uncheckedDowncast<JSC::JSFunction>(call_frame->jsCallee()));
-    RETURN_IF_EXCEPTION(scope, {});
-    return stream->write(global_object, scope, call_frame->argument(0));
-}
-
-JSC_DEFINE_HOST_FUNCTION(compressionCloseCallback, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
-{
-    auto& vm = global_object->vm();
-    auto scope = DECLARE_THROW_SCOPE(vm);
-    auto* stream = compressionStreamFromFunction(
-        global_object, scope, uncheckedDowncast<JSC::JSFunction>(call_frame->jsCallee()));
-    RETURN_IF_EXCEPTION(scope, {});
-    return stream->close(global_object, scope);
-}
-
-JSC_DEFINE_HOST_FUNCTION(compressionAbortCallback, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
-{
-    auto& vm = global_object->vm();
-    auto scope = DECLARE_THROW_SCOPE(vm);
-    auto* stream = compressionStreamFromFunction(
-        global_object, scope, uncheckedDowncast<JSC::JSFunction>(call_frame->jsCallee()));
-    RETURN_IF_EXCEPTION(scope, {});
-    stream->abort(global_object, call_frame->argument(0));
-    return JSC::JSValue::encode(JSC::jsUndefined());
-}
-
-JSC_DEFINE_HOST_FUNCTION(compressionPullCallback, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
-{
-    auto& vm = global_object->vm();
-    auto scope = DECLARE_THROW_SCOPE(vm);
-    auto* stream = compressionStreamFromFunction(
-        global_object, scope, uncheckedDowncast<JSC::JSFunction>(call_frame->jsCallee()));
-    RETURN_IF_EXCEPTION(scope, {});
-    stream->resume(global_object, scope);
-    RETURN_IF_EXCEPTION(scope, {});
-    return JSC::JSValue::encode(JSC::jsUndefined());
-}
-
-JSC_DEFINE_HOST_FUNCTION(compressionCancelCallback, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
-{
-    auto& vm = global_object->vm();
-    auto scope = DECLARE_THROW_SCOPE(vm);
-    auto* stream = compressionStreamFromFunction(
-        global_object, scope, uncheckedDowncast<JSC::JSFunction>(call_frame->jsCallee()));
-    RETURN_IF_EXCEPTION(scope, {});
-    stream->readableCanceled(global_object, call_frame->argument(0));
-    return JSC::JSValue::encode(JSC::jsUndefined());
-}
-
-JSC_DEFINE_HOST_FUNCTION(
-    compressionChunkSizeCallback, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
-{
-    auto& vm = global_object->vm();
-    auto scope = DECLARE_THROW_SCOPE(vm);
-    JSC::JSValue chunk = call_frame->argument(0);
-    if (auto* view = dynamicDowncast<JSC::JSArrayBufferView>(chunk)) {
-        if (arrayBufferViewIsUnavailable(view))
-            return JSC::JSValue::encode(JSC::jsNumber(0));
-        return JSC::JSValue::encode(JSC::jsNumber(view->byteLength()));
-    }
-    if (auto* array_buffer = dynamicDowncast<JSC::JSArrayBuffer>(chunk)) {
-        if (arrayBufferIsUnavailableForCopy(array_buffer))
-            return JSC::JSValue::encode(JSC::jsNumber(0));
-        return JSC::JSValue::encode(JSC::jsNumber(arrayBufferBytes(array_buffer).size()));
-    }
-    auto string = chunk.toWTFString(global_object);
-    RETURN_IF_EXCEPTION(scope, {});
-    return JSC::JSValue::encode(JSC::jsNumber(string.length()));
-}
-
-static JSC::JSValue createCompressionCallback(JSC::JSGlobalObject* global_object, JSColloCompressionStream* stream,
-    WTF::ASCIILiteral name, JSC::NativeFunction callback, unsigned length)
-{
-    auto& vm = global_object->vm();
-    auto* function
-        = JSC::JSFunction::create(vm, global_object, length, name, callback, JSC::ImplementationVisibility::Public);
-    function->putDirect(vm, compressionStreamStateIdentifier(global_object), stream,
-        static_cast<unsigned>(JSC::PropertyAttribute::DontEnum));
-    return function;
-}
-
-bool JSColloCompressionStream::initialize(
-    JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, CompressionFormat format, bool decompressing)
-{
-    auto& vm = global_object->vm();
-    auto* collo_global = uncheckedDowncast<Collo::GlobalObject>(global_object);
-    // The pinned libraries accept every format and parameter used here, so only an allocation can fail.
-    if (!m_codec.open(format, decompressing)) {
-        JSC::throwOutOfMemoryError(global_object, scope);
-        return false;
-    }
-    m_decompressing = decompressing;
-    noteMemoryCost();
-
-    auto* readable = JSColloReadableStream::create(vm, collo_global);
-    auto* readable_controller = JSColloReadableStreamDefaultController::create(vm, global_object, readable);
-    readable->setController(vm, readable_controller);
-    // The Compression standard sets up its TransformStream with the default
-    // high-water marks, 0 for the readable side and 1 for the writable side
-    // below, so a write stays pending until the readable side pulls.
-    readable->setHighWaterMark(0);
-    JSC::JSValue pull_function
-        = createCompressionCallback(global_object, this, "CompressionStream pull"_s, compressionPullCallback, 0);
-    JSC::JSValue cancel_function
-        = createCompressionCallback(global_object, this, "CompressionStream cancel"_s, compressionCancelCallback, 1);
-    JSC::JSValue size_function
-        = createCompressionCallback(global_object, this, "CompressionStream size"_s, compressionChunkSizeCallback, 1);
-    readable_controller->setCallbacks(vm, pull_function, cancel_function, size_function);
-    m_readable.set(vm, this, readable);
-
-    JSC::JSValue write_function
-        = createCompressionCallback(global_object, this, "CompressionStream write"_s, compressionWriteCallback, 1);
-    JSC::JSValue close_function
-        = createCompressionCallback(global_object, this, "CompressionStream close"_s, compressionCloseCallback, 0);
-    JSC::JSValue abort_function
-        = createCompressionCallback(global_object, this, "CompressionStream abort"_s, compressionAbortCallback, 1);
-    auto* writable = createWritableStreamFromCallbacks(global_object, scope, JSC::jsUndefined(), write_function,
-        close_function, abort_function, JSC::jsUndefined(), 1);
-    RETURN_IF_EXCEPTION(scope, false);
-    if (!writable)
-        return false;
-    m_writable.set(vm, this, writable);
-    return true;
-}
-
-void JSColloCompressionStream::noteMemoryCost()
-{
-    const size_t cost = m_codec.allocatedBytes() + m_pending_input.capacity() + m_output.capacity();
-    m_memory_cost.store(cost, std::memory_order_relaxed);
-    if (cost <= m_memory_cost_reported)
-        return;
-    const size_t growth = cost - m_memory_cost_reported;
-    m_memory_cost_reported = cost;
-    vm().heap.reportExtraMemoryAllocated(this, growth);
-}
-
-bool JSColloCompressionStream::readableWantsOutput() const
-{
-    auto* readable_stream = readable();
-    if (!readable_stream || readable_stream->state() != StreamState::Readable)
-        return false;
-    return readable_stream->hasPendingReadRequests() || readable_stream->desiredSize() > 0;
-}
-
-bool JSColloCompressionStream::beginOperation(
-    JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, PendingOperation operation)
-{
-    if (m_pending_operation != PendingOperation::None) {
-        JSC::throwVMTypeError(global_object, scope, "CompressionStream already has a pending operation"_s);
-        return false;
-    }
-    // An operation ends only with its input consumed and its output delivered, or by takePendingOperation.
-    ASSERT(m_pending_input.isEmpty());
-    ASSERT(m_output.isEmpty());
-    m_pending_promise.set(global_object->vm(), this, Collo::newPromise(global_object));
-    m_pending_operation = operation;
-    return true;
-}
-
-std::span<const uint8_t> JSColloCompressionStream::pendingInput() const
-{
-    return m_pending_input.span().subspan(m_pending_offset);
-}
-
-void JSColloCompressionStream::consumePendingInput(size_t consumed)
-{
-    ASSERT(consumed <= m_pending_input.size() - m_pending_offset);
-    m_pending_offset += consumed;
-    if (m_pending_offset == m_pending_input.size()) {
-        m_pending_input.clear();
-        m_pending_offset = 0;
-    }
-}
-
-bool JSColloCompressionStream::keepInput(
-    JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, std::span<const uint8_t> borrowed_input)
-{
-    if (borrowed_input.empty())
-        return true;
-    // A write's input is borrowed until the first time it is kept, and owned from then on.
-    ASSERT(m_pending_input.isEmpty());
-    if (!m_pending_input.tryAppend(borrowed_input)) {
-        JSC::throwOutOfMemoryError(global_object, scope);
-        return false;
-    }
-    m_pending_offset = 0;
-    noteMemoryCost();
-    return true;
-}
-
-CodecStatus JSColloCompressionStream::fillOutput(std::span<const uint8_t> input, bool finish, size_t& consumed)
-{
-    ASSERT(m_output.isEmpty());
-    consumed = 0;
-    if (!m_output.tryReserveCapacity(WebApiCompressionStreamOutputChunkBytes))
-        return CodecStatus::OutOfMemory;
-    while (true) {
-        const size_t held = m_output.size();
-        if (held == WebApiCompressionStreamOutputChunkBytes)
-            return CodecStatus::MoreOutput;
-        // Within the reserved capacity, so this grows without allocating.
-        if (!m_output.tryGrow(WebApiCompressionStreamOutputChunkBytes))
-            return CodecStatus::OutOfMemory;
-        const auto step = m_codec.step(input.subspan(consumed), finish, m_output.mutableSpan().subspan(held));
-        m_output.shrink(held + step.produced);
-        consumed += step.consumed;
-        switch (step.status) {
-        case CodecStatus::NeedsInput:
-            if (consumed == input.size())
-                return CodecStatus::NeedsInput;
-            break;
-        case CodecStatus::MoreOutput:
-            break;
-        case CodecStatus::Finished:
-        case CodecStatus::Failed:
-        case CodecStatus::OutOfMemory:
-            return step.status;
+    class CompressionStreamTransformer final : public TransformStreamNativeTransformer {
+    public:
+        static WTF::RefPtr<CompressionStreamTransformer> create(CompressionFormat format, bool decompressing)
+        {
+            void* storage = nullptr;
+            if (!WTF::tryFastMalloc(sizeof(CompressionStreamTransformer)).getValue(storage))
+                return nullptr;
+            auto* transformer = new (NotNull, storage) CompressionStreamTransformer(format, decompressing);
+            return adoptRef(*transformer);
         }
-        // A step that neither consumes nor produces would repeat forever.
-        if (!step.consumed && !step.produced)
-            return CodecStatus::Failed;
-    }
-}
 
-bool JSColloCompressionStream::deliverOutput(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope)
-{
-    ASSERT(!m_output.isEmpty());
-    auto* readable_stream = readable();
-    if (!readable_stream) {
-        JSC::throwVMTypeError(global_object, scope, "CompressionStream readable side is unavailable"_s);
-        return false;
-    }
-    JSC::JSUint8Array* chunk = nullptr;
-    if (m_output.size() == m_output.capacity()) {
-        // A full buffer becomes the chunk's storage without a copy.
-        const size_t length = m_output.size();
-        auto bytes = ColloSharedBytes::create(std::exchange(m_output, {}));
-        noteMemoryCost();
-        if (!bytes) {
+        bool write(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSC::JSValue chunk) override
+        {
+            std::span<const uint8_t> bytes;
+            // "compress and enqueue a chunk" and "decompress and enqueue a chunk" accept only a BufferSource, which
+            // has no [AllowShared]: a SharedArrayBuffer, or a view on one, is refused like any other non-BufferSource.
+            if (auto* view = dynamicDowncast<JSC::JSArrayBufferView>(chunk)) {
+                if (view->isShared()) {
+                    JSC::throwVMTypeError(
+                        global_object, scope, "CompressionStream chunk must not be backed by a SharedArrayBuffer"_s);
+                    return false;
+                }
+                if (!validateArrayBufferViewForCopy(
+                        global_object, scope, view, "CompressionStream chunk view is detached or out of bounds"_s))
+                    return false;
+                bytes = arrayBufferViewBytes(view);
+            } else if (auto* array_buffer = dynamicDowncast<JSC::JSArrayBuffer>(chunk)) {
+                if (array_buffer->isShared()) {
+                    JSC::throwVMTypeError(
+                        global_object, scope, "CompressionStream chunk must not be a SharedArrayBuffer"_s);
+                    return false;
+                }
+                if (!validateArrayBufferForCopy(global_object, scope, array_buffer,
+                        "CompressionStream chunk must be a fixed-length attached ArrayBuffer"_s))
+                    return false;
+                bytes = arrayBufferBytes(array_buffer);
+            } else {
+                JSC::throwVMTypeError(global_object, scope, "CompressionStream chunk must be a BufferSource"_s);
+                return false;
+            }
+            if (!ensureOpen(global_object, scope))
+                return false;
+            // The chunk is copied: its buffer can change once script runs, and the input waits for demand.
+            if (!m_input.tryAppend(bytes)) {
+                JSC::throwOutOfMemoryError(global_object, scope);
+                return false;
+            }
+            return true;
+        }
+
+        bool close(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope) override
+        {
+            // A stream closed before any write still produces a whole compressed stream.
+            if (!ensureOpen(global_object, scope))
+                return false;
+            m_closed = true;
+            return true;
+        }
+
+        bool hasPendingOutput() const override
+        {
+            if (m_released)
+                return false;
+            if (pendingInput().size() || m_codec_has_more_output)
+                return true;
+            return m_closed && !m_codec.finished();
+        }
+
+        JSC::JSValue produce(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope) override
+        {
+            auto input = pendingInput();
+            // Once the writable side closed and every written byte went in, each step finishes the stream.
+            const bool finishing = m_closed && input.empty();
+            if (!m_output.tryReserveCapacity(WebApiCompressionStreamOutputChunkBytes)) {
+                JSC::throwOutOfMemoryError(global_object, scope);
+                return {};
+            }
+            size_t consumed = 0;
+            const CodecStatus status = fillOutput(input, finishing, consumed);
+            consumeInput(consumed);
+            m_codec_has_more_output = status == CodecStatus::MoreOutput;
+            if (status == CodecStatus::OutOfMemory) {
+                m_output.shrink(0);
+                JSC::throwOutOfMemoryError(global_object, scope);
+                return {};
+            }
+            // A codec that is finishing has all its input, so asking for more means the compressed data ended early.
+            if (status == CodecStatus::Failed || (finishing && status == CodecStatus::NeedsInput)) {
+                m_output.shrink(0);
+                // The Compression Standard reports every codec failure as a TypeError.
+                JSC::throwVMTypeError(global_object, scope,
+                    m_decompressing ? "DecompressionStream input is not valid compressed data"_s
+                                    : "CompressionStream could not compress its input"_s);
+                return {};
+            }
+            if (m_output.isEmpty())
+                return {};
+            return takeOutput(global_object, scope);
+        }
+
+        void release() override
+        {
+            m_released = true;
+            m_codec.release();
+            m_input = {};
+            m_input_offset = 0;
+            m_output = {};
+            m_codec_has_more_output = false;
+        }
+
+        size_t memoryCost() const override
+        {
+            return m_codec.allocatedBytes() + m_input.capacity() + m_output.capacity();
+        }
+
+    private:
+        CompressionStreamTransformer(CompressionFormat format, bool decompressing)
+            : m_format(format)
+            , m_decompressing(decompressing)
+        {
+        }
+
+        bool ensureOpen(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope)
+        {
+            if (m_codec.isOpen() || m_codec.finished())
+                return true;
+            // The pinned libraries accept every format and parameter used here, so only an allocation can fail.
+            if (m_codec.open(m_format, m_decompressing))
+                return true;
             JSC::throwOutOfMemoryError(global_object, scope);
             return false;
         }
-        chunk = createUint8ArrayFromExclusiveSharedBytes(global_object, scope, bytes.releaseNonNull(), 0, length);
-    } else {
-        // A partial one is copied, so the chunk keeps no unused capacity alive.
-        chunk = createUint8ArrayCopy(global_object, scope, m_output.span());
-        m_output.clear();
-        noteMemoryCost();
-    }
-    RETURN_IF_EXCEPTION(scope, false);
-    readable_stream->enqueue(global_object, scope, chunk);
-    RETURN_IF_EXCEPTION(scope, false);
-    return true;
-}
 
-JSColloCompressionStream::PumpResult JSColloCompressionStream::pump(
-    JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, std::span<const uint8_t> borrowed_input)
-{
-    ASSERT(m_pending_operation != PendingOperation::None);
-    ASSERT(!m_pumping);
-    WTF::SetForScope<bool> pumping { m_pumping, true };
-    auto* operation = m_pending_promise.get();
-    const bool finishing = m_pending_operation == PendingOperation::Close;
-    ASSERT(!finishing || borrowed_input.empty());
+        std::span<const uint8_t> pendingInput() const { return m_input.span().subspan(m_input_offset); }
 
-    while (true) {
-        // A delivery runs script: no borrowed span is alive across it, and the state is read again after it.
-        while (!m_output.isEmpty()) {
-            ASSERT(borrowed_input.empty());
-            if (!m_codec.finished() && !readableWantsOutput())
-                return PumpResult::Blocked;
-            if (!deliverOutput(global_object, scope))
-                return PumpResult::Threw;
-            if (m_pending_promise.get() != operation)
-                return PumpResult::Superseded;
-        }
-
-        const bool borrowing = !borrowed_input.empty();
-        const auto input = borrowing ? borrowed_input : pendingInput();
-        if (finishing) {
-            if (m_codec.finished())
-                return PumpResult::Complete;
-        } else {
-            if (input.empty() && !m_codec_has_more_output)
-                return PumpResult::Complete;
-            // Input after the end of the compressed stream.
-            if (m_codec.finished())
-                return PumpResult::CodecFailed;
-            if (!readableWantsOutput()) {
-                if (!keepInput(global_object, scope, borrowed_input))
-                    return PumpResult::Threw;
-                return PumpResult::Blocked;
+        // Keeps m_input_offset below m_input.size(), or both at zero once every byte is consumed. A consumed buffer is
+        // freed, not kept for the next write, so one large write's input does not stay allocated, and counted in
+        // memoryCost(), for the rest of the stream's life.
+        void consumeInput(size_t consumed)
+        {
+            ASSERT(consumed <= m_input.size() - m_input_offset);
+            m_input_offset += consumed;
+            if (m_input_offset == m_input.size()) {
+                m_input.clear();
+                m_input_offset = 0;
             }
         }
 
-        size_t consumed = 0;
-        const CodecStatus status = fillOutput(input, finishing, consumed);
-        m_codec_has_more_output = status == CodecStatus::MoreOutput;
-        if (borrowing)
-            borrowed_input = borrowed_input.subspan(consumed);
-        else
-            consumePendingInput(consumed);
-        // A codec that is finishing has all its input, so asking for more is a failure, and pumping again would spin.
-        if (status == CodecStatus::Failed || (finishing && status == CodecStatus::NeedsInput))
-            return PumpResult::CodecFailed;
-        if (status == CodecStatus::OutOfMemory) {
-            JSC::throwOutOfMemoryError(global_object, scope);
-            return PumpResult::Threw;
+        // Runs the codec, with no script, until the output reaches WebApiCompressionStreamOutputChunkBytes, the input
+        // runs out, the stream ends or the codec fails.
+        CodecStatus fillOutput(std::span<const uint8_t> input, bool finish, size_t& consumed)
+        {
+            ASSERT(m_output.isEmpty());
+            consumed = 0;
+            if (m_codec.finished())
+                return input.empty() ? CodecStatus::Finished : CodecStatus::Failed;
+            while (true) {
+                const size_t held = m_output.size();
+                if (held == WebApiCompressionStreamOutputChunkBytes)
+                    return CodecStatus::MoreOutput;
+                // Within the reserved capacity, so this grows without allocating.
+                if (!m_output.tryGrow(WebApiCompressionStreamOutputChunkBytes))
+                    return CodecStatus::OutOfMemory;
+                const auto step = m_codec.step(input.subspan(consumed), finish, m_output.mutableSpan().subspan(held));
+                m_output.shrink(held + step.produced);
+                consumed += step.consumed;
+                switch (step.status) {
+                case CodecStatus::NeedsInput:
+                    if (consumed == input.size())
+                        return CodecStatus::NeedsInput;
+                    break;
+                case CodecStatus::MoreOutput:
+                    break;
+                case CodecStatus::Finished:
+                case CodecStatus::Failed:
+                case CodecStatus::OutOfMemory:
+                    return step.status;
+                }
+                // A step that neither consumes nor produces would repeat forever.
+                if (!step.consumed && !step.produced)
+                    return CodecStatus::Failed;
+            }
         }
-        // Deliveries run script from here on, so whatever the codec left of a borrowed chunk is copied now.
-        if (!keepInput(global_object, scope, borrowed_input))
-            return PumpResult::Threw;
-        borrowed_input = {};
-        noteMemoryCost();
-    }
-}
 
-JSC::JSPromise* JSColloCompressionStream::takePendingOperation()
-{
-    auto* promise = m_pending_promise.get();
-    m_pending_promise.clear();
-    m_pending_operation = PendingOperation::None;
-    m_pending_input.clear();
-    m_pending_offset = 0;
-    m_output.clear();
-    m_codec_has_more_output = false;
-    noteMemoryCost();
-    return promise;
-}
+        JSC::JSValue takeOutput(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope)
+        {
+            if (m_output.size() == m_output.capacity()) {
+                // A full buffer becomes the chunk's storage without a copy.
+                const size_t length = m_output.size();
+                auto bytes = ColloSharedBytes::create(std::exchange(m_output, {}));
+                if (!bytes) {
+                    JSC::throwOutOfMemoryError(global_object, scope);
+                    return {};
+                }
+                return createUint8ArrayFromExclusiveSharedBytes(
+                    global_object, scope, bytes.releaseNonNull(), 0, length);
+            }
+            // A partial one is copied, so the chunk keeps no unused capacity alive.
+            auto* chunk = createUint8ArrayCopy(global_object, scope, m_output.span());
+            m_output.shrink(0);
+            return chunk;
+        }
 
-void JSColloCompressionStream::completePendingOperation(JSC::JSGlobalObject* global_object)
-{
-    const bool closing = m_pending_operation == PendingOperation::Close;
-    // Closing the readable side settles its pending reads, which runs script, so the operation is detached first.
-    auto* promise = takePendingOperation();
-    if (closing) {
-        if (auto* readable_stream = readable())
-            readable_stream->close(global_object);
-    }
-    // settlePromise refuses while a termination that script raised is pending, and then nothing is left to undo.
-    (void)Collo::settlePromise(promise, JSC::jsUndefined(), false);
-}
+        CompressionFormat m_format;
+        bool m_decompressing { false };
+        bool m_closed { false };
+        bool m_released { false };
+        // The codec's last step stopped early, so it may hold output even with no input left.
+        bool m_codec_has_more_output { false };
+        CompressionCodec m_codec;
+        // Written bytes the codec has not consumed yet, from m_input_offset on; consumeInput() keeps the offset's
+        // invariant.
+        WTF::Vector<uint8_t> m_input;
+        size_t m_input_offset { 0 };
+        // The output of one produce(), at most WebApiCompressionStreamOutputChunkBytes; empty between calls.
+        WTF::Vector<uint8_t> m_output;
+    };
 
-void JSColloCompressionStream::rejectPendingOperation(JSC::JSValue reason)
-{
-    if (m_pending_operation == PendingOperation::None)
-        return;
-    auto* promise = takePendingOperation();
-    // When the sink callback threw instead of returning this promise, nothing observes it, and the writable side
-    // reports the failure itself.
-    promise->markAsHandled();
-    (void)Collo::settlePromise(promise, reason, true);
-}
-
-void JSColloCompressionStream::failBothSides(JSC::JSGlobalObject* global_object, JSC::JSValue reason)
-{
-    if (auto* readable_stream = readable())
-        readable_stream->error(global_object, reason);
-    m_codec.release();
-    rejectPendingOperation(reason);
-    noteMemoryCost();
-}
-
-JSC::EncodedJSValue JSColloCompressionStream::drivePendingOperation(
-    JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, std::span<const uint8_t> borrowed_input)
-{
-    auto* promise = m_pending_promise.get();
-    const PumpResult result = pump(global_object, scope, borrowed_input);
-    if (auto* exception = scope.exception()) {
-        ASSERT(result == PumpResult::Threw);
-        JSC::JSValue reason = exception->value();
-        if (!scope.tryClearException()) {
-            // A termination stays pending and ends the request. Free the native state, settle nothing, and let it
-            // unwind.
-            m_codec.release();
-            if (m_pending_promise.get() == promise)
-                (void)takePendingOperation();
-            noteMemoryCost();
+    JSC::EncodedJSValue constructCodecStream(
+        JSC::JSGlobalObject* global_object, JSC::CallFrame* call_frame, bool decompressing)
+    {
+        auto& vm = global_object->vm();
+        auto scope = DECLARE_THROW_SCOPE(vm);
+        auto* collo_global = uncheckedDowncast<Collo::GlobalObject>(global_object);
+        auto format_string = call_frame->argument(0).toWTFString(global_object);
+        RETURN_IF_EXCEPTION(scope, {});
+        CompressionFormat format;
+        if (!parseCompressionFormat(format_string, format)) {
+            JSC::throwVMTypeError(global_object, scope,
+                decompressing ? "DecompressionStream format is not supported"_s
+                              : "CompressionStream format is not supported"_s);
             return {};
         }
-        if (m_pending_promise.get() == promise)
-            failBothSides(global_object, reason);
-        JSC::throwException(global_object, scope, reason);
-        return {};
+        auto* base_structure
+            = decompressing ? collo_global->decompressionStreamStructure() : collo_global->compressionStreamStructure();
+        auto* structure = streamStructureForNewTarget(global_object, scope, call_frame, base_structure);
+        RETURN_IF_EXCEPTION(scope, {});
+        auto transformer = CompressionStreamTransformer::create(format, decompressing);
+        if (!transformer) {
+            JSC::throwOutOfMemoryError(global_object, scope);
+            return {};
+        }
+        auto* stream = createNativeTransformStream(global_object, scope, structure,
+            decompressing ? TransformStreamKind::DecompressionStream : TransformStreamKind::CompressionStream,
+            transformer.releaseNonNull());
+        RETURN_IF_EXCEPTION(scope, {});
+        return JSC::JSValue::encode(stream);
     }
 
-    switch (result) {
-    case PumpResult::Complete:
-        completePendingOperation(global_object);
-        break;
-    case PumpResult::CodecFailed:
-        // The Compression standard reports every codec failure as a TypeError.
-        failBothSides(global_object,
-            JSC::createTypeError(global_object,
-                m_decompressing ? "DecompressionStream input is not valid compressed data"_s
-                                : "CompressionStream could not compress its input"_s));
-        break;
-    case PumpResult::Blocked:
-    case PumpResult::Superseded:
-    case PumpResult::Threw:
-        break;
+    JSC_DEFINE_HOST_FUNCTION(
+        compressionStreamConstruct, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
+    {
+        return constructCodecStream(global_object, call_frame, false);
     }
-    RETURN_IF_EXCEPTION(scope, {});
-    return JSC::JSValue::encode(promise);
-}
 
-JSC::EncodedJSValue JSColloCompressionStream::write(
-    JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSC::JSValue chunk)
-{
-    CompressionInputBytes input;
-    if (!compressionInputBytes(global_object, scope, chunk, input))
-        return {};
-    if (!beginOperation(global_object, scope, PendingOperation::Write))
-        return {};
-    // beginOperation allocates but runs no script, so the chunk's bytes are still the ones validated above.
-    return drivePendingOperation(global_object, scope, input.bytes);
-}
-
-JSC::EncodedJSValue JSColloCompressionStream::close(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope)
-{
-    if (!beginOperation(global_object, scope, PendingOperation::Close))
-        return {};
-    return drivePendingOperation(global_object, scope, {});
-}
-
-void JSColloCompressionStream::resume(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope)
-{
-    // A pull that script starts during a delivery finds pump running, and pump re-checks demand after every delivery.
-    if (m_pumping || m_pending_operation == PendingOperation::None)
-        return;
-    (void)drivePendingOperation(global_object, scope, {});
-}
-
-void JSColloCompressionStream::readableCanceled(JSC::JSGlobalObject* global_object, JSC::JSValue reason)
-{
-    const bool had_pending = m_pending_operation != PendingOperation::None;
-    m_codec.release();
-    // A pending write or close errors the writable side when its rejected
-    // promise reaches the writable stream; with none pending, it is errored
-    // here.
-    rejectPendingOperation(reason);
-    if (!had_pending) {
-        if (auto* writable_stream = writable())
-            writable_stream->error(global_object, reason);
+    JSC_DEFINE_HOST_FUNCTION(
+        decompressionStreamConstruct, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
+    {
+        return constructCodecStream(global_object, call_frame, true);
     }
-    noteMemoryCost();
-}
 
-void JSColloCompressionStream::abort(JSC::JSGlobalObject* global_object, JSC::JSValue reason)
-{
-    failBothSides(global_object, reason);
-}
-
-// CompressionStream and DecompressionStream share one cell class, so the
-// direction tells a receiver of one from an instance of the other.
-static JSColloCompressionStream* requireCompressionStreamInstance(JSC::JSGlobalObject* global_object,
-    JSC::ThrowScope& scope, JSC::JSValue value, bool expected_decompression, WTF::ASCIILiteral class_name)
-{
-    auto* stream = dynamicDowncast<JSColloCompressionStream>(value);
-    if (!stream || stream->isDecompression() != expected_decompression) {
-        JSC::throwVMTypeError(
-            global_object, scope, WTF::makeString(class_name, " method called on incompatible receiver"_s));
-        return nullptr;
+    // One accessor per side and class: CompressionStream and DecompressionStream are distinct interfaces, so each
+    // getter accepts only instances of its own.
+    template <TransformStreamKind kind, bool readable_side>
+    JSC::EncodedJSValue JSC_HOST_CALL_ATTRIBUTES codecStreamSide(
+        JSC::JSGlobalObject* global_object, JSC::CallFrame* call_frame)
+    {
+        auto& vm = global_object->vm();
+        auto scope = DECLARE_THROW_SCOPE(vm);
+        auto* stream = transformStreamOfKind(call_frame->thisValue(), kind);
+        if (!stream) {
+            return JSC::throwVMTypeError(global_object, scope,
+                kind == TransformStreamKind::DecompressionStream
+                    ? "DecompressionStream method called on incompatible receiver"_s
+                    : "CompressionStream method called on incompatible receiver"_s);
+        }
+        return JSC::JSValue::encode(readable_side ? transformStreamReadable(stream) : transformStreamWritable(stream));
     }
-    return stream;
-}
 
-JSC_DEFINE_HOST_FUNCTION(compressionStreamConstructorCall, (JSC::JSGlobalObject * global_object, JSC::CallFrame*))
-{
-    auto& vm = global_object->vm();
-    auto scope = DECLARE_THROW_SCOPE(vm);
-    return JSC::throwVMTypeError(global_object, scope, "CompressionStream constructor requires 'new'"_s);
-}
-
-JSC_DEFINE_HOST_FUNCTION(
-    compressionStreamConstructorConstruct, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
-{
-    auto& vm = global_object->vm();
-    auto scope = DECLARE_THROW_SCOPE(vm);
-    auto* collo_global = uncheckedDowncast<Collo::GlobalObject>(global_object);
-    auto format_string = call_frame->argument(0).toWTFString(global_object);
-    RETURN_IF_EXCEPTION(scope, {});
-    CompressionFormat format;
-    if (!parseCompressionFormat(format_string, format)) {
-        JSC::throwException(
-            global_object, scope, JSC::createTypeError(global_object, "CompressionStream format is not supported"_s));
-        return {};
+    void installCodecInterface(Collo::GlobalObject* global_object, JSC::VM& vm, WTF::ASCIILiteral name,
+        JSC::NativeFunction construct, JSC::NativeFunction readable_getter, JSC::NativeFunction writable_getter,
+        JSC::Strong<JSC::Structure>& structure_slot)
+    {
+        constexpr unsigned accessor_attributes = static_cast<unsigned>(JSC::PropertyAttribute::Accessor);
+        auto* prototype = JSC::constructEmptyObject(global_object);
+        putWebApiAccessor(global_object, prototype, vm, "readable"_s, readable_getter, nullptr, accessor_attributes);
+        putWebApiAccessor(global_object, prototype, vm, "writable"_s, writable_getter, nullptr, accessor_attributes);
+        installStreamInterface(global_object, vm, name, 1, prototype, construct);
+        structure_slot.set(vm, createTransformStreamStructure(vm, global_object, prototype));
     }
-    auto* structure
-        = streamStructureForNewTarget(global_object, scope, call_frame, collo_global->compressionStreamStructure());
-    RETURN_IF_EXCEPTION(scope, {});
-    auto* stream = JSColloCompressionStream::createWithStructure(vm, structure);
-    if (!stream->initialize(global_object, scope, format, false))
-        return {};
-    RETURN_IF_EXCEPTION(scope, {});
-    return JSC::JSValue::encode(stream);
+
+} // namespace
+
+void installCompressionStreamClasses(Collo::GlobalObject* global_object, JSC::VM& vm)
+{
+    auto& cache = global_object->webApiCache();
+    installCodecInterface(global_object, vm, "CompressionStream"_s, compressionStreamConstruct,
+        codecStreamSide<TransformStreamKind::CompressionStream, true>,
+        codecStreamSide<TransformStreamKind::CompressionStream, false>, cache.compression_stream_structure);
+    installCodecInterface(global_object, vm, "DecompressionStream"_s, decompressionStreamConstruct,
+        codecStreamSide<TransformStreamKind::DecompressionStream, true>,
+        codecStreamSide<TransformStreamKind::DecompressionStream, false>, cache.decompression_stream_structure);
 }
 
-JSC_DEFINE_HOST_FUNCTION(decompressionStreamConstructorCall, (JSC::JSGlobalObject * global_object, JSC::CallFrame*))
-{
-    auto& vm = global_object->vm();
-    auto scope = DECLARE_THROW_SCOPE(vm);
-    return JSC::throwVMTypeError(global_object, scope, "DecompressionStream constructor requires 'new'"_s);
-}
-
-JSC_DEFINE_HOST_FUNCTION(
-    decompressionStreamConstructorConstruct, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
-{
-    auto& vm = global_object->vm();
-    auto scope = DECLARE_THROW_SCOPE(vm);
-    auto* collo_global = uncheckedDowncast<Collo::GlobalObject>(global_object);
-    auto format_string = call_frame->argument(0).toWTFString(global_object);
-    RETURN_IF_EXCEPTION(scope, {});
-    CompressionFormat format;
-    if (!parseCompressionFormat(format_string, format)) {
-        JSC::throwException(
-            global_object, scope, JSC::createTypeError(global_object, "DecompressionStream format is not supported"_s));
-        return {};
-    }
-    auto* structure
-        = streamStructureForNewTarget(global_object, scope, call_frame, collo_global->decompressionStreamStructure());
-    RETURN_IF_EXCEPTION(scope, {});
-    auto* stream = JSColloCompressionStream::createWithStructure(vm, structure);
-    if (!stream->initialize(global_object, scope, format, true))
-        return {};
-    RETURN_IF_EXCEPTION(scope, {});
-    return JSC::JSValue::encode(stream);
-}
-
-JSC_DEFINE_HOST_FUNCTION(
-    compressionStreamGetReadable, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
-{
-    auto& vm = global_object->vm();
-    auto scope = DECLARE_THROW_SCOPE(vm);
-    auto* stream
-        = requireCompressionStreamInstance(global_object, scope, call_frame->thisValue(), false, "CompressionStream"_s);
-    RETURN_IF_EXCEPTION(scope, {});
-    return JSC::JSValue::encode(stream->readable());
-}
-
-JSC_DEFINE_HOST_FUNCTION(
-    compressionStreamGetWritable, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
-{
-    auto& vm = global_object->vm();
-    auto scope = DECLARE_THROW_SCOPE(vm);
-    auto* stream
-        = requireCompressionStreamInstance(global_object, scope, call_frame->thisValue(), false, "CompressionStream"_s);
-    RETURN_IF_EXCEPTION(scope, {});
-    return JSC::JSValue::encode(stream->writable());
-}
-
-JSC_DEFINE_HOST_FUNCTION(
-    decompressionStreamGetReadable, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
-{
-    auto& vm = global_object->vm();
-    auto scope = DECLARE_THROW_SCOPE(vm);
-    auto* stream = requireCompressionStreamInstance(
-        global_object, scope, call_frame->thisValue(), true, "DecompressionStream"_s);
-    RETURN_IF_EXCEPTION(scope, {});
-    return JSC::JSValue::encode(stream->readable());
-}
-
-JSC_DEFINE_HOST_FUNCTION(
-    decompressionStreamGetWritable, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
-{
-    auto& vm = global_object->vm();
-    auto scope = DECLARE_THROW_SCOPE(vm);
-    auto* stream = requireCompressionStreamInstance(
-        global_object, scope, call_frame->thisValue(), true, "DecompressionStream"_s);
-    RETURN_IF_EXCEPTION(scope, {});
-    return JSC::JSValue::encode(stream->writable());
-}
 } // namespace Collo::HostFunctions

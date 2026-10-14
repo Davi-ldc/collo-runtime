@@ -10,7 +10,7 @@
 #include "host_functions/webapi/files/blob.h"
 #include "host_functions/webapi/files/formdata.h"
 #include "host_functions/webapi/limits.h"
-#include "host_functions/webapi/streams/readable_stream_private.h"
+#include "host_functions/webapi/streams/readable_stream.h"
 
 #include <JavaScriptCore/JSArrayBuffer.h>
 #include <JavaScriptCore/JSArrayBufferView.h>

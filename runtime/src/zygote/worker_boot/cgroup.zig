@@ -1,18 +1,28 @@
-//! Checks a worker's cgroup from the zygote's side. Before the clone, the
-//! zygote verifies the target is an empty cgroup2 directory; after it, the
-//! child verifies it is the cgroup's only member, that its memory, swap and
-//! CPU limits match the ones WorkerInit carries, and that the pids limit and
-//! CPU period match the defaults (`common/cgroup.zig:worker.validateLimitsAt`),
-//! and opens the two files the worker reads for the rest of its life. A
-//! mismatch fails the boot rather than letting the worker serve under limits
-//! nobody set. The child's checks run without allocating.
+//! A worker's cgroup leaf as the zygote and the child check it. The kernel
+//! places the child: the fork loop clones it straight into the leaf its
+//! request carries (`CLONE_INTO_CGROUP`), so the limits the launcher wrote
+//! there hold from its first instruction. These checks catch a host that sent
+//! the wrong leaf or wrote the wrong limits, and both run without allocating.
+//!
+//! - Before the clone the zygote checks that the leaf is an empty cgroup2
+//!   directory (`validateEmptyWorkerCgroupDirFd`), so a child is never born
+//!   among the runtime's own processes.
+//! - After it the child makes one pass over the leaf it was born in
+//!   (`validateAndOpenWorkerLeafAt`): it must be the leaf's only member, and
+//!   the leaf must hold the memory, swap, CPU and pids limits
+//!   `common/cgroup.zig:worker.configureLimitsAt` writes for its
+//!   `WorkerInit`, so no engine or tenant code runs under limits nobody set.
+//!   Then it opens the two files the worker reads for the rest of its life,
+//!   before the chroot hides the cgroup filesystem.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const common = @import("collo_cgroup");
+const linux_helpers = @import("collo_os").linux;
+const linux = std.os.linux;
 
 const cgroup2_super_magic: c_long = 0x63677270;
 
+/// The kernel's `struct statfs` on the 64-bit targets, for the raw `fstatfs`.
 const Statfs = extern struct {
     f_type: c_long,
     f_bsize: c_long,
@@ -28,15 +38,8 @@ const Statfs = extern struct {
     f_spare: [4]c_long,
 };
 
-extern fn fstatfs(fd: c_int, buf: *Statfs) c_int;
-
 pub const memory = common.memory;
 pub const worker = common.worker;
-
-pub const CurrentWorkerMemoryEvents = struct {
-    fd: std.posix.fd_t,
-    cgroup_dir: []u8,
-};
 
 /// The leaf files a worker keeps open for its life, each read-only and
 /// close-on-exec, opened while the child still sees the cgroup filesystem.
@@ -48,14 +51,16 @@ pub const OpenedWorkerLeaf = struct {
     memory_current_fd: std.posix.fd_t,
 };
 
+/// Fails unless `cgroup_dir_fd` is a directory on the cgroup2 filesystem.
 pub fn validateWorkerCgroupDirFd(cgroup_dir_fd: std.posix.fd_t) !void {
     if (cgroup_dir_fd < 0)
         return error.InvalidWorkerCgroupDir;
     const stat = std.posix.fstat(cgroup_dir_fd) catch return error.InvalidWorkerCgroupDir;
-    if ((stat.mode & std.os.linux.S.IFMT) != std.os.linux.S.IFDIR)
+    if ((stat.mode & linux.S.IFMT) != linux.S.IFDIR)
         return error.InvalidWorkerCgroupDir;
     var fs: Statfs = undefined;
-    if (fstatfs(cgroup_dir_fd, &fs) != 0)
+    const rc = linux.syscall2(.fstatfs, @as(usize, @intCast(cgroup_dir_fd)), @intFromPtr(&fs));
+    if (linux_helpers.syscallErrno(rc) != .SUCCESS)
         return error.InvalidWorkerCgroupDir;
     if (fs.f_type != cgroup2_super_magic)
         return error.InvalidWorkerCgroupDir;
@@ -75,49 +80,39 @@ pub fn validateEmptyWorkerCgroupDirFd(cgroup_dir_fd: std.posix.fd_t) !void {
         return error.WorkerCgroupNotEmpty;
 }
 
-/// The child's check of the leaf it was born in, then the opens of
-/// `OpenedWorkerLeaf`, then the check again, so the descriptors belong to a
-/// leaf that still holds the child alone under the limits of `limits`. Runs
-/// before the chroot, which hides the cgroup filesystem, and without
-/// allocating. The caller owns both descriptors.
+/// The child's one pass over the leaf it was born in, then the opens of
+/// `OpenedWorkerLeaf`. The leaf must hold the child alone under the limits
+/// of `limits`. Runs before the chroot, which hides the cgroup filesystem,
+/// and without allocating. The caller owns both descriptors.
 pub fn validateAndOpenWorkerLeafAt(
     cgroup_dir_fd: std.posix.fd_t,
     pid: u32,
     limits: common.worker.Limits,
 ) !OpenedWorkerLeaf {
     try validateWorkerCgroupDirFd(cgroup_dir_fd);
-    try common.worker.ensureSurfaceAt(cgroup_dir_fd);
-    try validateCurrentWorkerCgroupAt(cgroup_dir_fd, pid, limits);
+    const membership = try common.membership.readAt(cgroup_dir_fd, pid);
+    if (!membership.contains_expected)
+        return error.ExpectedPidMissingFromCgroup;
+    if (!membership.only_expected)
+        return error.WorkerCgroupNotDedicated;
+    try common.worker.validateLimitsAt(cgroup_dir_fd, limits);
 
     const memory_events_fd = try common.openReadOnlyAt(cgroup_dir_fd, "memory.events.local");
     errdefer std.posix.close(memory_events_fd);
     const memory_current_fd = try common.openReadOnlyAt(cgroup_dir_fd, "memory.current");
-    errdefer std.posix.close(memory_current_fd);
-    try validateCurrentWorkerCgroupAt(cgroup_dir_fd, pid, limits);
     return .{
         .memory_events_fd = memory_events_fd,
         .memory_current_fd = memory_current_fd,
     };
 }
 
-fn validateCurrentWorkerCgroupAt(
-    cgroup_dir_fd: std.posix.fd_t,
-    pid: u32,
-    limits: common.worker.Limits,
-) !void {
-    try common.worker.validateLimitsConfig(limits);
-    const membership = try common.membership.readAt(cgroup_dir_fd, pid);
-    if (!membership.contains_expected)
-        return error.ExpectedPidMissingFromCgroup;
-    if (!membership.only_expected) {
-        // A test process shares its cgroup with the build that spawned it,
-        // whose limits are not a worker's.
-        if (!builtin.is_test)
-            return error.WorkerCgroupNotDedicated;
-        return;
-    }
-    try common.worker.validateLimitsAt(cgroup_dir_fd, limits);
-}
+/// The `memory.events.local` of the cgroup `pid` is in, opened read-only, and
+/// that cgroup's path, which the caller frees. Only tests call it: a worker
+/// opens its leaf's file through `validateAndOpenWorkerLeafAt`.
+pub const CurrentWorkerMemoryEvents = struct {
+    fd: std.posix.fd_t,
+    cgroup_dir: []u8,
+};
 
 pub fn openCurrentWorkerMemoryEvents(
     allocator: std.mem.Allocator,
@@ -130,7 +125,6 @@ pub fn openCurrentWorkerMemoryEvents(
     defer std.posix.close(cgroup_dir_fd);
 
     try validateWorkerCgroupDirFd(cgroup_dir_fd);
-    try common.worker.ensureSurfaceAt(cgroup_dir_fd);
     const fd = try common.openReadOnlyAt(cgroup_dir_fd, "memory.events.local");
     return .{
         .fd = fd,

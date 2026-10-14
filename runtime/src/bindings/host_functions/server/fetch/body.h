@@ -17,6 +17,7 @@
 
 #include "host_functions/support.h"
 #include "host_functions/webapi/files/blob.h"
+#include "host_functions/webapi/streams/readable_stream.h"
 #include "host_functions/webapi/streams/shared_bytes.h"
 
 #include <JavaScriptCore/JSDestructibleObject.h>
@@ -37,25 +38,6 @@ namespace Collo::HostFunctions {
 
 class JSColloBodyOwner;
 struct PendingBody;
-
-// The clone count of one streaming body's clone tree. Every BodyState in the tree holds the same budget, so
-// WebApiBodyCloneFanoutMax bounds the clones of the whole tree, and a branch's own clones count against that total.
-class BodyCloneBudget final : public WTF::RefCounted<BodyCloneBudget> {
-public:
-    static WTF::RefPtr<BodyCloneBudget> create()
-    {
-        void* storage = nullptr;
-        if (!WTF::tryFastMalloc(sizeof(BodyCloneBudget)).getValue(storage))
-            return nullptr;
-        auto* budget = new (NotNull, storage) BodyCloneBudget;
-        return WTF::adoptRef(*budget);
-    }
-
-    unsigned clone_count { 0 };
-
-private:
-    BodyCloneBudget() = default;
-};
 
 // The native state of a Request or Response body. It holds no GC field, so it is built, moved and assigned anywhere
 // without a write barrier: the stream a body reads from lives in the owning cell's traced edge (JSColloBodyOwner).
@@ -146,9 +128,11 @@ private:
 
     // In the methods below, `stream` is the owner's body stream, or null when the owner has none.
     bool bodyUsed(JSC::JSObject* stream) const;
-    // A Text, Bytes or SharedBytes clone shares the body's storage. Cloning a stream body tees it: the clone reads one
-    // branch, and `out_kept_stream` receives the other, which replaces the owner's stream. A lazy request body cannot
-    // be cloned and throws a TypeError.
+    // A Text, Bytes or SharedBytes clone shares the body's storage and counts nothing. A fetch stream clone counts
+    // against the body's clone budget, and only once Zig has made it. Cloning a stream body tees it through
+    // readableStreamTee, which counts against the stream's budget: the clone reads one branch, and `out_kept_stream`
+    // receives the other, which replaces the owner's stream. A lazy request body cannot be cloned and throws a
+    // TypeError.
     bool clone(JSC::JSGlobalObject*, JSC::ThrowScope&, JSC::JSObject* stream, WTF::ASCIILiteral already_used_message,
         JSC::JSObject*& out_kept_stream, PendingBody& out);
     JSC::EncodedJSValue consumeText(
@@ -169,7 +153,6 @@ private:
         JSC::EncodedJSValue& out_rejection);
 
     bool appendSharedBytes(JSC::JSGlobalObject*, JSC::ThrowScope&, WTF::Vector<uint8_t>& out) const;
-    bool consumeCloneBudget(JSC::JSGlobalObject*, JSC::ThrowScope&);
     void releaseFetchStream();
 
     Source m_source { Source::Empty };
@@ -181,7 +164,11 @@ private:
     ColloRequestIdentity m_identity {};
     ColloFetchBodyIdentity m_fetch_body_identity {};
     ColloVm* m_fetch_body_owner { nullptr };
-    WTF::RefPtr<BodyCloneBudget> m_clone_budget;
+    // The budget of the clone tree this native body belongs to, shared with its clones and with the stream `body`
+    // creates over it, so Response.clone(), Request.clone() and tee() on any of their streams count against one
+    // WebApiBodyCloneFanoutMax. Null until the tree's first clone or stream. A stream body leaves it null: its stream
+    // carries the budget.
+    WTF::RefPtr<StreamCloneBudget> m_clone_budget;
     bool m_used { false };
     bool m_streaming { false };
 };
@@ -235,8 +222,10 @@ public:
 
     const BodyState& body() const { return m_body; }
     JSC::JSObject* bodyStream() const { return m_body_stream.get(); }
-    // Stores the stream `body` created for a native body; the cell has none yet.
-    void setBodyStream(JSC::VM&, JSC::JSObject*);
+    // Creates the stream `body` returns for a native body over `source`, sharing the body's clone budget, and stores
+    // it; the cell has none yet. Throws and returns null when the budget or the stream cannot be allocated. The caller
+    // keeps the cells `source` holds on its stack until this returns, as readable_stream.h requires.
+    JSC::JSObject* createBodyStream(JSC::JSGlobalObject*, JSC::ThrowScope&, WTF::Ref<ReadableStreamNativeSource>&&);
     bool bodyUsed() const;
 
     // Each calls the BodyState method of the same name.

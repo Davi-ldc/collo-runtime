@@ -1,7 +1,6 @@
-// The Performance object and PerformanceTiming on the VM thread, the installer for every interface under
-// `performance/`, and `collo_webapi_cleanup_request`. PerformanceTiming is a legacy stub whose attributes are all 0.
-// `performance` inherits from EventTarget.prototype and reaches the shared event code through
-// `webApiPerformanceTargetHandle`.
+// The Performance object on the VM thread, the installer for every interface under `performance/`, and
+// `collo_webapi_cleanup_request`. `performance` is a plain object, not an EventTarget: no event is ever dispatched at
+// it.
 
 #include "host_functions/webapi/platform/performance/private.h"
 
@@ -21,43 +20,8 @@ using JSC::JSValue;
 using WTF::String;
 using namespace JSC;
 
-constexpr std::array<WTF::ASCIILiteral, 21> performance_timing_keys {
-    "navigationStart"_s,
-    "unloadEventStart"_s,
-    "unloadEventEnd"_s,
-    "redirectStart"_s,
-    "redirectEnd"_s,
-    "fetchStart"_s,
-    "domainLookupStart"_s,
-    "domainLookupEnd"_s,
-    "connectStart"_s,
-    "connectEnd"_s,
-    "secureConnectionStart"_s,
-    "requestStart"_s,
-    "responseStart"_s,
-    "responseEnd"_s,
-    "domLoading"_s,
-    "domInteractive"_s,
-    "domContentLoadedEventStart"_s,
-    "domContentLoadedEventEnd"_s,
-    "domComplete"_s,
-    "loadEventStart"_s,
-    "loadEventEnd"_s,
-};
-
-const JSC::ClassInfo JSColloPerformanceTiming::s_info
-    = { "PerformanceTiming"_s, &Base::s_info, nullptr, nullptr, CREATE_METHOD_TABLE(JSColloPerformanceTiming) };
 const JSC::ClassInfo JSColloPerformance::s_info
     = { "Performance"_s, &Base::s_info, nullptr, nullptr, CREATE_METHOD_TABLE(JSColloPerformance) };
-
-template <typename Visitor> void JSColloPerformanceTiming::visitChildrenImpl(JSC::JSCell* cell, Visitor& visitor)
-{
-    auto* this_object = static_cast<JSColloPerformanceTiming*>(cell);
-    ASSERT_GC_OBJECT_INHERITS(this_object, info());
-    Base::visitChildren(this_object, visitor);
-}
-
-DEFINE_VISIT_CHILDREN(JSColloPerformanceTiming);
 
 template <typename Visitor> void JSColloPerformance::visitChildrenImpl(JSC::JSCell* cell, Visitor& visitor)
 {
@@ -68,23 +32,11 @@ template <typename Visitor> void JSColloPerformance::visitChildrenImpl(JSC::JSCe
     visitor.append(this_object->m_measure_structure);
     visitor.append(this_object->m_observer_structure);
     visitor.append(this_object->m_observer_entry_list_structure);
-    visitor.append(this_object->m_timing);
-    visitor.append(this_object->m_on_resource_timing_buffer_full);
-    this_object->m_event_target.visit(this_object, visitor);
     this_object->m_entries.visit(this_object, visitor);
     this_object->m_observers.visit(this_object, visitor);
 }
 
 DEFINE_VISIT_CHILDREN(JSColloPerformance);
-
-static JSColloPerformanceTiming* requirePerformanceTiming(
-    JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSValue value)
-{
-    if (auto* timing = dynamicDowncast<JSColloPerformanceTiming>(value))
-        return timing;
-    JSC::throwVMTypeError(global_object, scope, "PerformanceTiming method called on incompatible receiver"_s);
-    return nullptr;
-}
 
 JSColloPerformance* realmPerformance(JSC::JSGlobalObject* global_object)
 {
@@ -94,270 +46,130 @@ JSColloPerformance* realmPerformance(JSC::JSGlobalObject* global_object)
     return dynamicDowncast<JSColloPerformance>(collo_global->webApiCache().performance.get());
 }
 
-JSC_DEFINE_HOST_FUNCTION(performanceConstructorCall, (JSC::JSGlobalObject * global_object, JSC::CallFrame*))
-{
-    auto& vm = global_object->vm();
-    auto scope = DECLARE_THROW_SCOPE(vm);
-    return JSC::throwVMTypeError(global_object, scope, "Performance is not constructable"_s);
-}
+namespace {
 
-JSC_DEFINE_HOST_FUNCTION(performanceConstructorConstruct, (JSC::JSGlobalObject * global_object, JSC::CallFrame*))
-{
-    auto& vm = global_object->vm();
-    auto scope = DECLARE_THROW_SCOPE(vm);
-    return JSC::throwVMTypeError(global_object, scope, "Performance is not constructable"_s);
-}
+    JSC_DEFINE_HOST_FUNCTION(performanceConstructorCall, (JSC::JSGlobalObject * global_object, JSC::CallFrame*))
+    {
+        auto& vm = global_object->vm();
+        auto scope = DECLARE_THROW_SCOPE(vm);
+        return JSC::throwVMTypeError(global_object, scope, "Performance is not constructable"_s);
+    }
 
-JSC_DEFINE_HOST_FUNCTION(performanceTimingConstructorCall, (JSC::JSGlobalObject * global_object, JSC::CallFrame*))
-{
-    auto& vm = global_object->vm();
-    auto scope = DECLARE_THROW_SCOPE(vm);
-    return JSC::throwVMTypeError(global_object, scope, "PerformanceTiming is not constructable"_s);
-}
+    JSC_DEFINE_HOST_FUNCTION(performanceConstructorConstruct, (JSC::JSGlobalObject * global_object, JSC::CallFrame*))
+    {
+        auto& vm = global_object->vm();
+        auto scope = DECLARE_THROW_SCOPE(vm);
+        return JSC::throwVMTypeError(global_object, scope, "Performance is not constructable"_s);
+    }
 
-JSC_DEFINE_HOST_FUNCTION(performanceTimingConstructorConstruct, (JSC::JSGlobalObject * global_object, JSC::CallFrame*))
-{
-    auto& vm = global_object->vm();
-    auto scope = DECLARE_THROW_SCOPE(vm);
-    return JSC::throwVMTypeError(global_object, scope, "PerformanceTiming is not constructable"_s);
-}
-
-JSC_DEFINE_HOST_FUNCTION(performanceTimingZero, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
-{
-    auto& vm = global_object->vm();
-    auto scope = DECLARE_THROW_SCOPE(vm);
-    requirePerformanceTiming(global_object, scope, call_frame->thisValue());
-    RETURN_IF_EXCEPTION(scope, {});
-    return JSValue::encode(JSC::jsNumber(0));
-}
-
-JSC_DEFINE_HOST_FUNCTION(performanceTimingToJSON, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
-{
-    auto& vm = global_object->vm();
-    auto scope = DECLARE_THROW_SCOPE(vm);
-    requirePerformanceTiming(global_object, scope, call_frame->thisValue());
-    RETURN_IF_EXCEPTION(scope, {});
-    auto* result
-        = JSC::constructEmptyObject(global_object, global_object->objectPrototype(), performance_timing_keys.size());
-    for (auto key : performance_timing_keys)
-        result->putDirect(vm, JSC::Identifier::fromString(vm, key), JSC::jsNumber(0));
-    return JSValue::encode(result);
-}
-
-JSC_DEFINE_HOST_FUNCTION(performanceNow, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
-{
-    auto& vm = global_object->vm();
-    auto scope = DECLARE_THROW_SCOPE(vm);
-    auto* performance = requirePerformance(global_object, scope, call_frame->thisValue());
-    RETURN_IF_EXCEPTION(scope, {});
-    return JSValue::encode(JSC::jsNumber(performance->nowMs(global_object)));
-}
-
-JSC_DEFINE_HOST_FUNCTION(performanceGetTimeOrigin, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
-{
-    auto& vm = global_object->vm();
-    auto scope = DECLARE_THROW_SCOPE(vm);
-    auto* performance = requirePerformance(global_object, scope, call_frame->thisValue());
-    RETURN_IF_EXCEPTION(scope, {});
-    return JSValue::encode(JSC::jsNumber(performance->timeOriginMs(global_object)));
-}
-
-JSC_DEFINE_HOST_FUNCTION(performanceGetTiming, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
-{
-    auto& vm = global_object->vm();
-    auto scope = DECLARE_THROW_SCOPE(vm);
-    auto* performance = requirePerformance(global_object, scope, call_frame->thisValue());
-    RETURN_IF_EXCEPTION(scope, {});
-    return JSValue::encode(performance->timing());
-}
-
-JSC_DEFINE_HOST_FUNCTION(performanceToJSON, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
-{
-    auto& vm = global_object->vm();
-    auto scope = DECLARE_THROW_SCOPE(vm);
-    auto* performance = requirePerformance(global_object, scope, call_frame->thisValue());
-    RETURN_IF_EXCEPTION(scope, {});
-
-    auto* result = JSC::constructEmptyObject(global_object, global_object->objectPrototype(), 1);
-    result->putDirect(
-        vm, JSC::Identifier::fromString(vm, "timeOrigin"_s), JSC::jsNumber(performance->timeOriginMs(global_object)));
-    return JSValue::encode(result);
-}
-
-JSC_DEFINE_HOST_FUNCTION(
-    performanceGetOnResourceTimingBufferFull, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
-{
-    auto& vm = global_object->vm();
-    auto scope = DECLARE_THROW_SCOPE(vm);
-    auto* performance = requirePerformance(global_object, scope, call_frame->thisValue());
-    RETURN_IF_EXCEPTION(scope, {});
-    if (!performance)
-        return {};
-    return JSValue::encode(performance->onResourceTimingBufferFull());
-}
-
-JSC_DEFINE_HOST_FUNCTION(
-    performanceSetOnResourceTimingBufferFull, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
-{
-    auto& vm = global_object->vm();
-    auto scope = DECLARE_THROW_SCOPE(vm);
-    auto* performance = requirePerformance(global_object, scope, call_frame->thisValue());
-    RETURN_IF_EXCEPTION(scope, {});
-    if (!performance)
-        return {};
-    performance->ensureTimeOriginForAccess();
-    performance->setOnResourceTimingBufferFull(vm, call_frame->argument(0));
-    return JSValue::encode(JSC::jsUndefined());
-}
-
-JSC_DEFINE_HOST_FUNCTION(
-    performanceClearResourceTimings, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
-{
-    auto& vm = global_object->vm();
-    auto scope = DECLARE_THROW_SCOPE(vm);
-    auto* performance = requirePerformance(global_object, scope, call_frame->thisValue());
-    RETURN_IF_EXCEPTION(scope, {});
-    if (!performance)
-        return {};
-    performance->ensureTimeOriginForAccess();
-    return JSValue::encode(JSC::jsUndefined());
-}
-
-JSC_DEFINE_HOST_FUNCTION(
-    performanceSetResourceTimingBufferSize, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
-{
-    auto& vm = global_object->vm();
-    auto scope = DECLARE_THROW_SCOPE(vm);
-    auto* performance = requirePerformance(global_object, scope, call_frame->thisValue());
-    RETURN_IF_EXCEPTION(scope, {});
-    if (!performance)
-        return {};
-    performance->ensureTimeOriginForAccess();
-    if (!call_frame->argument(0).isUndefined()) {
-        auto size = call_frame->argument(0).toIntegerOrInfinity(global_object);
+    JSC_DEFINE_HOST_FUNCTION(performanceNow, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
+    {
+        auto& vm = global_object->vm();
+        auto scope = DECLARE_THROW_SCOPE(vm);
+        auto* performance = requirePerformance(global_object, scope, call_frame->thisValue());
         RETURN_IF_EXCEPTION(scope, {});
-        if (std::isnan(size) || size <= 0)
-            performance->setResourceTimingBufferSize(0);
-        else if (size >= PerformanceMaxEntries)
-            performance->setResourceTimingBufferSize(PerformanceMaxEntries);
-        else
-            performance->setResourceTimingBufferSize(static_cast<unsigned>(size));
+        return JSValue::encode(JSC::jsNumber(performance->nowMs()));
     }
-    return JSValue::encode(JSC::jsUndefined());
-}
 
-JSC_DEFINE_HOST_FUNCTION(
-    performanceMarkResourceTiming, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
-{
-    auto& vm = global_object->vm();
-    auto scope = DECLARE_THROW_SCOPE(vm);
-    auto* performance = requirePerformance(global_object, scope, call_frame->thisValue());
-    RETURN_IF_EXCEPTION(scope, {});
-    if (!performance)
-        return {};
-    performance->ensureTimeOriginForAccess();
-    return JSValue::encode(JSC::jsUndefined());
-}
-
-JSC_DEFINE_HOST_FUNCTION(performanceGetEntries, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
-{
-    auto& vm = global_object->vm();
-    auto scope = DECLARE_THROW_SCOPE(vm);
-    auto* performance = requirePerformance(global_object, scope, call_frame->thisValue());
-    RETURN_IF_EXCEPTION(scope, {});
-    if (!performance)
-        return {};
-    return JSValue::encode(
-        performance->entriesArray(global_object, [](const JSColloPerformanceEntry&) { return true; }));
-}
-
-JSC_DEFINE_HOST_FUNCTION(performanceGetEntriesByName, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
-{
-    auto& vm = global_object->vm();
-    auto scope = DECLARE_THROW_SCOPE(vm);
-    auto* performance = requirePerformance(global_object, scope, call_frame->thisValue());
-    RETURN_IF_EXCEPTION(scope, {});
-    if (!performance)
-        return {};
-    if (!requireArgumentCount(global_object, scope, call_frame, 1, "performance.getEntriesByName requires a name"_s))
-        return {};
-
-    auto name = argumentToWebApiString(global_object, scope, call_frame, 0);
-    RETURN_IF_EXCEPTION(scope, {});
-    std::optional<String> type;
-    if (!call_frame->argument(1).isUndefined()) {
-        type = valueToWebApiString(global_object, scope, call_frame->argument(1));
+    JSC_DEFINE_HOST_FUNCTION(
+        performanceGetTimeOrigin, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
+    {
+        auto& vm = global_object->vm();
+        auto scope = DECLARE_THROW_SCOPE(vm);
+        auto* performance = requirePerformance(global_object, scope, call_frame->thisValue());
         RETURN_IF_EXCEPTION(scope, {});
+        return JSValue::encode(JSC::jsNumber(performance->timeOriginMs()));
     }
-    return JSValue::encode(performance->entriesArray(global_object, [&](const JSColloPerformanceEntry& entry) {
-        return entry.name() == name && (!type || entry.entryType() == *type);
-    }));
-}
 
-JSC_DEFINE_HOST_FUNCTION(performanceGetEntriesByType, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
-{
-    auto& vm = global_object->vm();
-    auto scope = DECLARE_THROW_SCOPE(vm);
-    auto* performance = requirePerformance(global_object, scope, call_frame->thisValue());
-    RETURN_IF_EXCEPTION(scope, {});
-    if (!performance)
-        return {};
-    if (!requireArgumentCount(
-            global_object, scope, call_frame, 1, "performance.getEntriesByType requires an entry type"_s))
-        return {};
+    JSC_DEFINE_HOST_FUNCTION(performanceToJSON, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
+    {
+        auto& vm = global_object->vm();
+        auto scope = DECLARE_THROW_SCOPE(vm);
+        auto* performance = requirePerformance(global_object, scope, call_frame->thisValue());
+        RETURN_IF_EXCEPTION(scope, {});
 
-    auto type = argumentToWebApiString(global_object, scope, call_frame, 0);
-    RETURN_IF_EXCEPTION(scope, {});
-    return JSValue::encode(performance->entriesArray(
-        global_object, [&](const JSColloPerformanceEntry& entry) { return entry.entryType() == type; }));
-}
-
-static JSC::JSFunction* createPerformanceConstructor(JSC::JSGlobalObject* global_object, JSC::VM& vm)
-{
-    auto* constructor = JSC::JSFunction::create(vm, global_object, 0, "Performance"_s, performanceConstructorCall,
-        JSC::ImplementationVisibility::Public, JSC::NoIntrinsic, performanceConstructorConstruct, nullptr);
-    RELEASE_ASSERT(constructor);
-    return constructor;
-}
-
-static JSC::JSFunction* createPerformanceEntryConstructor(JSC::JSGlobalObject* global_object, JSC::VM& vm,
-    WTF::ASCIILiteral name, unsigned length, JSC::NativeFunction call, JSC::NativeFunction construct)
-{
-    auto* constructor = JSC::JSFunction::create(vm, global_object, length, name, call,
-        JSC::ImplementationVisibility::Public, JSC::NoIntrinsic, construct, nullptr);
-    RELEASE_ASSERT(constructor);
-    return constructor;
-}
-
-bool webApiPerformanceTargetHandle(JSC::JSValue value, WebApiEventTargetHandle& handle)
-{
-    if (auto* performance = dynamicDowncast<JSColloPerformance>(value)) {
-        if (auto* global_object = performance->realm())
-            performance->ensureTimeOriginForAccess();
-        handle.object = performance;
-        handle.listener_owner = performance;
-        handle.data = &performance->eventTargetData();
-        return true;
+        auto* result = JSC::constructEmptyObject(global_object, global_object->objectPrototype(), 1);
+        result->putDirect(
+            vm, JSC::Identifier::fromString(vm, "timeOrigin"_s), JSC::jsNumber(performance->timeOriginMs()));
+        return JSValue::encode(result);
     }
-    return false;
-}
 
-// Releases what the VM and its realms hold for `request_id` once that request ends: the object URLs it created in any
-// realm, the GC roots of its native holders and its console output budget. Each step touches only this request's
-// share, because a request co-scheduled on the same worker may still be running. A realm's performance timeline
-// belongs to the realm rather than to a request, so nothing in it is released here.
+    JSC_DEFINE_HOST_FUNCTION(performanceGetEntries, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
+    {
+        auto& vm = global_object->vm();
+        auto scope = DECLARE_THROW_SCOPE(vm);
+        auto* performance = requirePerformance(global_object, scope, call_frame->thisValue());
+        RETURN_IF_EXCEPTION(scope, {});
+        if (!performance)
+            return {};
+        return JSValue::encode(
+            performance->entriesArray(global_object, [](const JSColloPerformanceEntry&) { return true; }));
+    }
+
+    JSC_DEFINE_HOST_FUNCTION(
+        performanceGetEntriesByName, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
+    {
+        auto& vm = global_object->vm();
+        auto scope = DECLARE_THROW_SCOPE(vm);
+        auto* performance = requirePerformance(global_object, scope, call_frame->thisValue());
+        RETURN_IF_EXCEPTION(scope, {});
+        if (!performance)
+            return {};
+        if (!requireArgumentCount(
+                global_object, scope, call_frame, 1, "performance.getEntriesByName requires a name"_s))
+            return {};
+
+        auto name = argumentToWebApiString(global_object, scope, call_frame, 0);
+        RETURN_IF_EXCEPTION(scope, {});
+        std::optional<String> type;
+        if (!call_frame->argument(1).isUndefined()) {
+            type = valueToWebApiString(global_object, scope, call_frame->argument(1));
+            RETURN_IF_EXCEPTION(scope, {});
+        }
+        return JSValue::encode(performance->entriesArray(global_object, [&](const JSColloPerformanceEntry& entry) {
+            return entry.name() == name && (!type || entry.entryType() == *type);
+        }));
+    }
+
+    JSC_DEFINE_HOST_FUNCTION(
+        performanceGetEntriesByType, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
+    {
+        auto& vm = global_object->vm();
+        auto scope = DECLARE_THROW_SCOPE(vm);
+        auto* performance = requirePerformance(global_object, scope, call_frame->thisValue());
+        RETURN_IF_EXCEPTION(scope, {});
+        if (!performance)
+            return {};
+        if (!requireArgumentCount(
+                global_object, scope, call_frame, 1, "performance.getEntriesByType requires an entry type"_s))
+            return {};
+
+        auto type = argumentToWebApiString(global_object, scope, call_frame, 0);
+        RETURN_IF_EXCEPTION(scope, {});
+        return JSValue::encode(performance->entriesArray(
+            global_object, [&](const JSColloPerformanceEntry& entry) { return entry.entryType() == type; }));
+    }
+
+    JSC::JSFunction* createPerformanceConstructor(JSC::JSGlobalObject* global_object, JSC::VM& vm,
+        WTF::ASCIILiteral name, unsigned length, JSC::NativeFunction call, JSC::NativeFunction construct)
+    {
+        auto* constructor = JSC::JSFunction::create(vm, global_object, length, name, call,
+            JSC::ImplementationVisibility::Public, JSC::NoIntrinsic, construct, nullptr);
+        RELEASE_ASSERT(constructor);
+        return constructor;
+    }
+
+} // namespace
+
+// Releases what the VM holds for `request_id` once that request ends: its console output budget. A request
+// co-scheduled on the same worker may still be running, so only this request's share is touched. A realm's
+// performance timeline belongs to the realm rather than to a request, so nothing in it is released here.
 extern "C" ColloStatus collo_webapi_cleanup_request(ColloVm* vm, uint64_t request_id)
 {
     if (!vm || !vm->isReady() || !request_id)
         return COLLO_STATUS_INVALID_ARGUMENT;
 
     JSC::JSLockHolder locker(*vm->vm);
-    for (auto& realm : vm->realms)
-        realm->blob_object_urls.removeOwnedBy(request_id);
-    // Native objects that root this request's JS graphs, such as a body consumer whose ReadableStream never settled,
-    // cannot be reclaimed by the collector; without this they would live as long as the worker.
-    // ColloRequestScopedRoots in state.h explains why.
-    vm->request_scoped_roots.clearOwnedBy(request_id);
     // The budget is the `request_lines_max` and `request_bytes_max` pair given to `collo_vm_set_console_sink`.
     if (vm->console_client)
         vm->console_client->clearRequestOutputBudget(request_id);
@@ -383,7 +195,7 @@ void installWebApiPerformance(Collo::GlobalObject* global_object, JSC::VM& vm)
         JSC::jsString(vm, WTF::String("PerformanceEntry"_s)),
         JSC::PropertyAttribute::ReadOnly | JSC::PropertyAttribute::DontEnum);
 
-    auto* entry_constructor = createPerformanceEntryConstructor(global_object, vm, "PerformanceEntry"_s, 0,
+    auto* entry_constructor = createPerformanceConstructor(global_object, vm, "PerformanceEntry"_s, 0,
         performanceEntryConstructorCall, performanceEntryConstructorConstruct);
     entry_constructor->putDirect(vm, vm.propertyNames->prototype, entry_prototype,
         JSC::PropertyAttribute::ReadOnly | JSC::PropertyAttribute::DontEnum | JSC::PropertyAttribute::DontDelete);
@@ -398,7 +210,7 @@ void installWebApiPerformance(Collo::GlobalObject* global_object, JSC::VM& vm)
         JSC::jsString(vm, WTF::String("PerformanceMark"_s)),
         JSC::PropertyAttribute::ReadOnly | JSC::PropertyAttribute::DontEnum);
 
-    auto* mark_constructor = createPerformanceEntryConstructor(
+    auto* mark_constructor = createPerformanceConstructor(
         global_object, vm, "PerformanceMark"_s, 1, performanceMarkConstructorCall, performanceMarkConstructorConstruct);
     mark_constructor->setPrototype(vm, global_object, entry_constructor, true);
     mark_constructor->putDirect(vm, vm.propertyNames->prototype, mark_prototype,
@@ -414,7 +226,7 @@ void installWebApiPerformance(Collo::GlobalObject* global_object, JSC::VM& vm)
         JSC::jsString(vm, WTF::String("PerformanceMeasure"_s)),
         JSC::PropertyAttribute::ReadOnly | JSC::PropertyAttribute::DontEnum);
 
-    auto* measure_constructor = createPerformanceEntryConstructor(global_object, vm, "PerformanceMeasure"_s, 0,
+    auto* measure_constructor = createPerformanceConstructor(global_object, vm, "PerformanceMeasure"_s, 0,
         performanceMeasureConstructorCall, performanceMeasureConstructorConstruct);
     measure_constructor->setPrototype(vm, global_object, entry_constructor, true);
     measure_constructor->putDirect(vm, vm.propertyNames->prototype, measure_prototype,
@@ -434,7 +246,7 @@ void installWebApiPerformance(Collo::GlobalObject* global_object, JSC::VM& vm)
         JSC::PropertyAttribute::ReadOnly | JSC::PropertyAttribute::DontEnum);
 
     auto* observer_entry_list_constructor
-        = createPerformanceEntryConstructor(global_object, vm, "PerformanceObserverEntryList"_s, 0,
+        = createPerformanceConstructor(global_object, vm, "PerformanceObserverEntryList"_s, 0,
             performanceObserverEntryListConstructorCall, performanceObserverEntryListConstructorConstruct);
     observer_entry_list_constructor->putDirect(vm, vm.propertyNames->prototype, observer_entry_list_prototype,
         JSC::PropertyAttribute::ReadOnly | JSC::PropertyAttribute::DontEnum | JSC::PropertyAttribute::DontDelete);
@@ -452,7 +264,7 @@ void installWebApiPerformance(Collo::GlobalObject* global_object, JSC::VM& vm)
         JSC::jsString(vm, WTF::String("PerformanceObserver"_s)),
         JSC::PropertyAttribute::ReadOnly | JSC::PropertyAttribute::DontEnum);
 
-    auto* observer_constructor = createPerformanceEntryConstructor(global_object, vm, "PerformanceObserver"_s, 1,
+    auto* observer_constructor = createPerformanceConstructor(global_object, vm, "PerformanceObserver"_s, 1,
         performanceObserverConstructorCall, performanceObserverConstructorConstruct);
     observer_constructor->putDirect(vm, vm.propertyNames->prototype, observer_prototype,
         JSC::PropertyAttribute::ReadOnly | JSC::PropertyAttribute::DontEnum | JSC::PropertyAttribute::DontDelete);
@@ -461,29 +273,9 @@ void installWebApiPerformance(Collo::GlobalObject* global_object, JSC::VM& vm)
     putWebApiAccessor(global_object, observer_constructor, vm, "supportedEntryTypes"_s,
         performanceObserverSupportedEntryTypes, nullptr, static_cast<unsigned>(JSC::PropertyAttribute::Accessor));
 
-    auto* timing_prototype = JSC::constructEmptyObject(global_object);
-    for (auto key : performance_timing_keys)
-        putWebApiAccessor(global_object, timing_prototype, vm, key, performanceTimingZero, nullptr, enumerableAccessor);
-    putWebApiFunction(global_object, timing_prototype, vm, "toJSON"_s, 0, performanceTimingToJSON, enumerableFunction);
-    timing_prototype->putDirect(vm, vm.propertyNames->toStringTagSymbol,
-        JSC::jsString(vm, WTF::String("PerformanceTiming"_s)),
-        JSC::PropertyAttribute::ReadOnly | JSC::PropertyAttribute::DontEnum);
-
-    auto* timing_constructor = createPerformanceEntryConstructor(global_object, vm, "PerformanceTiming"_s, 0,
-        performanceTimingConstructorCall, performanceTimingConstructorConstruct);
-    timing_constructor->putDirect(vm, vm.propertyNames->prototype, timing_prototype,
-        JSC::PropertyAttribute::ReadOnly | JSC::PropertyAttribute::DontEnum | JSC::PropertyAttribute::DontDelete);
-    timing_prototype->putDirect(
-        vm, vm.propertyNames->constructor, timing_constructor, static_cast<unsigned>(JSC::PropertyAttribute::DontEnum));
-    auto* timing_structure = JSColloPerformanceTiming::createStructure(vm, global_object, timing_prototype);
-    auto* timing = JSColloPerformanceTiming::create(vm, timing_structure);
-
-    auto* prototype = JSC::constructEmptyObject(global_object, global_object->eventTargetPrototype());
+    auto* prototype = JSC::constructEmptyObject(global_object);
     putWebApiAccessor(
         global_object, prototype, vm, "timeOrigin"_s, performanceGetTimeOrigin, nullptr, enumerableAccessor);
-    putWebApiAccessor(global_object, prototype, vm, "timing"_s, performanceGetTiming, nullptr, enumerableAccessor);
-    putWebApiAccessor(global_object, prototype, vm, "onresourcetimingbufferfull"_s,
-        performanceGetOnResourceTimingBufferFull, performanceSetOnResourceTimingBufferFull, enumerableAccessor);
     putWebApiFunction(global_object, prototype, vm, "now"_s, 0, performanceNow, enumerableFunction);
     putWebApiFunction(global_object, prototype, vm, "toJSON"_s, 0, performanceToJSON, enumerableFunction);
     putWebApiFunction(global_object, prototype, vm, "getEntries"_s, 0, performanceGetEntries, enumerableFunction);
@@ -491,20 +283,15 @@ void installWebApiPerformance(Collo::GlobalObject* global_object, JSC::VM& vm)
         global_object, prototype, vm, "getEntriesByType"_s, 1, performanceGetEntriesByType, enumerableFunction);
     putWebApiFunction(
         global_object, prototype, vm, "getEntriesByName"_s, 1, performanceGetEntriesByName, enumerableFunction);
-    putWebApiFunction(
-        global_object, prototype, vm, "clearResourceTimings"_s, 0, performanceClearResourceTimings, enumerableFunction);
-    putWebApiFunction(global_object, prototype, vm, "setResourceTimingBufferSize"_s, 1,
-        performanceSetResourceTimingBufferSize, enumerableFunction);
     putWebApiFunction(global_object, prototype, vm, "mark"_s, 1, performanceMark, enumerableFunction);
     putWebApiFunction(global_object, prototype, vm, "clearMarks"_s, 0, performanceClearMarks, enumerableFunction);
     putWebApiFunction(global_object, prototype, vm, "measure"_s, 1, performanceMeasure, enumerableFunction);
     putWebApiFunction(global_object, prototype, vm, "clearMeasures"_s, 0, performanceClearMeasures, enumerableFunction);
-    putWebApiFunction(
-        global_object, prototype, vm, "markResourceTiming"_s, 7, performanceMarkResourceTiming, enumerableFunction);
     prototype->putDirect(vm, vm.propertyNames->toStringTagSymbol, JSC::jsString(vm, WTF::String("Performance"_s)),
         JSC::PropertyAttribute::ReadOnly | JSC::PropertyAttribute::DontEnum);
 
-    auto* constructor = createPerformanceConstructor(global_object, vm);
+    auto* constructor = createPerformanceConstructor(
+        global_object, vm, "Performance"_s, 0, performanceConstructorCall, performanceConstructorConstruct);
     constructor->putDirect(vm, vm.propertyNames->prototype, prototype,
         JSC::PropertyAttribute::ReadOnly | JSC::PropertyAttribute::DontEnum | JSC::PropertyAttribute::DontDelete);
     prototype->putDirect(
@@ -517,22 +304,21 @@ void installWebApiPerformance(Collo::GlobalObject* global_object, JSC::VM& vm)
         = JSColloPerformanceObserverEntryList::createStructure(vm, global_object, observer_entry_list_prototype);
     auto* structure = JSColloPerformance::createStructure(vm, global_object, prototype);
     auto* performance = JSColloPerformance::create(
-        vm, structure, mark_structure, measure_structure, observer_structure, observer_entry_list_structure, timing);
+        vm, structure, mark_structure, measure_structure, observer_structure, observer_entry_list_structure);
 
-    global_object->putDirect(vm, JSC::Identifier::fromString(vm, "PerformanceEntry"_s), entry_constructor,
-        static_cast<unsigned>(JSC::PropertyAttribute::DontEnum));
-    global_object->putDirect(vm, JSC::Identifier::fromString(vm, "PerformanceMark"_s), mark_constructor,
-        static_cast<unsigned>(JSC::PropertyAttribute::DontEnum));
-    global_object->putDirect(vm, JSC::Identifier::fromString(vm, "PerformanceMeasure"_s), measure_constructor,
-        static_cast<unsigned>(JSC::PropertyAttribute::DontEnum));
-    global_object->putDirect(vm, JSC::Identifier::fromString(vm, "PerformanceTiming"_s), timing_constructor,
-        static_cast<unsigned>(JSC::PropertyAttribute::None));
+    // Web IDL defines interface objects as non-enumerable properties of the global object.
+    constexpr unsigned interface_attributes = static_cast<unsigned>(JSC::PropertyAttribute::DontEnum);
+    global_object->putDirect(
+        vm, JSC::Identifier::fromString(vm, "PerformanceEntry"_s), entry_constructor, interface_attributes);
+    global_object->putDirect(
+        vm, JSC::Identifier::fromString(vm, "PerformanceMark"_s), mark_constructor, interface_attributes);
+    global_object->putDirect(
+        vm, JSC::Identifier::fromString(vm, "PerformanceMeasure"_s), measure_constructor, interface_attributes);
     global_object->putDirect(vm, JSC::Identifier::fromString(vm, "PerformanceObserverEntryList"_s),
-        observer_entry_list_constructor, static_cast<unsigned>(JSC::PropertyAttribute::None));
-    global_object->putDirect(vm, JSC::Identifier::fromString(vm, "PerformanceObserver"_s), observer_constructor,
-        static_cast<unsigned>(JSC::PropertyAttribute::None));
-    global_object->putDirect(vm, JSC::Identifier::fromString(vm, "Performance"_s), constructor,
-        static_cast<unsigned>(JSC::PropertyAttribute::DontEnum));
+        observer_entry_list_constructor, interface_attributes);
+    global_object->putDirect(
+        vm, JSC::Identifier::fromString(vm, "PerformanceObserver"_s), observer_constructor, interface_attributes);
+    global_object->putDirect(vm, JSC::Identifier::fromString(vm, "Performance"_s), constructor, interface_attributes);
     global_object->putDirect(vm, JSC::Identifier::fromString(vm, "performance"_s), performance,
         static_cast<unsigned>(JSC::PropertyAttribute::ReadOnly | JSC::PropertyAttribute::DontEnum));
     // Script can delete or redefine the configurable `performance` property, so the constructors that record into
@@ -541,7 +327,6 @@ void installWebApiPerformance(Collo::GlobalObject* global_object, JSC::VM& vm)
     RELEASE_ASSERT(global_object->getDirect(vm, JSC::Identifier::fromString(vm, "PerformanceEntry"_s)));
     RELEASE_ASSERT(global_object->getDirect(vm, JSC::Identifier::fromString(vm, "PerformanceMark"_s)));
     RELEASE_ASSERT(global_object->getDirect(vm, JSC::Identifier::fromString(vm, "PerformanceMeasure"_s)));
-    RELEASE_ASSERT(global_object->getDirect(vm, JSC::Identifier::fromString(vm, "PerformanceTiming"_s)));
     RELEASE_ASSERT(global_object->getDirect(vm, JSC::Identifier::fromString(vm, "PerformanceObserverEntryList"_s)));
     RELEASE_ASSERT(global_object->getDirect(vm, JSC::Identifier::fromString(vm, "PerformanceObserver"_s)));
     RELEASE_ASSERT(global_object->getDirect(vm, JSC::Identifier::fromString(vm, "Performance"_s)));

@@ -1,6 +1,6 @@
 // The Event, CustomEvent, MessageEvent, ErrorEvent and CloseEvent interfaces: constructors, init dictionaries,
-// accessors and legacy init methods, plus the installer of every event interface, EventTarget and the global object's
-// event members. VM thread only.
+// accessors and legacy init methods, plus installWebApiEvent, which installs them with EventTarget
+// (installEventTargetInterface in event_target.cpp) and caches every interface object in the realm. VM thread only.
 
 #include "host_functions/webapi/events/event_private.h"
 
@@ -11,8 +11,8 @@
 #include <JavaScriptCore/IdentifierInlines.h>
 #include <JavaScriptCore/InternalFunction.h>
 #include <JavaScriptCore/IteratorOperations.h>
-#include <JavaScriptCore/JSCInlines.h>
 #include <JavaScriptCore/JSArray.h>
+#include <JavaScriptCore/JSCInlines.h>
 #include <JavaScriptCore/JSFunction.h>
 #include <JavaScriptCore/JSObject.h>
 #include <JavaScriptCore/JSString.h>
@@ -946,16 +946,7 @@ JSC::JSObject* createWebApiMessageEvent(JSC::JSGlobalObject* global_object, JSC:
     auto& vm = global_object->vm();
     auto* collo_global = uncheckedDowncast<Collo::GlobalObject>(global_object);
     return JSColloMessageEvent::create(vm, collo_global, collo_global->messageEventStructure(), "message"_s, false,
-        false, false, data, emptyString(), emptyString(), JSC::jsNull(), ports);
-}
-
-JSC::JSObject* createWebApiErrorEvent(JSC::JSGlobalObject* global_object, WTF::String message, WTF::String filename,
-    uint32_t lineno, uint32_t colno, JSC::JSValue error)
-{
-    auto& vm = global_object->vm();
-    auto* collo_global = uncheckedDowncast<Collo::GlobalObject>(global_object);
-    return JSColloErrorEvent::create(vm, collo_global, collo_global->errorEventStructure(), "error"_s, false, true,
-        false, WTF::move(message), WTF::move(filename), lineno, colno, error);
+        false, false, data, emptyString(), emptyString(), JSC::jsNull(), ports, /* trusted */ true);
 }
 
 void installWebApiEvent(Collo::GlobalObject* global_object, JSC::VM& vm)
@@ -1120,49 +1111,7 @@ void installWebApiEvent(Collo::GlobalObject* global_object, JSC::VM& vm)
         vm, close_event_identifier, close_event_constructor, static_cast<unsigned>(JSC::PropertyAttribute::DontEnum));
     RELEASE_ASSERT(global_object->getDirect(vm, close_event_identifier));
 
-    auto* target_prototype = JSC::constructEmptyObject(global_object);
-    putWebApiFunction(
-        global_object, target_prototype, vm, "addEventListener"_s, 2, eventTargetAddEventListener, enumerableFunction);
-    putWebApiFunction(global_object, target_prototype, vm, "removeEventListener"_s, 2, eventTargetRemoveEventListener,
-        enumerableFunction);
-    putWebApiFunction(
-        global_object, target_prototype, vm, "dispatchEvent"_s, 1, eventTargetDispatchEvent, enumerableFunction);
-    target_prototype->putDirect(vm, vm.propertyNames->toStringTagSymbol,
-        JSC::jsString(vm, WTF::makeString("EventTarget"_s)),
-        JSC::PropertyAttribute::ReadOnly | JSC::PropertyAttribute::DontEnum);
-
-    auto* target_constructor
-        = JSC::JSFunction::create(vm, global_object, 0, "EventTarget"_s, eventTargetConstructorCall,
-            JSC::ImplementationVisibility::Public, JSC::NoIntrinsic, eventTargetConstructorConstruct, nullptr);
-    RELEASE_ASSERT(target_constructor);
-    target_constructor->putDirect(vm, vm.propertyNames->prototype, target_prototype,
-        JSC::PropertyAttribute::ReadOnly | JSC::PropertyAttribute::DontEnum | JSC::PropertyAttribute::DontDelete);
-    target_prototype->putDirect(
-        vm, vm.propertyNames->constructor, target_constructor, static_cast<unsigned>(JSC::PropertyAttribute::DontEnum));
-    JSC::Identifier target_identifier = JSC::Identifier::fromString(vm, "EventTarget"_s);
-    global_object->putDirect(
-        vm, target_identifier, target_constructor, static_cast<unsigned>(JSC::PropertyAttribute::DontEnum));
-    RELEASE_ASSERT(global_object->getDirect(vm, target_identifier));
-
-    // The global object has no listener storage of its own, so its listeners live in this EventTarget cell, which
-    // the realm's webapi_cache roots for the VM's lifetime together with the onerror and onmessage handlers. Each
-    // realm has its own, so one realm's listeners never hear another's events.
-    auto* target_structure = JSColloEventTarget::createStructure(vm, global_object, target_prototype);
-    auto* global_event_target = JSColloEventTarget::create(vm, target_structure);
-    auto& cache = global_object->webApiCache();
-    cache.global_event_target.set(vm, global_event_target);
-    cache.global_on_error.set(vm, JSC::jsNull());
-    cache.global_on_message.set(vm, JSC::jsNull());
-
-    putWebApiFunction(
-        global_object, global_object, vm, "addEventListener"_s, 2, globalAddEventListener, enumerableFunction);
-    putWebApiFunction(
-        global_object, global_object, vm, "removeEventListener"_s, 2, globalRemoveEventListener, enumerableFunction);
-    putWebApiFunction(global_object, global_object, vm, "dispatchEvent"_s, 1, globalDispatchEvent, enumerableFunction);
-    putWebApiAccessor(
-        global_object, global_object, vm, "onerror"_s, globalGetOnError, globalSetOnError, enumerableAccessor);
-    putWebApiAccessor(
-        global_object, global_object, vm, "onmessage"_s, globalGetOnMessage, globalSetOnMessage, enumerableAccessor);
+    auto event_target = installEventTargetInterface(global_object, vm);
 
     global_object->cacheEventApi(event_constructor, event_prototype,
         JSColloEvent::createStructure(vm, global_object, event_prototype), custom_event_constructor,
@@ -1171,8 +1120,8 @@ void installWebApiEvent(Collo::GlobalObject* global_object, JSC::VM& vm)
         JSColloMessageEvent::createStructure(vm, global_object, message_event_prototype), error_event_constructor,
         error_event_prototype, JSColloErrorEvent::createStructure(vm, global_object, error_event_prototype),
         close_event_constructor, close_event_prototype,
-        JSColloCloseEvent::createStructure(vm, global_object, close_event_prototype), target_constructor,
-        target_prototype, target_structure);
+        JSColloCloseEvent::createStructure(vm, global_object, close_event_prototype), event_target.constructor,
+        event_target.prototype, event_target.structure);
 }
 
 } // namespace Collo::HostFunctions

@@ -1,12 +1,15 @@
-//! The zygote control protocol's host side (`host_client.zig`), over real
-//! socket pairs: the ready and WorkerInit-outcome waits time out instead of
-//! blocking, and the two halves of a fork request match the reply to its
-//! job. A real zygote forks in `zygote-integration`.
+//! The zygote control protocol's host side (`host_client.zig`) over real
+//! socket pairs: a fork request carries its job and its leaf, the reply
+//! comes back as the forked child of that job, and a mismatched, refused or
+//! hung-up reply reads as the failure it is; the ready wait and the test
+//! driver's outcome wait (`zygote_support`) time out instead of blocking. A
+//! real zygote forks in `zygote-integration`.
 
 const std = @import("std");
 const fd_mod = @import("collo_os").fd;
 const zygote = @import("collo_zygote");
 const process = @import("collo_os").process;
+const support = @import("zygote_support");
 
 const host_client = zygote.host_client;
 const ipc = zygote.ipc;
@@ -30,7 +33,6 @@ const StandInZygote = struct {
             .control_fd = self.pair[0],
             .trace_read_fd = null,
             .trace_write_fd = null,
-            .next_fork_job_id = 1,
         };
     }
 
@@ -75,18 +77,30 @@ fn answerFork(stand_in: *const StandInZygote, reply_job_id: u64, pid: u32) !void
     try ipc.sendForkReply(stand_in.zygoteEnd(), reply_job_id, pid, init_stand_in, pidfd_stand_in);
 }
 
-test "a fork request carries its job to the zygote and the reply comes back as the forked child of that job" {
+/// Sends the request of job 7 with a stand-in leaf, which the request only
+/// lends, and drops what the zygote's end received.
+fn sendJobSeven(stand_in: *StandInZygote) !void {
+    const leaf_stand_in = try std.posix.eventfd(0, std.os.linux.EFD.CLOEXEC);
+    defer std.posix.close(leaf_stand_in);
+    try host_client.sendForkRequest(&stand_in.spawned, 7, leaf_stand_in);
+    var request = try ipc.recvForkRequest(stand_in.zygoteEnd());
+    request.deinit();
+}
+
+test "a fork request carries its job and its leaf to the zygote and the reply comes back as the forked child of that job" {
     var stand_in: StandInZygote = undefined;
     try stand_in.init();
     defer stand_in.deinit();
 
-    try host_client.sendForkRequest(&stand_in.spawned, 7, null);
-    // The job ids a later request takes start past this one.
-    try std.testing.expectEqual(@as(u64, 8), stand_in.spawned.next_fork_job_id);
-    var request = try ipc.recvForkRequestWithFd(stand_in.zygoteEnd());
+    const leaf_stand_in = try std.posix.eventfd(0, std.os.linux.EFD.CLOEXEC);
+    defer std.posix.close(leaf_stand_in);
+    try host_client.sendForkRequest(&stand_in.spawned, 7, leaf_stand_in);
+    var request = try ipc.recvForkRequest(stand_in.zygoteEnd());
     defer request.deinit();
     try std.testing.expectEqual(@as(u64, 7), request.message.fork_job_id);
-    try std.testing.expect(request.cgroup_dir_fd == null);
+    // The zygote holds its own copy of the leaf, which the request lent.
+    try std.testing.expect(request.cgroup_dir_fd >= 0);
+    try std.testing.expect(request.cgroup_dir_fd != leaf_stand_in);
 
     try answerFork(&stand_in, 7, 4242);
     var forked = try host_client.receiveForkReply(&stand_in.spawned, 7);
@@ -95,7 +109,6 @@ test "a fork request carries its job to the zygote and the reply comes back as t
     try std.testing.expectEqual(@as(u64, 7), forked.fork_job_id);
     try std.testing.expect(forked.worker_init_fd != null);
     try std.testing.expect(forked.pidfd != null);
-    try std.testing.expect(forked.cgroup_dir_fd == null);
 }
 
 test "a fork reply that names another job is a protocol failure and leaves no descriptor behind" {
@@ -103,9 +116,7 @@ test "a fork reply that names another job is a protocol failure and leaves no de
     try stand_in.init();
     defer stand_in.deinit();
 
-    try host_client.sendForkRequest(&stand_in.spawned, 7, null);
-    var request = try ipc.recvForkRequestWithFd(stand_in.zygoteEnd());
-    request.deinit();
+    try sendJobSeven(&stand_in);
     try answerFork(&stand_in, 8, 4242);
     const before = try openFdCount();
     try std.testing.expectError(error.ZygoteProtocol, host_client.receiveForkReply(&stand_in.spawned, 7));
@@ -118,9 +129,7 @@ test "a fork the zygote refuses reads as a transient failure" {
     try stand_in.init();
     defer stand_in.deinit();
 
-    try host_client.sendForkRequest(&stand_in.spawned, 7, null);
-    var request = try ipc.recvForkRequestWithFd(stand_in.zygoteEnd());
-    request.deinit();
+    try sendJobSeven(&stand_in);
     try ipc.sendForkFailed(stand_in.zygoteEnd(), 7);
     try std.testing.expectError(error.ForkTransientFailure, host_client.receiveForkReply(&stand_in.spawned, 7));
 }
@@ -130,7 +139,7 @@ test "a zygote that closed its control socket reads as dead, not as a broken pro
     try stand_in.init();
     defer stand_in.deinit();
 
-    try host_client.sendForkRequest(&stand_in.spawned, 7, null);
+    try sendJobSeven(&stand_in);
     // The zygote closes its end only as it exits, even while its pidfd does
     // not report the exit yet.
     std.posix.close(stand_in.pair[1]);
@@ -155,17 +164,17 @@ test "zygote ready wait receives ready message before timeout" {
     _ = try host_client.recvZygoteReadyBeforeTimeout(pair[1], null, 1_000);
 }
 
-test "worker init outcome wait times out before blocking receive" {
+test "the test driver's worker init outcome wait times out before blocking receive" {
     const pair = try fd_mod.socketPairType(ipc_socket_type);
     defer std.posix.close(pair[0]);
     defer std.posix.close(pair[1]);
     const self_pidfd = try process.openPidFd(@intCast(std.c.getpid()));
     defer std.posix.close(self_pidfd);
 
-    try std.testing.expectError(error.WorkerInitTimeout, host_client.receiveWorkerInitOutcomeBeforeTimeout(pair[1], self_pidfd, null, 0));
+    try std.testing.expectError(error.WorkerInitTimeout, support.receiveWorkerInitOutcomeBeforeTimeout(pair[1], self_pidfd, 0));
 }
 
-test "worker init outcome wait receives outcome before timeout" {
+test "the test driver's worker init outcome wait receives the outcome before timeout" {
     const pair = try fd_mod.socketPairType(ipc_socket_type);
     defer std.posix.close(pair[0]);
     defer std.posix.close(pair[1]);
@@ -173,5 +182,5 @@ test "worker init outcome wait receives outcome before timeout" {
     defer std.posix.close(self_pidfd);
 
     try ipc.sendWorkerReady(pair[0]);
-    try std.testing.expectEqual(host_client.WorkerInitOutcome.ready, try host_client.receiveWorkerInitOutcomeBeforeTimeout(pair[1], self_pidfd, null, 1_000));
+    try std.testing.expectEqual(ipc.InitOutcome.ready, try support.receiveWorkerInitOutcomeBeforeTimeout(pair[1], self_pidfd, 1_000));
 }

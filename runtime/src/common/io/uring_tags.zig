@@ -12,7 +12,6 @@ pub const high_nibble_shift: u6 = 60;
 
 pub const shared_supervision_high_byte: u64 = 0xc0;
 pub const server_ingress_high_byte: u64 = 0xce;
-pub const worker_scheduler_high_byte: u64 = 0x57;
 pub const egress_high_byte: u64 = 0x53;
 pub const egress_gateway_readiness_high_byte: u64 = 0x54;
 
@@ -25,7 +24,6 @@ pub const listener_accept_high_byte_max: u64 = listener_accept_high_byte_min | 0
 pub const high_byte_tags = [_]u64{
     shared_supervision_high_byte,
     server_ingress_high_byte,
-    worker_scheduler_high_byte,
     egress_high_byte,
     egress_gateway_readiness_high_byte,
 };

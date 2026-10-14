@@ -1,6 +1,6 @@
 //! The scheduler's policy numbers: the memory levels that gate pool growth
-//! and drive the reaper, and the launches each worker definition's pool may
-//! have in flight. Consumers import them from here instead of repeating
+//! and drive the reaper, the CPU figures that decide a scale-out, and the
+//! launches each worker definition's pool may have in flight. Consumers import them from here instead of repeating
 //! them; the pool's own bounds live in `common/limits/pool.zig`.
 //!
 //! Each number is a policy choice tied to a metric that says which way to
@@ -110,6 +110,33 @@ pub const memory = struct {
     /// together nest well under this; a deeper limit is left out with a
     /// warning (`MemoryDomains.init`).
     pub const cgroup_ancestors_max: usize = 32;
+};
+
+/// The scale-out verdict (`scale_out.zig`): when a definition whose live
+/// workers hold every slot while requests wait gets a worker more.
+pub const scale_out = struct {
+    /// The time between two samples while the launcher watches a
+    /// definition, so the shortest a backlog persists before a worker joins
+    /// the live ones, and the rate at which one definition can grow, one
+    /// worker per sample. Shorter samples react sooner but measure CPU over
+    /// fewer of `/proc/stat`'s 10 ms ticks.
+    pub const sample_interval_ns: u64 = 100 * std.time.ns_per_ms;
+    /// The mean share of the interval, in thousandths, that a definition's
+    /// workers may wait for a CPU and still grow: above it they queue for
+    /// CPUs already, and a worker more would queue with them.
+    pub const stall_permille_max: u32 = 100;
+    /// The mean CPU per worker, in thousandths of a core, from which a
+    /// definition's workers count as CPU-bound, so a worker more needs a
+    /// whole idle core; below it they mostly wait on I/O.
+    pub const cpu_bound_permille: u32 = 500;
+
+    comptime {
+        std.debug.assert(sample_interval_ns > 0);
+        std.debug.assert(stall_permille_max > 0);
+        std.debug.assert(stall_permille_max <= 1000);
+        std.debug.assert(cpu_bound_permille > 0);
+        std.debug.assert(cpu_bound_permille <= 1000);
+    }
 };
 
 /// The launch capacity of one worker definition's pool (`pool.zig`). Its

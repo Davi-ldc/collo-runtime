@@ -5,13 +5,12 @@
 //! stale once its entry moves, and the armed transitions the lane's timer
 //! follows. A request's handle cancels its entry once. Lane
 //! `server-ingress-test`. What an expiry does to its request and worker
-//! runs through a whole lane in `request_deadlines.zig` and
-//! `completion_ring.zig`; in `local-e2e` the worker answers a served
-//! request's deadline itself, so the wheel entry is only cancelled.
+//! runs through a whole lane in `request_deadlines.zig`; in `local-e2e` the
+//! worker answers a served request's deadline itself, so the wheel entry is
+//! only cancelled.
 
 const std = @import("std");
 const server_main = @import("collo_server_main");
-const worker_shared_page = @import("collo_worker_state").page;
 
 const ingress = server_main.ingress;
 const lifecycle = server_main.lifecycle;
@@ -206,8 +205,7 @@ test "deadline wheel insert after time advance expires at absolute deadline" {
 test "a request's deadline handle cancels its wheel entry once, and a second cancel finds nothing" {
     var lane = try ingress.lane.IngressLane.init(std.testing.allocator, .{
         .lane_id = 1,
-        .definition_count = 0,
-        .slots_per_worker_total = 0,
+        .served = .{ .count = 0, .slots_per_worker_total = 0 },
         .max_requests = 1,
     }, 0);
     defer lane.deinit();
@@ -230,8 +228,7 @@ test "a request's deadline handle cancels its wheel entry once, and a second can
 test "re-arming a request's deadline moves its one wheel entry, and the old handle goes stale" {
     var lane = try ingress.lane.IngressLane.init(std.testing.allocator, .{
         .lane_id = 1,
-        .definition_count = 0,
-        .slots_per_worker_total = 0,
+        .served = .{ .count = 0, .slots_per_worker_total = 0 },
         .max_requests = 1,
     }, 0);
     defer lane.deinit();

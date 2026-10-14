@@ -5,81 +5,68 @@
 //!
 //! `control.zig` is the wire between the server and the gateway, with the hello that hands over
 //! the server's network policy image, and `launch.zig` the gateway's arg0 and inherited
-//! descriptor. `policy.zig` holds the limits both sides share and the isolation ids of policies,
-//! and `sizing.zig` the gateway's plan and the most sessions any gateway holds, which the server
-//! reads.
+//! descriptor. `policy.zig` holds the limits every fetch runs under and the check of a fetch
+//! start, and `sizing.zig` the gateway's plan and the most sessions any gateway holds, which the
+//! server reads.
 //!
 //! Everything else runs only in the gateway. `runtime/` is its boot and event loop on the
 //! process's main thread, `readiness.zig` the loop's io_uring wait, and `sandbox.zig` the sandbox
-//! the process applies to itself. The loop's state is the worker sessions (`worker_registry.zig`,
-//! `sessions.zig`, `drop_queue.zig`, `backpressure.zig`) with the fetch budgets of their tokens
-//! (`budgets.zig`), the routes from worker ids to shards (`router.zig`), the active-fetch counts
-//! (`limit_tracker.zig`) and the control packets still to send (`control_queue.zig`);
-//! `publisher.zig` writes into worker endpoints. Behind the loop,
-//! `shard_set.zig` and `shard.zig` own the shards, each with a budgeted allocator
-//! (`counting_allocator.zig`, limits in `supervisor_limits.zig`) and an engine (`engine.zig`)
-//! whose threads run the outbound transport. An engine keeps its admitted fetches in
-//! `active_table.zig` and `active_fetch.zig`, learns which need attention through
-//! `ready_scan.zig`, and turns responses into worker packets in `body_pump.zig`.
+//! the process applies to itself. The loop's state is the worker sessions (`sessions.zig`, each
+//! with the ledger of the body-pool extents its worker holds), the one table of fetches
+//! (`fetch_table.zig`) and the control packets still to send (`control_queue.zig`);
+//! `publisher.zig` writes into worker endpoints, and `credit_batch.zig` merges the flow-control
+//! credits on their way back to the engines. Behind the loop, `shard.zig` owns the shards, each
+//! with a budgeted allocator (`counting_allocator.zig`, limits in `containment.zig`) and an
+//! engine (`engine.zig`) whose threads run the outbound transport and report ready fetches
+//! through `ready_scan.zig`.
+//!
+//! The gateway exits at once when `runtime.run` returns (`runFromInheritedControlFd`): with
+//! status 0 when the server shut it down, and with status 1 after one line naming the error for
+//! any failure. Nothing after that return tears anything down. What is left is the process's own
+//! memory, descriptors and threads, which the kernel releases at exit, and the server waits for
+//! the exit on the gateway's pidfd for a bounded time before it sends SIGKILL
+//! (`server/gateway/process.zig`), so teardown would only delay it.
 
-const builtin = @import("builtin");
 const std = @import("std");
 
+pub const containment = @import("containment.zig");
 pub const control = @import("control.zig");
-pub const engine = @import("engine.zig");
-pub const active_fetch = @import("active_fetch.zig");
-pub const active_table = @import("active_table.zig");
-pub const backpressure = @import("backpressure.zig");
-pub const body_pump = @import("body_pump.zig");
-pub const budgets = @import("budgets.zig");
 pub const control_queue = @import("control_queue.zig");
 pub const counting_allocator = @import("counting_allocator.zig");
-pub const drop_queue = @import("drop_queue.zig");
+pub const credit_batch = @import("credit_batch.zig");
+pub const engine = @import("engine.zig");
+pub const fetch_table = @import("fetch_table.zig");
 pub const launch = @import("launch.zig");
-pub const limit_tracker = @import("limit_tracker.zig");
 pub const policy = @import("policy.zig");
 pub const publisher = @import("publisher.zig");
 pub const readiness = @import("readiness.zig");
 pub const ready_scan = @import("ready_scan.zig");
-pub const router = @import("router.zig");
 pub const runtime = @import("runtime/root.zig");
 pub const sandbox = @import("sandbox.zig");
 pub const sessions = @import("sessions.zig");
 pub const shard = @import("shard.zig");
-pub const shard_set = @import("shard_set.zig");
 pub const sizing = @import("sizing.zig");
-pub const supervisor_limits = @import("supervisor_limits.zig");
-pub const worker_registry = @import("worker_registry.zig");
-
-pub const testing = if (builtin.is_test) struct {
-    /// The runtime loop's shard flow (the collection pass and the shard supervisor) as a comptime
-    /// mixin: chaos tests instantiate `Methods` over a minimal recording gateway, so the real
-    /// supervisor, backstop and redispatch code runs against real shards without worker
-    /// shared-memory endpoints.
-    pub const shard_flow = @import("runtime/shard_flow.zig");
-    /// Release-flow credit-ack aggregation (`PendingCreditAck.tryMerge`): the merge rule must
-    /// mirror `CreditBatch.add`'s, so tests pin it directly.
-    pub const body_release_flow = @import("runtime/body_release_flow.zig");
-    /// Worker-command dispatch and pooled-upload assembly as comptime mixins: the worker_flow
-    /// suite instantiates both `Methods` over a minimal gateway harness, so the real adversarial
-    /// dispatch runs against real shared-memory endpoints, the security boundary of the process
-    /// that holds the network capability.
-    pub const worker_flow = @import("runtime/worker_flow.zig");
-    pub const upload_flow = @import("runtime/upload_flow.zig");
-    /// The control socket's flow as a comptime mixin: the admission and control suites feed a
-    /// harness gateway its hello through the real flow, so the key, the decoded policies and each
-    /// policy's isolation id are the ones fetch admission reads.
-    pub const control_flow = @import("runtime/control_flow.zig");
-} else struct {};
 
 pub const process_name = launch.process_name;
 pub const inherited_control_fd = launch.inherited_control_fd;
 
 /// The gateway process's entry point, run from `main` when arg0 is `process_name`. Runs on the
-/// descriptor `launch.zig` defines and returns when the server shuts the gateway down. A command
-/// line with anything after arg0 fails with `error.InvalidEgressGatewayArguments`, since the
-/// server's spawn passes nothing there.
-pub fn runFromInheritedControlFd(allocator: std.mem.Allocator) !void {
+/// descriptor `launch.zig` defines until the server shuts the gateway down, then exits as the
+/// header says. The exit is `_exit`, which runs no exit handler, static destructor or error
+/// trace: engine threads may still be alive, beside which exit handlers can hang or crash, and a
+/// Debug build's error trace parses the binary's whole debug info, which takes seconds.
+pub fn runFromInheritedControlFd(allocator: std.mem.Allocator) noreturn {
+    serve(allocator) catch |err| {
+        std.log.err("egress gateway failed: {s}", .{@errorName(err)});
+        std.c._exit(1);
+    };
+    std.c._exit(0);
+}
+
+/// Boots and serves until the server shuts the gateway down. A command line with anything after
+/// arg0 fails with `error.InvalidEgressGatewayArguments`, since the server's spawn passes nothing
+/// there.
+fn serve(allocator: std.mem.Allocator) !void {
     if (std.os.argv.len != 1)
         return error.InvalidEgressGatewayArguments;
     try runtime.run(allocator, launch.inherited_control_fd);

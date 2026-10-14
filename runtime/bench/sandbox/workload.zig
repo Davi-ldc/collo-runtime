@@ -126,7 +126,7 @@ pub const Exchange = enum {
     /// upload pool.
     fetch_upload,
     /// One `crypto.subtle.digest` of `webcrypto_digest_bytes` zero bytes,
-    /// which runs on the worker's crypto pool, so its threads allocate too.
+    /// which runs inline on the worker's VM thread.
     webcrypto,
 
     /// The query the steps fixture dispatches on, appended to the route's
@@ -206,9 +206,8 @@ pub const Load = struct {
     }
 };
 
-/// The largest `COLLO_BENCH_LOAD_REQUESTS`: enough hello requests to wrap
-/// the worker's usage-record ring (`RECORD_RING_COUNT` in
-/// `common/worker_state/page/usage_records.zig`) several times over.
+/// The largest `COLLO_BENCH_LOAD_REQUESTS`: enough hello requests that a
+/// worker's console ring and live slots cycle many times over.
 pub const load_requests_max: u32 = 10_000;
 
 const sequence_steps = [_]Step{

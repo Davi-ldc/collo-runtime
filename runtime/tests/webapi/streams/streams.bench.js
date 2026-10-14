@@ -38,6 +38,21 @@ bench("Response.body tee read bytes", async iterations => {
   return checksum;
 }, { iterations: 1000, warmup: 100 });
 
+bench("Response arrayBuffer of a JavaScript stream", async iterations => {
+  let checksum = 0;
+  const chunk = new Uint8Array(1024);
+  for (let index = 0; index < iterations; index++) {
+    const stream = new ReadableStream({
+      start(controller) {
+        for (let part = 0; part < 8; part++) controller.enqueue(chunk);
+        controller.close();
+      },
+    });
+    checksum += (await new Response(stream).arrayBuffer()).byteLength;
+  }
+  return checksum;
+}, { iterations: 1000, warmup: 100 });
+
 bench("ReadableStream pipeTo highWaterMark", async iterations => {
   let checksum = 0;
   for (let index = 0; index < iterations; index++) {

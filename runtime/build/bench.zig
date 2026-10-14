@@ -286,8 +286,6 @@ fn egressBenchModule(
     // `local_origin.zig` builds the policy naming the bench's own origins
     // from the same module the transport matches with.
     module.addImport("collo_network", stub_release.get(.network));
-    if (bench.import_bindings)
-        module.addImport("collo_bindings", stub_release.get(.bindings));
     if (bench.tls_test_shim)
         module.addImport("collo_test_tls_shim", shims.tlsTestShimModule(b, ctx.opts.target, .ReleaseFast));
     return module;
@@ -299,7 +297,6 @@ const EgressBench = struct {
     step_name: []const u8,
     step_desc: []const u8,
     import: modules_mod.ModuleId,
-    import_bindings: bool = false,
     tls_test_shim: bool = false,
     install: bool = false,
 };
@@ -309,17 +306,16 @@ const egress_benches = [_]EgressBench{
         .file = "runtime/bench/egress_tls.zig",
         .name = "egress_tls",
         .step_name = "bench-egress-tls",
-        .step_desc = "Benchmark the BIO/io_uring HTTP/2 TLS egress data path",
-        .import = .egress_pool,
+        .step_desc = "Measure egress TLS handshakes and HTTP/2 transfers through one engine",
+        .import = .egress_client,
         .tls_test_shim = true,
     },
     .{
         .file = "runtime/bench/egress_h2_engine.zig",
         .name = "egress_h2_engine",
         .step_name = "bench-egress-h2-engine",
-        .step_desc = "Measure egress engine HTTP/2 owner-thread throughput across engines/connectors/origins/streams",
+        .step_desc = "Measure egress engine HTTP/2 owner-thread throughput across engines/origins/streams",
         .import = .egress_client,
-        .import_bindings = true,
         .tls_test_shim = true,
         .install = true,
     },
@@ -327,9 +323,8 @@ const egress_benches = [_]EgressBench{
         .file = "runtime/bench/egress_http1.zig",
         .name = "egress_http1",
         .step_name = "bench-egress-http1",
-        .step_desc = "Compare HTTP/1 close, keep-alive, and streaming decompression egress",
+        .step_desc = "Measure HTTP/1 egress through one engine: closed connections, keep-alive and gzip bodies",
         .import = .egress_client,
-        .import_bindings = true,
     },
 };
 

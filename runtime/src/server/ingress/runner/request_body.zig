@@ -2,7 +2,8 @@
 //! on the lane thread that owns their connection: the DATA frames of a stream
 //! whose request waits for a worker slot or is dispatched, the body a stream
 //! buffers until its worker takes it, the inline and payload-ring sends of
-//! body chunks, the lane's refusal of a body, and the client's RST_STREAM.
+//! body chunks with the wake that tells a full ring has room again, the
+//! lane's refusal of a body, and the client's RST_STREAM.
 //!
 //! Invariants:
 //! - A request body is bounded by its `content-length` or, without one, by
@@ -19,23 +20,24 @@
 //! - A chunk that finds the worker's payload ring full registers its request
 //!   in the worker's record (`Record.body_waiters`), marks the ring waiting
 //!   and tries once more (`waitForRingRoom`). The worker's next release of
-//!   ring bytes then writes its completion eventfd, and the worker's reader
-//!   raises this lane's `payload_credit` wake (`worker_completions.zig`),
-//!   whose retry sends the chunk (`dispatch.retryRingBlockedSends`). No lane
-//!   polls a credit eventfd.
+//!   ring bytes then writes its completion eventfd, which only the worker's
+//!   reader polls, and the reader raises the `payload_credit` wake of every
+//!   lane registered (`handleWorkerRingCredit`), whose retry sends the chunk
+//!   (`dispatch.retryRingBlockedSends`). The eventfd carries nothing else, so
+//!   its wake reads neither the control socket nor the forwarding window.
 //! - The handlers the HTTP/2 driver calls return `StreamError`
 //!   (`admission.zig`). A connection that must close is only marked closing
 //!   here (`closeRuntimeConnection`); its next turn finishes the close.
 //! - A client's reset frees no worker slot its worker may still use: a
-//!   dispatched request whose begin reached the worker stays until the worker
-//!   completes it, after a `request_reset` tells the worker the stream is gone
-//!   (`dispatch.cancelRequestToWorker`). A completion already parked on the
-//!   request ends it at once.
+//!   dispatched request whose begin reached the worker stays until the
+//!   worker's `request_done` ends it, after a `request_reset` tells the
+//!   worker the stream is gone (`dispatch.cancelRequestToWorker`).
 
 const std = @import("std");
 const http_common = @import("collo_http");
 const ipc = @import("collo_ipc");
 const supervision = @import("collo_server_supervisor");
+const completions = @import("../completions.zig");
 const fault = @import("../fault.zig");
 const server_responses = @import("../server_responses.zig");
 const http2_connection = @import("../http2/connection.zig");
@@ -44,9 +46,13 @@ const admission = @import("admission.zig");
 const connection_flow = @import("connection_flow.zig");
 const connection_slot = @import("connection_slot.zig");
 const dispatch = @import("dispatch.zig");
+const event_sources = @import("event_sources.zig");
 const flow_control = @import("flow_control.zig");
 const request_finish = @import("request_finish.zig");
 const request_slot_mod = @import("request_slot.zig");
+const worker_fault = @import("worker_fault.zig");
+const worker_registration = @import("worker_registration.zig");
+const runner = @import("root.zig");
 
 const ConnectionSlot = connection_slot.Slot;
 const RequestSlot = request_slot_mod.RequestSlot;
@@ -62,6 +68,52 @@ pub fn Methods(comptime Self: type) type {
         const Connection = connection_flow.Methods(Self);
         const Dispatch = dispatch.Methods(Self);
         const RequestFinish = request_finish.Methods(Self);
+        const WorkerFault = worker_fault.Methods(Self);
+        const WorkerRegistration = worker_registration.Methods(Self);
+
+        /// Loop handler: the completion eventfd of a worker this lane reads
+        /// fired, so the worker freed room in its server-to-worker payload
+        /// ring. Drains the eventfd, then raises the `payload_credit` wake of
+        /// each lane registered as waiting for that room in the worker's
+        /// record (`Record.body_waiters`), this one included, and re-arms the
+        /// reader's polls; a fault of the eventfd runs the death path. The
+        /// eventfd goes first: a release the worker makes after the drain
+        /// writes it again, so its poll fires again, and a lane registers
+        /// before it marks the ring (`waitForRingRoom`), so the release that
+        /// answers its mark finds its registration here.
+        pub fn handleWorkerRingCredit(self: *Self, registration_index: u32) LaneFault!void {
+            const registration = try readingRegistration(self, registration_index);
+            const wakes = event_sources.drainEventFd(registration.ring_credit_fd) catch |err|
+                switch (try fault.classifyWorkerError(.{ .wake = err })) {
+                    .ok, .would_block => 0,
+                    .fault => |reason| return WorkerFault.faultWorker(self, registration_index, reason),
+                };
+            if (wakes != 0)
+                self.lane.counters.worker_ring_credit_wakes += 1;
+            const worker = registration.worker orelse return error.InvalidWorkerRegistration;
+            for (&worker.body_waiters) |*waiter| {
+                // Only a lane writes a waiter, and a registration the release
+                // answered happened before the eventfd write this drain took,
+                // so a plain load sees it.
+                if (waiter.load(.monotonic) == 0)
+                    continue;
+                const lane = waiter.swap(0, .seq_cst);
+                if (lane == 0)
+                    continue;
+                try self.service.raiseLaneWake(lane - 1, runner.wake.payload_credit);
+            }
+            try WorkerRegistration.armWorkerPolls(self, registration_index);
+        }
+
+        /// The registration at `registration_index`, which must read its
+        /// worker: only the reader polls the worker's completion eventfd.
+        fn readingRegistration(self: *Self, registration_index: u32) LaneFault!*completions.Registration {
+            const registration = self.registrations.get(registration_index) orelse
+                return error.InvalidWorkerRegistration;
+            if (!registration.reading())
+                return error.InvalidWorkerRegistration;
+            return registration;
+        }
 
         pub fn handleH2DataFrame(
             self: *Self,
@@ -296,12 +348,6 @@ pub fn Methods(comptime Self: type) type {
             if (slot.h2_client_reset)
                 return true;
             slot.h2_client_reset = true;
-            // A parked completion means the worker already answered, and the
-            // reset ended the descriptor flow that would have ended its
-            // response, so the request ends here and the worker, done with it,
-            // is not told.
-            if (try RequestFinish.finishParkedCompletion(self, request_slot))
-                return true;
             try Dispatch.cancelRequestToWorker(self, request_slot, error_code);
             return true;
         }
@@ -324,8 +370,6 @@ pub fn Methods(comptime Self: type) type {
                 return;
             slot.h2_client_reset = true;
             slot.local_answer = local_answer;
-            if (try RequestFinish.finishParkedCompletion(self, request_slot))
-                return;
             try Dispatch.cancelRequestToWorker(self, request_slot, error_code);
         }
 

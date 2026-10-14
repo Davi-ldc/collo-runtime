@@ -1,20 +1,21 @@
 //! The scheduler domain of the worker runtime. `Scheduler` is its state: the
 //! ready queue and its backlog, the request-deadline heap, timers and
-//! immediates with their ready maps, the loop's wakeup eventfd, the
-//! restricted worker ring, and the bookkeeping of the timer callback running
-//! now. `Methods` holds the runtime's operations on that state, which
-//! `Runtime` declares as its own (`root.zig`): queueing ready work, timers
-//! and immediates, request deadlines, the worker ring, and waking and
-//! draining the loop. It belongs to the worker's
+//! immediates with their ready maps, the loop's wakeup eventfd, and the
+//! bookkeeping of the timer callback running now. `Methods` holds the
+//! runtime's operations on that state, which `Runtime` declares as its own
+//! (`root.zig`): queueing ready work, timers and immediates, request
+//! deadlines, and waking and draining the loop. It belongs to the worker's
 //! VM thread; other threads only write the wakeup eventfd (`wakeup_fd`). The
 //! policy over the state lives in `scheduler/resources.zig` and
-//! `scheduler/loop.zig`. Every capacity comes from `RuntimeLimits` and the
-//! route limit, and is reserved in `init`.
+//! `scheduler/loop.zig`, and the loop's wait in `scheduler/poll_backend.zig`.
+//! Every capacity comes from `RuntimeLimits`, the route limit and the
+//! backlog's share for egress items (`queueReadyWork`), and is reserved in
+//! `init`.
 
 const std = @import("std");
 const bindings = @import("collo_bindings");
 const server_limits = @import("collo_limits").server;
-const restricted_uring = @import("collo_common_io").restricted_uring;
+const worker_limits = @import("collo_limits").worker;
 const js_value = @import("collo_worker_js").value;
 const request_context = @import("collo_worker_request").context;
 const ready_queue_mod = @import("../scheduler/queue.zig");
@@ -32,15 +33,10 @@ pub const Scheduler = struct {
     pending_immediate_callbacks: immediates_mod.ImmediateQueue,
     ready_timer_callbacks: std.AutoHashMapUnmanaged(u64, timers_mod.TimerEntry),
     ready_immediate_callbacks: std.AutoHashMapUnmanaged(u64, immediates_mod.ImmediateEntry),
-    /// Wakes the loop. The crypto pool's threads, the engine's deferred-work
-    /// notification (from the wasm worklist thread too) and `Runtime.wake`
-    /// write it, so the other threads must stop writing before `deinit`
-    /// closes it.
+    /// Wakes the loop. The engine's deferred-work notification (from the
+    /// wasm worklist thread too) and `Runtime.wake` write it, so the other
+    /// threads must stop writing before `deinit` closes it.
     wakeup_fd: ?std.posix.fd_t,
-    worker_ring_fixed_files: ?[restricted_uring.FixedFile.count]std.posix.fd_t,
-    worker_ring: ?restricted_uring.WorkerRing,
-    worker_timer_fd: ?std.posix.fd_t,
-    metrics: runtime_types.WorkerSchedulerMetrics,
     next_timer_id: u64,
     executing_timer_id: ?u64,
     executing_timer_request_id: u64,
@@ -58,7 +54,13 @@ pub const Scheduler = struct {
         var ready_queue = try ready_queue_mod.ReadyQueue.init(allocator, limits.ready_queue_capacity);
         errdefer ready_queue.deinit();
 
-        var ready_backlog = try ready_queue_mod.ReadyQueue.init(allocator, limits.ready_queue_capacity);
+        // The backlog keeps `egress_ready_items_max` slots beyond the queue's
+        // capacity for the egress items, which never wait for room
+        // (`queueReadyWork`).
+        var ready_backlog = try ready_queue_mod.ReadyQueue.init(
+            allocator,
+            limits.ready_queue_capacity + worker_limits.egress_ready_items_max,
+        );
         errdefer ready_backlog.deinit();
 
         // Armed deadlines belong to live requests, at most one task each, and
@@ -99,10 +101,6 @@ pub const Scheduler = struct {
             .ready_timer_callbacks = ready_timer_callbacks,
             .ready_immediate_callbacks = ready_immediate_callbacks,
             .wakeup_fd = wakeup_fd,
-            .worker_ring_fixed_files = null,
-            .worker_ring = null,
-            .worker_timer_fd = null,
-            .metrics = .{},
             .next_timer_id = 1,
             .executing_timer_id = null,
             .executing_timer_request_id = 0,
@@ -115,21 +113,7 @@ pub const Scheduler = struct {
         };
     }
 
-    pub fn deinitWorkerRing(self: *Scheduler) void {
-        if (self.worker_ring) |*ring| {
-            ring.deinit();
-            self.worker_ring = null;
-        }
-        if (self.worker_timer_fd) |fd| {
-            std.posix.close(fd);
-            self.worker_timer_fd = null;
-        }
-        self.worker_ring_fixed_files = null;
-    }
-
     pub fn deinit(self: *Scheduler, allocator: std.mem.Allocator) void {
-        self.deinitWorkerRing();
-
         var timer_it = self.ready_timer_callbacks.iterator();
         while (timer_it.next()) |entry| {
             entry.value_ptr.deinit(allocator);
@@ -144,8 +128,8 @@ pub const Scheduler = struct {
 
         if (self.wakeup_fd) |fd| {
             // `Runtime.deinit` unregisters the engine's deferred-work wakeup
-            // and joins the crypto pool before calling this, so neither
-            // thread can write this fd's number after the close recycles it.
+            // before calling this, so no thread can write this fd's number
+            // after the close recycles it.
             std.posix.close(fd);
         }
 
@@ -160,26 +144,6 @@ pub const Scheduler = struct {
 
 pub fn Methods(comptime Runtime: type) type {
     return struct {
-        pub fn initRestrictedWorkerRing(self: *Runtime) !void {
-            try scheduler_resources.initRestrictedWorkerRing(self);
-        }
-
-        pub fn workerRingFd(self: *const Runtime) ?std.posix.fd_t {
-            return scheduler_resources.workerRingFd(self);
-        }
-
-        pub fn workerTimerFd(self: *const Runtime) ?std.posix.fd_t {
-            return scheduler_resources.workerTimerFd(self);
-        }
-
-        pub fn workerRingFixedFiles(self: *const Runtime) ?[restricted_uring.FixedFile.count]std.posix.fd_t {
-            return scheduler_resources.workerRingFixedFiles(self);
-        }
-
-        pub fn workerSchedulerMetricsSnapshot(self: *const Runtime) runtime_types.WorkerSchedulerMetrics {
-            return scheduler_resources.workerSchedulerMetricsSnapshot(self);
-        }
-
         pub fn armRequestDeadline(self: *Runtime, request: *request_context.RequestContext) !void {
             try scheduler_resources.armRequestDeadline(self, request);
         }
@@ -215,8 +179,7 @@ pub fn Methods(comptime Runtime: type) type {
         /// `scheduler/loop.zig`) and, for a request, counts it in its
         /// timeline. It is resolved at enqueue, because the maps it reads may
         /// lose the entry before the pop: an executed handler and a cancel both
-        /// remove entries while the item still sits in the queue. An fs fault
-        /// item spans several requests and has no single owner.
+        /// remove entries while the item still sits in the queue.
         pub fn readyItemOwnerRequestId(self: *Runtime, item: ready_queue_mod.WorkItem) u64 {
             return switch (item) {
                 .request,
@@ -245,13 +208,14 @@ pub fn Methods(comptime Runtime: type) type {
                     immediate.request_id
                 else
                     0,
-                .fs_fault_completion => 0,
             };
         }
 
-        /// Queues `item` as ready now. Returns false when the queue and its
-        /// backlog are both full, and the producer then keeps the item for a
-        /// later pass (`scheduler/queue.zig` says how each kind is retried).
+        /// Queues `item`, which is no egress item (`queueReadyWork`), as
+        /// ready now. Returns false when the queue is full and the backlog
+        /// holds `ready_queue_capacity` items, and the producer then keeps
+        /// the item for a later pass (`scheduler/queue.zig` says how each
+        /// kind is retried).
         pub fn tryQueueReadyWork(self: *Runtime, item: ready_queue_mod.WorkItem) bool {
             return self.tryQueueReadyWorkReadySince(item, 0);
         }
@@ -265,6 +229,7 @@ pub fn Methods(comptime Runtime: type) type {
             item: ready_queue_mod.WorkItem,
             ready_since_mono_ns: u64,
         ) bool {
+            std.debug.assert(!isEgressItem(item));
             const now = self.core.clock.now();
             const meta: ready_queue_mod.SlotMeta = .{
                 .enqueued_mono_ns = now,
@@ -275,7 +240,11 @@ pub fn Methods(comptime Runtime: type) type {
                 noteOwnerReady(self, meta);
                 return true;
             }
-            if (self.scheduler.ready_backlog.tryPushStamped(item, meta)) {
+            // Past `ready_queue_capacity` items, the backlog's slots belong
+            // to the egress items (`queueReadyWork`).
+            if (self.scheduler.ready_backlog.len < self.core.limits.ready_queue_capacity and
+                self.scheduler.ready_backlog.tryPushStamped(item, meta))
+            {
                 noteOwnerReady(self, meta);
                 self.wake();
                 return true;
@@ -287,6 +256,48 @@ pub fn Methods(comptime Runtime: type) type {
             // after its next drain (`drained_wakeup` in `scheduler/loop.zig`),
             // where the rescan fails and wakes again, so no item would pop.
             return false;
+        }
+
+        /// Queues an egress item, a fetch task's completion or a body view's
+        /// readiness, as ready since `ready_since_mono_ns`. It never fails:
+        /// the queue and the backlog together hold at most
+        /// `worker_limits.egress_ready_items_max` egress items, which their
+        /// producers bound by construction, and every other producer enters
+        /// the backlog only while it holds fewer than `ready_queue_capacity`
+        /// items (`tryQueueReadyWorkReadySince`). So when the queue is full,
+        /// the backlog holds at most `ready_queue_capacity +
+        /// egress_ready_items_max - 1` items, and its capacity, one more, has
+        /// room. `drainReadyBacklog` only moves items.
+        pub fn queueReadyWork(self: *Runtime, item: ready_queue_mod.WorkItem, ready_since_mono_ns: u64) void {
+            std.debug.assert(isEgressItem(item));
+            const meta: ready_queue_mod.SlotMeta = .{
+                .enqueued_mono_ns = self.core.clock.now(),
+                .owner_request_id = self.readyItemOwnerRequestId(item),
+                .ready_since_mono_ns = ready_since_mono_ns,
+            };
+            if (self.scheduler.ready_queue.tryPushStamped(item, meta)) {
+                noteOwnerReady(self, meta);
+                return;
+            }
+            const queued = self.scheduler.ready_backlog.tryPushStamped(item, meta);
+            std.debug.assert(queued);
+            noteOwnerReady(self, meta);
+            self.wake();
+        }
+
+        fn isEgressItem(item: ready_queue_mod.WorkItem) bool {
+            return switch (item) {
+                .fetch_completion, .fetch_body_ready => true,
+                .request,
+                .timer_callback,
+                .immediate_callback,
+                .request_completion,
+                .request_body_ready,
+                .request_cancelled,
+                .request_deadline,
+                .response_advance,
+                => false,
+            };
         }
 
         /// Only a dispatched request keeps a timeline, so an evaluation's items
@@ -326,15 +337,8 @@ pub fn Methods(comptime Runtime: type) type {
                     self.scheduler.request_completion_rescan_needed = true;
                 },
                 .request_deadline => {},
-                .fetch_completion => {
-                    self.egress.state.fetch_task_rescan_needed = true;
-                },
-                .fetch_body_ready => {
-                    self.egress.state.fetch_body_rescan_needed = true;
-                },
-                .fs_fault_completion => {
-                    self.fs_fault.rescan_needed = true;
-                },
+                // Egress items never reach here (`queueReadyWork`).
+                .fetch_completion, .fetch_body_ready => {},
                 .timer_callback, .immediate_callback => {},
             }
         }

@@ -47,15 +47,15 @@ fn withWorkerSettings(comptime settings: []const u8) []const u8 {
     return "{\"workers\": {\"api\": {\"routes\": {\"/x\": {\"entry\": \"app.js\"}}, \"settings\": " ++ settings ++ "}}}";
 }
 
-/// A one-worker configuration with `global` as its global settings.
-fn withGlobal(comptime global: []const u8) []const u8 {
-    return "{\"globalSettings\": " ++ global ++ ", \"workers\": {\"api\": {\"routes\": {\"/x\": {\"entry\": \"app.js\"}}}}}";
+/// A one-worker configuration whose top-level settings are `settings`.
+fn withSettings(comptime settings: []const u8) []const u8 {
+    return "{\"settings\": " ++ settings ++ ", \"workers\": {\"api\": {\"routes\": {\"/x\": {\"entry\": \"app.js\"}}}}}";
 }
 
 const full_source =
     \\{
-    \\  // Global defaults every worker starts from.
-    \\  "globalSettings": {
+    \\  // Server settings and the defaults every worker starts from.
+    \\  "settings": {
     \\    "listen": "0.0.0.0:9443",
     \\    "tls": { "certificate": "certs/cert.pem", "privateKey": "/etc/collo/key.pem" },
     \\    "analytics": { "directory": "./collo-analytics" },
@@ -95,7 +95,7 @@ test "a full configuration resolves the cascade and relative paths" {
     try std.testing.expectEqualStrings("users", users.name);
     try std.testing.expect(!users.settings.isolate_realm);
     // The worker names only memoryMiB; the other limits come from the
-    // global settings, not from the built-in defaults.
+    // top-level settings, not from the built-in defaults.
     try std.testing.expectEqual(@as(u32, 256), users.settings.limits.memory_mib);
     try std.testing.expectEqual(@as(u8, 2), users.settings.limits.concurrency);
     try std.testing.expectEqual(@as(u32, 20_000), users.settings.limits.timeout_ms);
@@ -178,11 +178,21 @@ test "the JSON layer rejects syntax errors, duplicate keys and open comments wit
 
 test "unknown keys are rejected with their key path" {
     try expectRejected("{\"colors\": 1}", "colors: unknown key");
-    try expectRejected(withGlobal("{\"port\": 1}"), "globalSettings.port: unknown key");
-    try expectRejected(withGlobal("{\"tls\": {\"certificate\": \"c\", \"privateKey\": \"k\", \"ca\": \"x\"}}"), "globalSettings.tls.ca: unknown key");
-    try expectRejected(withGlobal("{\"limits\": {\"cpu\": 1}}"), "globalSettings.limits.cpu: unknown key");
+    try expectRejected(withSettings("{\"port\": 1}"), config_path ++ ": settings.port: unknown key");
+    try expectRejected(withSettings("{\"tls\": {\"certificate\": \"c\", \"privateKey\": \"k\", \"ca\": \"x\"}}"), config_path ++ ": settings.tls.ca: unknown key");
+    try expectRejected(withSettings("{\"limits\": {\"cpu\": 1}}"), config_path ++ ": settings.limits.cpu: unknown key");
     try expectRejected(withWorkerSettings("{\"memoryMiB\": 1}"), "workers.api.settings.memoryMiB: unknown key");
     try expectRejected(withRoute("{\"entry\": \"app.js\", \"bogus\": true}"), "workers.api.routes.\"/x\".bogus: unknown key");
+}
+
+test "the top-level settings live under settings, and globalSettings is an unknown key named by its path" {
+    try expectRejected(
+        "{\"globalSettings\": {\"limits\": {\"memoryMiB\": 256}}, \"workers\": {\"api\": {\"routes\": {\"/x\": {\"entry\": \"app.js\"}}}}}",
+        config_path ++ ": globalSettings: unknown key",
+    );
+    var parsed = try parseOk(withSettings("{\"limits\": {\"memoryMiB\": 256}}"));
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u32, 256), parsed.defaults.limits.memory_mib);
 }
 
 test "structure and types are checked" {
@@ -194,10 +204,10 @@ test "structure and types are checked" {
     try expectRejected(withRoute("{}"), "workers.api.routes.\"/x\": missing key 'entry'");
     try expectRejected(withRoute("{\"entry\": \"\"}"), "routes.\"/x\".entry: the path is empty");
     try expectRejected(withRoute("{\"entry\": 7}"), "entry: expected a string, found a number");
-    try expectRejected(withGlobal("{\"isolateRealm\": \"yes\"}"), "globalSettings.isolateRealm: expected true or false");
-    try expectRejected(withGlobal("{\"tls\": {\"certificate\": \"c\"}}"), "globalSettings.tls: missing key 'privateKey'");
-    try expectRejected(withGlobal("{\"analytics\": {}}"), "globalSettings.analytics: missing key 'directory'");
-    try expectRejected(withGlobal("{\"listen\": \"localhost:8443\"}"), "globalSettings.listen: 'localhost:8443' is not an address");
+    try expectRejected(withSettings("{\"isolateRealm\": \"yes\"}"), config_path ++ ": settings.isolateRealm: expected true or false");
+    try expectRejected(withSettings("{\"tls\": {\"certificate\": \"c\"}}"), config_path ++ ": settings.tls: missing key 'privateKey'");
+    try expectRejected(withSettings("{\"analytics\": {}}"), config_path ++ ": settings.analytics: missing key 'directory'");
+    try expectRejected(withSettings("{\"listen\": \"localhost:8443\"}"), config_path ++ ": settings.listen: 'localhost:8443' is not an address");
 }
 
 test "names and route patterns follow their grammars" {
@@ -218,27 +228,27 @@ test "names and route patterns follow their grammars" {
 
 test "concurrency admits the largest a worker's page holds and refuses one more" {
     const max = server_limits.worker_concurrency_max;
-    var widest = try parseOk(withGlobal(std.fmt.comptimePrint("{{\"limits\": {{\"concurrency\": {d}}}}}", .{max})));
+    var widest = try parseOk(withSettings(std.fmt.comptimePrint("{{\"limits\": {{\"concurrency\": {d}}}}}", .{max})));
     defer widest.deinit();
     try std.testing.expectEqual(max, widest.defaults.limits.concurrency);
     try expectRejected(
-        withGlobal(std.fmt.comptimePrint("{{\"limits\": {{\"concurrency\": {d}}}}}", .{max + 1})),
-        std.fmt.comptimePrint("globalSettings.limits.concurrency: {d} is out of range; expected 1 to {d}", .{ max + 1, max }),
+        withSettings(std.fmt.comptimePrint("{{\"limits\": {{\"concurrency\": {d}}}}}", .{max + 1})),
+        std.fmt.comptimePrint(config_path ++ ": settings.limits.concurrency: {d} is out of range; expected 1 to {d}", .{ max + 1, max }),
     );
 }
 
 test "the limits are range checked" {
     try expectRejected(withWorkerSettings("{\"limits\": {\"concurrency\": 0}}"), "workers.api.settings.limits.concurrency: 0 is out of range");
-    try expectRejected(withGlobal("{\"limits\": {\"memoryMiB\": 8}}"), "memoryMiB: 8 is out of range");
-    try expectRejected(withGlobal("{\"limits\": {\"memoryMiB\": 1.5}}"), "memoryMiB: expected a whole number");
-    try expectRejected(withGlobal("{\"limits\": {\"memoryMiB\": \"128\"}}"), "memoryMiB: expected an integer, found a string");
-    try expectRejected(withGlobal("{\"limits\": {\"memoryMiB\": 99999999999999999999}}"), "memoryMiB: the number is out of range");
-    try expectRejected(withGlobal("{\"limits\": {\"timeoutMs\": 0}}"), "timeoutMs: 0 is out of range");
+    try expectRejected(withSettings("{\"limits\": {\"memoryMiB\": 8}}"), "memoryMiB: 8 is out of range");
+    try expectRejected(withSettings("{\"limits\": {\"memoryMiB\": 1.5}}"), "memoryMiB: expected a whole number");
+    try expectRejected(withSettings("{\"limits\": {\"memoryMiB\": \"128\"}}"), "memoryMiB: expected an integer, found a string");
+    try expectRejected(withSettings("{\"limits\": {\"memoryMiB\": 99999999999999999999}}"), "memoryMiB: the number is out of range");
+    try expectRejected(withSettings("{\"limits\": {\"timeoutMs\": 0}}"), "timeoutMs: 0 is out of range");
 }
 
 test "cpuMs is a per-request budget that cascades and is range checked" {
     var parsed = try parseOk(
-        \\{"globalSettings": {"limits": {"cpuMs": 50, "timeoutMs": 1000}},
+        \\{"settings": {"limits": {"cpuMs": 50, "timeoutMs": 1000}},
         \\ "workers": {
         \\   "inherits": {"routes": {"/a": {"entry": "a.js"}}},
         \\   "own": {"routes": {"/b": {"entry": "b.js"}}, "settings": {"limits": {"cpuMs": 2000}}}
@@ -248,17 +258,17 @@ test "cpuMs is a per-request budget that cascades and is range checked" {
     try std.testing.expectEqual(@as(?u32, 50), parsed.defaults.limits.cpu_ms);
     try std.testing.expectEqual(@as(?u32, 50), parsed.definitions[0].settings.limits.cpu_ms);
     try std.testing.expectEqual(@as(u64, 50 * std.time.ns_per_ms), parsed.definitions[0].settings.limits.cpuBudgetNs());
-    // A budget past the deadline is valid: crypto jobs run beside the VM
-    // thread, so CPU can outrun wall time.
+    // A budget past the deadline is accepted, although it never binds: a
+    // request's CPU on its one VM thread cannot outgrow its wall time.
     try std.testing.expectEqual(@as(?u32, 2000), parsed.definitions[1].settings.limits.cpu_ms);
     try std.testing.expectEqual(@as(u32, 1000), parsed.definitions[1].settings.limits.timeout_ms);
 
-    var none = try parseOk(withGlobal("{}"));
+    var none = try parseOk(withSettings("{}"));
     defer none.deinit();
     try std.testing.expectEqual(@as(?u32, null), none.definitions[0].settings.limits.cpu_ms);
     try std.testing.expectEqual(@as(u64, 0), none.definitions[0].settings.limits.cpuBudgetNs());
 
-    try expectRejected(withGlobal("{\"limits\": {\"cpuMs\": 0}}"), "globalSettings.limits.cpuMs: 0 is out of range");
+    try expectRejected(withSettings("{\"limits\": {\"cpuMs\": 0}}"), config_path ++ ": settings.limits.cpuMs: 0 is out of range");
     try expectRejected(
         withWorkerSettings(std.fmt.comptimePrint("{{\"limits\": {{\"cpuMs\": {d}}}}}", .{server_limits.request_cpu_ms_max + 1})),
         std.fmt.comptimePrint("workers.api.settings.limits.cpuMs: {d} is out of range; expected 1 to {d}", .{
@@ -275,11 +285,11 @@ test "binding kinds the runtime lacks are rejected as not supported yet" {
     try expectRejected(withRoute("{\"entry\": \"a.js\", \"bindings\": {\"DATA\": {\"text\": 1}}}"), "bindings.DATA.text: expected a string");
 }
 
-/// Global grant inherited by `inherits`'s routes, dropped by its `/drop`
+/// Top-level grant inherited by `inherits`'s routes, dropped by its `/drop`
 /// route; replaced by `own`'s settings, and that replaced again by its `/c`
 /// route.
 const network_source =
-    \\{"globalSettings": {"network": {"allow": ["api.example.com", "10.0.0.5:8080"], "allowPrivateNetworks": true}},
+    \\{"settings": {"network": {"allow": ["api.example.com", "10.0.0.5:8080"], "allowPrivateNetworks": true}},
     \\ "workers": {
     \\   "inherits": {"routes": {"/a": {"entry": "a.js"}, "/drop": {"entry": "a.js", "network": {"allow": []}}}},
     \\   "own": {"settings": {"network": {"allow": ["*"], "allowHttp": true}},
@@ -302,17 +312,17 @@ test "network cascades by replacing the inherited value whole, down to each rout
     var parsed = try parseOk(network_source);
     defer parsed.deinit();
 
-    const global = parsed.defaults.network.?;
-    try std.testing.expectEqual(@as(usize, 2), global.allow.len);
-    try std.testing.expectEqualStrings("api.example.com", global.allow[0].host.name);
-    try std.testing.expectEqual(@as(u16, 0), global.allow[0].port);
-    try std.testing.expectEqual([4]u8{ 10, 0, 0, 5 }, global.allow[1].host.ipv4);
-    try std.testing.expectEqual(@as(u16, 8080), global.allow[1].port);
-    try std.testing.expect(global.allow_private_networks);
-    try std.testing.expect(!global.allow_http);
+    const top_level = parsed.defaults.network.?;
+    try std.testing.expectEqual(@as(usize, 2), top_level.allow.len);
+    try std.testing.expectEqualStrings("api.example.com", top_level.allow[0].host.name);
+    try std.testing.expectEqual(@as(u16, 0), top_level.allow[0].port);
+    try std.testing.expectEqual([4]u8{ 10, 0, 0, 5 }, top_level.allow[1].host.ipv4);
+    try std.testing.expectEqual(@as(u16, 8080), top_level.allow[1].port);
+    try std.testing.expect(top_level.allow_private_networks);
+    try std.testing.expect(!top_level.allow_http);
 
     // A definition without its own value, and a route without one, run
-    // under the global value.
+    // under the top-level value.
     const inherits = parsed.definitions[0];
     try std.testing.expectEqual(@as(usize, 2), inherits.settings.network.?.allow.len);
     const route_a = inherits.routes[0].network.?;
@@ -324,7 +334,7 @@ test "network cascades by replacing the inherited value whole, down to each rout
     try std.testing.expect(!dropped.allow_private_networks);
     try std.testing.expect(!dropped.allow_http);
 
-    // A definition's value keeps none of the global entries or flags.
+    // A definition's value keeps none of the top-level entries or flags.
     const own = parsed.definitions[1];
     const own_value = own.settings.network.?;
     try std.testing.expectEqual(@as(usize, 1), own_value.allow.len);
@@ -346,34 +356,34 @@ test "a network entry the grammar refuses is named by its index and quoted" {
         withRoute("{\"entry\": \"a.js\", \"network\": {\"allow\": [\"api.example.com\", \"ok.example.com\", \"*.*.example.com\"]}}"),
         "workers.api.routes.\"/x\".network.allow[2]: '*.*.example.com': a wildcard is \"*\" alone or a leading \"*.\" before a host name",
     );
-    try expectRejected(withGlobal("{\"network\": {\"allow\": [\"*:8443\"]}}"), "globalSettings.network.allow[0]: '*:8443': \"*\" takes no port");
+    try expectRejected(withSettings("{\"network\": {\"allow\": [\"*:8443\"]}}"), config_path ++ ": settings.network.allow[0]: '*:8443': \"*\" takes no port");
     try expectRejected(
         withWorkerSettings("{\"network\": {\"allow\": [\"b\u{fc}cher.example\"]}}"),
         "workers.api.settings.network.allow[0]: 'b\u{fc}cher.example': a host must be ASCII; write an internationalized name in its xn-- form",
     );
-    try expectRejected(withGlobal("{\"network\": {\"allow\": [\"169.254.169.254\"]}}"), "globalSettings.network.allow[0]: '169.254.169.254': a link-local or cloud metadata address is never reachable");
-    try expectRejected(withGlobal("{\"network\": {\"allow\": [\"localhost\"]}}"), "globalSettings.network.allow[0]: 'localhost': localhost and its subdomains are never reachable");
-    try expectRejected(withGlobal("{\"network\": {\"allow\": [7]}}"), "globalSettings.network.allow[0]: expected a string, found a number");
+    try expectRejected(withSettings("{\"network\": {\"allow\": [\"169.254.169.254\"]}}"), config_path ++ ": settings.network.allow[0]: '169.254.169.254': a link-local or cloud metadata address is never reachable");
+    try expectRejected(withSettings("{\"network\": {\"allow\": [\"localhost\"]}}"), config_path ++ ": settings.network.allow[0]: 'localhost': localhost and its subdomains are never reachable");
+    try expectRejected(withSettings("{\"network\": {\"allow\": [7]}}"), config_path ++ ": settings.network.allow[0]: expected a string, found a number");
 }
 
 test "a network value is an object with an allow array and two flags" {
-    try expectRejected(withGlobal("{\"network\": {}}"), "globalSettings.network: missing key 'allow'");
-    try expectRejected(withGlobal("{\"network\": {\"allowHttp\": true}}"), "globalSettings.network: missing key 'allow'");
-    try expectRejected(withGlobal("{\"network\": {\"allow\": \"*\"}}"), "globalSettings.network.allow: expected an array, found a string");
-    try expectRejected(withGlobal("{\"network\": [\"*\"]}"), "globalSettings.network: expected an object, found an array");
+    try expectRejected(withSettings("{\"network\": {}}"), config_path ++ ": settings.network: missing key 'allow'");
+    try expectRejected(withSettings("{\"network\": {\"allowHttp\": true}}"), config_path ++ ": settings.network: missing key 'allow'");
+    try expectRejected(withSettings("{\"network\": {\"allow\": \"*\"}}"), config_path ++ ": settings.network.allow: expected an array, found a string");
+    try expectRejected(withSettings("{\"network\": [\"*\"]}"), config_path ++ ": settings.network: expected an object, found an array");
     try expectRejected(withWorkerSettings("{\"network\": {\"allow\": [], \"allowFtp\": true}}"), "workers.api.settings.network.allowFtp: unknown key");
-    try expectRejected(withGlobal("{\"network\": {\"allow\": [\"*\"], \"allowHttp\": 1}}"), "globalSettings.network.allowHttp: expected true or false");
+    try expectRejected(withSettings("{\"network\": {\"allow\": [\"*\"], \"allowHttp\": 1}}"), config_path ++ ": settings.network.allowHttp: expected true or false");
 }
 
 test "a network value that admits less than it says is refused at the key at fault" {
     try expectRejected(
-        withGlobal("{\"network\": {\"allow\": [\"api.example.com\", \"10.0.0.5:8080\"]}}"),
-        "globalSettings.network.allow[1]: '10.0.0.5:8080': the entry is a private address; set allowPrivateNetworks to allow it",
+        withSettings("{\"network\": {\"allow\": [\"api.example.com\", \"10.0.0.5:8080\"]}}"),
+        config_path ++ ": settings.network.allow[1]: '10.0.0.5:8080': the entry is a private address; set allowPrivateNetworks to allow it",
     );
     // "*" covers public addresses only, so the flag would admit nothing.
     try expectRejected(
-        withGlobal("{\"network\": {\"allow\": [\"*\"], \"allowPrivateNetworks\": true}}"),
-        "globalSettings.network.allowPrivateNetworks: allowPrivateNetworks needs an entry that names a private host or address",
+        withSettings("{\"network\": {\"allow\": [\"*\"], \"allowPrivateNetworks\": true}}"),
+        config_path ++ ": settings.network.allowPrivateNetworks: allowPrivateNetworks needs an entry that names a private host or address",
     );
     try expectRejected(
         withRoute("{\"entry\": \"a.js\", \"network\": {\"allow\": [], \"allowHttp\": true}}"),
@@ -385,7 +395,7 @@ test "a network value that admits less than it says is refused at the key at fau
         "workers.api.routes.\"/x\".network.allow[2]: 'api.example.com.': the entry repeats an earlier entry of the same list (allow[0])",
     );
 
-    var private = try parseOk(withGlobal("{\"network\": {\"allow\": [\"[fd12::1]:8443\"], \"allowPrivateNetworks\": true}}"));
+    var private = try parseOk(withSettings("{\"network\": {\"allow\": [\"[fd12::1]:8443\"], \"allowPrivateNetworks\": true}}"));
     defer private.deinit();
     const value = private.definitions[0].routes[0].network.?;
     try std.testing.expect(value.allow[0].host == .ipv6);

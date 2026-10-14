@@ -3,13 +3,12 @@
 //! dispatch's path, query, captures and headers), the performance timeline
 //! that belongs to the worker rather than to one request, and edge cases of
 //! `Headers`, JSON bodies, `URL` and `URLSearchParams`, with the count caps
-//! that refuse form-data, search-parameter and codec stream floods. Runs in
-//! `worker-test`; Web API conformance is covered by the `webapi` lane.
+//! that refuse form-data and search-parameter floods. Runs in `worker-test`;
+//! Web API conformance is covered by the `webapi` lane.
 
 const std = @import("std");
 const support = @import("bindings_support");
 const ipc = @import("collo_ipc");
-const worker_metrics_state = @import("collo_worker_state").metrics;
 const worker_shared_page = @import("collo_worker_state").page;
 const worker = @import("collo_worker");
 const rt = @import("collo_test_harness");
@@ -194,7 +193,7 @@ test "web api headers body json and fetch validation edge cases" {
     defer runtime.deinit();
     try runtime.attachHostRuntime();
 
-    const headers_response = try runRouteAndReadBody(&runtime, control_pair[1],
+    const headers_source =
         \\export default function handle() {
         \\    const source = {
         \\        *[Symbol.iterator]() {
@@ -266,7 +265,39 @@ test "web api headers body json and fetch validation edge cases" {
         \\        callThrows: throws(() => Headers())
         \\    });
         \\}
-    , 23, "/headers-iterable.js");
+    ;
+    const request_headers_source =
+        \\export default function handle(req) {
+        \\    return Response.json({
+        \\        repeat: req.headers.get("x-repeat"),
+        \\        proto: req.headers.get("__proto__")
+        \\    });
+        \\}
+    ;
+    const json_source =
+        \\export default async function handle(req) {
+        \\    let requestRejected = false;
+        \\    let responseRejected = false;
+        \\    try {
+        \\        await req.json();
+        \\    } catch (err) {
+        \\        requestRejected = err instanceof SyntaxError;
+        \\    }
+        \\    try {
+        \\        await new Response("").json();
+        \\    } catch (err) {
+        \\        responseRejected = err instanceof SyntaxError;
+        \\    }
+        \\    return Response.json({ requestRejected, responseRejected });
+        \\}
+    ;
+    try rt.bootRoutes(&runtime, &.{
+        .{ .specifier = "/headers-iterable.js", .source = headers_source },
+        .{ .specifier = "/request-header-pairs.js", .source = request_headers_source },
+        .{ .specifier = "/empty-json.js", .source = json_source },
+    });
+
+    const headers_response = try runRouteAndReadBody(&runtime, control_pair[1], headers_source, 23, "/headers-iterable.js");
     defer std.testing.allocator.free(headers_response);
     try std.testing.expect(std.mem.containsAtLeast(u8, headers_response, 1, "\"duck\":\"ok\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, headers_response, 1, "\"joined\":null"));
@@ -296,14 +327,7 @@ test "web api headers body json and fetch validation edge cases" {
     try std.testing.expect(std.mem.containsAtLeast(u8, headers_response, 1, "\"instance\":true"));
     try std.testing.expect(std.mem.containsAtLeast(u8, headers_response, 1, "\"callThrows\":true"));
 
-    const request_headers_response = try runRouteAndReadBodyWithRequest(&runtime, control_pair[1],
-        \\export default function handle(req) {
-        \\    return Response.json({
-        \\        repeat: req.headers.get("x-repeat"),
-        \\        proto: req.headers.get("__proto__")
-        \\    });
-        \\}
-    , 34, "/request-header-pairs.js", .{
+    const request_headers_response = try runRouteAndReadBodyWithRequest(&runtime, control_pair[1], request_headers_source, 34, "/request-header-pairs.js", .{
         .path = "/headers",
         .headers = &[_]ipc.RequestHeader{
             .{ .name = "host", .value = "demo.test" },
@@ -316,23 +340,7 @@ test "web api headers body json and fetch validation edge cases" {
     try std.testing.expect(std.mem.containsAtLeast(u8, request_headers_response, 1, "\"repeat\":\"a, b\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, request_headers_response, 1, "\"proto\":\"safe\""));
 
-    const json_response = try runRouteAndReadBody(&runtime, control_pair[1],
-        \\export default async function handle(req) {
-        \\    let requestRejected = false;
-        \\    let responseRejected = false;
-        \\    try {
-        \\        await req.json();
-        \\    } catch (err) {
-        \\        requestRejected = err instanceof SyntaxError;
-        \\    }
-        \\    try {
-        \\        await new Response("").json();
-        \\    } catch (err) {
-        \\        responseRejected = err instanceof SyntaxError;
-        \\    }
-        \\    return Response.json({ requestRejected, responseRejected });
-        \\}
-    , 24, "/empty-json.js");
+    const json_response = try runRouteAndReadBody(&runtime, control_pair[1], json_source, 24, "/empty-json.js");
     defer std.testing.allocator.free(json_response);
     try std.testing.expect(std.mem.containsAtLeast(u8, json_response, 1, "\"requestRejected\":true"));
     try std.testing.expect(std.mem.containsAtLeast(u8, json_response, 1, "\"responseRejected\":true"));
@@ -504,7 +512,7 @@ test "URL and URLSearchParams use WTF form encoding and stay associated" {
     , 23, "/url-search-params-wtf.js", "\"ok\":true");
 }
 
-test "web api count caps reject form data url params and codec stream floods" {
+test "web api count caps reject form data and url params floods" {
     var vm = try support.createVm();
     defer vm.deinit();
 
@@ -557,14 +565,6 @@ test "web api count caps reject form data url params and codec stream floods" {
         \\    }
         \\    const giantBoundaryRejected = boundaryError instanceof TypeError;
         \\
-        \\    const writer = new TextEncoderStream().writable.getWriter();
-        \\    const writes = [];
-        \\    for (let index = 0; index < 4200; index++)
-        \\        writes.push(writer.write(""));
-        \\    const settled = await Promise.allSettled(writes);
-        \\    const codecCountCapRejected = settled.some(
-        \\        (entry) => entry.status === "rejected" && isQuota(entry.reason));
-        \\
         \\    let paramsInitError = null;
         \\    try {
         \\        new URLSearchParams("a&".repeat(8200));
@@ -595,7 +595,6 @@ test "web api count caps reject form data url params and codec stream floods" {
         \\        urlencodedWithinCapWorks,
         \\        oversizedBlobRejected,
         \\        giantBoundaryRejected,
-        \\        codecCountCapRejected,
         \\        paramsInitRejected,
         \\        paramsAppendRejected,
         \\        paramsWithinCapWorks,
@@ -608,7 +607,6 @@ test "web api count caps reject form data url params and codec stream floods" {
     try std.testing.expect(std.mem.containsAtLeast(u8, response, 1, "\"urlencodedWithinCapWorks\":true"));
     try std.testing.expect(std.mem.containsAtLeast(u8, response, 1, "\"oversizedBlobRejected\":true"));
     try std.testing.expect(std.mem.containsAtLeast(u8, response, 1, "\"giantBoundaryRejected\":true"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, response, 1, "\"codecCountCapRejected\":true"));
     try std.testing.expect(std.mem.containsAtLeast(u8, response, 1, "\"paramsInitRejected\":true"));
     try std.testing.expect(std.mem.containsAtLeast(u8, response, 1, "\"paramsAppendRejected\":true"));
     try std.testing.expect(std.mem.containsAtLeast(u8, response, 1, "\"paramsWithinCapWorks\":true"));
@@ -628,9 +626,10 @@ test "a returned Response whose extraction throws writes the exception to the te
     defer std.posix.close(control_pair[1]);
     const page_fd = try worker_shared_page.createMemfd("server-api-extraction-throws");
     defer std.posix.close(page_fd);
-    var view = try worker_shared_page.mapReadWrite(page_fd);
+    var view = try worker_shared_page.mapWorkerWriter(page_fd);
     defer view.deinit();
-    view.initializeCrashDefault();
+    var reader = try worker_shared_page.mapHostReader(page_fd);
+    defer reader.deinit();
 
     var now_mono_ns: u64 = 0;
     var runtime = try worker.Runtime.init(std.testing.allocator, &vm, control_pair[0], &view, try rt.createCompletionEventfd(), .{
@@ -640,7 +639,7 @@ test "a returned Response whose extraction throws writes the exception to the te
     defer runtime.deinit();
     try runtime.attachHostRuntime();
 
-    const route_index = try rt.registerRoute(&runtime, "/__collo_route/demo/server-api-extraction-throws.js",
+    const route_index = try rt.registerRoute(&runtime, "/var/task/server-api-extraction-throws.js",
         \\export default function handle() {
         \\    const response = new Response(new ReadableStream());
         \\    response.body.getReader();
@@ -666,7 +665,7 @@ test "a returned Response whose extraction throws writes the exception to the te
     var scratch: [worker_shared_page.LOG_LINE_BYTES_MAX]u8 = undefined;
     var out: [16]worker_shared_page.DrainedLogLine = undefined;
     while (true) {
-        const count = try view.drainLogLinesChecked(&scratch, &out);
+        const count = try reader.drainLogLinesChecked(&scratch, &out);
         if (count == 0) break;
         for (out[0..count]) |line| {
             if (line.header.request_id != request_id)

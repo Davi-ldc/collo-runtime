@@ -1,8 +1,9 @@
 //! Tests of the egress TLS client on BoringSSL: the verified context loads,
 //! the ALPN offer values match the shim's ABI, an end-to-end handshake
-//! negotiates h2 and http/1.1, a socket connection reports a pending
-//! handshake step instead of blocking, and a memory-BIO connection hands out
-//! its handshake ciphertext without owning an fd.
+//! negotiates h2 and http/1.1, a memory-BIO connection hands out its
+//! handshake ciphertext without owning an fd and offers only what its offer
+//! names, and the session key carries cell, policy, host and port. The wire
+//! that holds a connection is covered by `wire.zig`.
 
 const std = @import("std");
 const tls = @import("collo_egress_client").tls;
@@ -20,7 +21,6 @@ test "egress TLS verified client context preloads through BoringSSL" {
 test "egress TLS ALPN offers preserve shim ABI" {
     try std.testing.expectEqual(boring.alpn_offer_http_1_1, @intFromEnum(tls.AlpnOffer.http_1_1));
     try std.testing.expectEqual(boring.alpn_offer_h2_http_1_1, @intFromEnum(tls.AlpnOffer.h2_http_1_1));
-    try std.testing.expectEqual(boring.alpn_offer_h2_only, @intFromEnum(tls.AlpnOffer.h2_only));
 }
 
 test "egress TLS client negotiates h2 and http1 through ALPN" {
@@ -31,37 +31,6 @@ test "egress TLS client negotiates h2 and http1 through ALPN" {
     }
     try std.testing.expectEqual(@as(c_int, boring.alpn_h2), result.h2_protocol);
     try std.testing.expectEqual(@as(c_int, boring.alpn_http_1_1), result.http11_protocol);
-}
-
-test "egress TLS exposes incremental handshake readiness" {
-    var fds: [2]i32 = undefined;
-    const rc = std.c.socketpair(
-        std.posix.AF.UNIX,
-        std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC | std.posix.SOCK.NONBLOCK,
-        0,
-        &fds,
-    );
-    switch (std.posix.errno(rc)) {
-        .SUCCESS => {},
-        else => |err| return std.posix.unexpectedErrno(err),
-    }
-    defer std.posix.close(fds[1]);
-
-    const stream = std.net.Stream{ .handle = fds[0] };
-    var connection = try tls.Connection.createUnhandshaken(
-        std.testing.allocator,
-        stream,
-        "example.com",
-        true,
-        .h2_http_1_1,
-        null,
-    );
-    defer connection.deinit();
-
-    switch (try connection.handshakeStep()) {
-        .wait => {},
-        .done => return error.ExpectedTlsHandshakeReadinessWait,
-    }
 }
 
 test "egress TLS memory BIO emits handshake ciphertext without owning an fd" {
@@ -86,7 +55,7 @@ test "egress TLS memory BIO emits handshake ciphertext without owning an fd" {
     switch (try connection.drainCiphertext(&ciphertext)) {
         .ready => |drained| {
             try std.testing.expectEqual(pending, drained);
-            try std.testing.expect(std.mem.indexOf(u8, ciphertext[0..drained], "h2") != null);
+            try std.testing.expectEqualStrings("\x02h2\x08http/1.1", try clientHelloAlpn(ciphertext[0..drained]));
         },
         .wait, .eof => return error.ExpectedTlsBioCiphertext,
     }
@@ -96,4 +65,80 @@ test "egress TLS memory BIO emits handshake ciphertext without owning an fd" {
         .wait => {},
         .ready, .eof => return error.ExpectedTlsBioEmptyDrainWait,
     }
+}
+
+test "an http/1.1-only offer leaves h2 out of the client hello" {
+    var connection = try tls.BioConnection.createUnhandshaken(
+        std.testing.allocator,
+        "example.com",
+        true,
+        .http_1_1,
+        null,
+    );
+    defer connection.deinit();
+    _ = try connection.handshakeStep();
+
+    var ciphertext: [16 * 1024]u8 = undefined;
+    switch (try connection.drainCiphertext(&ciphertext)) {
+        .ready => |drained| try std.testing.expectEqualStrings("\x08http/1.1", try clientHelloAlpn(ciphertext[0..drained])),
+        .wait, .eof => return error.ExpectedTlsBioCiphertext,
+    }
+}
+
+const record_type_handshake: u8 = 22;
+const handshake_type_client_hello: u8 = 1;
+const extension_type_alpn: u16 = 16;
+
+/// The protocol name list of the ALPN extension (RFC 7301 §3.1), each name
+/// after its one-byte length, from `record`, a TLS record that holds a
+/// whole ClientHello (RFC 8446 §4.1.2). The hello's random, session id and
+/// key shares are random bytes, so only the extension's own bytes can say
+/// what the client offered.
+fn clientHelloAlpn(record: []const u8) ![]const u8 {
+    var record_reader: std.Io.Reader = .fixed(record);
+    if (try record_reader.takeByte() != record_type_handshake)
+        return error.ExpectedHandshakeRecord;
+    try record_reader.discardAll(2); // legacy_record_version
+    var handshake: std.Io.Reader = .fixed(try record_reader.take(try record_reader.takeInt(u16, .big)));
+    if (try handshake.takeByte() != handshake_type_client_hello)
+        return error.ExpectedClientHello;
+    var hello: std.Io.Reader = .fixed(try handshake.take(try handshake.takeInt(u24, .big)));
+    try hello.discardAll(2 + 32); // legacy_version, random
+    try hello.discardAll(try hello.takeByte()); // legacy_session_id
+    try hello.discardAll(try hello.takeInt(u16, .big)); // cipher_suites
+    try hello.discardAll(try hello.takeByte()); // legacy_compression_methods
+    var extensions: std.Io.Reader = .fixed(try hello.take(try hello.takeInt(u16, .big)));
+    while (extensions.bufferedLen() != 0) {
+        const extension_type = try extensions.takeInt(u16, .big);
+        const data = try extensions.take(try extensions.takeInt(u16, .big));
+        if (extension_type != extension_type_alpn)
+            continue;
+        var alpn: std.Io.Reader = .fixed(data);
+        const names = try alpn.take(try alpn.takeInt(u16, .big));
+        if (alpn.bufferedLen() != 0)
+            return error.MalformedAlpnExtension;
+        return names;
+    }
+    return error.ExpectedAlpnExtension;
+}
+
+test "a TLS session key names the cell, the policy, the lowercased host and the port" {
+    var buffer: [tls.max_session_key_bytes]u8 = undefined;
+    const cell = [_]u8{0x11} ** 16;
+    const policy = [_]u8{0x22} ** 16;
+    const key = tls.buildSessionKey(&buffer, cell, policy, "Example.COM", 8443).?;
+
+    try std.testing.expectEqual(@as(usize, 16 + 16 + "example.com".len + 2), key.len);
+    try std.testing.expectEqualSlices(u8, &cell, key[0..16]);
+    try std.testing.expectEqualSlices(u8, &policy, key[16..32]);
+    try std.testing.expectEqualStrings("example.com", key[32 .. key.len - 2]);
+    try std.testing.expectEqual(@as(u16, 8443), std.mem.readInt(u16, key[key.len - 2 ..][0..2], .big));
+
+    // Another policy cell keys another ticket.
+    var other_buffer: [tls.max_session_key_bytes]u8 = undefined;
+    const other = tls.buildSessionKey(&other_buffer, cell, [_]u8{0x33} ** 16, "example.com", 8443).?;
+    try std.testing.expect(!std.mem.eql(u8, key, other));
+
+    try std.testing.expect(tls.buildSessionKey(&buffer, cell, policy, "", 443) == null);
+    try std.testing.expect(tls.buildSessionKey(&buffer, cell, policy, "a" ** 254, 443) == null);
 }

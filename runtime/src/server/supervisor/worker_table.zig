@@ -1,6 +1,8 @@
-//! The supervisor's record of one worker process, and the life of the storage
-//! that holds it: vacant, then holding one launched worker from `occupy`
-//! until `vacate`, then vacant again for the next launch of its pool entry.
+//! The supervisor's record of one worker process, the life of the storage
+//! that holds it, and what the server reads off the worker's page once it
+//! ends a request or the worker: vacant, then holding one launched worker
+//! from `occupy` until `vacate`, then vacant again for the next launch of
+//! its pool entry.
 //!
 //! A record belongs to one entry of one worker definition's pool for the
 //! server's life (`Supervisor.records` in `supervisor.zig`), so its
@@ -19,26 +21,34 @@
 //! the launcher thread and is read on the lanes, both under the mutex of the
 //! record's pool (`Pool.visitWorker` in `pool.zig`). `metrics_mutex` guards
 //! `page_mapped`, `boot_egress`, `boot_end_pending`, `log_drops_reported`,
-//! both ring marks (`log_ring_failed` and `usage_ring_failed`) and the usage
-//! and console cursors of the page view (`page.HostCursors`), and spans every
-//! drain of the worker's usage and console rings: the metrics thread's, a
-//! lane's settle, the reaper's final drain and the exiting thread's. The
-//! view's completion cursor belongs to the worker's reader lane. The
-//! forwarding window (`forwarded_in_queues`, `window_waiter`) and the body
-//! waiters are atomics any lane reads and writes without a lock. Lock order:
-//! `metrics_mutex` before the request table's own lock (`request_table.zig`),
-//! and never held across the boot token's end (`Supervisor.progressBootEgress`);
+//! `log_ring_failed` and the console cursor of the page view
+//! (`page.HostCursors`), and spans every drain of the worker's console ring:
+//! the metrics thread's and the teardown's
+//! (`worker_registry.teardown`). The forwarding window
+//! (`forwarded_in_queues`, `window_waiter`) and the body waiters are atomics
+//! any lane reads and writes without a lock. Lock order: `metrics_mutex`
+//! before the request table's own lock (`request_table.zig`), and never held
+//! across the boot token's end (`Supervisor.progressBootEgress`);
 //! `send_mutex` never nests with either.
+//!
+//! The page is the worker's memory, so everything read off it is the
+//! worker's claim. `usageFloor` and `classifyDeath` load each field once
+//! through the record's `HostReaderView`, and what they return enters only
+//! the records of this worker and of the request the caller names.
 
 const std = @import("std");
 const ipc = @import("collo_ipc");
 const process = @import("collo_os").process;
+const cgroup = @import("collo_cgroup");
 const process_limits = @import("collo_limits").process;
 const server_limits = @import("collo_limits").server;
 const server_lifecycle = @import("collo_server_lifecycle");
 const config = @import("collo_server_config");
+const access = @import("collo_server_analytics").access;
+const workers_log = @import("collo_server_analytics").workers;
 
 const host = @import("collo_host");
+const pool = @import("pool.zig");
 const request_table = @import("request_table.zig");
 const page = @import("collo_worker_state").page;
 
@@ -54,6 +64,47 @@ pub const BootToken = struct {
 pub const BootEndAttempt = struct {
     worker_key: server_lifecycle.WorkerKey,
     token: BootToken,
+};
+
+/// A dispatched request as its worker's live slot names it: the server's
+/// request id and the generation of the lane request slot that holds it
+/// (`lifecycle.RequestKey.generation`), both of which the dispatch carried
+/// to the worker.
+pub const LiveRequest = struct {
+    request_id: u64,
+    request_generation: u64,
+};
+
+/// How a worker died, as its page and its cgroup leaf tell it
+/// (`Record.classifyDeath`).
+pub const Death = enum {
+    /// Its sentinel stopped it past `memory.high` and stamped `memory` on
+    /// its page.
+    memory_high,
+    /// The kernel's OOM killer ended it at `memory.max`, which its leaf
+    /// counts as `oom_kill`.
+    memory_max,
+    /// Any other death: a fault, its own exit, or a deadline's grace.
+    crash,
+
+    /// The error code of the requests the death ended. A request's record
+    /// says only that its worker died of memory; the worker's line tells who
+    /// stopped it (`ending`).
+    pub fn errorCode(self: Death) access.ErrorCode {
+        return switch (self) {
+            .memory_high, .memory_max => .memory,
+            .crash => .crash,
+        };
+    }
+
+    /// The ending of the worker's line in `workers.jsonl`.
+    pub fn ending(self: Death) workers_log.Ending {
+        return switch (self) {
+            .memory_high => .memory_high,
+            .memory_max => .memory_max,
+            .crash => .crash,
+        };
+    }
 };
 
 pub const Record = struct {
@@ -75,21 +126,22 @@ pub const Record = struct {
     /// The worker definition this storage serves; its pool is
     /// `Supervisor.pools[definition_index]`.
     definition_index: config.DefinitionIndex,
-    /// The definition's name, borrowed from the configuration. Usage records
-    /// and console lines carry it as the worker name.
+    /// The definition's name, borrowed from the configuration. Console lines
+    /// and the worker's line in `workers.jsonl` carry it as the worker name.
     name: []const u8,
     /// The worker's process and channels, defined from `occupy` to `vacate`.
     handle: host.WorkerHandle,
     /// `ipc.max_message_bytes` bytes from the supervisor's allocator while the
     /// record holds a worker; `vacate` frees them.
     dispatch_send_scratch: []u8 = &.{},
-    /// Spans one drain of the worker's usage and console rings and guards
-    /// the fields the file header lists.
+    /// Spans one drain of the worker's console ring and guards the fields
+    /// the file header lists.
     metrics_mutex: std.Thread.Mutex = .{},
-    /// The page is mapped and its rings may be drained. Set by `occupy`,
-    /// cleared by the final drain (`usage_drain.drainFinal`) before `vacate`
-    /// unmaps it, both under `metrics_mutex`; every drain checks it under the
-    /// lock and skips a record without it.
+    /// The page is mapped and its console ring may be drained. Set by
+    /// `occupy`, cleared by the teardown's last drain
+    /// (`worker_registry.teardown`) before `vacate` unmaps it, both under
+    /// `metrics_mutex`; every drain checks it under the lock and skips a
+    /// record without it.
     page_mapped: bool = false,
     /// The worker's boot token until its end went out to its gateway or its
     /// deadline passed; null for a worker launched without one. Guarded by
@@ -108,15 +160,15 @@ pub const Record = struct {
     /// mutex; control-fd-only frames encoded in lane-local scratch are safe
     /// without it, since a frame is one atomic SEQPACKET syscall.
     send_mutex: std.Thread.Mutex = .{},
-    /// The requests dispatched to this worker and the completed ones whose
-    /// usage record is still expected (`request_table.zig`).
-    /// Locks itself.
+    /// The requests dispatched to this worker that have not ended, and the
+    /// routes of the last ones that did (`request_table.zig`). Locks itself.
     requests: request_table.RequestTable = .{},
     /// The forwarding window: the commands carrying this storage's workers'
-    /// output that wait in lanes' queues. A descriptor the reader forwards is
-    /// one unit from its post until its owner applies it, and a ring
-    /// payload's unit moves on to the owner's answer until the reader takes
-    /// it (`server/ingress/runner/h2_worker_ipc.zig`). The reader receives the
+    /// response output that wait in lanes' queues. A response descriptor the
+    /// reader forwards is one unit from its post until its owner applies it,
+    /// and a ring payload's unit moves on to the owner's answer until the
+    /// reader takes it; a forwarded `request_done` takes none
+    /// (`server/ingress/runner/h2_worker_ipc.zig`). The reader receives the
     /// worker's next packet only while a packet's worth of units still fits
     /// under `limits.ingress.forwarded_commands_per_worker_max`, which bounds
     /// the places one worker's output takes in any lane's queue. Units of one
@@ -147,12 +199,6 @@ pub const Record = struct {
     /// from the bit. Set once, under `metrics_mutex`; no drain reads the
     /// ring again.
     log_ring_failed: bool = false,
-    /// A drain found the usage record ring's head where no append puts it
-    /// (`RecordCursor.peek` in `common/worker_state/page/snapshots.zig`).
-    /// Set once, under `metrics_mutex`; no drain reads the ring again, the
-    /// worker's requests get floor records, and the metrics thread takes the
-    /// worker out of service (`server/ingress/analytics_drain.zig`).
-    usage_ring_failed: bool = false,
 
     /// What a launched worker brings to the record that holds it.
     pub const Occupant = struct {
@@ -217,7 +263,6 @@ pub const Record = struct {
         self.boot_work_ns = occupant.boot_work_ns;
         self.log_drops_reported = 0;
         self.log_ring_failed = false;
-        self.usage_ring_failed = false;
 
         self.metrics_mutex.lock();
         defer self.metrics_mutex.unlock();
@@ -244,8 +289,7 @@ pub const Record = struct {
         }
         if (!self.boot_end_pending) {
             const view = if (self.handle.metrics) |*mapped| mapped else return null;
-            const snapshot = page.LifecycleSnapshot.load(view.header);
-            self.boot_end_pending = snapshot.startupEnded();
+            self.boot_end_pending = view.loadLifecycle().startupEnded();
         }
         if (!self.boot_end_pending)
             return null;
@@ -266,6 +310,82 @@ pub const Record = struct {
         self.boot_end_pending = false;
     }
 
+    /// What `request` used on this worker as far as the worker's page tells,
+    /// for a request the server ended without the worker's `request_done`:
+    /// origin `server`, with the CPU the worker measured until then and none
+    /// of the measures only `request_done` carries. Pure: it changes nothing,
+    /// takes no lock and never fails. The caller is the lane that ends the
+    /// request, which still holds its pool slot `worker_slot`: the slot keeps
+    /// the page mapped, and the live slot at that index is the request's
+    /// (`DispatchWork.worker_slot` in `common/ipc/dispatch.zig`).
+    ///
+    /// The CPU is the live slot's, which the VM thread stores whenever it
+    /// charges the request a window, or, when the worker's sentinel last saw
+    /// the request running (`RunningOwnerSnapshot`), the larger of that and
+    /// the sentinel's count of the running window, which a stuck or dying VM
+    /// thread never stored. The two count the same CPU, so they never add. A
+    /// live slot that holds another request or none gives nothing, and a
+    /// death the server caused (`internal_error`) carries no CPU.
+    pub fn usageFloor(
+        self: *Record,
+        worker_slot: pool.Slot,
+        request: LiveRequest,
+        error_code: access.ErrorCode,
+    ) access.Usage {
+        std.debug.assert(request.request_id != 0);
+        std.debug.assert(worker_slot < page.LIVE_SLOT_COUNT);
+        var usage: access.Usage = .{ .origin = .server };
+        if (error_code == .internal_error)
+            return usage;
+        const view = if (self.handle.metrics) |*mapped| mapped else return usage;
+        // The slot's index is the request's pool slot, so its id and
+        // generation tell this request from one the slot held before it.
+        const live = view.loadLiveSlot(worker_slot);
+        if (live.matches(request.request_id, request.request_generation))
+            usage.cpu_ns = live.cpu_ns;
+        if (view.loadRunningOwner()) |running| {
+            if (running.owner_id == request.request_id)
+                usage.cpu_ns = @max(usage.cpu_ns, running.cpu_ns);
+        }
+        return usage;
+    }
+
+    /// How this worker died (`Death`). The page starts out stamped `crash`,
+    /// and the sentinel stamps `memory` before it exits under `memory.high`
+    /// pressure, which decides first. A kernel OOM kill at `memory.max` is a
+    /// SIGKILL the worker cannot stamp, so the worker's cgroup leaf, which
+    /// lives until `vacate`, is asked whether the kernel counted an
+    /// `oom_kill`. A leaf that cannot say keeps `crash`, with a warning. It
+    /// reads a cgroup file, so a lane that runs a death calls it once for
+    /// the worker, not once per request, and the reaper calls it before the
+    /// teardown removes the leaf.
+    pub fn classifyDeath(self: *Record) Death {
+        if (self.handle.metrics) |*view| {
+            // A reason outside `TerminationReason` says nothing, and the
+            // cgroup decides as it does for a crash.
+            const snapshot = view.loadLifecycle();
+            if (snapshot.knownTerminationReason()) |reason| {
+                if (reason == .memory)
+                    return .memory_high;
+            }
+        }
+        const events = cgroup.readLeafFigure(self.handle.leaf, .memory_events) catch |err| {
+            std.log.warn("worker death: memory.events.local read failed for worker_id={d}: {s}", .{
+                self.id,
+                @errorName(err),
+            });
+            return .crash;
+        };
+        if (events.oom_kill > 0) {
+            std.log.warn("worker death classified as out-of-memory: worker_id={d} oom_kill={d}", .{
+                self.id,
+                events.oom_kill,
+            });
+            return .memory_max;
+        }
+        return .crash;
+    }
+
     /// Sends SIGKILL to the worker through its pidfd. A worker that already
     /// exited is not an error.
     pub fn signalKill(self: *Record) void {
@@ -280,6 +400,13 @@ pub const Record = struct {
         };
     }
 
+    /// Whether the worker's process has exited, as its pidfd says now,
+    /// without waiting.
+    pub fn hasExited(self: *Record) bool {
+        std.debug.assert(self.id != 0);
+        return process.pidFdHasExited(self.handle.pidfd);
+    }
+
     /// Waits up to `PROCESS_EXIT_WAIT_MS` for the worker's process to exit,
     /// and reports whether it did. Blocks the calling thread, which is why
     /// only the reaper and the exiting thread call it.
@@ -291,11 +418,11 @@ pub const Record = struct {
 
     /// Releases what the record holds for its worker and leaves it vacant:
     /// the handle, whose `deinit` closes the worker's descriptors, unmaps its
-    /// page and payload rings, deletes its tmp root and removes its cgroup
-    /// leaf with retries, the wake set, and the send scratch, back to `gpa`.
-    /// Blocks on that teardown, so only the reaper and the exiting thread
-    /// call it, after the final drain unmapped the page for every drain
-    /// (`usage_drain.drainFinal`).
+    /// page and payload rings and removes its cgroup leaf with retries, the
+    /// wake set, and the send scratch, back to `gpa`. Blocks on that
+    /// teardown, so only the reaper and the exiting thread call it, after the
+    /// teardown's last console drain unmapped the page for every drain
+    /// (`worker_registry.teardown`).
     pub fn vacate(self: *Record, gpa: std.mem.Allocator) void {
         std.debug.assert(self.id != 0);
         std.debug.assert(!self.page_mapped);

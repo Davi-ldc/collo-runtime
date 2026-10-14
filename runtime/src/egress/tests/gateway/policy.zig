@@ -1,180 +1,137 @@
-//! The gateway's limits (`egress/gateway/policy.zig`): the isolation id of each policy of the
-//! hello's image, which changes with the policy's id, with the image and with the gateway's
-//! limits, the limits' own identity over every field, and limits a worker sends that cannot raise
-//! the gateway's. The image's layout and its policies are covered in `common/tests/network/`,
-//! their lookup by a verified token's policy id in `control_flow.zig` and admission, which refuses
-//! an id past the table, in `worker_flow.zig`. Lane: egress-gateway-test.
+//! The gateway's limits (`egress/gateway/policy.zig`): the shape check every fetch start passes
+//! before anything is allocated for it, which refuses zero ids, too many or too large headers and
+//! a request body past the limit, an empty announced pooled body included, and returns the
+//! policy's response cap; and the pool id of a network policy, which tells every two policies
+//! apart. Admission's order around the shape check is covered in `command_flow.zig`, and the
+//! comptime block of `policy.zig` holds `production` inside the IPC's bounds. Lane:
+//! egress-gateway-test.
 
 const std = @import("std");
 const gateway = @import("collo_egress_gateway");
-const limits = @import("collo_limits");
 const ipc = @import("collo_ipc");
+const limits = @import("collo_limits");
 const network = @import("collo_egress_client").network;
-
-const policy_image = @import("support/policy_image.zig");
 
 const policy = gateway.policy;
 
-test "each policy of an image has its own isolation id, which changes with its id, its image and the limits" {
-    const standard = try policy_image.standard(std.testing.allocator);
-    defer std.testing.allocator.free(standard);
-    // Another image whose policy 1 grants exactly what the standard image's policy 1 grants, so
-    // only the digest tells the two apart.
-    const any_host = [_]network.Pattern{.{ .host = .any, .port = 0 }};
-    const name = [_]network.Pattern{.{ .host = .{ .name = "api.example.test" }, .port = 0 }};
-    const settings = [_]network.Setting{ .{ .allow = &any_host }, .{ .allow = &name } };
-    const first_members = [_]usize{0};
-    const second_members = [_]usize{1};
-    const policies = [_][]const usize{ &first_members, &second_members };
-    const other = try policy_image.encode(std.testing.allocator, &settings, &policies);
-    defer std.testing.allocator.free(other);
-    const standard_digest = policy_image.digest(standard);
-    const other_digest = policy_image.digest(other);
-    try std.testing.expect(!std.mem.eql(u8, &standard_digest, &other_digest));
+test "a start within every limit passes and runs under the policy's response cap" {
+    const headers = [_]ipc.RequestHeader{
+        .{ .name = "accept", .value = "*/*" },
+        .{ .name = "x-trace", .value = "1" },
+    };
+    try std.testing.expectEqual(
+        limits.http_body.MATERIALIZED_BODY_BYTES_MAX,
+        try policy.checkStart(inlineStart(&headers, "hello"), policy.production),
+    );
+    // A start names no response cap, so a policy's own cap is the one a fetch gets.
+    var lower = policy.production;
+    lower.max_response_body_bytes = 4096;
+    try std.testing.expectEqual(@as(usize, 4096), try policy.checkStart(inlineStart(&headers, ""), lower));
+}
 
-    const limits_id = policy.policyIsolationId(policy.production);
-    const base = policy.networkPolicyIsolationId(limits_id, standard_digest, policy_image.public_https_id);
+test "a start with a zero fetch id or a zero body id is refused" {
+    var start = inlineStart(&.{}, "");
+    start.fetch_id = 0;
+    try std.testing.expectError(error.InvalidEgressGatewayFetchIdentity, policy.checkStart(start, policy.production));
+    start = inlineStart(&.{}, "");
+    start.body_id = 0;
+    try std.testing.expectError(error.InvalidEgressGatewayFetchIdentity, policy.checkStart(start, policy.production));
+}
 
-    // Equal inputs give equal ids, so a fetch's pooled connections are found again.
-    try expectSameId(base, policy.networkPolicyIsolationId(limits_id, standard_digest, policy_image.public_https_id));
+test "a start with more headers than the policy allows is refused, and one at the count passes" {
+    var limited = policy.production;
+    limited.max_request_headers = 2;
+    const two = [_]ipc.RequestHeader{
+        .{ .name = "a", .value = "1" },
+        .{ .name = "b", .value = "2" },
+    };
+    const three = two ++ [_]ipc.RequestHeader{.{ .name = "c", .value = "3" }};
+    _ = try policy.checkStart(inlineStart(&two, ""), limited);
+    try std.testing.expectError(error.TooManyFetchHeaders, policy.checkStart(inlineStart(&three, ""), limited));
+}
 
-    // Two policies of one image never share pools.
-    for (0..policy_image.standard_policy_count) |index| {
-        const id: network.PolicyId = @intCast(index);
-        const isolation_id = policy.networkPolicyIsolationId(limits_id, standard_digest, id);
-        for (index + 1..policy_image.standard_policy_count) |other_index| {
-            const other_id: network.PolicyId = @intCast(other_index);
-            try expectOtherId(isolation_id, policy.networkPolicyIsolationId(limits_id, standard_digest, other_id));
+test "a start whose header names and values pass the byte limit is refused, and one at it passes" {
+    var limited = policy.production;
+    limited.max_request_header_bytes = 10;
+    // Names and values both count: 4 + 6 bytes.
+    const at_limit = [_]ipc.RequestHeader{.{ .name = "name", .value = "valueX" }};
+    const past_limit = [_]ipc.RequestHeader{.{ .name = "name", .value = "valueXY" }};
+    _ = try policy.checkStart(inlineStart(&at_limit, ""), limited);
+    try std.testing.expectError(
+        error.EgressGatewayRequestHeadersTooLarge,
+        policy.checkStart(inlineStart(&past_limit, ""), limited),
+    );
+}
+
+test "an inline body past the request body limit is refused, and one at it passes" {
+    var limited = policy.production;
+    limited.max_request_body_bytes = 4;
+    _ = try policy.checkStart(inlineStart(&.{}, "four"), limited);
+    try std.testing.expectError(
+        error.EgressGatewayRequestBodyLimitExceeded,
+        policy.checkStart(inlineStart(&.{}, "five!"), limited),
+    );
+}
+
+test "a pooled body announcing nothing or more than the request body limit is refused before any buffer exists" {
+    var limited = policy.production;
+    limited.max_request_body_bytes = 1024;
+    _ = try policy.checkStart(pooledStart(1024), limited);
+    try std.testing.expectError(error.EgressGatewayRequestBodyLimitExceeded, policy.checkStart(pooledStart(1025), limited));
+    try std.testing.expectError(error.EgressGatewayRequestBodyLimitExceeded, policy.checkStart(pooledStart(0), limited));
+    // The production limit is the pooled-upload ceiling the IPC carries.
+    _ = try policy.checkStart(pooledStart(ipc.fetch_limits.request_body_pooled_bytes_max), policy.production);
+    try std.testing.expectError(
+        error.EgressGatewayRequestBodyLimitExceeded,
+        policy.checkStart(pooledStart(ipc.fetch_limits.request_body_pooled_bytes_max + 1), policy.production),
+    );
+}
+
+test "the pool id of a policy is its id in little-endian bytes, zero-padded, so two policies never share pools" {
+    const zero: policy.PoolIsolationId = @splat(0);
+    try std.testing.expectEqualSlices(u8, &zero, &policy.poolPolicyId(0));
+
+    var expected: policy.PoolIsolationId = @splat(0);
+    expected[0] = 0x02;
+    expected[1] = 0x01;
+    try std.testing.expectEqualSlices(u8, &expected, &policy.poolPolicyId(0x0102));
+
+    // Every id a hello's table can hold has a pool id of its own.
+    const ids = [_]network.PolicyId{ 0, 1, 2, 255, 256, std.math.maxInt(network.PolicyId) };
+    for (ids, 0..) |id, index| {
+        try std.testing.expectEqualSlices(u8, &policy.poolPolicyId(id), &policy.poolPolicyId(id));
+        for (ids[index + 1 ..]) |other| {
+            const first = policy.poolPolicyId(id);
+            const second = policy.poolPolicyId(other);
+            try std.testing.expect(!std.mem.eql(u8, &first, &second));
         }
     }
-
-    // One policy id of two images never shares pools.
-    try expectOtherId(base, policy.networkPolicyIsolationId(limits_id, other_digest, policy_image.public_https_id));
-
-    // Nor does one policy under other limits.
-    var other_limits = policy.production;
-    other_limits.max_redirects -= 1;
-    const other_limits_id = policy.policyIsolationId(other_limits);
-    try expectOtherId(
-        base,
-        policy.networkPolicyIsolationId(other_limits_id, standard_digest, policy_image.public_https_id),
-    );
 }
 
-test "the limits' identity changes with every field of the limits" {
-    const base = policy.Policy{};
-    const base_id = policy.policyIsolationId(base);
-    inline for (std.meta.fields(policy.Policy)) |field| {
-        var changed = base;
-        const value = &@field(changed, field.name);
-        switch (@typeInfo(field.type)) {
-            .bool => value.* = !value.*,
-            .int => value.* = if (value.* == std.math.maxInt(field.type)) value.* - 1 else value.* + 1,
-            else => @compileError("no variation for Policy." ++ field.name),
-        }
-        const changed_id = policy.policyIsolationId(changed);
-        if (std.mem.eql(u8, &base_id, &changed_id)) {
-            std.debug.print("policyIsolationId ignores Policy.{s}\n", .{field.name});
-            return error.TestUnexpectedResult;
-        }
-    }
-    // The network flags are no limit of the gateway's: each grant of a policy carries its own.
-    try std.testing.expect(!@hasField(policy.Policy, "allow_plain_http"));
-    try std.testing.expect(!@hasField(policy.Policy, "allow_private_networks"));
+/// An inline start with `headers` and `body` and nonzero ids.
+fn inlineStart(headers: []const ipc.RequestHeader, body: []const u8) ipc.EgressFetchStartView {
+    return .{
+        .fetch_id = 1,
+        .egress_token = ipc.egress_token.none,
+        .body_id = 2,
+        .method = "POST",
+        .url = "https://origin.test/",
+        .headers = headers,
+        .body = body,
+    };
 }
 
-test "egress gateway response body limit cannot be enlarged by worker IPC" {
-    const gateway_limit = limits.http_body.MATERIALIZED_BODY_BYTES_MAX;
-
-    try std.testing.expectEqual(
-        gateway_limit,
-        try policy.resolveMaxResponseBodyBytes(0, gateway_limit),
-    );
-    try std.testing.expectEqual(
-        @as(usize, 1024),
-        try policy.resolveMaxResponseBodyBytes(1024, gateway_limit),
-    );
-    try std.testing.expectError(
-        error.EgressGatewayResponseBodyLimitExceeded,
-        policy.resolveMaxResponseBodyBytes(gateway_limit + 1, gateway_limit),
-    );
-    try std.testing.expectError(
-        error.InvalidEgressGatewayResponseBodyLimit,
-        policy.resolveMaxResponseBodyBytes(0, 0),
-    );
-}
-
-test "egress gateway request body policy is capped by the pooled upload limit" {
-    try std.testing.expectEqual(
-        ipc.fetch_limits.request_body_pooled_bytes_max,
-        policy.default_max_request_body_bytes,
-    );
-    try std.testing.expectError(
-        error.InvalidEgressGatewayResponseBodyLimit,
-        policy.validate(.{
-            .max_request_body_bytes = ipc.fetch_limits.request_body_pooled_bytes_max + 1,
-        }),
-    );
-}
-
-test "egress gateway rejects impossible encoded response policy" {
-    try std.testing.expectError(
-        error.InvalidEgressGatewayResponseBodyLimit,
-        gateway.engine.Engine.init(std.testing.allocator, .{
-            .policy = .{
-                .max_encoded_response_bytes = 0,
-            },
-        }),
-    );
-}
-
-test "egress gateway rejects impossible body chunk policy" {
-    try std.testing.expectError(
-        error.InvalidEgressGatewayResponseBodyLimit,
-        gateway.engine.Engine.init(std.testing.allocator, .{
-            .policy = .{
-                .max_body_chunk_bytes = 0,
-            },
-        }),
-    );
-    try std.testing.expectError(
-        error.InvalidEgressGatewayResponseBodyLimit,
-        gateway.engine.Engine.init(std.testing.allocator, .{
-            .policy = .{
-                .max_body_chunk_bytes = ipc.egress_shared.body_pool_capacity + 1,
-            },
-        }),
-    );
-    try std.testing.expectError(
-        error.InvalidEgressGatewayResponseBodyLimit,
-        gateway.engine.Engine.init(std.testing.allocator, .{
-            .policy = .{
-                .max_request_header_bytes = ipc.fetch_limits.request_headers_bytes_max + 1,
-            },
-        }),
-    );
-    try std.testing.expectError(
-        error.InvalidEgressGatewayResponseBodyLimit,
-        gateway.engine.Engine.init(std.testing.allocator, .{
-            .policy = .{
-                .max_fetches_per_request = 0,
-            },
-        }),
-    );
-    try std.testing.expectError(
-        error.InvalidEgressGatewayResponseBodyLimit,
-        gateway.engine.Engine.init(std.testing.allocator, .{
-            .policy = .{
-                .max_active_fetches_per_security_cell = 0,
-            },
-        }),
-    );
-}
-
-fn expectSameId(expected: policy.PoolIsolationId, actual: policy.PoolIsolationId) !void {
-    try std.testing.expectEqualSlices(u8, &expected, &actual);
-}
-
-fn expectOtherId(first: policy.PoolIsolationId, second: policy.PoolIsolationId) !void {
-    try std.testing.expect(!std.mem.eql(u8, &first, &second));
+/// A start whose body comes through the upload pool, announcing `pooled_body_len` bytes.
+fn pooledStart(pooled_body_len: u64) ipc.EgressFetchStartView {
+    return .{
+        .fetch_id = 1,
+        .egress_token = ipc.egress_token.none,
+        .body_id = 2,
+        .flags = ipc.egress_fetch_start_flag_body_pooled,
+        .method = "POST",
+        .url = "https://origin.test/",
+        .headers = &.{},
+        .body = "",
+        .pooled_body_len = pooled_body_len,
+    };
 }

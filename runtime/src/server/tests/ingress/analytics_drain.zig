@@ -1,23 +1,22 @@
-//! How ingress produces and drains its records: the status and the worker
-//! fault an access record carries for each way a request ends, and the usage
-//! settle each way implies (`endingFor` and `settleOutcomeFor` in
-//! `runner/request_finish.zig`), and the metrics tick of
+//! How ingress produces and drains its records: the status, error code and
+//! worker fault an access record carries for each way a request ends, and
+//! the usage a `request_done` gives it (`endingFor`, `doneHttpStatus` and
+//! `usageOfDone` in `runner/request_finish.zig`), and the metrics tick of
 //! `ingress/analytics_drain.zig`: it moves every lane's access ring into the
-//! sink and flushes it; it drains each worker's console lines before its
-//! usage records, moving the worker it drains first along the supervisor's
-//! records, writing each line under the worker's definition name and under
-//! the request and route the worker's request table confirms; and it takes
-//! out of service, once, a worker whose usage ring head moved back behind the
-//! server's tail or whose VM thread overran its owner's deadline. Lane
+//! sink and flushes it; it drains each worker's console lines, moving the
+//! worker it drains first along the supervisor's records, writing each line
+//! under the worker's definition name and under the request and route the
+//! worker's request table confirms; and it takes out of service, once, a
+//! worker whose VM thread overran its owner's deadline. Lane
 //! `server-ingress-test`; draining one log ring is covered in
 //! `tests/analytics/logs.zig`, the encoders and the sink in the rest of
-//! `tests/analytics/`, the usage drain's own handling of a failed ring in
+//! `tests/analytics/`, the floor of a request the server ended in
 //! `tests/supervisor/usage.zig`, and the request table's ring of ended
 //! requests in `tests/supervisor/`.
 
 const std = @import("std");
+const ipc = @import("collo_ipc");
 const analytics = @import("collo_server_analytics");
-const page = @import("collo_worker_state").page;
 const server_main = @import("collo_server_main");
 const supervision = @import("collo_server_supervisor");
 const fixture = @import("supervisor_fixture");
@@ -34,11 +33,10 @@ const access = analytics.access;
 const file_bytes_max = 16 * 1024 * 1024;
 
 test "an ended request's access record carries the status of the answer its client got" {
-    var completion = std.mem.zeroes(page.WorkerCompletionRecord);
-    completion.http_status = 201;
+    const done: ipc.ingress_channel.RequestDone = .{ .status = .ok, .http_status = 201 };
     // The worker's own status, whether or not its response went out; the
     // lane writes no response of its own.
-    const answered = request_finish.endingFor(.{ .worker_completion = completion });
+    const answered = request_finish.endingFor(.{ .worker_done = done });
     try std.testing.expectEqual(@as(u16, 201), answered.status);
     try std.testing.expectEqual(@as(?server_responses.Id, null), answered.response);
 
@@ -83,35 +81,60 @@ test "an ended request's access record carries the status of the answer its clie
     try std.testing.expectEqual(@as(?fault.WorkerFaultReason, null), request_finish.endingFor(.send_expired).worker_fault);
 }
 
-test "a request the server ended settles a floor with its error code and the label of the worker fault that ended it" {
-    // The worker's completion means it wrote its own record, and a request
-    // whose begin never reached the worker leaves no usage at all.
-    const completion = std.mem.zeroes(page.WorkerCompletionRecord);
-    try std.testing.expect(request_finish.settleOutcomeFor(true, .{ .worker_completion = completion }) == .completed);
+test "a request the server ended reports the error code and the worker fault that ended it" {
     const died: request_finish.RequestOutcome = .{ .worker_died = .{ .status = .crash, .reason = .packet_short } };
-    try std.testing.expect(request_finish.settleOutcomeFor(false, died) == .abandoned);
-    try std.testing.expect(request_finish.settleOutcomeFor(false, .send_expired) == .abandoned);
-
-    const floors = [_]struct {
+    const endings = [_]struct {
         outcome: request_finish.RequestOutcome,
-        status: page.CompletedStatus,
-        worker_fault: []const u8,
+        error_code: access.ErrorCode,
+        worker_fault: ?fault.WorkerFaultReason,
     }{
-        .{ .outcome = died, .status = .crash, .worker_fault = "packet_short" },
-        .{ .outcome = .{ .deadline_expired = .deadline_grace_expired }, .status = .deadline, .worker_fault = "deadline_grace_expired" },
-        .{ .outcome = .{ .deadline_expired = .owner_overran }, .status = .deadline, .worker_fault = "owner_overran" },
-        .{ .outcome = .stream_gone, .status = .client_closed, .worker_fault = "" },
-        .{ .outcome = .shutdown, .status = .internal_error, .worker_fault = "" },
+        .{ .outcome = died, .error_code = .crash, .worker_fault = .packet_short },
+        .{ .outcome = .{ .worker_died = .{ .status = .memory, .reason = .exited } }, .error_code = .memory, .worker_fault = .exited },
+        .{ .outcome = .{ .deadline_expired = .deadline_grace_expired }, .error_code = .deadline, .worker_fault = .deadline_grace_expired },
+        .{ .outcome = .{ .deadline_expired = .owner_overran }, .error_code = .deadline, .worker_fault = .owner_overran },
+        .{ .outcome = .send_expired, .error_code = .deadline, .worker_fault = null },
+        .{ .outcome = .stream_gone, .error_code = .client_closed, .worker_fault = null },
+        .{ .outcome = .shutdown, .error_code = .internal_error, .worker_fault = null },
+        .{ .outcome = .waiter_expired, .error_code = .done, .worker_fault = null },
     };
-    for (floors) |case| {
-        switch (request_finish.settleOutcomeFor(true, case.outcome)) {
-            .floor => |floor| {
-                try std.testing.expectEqual(case.status, floor.status);
-                try std.testing.expectEqualStrings(case.worker_fault, floor.worker_fault);
-            },
-            .completed, .abandoned => return error.ExpectedFloor,
-        }
+    for (endings) |case| {
+        const ending = request_finish.endingFor(case.outcome);
+        try std.testing.expectEqual(case.error_code, ending.error_code);
+        try std.testing.expectEqual(case.worker_fault, ending.worker_fault);
     }
+}
+
+test "a request_done gives the record the worker's error code, its status, and its measures as the worker's usage" {
+    const done: ipc.ingress_channel.RequestDone = .{
+        .status = .js_exception,
+        .http_status = 500,
+        .exec_ns = 11,
+        .waiting_ns = 12,
+        .io_ns = 13,
+        .cpu_ns = 14,
+        .client_served_bytes = 15,
+        .fetch_sent_bytes = 16,
+        .fetch_received_bytes = 17,
+    };
+    const ending = request_finish.endingFor(.{ .worker_done = done });
+    try std.testing.expectEqual(access.ErrorCode.js_exception, ending.error_code);
+    try std.testing.expectEqual(@as(u16, 500), ending.status);
+    const usage = request_finish.usageOfDone(done);
+    try std.testing.expectEqual(access.Origin.worker, usage.origin);
+    try std.testing.expectEqual(@as(u64, 11), usage.exec_ns);
+    try std.testing.expectEqual(@as(u64, 12), usage.waiting_ns);
+    try std.testing.expectEqual(@as(u64, 13), usage.io_ns);
+    try std.testing.expectEqual(@as(u64, 14), usage.cpu_ns);
+    try std.testing.expectEqual(@as(u64, 15), usage.client_served_bytes);
+    try std.testing.expectEqual(@as(u64, 16), usage.fetch_sent_bytes);
+    try std.testing.expectEqual(@as(u64, 17), usage.fetch_received_bytes);
+
+    // A worker that answered no status: the 499 of a client that went away,
+    // otherwise the 502 the lane answers a stream left without a head.
+    const closed: ipc.ingress_channel.RequestDone = .{ .status = .client_closed, .http_status = 0 };
+    try std.testing.expectEqual(request_finish.client_closed_status, request_finish.doneHttpStatus(closed));
+    const crashed: ipc.ingress_channel.RequestDone = .{ .status = .worker_crash, .http_status = 0 };
+    try std.testing.expectEqual(@as(u16, 502), request_finish.doneHttpStatus(crashed));
 }
 
 test "an owner overruns its deadline only past the grace, and a deadline near the top of the clock never wraps into an early fault" {
@@ -139,8 +162,7 @@ const FakeLane = struct {
 /// The service as the metrics thread reads it, over a fixture supervisor
 /// whose pools take a worker out of service for real. It keeps each death it
 /// is asked to announce instead of posting it to lanes. `analytics` is a
-/// sink of the test's own, whose console the test reads back; the
-/// supervisor's sink takes the usage records.
+/// sink of the test's own, whose console the test reads back.
 const Service = struct {
     supervisor: *supervision.Supervisor,
     analytics: *analytics.Sink,
@@ -253,13 +275,6 @@ test "a drain tick moves every lane's access records into access.jsonl" {
     try std.testing.expect(std.mem.indexOf(u8, written, "\"client_ip\":\"127.0.0.1\"") != null);
 }
 
-/// The view of `worker`'s shared page, which the record owns.
-fn pageOf(worker: *WorkerRecord) !*page.WorkerWriterView {
-    if (worker.handle.metrics) |*view|
-        return view;
-    return error.NoSharedPage;
-}
-
 test "the worker a tick drains first moves along the records every tick, under its definition name" {
     var supervisor = try fixture.minimalSupervisor(std.testing.allocator);
     defer fixture.deinitMinimal(&supervisor);
@@ -268,14 +283,18 @@ test "the worker a tick drains first moves along the records every tick, under i
     defer output.deinit();
     const first = try fixture.publishInertWorker(&supervisor, .{ .definition_index = 0 });
     const second = try fixture.publishInertWorker(&supervisor, .{ .definition_index = 1 });
+    var first_page = try fixture.WorkerPage.attach(first);
+    defer first_page.deinit();
+    var second_page = try fixture.WorkerPage.attach(second);
+    defer second_page.deinit();
 
     var no_lanes = [_]FakeLane{};
     var service = Service{ .supervisor = &supervisor, .analytics = &output.sink, .lanes = &no_lanes };
     // A worker that fills the console buffer alone crowds out whoever drains
     // after it, so the order must not always favor the same worker.
     for (0..2) |tick| {
-        (try pageOf(first)).publishLogLine(.info, 0, 0, 1_000_000_000, if (tick == 0) "a" else "c");
-        (try pageOf(second)).publishLogLine(.info, 0, 0, 1_000_000_000, if (tick == 0) "b" else "d");
+        first_page.writer.publishLogLine(.info, 0, 0, 1_000_000_000, if (tick == 0) "a" else "c");
+        second_page.writer.publishLogLine(.info, 0, 0, 1_000_000_000, if (tick == 0) "b" else "d");
         service.tickAt(tick_clock);
     }
     try std.testing.expectEqual(@as(usize, 0), service.announcements);
@@ -300,14 +319,16 @@ test "a console line keeps its request id only when the worker's request table c
     try output.init(true);
     defer output.deinit();
     const worker = try fixture.publishInertWorker(&supervisor, .{});
-    const view = try pageOf(worker);
+    var worker_page = try fixture.WorkerPage.attach(worker);
+    defer worker_page.deinit();
+    const view = &worker_page.writer;
 
     // Request 5 is in flight on the worker; request 7 ran on it and ended,
     // which leaves it only in the table's ring of ended requests; request 9
     // was never sent to it, such as another worker's request.
     try worker.requests.record(fixture.dispatchedRequest(5));
     try worker.requests.record(fixture.dispatchedRequest(7));
-    try std.testing.expect(worker.requests.settle(7, false) == .freed);
+    worker.requests.end(7);
     view.publishLogLine(.info, 0, 5, 1_000_000_000, "live");
     view.publishLogLine(.info, 0, 7, 1_000_000_000, "ended");
     view.publishLogLine(.warn, 0, 9, 1_000_000_000, "forged");
@@ -315,10 +336,7 @@ test "a console line keeps its request id only when the worker's request table c
 
     var no_lanes = [_]FakeLane{};
     var service = Service{ .supervisor = &supervisor, .analytics = &output.sink, .lanes = &no_lanes };
-    const refused_before = supervisor.usage_counters.console_ids_refused.load(.monotonic);
     service.tickAt(tick_clock);
-    // Only the forged id counts; a line under no request names none.
-    try std.testing.expectEqual(refused_before + 1, supervisor.usage_counters.console_ids_refused.load(.monotonic));
 
     const console = try output.readConsole();
     defer std.testing.allocator.free(console);
@@ -348,76 +366,6 @@ test "a console line keeps its request id only when the worker's request table c
     try std.testing.expect(lines.next() == null);
 }
 
-test "a console line of a request whose usage record the same tick drains still prints the request's route" {
-    var supervisor = try fixture.minimalSupervisor(std.testing.allocator);
-    defer fixture.deinitMinimal(&supervisor);
-    var output: OwnSink = undefined;
-    try output.init(false);
-    defer output.deinit();
-    const worker = try fixture.publishInertWorker(&supervisor, .{});
-
-    // Request 3 completed: its entry awaits the usage record already in the
-    // ring, and the tick's usage drain frees that entry. Console lines drain
-    // first, so the line finds the entry itself rather than the table's ring
-    // of ended requests, which would find it too.
-    try fixture.publishCompletedRecord(worker, 3);
-    (try pageOf(worker)).publishLogLine(.info, 0, 3, 1_000_000_000, "done");
-
-    var no_lanes = [_]FakeLane{};
-    var service = Service{ .supervisor = &supervisor, .analytics = &output.sink, .lanes = &no_lanes };
-    service.tickAt(tick_clock);
-    try std.testing.expect(worker.requests.dispatchedFor(3) == null);
-
-    const console = try output.readConsole();
-    defer std.testing.allocator.free(console);
-    try std.testing.expectEqualStrings("[demo /demo/*] done\n", console);
-}
-
-test "a usage ring head the worker moves back between a drain's peek and its advance faults the worker within one metrics tick" {
-    var supervisor = try fixture.minimalSupervisorWithAnalytics(std.testing.allocator, null);
-    defer fixture.deinitMinimal(&supervisor);
-    const worker = try fixture.publishInertWorker(&supervisor, .{});
-    try fixture.publishCompletedRecord(worker, 1);
-    try fixture.publishCompletedRecord(worker, 2);
-
-    // A drain peeks both records through the server's cursor, the worker
-    // stores its head back by one, and the drain's advance moves the tail
-    // past what the peek saw without loading the head again.
-    const view = try pageOf(worker);
-    const cursor = &view.host_cursors.records;
-    const peeked = cursor.peek(view.header) orelse return error.TestExpectedPeek;
-    try std.testing.expectEqual(@as(u64, 2), peeked.count);
-    @atomicStore(u64, &view.header.records_head, 1, .release);
-    cursor.advance(view.header, peeked, peeked.count);
-
-    var no_lanes = [_]FakeLane{};
-    var service = Service{
-        .supervisor = &supervisor,
-        .analytics = supervisor.analytics,
-        .lanes = &no_lanes,
-    };
-    service.tickAt(tick_clock);
-
-    // The tick's usage drain found the head behind the tail and failed the
-    // ring, and the same tick took the worker out of service for it.
-    try std.testing.expect(worker.usage_ring_failed);
-    try std.testing.expectEqual(@as(usize, 1), service.announcements);
-    const announced = service.announced orelse return error.TestExpectedDeath;
-    try std.testing.expectEqual(worker.key(), announced.worker_key);
-    try std.testing.expectEqual(fault.WorkerFaultReason.usage_record_protocol, announced.reason);
-    // No lane holds or reads the worker, so its retirement is due at once.
-    try std.testing.expect(announced.retire);
-    const entry = supervisor.poolFor(worker.definition_index).inspect(worker) orelse return error.TestExpectedWorker;
-    try std.testing.expectEqual(supervision.pool.EntryState.dead, entry.state);
-    // The tail stays where the peek put it, on the server and on the page.
-    try std.testing.expectEqual(@as(u64, 2), cursor.tail);
-    try std.testing.expectEqual(@as(u64, 2), @atomicLoad(u64, &view.header.records_tail, .acquire));
-
-    // Every later tick sees the failed ring again and announces nothing.
-    service.tickAt(tick_clock);
-    try std.testing.expectEqual(@as(usize, 1), service.announcements);
-}
-
 test "a worker whose VM thread works for an owner 400 ms past its deadline is faulted once as owner_overran; 100 ms past, or no deadline, is left in service" {
     var supervisor = try fixture.minimalSupervisor(std.testing.allocator);
     defer fixture.deinitMinimal(&supervisor);
@@ -427,10 +375,16 @@ test "a worker whose VM thread works for an owner 400 ms past its deadline is fa
     const hung = try fixture.publishInertWorker(&supervisor, .{ .definition_index = 0 });
     const late = try fixture.publishInertWorker(&supervisor, .{ .definition_index = 1 });
     const idle = try fixture.publishInertWorker(&supervisor, .{ .definition_index = 2 });
+    var hung_page = try fixture.WorkerPage.attach(hung);
+    defer hung_page.deinit();
+    var late_page = try fixture.WorkerPage.attach(late);
+    defer late_page.deinit();
+    var idle_page = try fixture.WorkerPage.attach(idle);
+    defer idle_page.deinit();
     const now_ns = tick_clock.mono_now_ns;
-    (try pageOf(hung)).publishOwner(std.math.maxInt(u64), now_ns - 400 * std.time.ns_per_ms);
-    (try pageOf(late)).publishOwner(41, now_ns - 100 * std.time.ns_per_ms);
-    (try pageOf(idle)).publishOwner(0, 0);
+    hung_page.writer.publishOwner(std.math.maxInt(u64), now_ns - 400 * std.time.ns_per_ms);
+    late_page.writer.publishOwner(41, now_ns - 100 * std.time.ns_per_ms);
+    idle_page.writer.publishOwner(0, 0);
 
     var no_lanes = [_]FakeLane{};
     var service = Service{ .supervisor = &supervisor, .analytics = supervisor.analytics, .lanes = &no_lanes };
@@ -460,7 +414,9 @@ test "the exiting thread's last drain marks an owner overrun without announcing 
     var supervisor = try fixture.minimalSupervisor(std.testing.allocator);
     defer fixture.deinitMinimal(&supervisor);
     const hung = try fixture.publishInertWorker(&supervisor, .{});
-    (try pageOf(hung)).publishOwner(1, tick_clock.mono_now_ns - std.time.ns_per_s);
+    var hung_page = try fixture.WorkerPage.attach(hung);
+    defer hung_page.deinit();
+    hung_page.writer.publishOwner(1, tick_clock.mono_now_ns - std.time.ns_per_s);
 
     var no_lanes = [_]FakeLane{};
     var service = Service{ .supervisor = &supervisor, .analytics = supervisor.analytics, .lanes = &no_lanes };

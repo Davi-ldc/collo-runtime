@@ -35,8 +35,8 @@ pub const Completion = struct {
 /// work item, or leaves it for `collectReady` when the ready queue and its
 /// backlog are full. Takes `value` on every path. A token whose task is
 /// gone, belongs to another request or generation, no longer waits on a
-/// thenable, or was canceled or timed out is counted as stale and dropped
-/// without an error. Fails only when the pending map cannot grow.
+/// thenable, or was canceled or timed out is stale and dropped without an
+/// error. Fails only when the pending map cannot grow.
 pub fn schedule(
     runtime: anytype,
     token: request_task.TaskToken,
@@ -50,19 +50,13 @@ pub fn schedule(
     defer if (!moved)
         owned_value.deinit();
 
-    const task = runtime.requests.tasks.get(token) orelse {
-        runtime.observability.stale_task_completion_count += 1;
-        return;
-    };
+    const task = runtime.requests.tasks.get(token) orelse return;
     if (task.request_id != request_id or
         task.request_generation != request_generation or
         task.state != .waiting_thenable or
         task.canceled or
         task.timed_out)
-    {
-        runtime.observability.stale_task_completion_count += 1;
         return;
-    }
 
     const ready_at_mono_ns = runtime.nowMonoNs();
     try runtime.requests.pending_completions.putNoClobber(runtime.core.allocator, request_id, .{

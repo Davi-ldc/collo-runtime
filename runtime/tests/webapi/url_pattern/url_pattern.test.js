@@ -65,8 +65,10 @@ describe("URLPattern", () => {
     assert.throws(() => URLPattern({ pathname: "*" }), TypeError);
     assert.equal(Object.prototype.toString.call(new URLPattern({})), "[object URLPattern]");
 
+    // WebIDL interface objects are not enumerable on the global object.
     const globalDescriptor = Object.getOwnPropertyDescriptor(globalThis, "URLPattern");
-    assert.equal(globalDescriptor.enumerable, true);
+    assert.equal(globalDescriptor.enumerable, false);
+    assert.equal(Object.keys(globalThis).includes("URLPattern"), false);
     assert.equal(globalDescriptor.configurable, true);
     assert.equal(globalDescriptor.writable, true);
 
@@ -226,7 +228,8 @@ describe("URLPattern", () => {
       });
     }
     assert.equal(pattern.test(input), true);
-    assert.deepEqual(reads, [...kComponents, "baseURL"]);
+    // WebIDL reads a dictionary's members in lexicographic order of their names.
+    assert.deepEqual(reads, ["baseURL", "hash", "hostname", "password", "pathname", "port", "protocol", "search", "username"]);
   });
 
   test("pathname fast path validates absolute URLs and bases before matching", () => {

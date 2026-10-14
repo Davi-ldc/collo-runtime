@@ -22,6 +22,7 @@ fn dispatchWork() !ipc.DispatchWork {
         .request_generation = 9,
         .request_lane_id = 3,
         .request_slot = 12,
+        .worker_slot = 0,
         .authority = "demo.example.test",
         .deadline_monotonic_ns = 0,
         .method = "POST",
@@ -182,6 +183,7 @@ test "a request context takes its stream and generation from the dispatch" {
         .request_generation = 5,
         .request_lane_id = 2,
         .request_slot = 3,
+        .worker_slot = 0,
         .authority = "demo.example.test",
         .deadline_monotonic_ns = 0,
         .method = "GET",
@@ -198,7 +200,6 @@ test "a request context takes its stream and generation from the dispatch" {
         std.testing.allocator,
         11,
         dispatch,
-        .{ .index = 0, .generation = 1 },
         0,
     );
     defer ctx.deinit();
@@ -224,6 +225,7 @@ test "worker h2 response planner batches small head and body descriptors" {
         &headers,
         "ok",
         ipc.ingress_channel.shared_payload_threshold,
+        false,
         &entries,
     )) orelse return error.ExpectedInlineBatch;
 
@@ -254,6 +256,7 @@ test "worker h2 response planner leaves head-only and large bodies to streaming 
         &.{},
         "",
         ipc.ingress_channel.shared_payload_threshold,
+        false,
         &entries,
     ));
 
@@ -268,6 +271,7 @@ test "worker h2 response planner leaves head-only and large bodies to streaming 
         &.{},
         body,
         ipc.ingress_channel.shared_payload_threshold,
+        true,
         &entries,
     ));
 }

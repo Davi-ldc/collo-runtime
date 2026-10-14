@@ -80,14 +80,6 @@ pub const EGRESS_GATEWAY_OPEN_FILES_MAX: u64 = 65_536;
 /// it bounds the gateway's threads rather than every process of the user
 /// running the server.
 pub const EGRESS_GATEWAY_TASKS_MAX: u64 = 1_024;
-/// The most address space the gateway's sizing plan may give it
-/// (`egress/gateway/sizing.zig:addressSpaceBytes`, which the gateway
-/// applies). The plan's own sum is the backstop, above the sessions'
-/// mappings, the shards' and uploads' budgets and the thread stacks; this
-/// bounds the sum, and `sizing.zig` checks that the largest plan fits under
-/// it. Address space costs nothing physical: the budgets bound what a
-/// gateway spends.
-pub const EGRESS_GATEWAY_ADDRESS_SPACE_BYTES_MAX: u64 = 128 * 1024 * 1024 * 1024;
 
 /// Size of the tmpfs the gateway mounts as its root. It holds only the
 /// directories and empty files its read-only binds cover, so one page would

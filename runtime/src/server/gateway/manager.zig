@@ -17,8 +17,9 @@
 //! the liveness descriptor of every worker attached to it so the worker detaches, and tells the
 //! launcher (`Deps.gatewayLost`), which spawns the next gateway and reattaches the live workers.
 //! Only a refused attach fails one call and leaves the gateway current. A session the gateway
-//! removes on its own detaches that worker alone; the gateway reports it, and the manager passes
-//! the report to the launcher (`Deps.sessionLost`), which gives the worker a new session.
+//! removes on its own detaches that worker alone; the gateway reports it with its cause, and the
+//! manager passes the report to the launcher (`Deps.sessionLost`), which decides what it costs the
+//! worker (`Launcher.egressSessionLost` in `server/supervisor/launcher.zig`).
 //!
 //! A retired record waits in `retired` until the next spawn or `deinit` destroys it, joining its
 //! reader first, so no reader destroys its own record. Only the current record is retired, and
@@ -27,8 +28,8 @@
 //! `prewarm`, `attachWorker` and `deinit` hold `serial` for their whole run, so spawns never overlap
 //! and no record is destroyed while an attach uses it outside `mutex`. In a server the boot thread
 //! may prewarm before the launcher exists, the launcher makes every later call, and `deinit` runs
-//! after it joined, so `serial` is never contended. `mutex` guards `current`, `retired`, `ended`
-//! and the counters; a lane takes it only to renew its lease, and the metrics thread only to send
+//! after it joined, so `serial` is never contended. `mutex` guards `current` and `retired`; a
+//! lane takes it only to renew its lease, and the metrics thread only to send
 //! a boot token's end (`endBoot`), with no worker lock held. `deps_mutex` guards `deps` and is
 //! held across each `Deps.gatewayLost` call. The lock order is `serial`, a client's
 //! `attach_mutex`, then `mutex` or `deps_mutex`, and no thread holds those last two together.
@@ -59,7 +60,7 @@ pub const Config = struct {
 /// What the manager calls when a gateway it held, or one session of it, is gone. Set with
 /// `setDeps` while a launcher can take the loss and cleared with `clearDeps` before it goes; a
 /// gateway lost while none is set is retired without a call, and the next `prewarm` or
-/// `attachWorker` spawns its successor, while a session lost then has no worker to reattach.
+/// `attachWorker` spawns its successor, while a session lost then has no worker to retire.
 pub const Deps = struct {
     ctx: *anyopaque,
     /// Called once per retired gateway, after its control channel failed or its process exited,
@@ -69,11 +70,11 @@ pub const Deps = struct {
     /// never calls into the manager: the reattach waits for attach acks, which only a control
     /// reader receives.
     gatewayLost: *const fn (ctx: *anyopaque, generation: u64) void,
-    /// Called once per session that gateway `generation` reported removed
-    /// (`control.SessionRemoved`), on that gateway's control reader, under the same rules as
-    /// `gatewayLost`. The callee hands it to the launcher (`Launcher.egressSessionLost`) and
+    /// Called once per session that gateway `generation` reported removed, with the removal's
+    /// cause (`control.SessionRemoved`), on that gateway's control reader, under the same rules
+    /// as `gatewayLost`. The callee hands it to the launcher (`Launcher.egressSessionLost`) and
     /// returns at once.
-    sessionLost: *const fn (ctx: *anyopaque, generation: u64, session_id: u64) void,
+    sessionLost: *const fn (ctx: *anyopaque, generation: u64, removed: control.RemovedSession) void,
 };
 
 pub const Manager = struct {
@@ -89,13 +90,6 @@ pub const Manager = struct {
     current_generation: std.atomic.Value(u64) = .init(0),
     /// The generation of the next gateway; only the spawn path, under `serial`, touches it.
     next_gateway_generation: u64 = 1,
-    /// The one-entry packet of `endBoot`, built here so the wire stays `control.zig`'s.
-    ended: control.RequestEndedBatch = .{},
-    /// `renewLease` calls that could not dup the control socket. Each leaves the lease empty, so
-    /// its lane mints `egress_token.none` until a later pass renews it.
-    lease_renewals_failed: u64 = 0,
-    /// The generation whose failed renewal was logged last, so each gateway logs once.
-    lease_renewal_failure_logged_generation: u64 = 0,
     deps_mutex: std.Thread.Mutex = .{},
     deps: ?Deps = null,
 
@@ -199,34 +193,21 @@ pub const Manager = struct {
         return self.current_generation.load(.acquire);
     }
 
-    /// Hands `lease` the current gateway's generation, a copy of its key and a dup of its control
-    /// socket made with `F_DUPFD_CLOEXEC` (`Lease.replace`), or generation 0 and no descriptor when
-    /// none is current. It takes the mutex, so a lane calls it only when `currentGeneration` moved.
-    /// A lease that already holds the current gateway keeps its descriptor and pending entries. A
-    /// dup that fails leaves the lease empty, so the lane asks again on its next pass.
+    /// Hands `lease` the current gateway's generation and a copy of its key (`Lease.replace`), or
+    /// generation 0 and the zero key when none is current. It takes the mutex, so a lane calls it
+    /// only when `currentGeneration` moved. A lease that already holds the current gateway is
+    /// left as it is.
     pub fn renewLease(self: *Manager, lease: *lease_mod.Lease) void {
         self.mutex.lock();
         defer self.mutex.unlock();
         const record = self.current orelse {
             if (lease.generation != 0)
-                lease.replace(0, no_key, .{});
+                lease.replace(0, no_key);
             return;
         };
         if (lease.generation == record.generation)
             return;
-        const control_fd = fd_mod.OwnedFd.dupCloexec(record.process.control_fd) catch |err| {
-            self.lease_renewals_failed += 1;
-            if (self.lease_renewal_failure_logged_generation != record.generation) {
-                self.lease_renewal_failure_logged_generation = record.generation;
-                std.log.warn("egress gateway lease renewal failed generation={d}: {s}; fetches go without tokens until a renewal succeeds", .{
-                    record.generation,
-                    @errorName(err),
-                });
-            }
-            lease.replace(0, no_key, .{});
-            return;
-        };
-        lease.replace(record.generation, record.key, control_fd);
+        lease.replace(record.generation, record.key);
     }
 
     /// Copies the key of gateway `generation` into `out` and returns true, or returns false when
@@ -241,10 +222,10 @@ pub const Manager = struct {
         return true;
     }
 
-    /// Sends gateway `generation` the end of session `session_id`'s boot token, an entry whose
-    /// request id and generation are 0, without waiting. Returns true when the packet went out or
-    /// that gateway is no longer current, and false when the send failed, so the caller tries
-    /// again later (`Supervisor.progressBootEgress`).
+    /// Sends gateway `generation` the end of session `session_id`'s boot token
+    /// (`control.BootEnded`) without waiting. Returns true when the packet went out or that
+    /// gateway is no longer current, and false when the send failed, so the caller tries again
+    /// later (`Supervisor.progressBootEgress`).
     pub fn endBoot(self: *Manager, generation: u64, session_id: u64) bool {
         std.debug.assert(session_id != 0);
         self.mutex.lock();
@@ -252,15 +233,7 @@ pub const Manager = struct {
         const record = self.current orelse return true;
         if (record.generation != generation)
             return true;
-        // `sendAndClear` empties the batch whatever the send does.
-        std.debug.assert(self.ended.isEmpty());
-        const appended = self.ended.append(.{
-            .session_id = session_id,
-            .request_id = 0,
-            .request_generation = 0,
-        });
-        std.debug.assert(appended);
-        self.ended.sendAndClear(record.process.control_fd) catch return false;
+        control.sendBootEnded(record.process.control_fd, session_id) catch return false;
         return true;
     }
 
@@ -327,11 +300,11 @@ pub const Manager = struct {
 
     /// The control client's `session_removed` callback: passes the report of `record`'s gateway
     /// to the launcher, on the record's reader thread.
-    fn reportSessionLost(self: *Manager, record: *Record, session_id: u64) void {
+    fn reportSessionLost(self: *Manager, record: *Record, removed: control.RemovedSession) void {
         self.deps_mutex.lock();
         defer self.deps_mutex.unlock();
         if (self.deps) |deps|
-            deps.sessionLost(deps.ctx, record.generation, session_id);
+            deps.sessionLost(deps.ctx, record.generation, removed);
     }
 
     /// The control client's `failed` callback: retires `record` and tells the launcher, on the
@@ -398,9 +371,9 @@ fn controlFailedCallback(ctx: *anyopaque, err: anyerror) void {
     record.manager.retireAfterFailure(record, err);
 }
 
-fn sessionRemovedCallback(ctx: *anyopaque, session_id: u64) void {
+fn sessionRemovedCallback(ctx: *anyopaque, removed: control.RemovedSession) void {
     const record: *Record = @ptrCast(@alignCast(ctx));
-    record.manager.reportSessionLost(record, session_id);
+    record.manager.reportSessionLost(record, removed);
 }
 
 /// The attach round trip of a session whose gateway half is `gateway_half`, returning the session

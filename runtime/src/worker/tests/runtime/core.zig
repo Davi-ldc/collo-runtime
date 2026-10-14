@@ -3,8 +3,8 @@
 //! timer, immediate and fetch needs, the callback budget timers and
 //! immediates share, the requeue slot a running interval holds, immediates
 //! collected one generation at a time, the backlog behind a full ready
-//! queue, how `Runtime.init` takes its boot flags and resolves limits left
-//! at zero, and the precedence of a turn's outcomes
+//! queue, how `Runtime.init` takes the benchmark marker switch and resolves
+//! limits left at zero, and the precedence of a turn's outcomes
 //! (`js/jsc/turn.zig:turnOutcome`). Timer and immediate callbacks that run
 //! JavaScript are covered by the web API `timers` suite (`runtime/tests/webapi/timers/`,
 //! `webapi-test`), and the cancellation of a finished request's timers and
@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const bindings = @import("collo_bindings");
+const worker_limits = @import("collo_limits").worker;
 const worker = @import("collo_worker");
 const rt = @import("collo_test_harness");
 
@@ -255,7 +256,13 @@ test "fetch scheduling requires an active request" {
 
     try std.testing.expectError(
         error.FetchOutsideActiveRequest,
-        runtime.scheduleFetch(0, "https://example.com/", "GET", "", &.{}, 0, .{}),
+        runtime.scheduleFetch(0, .{
+            .url = "https://example.com/",
+            .method = "GET",
+            .body = "",
+            .headers = &.{},
+            .flags = 0,
+        }, .{}),
     );
 }
 
@@ -276,29 +283,22 @@ test "ready work falls back to backlog and marks rescan when both queues are ful
     });
     defer runtime.deinit();
 
-    // The backlog has the ready queue's capacity, one slot each here, so the
-    // third item finds both full and marks its kind for a rescan.
+    // Items other than egress ones fill the backlog only to the ready queue's
+    // capacity, one slot each here, so the third item finds both full and
+    // marks its kind for a rescan.
     try std.testing.expect(runtime.tryQueueReadyWork(.{ .request = 1 }));
     try std.testing.expect(runtime.tryQueueReadyWork(.{ .request = 2 }));
-    try std.testing.expect(!runtime.tryQueueReadyWork(.{ .fetch_completion = 3 }));
-    try std.testing.expect(runtime.egress.state.fetch_task_rescan_needed);
+    try std.testing.expect(!runtime.tryQueueReadyWork(.{ .request = 3 }));
+    try std.testing.expect(runtime.scheduler.ingress_rescan_needed);
 
     try std.testing.expectEqual(@as(u64, 1), runtime.scheduler.ready_queue.pop().?.request);
     runtime.drainReadyBacklog();
     try std.testing.expectEqual(@as(u64, 2), runtime.scheduler.ready_queue.pop().?.request);
 }
 
-// The handler benchmark flag must neither turn on request tracing nor
-// publish a sample before a request enters its handler.
-test "handler benchmark option is independent of request tracing" {
-    const ipc = @import("collo_ipc");
-    const boot = ipc.WorkerRuntimeBootOptions{
-        .runtime_flags = ipc.WorkerRuntimeBootOptions.flag_bench_handler,
-    };
-    try boot.validate();
-    try std.testing.expectEqual(@as(u32, 0), boot.runtime_flags &
-        (ipc.WorkerRuntimeBootOptions.flag_trace_requests |
-            ipc.WorkerRuntimeBootOptions.flag_trace_all_requests));
+// The handler benchmark switch must not publish a sample before a request
+// enters its handler.
+test "the handler benchmark switch publishes nothing before a request enters its handler" {
     var vm = try bindings.Vm.createDefault();
     defer vm.deinit();
     var completion_fixture = try rt.CompletionFixture.init();
@@ -313,43 +313,25 @@ test "handler benchmark option is independent of request tracing" {
     );
     defer runtime.deinit();
     try std.testing.expect(runtime.observability.bench_handler);
-    try std.testing.expect(!runtime.observability.trace_requests);
-    try std.testing.expect(!runtime.observability.trace_all_requests);
-    try std.testing.expect(completion_fixture.view.loadBenchHandler() == null);
+    try std.testing.expect(completion_fixture.reader.loadBenchHandler() == null);
 }
 
-test "runtime consumes pre-resolved boot flags and normalizes auto limits" {
+test "runtime limits default to the worker constants" {
     var vm = try bindings.Vm.createDefault();
     defer vm.deinit();
 
     var completion_fixture = try rt.CompletionFixture.init();
     defer completion_fixture.deinit();
-    var runtime = try worker.Runtime.init(std.testing.allocator, &vm, null, &completion_fixture.view, try rt.createCompletionEventfd(), worker.RuntimeOptions{
-        .trace_requests = true,
-        .trace_all_requests = true,
-        .log_full_js_exceptions = false,
-        .limits = .{
-            .crypto_thread_count = 0,
-            .crypto_max_in_flight_per_request = 0,
-            .crypto_max_in_flight_per_worker = 0,
-        },
-    });
+    var runtime = try worker.Runtime.init(std.testing.allocator, &vm, null, &completion_fixture.view, try rt.createCompletionEventfd(), worker.RuntimeOptions{});
     defer runtime.deinit();
 
-    try std.testing.expect(runtime.observability.trace_requests);
-    try std.testing.expect(runtime.observability.trace_all_requests);
     try std.testing.expect(!runtime.observability.bench_handler);
-    // A zero limit resolves to the default of `ipc.WorkerRuntimeBootOptions`,
-    // and the per-worker crypto cap to `request_task_capacity` times the
-    // per-request cap (`resolveAutoRuntimeLimits` in `runtime/types.zig`).
-    try std.testing.expectEqual(@as(usize, 2), runtime.core.limits.crypto_thread_count);
+    try std.testing.expectEqual(worker_limits.timers_per_worker_max, runtime.core.limits.max_timers_per_worker);
+    try std.testing.expectEqual(worker_limits.ready_queue_capacity, runtime.core.limits.ready_queue_capacity);
+    try std.testing.expectEqual(worker_limits.request_task_capacity, runtime.core.limits.request_task_capacity);
     try std.testing.expectEqual(
-        @as(usize, 6),
-        runtime.core.limits.crypto_max_in_flight_per_request,
-    );
-    try std.testing.expectEqual(
-        @as(usize, 384),
-        runtime.core.limits.crypto_max_in_flight_per_worker,
+        worker_limits.ready_queue_capacity + worker_limits.egress_ready_items_max,
+        runtime.scheduler.ready_backlog.items.len,
     );
 }
 

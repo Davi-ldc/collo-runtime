@@ -16,7 +16,9 @@ const process = @import("collo_os").process;
 
 /// Whose record it is. Every field is the server's: the worker definition it
 /// dispatched to, the route pattern it matched, and the id and generation it
-/// gave that worker process.
+/// gave that worker process; a launch that failed before its publish has
+/// none, and its records carry 0 for both, which no worker is given
+/// (`server/lifecycle.zig:nextGeneration`).
 pub const Identity = struct {
     /// The worker definition's name from the configuration.
     worker: []const u8,

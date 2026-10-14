@@ -1,13 +1,13 @@
 //! Fixtures shared by the egress core suite: "hello world" compressed in each
-//! wire shape, body identities and waiters, and helpers that build, collect
-//! and check HTTP/2 credits.
+//! wire shape, body identities, and helpers that build, collect and check
+//! HTTP/2 credits.
 
 const std = @import("std");
-pub const bindings = @import("collo_bindings");
-pub const body_credit = @import("collo_egress_client").core.body_credit;
-pub const fetch_body = @import("collo_egress_client").core.fetch_body;
-pub const decompress = @import("collo_egress_client").core.decompress;
-pub const stream_pump = @import("collo_egress_client").core.stream_pump;
+pub const core = @import("collo_egress_client").core;
+pub const body_credit = core.body_credit;
+pub const response_queue = core.response_queue;
+pub const decompress = core.decompress;
+pub const stream_pump = core.stream_pump;
 pub const transport = @import("collo_egress_client").transport;
 
 /// "hello world" as one gzip member.
@@ -37,20 +37,12 @@ pub const zlib_deflate_hello_world = [_]u8{
 
 /// A body identity with fixed request and fetch ids (fetch id 30), told
 /// apart by `body_id`.
-pub fn identity(body_id: u64) bindings.FetchBodyIdentity {
+pub fn identity(body_id: u64) core.FetchBodyIdentity {
     return .{
         .request_id = 10,
         .request_generation = 20,
         .fetch_id = 30,
         .body_id = body_id,
-    };
-}
-
-pub fn waiter(allocator: std.mem.Allocator) !fetch_body.Waiter {
-    return .{
-        .kind = .bytes,
-        .content_type = try allocator.dupe(u8, ""),
-        .deferred = null,
     };
 }
 
@@ -79,15 +71,15 @@ pub const ReleasedCredits = struct {
     }
 };
 
-/// Releases every queued chunk of `body` and returns the credits that came
-/// out, at most the capacity of `ReleasedCredits`.
-pub fn collectReleasedCredits(body: *fetch_body.Body) ReleasedCredits {
+/// Drops every chunk `queue` holds and returns the credits that came out,
+/// at most the capacity of `ReleasedCredits`.
+pub fn collectReleasedCredits(queue: *response_queue.ResponseQueue) ReleasedCredits {
     var released = ReleasedCredits{};
-    body.releaseQueuedChunksCallback(std.testing.allocator, &released, collectReleasedCreditForTest);
+    queue.releaseQueued(std.testing.allocator, &released, collectReleasedCredit);
     return released;
 }
 
-pub fn collectReleasedCreditForTest(released: *ReleasedCredits, credit: body_credit.Handle) void {
+fn collectReleasedCredit(released: *ReleasedCredits, credit: body_credit.Handle) void {
     std.debug.assert(released.len < released.items.len);
     released.items[released.len] = credit;
     released.len += 1;

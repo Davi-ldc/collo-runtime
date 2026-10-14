@@ -1,8 +1,8 @@
 // Collo::GlobalObject, the JSC global object of each realm of a Collo VM, and VmClientData, through which a global
-// finds its ColloVm, stack frames get their public source URLs, and globals get the subspace their size needs. Runs
-// on the VM thread. VM creation installs VmClientData before it creates the first global, and the JSC VM deletes it
-// only in its own destructor, so every live global reaches its ColloVm; owner() aborts when it cannot. A global knows
-// its realm from its creation on, and the realm, which the VM owns, outlives it.
+// finds its ColloVm and globals get the subspace their size needs. Runs on the VM thread. VM creation installs
+// VmClientData before it creates the first global, and the JSC VM deletes it only in its own destructor, so every live
+// global reaches its ColloVm; owner() aborts when it cannot. A global knows its realm from its creation on, and the
+// realm, which the VM owns, outlives it.
 
 #include "jsc/runtime/state.h"
 
@@ -18,12 +18,11 @@ VmClientData::VmClientData(ColloVm* owner)
 {
 }
 
-WTF::String VmClientData::overrideSourceURL(const JSC::StackFrame&, const WTF::String& originalSourceURL) const
+WTF::String VmClientData::overrideSourceURL(const JSC::StackFrame&, const WTF::String&) const
 {
-    // A deploy-scoped module key stays internal: stack frames show the same file:///var/task URL that
-    // import.meta.url exposes, as Node's ESM stacks carry file: URLs. Every other source URL passes through.
-    WTF::String public_url = publicModuleURLForKey(originalSourceURL);
-    return public_url.isNull() ? originalSourceURL : public_url;
+    // A null string keeps the frame's own source URL, which for a module is the file: URL of its key, as Node's ESM
+    // stacks carry, and the same URL import.meta.url exposes.
+    return {};
 }
 
 const JSC::ClassInfo GlobalObject::s_info

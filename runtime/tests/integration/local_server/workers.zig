@@ -1,7 +1,9 @@
 //! How the server shares workers among requests and lanes, seen from clients
 //! against real sandboxed workers: two connections on two lanes served at
 //! once by one worker, a steady load on one connection served by the one
-//! worker its first request launched, a deadline that ends its request and
+//! worker its first request launched, at concurrency 1 on one CPU too, the
+//! scale-out that gives workers waiting on timers company and keeps workers
+//! spinning on one CPU alone, a deadline that ends its request and
 //! keeps its worker, a worker's death answered on every lane that held one of
 //! its requests, request bodies that meet a worker running synchronous
 //! JavaScript or a worker that dies, workers that retire one after another
@@ -29,6 +31,17 @@ const uploadReplyOf = harness_mod.uploadReplyOf;
 /// Requests of the steady load: enough that, with the old one-request
 /// workers, several would meet the worker still finishing the one before.
 const steady_requests: usize = 64;
+/// Requests of the one-CPU load: each follows the previous response at once.
+const single_cpu_requests: usize = 512;
+/// Connections of the scale-out loads, each with one request in flight at a
+/// time: more than one worker of `concurrency` 1 can serve at once.
+const scale_load_clients: usize = 4;
+/// How long a scale-out load lasts: many scale-out samples
+/// (`scheduler_limits.scale_out.sample_interval_ns`, 100 ms).
+const scale_load_ns: u64 = 1500 * std.time.ns_per_ms;
+/// Requests one scale-out connection sends at most; the load's duration
+/// ends it first.
+const scale_load_requests_max: usize = 4096;
 /// A body well past the worker's control socket buffer, about 208 KiB by
 /// default, and past the stream's receive window, 512 KiB, so the lane holds
 /// part of it and the client waits for credit.
@@ -96,16 +109,182 @@ test "a steady load on one connection is served by the one worker its first requ
     var client = try Client.open(&harness);
     defer client.close();
 
-    // Each request follows the previous response at once, so it often
-    // reaches the lane before the worker's completion of the previous one
-    // does. The worker then still holds that request's slot, and the new
-    // request takes its other slot instead of launching a second worker.
+    // Each request follows the previous response at once. The worker's
+    // completion rides the packet that ends the previous response, so the
+    // lane has the slot back before the next request arrives.
     const first = try client.get("/token");
     const token = try tokenOf(&first);
     for (1..steady_requests) |_| {
         const response = try client.get("/token");
         try std.testing.expect(token.eql(try tokenOf(&response)));
     }
+
+    var traces: [16]LaunchTrace = undefined;
+    const launches = harness_mod.countLaunches(harness.takeLaunches(&traces), definition);
+    try std.testing.expectEqual(@as(usize, 1), launches.published);
+    try std.testing.expectEqual(@as(usize, 0), launches.failed);
+}
+
+/// Restricts the calling thread, and every thread and process it starts
+/// afterwards, to its first allowed CPU, and returns the mask it had, which
+/// the caller restores with `std.os.linux.sched_setaffinity`.
+fn pinToFirstAllowedCpu() !std.os.linux.cpu_set_t {
+    const previous = try std.posix.sched_getaffinity(0);
+    var pinned = std.mem.zeroes(std.os.linux.cpu_set_t);
+    for (previous, 0..) |word, word_index| {
+        if (word == 0) continue;
+        pinned[word_index] = word & (~word +% 1);
+        break;
+    }
+    try std.os.linux.sched_setaffinity(0, &pinned);
+    return previous;
+}
+
+test "one connection at concurrency 1 on one CPU is served by the one worker its first request launched (#157)" {
+    const configuration = try network_mod.configText(std.testing.allocator, &.{.{
+        .name = "single",
+        .routes = &.{.{ .path = "/single", .entry = "./api/token.js" }},
+        .concurrency = 1,
+    }});
+    defer std.testing.allocator.free(configuration);
+    // The server, its zygote and every worker share one CPU, so the lane that
+    // writes a response and the client's next request run while the worker
+    // that wrote it waits for the CPU. A worker that freed its slot only in
+    // a packet of its own, after its cleanup, left that request waiting
+    // behind a slot it no longer needed.
+    const previous_affinity = try pinToFirstAllowedCpu();
+    // A mask the thread held a moment ago is always accepted again.
+    defer std.os.linux.sched_setaffinity(0, &previous_affinity) catch |err|
+        std.debug.panic("restoring the test thread's CPU mask failed: {s}", .{@errorName(err)});
+    var harness: Harness = undefined;
+    try harness.init(.{ .config_source = configuration });
+    defer harness.deinit();
+    errdefer harness_mod.dumpZygoteTrace(&harness.spawned);
+    const definition = try harness.definitionIndex("single");
+
+    var client = try Client.open(&harness);
+    defer client.close();
+    const first = try client.get("/single");
+    const token = try tokenOf(&first);
+    for (1..single_cpu_requests) |_| {
+        const response = try client.get("/single");
+        try std.testing.expect(token.eql(try tokenOf(&response)));
+    }
+
+    var traces: [16]LaunchTrace = undefined;
+    const launches = harness_mod.countLaunches(harness.takeLaunches(&traces), definition);
+    try std.testing.expectEqual(@as(usize, 1), launches.published);
+    try std.testing.expectEqual(@as(usize, 0), launches.failed);
+}
+
+/// A connection that sends `path` again as soon as each answer arrives,
+/// until `end_ns`, and counts the answers.
+const SteadyClient = struct {
+    client: Client,
+    path: []const u8,
+    /// CLOCK_MONOTONIC instant after which no request starts.
+    end_ns: u64,
+    requests: usize = 0,
+    /// The status of the first answer other than 200, which ends the load.
+    unexpected_status: ?u16 = null,
+    failure: ?anyerror = null,
+
+    fn run(self: *SteadyClient) void {
+        for (0..scale_load_requests_max) |_| {
+            const now_ns = process.monotonicNowNs() catch |err| {
+                self.failure = err;
+                return;
+            };
+            if (now_ns >= self.end_ns) return;
+            const response = self.client.get(self.path) catch |err| {
+                self.failure = err;
+                return;
+            };
+            self.requests += 1;
+            if (response.status != 200) {
+                self.unexpected_status = response.status;
+                return;
+            }
+        }
+    }
+};
+
+/// Runs `clients_count` connections of `SteadyClient` against `path` for
+/// `scale_load_ns` and checks that every answer was 200.
+fn runSteadyLoad(harness: *Harness, comptime clients_count: usize, path: []const u8) !void {
+    var load: [clients_count]SteadyClient = undefined;
+    var opened: usize = 0;
+    defer for (load[0..opened]) |*steady| steady.client.close();
+    const end_ns = (try process.monotonicNowNs()) + scale_load_ns;
+    for (&load) |*steady| {
+        steady.* = .{ .client = try Client.open(harness), .path = path, .end_ns = end_ns };
+        opened += 1;
+    }
+    var threads: [clients_count]std.Thread = undefined;
+    var running: usize = 0;
+    defer for (threads[0..running]) |thread| thread.join();
+    for (&load, &threads) |*steady, *thread| {
+        thread.* = try std.Thread.spawn(.{}, SteadyClient.run, .{steady});
+        running += 1;
+    }
+    for (threads[0..running]) |thread| thread.join();
+    running = 0;
+    for (&load) |*steady| {
+        if (steady.failure) |failure| return failure;
+        if (steady.unexpected_status) |status| {
+            std.debug.print("an answer of the steady load had status {d}\n", .{status});
+            return error.UnexpectedStatus;
+        }
+        try std.testing.expect(steady.requests > 0);
+    }
+}
+
+test "a definition whose workers wait on timers gets workers beside its first while its requests keep waiting (#157)" {
+    const configuration = try network_mod.configText(std.testing.allocator, &.{.{
+        .name = "timers",
+        .routes = &.{.{ .path = "/timers", .entry = "./api/token.js" }},
+        .concurrency = 1,
+    }});
+    defer std.testing.allocator.free(configuration);
+    var harness: Harness = undefined;
+    try harness.init(.{ .config_source = configuration });
+    defer harness.deinit();
+    errdefer harness_mod.dumpZygoteTrace(&harness.spawned);
+    const definition = try harness.definitionIndex("timers");
+
+    // Each request holds its worker's only slot through a timer and uses
+    // almost no CPU, so the waiters behind it wait for slots, and the
+    // scale-out verdict grants a worker more at each sample while they do.
+    try runSteadyLoad(&harness, scale_load_clients, "/timers?ms=40");
+
+    var traces: [16]LaunchTrace = undefined;
+    const launches = harness_mod.countLaunches(harness.takeLaunches(&traces), definition);
+    try std.testing.expect(launches.published >= 2);
+    try std.testing.expect(launches.published <= scale_load_clients);
+    try std.testing.expectEqual(@as(usize, 0), launches.failed);
+}
+
+test "a definition whose workers spin on one CPU keeps the one worker its first request launched however many requests wait (#157)" {
+    const configuration = try network_mod.configText(std.testing.allocator, &.{.{
+        .name = "spin",
+        .routes = &.{.{ .path = "/spin", .entry = "./api/token.js" }},
+        .concurrency = 1,
+    }});
+    defer std.testing.allocator.free(configuration);
+    // The server, its workers and the clients share one CPU, which the one
+    // worker's turns and the lane's writes already fill, so a worker more
+    // would only split it.
+    const previous_affinity = try pinToFirstAllowedCpu();
+    // A mask the thread held a moment ago is always accepted again.
+    defer std.os.linux.sched_setaffinity(0, &previous_affinity) catch |err|
+        std.debug.panic("restoring the test thread's CPU mask failed: {s}", .{@errorName(err)});
+    var harness: Harness = undefined;
+    try harness.init(.{ .config_source = configuration });
+    defer harness.deinit();
+    errdefer harness_mod.dumpZygoteTrace(&harness.spawned);
+    const definition = try harness.definitionIndex("spin");
+
+    try runSteadyLoad(&harness, scale_load_clients, "/spin?spin=3");
 
     var traces: [16]LaunchTrace = undefined;
     const launches = harness_mod.countLaunches(harness.takeLaunches(&traces), definition);
@@ -277,20 +456,21 @@ test "a killed worker's line in workers.jsonl carries the CPU and memory peak it
 
     // The leaf counts every thread of the worker from its clone on, boot
     // included, so even at the microsecond grain of `cpu.stat` it holds at
-    // least what the usage record of the one request counted on the VM
+    // least what the access record of the one request counted on the VM
     // thread.
     const worker_cpu_ns = line.worker_cpu_ns orelse return error.WorkerCpuNotRead;
     try std.testing.expect(worker_cpu_ns > 0);
-    var usage = try harness_mod.waitForRecordLines(harness_mod.UsageLine, &harness, "usage.jsonl", 1);
-    defer usage.deinit();
-    try std.testing.expectEqual(@as(usize, 1), usage.items.len);
-    const request_usage = usage.items[0];
-    try std.testing.expectEqual(line.worker_id, request_usage.worker_id);
-    try std.testing.expectEqual(line.worker_generation, request_usage.worker_generation);
-    if (worker_cpu_ns < request_usage.cpu_ns) {
-        std.debug.print("the leaf counted {d} ns of CPU, less than the {d} ns of its request's usage record\n", .{
+    var access = try harness_mod.waitForRecordLines(harness_mod.AccessLine, &harness, "access.jsonl", 1);
+    defer access.deinit();
+    try std.testing.expectEqual(@as(usize, 1), access.items.len);
+    const request_record = access.items[0];
+    try std.testing.expectEqual(line.worker_id, request_record.worker_id);
+    try std.testing.expectEqual(line.worker_generation, request_record.worker_generation);
+    const request_cpu_ns = request_record.cpu_ns orelse return error.TestExpectedUsage;
+    if (worker_cpu_ns < request_cpu_ns) {
+        std.debug.print("the leaf counted {d} ns of CPU, less than the {d} ns of its request's access record\n", .{
             worker_cpu_ns,
-            request_usage.cpu_ns,
+            request_cpu_ns,
         });
         return error.WorkerCpuBelowRequestCpu;
     }

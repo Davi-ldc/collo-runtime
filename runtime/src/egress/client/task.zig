@@ -1,50 +1,47 @@
-//! The gateway's fetch task: one outbound request with its redirect chain,
-//! meter totals and published result, shared by the gateway thread and the
-//! engine.
+//! The gateway's fetch task: one outbound request with its redirect chain
+//! and published result, shared by the gateway thread and the engine.
 //!
 //! A task holds no worker or JSC promise state; the worker settles its promise
 //! from its own wrapper. Tasks on the heap are reference-counted because the
 //! engine keeps using a task after it publishes the result, and the last
 //! holder frees it. Everything a task owns comes from its allocator except a
 //! body it took as an `OwnedBody`, which goes back to the allocator that came
-//! with it.
+//! with it, and its response queue, which holds a reference of its own.
 
 const std = @import("std");
-const bindings = @import("collo_bindings");
 const http = @import("collo_http");
-const fetch_body = @import("collo_egress_core").fetch_body;
-const decompress = @import("collo_egress_core").decompress;
-const transport = @import("collo_egress_transport");
+const core = @import("collo_egress_core");
+const transport = @import("transport/root.zig");
+
+const decompress = core.decompress;
 
 const Header = http.Header;
+const cloneHeaders = transport.headers.cloneHeaders;
+const freeHeaders = transport.headers.freeHeaders;
 
 pub const Result = union(enum) {
     success: struct {
         status: u16,
         status_text: []const u8 = "",
         url: []u8,
-        body_identity: bindings.FetchBodyIdentity,
-        headers: []const bindings.NameValuePair = &.{},
+        /// In the task's result arena (`copyResponseHeaders`).
+        headers: []const Header = &.{},
         redirected: bool = false,
-        /// Content coding of the bytes in this task's fetch body. HTTP/2
+        /// Content coding of the bytes in this task's response queue. HTTP/2
         /// bodies travel encoded and the worker decodes them; HTTP/1 bodies
         /// are decoded in the gateway and stay `.identity`.
         body_encoding: decompress.Encoding = .identity,
     },
     failure: struct {
+        /// In the task's result arena, or static.
         message: []const u8,
-        owned: bool = true,
         cause: FailureCause = .failed,
     },
-
-    pub fn deinit(self: *Result) void {
-        self.* = undefined;
-    }
 };
 
 /// Why a fetch failed, as far as its worker must tell the tenant. The
 /// gateway maps it onto the error packet's cause at the IPC boundary
-/// (`egress/gateway/body_pump.zig`).
+/// (`egress/gateway/runtime/body_pump.zig:failureCauseForIpc`).
 pub const FailureCause = enum {
     failed,
     /// The fetch's network policy refused a hop; the message names the
@@ -63,7 +60,6 @@ pub const OwnedBody = struct {
 pub const Task = struct {
     allocator: std.mem.Allocator,
     id: u64,
-    request_id: u64,
     url: []u8,
     method: []u8,
     body: []u8,
@@ -73,71 +69,67 @@ pub const Task = struct {
     headers: []Header,
     flags: u32,
     redirect_count: usize,
-    response_body_identity: bindings.FetchBodyIdentity,
-    response_body: *fetch_body.Body,
+    /// The task's reference to the queue its body goes into, dropped when
+    /// the task is destroyed. The queue's identity names the fetch body.
+    response_body: *core.ResponseQueue,
+    /// Guards `done` and `result`, which the engine publishes and the
+    /// gateway reads.
     mutex: std.Thread.Mutex,
     done: bool,
-    queued: bool,
-    canceled: bool,
-    /// Atomic because its writers share no lock with its readers: the gateway
-    /// assigns it when it indexes the fetch and zeroes it when the fetch
-    /// retires, while engine threads copy it into wake tokens at any time. A
-    /// zero token makes the gateway scan its active fetches, and a stale one
-    /// no longer matches and is dropped. Monotonic ordering is enough because
-    /// the value is a routing hint, never a synchronization edge.
-    ready_generation: std.atomic.Value(u64),
-    /// Meter totals of the transport attempts this task has finished. The
-    /// live attempt adds its own meters and reports the sums to the fetch
-    /// body as absolute totals. A redirect hop adds billed and cost bytes,
-    /// since the client asked for the chain; a retried attempt adds cost
-    /// only, since the client never asked for the retry. The totals live on
-    /// the task because each attempt's meters restart at zero (an HTTP/2 hop
-    /// frees its pending entry, an HTTP/1 hop starts a fresh exchange), and
-    /// the body's monotonic-max fold would otherwise lose earlier hops.
-    /// The gateway thread adds a redispatched fetch's cost before submitting
-    /// it and the engine's owner thread adds later hops; no two accesses
-    /// overlap within one attempt, so monotonic ordering suffices.
-    egress_billed_sent_base: std.atomic.Value(u64),
-    egress_billed_received_base: std.atomic.Value(u64),
-    egress_cost_base: std.atomic.Value(u64),
     result: ?Result,
     result_arena: std.heap.ArenaAllocator,
     /// The engine keeps using the task after it publishes the headers-first
-    /// result (cancel probes, body-credit bookkeeping), while the gateway
+    /// result (the body, cancellation, body credits), while the gateway
     /// drops it as soon as the fetch retires. Each side holds a reference, so
     /// the last holder destroys the task whatever the publication order. A
     /// heap task is released, never deinit'd directly.
     refs: std.atomic.Value(u32),
+    engine: EngineLink = .{},
 
     pub const ReadyToken = struct {
         task: *Task,
         generation: u64,
     };
 
+    /// What the engine keeps with a task it was given
+    /// (`engine/root.zig:Engine.submit`). `submit` writes the config and the
+    /// ready generation once, before the owner thread can see the task, and
+    /// nothing writes them after. The flags and a link into a list the
+    /// engine still holds change only under the engine's mutex; the thread
+    /// that took a whole list off the engine (the owner, or a stop that
+    /// settles what the owner never took) clears its links without it.
+    pub const EngineLink = struct {
+        config: transport.Config = undefined,
+        ready_generation: u64 = 0,
+        submitted: bool = false,
+        next_submitted: ?*Task = null,
+        cancel_queued: bool = false,
+        next_canceled: ?*Task = null,
+    };
+
+    /// Copies the URL, method, headers and body into `allocator`. The task
+    /// takes over the caller's reference to `response_body` on success; on
+    /// error the caller keeps it.
     pub fn init(
         allocator: std.mem.Allocator,
         id: u64,
-        request_id: u64,
         url: []const u8,
         method: []const u8,
         body: []const u8,
-        headers: []const bindings.NameValuePair,
+        headers: []const Header,
         flags: u32,
-        response_body_identity: bindings.FetchBodyIdentity,
-        response_body: *fetch_body.Body,
+        response_body: *core.ResponseQueue,
     ) !Task {
         const owned_body = try allocator.dupe(u8, body);
         errdefer allocator.free(owned_body);
         return initOwnedBody(
             allocator,
             id,
-            request_id,
             url,
             method,
             .{ .bytes = owned_body, .allocator = allocator },
             headers,
             flags,
-            response_body_identity,
             response_body,
         );
     }
@@ -149,14 +141,12 @@ pub const Task = struct {
     pub fn initOwnedBody(
         allocator: std.mem.Allocator,
         id: u64,
-        request_id: u64,
         url: []const u8,
         method: []const u8,
         owned_body: OwnedBody,
-        headers: []const bindings.NameValuePair,
+        headers: []const Header,
         flags: u32,
-        response_body_identity: bindings.FetchBodyIdentity,
-        response_body: *fetch_body.Body,
+        response_body: *core.ResponseQueue,
     ) !Task {
         var result_arena = std.heap.ArenaAllocator.init(allocator);
         errdefer result_arena.deinit();
@@ -165,12 +155,11 @@ pub const Task = struct {
         errdefer allocator.free(owned_url);
         const owned_method = try allocator.dupe(u8, method);
         errdefer allocator.free(owned_method);
-        const owned_headers = try cloneBindingHeaders(allocator, headers);
+        const owned_headers = try cloneHeaders(allocator, headers);
         errdefer freeHeaders(allocator, owned_headers);
         return .{
             .allocator = allocator,
             .id = id,
-            .request_id = request_id,
             .url = owned_url,
             .method = owned_method,
             .body = owned_body.bytes,
@@ -178,16 +167,9 @@ pub const Task = struct {
             .headers = owned_headers,
             .flags = flags,
             .redirect_count = 0,
-            .response_body_identity = response_body_identity,
             .response_body = response_body,
             .mutex = .{},
             .done = false,
-            .queued = false,
-            .canceled = false,
-            .ready_generation = .init(0),
-            .egress_billed_sent_base = .init(0),
-            .egress_billed_received_base = .init(0),
-            .egress_cost_base = .init(0),
             .result = null,
             .result_arena = result_arena,
             .refs = .init(1),
@@ -215,11 +197,34 @@ pub const Task = struct {
         return self.result_arena.allocator();
     }
 
+    /// Copies a response head's fields into the result arena, the bytes of
+    /// every name and value in one allocation, for `Result.success.headers`.
+    pub fn copyResponseHeaders(self: *Task, headers: []const Header) ![]const Header {
+        const arena = self.resultAllocator();
+        var total_bytes: usize = 0;
+        for (headers) |header| {
+            total_bytes = try std.math.add(usize, total_bytes, header.name.len);
+            total_bytes = try std.math.add(usize, total_bytes, header.value.len);
+        }
+        const copies = try arena.alloc(Header, headers.len);
+        const bytes = try arena.alloc(u8, total_bytes);
+        var offset: usize = 0;
+        for (headers, copies) |header, *copy| {
+            const name = bytes[offset..][0..header.name.len];
+            @memcpy(name, header.name);
+            offset += name.len;
+            const value = bytes[offset..][0..header.value.len];
+            @memcpy(value, header.value);
+            offset += value.len;
+            copy.* = .{ .name = name, .value = value };
+        }
+        std.debug.assert(offset == total_bytes);
+        return copies;
+    }
+
     pub fn deinit(self: *Task) void {
         const allocator = self.allocator;
-        if (self.result) |*result|
-            result.deinit();
-        self.response_body.releaseAfterQueuedResourcesReleased(allocator);
+        self.response_body.release(allocator);
         self.result_arena.deinit();
         freeHeaders(allocator, self.headers);
         self.body_allocator.free(self.body);
@@ -245,7 +250,7 @@ pub const Task = struct {
         errdefer allocator.free(next_url);
         const next_method = try allocator.dupe(u8, method);
         errdefer allocator.free(next_method);
-        const next_headers = try cloneHttpHeaders(allocator, headers);
+        const next_headers = try cloneHeaders(allocator, headers);
         errdefer freeHeaders(allocator, next_headers);
 
         allocator.free(self.url);
@@ -264,150 +269,11 @@ pub const Task = struct {
         }
     }
 
-    pub fn markCanceled(self: *Task) void {
-        self.mutex.lock();
-        self.canceled = true;
-        self.mutex.unlock();
-    }
-
-    pub fn isCanceled(self: *Task) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return self.canceled;
-    }
-
+    /// What every wake of the engine for this task carries.
     pub fn readyToken(self: *Task) ReadyToken {
         return .{
             .task = self,
-            .generation = self.ready_generation.load(.monotonic),
-        };
-    }
-
-    pub const EgressBase = struct {
-        billed_sent: u64 = 0,
-        billed_received: u64 = 0,
-        cost: u64 = 0,
-    };
-
-    /// Adds a finished attempt's meters to the task's totals. A retried
-    /// attempt passes zero billed bytes; its cost is real either way.
-    pub fn addEgressBase(self: *Task, billed_sent: u64, billed_received: u64, cost: u64) void {
-        if (billed_sent != 0)
-            _ = self.egress_billed_sent_base.fetchAdd(billed_sent, .monotonic);
-        if (billed_received != 0)
-            _ = self.egress_billed_received_base.fetchAdd(billed_received, .monotonic);
-        if (cost != 0)
-            _ = self.egress_cost_base.fetchAdd(cost, .monotonic);
-    }
-
-    pub fn egressBase(self: *const Task) EgressBase {
-        return .{
-            .billed_sent = self.egress_billed_sent_base.load(.monotonic),
-            .billed_received = self.egress_billed_received_base.load(.monotonic),
-            .cost = self.egress_cost_base.load(.monotonic),
+            .generation = self.engine.ready_generation,
         };
     }
 };
-
-fn cloneBindingHeaders(allocator: std.mem.Allocator, headers: []const bindings.NameValuePair) ![]Header {
-    const out = try allocator.alloc(Header, headers.len);
-    var initialized: usize = 0;
-    errdefer {
-        freeHeaderFields(allocator, out[0..initialized]);
-        allocator.free(out);
-    }
-    for (headers, 0..) |header, index| {
-        out[index] = try cloneBindingHeader(allocator, header);
-        initialized += 1;
-    }
-    return out;
-}
-
-pub fn cloneHttpHeaders(allocator: std.mem.Allocator, headers: []const Header) ![]Header {
-    const out = try allocator.alloc(Header, headers.len);
-    var initialized: usize = 0;
-    errdefer {
-        freeHeaderFields(allocator, out[0..initialized]);
-        allocator.free(out);
-    }
-    for (headers, 0..) |header, index| {
-        out[index] = try cloneHttpHeader(allocator, header);
-        initialized += 1;
-    }
-    return out;
-}
-
-fn cloneBindingHeader(allocator: std.mem.Allocator, header: bindings.NameValuePair) !Header {
-    const name = try cloneRawString(allocator, header.name);
-    errdefer allocator.free(name);
-    const value = try cloneRawString(allocator, header.value);
-    errdefer allocator.free(value);
-    return .{ .name = name, .value = value };
-}
-
-fn cloneHttpHeader(allocator: std.mem.Allocator, header: Header) !Header {
-    const name = try allocator.dupe(u8, header.name);
-    errdefer allocator.free(name);
-    const value = try allocator.dupe(u8, header.value);
-    errdefer allocator.free(value);
-    return .{ .name = name, .value = value };
-}
-
-pub fn freeHeaders(allocator: std.mem.Allocator, headers: []Header) void {
-    freeHeaderFields(allocator, headers);
-    allocator.free(headers);
-}
-
-fn freeHeaderFields(allocator: std.mem.Allocator, headers: []Header) void {
-    for (headers) |header| {
-        allocator.free(header.name);
-        allocator.free(header.value);
-    }
-}
-
-fn cloneRawString(allocator: std.mem.Allocator, raw: bindings.RawString) ![]u8 {
-    if (raw.len == 0)
-        return try allocator.dupe(u8, "");
-    const ptr = raw.ptr orelse return error.InvalidFetchHeader;
-    return try allocator.dupe(u8, ptr[0..raw.len]);
-}
-
-pub fn bindResponseHeaders(allocator: std.mem.Allocator, headers: anytype) ![]bindings.NameValuePair {
-    const pairs = try allocator.alloc(bindings.NameValuePair, headers.len);
-    for (headers, 0..) |header, index| {
-        pairs[index] = .{
-            .name = .{ .ptr = if (header.name.len == 0) null else header.name.ptr, .len = header.name.len },
-            .value = .{ .ptr = if (header.value.len == 0) null else header.value.ptr, .len = header.value.len },
-        };
-    }
-    return pairs;
-}
-
-pub fn cloneBindResponseHeaders(allocator: std.mem.Allocator, headers: anytype) ![]bindings.NameValuePair {
-    const pairs = try allocator.alloc(bindings.NameValuePair, headers.len);
-    errdefer allocator.free(pairs);
-    var total_bytes: usize = 0;
-    for (headers) |header| {
-        total_bytes = try std.math.add(usize, total_bytes, header.name.len);
-        total_bytes = try std.math.add(usize, total_bytes, header.value.len);
-    }
-    var bytes: []u8 = &.{};
-    if (total_bytes != 0)
-        bytes = try allocator.alloc(u8, total_bytes);
-    errdefer if (total_bytes != 0) allocator.free(bytes);
-    var offset: usize = 0;
-    for (headers, 0..) |header, index| {
-        const name = bytes[offset .. offset + header.name.len];
-        offset += header.name.len;
-        const value = bytes[offset .. offset + header.value.len];
-        offset += header.value.len;
-        @memcpy(name, header.name);
-        @memcpy(value, header.value);
-        pairs[index] = .{
-            .name = .{ .ptr = if (name.len == 0) null else name.ptr, .len = name.len },
-            .value = .{ .ptr = if (value.len == 0) null else value.ptr, .len = value.len },
-        };
-    }
-    std.debug.assert(offset == total_bytes);
-    return pairs;
-}

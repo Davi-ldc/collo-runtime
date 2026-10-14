@@ -1,37 +1,74 @@
-//! Helpers for the HTTP/2 codec tests: they build the server's frames in
-//! memory, drive a `Connection` until one stream's response is complete, and
-//! parse the frames the client wrote after its preface.
+//! Helpers for the HTTP/2 codec tests: the shard's HPACK scratch every test
+//! connection borrows, a frame reader that feeds a `Connection` the way the
+//! engine's pool does, the drive of one stream until its response is
+//! complete, builders for the server's frames, and parsers for the frames
+//! the client wrote after its preface.
 
 const std = @import("std");
 const egress_http2 = @import("collo_egress_client").http2;
 const h2 = @import("collo_http").http2;
 const hpack = @import("collo_hpack");
 
+var decode_storage: [egress_http2.HpackScratch.decode_bytes]u8 = undefined;
+var encode_storage: [egress_http2.HpackScratch.encode_bytes]u8 = undefined;
+
+/// The HPACK scratch of the tests' one coding thread, which every test
+/// connection borrows as an engine shard's connections do.
+pub const scratch: egress_http2.HpackScratch = .{ .decode = &decode_storage, .encode = &encode_storage };
+
+/// Reads frames from `reader`, a server's bytes, and hands each to the
+/// connection until one yields an event, as the engine's pool does with the
+/// frames it reads from a wire: an unprocessed-stream failure goes first, and
+/// a run of frames without an event is bounded.
+pub fn readEvent(
+    connection: *egress_http2.Connection,
+    reader: *std.Io.Reader,
+    writer: *std.Io.Writer,
+) !egress_http2.Event {
+    var frames_without_event: usize = 0;
+    while (connection.hasActiveStreams()) {
+        if (try connection.nextUnprocessedStreamFailure(writer)) |failure|
+            return failure;
+        var frame = try readFrame(reader, connection.session.local_settings.max_frame_size);
+        defer frame.deinit();
+        if (try connection.processEventFrame(writer, &frame)) |event|
+            return event;
+        frames_without_event += 1;
+        if (frames_without_event > egress_http2.max_frames_without_event_per_read)
+            return error.Http2FrameProgressLimitExceeded;
+    }
+    return error.Http2NoActiveStreams;
+}
+
+fn readFrame(reader: *std.Io.Reader, max_frame_size: u32) !egress_http2.client.Frame {
+    var header_wire: [h2.frame_header_len]u8 = undefined;
+    try reader.readSliceAll(&header_wire);
+    const header = try h2.FrameHeader.parse(&header_wire);
+    if (header.length > max_frame_size)
+        return error.Http2FrameTooLarge;
+    const payload = try std.testing.allocator.alloc(u8, header.length);
+    errdefer std.testing.allocator.free(payload);
+    if (payload.len != 0)
+        try reader.readSliceAll(payload);
+    return .{ .allocator = std.testing.allocator, .header = header, .payload = payload };
+}
+
 pub const CollectedH2Response = struct {
     allocator: std.mem.Allocator,
     status_code: u16,
     headers: []hpack.Header,
     body: []u8,
-    wire_bytes: u64,
-    /// The billed meters the codec events carry: the final head block length
-    /// from `.head`, and the cumulative counter of the terminal `.end`.
-    billed_head_bytes: u64 = 0,
-    billed_sent: u64 = 0,
-    billed_received: u64 = 0,
 
     pub fn deinit(self: *CollectedH2Response) void {
-        for (self.headers) |header| {
-            self.allocator.free(header.name);
-            self.allocator.free(header.value);
-        }
-        self.allocator.free(self.headers);
+        freeClonedHeaders(self.allocator, self.headers);
         self.allocator.free(self.body);
         self.* = undefined;
     }
 };
 
 /// Reads events until `stream_id` ends, acking every body chunk as it arrives
-/// and skipping other streams' events.
+/// and skipping other streams' events. A head that ends its stream is acked
+/// with zero credit, which surfaces the stream's `.end`, as the engine does.
 pub fn readCollectedResponse(
     allocator: std.mem.Allocator,
     connection: *egress_http2.Connection,
@@ -46,73 +83,34 @@ pub fn readCollectedResponse(
         body.deinit(allocator);
     }
     var status_code: ?u16 = null;
-    var wire_bytes: u64 = 0;
-    var billed_head_bytes: u64 = 0;
 
     while (true) {
-        var event = try connection.readNextEvent(reader, writer);
+        var event = try readEvent(connection, reader, writer);
+        var acked: ?egress_http2.Event = null;
         switch (event) {
             .head => |*head| {
                 defer event.deinit();
-                if (head.stream_id != stream_id)
-                    continue;
-                status_code = head.result.status_code;
-                wire_bytes += head.result.wire_bytes.total();
-                billed_head_bytes = head.billed_head_bytes;
-                headers = try cloneHeaders(allocator, head.result.headers);
+                if (head.stream_id == stream_id) {
+                    status_code = head.status_code;
+                    headers = try cloneHeaders(allocator, head.headers);
+                }
+                if (head.end_stream)
+                    acked = try connection.ackReceivedData(writer, head.stream_id, 0, false);
             },
-            .progress => |progress| {
-                defer event.deinit();
-                if (progress.stream_id == stream_id)
-                    wire_bytes += progress.wire_bytes.total();
-            },
+            .progress => event.deinit(),
             .body_chunk => |*chunk| {
                 const update_stream = chunk.update_stream_window;
                 const flow_credit = chunk.flow_credit;
                 const chunk_stream_id = chunk.stream_id;
                 defer event.deinit();
-                if (chunk_stream_id == stream_id) {
+                if (chunk_stream_id == stream_id)
                     try body.appendSlice(allocator, chunk.bytes);
-                    wire_bytes += chunk.wire_bytes.total();
-                }
-                var maybe_end = try connection.ackReceivedData(writer, chunk_stream_id, flow_credit, update_stream);
-                if (maybe_end) |*end| {
-                    defer end.deinit();
-                    switch (end.*) {
-                        .end => |done| {
-                            if (done.stream_id != stream_id)
-                                continue;
-                            wire_bytes += done.wire_bytes.total();
-                            return .{
-                                .allocator = allocator,
-                                .status_code = status_code orelse return error.ExpectedHttp2Head,
-                                .headers = headers,
-                                .body = try body.toOwnedSlice(allocator),
-                                .wire_bytes = wire_bytes,
-                                .billed_head_bytes = billed_head_bytes,
-                                .billed_sent = done.billed_bytes.sent,
-                                .billed_received = done.billed_bytes.received,
-                            };
-                        },
-                        else => return error.UnexpectedHttp2Event,
-                    }
-                }
+                acked = try connection.ackReceivedData(writer, chunk_stream_id, flow_credit, update_stream);
             },
             .end => |end| {
                 defer event.deinit();
-                if (end.stream_id != stream_id)
-                    continue;
-                wire_bytes += end.wire_bytes.total();
-                return .{
-                    .allocator = allocator,
-                    .status_code = status_code orelse return error.ExpectedHttp2Head,
-                    .headers = headers,
-                    .body = try body.toOwnedSlice(allocator),
-                    .wire_bytes = wire_bytes,
-                    .billed_head_bytes = billed_head_bytes,
-                    .billed_sent = end.billed_bytes.sent,
-                    .billed_received = end.billed_bytes.received,
-                };
+                if (end.stream_id == stream_id)
+                    return collected(allocator, status_code, headers, &body);
             },
             .failure => |failure| {
                 defer event.deinit();
@@ -120,7 +118,31 @@ pub fn readCollectedResponse(
                     return failure.err;
             },
         }
+        if (acked) |*end| {
+            defer end.deinit();
+            switch (end.*) {
+                .end => |done| {
+                    if (done.stream_id == stream_id)
+                        return collected(allocator, status_code, headers, &body);
+                },
+                else => return error.UnexpectedHttp2Event,
+            }
+        }
     }
+}
+
+fn collected(
+    allocator: std.mem.Allocator,
+    status_code: ?u16,
+    headers: []hpack.Header,
+    body: *std.array_list.Aligned(u8, null),
+) !CollectedH2Response {
+    return .{
+        .allocator = allocator,
+        .status_code = status_code orelse return error.ExpectedHttp2Head,
+        .headers = headers,
+        .body = try body.toOwnedSlice(allocator),
+    };
 }
 
 /// Reads events, acking body chunks, until `stream_id` fails, and expects the
@@ -133,7 +155,7 @@ pub fn expectStreamFailure(
     expected: anyerror,
 ) !void {
     while (true) {
-        var event = try connection.readNextEvent(reader, writer);
+        var event = try readEvent(connection, reader, writer);
         switch (event) {
             .head, .progress => {
                 event.deinit();
@@ -187,15 +209,14 @@ fn freeClonedHeaders(allocator: std.mem.Allocator, headers: []hpack.Header) void
     allocator.free(headers);
 }
 
-/// HPACK block length of `headers` from a fresh encoder. These are the bytes
-/// `appendHeaderFrames` and `appendResponseFrames` send, so tests can state
-/// the expected billed header-block sizes exactly.
-pub fn encodedHeaderBlockLen(headers: []const hpack.Header) !usize {
+/// Room for one server header block, which `serverHeaderBlock` encodes with a
+/// fresh encoder, as a server's first block on a connection is.
+const server_block_bytes_max: usize = 4096;
+
+fn serverHeaderBlock(storage: *[server_block_bytes_max]u8, headers: []const hpack.Header) ![]const u8 {
     var encoder = try hpack.Encoder.init();
     defer encoder.deinit();
-    var block = try encoder.encodeHeaders(std.testing.allocator, headers, 4096);
-    defer block.deinit(std.testing.allocator);
-    return block.bytes().len;
+    return encoder.encodeHeaders(storage, headers, storage.len);
 }
 
 pub fn appendSettingsFrame(writer: *std.Io.Writer) !void {
@@ -307,15 +328,13 @@ pub fn appendHeaderFrames(writer: *std.Io.Writer, headers: []const hpack.Header,
 }
 
 pub fn appendHeaderFramesForStream(writer: *std.Io.Writer, stream_id: u32, headers: []const hpack.Header, end_stream: bool) !void {
-    var encoder = try hpack.Encoder.init();
-    defer encoder.deinit();
-    var block = try encoder.encodeHeaders(std.testing.allocator, headers, 4096);
-    defer block.deinit(std.testing.allocator);
+    var storage: [server_block_bytes_max]u8 = undefined;
+    const block = try serverHeaderBlock(&storage, headers);
     const wire = try h2.encodeHeadersFrames(
         std.testing.allocator,
         h2.default_max_frame_size,
         stream_id,
-        block.bytes(),
+        block,
         end_stream,
     );
     defer std.testing.allocator.free(wire);
@@ -341,12 +360,10 @@ pub fn appendPaddedPriorityHeaderFrame(
     end_stream: bool,
     pad_len: u8,
 ) !void {
-    var encoder = try hpack.Encoder.init();
-    defer encoder.deinit();
-    var block = try encoder.encodeHeaders(std.testing.allocator, headers, 4096);
-    defer block.deinit(std.testing.allocator);
+    var storage: [server_block_bytes_max]u8 = undefined;
+    const block = try serverHeaderBlock(&storage, headers);
 
-    const payload_len: u32 = @intCast(1 + 5 + block.bytes().len + pad_len);
+    const payload_len: u32 = @intCast(1 + 5 + block.len + pad_len);
     var header = h2.FrameHeader{
         .length = payload_len,
         .frame_type_raw = @intFromEnum(h2.FrameType.headers),
@@ -359,7 +376,7 @@ pub fn appendPaddedPriorityHeaderFrame(
     try writer.writeAll(&header_wire);
     try writer.writeByte(pad_len);
     try writer.writeAll(&[_]u8{ 0, 0, 0, 0, 1 });
-    try writer.writeAll(block.bytes());
+    try writer.writeAll(block);
     try writer.splatByteAll(0, pad_len);
 }
 
@@ -422,6 +439,23 @@ pub fn clientFrameStreamIds(allocator: std.mem.Allocator, wire: []const u8, fram
         cursor += h2.frame_header_len + header.length;
     }
     return ids;
+}
+
+/// The header block of the HEADERS frame the client sent for `stream_id`,
+/// which must hold the whole block, as every block the tests send does.
+pub fn clientHeaderBlock(wire: []const u8, stream_id: u32) ![]const u8 {
+    var cursor: usize = h2.client_connection_preface.len;
+    while (cursor < wire.len) {
+        const header = try h2.FrameHeader.parse(wire[cursor..][0..h2.frame_header_len]);
+        const payload = wire[cursor + h2.frame_header_len ..][0..header.length];
+        if (header.frame_type == .headers and header.stream_id == stream_id) {
+            if (!header.flags.end_headers_or_ack)
+                return error.ExpectedWholeHeaderBlock;
+            return payload;
+        }
+        cursor += h2.frame_header_len + header.length;
+    }
+    return error.ExpectedClientHeaders;
 }
 
 pub fn sumClientWindowUpdateIncrements(wire: []const u8, stream_id: u32) !u32 {

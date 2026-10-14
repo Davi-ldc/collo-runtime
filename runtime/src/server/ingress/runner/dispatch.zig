@@ -48,7 +48,6 @@ const std = @import("std");
 const lifecycle = @import("collo_server_lifecycle");
 const supervision = @import("collo_server_supervisor");
 const ipc = @import("collo_ipc");
-const policy = @import("collo_egress_gateway").policy;
 const fault = @import("../fault.zig");
 const completions = @import("../completions.zig");
 const admission = @import("admission.zig");
@@ -59,8 +58,6 @@ const request_slot_mod = @import("request_slot.zig");
 const ring_driver = @import("ring_driver.zig");
 const worker_fault = @import("worker_fault.zig");
 const worker_registration = @import("worker_registration.zig");
-
-const worker_shared_page = @import("collo_worker_state").page;
 
 const pool = supervision.pool;
 const WorkerRecord = supervision.worker_table.Record;
@@ -95,15 +92,14 @@ pub const HandoffUse = enum {
 
 /// What the egress token of the request in `slot` says when it is minted
 /// for worker session `session_id`: the request's identity, its deadline,
-/// the fetch budget of `egress/gateway/policy.zig`, and `policy_id`, the
-/// network policy of the request's route (`server/routes/network.zig`),
-/// which holds whatever code runs during the request's turns. Pure and
-/// file-level, so the mapping is testable without a lane.
+/// and `policy_id`, the network policy of the request's route
+/// (`server/routes/network.zig`), which holds whatever code runs during the
+/// request's turns. Pure and file-level, so the mapping is testable without
+/// a lane.
 pub fn requestTokenFields(slot: *const RequestSlot, session_id: u64, policy_id: u16) ipc.egress_token.Fields {
     return .{
         .kind = .request,
         .policy_id = policy_id,
-        .budget = policy.production.max_fetches_per_request,
         .session_id = session_id,
         .request_id = slot.request_id,
         .request_generation = slot.request_key.generation,
@@ -218,24 +214,23 @@ pub fn Methods(comptime Self: type) type {
             };
             self.lane.recordDispatchHandoff();
 
-            var accounting_flags: u32 = 0;
+            // The request's usage, in its access record, runs from here.
+            slot.access.dispatched_mono_ns = now;
             // A request that waited (it owns its head) for a worker launched
             // after it arrived rode that cold start.
             if (slot.head != null and worker.created_mono_ns >= slot.admitted_ns) {
-                accounting_flags |= worker_shared_page.AccountingFlags.cold_start;
                 slot.access.cold_start = true;
                 slot.access.cold_start_ns = worker.boot_work_ns;
                 slot.access.cold_start_blocked_ns = now -| slot.admitted_ns;
             }
-            // Recorded before the worker can hear of the request, so its
-            // usage record never reaches a drain ahead of the entry
-            // (`server/supervisor/request_table.zig`).
+            // Recorded before the worker can hear of the request, so the
+            // reader's check of a descriptor it forwards for the request
+            // (`RequestTable.forwardCheck` in
+            // `server/supervisor/request_table.zig`) finds the entry.
             try worker.requests.record(.{
                 .request_id = slot.request_id,
                 .request_key = slot.request_key,
                 .route = slot.route.route,
-                .accounting_flags = accounting_flags,
-                .started_mono_ns = now,
             });
             var dispatch_work = ipc.DispatchWorkView{
                 .request_id = slot.request_id,
@@ -244,7 +239,10 @@ pub fn Methods(comptime Self: type) type {
                 .request_generation = slot.request_key.generation,
                 .worker_id = worker_key.worker_id,
                 .worker_generation = worker_key.worker_generation,
-                .accounting_flags = accounting_flags,
+                // The worker writes the request's live slot at this index
+                // of its page, which the request's floor reads back
+                // (`Record.usageFloor` in `server/supervisor/worker_table.zig`).
+                .worker_slot = slot.worker_slot,
                 .authority = head.authority,
                 .deadline_monotonic_ns = slot.deadline_ns,
                 .method = head.method,
@@ -264,13 +262,6 @@ pub fn Methods(comptime Self: type) type {
                     egress.generation,
                     requestTokenFields(slot, egress.session_id, self.service.routes.network.routePolicy(slot.route)),
                 );
-                // The slot keeps the session of a token the request carries,
-                // whose end its finish notes (`request_finish.zig`); `none`
-                // leaves nothing to end.
-                if (!ipc.egress_token.isNone(&dispatch_work.egress_token)) {
-                    slot.egress_gateway_generation = egress.generation;
-                    slot.egress_gateway_session_id = egress.session_id;
-                }
             }
 
             const payload = ipc.encodeDispatchWorkInto(self.ipc_send_scratch, &dispatch_work) catch |err| {
@@ -534,8 +525,8 @@ pub fn Methods(comptime Self: type) type {
                 slot.parked_begin = null;
             }
             slot.parked_reset = null;
-            const registration_index = WorkerRegistration.findCompletionRegistrationIndex(self, slot.worker_key) orelse
-                return error.WorkerCompletionRegistrationNotFound;
+            const registration_index = WorkerRegistration.findRegistrationIndex(self, slot.worker_key) orelse
+                return error.WorkerRegistrationNotFound;
             try WorkerFault.deferWorkerFault(self, registration_index, reason);
         }
 

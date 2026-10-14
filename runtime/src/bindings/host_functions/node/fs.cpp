@@ -4,39 +4,51 @@
 // `fs.promises` twins, and take no callback. It runs on the VM thread of a worker, which installs it after its seccomp
 // filter, and it is the one place the bridge performs file I/O.
 //
-// Every path is first routed through collo_runtime_fs_route, and worker/fs/index.zig defines the namespaces it sorts
-// paths into. A /tmp path reaches the real syscalls. A path in the read-only tree is answered from the index, and
-// every mutation there fails with EROFS. Reading a file of the tree that is not yet copied into the tmpfs faults it
-// in through worker/fs/fault.zig: a promise-returning read parks its promise, which settles on the event loop, and a
-// synchronous read blocks the VM thread until the copy exists or the request's deadline passes. Every `*at` syscall
-// here passes AT_FDCWD as its directory and only flags that the worker's seccomp filter admits
-// (zygote/worker_boot/sandbox.zig), which fails any other directory or flag with EPERM. Every fd is opened
-// close-on-exec and closed before the call that opened it returns.
+// What confines node:fs is the worker's sandbox, so node:fs is closed in any process the sandbox does not confine.
+// Every operation first checks a process-wide flag that only openNodeFsForProcess sets, and fails with EPERM while it
+// is clear; installing the binding opens nothing.
+//
+// Every operation passes the caller's path to its syscall as given, with AT_FDCWD as the directory, so the kernel
+// resolves it inside the worker's root: a relative path from the working directory the sandbox sets, and `..` never
+// above the chroot (zygote/worker_boot/sandbox.zig). The kernel also decides what may be written. The sandbox mounts
+// the root read-only except /tmp, so a write anywhere else fails with EROFS, and a rename between /tmp and the rest of
+// the root fails with EXDEV, whoever makes the call. Nothing here classifies a path or calls into Zig. Each syscall
+// passes only flags the worker's seccomp filter admits; the filter fails any other flag, or any directory but AT_FDCWD,
+// with EPERM. Every fd is opened close-on-exec and closed before the call that opened it returns.
+//
+// The promise forms run the same blocking syscalls on the VM thread and return a promise that is already settled. A
+// read or a listing has no cap of its own: its buffers are charged to the worker's cgroup, and an allocation that fails
+// becomes an OutOfMemoryError. The one exception is the decoded string of a UTF-8 read, which WTF allocates with an
+// allocator that ends the process when it fails (host_functions/webapi/encoding/utf8.h), so that failure ends the
+// worker.
 //
 // An errno failure throws or rejects with an Error carrying Node's `code`, `errno`, `syscall` and `path` properties,
 // plus `dest` for rename. An argument of the wrong type or value fails with a TypeError carrying Node's
-// ERR_INVALID_ARG_TYPE or ERR_INVALID_ARG_VALUE code.
+// ERR_INVALID_ARG_TYPE or ERR_INVALID_ARG_VALUE code, except in exists, which answers false as Node's existsSync does.
 
 #include "host_functions/node/fs.h"
 
-#include "collo/abi.h"
-#include "host_functions/runtime/bridge.h"
 // For createBodyUint8ArrayCopy, which readFile shares with the fetch body readers.
 #include "host_functions/server/fetch/body_utils.h"
 #include "host_functions/support.h"
+#include "host_functions/webapi/encoding/utf8.h"
 
 #include <JavaScriptCore/Error.h>
 #include <JavaScriptCore/IdentifierInlines.h>
 #include <JavaScriptCore/JSArray.h>
 #include <JavaScriptCore/JSCInlines.h>
-#include <JavaScriptCore/JSNativeStdFunction.h>
-#include <JavaScriptCore/JSPromise.h>
 #include <JavaScriptCore/JSString.h>
+#include <JavaScriptCore/JSTypedArrays.h>
+#include <JavaScriptCore/ObjectConstructor.h>
+#include <wtf/CheckedArithmetic.h>
 #include <wtf/StdLibExtras.h>
 #include <wtf/Vector.h>
 #include <wtf/text/CString.h>
 #include <wtf/text/MakeString.h>
+#include <wtf/text/StringView.h>
 
+#include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
@@ -48,60 +60,92 @@
 
 namespace {
 
-// A path as the collo_runtime_fs_* functions take it: the bytes of `path`, borrowed for the call.
-ColloString fsPathArgument(std::span<const char> path)
-{
-    auto bytes = byteCast<uint8_t>(path);
-    return { bytes.empty() ? nullptr : bytes.data(), bytes.size() };
-}
+// Whether node:fs may reach the filesystem in this process. Only openNodeFsForProcess sets it, and nothing clears it.
+// collo_vm_enable_node_fs_for_worker calls that function, and a worker's child boot calls the enable only after its
+// seccomp filter is installed (zygote/child_boot.zig); the zygote never does. So a binding installed in a process the
+// sandbox does not confine, such as the zygote and every child before that call, answers EPERM instead of reaching
+// the host's files with the server's uid. Constant-initialized, so it needs no global constructor.
+constinit std::atomic<bool> node_fs_open { false };
 
-constexpr size_t readChunkBytes = 16 * 1024;
-// The largest file of the read-only tree a read accepts: abi.h's copy of `max_fault_file_bytes` in
-// common/limits/fs_fault.zig, which says why it equals the default tmpfs size. Below it, the copy budget in
-// worker/fs/copies.zig applies. A /tmp read and a /tmp listing have no cap of their own: the worker's tmpfs bounds what
-// they can find, and the memory they allocate is charged to the worker's cgroup.
-constexpr size_t maxReadFileBytes = COLLO_FS_FAULT_MAX_FILE_BYTES;
+// The read size per pass once readFile's buffer is full, when a file has grown past the size fstat reported.
+constexpr size_t readGrowthBytes = 16 * 1024;
 constexpr size_t getdentsBufferBytes = 16 * 1024;
 constexpr unsigned fsPropertyAttributes = static_cast<unsigned>(JSC::PropertyAttribute::DontEnum);
+
+// The kernel's struct linux_dirent64 (include/linux/dirent.h), the record getdents64 fills its buffer with: `d_reclen`
+// at byte 16 is the length of the whole record with its padding, and the NUL-terminated `d_name` starts at byte 19.
+constexpr size_t direntReclenOffset = 16;
+constexpr size_t direntNameOffset = 19;
 
 struct FsResult {
     JSC::JSValue value { JSC::jsUndefined() };
     JSC::JSValue error { JSC::jsUndefined() };
     bool ok { false };
-    // `value` is already the promise of a parked fault, which encodePromiseResult returns as is. Only the
-    // promise-returning readFile sets it, so encodeSyncResult never sees it.
-    bool pending { false };
 };
 
-// The kernel's struct linux_dirent64, the record getdents64 fills its buffer with.
-struct LinuxDirent64 {
-    uint64_t inode;
-    int64_t offset;
-    unsigned short reclen;
-    unsigned char type;
-    char name[];
+// A path argument in the two forms an operation needs: the string the caller passed, which an error reports as given,
+// and its UTF-8 bytes with a trailing NUL, which the syscalls receive.
+struct FsPath {
+    WTF::String text;
+    WTF::CString bytes;
 };
 
+// Owns a descriptor an operation opened and closes it when the operation returns, on every path. It cannot be copied,
+// so each descriptor is closed once.
+class OwnedFd {
+public:
+    explicit OwnedFd(int fd)
+        : m_fd(fd)
+    {
+    }
+
+    ~OwnedFd()
+    {
+        if (m_fd >= 0)
+            close(m_fd);
+    }
+
+    OwnedFd(const OwnedFd&) = delete;
+    OwnedFd& operator=(const OwnedFd&) = delete;
+
+    explicit operator bool() const { return m_fd >= 0; }
+    int get() const { return m_fd; }
+
+private:
+    int m_fd;
+};
+
+// For short text only, a strerror message or a directory entry's name, which the kernel bounds at NAME_MAX bytes:
+// a file's contents go through the checked decode in utf8.h instead.
 WTF::String stringFromUtf8Bytes(std::span<const uint8_t> bytes)
 {
-    return WTF::String::fromUTF8ReplacingInvalidSequences(
-        std::span<const char8_t> { reinterpret_cast<const char8_t*>(bytes.data()), bytes.size() });
+    return WTF::String::fromUTF8ReplacingInvalidSequences(byteCast<char8_t>(bytes));
 }
 
-WTF::String stringFromCString(const char* value)
+WTF::String stringFromCString(const char* text)
 {
-    return WTF::String::fromUTF8ReplacingInvalidSequences(
-        std::span<const char8_t> { reinterpret_cast<const char8_t*>(value), std::strlen(value) });
+    return stringFromUtf8Bytes(byteCast<uint8_t>(std::span { text, std::strlen(text) }));
 }
 
-// An errno without a case here reports the code EIO, while the error's `errno` and message keep the real value.
+// The `code` Node reports for an errno: its name, for every errno the syscalls in this file can return. Any other
+// errno reports EIO, while the error's `errno` and message keep the real value.
 WTF::ASCIILiteral errnoCode(int err)
 {
     switch (err) {
     case EACCES:
         return "EACCES"_s;
+    case EAGAIN:
+        return "EAGAIN"_s;
+    case EBADF:
+        return "EBADF"_s;
+    case EBUSY:
+        return "EBUSY"_s;
+    case EDQUOT:
+        return "EDQUOT"_s;
     case EEXIST:
         return "EEXIST"_s;
+    case EFAULT:
+        return "EFAULT"_s;
     case EFBIG:
         return "EFBIG"_s;
     case EINVAL:
@@ -110,8 +154,18 @@ WTF::ASCIILiteral errnoCode(int err)
         return "EIO"_s;
     case EISDIR:
         return "EISDIR"_s;
+    case ELOOP:
+        return "ELOOP"_s;
+    case EMFILE:
+        return "EMFILE"_s;
+    case EMLINK:
+        return "EMLINK"_s;
     case ENAMETOOLONG:
         return "ENAMETOOLONG"_s;
+    case ENFILE:
+        return "ENFILE"_s;
+    case ENODEV:
+        return "ENODEV"_s;
     case ENOENT:
         return "ENOENT"_s;
     case ENOMEM:
@@ -120,39 +174,70 @@ WTF::ASCIILiteral errnoCode(int err)
         return "ENOSPC"_s;
     case ENOTDIR:
         return "ENOTDIR"_s;
+    case ENOTEMPTY:
+        return "ENOTEMPTY"_s;
+    case ENXIO:
+        return "ENXIO"_s;
+    case EOPNOTSUPP:
+        return "EOPNOTSUPP"_s;
+    case EOVERFLOW:
+        return "EOVERFLOW"_s;
     case EPERM:
         return "EPERM"_s;
     case EROFS:
         return "EROFS"_s;
+    case ETXTBSY:
+        return "ETXTBSY"_s;
+    case EXDEV:
+        return "EXDEV"_s;
     default:
         return "EIO"_s;
     }
 }
 
-// The Error of every errno failure: the message "<syscall> '<path>' failed: <detail>" and non-enumerable `code`,
-// `errno` (negative, as Node reports it), `syscall` and `path` properties. `detail` is strerror's text for a real
-// errno and the fault's reason for a failed fault.
-JSC::JSObject* createFsErrorWithDetail(JSC::JSGlobalObject* globalObject, JSC::VM& vm, int err,
-    WTF::ASCIILiteral syscallName, const WTF::CString& path, const WTF::String& detail)
+// Puts the non-enumerable `code`, `errno` (negative, as Node reports it) and `syscall` properties of an errno failure.
+void putErrnoProperties(JSC::VM& vm, JSC::JSObject* error, int err, WTF::ASCIILiteral syscallName)
 {
-    WTF::String pathString = stringFromUtf8Bytes(
-        std::span<const uint8_t> { reinterpret_cast<const uint8_t*>(path.data()), path.length() });
-    auto* error
-        = JSC::createError(globalObject, WTF::makeString(syscallName, " '"_s, pathString, "' failed: "_s, detail));
     error->putDirect(vm, JSC::Identifier::fromString(vm, "code"_s), JSC::jsString(vm, WTF::String(errnoCode(err))),
         fsPropertyAttributes);
     error->putDirect(vm, JSC::Identifier::fromString(vm, "errno"_s), JSC::jsNumber(-err), fsPropertyAttributes);
     error->putDirect(vm, JSC::Identifier::fromString(vm, "syscall"_s), JSC::jsString(vm, WTF::String(syscallName)),
         fsPropertyAttributes);
-    error->putDirect(
-        vm, JSC::Identifier::fromString(vm, "path"_s), JSC::jsString(vm, pathString), fsPropertyAttributes);
+}
+
+// The Error of every errno failure: the message "<syscall> '<path>' failed: <strerror text>", the errno properties and
+// a non-enumerable `path`, which keeps the whole string as given. A path too long to fit in a message with the rest
+// leaves it out of the message rather than ending the worker, which makeString would do.
+JSC::JSObject* createFsError(
+    JSC::JSGlobalObject* globalObject, JSC::VM& vm, int err, WTF::ASCIILiteral syscallName, const WTF::String& path)
+{
+    WTF::String reason = stringFromCString(std::strerror(err));
+    WTF::String message = WTF::tryMakeString(syscallName, " '"_s, path, "' failed: "_s, reason);
+    if (message.isNull())
+        message = WTF::makeString(syscallName, " failed: "_s, reason);
+    auto* error = JSC::createError(globalObject, message);
+    putErrnoProperties(vm, error, err, syscallName);
+    error->putDirect(vm, JSC::Identifier::fromString(vm, "path"_s), JSC::jsString(vm, path), fsPropertyAttributes);
     return error;
 }
 
-JSC::JSObject* createFsError(
-    JSC::JSGlobalObject* globalObject, JSC::VM& vm, int err, WTF::ASCIILiteral syscallName, const WTF::CString& path)
+// The failure of every operation while node:fs is closed in this process (`node_fs_open`): an EPERM Error without a
+// path, since no argument has been read.
+JSC::JSObject* createClosedFsError(JSC::JSGlobalObject* globalObject, JSC::VM& vm, WTF::ASCIILiteral syscallName)
 {
-    return createFsErrorWithDetail(globalObject, vm, err, syscallName, path, stringFromCString(std::strerror(err)));
+    auto* error = JSC::createError(
+        globalObject, WTF::makeString(syscallName, " refused: node:fs is not open in this process"_s));
+    putErrnoProperties(vm, error, EPERM, syscallName);
+    return error;
+}
+
+// A rename's errno failure, which also carries the destination as `dest`.
+JSC::JSObject* createFsErrorWithDest(JSC::JSGlobalObject* globalObject, JSC::VM& vm, int err,
+    WTF::ASCIILiteral syscallName, const WTF::String& path, const WTF::String& dest)
+{
+    auto* error = createFsError(globalObject, vm, err, syscallName, path);
+    error->putDirect(vm, JSC::Identifier::fromString(vm, "dest"_s), JSC::jsString(vm, dest), fsPropertyAttributes);
+    return error;
 }
 
 // A TypeError for a misused argument, carrying the `code` Node gives the same misuse.
@@ -165,70 +250,17 @@ JSC::JSObject* createTypeErrorWithCode(
     return error;
 }
 
-// A rename's errno failure, which also carries the destination as `dest`.
-JSC::JSObject* createFsErrorWithDest(JSC::JSGlobalObject* globalObject, JSC::VM& vm, int err,
-    WTF::ASCIILiteral syscallName, const WTF::CString& path, const WTF::CString& dest)
-{
-    auto* error = createFsError(globalObject, vm, err, syscallName, path);
-    error->putDirect(vm, JSC::Identifier::fromString(vm, "dest"_s),
-        JSC::jsString(vm,
-            stringFromUtf8Bytes(
-                std::span<const uint8_t> { reinterpret_cast<const uint8_t*>(dest.data()), dest.length() })),
-        fsPropertyAttributes);
-    return error;
-}
-
 FsResult ok(JSC::JSValue value) { return { value, JSC::jsUndefined(), true }; }
 
 FsResult fail(JSC::JSValue error) { return { JSC::jsUndefined(), error, false }; }
 
-struct RoutedPath {
-    ColloFsRouteClass klass { COLLO_FS_ROUTE_NONE };
-    uint64_t size { 0 };
-    uint64_t mtimeMs { 0 };
-    uint32_t normalizedLen { 0 };
-    // The normalized absolute path with a trailing NUL, which the syscalls receive as is: inside a worker, lexical
-    // resolution names the file the kernel would (`normalizePath` in worker/fs/index.zig says why).
-    char normalized[COLLO_FS_PATH_BYTES_MAX];
-
-    std::span<const char> normalizedPath() const { return std::span { normalized }.first(normalizedLen); }
-};
-
-// Routes `path` into `out`. Returns the collo_runtime_fs_route status: COLLO_STATUS_INVALID_ARGUMENT for a path too
-// long to normalize, another failure for no installed index or a misused call.
-ColloStatus routePath(const WTF::CString& path, RoutedPath& out)
+// Takes the exception pending on `scope` as an operation's failure. A termination stays pending, because
+// tryClearException refuses to clear one, and the encoders at the end of this file return no value while it is.
+JSC::JSValue takeException(JSC::ThrowScope& scope)
 {
-    ColloFsRoute route {};
-    ColloStatus status = collo_runtime_fs_route(fsPathArgument(path.span()),
-        byteCast<uint8_t>(std::span { out.normalized }).data(), sizeof(out.normalized), &route);
-    if (status != COLLO_STATUS_OK)
-        return status;
-    // Checked rather than trusted: the syscalls read up to the NUL at this length, and a class this file does not
-    // know would otherwise fall through to the /tmp branch of a caller and reach a real syscall.
-    if (route.normalized_len >= sizeof(out.normalized) || route.route_class > COLLO_FS_ROUTE_DEPLOY_DIR)
-        return COLLO_STATUS_ERROR;
-    out.klass = route.route_class;
-    out.size = route.size;
-    out.mtimeMs = route.mtime_ms;
-    out.normalizedLen = route.normalized_len;
-    return COLLO_STATUS_OK;
-}
-
-bool routeFsPath(JSC::JSGlobalObject* globalObject, JSC::VM& vm, const WTF::CString& path,
-    WTF::ASCIILiteral syscallName, RoutedPath& out, JSC::JSValue& outError)
-{
-    ColloStatus status = routePath(path, out);
-    if (status == COLLO_STATUS_INVALID_ARGUMENT) {
-        outError = createFsError(globalObject, vm, ENAMETOOLONG, syscallName, path);
-        return false;
-    }
-    if (status != COLLO_STATUS_OK) {
-        // No installed index or a misused call, a worker bug rather than anything the caller did, so the operation
-        // fails with EIO.
-        outError = createFsError(globalObject, vm, EIO, syscallName, path);
-        return false;
-    }
-    return true;
+    JSC::JSValue error = scope.exception()->value();
+    (void)scope.tryClearException();
+    return error;
 }
 
 double mtimeMsFromTimespec(const struct timespec& ts)
@@ -248,14 +280,22 @@ JSC::JSObject* makeStatObject(
     return object;
 }
 
-bool pathArgument(JSC::JSGlobalObject* globalObject, JSC::ThrowScope& scope, JSC::CallFrame* callFrame, unsigned index,
-    WTF::CString& out, JSC::JSValue& outError)
+// How reading a path argument ended: a path, the caller's misuse (the TypeErrors Node gives a path it cannot validate),
+// or a failure of the engine's own (an allocation, a pending exception).
+enum class PathArgument : uint8_t {
+    valid,
+    invalid,
+    failed,
+};
+
+PathArgument pathArgument(JSC::JSGlobalObject* globalObject, JSC::ThrowScope& scope, JSC::CallFrame* callFrame,
+    unsigned index, FsPath& out, JSC::JSValue& outError)
 {
     JSC::VM& vm = globalObject->vm();
     if (callFrame->argumentCount() <= index || callFrame->argument(index).isUndefined()) {
         outError
             = createTypeErrorWithCode(globalObject, vm, "ERR_INVALID_ARG_TYPE"_s, "fs path argument is required."_s);
-        return false;
+        return PathArgument::invalid;
     }
 
     // Only a string is a path, and the type is checked before any conversion, so a number or an object never becomes
@@ -264,34 +304,32 @@ bool pathArgument(JSC::JSGlobalObject* globalObject, JSC::ThrowScope& scope, JSC
     JSC::JSValue pathValue = callFrame->argument(index);
     if (!pathValue.isString()) {
         outError = createTypeErrorWithCode(globalObject, vm, "ERR_INVALID_ARG_TYPE"_s, "fs path must be a string."_s);
-        return false;
+        return PathArgument::invalid;
     }
 
-    WTF::String path = pathValue.toWTFString(globalObject);
+    out.text = pathValue.toWTFString(globalObject);
     if (scope.exception()) {
-        outError = scope.exception()->value();
-        (void)scope.tryClearException();
-        return false;
+        outError = takeException(scope);
+        return PathArgument::failed;
     }
 
-    for (unsigned i = 0; i < path.length(); ++i) {
-        if (path[i] != 0)
-            continue;
+    // The kernel reads a path up to its first NUL, so a path holding one would name a different file than the string.
+    if (out.text.contains(static_cast<char16_t>(0))) {
         outError = createTypeErrorWithCode(
             globalObject, vm, "ERR_INVALID_ARG_VALUE"_s, "fs path must not contain NUL bytes."_s);
-        return false;
+        return PathArgument::invalid;
     }
 
-    out = path.utf8();
-    if (!out.data()) {
+    // The lenient conversion fails only when the UTF-8 form would be longer than WTF converts; a failed allocation
+    // inside it still ends the process, as everywhere in WTF. An empty path reaches the kernel, which answers ENOENT,
+    // as it does for Node.
+    auto bytes = out.text.tryGetUTF8();
+    if (!bytes) {
         outError = JSC::createOutOfMemoryError(globalObject);
-        return false;
+        return PathArgument::failed;
     }
-    if (out.length() == 0) {
-        outError = createFsError(globalObject, vm, ENOENT, "openat"_s, out);
-        return false;
-    }
-    return true;
+    out.bytes = WTF::move(bytes.value());
+    return PathArgument::valid;
 }
 
 // writeFile's data: a string, written as UTF-8, or a Uint8Array, written byte for byte, so the bytes readFile returns
@@ -306,7 +344,7 @@ struct WriteData {
     {
         if (isBytes)
             return bytes;
-        return { reinterpret_cast<const uint8_t*>(string.data()), string.length() };
+        return byteCast<uint8_t>(string.span());
     }
 };
 
@@ -341,16 +379,17 @@ bool writeDataArgument(JSC::JSGlobalObject* globalObject, JSC::ThrowScope& scope
 
     WTF::String stringValue = value.toWTFString(globalObject);
     if (scope.exception()) {
-        outError = scope.exception()->value();
-        (void)scope.tryClearException();
+        outError = takeException(scope);
         return false;
     }
-    out.string = stringValue.utf8();
-    out.isBytes = false;
-    if (!out.string.data()) {
+    // As for a path, the conversion fails only when the UTF-8 form would be longer than WTF converts.
+    auto string = stringValue.tryGetUTF8();
+    if (!string) {
         outError = JSC::createOutOfMemoryError(globalObject);
         return false;
     }
+    out.string = WTF::move(string.value());
+    out.isBytes = false;
     return true;
 }
 
@@ -383,8 +422,7 @@ bool parseReadEncoding(JSC::JSGlobalObject* globalObject, JSC::ThrowScope& scope
         }
         encodingValue = value.getObject()->get(globalObject, JSC::Identifier::fromString(vm, "encoding"_s));
         if (scope.exception()) {
-            outError = scope.exception()->value();
-            (void)scope.tryClearException();
+            outError = takeException(scope);
             return false;
         }
         if (encodingValue.isUndefinedOrNull())
@@ -398,8 +436,7 @@ bool parseReadEncoding(JSC::JSGlobalObject* globalObject, JSC::ThrowScope& scope
 
     WTF::String name = encodingValue.toWTFString(globalObject);
     if (scope.exception()) {
-        outError = scope.exception()->value();
-        (void)scope.tryClearException();
+        outError = takeException(scope);
         return false;
     }
     if (equalIgnoringASCIICase(name, "utf8"_s) || equalIgnoringASCIICase(name, "utf-8"_s)) {
@@ -411,29 +448,31 @@ bool parseReadEncoding(JSC::JSGlobalObject* globalObject, JSC::ThrowScope& scope
     return false;
 }
 
-// Every readFile path builds its result here: a /tmp file, a copy read directly, and a copy read after a sync or an
-// async fault. All of them therefore apply the encoding the same way.
+// readFile's result from the bytes read, in the form `output` selects.
 FsResult encodeReadData(
     JSC::JSGlobalObject* globalObject, JSC::VM& vm, std::span<const uint8_t> bytes, ReadOutput output)
 {
-    if (output == ReadOutput::utf8)
-        return ok(JSC::jsString(vm, stringFromUtf8Bytes(bytes)));
     auto scope = DECLARE_THROW_SCOPE(vm);
-    auto* array = Collo::HostFunctions::createBodyUint8ArrayCopy(globalObject, scope, bytes);
-    if (scope.exception()) {
-        JSC::JSValue error = scope.exception()->value();
-        (void)scope.tryClearException();
-        return fail(error);
+    if (output == ReadOutput::utf8) {
+        // Node keeps a leading BOM as U+FEFF. utf8.h says which input the decode refuses with an OutOfMemoryError
+        // instead of ending the process.
+        WTF::String text;
+        if (!Collo::HostFunctions::decodeUtf8BytesPreservingBom(globalObject, scope, bytes, text))
+            return fail(takeException(scope));
+        return ok(JSC::jsString(vm, WTF::move(text)));
     }
+    auto* array = Collo::HostFunctions::createBodyUint8ArrayCopy(globalObject, scope, bytes);
+    if (scope.exception())
+        return fail(takeException(scope));
     if (!array)
         return fail(JSC::createOutOfMemoryError(globalObject));
     return ok(array);
 }
 
 // AT_FDCWD is a kernel `int`. Passed to the variadic syscall() as an int, it would reach the argument register through
-// a 32-bit move that zeroes the high word. The worker's seccomp filter compares only the low word, as the kernel reads
-// it (appendAtFdcwdPolicy in zygote/worker_boot/sandbox.zig), so both forms pass; the sign-extended long keeps the
-// whole register canonical and matches what Zig's `*at` wrappers pass.
+// a 32-bit move that zeroes the high word. The worker's seccomp filter (zygote/worker_boot/sandbox.zig) compares only
+// the low word, as the kernel reads it, so both forms pass; the sign-extended long keeps the whole register canonical
+// and matches what Zig's `*at` wrappers pass.
 static constexpr long kAtFdcwd = AT_FDCWD;
 
 int sysOpenAt(const char* path, int flags, mode_t mode)
@@ -491,553 +530,341 @@ int sysRenameAt2(const char* oldPath, const char* newPath)
     }
 }
 
-int sysFtruncate(int fd, off_t size)
+// Writes all of `bytes` to `fd`, retrying short writes. Returns 0, or the errno of the write that failed; a write that
+// accepts nothing without setting errno reports EIO.
+int writeAll(int fd, std::span<const uint8_t> bytes)
 {
-    for (;;) {
-        int rc = static_cast<int>(syscall(SYS_ftruncate, fd, size));
-        if (rc == 0)
-            return 0;
-        if (errno != EINTR)
-            return -1;
-    }
-}
-
-void closeBestEffort(int fd)
-{
-    if (fd >= 0)
-        close(fd);
-}
-
-bool writeAll(int fd, const char* data, size_t size, int& outErrno)
-{
-    size_t written = 0;
-    while (written < size) {
-        ssize_t rc = write(fd, data + written, size - written);
+    while (!bytes.empty()) {
+        ssize_t rc = write(fd, bytes.data(), bytes.size());
         if (rc > 0) {
-            written += static_cast<size_t>(rc);
+            bytes = bytes.subspan(static_cast<size_t>(rc));
             continue;
         }
         if (rc < 0 && errno == EINTR)
             continue;
-        outErrno = rc < 0 ? errno : EIO;
-        return false;
+        return rc < 0 ? errno : EIO;
     }
-    return true;
+    return 0;
+}
+
+// Reads the file at `path` to its end. Only a regular file is read: a directory fails with EISDIR and any other kind
+// of file with EINVAL. fstat's size is a hint, since the file may change while it is read. The buffer starts one byte
+// past it, so a file of exactly that size ends with a read of zero bytes and no reallocation; whenever it fills, the
+// next read asks for readGrowthBytes more, while Vector grows its capacity geometrically.
+//
+// The worker cannot create anything but directories and regular files, because its filter admits no mknodat, so its
+// own root holds no FIFO. A FIFO in a directory bound from the host would block the open until a writer appears, since
+// the filter admits no O_NONBLOCK, and only then would fstat refuse it.
+FsResult readWholeFile(JSC::JSGlobalObject* globalObject, JSC::VM& vm, const FsPath& path, ReadOutput output)
+{
+    OwnedFd fd(sysOpenAt(path.bytes.data(), O_RDONLY | O_CLOEXEC, 0));
+    if (!fd)
+        return fail(createFsError(globalObject, vm, errno, "openat"_s, path.text));
+
+    struct stat statBuffer;
+    if (fstat(fd.get(), &statBuffer) != 0)
+        return fail(createFsError(globalObject, vm, errno, "fstat"_s, path.text));
+    if (S_ISDIR(statBuffer.st_mode))
+        return fail(createFsError(globalObject, vm, EISDIR, "read"_s, path.text));
+    if (!S_ISREG(statBuffer.st_mode))
+        return fail(createFsError(globalObject, vm, EINVAL, "read"_s, path.text));
+
+    // A regular file's st_size is never negative.
+    CheckedSize capacity = static_cast<size_t>(statBuffer.st_size);
+    capacity += size_t { 1 };
+    WTF::Vector<uint8_t> bytes;
+    if (capacity.hasOverflowed() || !bytes.tryGrow(capacity.value()))
+        return fail(JSC::createOutOfMemoryError(globalObject));
+    size_t length = 0;
+    for (;;) {
+        if (length == bytes.size()) {
+            CheckedSize grown = bytes.size();
+            grown += readGrowthBytes;
+            if (grown.hasOverflowed() || !bytes.tryGrow(grown.value()))
+                return fail(JSC::createOutOfMemoryError(globalObject));
+        }
+        std::span<uint8_t> unfilled = bytes.mutableSpan().subspan(length);
+        ssize_t rc = read(fd.get(), unfilled.data(), unfilled.size());
+        if (rc > 0) {
+            length += static_cast<size_t>(rc);
+            continue;
+        }
+        if (!rc)
+            break;
+        if (errno != EINTR)
+            return fail(createFsError(globalObject, vm, errno, "read"_s, path.text));
+    }
+    bytes.shrink(length);
+    return encodeReadData(globalObject, vm, bytes.span(), output);
+}
+
+// Every operation starts here, before it reads an argument: false, with `out` set to the EPERM failure, while node:fs
+// is closed in this process.
+bool nodeFsOpen(JSC::JSGlobalObject* globalObject, JSC::VM& vm, WTF::ASCIILiteral syscallName, FsResult& out)
+{
+    if (node_fs_open.load())
+        return true;
+    out = fail(createClosedFsError(globalObject, vm, syscallName));
+    return false;
 }
 
 FsResult statOperation(JSC::JSGlobalObject* globalObject, JSC::CallFrame* callFrame)
 {
     JSC::VM& vm = globalObject->vm();
+    FsResult closed;
+    if (!nodeFsOpen(globalObject, vm, "stat"_s, closed))
+        return closed;
     auto scope = DECLARE_THROW_SCOPE(vm);
 
-    WTF::CString path;
+    FsPath path;
     JSC::JSValue error;
-    if (!pathArgument(globalObject, scope, callFrame, 0, path, error))
+    if (pathArgument(globalObject, scope, callFrame, 0, path, error) != PathArgument::valid)
         return fail(error);
 
-    RoutedPath routed;
-    if (!routeFsPath(globalObject, vm, path, "stat"_s, routed, error))
-        return fail(error);
-
-    if (routed.klass == COLLO_FS_ROUTE_TMP) {
-        struct stat statBuffer;
-        if (sysNewFstatAt(routed.normalized, &statBuffer) != 0)
-            return fail(createFsError(globalObject, vm, errno, "stat"_s, path));
-        return ok(makeStatObject(globalObject, vm, static_cast<uint64_t>(statBuffer.st_size), statBuffer.st_mode,
-            mtimeMsFromTimespec(statBuffer.st_mtim)));
-    }
-    // A path in the tree is answered from the index: a file reports its size, both kinds report the index's
-    // `deploy_epoch_ms` as mtime, and the modes are read-only.
-    if (routed.klass == COLLO_FS_ROUTE_DEPLOY_FILE)
-        return ok(makeStatObject(globalObject, vm, routed.size, S_IFREG | 0444, static_cast<double>(routed.mtimeMs)));
-    if (routed.klass == COLLO_FS_ROUTE_DEPLOY_DIR)
-        return ok(makeStatObject(globalObject, vm, 0, S_IFDIR | 0555, static_cast<double>(routed.mtimeMs)));
-    return fail(createFsError(globalObject, vm, ENOENT, "stat"_s, path));
+    struct stat statBuffer;
+    if (sysNewFstatAt(path.bytes.data(), &statBuffer) != 0)
+        return fail(createFsError(globalObject, vm, errno, "stat"_s, path.text));
+    return ok(makeStatObject(globalObject, vm, static_cast<uint64_t>(statBuffer.st_size), statBuffer.st_mode,
+        mtimeMsFromTimespec(statBuffer.st_mtim)));
 }
 
 FsResult existsOperation(JSC::JSGlobalObject* globalObject, JSC::CallFrame* callFrame)
 {
     JSC::VM& vm = globalObject->vm();
+    FsResult closed;
+    if (!nodeFsOpen(globalObject, vm, "stat"_s, closed))
+        return closed;
     auto scope = DECLARE_THROW_SCOPE(vm);
 
-    WTF::CString path;
+    // As Node's existsSync does, a path argument that is missing, not a string or holds a NUL answers false. An
+    // allocation failure or a pending termination still fails.
+    FsPath path;
     JSC::JSValue error;
-    if (!pathArgument(globalObject, scope, callFrame, 0, path, error))
-        return fail(error);
-
-    // A routing failure, such as a path too long or no installed index, answers false instead of throwing.
-    RoutedPath routed;
-    if (routePath(path, routed) != COLLO_STATUS_OK)
+    switch (pathArgument(globalObject, scope, callFrame, 0, path, error)) {
+    case PathArgument::valid:
+        break;
+    case PathArgument::invalid:
         return ok(JSC::jsBoolean(false));
-    if (routed.klass == COLLO_FS_ROUTE_DEPLOY_FILE || routed.klass == COLLO_FS_ROUTE_DEPLOY_DIR)
-        return ok(JSC::jsBoolean(true));
-    if (routed.klass != COLLO_FS_ROUTE_TMP)
-        return ok(JSC::jsBoolean(false));
-
-    struct stat statBuffer;
-    if (sysNewFstatAt(routed.normalized, &statBuffer) == 0)
-        return ok(JSC::jsBoolean(true));
-    if (errno == ENOENT || errno == ENOTDIR)
-        return ok(JSC::jsBoolean(false));
-    return fail(createFsError(globalObject, vm, errno, "stat"_s, path));
-}
-
-// Reads a copy in the tmpfs into one allocation of the size fstat reports. The allocation is charged to the worker's
-// cgroup, so failing it is an ordinary outcome that becomes an OutOfMemoryError. Takes `fd` and closes it on every
-// path; a read that ends before that size fails with EIO.
-FsResult readDeployFileExact(
-    JSC::JSGlobalObject* globalObject, JSC::VM& vm, const WTF::CString& path, int fd, ReadOutput output)
-{
-    struct stat statBuffer;
-    if (fstat(fd, &statBuffer) != 0) {
-        int savedErrno = errno;
-        closeBestEffort(fd);
-        return fail(createFsError(globalObject, vm, savedErrno, "fstat"_s, path));
-    }
-    if (S_ISDIR(statBuffer.st_mode)) {
-        closeBestEffort(fd);
-        return fail(createFsError(globalObject, vm, EISDIR, "read"_s, path));
-    }
-    // worker/fs/fault.zig never copies a file above maxReadFileBytes, so a larger copy cannot exist; the check keeps
-    // the allocation below bounded by this file's own constant and answers EFBIG.
-    if (statBuffer.st_size < 0 || statBuffer.st_size > static_cast<off_t>(maxReadFileBytes)) {
-        closeBestEffort(fd);
-        return fail(createFsError(globalObject, vm, EFBIG, "read"_s, path));
-    }
-
-    const size_t size = static_cast<size_t>(statBuffer.st_size);
-    WTF::Vector<uint8_t> bytes;
-    if (!bytes.tryGrow(size)) {
-        closeBestEffort(fd);
-        return fail(JSC::createOutOfMemoryError(globalObject));
-    }
-    size_t readTotal = 0;
-    while (readTotal < size) {
-        ssize_t rc = read(fd, bytes.mutableSpan().data() + readTotal, size - readTotal);
-        if (rc > 0) {
-            readTotal += static_cast<size_t>(rc);
-            continue;
-        }
-        if (rc < 0 && errno == EINTR)
-            continue;
-        int savedErrno = rc < 0 ? errno : EIO;
-        closeBestEffort(fd);
-        return fail(createFsError(globalObject, vm, savedErrno, "read"_s, path));
-    }
-    closeBestEffort(fd);
-    return encodeReadData(globalObject, vm, bytes.span(), output);
-}
-
-// Faults a file of the tree in for a promise-returning read and returns, marked pending, a promise for its contents
-// in the form `output` selects. Without a host runtime or an execution context nothing can fault the file in, so the
-// read fails with ENOENT as for a path outside the tree. A fault that cannot be scheduled fails with EIO at once
-// (`schedule` in worker/fs/fault.zig lists why it can fail), so the caller never waits on a promise nothing settles.
-FsResult scheduleDeployReadFault(JSC::JSGlobalObject* globalObject, JSC::ThrowScope& scope, const WTF::CString& path,
-    const RoutedPath& routed, ReadOutput output)
-{
-    JSC::VM& vm = globalObject->vm();
-    Collo::HostFunctions::Runtime::ActiveRequestRuntime runtime;
-    if (!Collo::HostFunctions::Runtime::optionalActiveRequestRuntime(globalObject, runtime)) {
-        return fail(createFsError(globalObject, vm, ENOENT, "openat"_s, path));
-    }
-
-    auto deferred_promise = Collo::HostFunctions::Runtime::createPromiseDeferred(
-        globalObject, scope, *runtime.owner, "Failed to create fs read promise."_s);
-    if (!deferred_promise.ok) {
-        JSC::JSValue error = JSC::jsUndefined();
-        if (scope.exception()) {
-            error = scope.exception()->value();
-            (void)scope.tryClearException();
-        } else
-            error = createFsError(globalObject, vm, EIO, "openat"_s, path);
+    case PathArgument::failed:
         return fail(error);
     }
 
-    uint64_t fault_id = 0;
-    ColloStatus status = collo_runtime_fs_fault_read_file(runtime.host_runtime, runtime.exec_ctx->request_id,
-        fsPathArgument(routed.normalizedPath()), deferred_promise.value.deferred, &fault_id);
-    if (status != COLLO_STATUS_OK) {
-        // Zig took the deferred although the call failed and released it unsettled, so nothing references the
-        // promise any more and the collector reclaims it.
-        return fail(createFsError(globalObject, vm, EIO, "openat"_s, path));
-    }
-
-    auto* pending = dynamicDowncast<JSC::JSPromise>(deferred_promise.value.promise);
-    if (!pending)
-        return fail(createFsError(globalObject, vm, EIO, "openat"_s, path));
-
-    // The fault resolves its promise with undefined once the copy exists (`resolveWaiters` in
-    // worker/fs/fault_completion.zig). The value the caller sees comes from the reaction chained below, which reads the
-    // copy and applies the encoding the same way a synchronous read does.
-    WTF::CString normalizedCopy(routed.normalizedPath());
-    auto* settled = JSC::JSNativeStdFunction::create(vm, globalObject, 1, "fsFaultSettleRead"_s,
-        [path, normalizedCopy, output](JSC::JSGlobalObject* lambdaGlobal, JSC::CallFrame*) -> JSC::EncodedJSValue {
-            JSC::VM& lambdaVm = lambdaGlobal->vm();
-            auto lambdaScope = DECLARE_THROW_SCOPE(lambdaVm);
-            // The copy may live outside the normalized path, as collo_runtime_fs_materialized_path explains.
-            char physical[COLLO_FS_PATH_BYTES_MAX];
-            size_t physicalLen = 0;
-            ColloStatus physicalStatus = collo_runtime_fs_materialized_path(fsPathArgument(normalizedCopy.span()),
-                byteCast<uint8_t>(std::span { physical }).data(), sizeof(physical), &physicalLen);
-            if (physicalStatus != COLLO_STATUS_OK || physicalLen >= sizeof(physical)) {
-                return JSC::JSValue::encode(JSC::throwException(
-                    lambdaGlobal, lambdaScope, createFsError(lambdaGlobal, lambdaVm, EIO, "read"_s, path)));
-            }
-            // This read records no local hit, so `worker.fs_fault.hit_local` traces only reads of a copy that existed
-            // before the call; copying the file already stamped its last read in the ledger.
-            int deployFd = sysOpenAt(physical, O_RDONLY | O_CLOEXEC, 0);
-            if (deployFd < 0) {
-                return JSC::JSValue::encode(JSC::throwException(
-                    lambdaGlobal, lambdaScope, createFsError(lambdaGlobal, lambdaVm, errno, "openat"_s, path)));
-            }
-            FsResult readResult = readDeployFileExact(lambdaGlobal, lambdaVm, path, deployFd, output);
-            if (!readResult.ok) {
-                return JSC::JSValue::encode(JSC::throwException(lambdaGlobal, lambdaScope, readResult.error));
-            }
-            return JSC::JSValue::encode(readResult.value);
-        });
-    auto* faulted = JSC::JSNativeStdFunction::create(vm, globalObject, 1, "fsFaultSettleReject"_s,
-        [path](JSC::JSGlobalObject* lambdaGlobal, JSC::CallFrame* lambdaFrame) -> JSC::EncodedJSValue {
-            JSC::VM& lambdaVm = lambdaGlobal->vm();
-            auto lambdaScope = DECLARE_THROW_SCOPE(lambdaVm);
-            // The fault rejects with a reason string from worker/fs/fault_completion.zig, which becomes the detail of
-            // an EIO error: the index already decided before the fault that the path exists.
-            // FIXME: a not_found answer from the host also becomes EIO here, while syncDeployReadFault turns it into
-            // ENOENT.
-            WTF::String reason = lambdaFrame->argument(0).toWTFString(lambdaGlobal);
-            if (lambdaScope.exception()) {
-                (void)lambdaScope.tryClearException();
-                reason = "fs fault failed"_s;
-            }
-            return JSC::JSValue::encode(JSC::throwException(lambdaGlobal, lambdaScope,
-                createFsErrorWithDetail(lambdaGlobal, lambdaVm, EIO, "read"_s, path, reason)));
-        });
-    auto* chained = JSC::JSPromise::create(vm, globalObject->promiseStructure());
-    pending->performPromiseThen(vm, globalObject, settled, faulted, chained);
-
-    FsResult result = ok(chained);
-    result.pending = true;
-    return result;
+    // So does every failure of the stat: a missing file, a path too long, a component that is not a directory.
+    struct stat statBuffer;
+    return ok(JSC::jsBoolean(sysNewFstatAt(path.bytes.data(), &statBuffer) == 0));
 }
 
-// Faults a file of the tree in for a synchronous read, blocking the VM thread until the copy exists or the request's
-// deadline passes, then reads the copy at the normalized path, where a worker keeps it. `faultSync` in
-// worker/fs/fault_sync.zig owns the wait and explains why a timeout cannot outlast the request. A file the host does
-// not have fails with ENOENT, as does a call with no host runtime or execution context; any other fault failure fails
-// with EIO.
-FsResult syncDeployReadFault(JSC::JSGlobalObject* globalObject, JSC::VM& vm, const WTF::CString& path,
-    const RoutedPath& routed, ReadOutput output)
-{
-    Collo::HostFunctions::Runtime::ActiveRequestRuntime runtime;
-    if (!Collo::HostFunctions::Runtime::optionalActiveRequestRuntime(globalObject, runtime)) {
-        return fail(createFsError(globalObject, vm, ENOENT, "openat"_s, path));
-    }
-
-    ColloStatus status = collo_runtime_fs_fault_sync(
-        runtime.host_runtime, runtime.exec_ctx->request_id, fsPathArgument(routed.normalizedPath()));
-    if (status == COLLO_STATUS_NOT_FOUND)
-        return fail(createFsError(globalObject, vm, ENOENT, "openat"_s, path));
-    if (status != COLLO_STATUS_OK)
-        return fail(createFsError(globalObject, vm, EIO, "openat"_s, path));
-
-    // No local hit is recorded, for the reason given in scheduleDeployReadFault.
-    // FIXME: this open and the direct one in readFileOperation use the normalized path instead of asking
-    // collo_runtime_fs_materialized_path, so under the in-process test install they miss the copy.
-    int deployFd = sysOpenAt(routed.normalized, O_RDONLY | O_CLOEXEC, 0);
-    if (deployFd < 0)
-        return fail(createFsError(globalObject, vm, errno, "openat"_s, path));
-    return readDeployFileExact(globalObject, vm, path, deployFd, output);
-}
-
-FsResult readFileOperation(JSC::JSGlobalObject* globalObject, JSC::CallFrame* callFrame, bool allowAsyncFault)
+FsResult readFileOperation(JSC::JSGlobalObject* globalObject, JSC::CallFrame* callFrame)
 {
     JSC::VM& vm = globalObject->vm();
+    FsResult closed;
+    if (!nodeFsOpen(globalObject, vm, "openat"_s, closed))
+        return closed;
     auto scope = DECLARE_THROW_SCOPE(vm);
 
-    WTF::CString path;
+    FsPath path;
     JSC::JSValue error;
-    if (!pathArgument(globalObject, scope, callFrame, 0, path, error))
+    if (pathArgument(globalObject, scope, callFrame, 0, path, error) != PathArgument::valid)
         return fail(error);
 
     ReadOutput output = ReadOutput::bytes;
     if (!parseReadEncoding(globalObject, scope, callFrame, 1, output, error))
         return fail(error);
 
-    RoutedPath routed;
-    if (!routeFsPath(globalObject, vm, path, "openat"_s, routed, error))
-        return fail(error);
-    if (routed.klass == COLLO_FS_ROUTE_DEPLOY_FILE) {
-        // A copy already in the tmpfs is read directly, and the read is recorded as a local hit.
-        int deployFd = sysOpenAt(routed.normalized, O_RDONLY | O_CLOEXEC, 0);
-        if (deployFd >= 0) {
-            auto* collo_global = dynamicDowncast<Collo::GlobalObject>(globalObject);
-            if (collo_global) {
-                void* host_runtime = Collo::HostFunctions::Runtime::hostRuntime(collo_global->owner());
-                if (host_runtime)
-                    collo_runtime_fs_fault_hit_local(host_runtime, fsPathArgument(routed.normalizedPath()));
-            }
-            return readDeployFileExact(globalObject, vm, path, deployFd, output);
-        }
-        if (errno != ENOENT)
-            return fail(createFsError(globalObject, vm, errno, "openat"_s, path));
-        // No copy yet. The index knows the size, so a file above maxReadFileBytes fails here with the EFBIG that
-        // readDeployFileExact gives; the fault would refuse the file too, but as EIO.
-        if (routed.size > maxReadFileBytes)
-            return fail(createFsError(globalObject, vm, EFBIG, "read"_s, path));
-        if (allowAsyncFault)
-            return scheduleDeployReadFault(globalObject, scope, path, routed, output);
-        return syncDeployReadFault(globalObject, vm, path, routed, output);
-    }
-    if (routed.klass == COLLO_FS_ROUTE_DEPLOY_DIR)
-        return fail(createFsError(globalObject, vm, EISDIR, "read"_s, path));
-    if (routed.klass == COLLO_FS_ROUTE_NONE)
-        return fail(createFsError(globalObject, vm, ENOENT, "openat"_s, path));
-
-    int fd = sysOpenAt(routed.normalized, O_RDONLY | O_CLOEXEC, 0);
-    if (fd < 0)
-        return fail(createFsError(globalObject, vm, errno, "openat"_s, path));
-
-    struct stat statBuffer;
-    if (fstat(fd, &statBuffer) != 0) {
-        int savedErrno = errno;
-        closeBestEffort(fd);
-        return fail(createFsError(globalObject, vm, savedErrno, "fstat"_s, path));
-    }
-    if (S_ISDIR(statBuffer.st_mode)) {
-        closeBestEffort(fd);
-        return fail(createFsError(globalObject, vm, EISDIR, "read"_s, path));
-    }
-    // A /tmp file has no size cap here, for the reason given at maxReadFileBytes; a failed allocation becomes an
-    // OutOfMemoryError.
-    WTF::Vector<uint8_t> bytes;
-    uint8_t chunk[readChunkBytes];
-    for (;;) {
-        ssize_t rc = read(fd, chunk, sizeof(chunk));
-        if (rc > 0) {
-            if (!bytes.tryAppend(std::span<const uint8_t> { chunk, static_cast<size_t>(rc) })) {
-                closeBestEffort(fd);
-                return fail(JSC::createOutOfMemoryError(globalObject));
-            }
-            continue;
-        }
-        if (rc == 0)
-            break;
-        if (errno == EINTR)
-            continue;
-        int savedErrno = errno;
-        closeBestEffort(fd);
-        return fail(createFsError(globalObject, vm, savedErrno, "read"_s, path));
-    }
-
-    closeBestEffort(fd);
-    return encodeReadData(globalObject, vm, bytes.span(), output);
+    return readWholeFile(globalObject, vm, path, output);
 }
 
 FsResult writeFileOperation(JSC::JSGlobalObject* globalObject, JSC::CallFrame* callFrame)
 {
     JSC::VM& vm = globalObject->vm();
+    FsResult closed;
+    if (!nodeFsOpen(globalObject, vm, "openat"_s, closed))
+        return closed;
     auto scope = DECLARE_THROW_SCOPE(vm);
 
-    WTF::CString path;
+    FsPath path;
     JSC::JSValue error;
-    if (!pathArgument(globalObject, scope, callFrame, 0, path, error))
+    if (pathArgument(globalObject, scope, callFrame, 0, path, error) != PathArgument::valid)
         return fail(error);
 
     WriteData data;
     if (!writeDataArgument(globalObject, scope, callFrame, 1, data, error))
         return fail(error);
 
-    RoutedPath routed;
-    if (!routeFsPath(globalObject, vm, path, "openat"_s, routed, error))
-        return fail(error);
-    // Only /tmp is writable: any other path fails with EROFS, whether or not the index lists it.
-    if (routed.klass != COLLO_FS_ROUTE_TMP)
-        return fail(createFsError(globalObject, vm, EROFS, "openat"_s, path));
-
-    int fd = sysOpenAt(routed.normalized, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
-    if (fd < 0)
-        return fail(createFsError(globalObject, vm, errno, "openat"_s, path));
-    if (sysFtruncate(fd, 0) != 0) {
-        int savedErrno = errno;
-        closeBestEffort(fd);
-        return fail(createFsError(globalObject, vm, savedErrno, "ftruncate"_s, path));
-    }
-
-    const std::span<const uint8_t> payload = data.span();
-    int writeErrno = 0;
-    if (!writeAll(fd, reinterpret_cast<const char*>(payload.data()), payload.size(), writeErrno)) {
-        closeBestEffort(fd);
-        return fail(createFsError(globalObject, vm, writeErrno, "write"_s, path));
-    }
-    closeBestEffort(fd);
+    OwnedFd fd(sysOpenAt(path.bytes.data(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600));
+    if (!fd)
+        return fail(createFsError(globalObject, vm, errno, "openat"_s, path.text));
+    if (int writeErrno = writeAll(fd.get(), data.span()))
+        return fail(createFsError(globalObject, vm, writeErrno, "write"_s, path.text));
     return ok(JSC::jsUndefined());
 }
 
 FsResult mkdirOperation(JSC::JSGlobalObject* globalObject, JSC::CallFrame* callFrame)
 {
     JSC::VM& vm = globalObject->vm();
+    FsResult closed;
+    if (!nodeFsOpen(globalObject, vm, "mkdir"_s, closed))
+        return closed;
     auto scope = DECLARE_THROW_SCOPE(vm);
 
-    WTF::CString path;
+    FsPath path;
     JSC::JSValue error;
-    if (!pathArgument(globalObject, scope, callFrame, 0, path, error))
+    if (pathArgument(globalObject, scope, callFrame, 0, path, error) != PathArgument::valid)
         return fail(error);
 
-    RoutedPath routed;
-    if (!routeFsPath(globalObject, vm, path, "mkdir"_s, routed, error))
-        return fail(error);
-    if (routed.klass != COLLO_FS_ROUTE_TMP)
-        return fail(createFsError(globalObject, vm, EROFS, "mkdir"_s, path));
-    if (sysMkdirAt(routed.normalized, 0700) != 0)
-        return fail(createFsError(globalObject, vm, errno, "mkdir"_s, path));
+    if (sysMkdirAt(path.bytes.data(), 0700) != 0)
+        return fail(createFsError(globalObject, vm, errno, "mkdir"_s, path.text));
     return ok(JSC::jsUndefined());
 }
 
 FsResult unlinkOperation(JSC::JSGlobalObject* globalObject, JSC::CallFrame* callFrame)
 {
     JSC::VM& vm = globalObject->vm();
+    FsResult closed;
+    if (!nodeFsOpen(globalObject, vm, "unlink"_s, closed))
+        return closed;
     auto scope = DECLARE_THROW_SCOPE(vm);
 
-    WTF::CString path;
+    FsPath path;
     JSC::JSValue error;
-    if (!pathArgument(globalObject, scope, callFrame, 0, path, error))
+    if (pathArgument(globalObject, scope, callFrame, 0, path, error) != PathArgument::valid)
         return fail(error);
 
-    RoutedPath routed;
-    if (!routeFsPath(globalObject, vm, path, "unlink"_s, routed, error))
-        return fail(error);
-    if (routed.klass != COLLO_FS_ROUTE_TMP)
-        return fail(createFsError(globalObject, vm, EROFS, "unlink"_s, path));
-    if (sysUnlinkAt(routed.normalized) != 0)
-        return fail(createFsError(globalObject, vm, errno, "unlink"_s, path));
+    if (sysUnlinkAt(path.bytes.data()) != 0)
+        return fail(createFsError(globalObject, vm, errno, "unlink"_s, path.text));
     return ok(JSC::jsUndefined());
 }
 
 FsResult renameOperation(JSC::JSGlobalObject* globalObject, JSC::CallFrame* callFrame)
 {
     JSC::VM& vm = globalObject->vm();
+    FsResult closed;
+    if (!nodeFsOpen(globalObject, vm, "rename"_s, closed))
+        return closed;
     auto scope = DECLARE_THROW_SCOPE(vm);
 
-    WTF::CString oldPath;
-    WTF::CString newPath;
+    FsPath oldPath;
+    FsPath newPath;
     JSC::JSValue error;
-    if (!pathArgument(globalObject, scope, callFrame, 0, oldPath, error))
+    if (pathArgument(globalObject, scope, callFrame, 0, oldPath, error) != PathArgument::valid)
         return fail(error);
-    if (!pathArgument(globalObject, scope, callFrame, 1, newPath, error))
+    if (pathArgument(globalObject, scope, callFrame, 1, newPath, error) != PathArgument::valid)
         return fail(error);
 
-    RoutedPath oldRouted;
-    if (!routeFsPath(globalObject, vm, oldPath, "rename"_s, oldRouted, error))
-        return fail(error);
-    RoutedPath newRouted;
-    if (!routeFsPath(globalObject, vm, newPath, "rename"_s, newRouted, error))
-        return fail(error);
-    // Both ends must be under /tmp; a rename from or into any other namespace fails with EROFS.
-    if (oldRouted.klass != COLLO_FS_ROUTE_TMP || newRouted.klass != COLLO_FS_ROUTE_TMP)
-        return fail(createFsErrorWithDest(globalObject, vm, EROFS, "rename"_s, oldPath, newPath));
-    if (sysRenameAt2(oldRouted.normalized, newRouted.normalized) != 0)
-        return fail(createFsErrorWithDest(globalObject, vm, errno, "rename"_s, oldPath, newPath));
+    if (sysRenameAt2(oldPath.bytes.data(), newPath.bytes.data()) != 0)
+        return fail(createFsErrorWithDest(globalObject, vm, errno, "rename"_s, oldPath.text, newPath.text));
     return ok(JSC::jsUndefined());
 }
 
+// One entry's name inside readdir's buffer of names.
+struct NameRange {
+    size_t offset;
+    size_t length;
+};
+
+// Lists a directory's entries without "." and "..", sorted by the bytes of their names as libuv's scandir sorts them
+// for Node (strcmp), so a listing never depends on the order the kernel returns. The sort runs before the names are
+// decoded, because UTF-16 code units put an astral character's surrogates before U+E000–U+FFFF, the reverse of the
+// order of their UTF-8 bytes, and a name that is not UTF-8 decodes to U+FFFD.
 FsResult readdirOperation(JSC::JSGlobalObject* globalObject, JSC::CallFrame* callFrame)
 {
     JSC::VM& vm = globalObject->vm();
+    FsResult closed;
+    if (!nodeFsOpen(globalObject, vm, "openat"_s, closed))
+        return closed;
     auto scope = DECLARE_THROW_SCOPE(vm);
 
-    WTF::CString path;
+    FsPath path;
     JSC::JSValue error;
-    if (!pathArgument(globalObject, scope, callFrame, 0, path, error))
+    if (pathArgument(globalObject, scope, callFrame, 0, path, error) != PathArgument::valid)
         return fail(error);
 
-    RoutedPath routed;
-    if (!routeFsPath(globalObject, vm, path, "openat"_s, routed, error))
-        return fail(error);
-    if (routed.klass == COLLO_FS_ROUTE_DEPLOY_DIR) {
-        // A directory of the tree lists from the index alone: its immediate children in the index's byte order, each
-        // subdirectory once. The tree and /tmp never overlap, so nothing local is merged in, and the virtual "/" and
-        // "/var" list the namespace roots through the same call. `entries_max` in common/ipc/fs_index.zig bounds a
-        // listing.
-        auto* array = JSC::constructEmptyArray(globalObject, nullptr);
-        uint64_t cursor = COLLO_FS_READDIR_CURSOR_START;
-        uint8_t nameBuffer[COLLO_FS_NAME_BYTES_MAX];
-        unsigned index = 0;
-        for (;;) {
-            uint32_t nameLen = 0;
-            uint8_t isDir = 0;
-            ColloStatus status = collo_runtime_fs_readdir_next(
-                fsPathArgument(routed.normalizedPath()), &cursor, nameBuffer, sizeof(nameBuffer), &nameLen, &isDir);
-            if (status == COLLO_STATUS_NOT_FOUND)
-                break;
-            if (status != COLLO_STATUS_OK || nameLen > sizeof(nameBuffer))
-                return fail(createFsError(globalObject, vm, EIO, "getdents64"_s, path));
-            array->putDirectIndex(
-                globalObject, index++, JSC::jsString(vm, stringFromUtf8Bytes(std::span { nameBuffer }.first(nameLen))));
-        }
-        return ok(array);
-    }
-    if (routed.klass == COLLO_FS_ROUTE_DEPLOY_FILE)
-        return fail(createFsError(globalObject, vm, ENOTDIR, "openat"_s, path));
-    if (routed.klass == COLLO_FS_ROUTE_NONE)
-        return fail(createFsError(globalObject, vm, ENOENT, "openat"_s, path));
+    OwnedFd fd(sysOpenAt(path.bytes.data(), O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0));
+    if (!fd)
+        return fail(createFsError(globalObject, vm, errno, "openat"_s, path.text));
 
-    int fd = sysOpenAt(routed.normalized, O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
-    if (fd < 0)
-        return fail(createFsError(globalObject, vm, errno, "openat"_s, path));
-
-    auto* array = JSC::constructEmptyArray(globalObject, nullptr);
+    // Every name's bytes, back to back, and where each one lies.
+    WTF::Vector<uint8_t> name_bytes;
+    WTF::Vector<NameRange> name_ranges;
     uint8_t buffer[getdentsBufferBytes];
-    unsigned index = 0;
     for (;;) {
-        long rc = syscall(SYS_getdents64, fd, buffer, sizeof(buffer));
-        if (rc > 0) {
-            size_t offset = 0;
-            while (offset < static_cast<size_t>(rc)) {
-                auto* entry = reinterpret_cast<LinuxDirent64*>(buffer + offset);
-                if (entry->reclen == 0 || offset + entry->reclen > static_cast<size_t>(rc)) {
-                    closeBestEffort(fd);
-                    return fail(createFsError(globalObject, vm, EIO, "getdents64"_s, path));
-                }
-                WTF::String name = stringFromCString(entry->name);
-                // No entry cap, for the reason given at maxReadFileBytes.
-                if (name != "."_s && name != ".."_s)
-                    array->putDirectIndex(globalObject, index++, JSC::jsString(vm, name));
-                offset += entry->reclen;
-            }
-            continue;
+        long rc = syscall(SYS_getdents64, fd.get(), buffer, sizeof(buffer));
+        if (rc < 0) {
+            if (errno == EINTR)
+                continue;
+            return fail(createFsError(globalObject, vm, errno, "getdents64"_s, path.text));
         }
-        if (rc == 0)
+        if (!rc)
             break;
-        if (errno == EINTR)
-            continue;
-        int savedErrno = errno;
-        closeBestEffort(fd);
-        return fail(createFsError(globalObject, vm, savedErrno, "getdents64"_s, path));
+
+        std::span<const uint8_t> records = std::span<const uint8_t> { buffer }.first(static_cast<size_t>(rc));
+        while (!records.empty()) {
+            uint16_t recordLength = 0;
+            if (records.size() <= direntNameOffset)
+                return fail(createFsError(globalObject, vm, EIO, "getdents64"_s, path.text));
+            memcpySpan(asMutableByteSpan(recordLength), records.subspan(direntReclenOffset, sizeof(recordLength)));
+            if (recordLength <= direntNameOffset || recordLength > records.size())
+                return fail(createFsError(globalObject, vm, EIO, "getdents64"_s, path.text));
+
+            std::span<const uint8_t> nameField = records.subspan(direntNameOffset, recordLength - direntNameOffset);
+            records = records.subspan(recordLength);
+            auto nameEnd = std::find(nameField.begin(), nameField.end(), 0);
+            if (nameEnd == nameField.end())
+                return fail(createFsError(globalObject, vm, EIO, "getdents64"_s, path.text));
+            std::span<const uint8_t> name = nameField.first(static_cast<size_t>(nameEnd - nameField.begin()));
+            bool isDot = name.size() == 1 && name[0] == '.';
+            bool isDotDot = name.size() == 2 && name[0] == '.' && name[1] == '.';
+            if (isDot || isDotDot)
+                continue;
+            // No entry cap, for the reason the file header gives.
+            const NameRange range { name_bytes.size(), name.size() };
+            if (!name_bytes.tryAppend(name) || !name_ranges.tryAppend(range))
+                return fail(JSC::createOutOfMemoryError(globalObject));
+        }
     }
-    closeBestEffort(fd);
+
+    const std::span<const uint8_t> all_names = name_bytes.span();
+    auto name_of = [all_names](const NameRange& range) { return all_names.subspan(range.offset, range.length); };
+    // uint8_t compares unsigned, as strcmp compares its bytes.
+    std::sort(name_ranges.begin(), name_ranges.end(), [&name_of](const NameRange& left, const NameRange& right) {
+        const auto left_name = name_of(left);
+        const auto right_name = name_of(right);
+        return std::lexicographical_compare(left_name.begin(), left_name.end(), right_name.begin(), right_name.end());
+    });
+    auto* array = JSC::constructEmptyArray(globalObject, nullptr);
+    if (scope.exception())
+        return fail(takeException(scope));
+    for (unsigned index = 0; index < name_ranges.size(); ++index) {
+        array->putDirectIndex(globalObject, index, JSC::jsString(vm, stringFromUtf8Bytes(name_of(name_ranges[index]))));
+        if (scope.exception())
+            return fail(takeException(scope));
+    }
     return ok(array);
 }
 
+// A termination that takeException could not clear is still pending here, and the VM keeps unwinding it without a
+// result, so neither encoder throws again or creates a promise while one is.
 JSC::EncodedJSValue encodeSyncResult(JSC::JSGlobalObject* globalObject, FsResult&& result)
 {
+    auto scope = DECLARE_THROW_SCOPE(globalObject->vm());
+    RETURN_IF_EXCEPTION(scope, {});
     if (result.ok)
         return JSC::JSValue::encode(result.value);
-    auto scope = DECLARE_THROW_SCOPE(globalObject->vm());
     return JSC::JSValue::encode(JSC::throwException(globalObject, scope, result.error));
 }
 
 JSC::EncodedJSValue encodePromiseResult(JSC::JSGlobalObject* globalObject, FsResult&& result)
 {
-    if (result.pending)
-        return JSC::JSValue::encode(result.value);
+    auto scope = DECLARE_THROW_SCOPE(globalObject->vm());
+    RETURN_IF_EXCEPTION(scope, {});
     if (result.ok)
-        return Collo::HostFunctions::resolvedPromise(globalObject, result.value);
-    return Collo::HostFunctions::rejectedPromise(globalObject, result.error);
+        RELEASE_AND_RETURN(scope, Collo::HostFunctions::resolvedPromise(globalObject, result.value));
+    RELEASE_AND_RETURN(scope, Collo::HostFunctions::rejectedPromise(globalObject, result.error));
 }
 
 JSC_DEFINE_HOST_FUNCTION(fsReadFileSync, (JSC::JSGlobalObject * globalObject, JSC::CallFrame* callFrame))
 {
-    return encodeSyncResult(globalObject, readFileOperation(globalObject, callFrame, /* allowAsyncFault */ false));
+    return encodeSyncResult(globalObject, readFileOperation(globalObject, callFrame));
 }
 
 JSC_DEFINE_HOST_FUNCTION(fsWriteFileSync, (JSC::JSGlobalObject * globalObject, JSC::CallFrame* callFrame))
@@ -1077,7 +904,7 @@ JSC_DEFINE_HOST_FUNCTION(fsExistsSync, (JSC::JSGlobalObject * globalObject, JSC:
 
 JSC_DEFINE_HOST_FUNCTION(fsReadFile, (JSC::JSGlobalObject * globalObject, JSC::CallFrame* callFrame))
 {
-    return encodePromiseResult(globalObject, readFileOperation(globalObject, callFrame, /* allowAsyncFault */ true));
+    return encodePromiseResult(globalObject, readFileOperation(globalObject, callFrame));
 }
 
 JSC_DEFINE_HOST_FUNCTION(fsWriteFile, (JSC::JSGlobalObject * globalObject, JSC::CallFrame* callFrame))
@@ -1124,6 +951,8 @@ void putFsFunction(JSC::JSGlobalObject* globalObject, JSC::JSObject* object, JSC
 } // namespace
 
 namespace Collo::HostFunctions {
+
+void openNodeFsForProcess() { node_fs_open.store(true); }
 
 void installNodeFs(Collo::GlobalObject* globalObject, JSC::VM& vm)
 {

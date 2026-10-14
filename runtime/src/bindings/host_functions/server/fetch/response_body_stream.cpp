@@ -17,8 +17,8 @@
 #include "host_functions/server/fetch/response_body_stream.h"
 
 #include "host_functions/server/fetch/extracted_response.h"
-#include "host_functions/webapi/buffer_source.h"
 #include "host_functions/webapi/dom/dom_exception.h"
+#include "host_functions/webapi/streams/readable_stream.h"
 #include "host_functions/webapi/streams/readable_stream_private.h"
 
 #include <JavaScriptCore/JSCInlines.h>
@@ -27,6 +27,7 @@
 
 #include <memory>
 #include <new>
+#include <span>
 
 struct ColloResponseBodyStream {
     ColloResponseBodyStream() = default;
@@ -59,9 +60,6 @@ namespace {
 
     using JSC::EncodedJSValue;
     using JSC::JSValue;
-
-    constexpr WTF::ASCIILiteral chunk_type_message
-        = "Response body stream chunks must be an ArrayBuffer or an ArrayBufferView"_s;
 
     // Reports one read's outcome to the runtime attached to the reaction's VM, under the request the read was started
     // for. `value` is the chunk for CHUNK and the reason for ERROR; DONE carries none.
@@ -163,8 +161,9 @@ namespace {
         case COLLO_RESPONSE_BODY_STREAM_CANCEL_RESPONSE_FAILED:
             return createDOMException(
                 global_object, DOMExceptionCode::AbortError, "The response ended before its body stream closed"_s);
+        // The reason names the chunk as the TypeError the read threw for it does.
         case COLLO_RESPONSE_BODY_STREAM_CANCEL_INVALID_CHUNK:
-            return JSC::createTypeError(global_object, chunk_type_message);
+            return JSC::createTypeError(global_object, readable_stream_chunk_type_message);
         default:
             return nullptr;
         }
@@ -293,25 +292,11 @@ extern "C" ColloStatus collo_response_body_stream_chunk(
 
     // A buffer's bytes are lent in place. The chunk's handle keeps its storage alive, and the storage changes or
     // detaches only when script runs, which the next ABI call on this VM may do.
-    if (auto* view = dynamicDowncast<JSC::JSArrayBufferView>(value)) {
-        if (!validateArrayBufferViewForCopy(
-                global_object, scope, view, "Response body stream chunk is detached or out of bounds"_s))
-            return consumeExceptionStatus(owner, scope, out_exception);
-        auto bytes = arrayBufferViewBytes(view);
-        *out_bytes = { bytes.empty() ? nullptr : bytes.data(), bytes.size() };
-        return COLLO_STATUS_OK;
-    }
-    if (auto* array_buffer = dynamicDowncast<JSC::JSArrayBuffer>(value)) {
-        if (!validateArrayBufferForCopy(global_object, scope, array_buffer,
-                "Response body stream chunk must be a fixed-length attached ArrayBuffer"_s))
-            return consumeExceptionStatus(owner, scope, out_exception);
-        auto bytes = arrayBufferBytes(array_buffer);
-        *out_bytes = { bytes.empty() ? nullptr : bytes.data(), bytes.size() };
-        return COLLO_STATUS_OK;
-    }
-
-    JSC::throwVMTypeError(global_object, scope, chunk_type_message);
-    return consumeExceptionStatus(owner, scope, out_exception);
+    std::span<const uint8_t> bytes;
+    if (!readableStreamChunkBytes(global_object, scope, value, bytes))
+        return consumeExceptionStatus(owner, scope, out_exception);
+    *out_bytes = { bytes.empty() ? nullptr : bytes.data(), bytes.size() };
+    return COLLO_STATUS_OK;
 }
 
 extern "C" ColloStatus collo_response_body_stream_cancel(

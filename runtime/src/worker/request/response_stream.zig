@@ -60,10 +60,6 @@ pub const Fetch = struct {
     identity: bindings.FetchBodyIdentity,
     /// A pull is in flight; `executeFetchBodyStreamReady` moves its bytes.
     pull_pending: bool = false,
-    /// The gateway session detached while a chunk borrowed from its body pool
-    /// waited to be sent, so the chunk was dropped and the response cannot
-    /// end whole (`serve/response.zig:releaseFetchResponseHoldsBeforeDetach`).
-    failed: bool = false,
 };
 
 pub const BodyStream = struct {
@@ -111,12 +107,14 @@ pub const Result = union(enum) {
 };
 
 /// Queues the request's `response_advance` item unless it is queued already
-/// or the request is finishing or reset. Returns false when both scheduler
-/// queues are full; the item then stays `unqueued` with its first stamp.
-/// Call it only for an event that lets the response move: one waiting for
-/// credit has nothing to run until a grant arrives.
+/// or the request is finishing or reset, except a finished request whose
+/// last packet still waits (`RequestContext.last_packet_done`), which only
+/// its advance sends. Returns false when both scheduler queues are full; the
+/// item then stays `unqueued` with its first stamp. Call it only for an
+/// event that lets the response move: one waiting for credit has nothing to
+/// run until a grant arrives.
 pub fn queueAdvance(runtime: anytype, request_ctx: anytype) bool {
-    if (request_ctx.finish_started or request_ctx.client_reset)
+    if (request_ctx.last_packet_done == null and (request_ctx.finish_started or request_ctx.client_reset))
         return true;
     const advance = &request_ctx.response_advance;
     if (advance.state == .queued)

@@ -105,10 +105,10 @@ fn runZygote(allocator: std.mem.Allocator, mode: Mode, counts: []const usize) !v
     defer bindings.clearHelperThreadsOverrides();
     try bindings.prepareProcessForFork();
 
-    var zygote = try zygote_mod.state.Zygote.init(null, .{ .vm_options = bindings.VmOptions.init() });
-    defer zygote.deinit();
-    try zygote_mod.warmup.runCorpus(&zygote.vm);
-    try zygote.vm.collectFullGCAndTrim();
+    var vm = try bindings.Vm.create(bindings.VmOptions.init());
+    defer vm.deinit();
+    try zygote_mod.warmup.runCorpus(&vm);
+    try vm.collectFullGCAndTrim();
 
     const self_pid: u32 = @intCast(std.c.getpid());
     const before_prewarm = try proc_memory.readProcess(allocator, self_pid);
@@ -120,9 +120,9 @@ fn runZygote(allocator: std.mem.Allocator, mode: Mode, counts: []const usize) !v
     if (mode == .prewarmed) {
         const started = Clock.now();
         for (prewarmed) |*realm|
-            realm.* = try zygote.vm.createRealm();
+            realm.* = try vm.createRealm();
         const elapsed = started.elapsed();
-        try zygote.vm.collectFullGCAndTrim();
+        try vm.collectFullGCAndTrim();
         const after_prewarm = try proc_memory.readProcess(allocator, self_pid);
         std.debug.print(
             "realm_cost mode=prewarmed process=zygote realms={d} create_wall_ns={d} create_cpu_ns={d} private_dirty_delta_kib={d} pss_delta_kib={d}\n",
@@ -141,9 +141,9 @@ fn runZygote(allocator: std.mem.Allocator, mode: Mode, counts: []const usize) !v
     // the same sources and only the per-realm work differs.
     const pack = try ipc.module_pack.buildSingleAlloc(allocator, route_specifier, route_source);
     defer allocator.free(pack);
-    try zygote.vm.registerModulePack(pack);
+    try vm.registerModulePack(pack);
 
-    try zygote.vm.prepareForFork();
+    try vm.prepareForFork();
     std.Thread.sleep(fork_helper_timeout_ns);
     try os.process.waitForSingleThreadedSelf(fork_drain_max_checks, fork_drain_check_interval_ns);
     // The engine reserves its heaps with MADV_DONTFORK, which the zygote
@@ -151,7 +151,7 @@ fn runZygote(allocator: std.mem.Allocator, mode: Mode, counts: []const usize) !v
     _ = try os.process.makeAddressSpaceForkInheritable();
 
     for (counts) |count|
-        try runChild(allocator, &zygote.vm, mode, count, prewarmed[0..if (mode == .prewarmed) count else 0]);
+        try runChild(allocator, &vm, mode, count, prewarmed[0..if (mode == .prewarmed) count else 0]);
 }
 
 fn runChild(

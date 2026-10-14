@@ -8,6 +8,9 @@ import { readableStreamToText } from "harness";
 // - Buffer-based assertions.
 // - Bun.file(), ArrayBufferSink, FIFO, subprocess, and node:fs/node:path cases.
 // - Bun direct streams and readMany(), which are Bun extensions.
+// - Cases that read string chunks through a Body method, which Collo rejects
+//   with a TypeError: Body consumption accepts only an ArrayBuffer or an
+//   ArrayBufferView.
 
 describe("WritableStream", () => {
   it("pipeTo", async () => {
@@ -138,20 +141,6 @@ it("ReadableStream.prototype.values", async () => {
     chunks.push(chunk);
   }
   expect(chunks.join("")).toBe("helloworld");
-});
-
-it("new Response(stream).body", async () => {
-  var stream = new ReadableStream({
-    pull(controller) {
-      controller.enqueue("hello");
-      controller.enqueue("world");
-      controller.close();
-    },
-    cancel() {},
-  });
-  var response = new Response(stream);
-  expect(response.body).toBe(stream);
-  expect(await response.text()).toBe("helloworld");
 });
 
 it("ReadableStream errors the stream on pull rejection", async () => {

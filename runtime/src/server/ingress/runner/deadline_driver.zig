@@ -12,11 +12,16 @@
 //! its pool's waiters, and ends a request whose begin never left with 504,
 //! its worker untouched. A worker that has the begin answers 504 itself when
 //! the deadline passes, so an entry that fires after the grace means it did
-//! not: once the backstop has read everything the worker wrote, and unless
-//! the worker's completion is parked on the request behind its response, the
-//! worker takes a fault, which ends the request with 504 and the worker's
-//! other requests with 502. A healthy worker therefore never dies of a
-//! deadline.
+//! not: once the backstop has taken what the worker wrote and found no
+//! `request_done` for the request there, the worker takes a fault, which
+//! ends the request with 504 and the worker's other requests with 502. The
+//! lane that reads the worker reads its control socket first, a bounded
+//! read (`worker_fault.drainControlToEnd`); a lane that only holds the
+//! request runs the commands the reader forwarded to it, and cannot read
+//! what the reader has not read yet. So a healthy worker never dies of a
+//! deadline of a request its reader owns; one whose `request_done` for
+//! another lane's request still waits in its socket at that request's
+//! backstop, behind a busy reader, does.
 //!
 //! A connection has at most one deadline at a time, one entry in the heap,
 //! and which one follows from its state (`desiredDeadline`):
@@ -60,7 +65,6 @@ const command_flow = @import("command_flow.zig");
 const connection_flow = @import("connection_flow.zig");
 const connection_slot = @import("connection_slot.zig");
 const request_finish = @import("request_finish.zig");
-const worker_completions = @import("worker_completions.zig");
 const worker_fault = @import("worker_fault.zig");
 const worker_registration = @import("worker_registration.zig");
 
@@ -177,65 +181,39 @@ fn expireRequest(comptime Lane: type, lane: *Lane, deadline: timer_wheel.Expired
 }
 
 /// The backstop of a dispatched request: its deadline and the grace both
-/// passed without the worker ending it. A completion the worker published in
-/// time but the lane has not taken yet wins over the fault, so the reader
-/// reads the worker's output to its end first, and a lane that only holds
-/// the request runs the commands the reader forwarded to it. A worker that
-/// kept its control socket filling through that whole read may still have
-/// the completion behind it, so its backstop moves out by one more grace,
-/// once. A completion parked behind the response's body ends the request
-/// instead of a fault.
+/// passed without the worker ending it. A `request_done` the worker sent in
+/// time but the lane has not read yet wins over the fault, so the reader
+/// reads the worker's control socket first, through any connection's
+/// backlog and the forwarding window, and a lane that only holds the
+/// request runs the commands the reader forwarded to it. A fault found in
+/// that output runs the death path instead, which ends the request.
 fn expireDispatchedRequest(comptime Lane: type, lane: *Lane, deadline: timer_wheel.Expired) LaneFault!void {
-    const RequestFinish = request_finish.Methods(Lane);
     const WorkerFault = worker_fault.Methods(Lane);
     const WorkerRegistration = worker_registration.Methods(Lane);
-    const registration_index = WorkerRegistration.findCompletionRegistrationIndex(lane, deadline.worker_key) orelse
-        return error.WorkerCompletionRegistrationNotFound;
+    const registration_index = WorkerRegistration.findRegistrationIndex(lane, deadline.worker_key) orelse
+        return error.WorkerRegistrationNotFound;
     if (lane.registrations.entries[registration_index].reading()) {
-        switch (try worker_completions.Methods(Lane).readForBackstop(lane, registration_index)) {
-            .done => {},
-            .socket_busy => if (liveRequestSlot(Lane, lane, deadline)) |request_index| {
-                if (try deferBackstop(Lane, lane, request_index))
-                    return;
-            },
+        // A worker that kept its socket filling for the whole bounded read
+        // answered neither within the grace nor behind it, and takes the
+        // fault below like one that wrote nothing.
+        switch (try WorkerFault.drainControlToEnd(lane, registration_index)) {
+            .ok, .would_block => try WorkerRegistration.armWorkerPolls(lane, registration_index),
+            .fault => |reason| return WorkerFault.faultWorker(lane, registration_index, reason),
         }
     } else {
         try command_flow.Methods(Lane).handleCommands(lane);
     }
-    const request_index = liveRequestSlot(Lane, lane, deadline) orelse {
-        lane.lane.counters.completion_before_timeout += 1;
-        return;
-    };
-    if (try RequestFinish.finishParkedCompletion(lane, request_index)) {
-        lane.lane.counters.completion_before_timeout += 1;
+    if (liveRequestSlot(Lane, lane, deadline) == null) {
+        lane.lane.counters.request_done_at_backstop += 1;
         return;
     }
     // A request still live keeps its worker's registration, so the drain
     // above cannot have freed it; it is looked up again by key all the
     // same, since nothing promises it kept its place.
-    const current_index = WorkerRegistration.findCompletionRegistrationIndex(lane, deadline.worker_key) orelse
-        return error.WorkerCompletionRegistrationNotFound;
+    const current_index = WorkerRegistration.findRegistrationIndex(lane, deadline.worker_key) orelse
+        return error.WorkerRegistrationNotFound;
     lane.lane.counters.deadline_grace_faults += 1;
     try WorkerFault.faultWorker(lane, current_index, .deadline_grace_expired);
-}
-
-/// Moves the backstop of the request in `request_index` out by one more
-/// grace, the first time only, and says whether it did.
-fn deferBackstop(comptime Lane: type, lane: *Lane, request_index: u32) LaneFault!bool {
-    const request = &lane.requests.entries[request_index];
-    if (request.backstop_deferred)
-        return false;
-    request.backstop_deferred = true;
-    const now = lane.monotonicNowNs();
-    try lane.lane.armRequestDeadline(
-        &request.deadline,
-        request.request_key,
-        request.connection_key,
-        request.worker_key,
-        now +| lane.service.hard_timeout_grace_ns,
-        now,
-    );
-    return true;
 }
 
 /// The request slot an expired wheel entry names, when that slot still

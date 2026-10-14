@@ -82,11 +82,20 @@ fn expectHandoff(released: TestPool.Released) !TestPool.Handoff {
     };
 }
 
+/// The ticket of a launch the pool starts under an open memory gate with a
+/// scale-out allowed, or null when it starts none.
+fn startLaunch(pool: *TestPool) ?pool_mod.LaunchTicket {
+    return switch (pool.launchStarted(true, true)) {
+        .started => |ticket| ticket,
+        .watch, .none => null,
+    };
+}
+
 /// Publishes `worker` to the one request `lane` queues for it, which then
 /// holds slot 0, and returns that grant.
 fn publishToNewWaiter(pool: *TestPool, worker: *Worker, lane: LaneId, request: u32) !ReaderGrant {
     try expectWait(pool, lane, request, far_ns);
-    const ticket = pool.launchStarted(true) orelse return error.TestExpectedLaunch;
+    const ticket = startLaunch(pool) orelse return error.TestExpectedLaunch;
     const handoffs = try pool.publish(ticket, worker, 0);
     try testing.expectEqual(@as(usize, 1), handoffs.slice().len);
     try testing.expect(handoffs.slice()[0].waiter.request_key.eql(requestKey(lane, request)));
@@ -162,7 +171,7 @@ test "publish serves the oldest waiters first and the first handoff makes its la
     try expectWait(&pool, lane_a, 0, far_ns);
     try expectWait(&pool, lane_b, 0, far_ns);
     try expectWait(&pool, lane_a, 1, far_ns);
-    const ticket = pool.launchStarted(true) orelse return error.TestExpectedLaunch;
+    const ticket = startLaunch(&pool) orelse return error.TestExpectedLaunch;
     const handoffs = try pool.publish(ticket, &worker, 10);
     const served = handoffs.slice();
     try testing.expectEqual(@as(usize, 2), served.len);
@@ -235,7 +244,7 @@ test "the free list hands out the most recently used worker first and a fresh id
     _ = try publishToNewWaiter(&pool, &workers[1], lane_a, 1);
     // The third launch's waiter leaves before the worker is published.
     try expectWait(&pool, lane_a, 2, far_ns);
-    const ticket = pool.launchStarted(true) orelse return error.TestExpectedLaunch;
+    const ticket = startLaunch(&pool) orelse return error.TestExpectedLaunch;
     try testing.expect(pool.cancelWaiter(requestKey(lane_a, 2)));
     try testing.expectEqual(@as(usize, 0), (try pool.publish(ticket, &workers[2], 3)).slice().len);
 
@@ -396,7 +405,7 @@ test "a handoff its lane never takes goes back with the tenure it granted, so th
 
     try expectWait(&pool, lane_a, 0, far_ns);
     try expectWait(&pool, lane_b, 0, far_ns);
-    const ticket = pool.launchStarted(true) orelse return error.TestExpectedLaunch;
+    const ticket = startLaunch(&pool) orelse return error.TestExpectedLaunch;
     const handoffs = try pool.publish(ticket, &worker, 0);
     try testing.expectEqual(@as(usize, 1), handoffs.slice().len);
     const refused = handoffs.slice()[0];
@@ -460,7 +469,7 @@ test "a death after an idle retirement started leaves the retirement to finish i
 
     _ = try publishToNewWaiter(&pool, &read, lane_a, 0);
     try expectWait(&pool, lane_a, 1, far_ns);
-    const ticket = pool.launchStarted(true) orelse return error.TestExpectedLaunch;
+    const ticket = startLaunch(&pool) orelse return error.TestExpectedLaunch;
     try testing.expect(pool.cancelWaiter(requestKey(lane_a, 1)));
     _ = try pool.publish(ticket, &unread, 1);
     _ = try pool.release(&read, 0, 2);
@@ -482,7 +491,7 @@ test "idle retirement takes a worker out of service and leaves its finish to the
 
     _ = try publishToNewWaiter(&pool, &read, lane_a, 0);
     try expectWait(&pool, lane_a, 1, far_ns);
-    const ticket = pool.launchStarted(true) orelse return error.TestExpectedLaunch;
+    const ticket = startLaunch(&pool) orelse return error.TestExpectedLaunch;
     try testing.expect(pool.cancelWaiter(requestKey(lane_a, 1)));
     _ = try pool.publish(ticket, &unread, 1);
     _ = try pool.release(&read, 0, 2);
@@ -507,38 +516,102 @@ test "idle retirement takes a worker out of service and leaves its finish to the
     try testing.expectError(error.WorkerNotFinished, pool.remove(&read));
 }
 
-test "growth is wanted only for uncovered waiters, with room in the table and under the launch cap and the memory gate" {
+test "growth answers the first worker at once and a worker more as a watch, only for uncovered waiters, with room in the table and under the launch cap and the memory gate" {
     var pool: TestPool = undefined;
     try pool.init(testing.allocator, .{ .concurrency = 1, .workers_max = 3, .launches_max = 2, .waiters_max = 8 });
     defer pool.deinit();
     var workers = [_]Worker{ .{ .index = 0 }, .{ .index = 1 }, .{ .index = 2 } };
 
-    try testing.expect(!pool.growthWanted(true));
+    try testing.expectEqual(pool_mod.Growth.none, pool.growthWanted(true));
     try expectWait(&pool, lane_a, 0, far_ns);
-    try testing.expect(pool.growthWanted(true));
-    try testing.expect(!pool.growthWanted(false));
-    try testing.expect(pool.launchStarted(false) == null);
-    const first = pool.launchStarted(true) orelse return error.TestExpectedLaunch;
+    try testing.expectEqual(pool_mod.Growth.none, pool.growthWanted(false));
+    try testing.expectEqual(pool_mod.Growth.launch, pool.growthWanted(true));
+    try testing.expect(pool.launchStarted(false, true) == .none);
+    // The first worker needs no scale-out verdict.
+    const first = switch (pool.launchStarted(true, false)) {
+        .started => |ticket| ticket,
+        .watch, .none => return error.TestExpectedLaunch,
+    };
+    try testing.expect(!first.scale_out);
     // The launch in flight covers the one waiter.
-    try testing.expect(!pool.growthWanted(true));
-
+    try testing.expectEqual(pool_mod.Growth.none, pool.growthWanted(true));
+    // A second waiter while the first worker boots wants nothing yet: a
+    // scale-out weighs the CPU of live workers.
     try expectWait(&pool, lane_a, 1, far_ns);
-    try testing.expect(pool.growthWanted(true));
-    const second = pool.launchStarted(true) orelse return error.TestExpectedLaunch;
-    try expectWait(&pool, lane_a, 2, far_ns);
-    // Three waiters and two launches, but the launch cap is reached.
-    try testing.expect(!pool.growthWanted(true));
-    try testing.expect(pool.launchStarted(true) == null);
+    try testing.expectEqual(pool_mod.Growth.none, pool.growthWanted(true));
+    try testing.expect(startLaunch(&pool) == null);
 
+    // The live worker serves the first waiter; the second asks for a watch,
+    // once.
     _ = try pool.publish(first, &workers[0], 1);
-    _ = try pool.publish(second, &workers[1], 2);
-    try testing.expect(pool.growthWanted(true));
-    _ = pool.launchStarted(true) orelse return error.TestExpectedLaunch;
+    try testing.expectEqual(pool_mod.Growth.watch, pool.growthWanted(true));
+    try testing.expectEqual(pool_mod.Growth.none, pool.growthWanted(true));
+    try testing.expect(pool.launchStarted(true, false) == .watch);
+    const second = startLaunch(&pool) orelse return error.TestExpectedLaunch;
+    try testing.expect(second.scale_out);
+    try testing.expectEqual(pool_mod.Growth.none, pool.growthWanted(true));
+    try expectWait(&pool, lane_a, 2, far_ns);
+    const third = startLaunch(&pool) orelse return error.TestExpectedLaunch;
     try expectWait(&pool, lane_a, 3, far_ns);
-    // Two waiters, one launch, one launch below the cap, but no entry left.
-    try testing.expectEqual(@as(u32, 2), pool.snapshot().waiters);
-    try testing.expect(!pool.growthWanted(true));
-    try testing.expect(pool.launchStarted(true) == null);
+    // Two launches cover two of three waiters, but the launch cap is reached.
+    try testing.expect(!pool.keepScaleOutWatch(true));
+    try testing.expectEqual(pool_mod.Growth.none, pool.growthWanted(true));
+    try testing.expect(startLaunch(&pool) == null);
+
+    _ = try pool.publish(second, &workers[1], 2);
+    _ = try pool.publish(third, &workers[2], 3);
+    // One waiter left, but no entry left either.
+    try testing.expectEqual(@as(u32, 1), pool.snapshot().waiters);
+    try testing.expectEqual(pool_mod.Growth.none, pool.growthWanted(true));
+    try testing.expect(startLaunch(&pool) == null);
+    try testing.expectEqual(@as(u64, 2), pool.snapshot().counters.scale_outs_started);
+}
+
+test "waiters behind a busy worker start no launch until the launcher's verdict allows a scale-out (#157)" {
+    var pool: TestPool = undefined;
+    try pool.init(testing.allocator, .{ .concurrency = 2, .workers_max = 16, .launches_max = 2, .waiters_max = 8 });
+    defer pool.deinit();
+    var worker: Worker = .{ .index = 0 };
+
+    _ = try publishToNewWaiter(&pool, &worker, lane_a, 0);
+    _ = try expectAcquired(&pool, lane_a, 1);
+    try expectWait(&pool, lane_a, 2, far_ns);
+    try expectWait(&pool, lane_a, 3, far_ns);
+    try expectWait(&pool, lane_a, 4, far_ns);
+    // One worker holds both slots and three requests wait: nothing on the
+    // node says yet that a second worker would get a CPU of its own.
+    try testing.expect(pool.launchStarted(true, false) == .watch);
+    try testing.expectEqual(@as(u32, 0), pool.snapshot().launching);
+    const ticket = startLaunch(&pool) orelse return error.TestExpectedLaunch;
+    try testing.expect(ticket.scale_out);
+}
+
+test "a pool's scale-out watch lasts while its waiters are uncovered, and the next waiter after it ends asks again (#157)" {
+    var pool: TestPool = undefined;
+    try pool.init(testing.allocator, .{ .concurrency = 1, .workers_max = 4, .launches_max = 2, .waiters_max = 8 });
+    defer pool.deinit();
+    var worker: Worker = .{ .index = 0 };
+
+    _ = try publishToNewWaiter(&pool, &worker, lane_a, 0);
+    try expectWait(&pool, lane_a, 1, far_ns);
+    try testing.expectEqual(pool_mod.Growth.watch, pool.growthWanted(true));
+    try expectWait(&pool, lane_a, 2, far_ns);
+    try testing.expectEqual(pool_mod.Growth.none, pool.growthWanted(true));
+    try testing.expect(pool.keepScaleOutWatch(true));
+    try testing.expectEqual(pool_mod.Growth.none, pool.growthWanted(true));
+
+    // A closed memory gate ends the watch; the next waiter asks again.
+    try testing.expect(!pool.keepScaleOutWatch(false));
+    try expectWait(&pool, lane_a, 3, far_ns);
+    try testing.expectEqual(pool_mod.Growth.watch, pool.growthWanted(true));
+
+    // Once the worker took every waiter in turn there is nothing to watch.
+    for (0..3) |_| {
+        const handoff = try expectHandoff(try pool.release(&worker, 0, 1));
+        try testing.expect(handoff.worker == &worker);
+    }
+    try testing.expect(!pool.keepScaleOutWatch(true));
+    try testing.expectEqual(pool_mod.Growth.none, pool.growthWanted(true));
 }
 
 test "a launch ticket ends once, through publish or launchEnded" {
@@ -548,14 +621,14 @@ test "a launch ticket ends once, through publish or launchEnded" {
     var worker: Worker = .{ .index = 0 };
 
     try expectWait(&pool, lane_a, 0, far_ns);
-    const failed = pool.launchStarted(true) orelse return error.TestExpectedLaunch;
+    const failed = startLaunch(&pool) orelse return error.TestExpectedLaunch;
     try testing.expectEqual(@as(u32, 1), pool.snapshot().launching);
     try pool.launchEnded(failed);
     try testing.expectEqual(@as(u32, 0), pool.snapshot().launching);
     try testing.expectError(error.TicketNotLaunching, pool.launchEnded(failed));
     try testing.expectError(error.TicketNotLaunching, pool.publish(failed, &worker, 1));
 
-    const published = pool.launchStarted(true) orelse return error.TestExpectedLaunch;
+    const published = startLaunch(&pool) orelse return error.TestExpectedLaunch;
     _ = try pool.publish(published, &worker, 1);
     try testing.expectError(error.TicketNotLaunching, pool.publish(published, &worker, 2));
     try testing.expectError(error.TicketNotLaunching, pool.launchEnded(published));
@@ -575,7 +648,7 @@ test "waiters are stranded only when no worker is live and no launch is in fligh
     try expectWait(&pool, lane_a, 0, far_ns);
     try expectWait(&pool, lane_b, 0, far_ns);
     try expectWait(&pool, lane_a, 1, far_ns);
-    const ticket = pool.launchStarted(true) orelse return error.TestExpectedLaunch;
+    const ticket = startLaunch(&pool) orelse return error.TestExpectedLaunch;
     try testing.expectEqual(@as(usize, 0), pool.takeStranded(&out).len);
     try pool.launchEnded(ticket);
 
@@ -642,16 +715,16 @@ test "retireForEgress takes a live worker out of service as markDead does, once,
     _ = try publishToNewWaiter(&pool, &worker, lane_a, 0);
     const second = try expectAcquired(&pool, lane_b, 0);
     const earlier: lifecycle.WorkerKey = .{ .worker_id = worker.key().worker_id, .worker_generation = 1 };
-    try testing.expect(pool.retireForEgress(&worker, earlier) == null);
+    try testing.expect(pool.retireForEgress(&worker, earlier, .egress) == null);
     try testing.expectEqual(pool_mod.EntryState.live, pool.inspect(&worker).?.state);
 
-    const death = pool.retireForEgress(&worker, worker.key()) orelse return error.TestExpectedDeath;
+    const death = pool.retireForEgress(&worker, worker.key(), .egress) orelse return error.TestExpectedDeath;
     try testing.expectEqualSlices(LaneId, &.{ lane_a, lane_b }, death.slice());
     try testing.expect(!death.retire);
     const view = pool.inspect(&worker).?;
     try testing.expectEqual(pool_mod.EntryState.dead, view.state);
     try testing.expectEqual(@as(?pool_mod.Departure, .egress), view.departure);
-    try testing.expect(pool.retireForEgress(&worker, worker.key()) == null);
+    try testing.expect(pool.retireForEgress(&worker, worker.key(), .egress_removed) == null);
     try testing.expect(pool.markDead(&worker, worker.key()) == null);
     var snapshot = pool.snapshot();
     try testing.expectEqual(@as(u64, 1), snapshot.counters.egress_retirements);
@@ -676,9 +749,10 @@ test "retireForEgress of a worker no lane holds or reads asks for its retirement
     try testing.expect((try pool.release(&worker, 0, 1)) == .idle);
     try testing.expectEqual(Transfer.vacated, pool.transferReader(&worker, .{ .lane = lane_a, .epoch = 1 }, .nothing));
 
-    const death = pool.retireForEgress(&worker, worker.key()) orelse return error.TestExpectedDeath;
+    const death = pool.retireForEgress(&worker, worker.key(), .egress_removed) orelse return error.TestExpectedDeath;
     try testing.expectEqual(@as(usize, 0), death.slice().len);
     try testing.expect(death.retire);
+    try testing.expectEqual(@as(?pool_mod.Departure, .egress_removed), pool.inspect(&worker).?.departure);
     try testing.expectEqual(@as(u64, 1), pool.snapshot().counters.retirements);
     try pool.remove(&worker);
 }
@@ -735,7 +809,7 @@ test "retireOnNotice of an idle worker retires it at once without a reader and a
 
     _ = try publishToNewWaiter(&pool, &read, lane_a, 0);
     try expectWait(&pool, lane_a, 1, far_ns);
-    const ticket = pool.launchStarted(true) orelse return error.TestExpectedLaunch;
+    const ticket = startLaunch(&pool) orelse return error.TestExpectedLaunch;
     try testing.expect(pool.cancelWaiter(requestKey(lane_a, 1)));
     _ = try pool.publish(ticket, &unread, 1);
     _ = try pool.release(&read, 0, 2);
@@ -762,6 +836,73 @@ test "retireOnNotice of an idle worker retires it at once without a reader and a
     try testing.expectEqual(@as(u64, 2), pool.snapshot().counters.retirements);
     try pool.remove(&read);
     try pool.remove(&unread);
+}
+
+/// The one idle worker of `pool`, as the reaper's scan lists it.
+fn expectOnlyIdle(pool: *TestPool, worker: *Worker) !TestPool.IdleWorker {
+    var out: [2]TestPool.IdleWorker = undefined;
+    const listed = pool.idleWorkers(&out);
+    try testing.expectEqual(@as(usize, 1), listed.len);
+    try testing.expectEqual(worker, listed[0].worker);
+    return listed[0];
+}
+
+test "the reaper's notice retires an unread idle worker only while no lane took a slot of it since the scan, and never one a lane took (#156)" {
+    var pool: TestPool = undefined;
+    try pool.init(testing.allocator, shape(1, 1));
+    defer pool.deinit();
+    var worker: Worker = .{ .index = 0 };
+
+    // A worker published with no waiter is idle with no reader, and the
+    // reaper's scan lists it with the entry's epoch.
+    try expectWait(&pool, lane_a, 0, far_ns);
+    const ticket = startLaunch(&pool) orelse return error.TestExpectedLaunch;
+    try testing.expect(pool.cancelWaiter(requestKey(lane_a, 0)));
+    try testing.expectEqual(@as(usize, 0), (try pool.publish(ticket, &worker, 0)).slice().len);
+    const scanned = try expectOnlyIdle(&pool, &worker);
+    try testing.expect(scanned.reader == null);
+
+    // Lane b takes a slot, which tells the reaper nothing, and its worker's
+    // answer turns the socket readable: the scan's epoch no longer holds.
+    const served = try expectAcquired(&pool, lane_b, 0);
+    const epoch = switch (served.reader) {
+        .you_become_reader => |epoch| epoch,
+        .already, .transfer_from => return error.TestExpectedReader,
+    };
+    try testing.expect(epoch != scanned.reader_epoch);
+    try testing.expectEqual(pool_mod.RetireOnUnreadNotice.stale, pool.retireOnUnreadNotice(&worker, worker.key(), scanned.reader_epoch));
+    try testing.expectEqual(pool_mod.EntryState.live, pool.inspect(&worker).?.state);
+
+    // Idle again with lane b reading it, then with no reader at all: the
+    // scan's epoch still refuses, so a live idle worker is never torn down
+    // on the answer a lane already read.
+    try testing.expect((try pool.release(&worker, served.slot, 1)) == .idle);
+    try testing.expectEqual(pool_mod.RetireOnUnreadNotice.stale, pool.retireOnUnreadNotice(&worker, worker.key(), scanned.reader_epoch));
+    try testing.expectEqual(Transfer.vacated, pool.transferReader(&worker, .{ .lane = lane_b, .epoch = epoch }, .nothing));
+    try testing.expectEqual(pool_mod.RetireOnUnreadNotice.stale, pool.retireOnUnreadNotice(&worker, worker.key(), scanned.reader_epoch));
+    var view = pool.inspect(&worker).?;
+    try testing.expectEqual(pool_mod.EntryState.live, view.state);
+    try testing.expectEqual(@as(?pool_mod.Departure, null), view.departure);
+    try testing.expectEqual(@as(u64, 0), pool.snapshot().counters.notice_retirements);
+
+    // A fresh scan sees the new epoch; a key of an earlier worker of the
+    // record is stale, and a genuine notice retires the worker as recycled,
+    // once.
+    const rescanned = try expectOnlyIdle(&pool, &worker);
+    try testing.expectEqual(epoch, rescanned.reader_epoch);
+    const earlier: lifecycle.WorkerKey = .{ .worker_id = worker.key().worker_id, .worker_generation = 0 };
+    try testing.expectEqual(pool_mod.RetireOnUnreadNotice.stale, pool.retireOnUnreadNotice(&worker, earlier, rescanned.reader_epoch));
+    try testing.expectEqual(pool_mod.RetireOnUnreadNotice.retire, pool.retireOnUnreadNotice(&worker, worker.key(), rescanned.reader_epoch));
+    view = pool.inspect(&worker).?;
+    try testing.expectEqual(pool_mod.EntryState.retiring, view.state);
+    try testing.expectEqual(@as(?pool_mod.Departure, .recycled), view.departure);
+    try testing.expectEqual(pool_mod.RetireOnUnreadNotice.stale, pool.retireOnUnreadNotice(&worker, worker.key(), rescanned.reader_epoch));
+    try testing.expect(pool.acquire(lane_a, requestKey(lane_a, 1), far_ns) == .wait);
+    try testing.expect(pool.cancelWaiter(requestKey(lane_a, 1)));
+    const counters = pool.snapshot().counters;
+    try testing.expectEqual(@as(u64, 1), counters.notice_retirements);
+    try testing.expectEqual(@as(u64, 1), counters.retirements);
+    try pool.remove(&worker);
 }
 
 test "a worker that dies while it drains after its notice still has the lanes of its requests told" {
@@ -989,8 +1130,10 @@ const Op = union(enum) {
     mark_dead: u8,
     /// The reaper starts the idle worker's retirement.
     retire_idle: u8,
-    /// The worker's `worker_retiring` notice reaches the pool, read by its
-    /// reader lane or, for a worker no lane reads, by the reaper's watch.
+    /// The worker's `worker_retiring` notice reaches the pool through
+    /// `retireOnNotice`, as its reader lane delivers it. The reaper's
+    /// delivery for a worker no lane reads, fenced by the reader epoch, is
+    /// pinned in its own test (`retireOnUnreadNotice`).
     notice: u8,
     /// The clock moves forward to this time.
     advance: u64,
@@ -1152,7 +1295,7 @@ const World = struct {
     }
 
     fn launch(world: *World) !void {
-        const ticket = world.pool.launchStarted(true) orelse return;
+        const ticket = startLaunch(&world.pool) orelse return;
         try testing.expect(ticket.entry < model_workers);
         try testing.expect(world.tickets[ticket.entry] == null);
         world.tickets[ticket.entry] = ticket;

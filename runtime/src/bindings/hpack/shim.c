@@ -1,8 +1,10 @@
 /*
- * Small C ABI wrapper around ls-hpack.
+ * Small C ABI wrapper around ls-hpack: one decoded field per call and one
+ * encoded field per call, each into a buffer the caller passes.
  *
  * Zig keeps HPACK ownership opaque so ls-hpack can keep its native struct
- * layout and dynamic-table invariants.
+ * layout and dynamic-table invariants. Sensitive fields are encoded as
+ * never-indexed literals here, so they never enter a dynamic table.
  */
 
 #include <stdint.h>
@@ -43,53 +45,6 @@ struct collo_hpack_decoded_header {
     uint32_t value_offset;
     uint32_t value_len;
 };
-
-enum collo_hpack_prepared_flag {
-    COLLO_HPACK_PREPARED_NAME_HASH = 1u << 0,
-    COLLO_HPACK_PREPARED_NAME_VALUE_HASH = 1u << 1,
-    COLLO_HPACK_PREPARED_VALUE_MATCHED = 1u << 2,
-    COLLO_HPACK_PREPARED_NEVER_INDEX = 1u << 3,
-    COLLO_HPACK_PREPARED_STATIC_MISS = 1u << 4,
-};
-
-struct collo_hpack_prepared_header {
-    uint32_t storage_offset;
-    uint32_t name_hash;
-    uint32_t name_value_hash;
-    uint16_t name_len;
-    uint16_t value_len;
-    uint8_t static_index;
-    uint8_t flags;
-    uint16_t reserved;
-};
-
-_Static_assert(
-    sizeof(struct collo_hpack_prepared_header) == 20,
-    "prepared HPACK descriptor size");
-_Static_assert(
-    offsetof(struct collo_hpack_prepared_header, storage_offset) == 0,
-    "prepared HPACK storage offset layout");
-_Static_assert(
-    offsetof(struct collo_hpack_prepared_header, name_hash) == 4,
-    "prepared HPACK name hash layout");
-_Static_assert(
-    offsetof(struct collo_hpack_prepared_header, name_value_hash) == 8,
-    "prepared HPACK name/value hash layout");
-_Static_assert(
-    offsetof(struct collo_hpack_prepared_header, name_len) == 12,
-    "prepared HPACK name length layout");
-_Static_assert(
-    offsetof(struct collo_hpack_prepared_header, value_len) == 14,
-    "prepared HPACK value length layout");
-_Static_assert(
-    offsetof(struct collo_hpack_prepared_header, static_index) == 16,
-    "prepared HPACK static index layout");
-_Static_assert(
-    offsetof(struct collo_hpack_prepared_header, flags) == 17,
-    "prepared HPACK flags layout");
-_Static_assert(
-    offsetof(struct collo_hpack_prepared_header, reserved) == 18,
-    "prepared HPACK reserved layout");
 
 static int collo_hpack_eq(const char *bytes, size_t len, const char *literal)
 {
@@ -236,18 +191,18 @@ static int collo_hpack_encode_string(
 /* Hand-rolled never-indexed literal encoding (RFC 7541 section 6.2.3) so
  * sensitive headers bypass the ls-hpack dynamic table entirely. Only the
  * static table may be used for the name. */
-static int collo_hpack_encode_never_index_header_with_static_name(
+static int collo_hpack_encode_never_index_header(
     uint8_t *dst,
     size_t dst_len,
     size_t *offset,
     const char *name,
     size_t name_len,
     const char *value,
-    size_t value_len,
-    unsigned static_name_index)
+    size_t value_len)
 {
     uint8_t *cursor = dst + *offset;
     uint8_t *end = dst + dst_len;
+    const unsigned static_name_index = collo_hpack_static_name_index(name, name_len, NULL);
 
     int status;
     if (static_name_index != LSHPACK_HDR_UNKNOWN) {
@@ -266,26 +221,6 @@ static int collo_hpack_encode_never_index_header_with_static_name(
 
     *offset = (size_t)(cursor - dst);
     return COLLO_HPACK_OK;
-}
-
-static int collo_hpack_encode_never_index_header(
-    uint8_t *dst,
-    size_t dst_len,
-    size_t *offset,
-    const char *name,
-    size_t name_len,
-    const char *value,
-    size_t value_len)
-{
-    return collo_hpack_encode_never_index_header_with_static_name(
-        dst,
-        dst_len,
-        offset,
-        name,
-        name_len,
-        value,
-        value_len,
-        collo_hpack_static_name_index(name, name_len, NULL));
 }
 
 int collo_hpack_decoder_new(struct collo_hpack_decoder **out)
@@ -442,183 +377,5 @@ int collo_hpack_encode_header(
         return COLLO_HPACK_OUTPUT_TOO_SMALL;
 
     *offset = (size_t)(encoded - dst);
-    return COLLO_HPACK_OK;
-}
-
-int collo_hpack_prepare_header(
-    struct collo_hpack_prepared_header *prepared,
-    uint8_t *storage,
-    size_t storage_len,
-    uint32_t storage_offset,
-    const char *name,
-    size_t name_len,
-    const char *value,
-    size_t value_len)
-{
-    if (prepared == NULL || name == NULL || value == NULL)
-        return COLLO_HPACK_INVALID_ARGUMENT;
-    if (name_len > LSHPACK_MAX_STRLEN || value_len > LSHPACK_MAX_STRLEN)
-        return COLLO_HPACK_TOO_LARGE;
-    if (name_len > SIZE_MAX - value_len)
-        return COLLO_HPACK_TOO_LARGE;
-
-    const size_t combined_len = name_len + value_len;
-    if ((combined_len != 0 && storage == NULL) ||
-        (size_t)storage_offset > storage_len ||
-        combined_len > storage_len - (size_t)storage_offset)
-        return COLLO_HPACK_OUTPUT_TOO_SMALL;
-
-    memset(prepared, 0, sizeof(*prepared));
-    prepared->storage_offset = storage_offset;
-    prepared->name_len = (uint16_t)name_len;
-    prepared->value_len = (uint16_t)value_len;
-
-    char *const combined = storage == NULL
-        ? NULL
-        : (char *)storage + storage_offset;
-    if (name_len != 0)
-        memcpy(combined, name, name_len);
-    if (value_len != 0)
-        memcpy(combined + name_len, value, value_len);
-
-    if (collo_hpack_should_never_index(name, name_len)) {
-        prepared->static_index = (uint8_t)collo_hpack_static_name_index(
-            name,
-            name_len,
-            NULL);
-        prepared->flags = COLLO_HPACK_PREPARED_NEVER_INDEX;
-        return COLLO_HPACK_OK;
-    }
-
-    struct lsxpack_header xhdr;
-    lsxpack_header_set_offset2(
-        &xhdr,
-        combined,
-        0,
-        name_len,
-        name_len,
-        value_len);
-    (void)lshpack_enc_precompute_static(
-        &xhdr,
-        LSHPACK_ENC_PRECOMPUTE_FULL);
-
-    prepared->name_hash = xhdr.name_hash;
-    prepared->name_value_hash = xhdr.nameval_hash;
-    prepared->static_index = xhdr.hpack_index;
-    if (xhdr.flags & LSXPACK_NAME_HASH)
-        prepared->flags |= COLLO_HPACK_PREPARED_NAME_HASH;
-    if (xhdr.flags & LSXPACK_NAMEVAL_HASH)
-        prepared->flags |= COLLO_HPACK_PREPARED_NAME_VALUE_HASH;
-    if (xhdr.flags & LSXPACK_HPACK_VAL_MATCHED)
-        prepared->flags |= COLLO_HPACK_PREPARED_VALUE_MATCHED;
-    if (xhdr.flags & LSXPACK_HPACK_STATIC_MISS)
-        prepared->flags |= COLLO_HPACK_PREPARED_STATIC_MISS;
-    return COLLO_HPACK_OK;
-}
-
-int collo_hpack_encode_prepared_block(
-    struct collo_hpack_encoder *encoder,
-    uint8_t *dst,
-    size_t dst_len,
-    size_t *offset,
-    const uint8_t *storage,
-    size_t storage_len,
-    const struct collo_hpack_prepared_header *headers,
-    size_t header_count)
-{
-    const uint8_t known_flags =
-        COLLO_HPACK_PREPARED_NAME_HASH |
-        COLLO_HPACK_PREPARED_NAME_VALUE_HASH |
-        COLLO_HPACK_PREPARED_VALUE_MATCHED |
-        COLLO_HPACK_PREPARED_NEVER_INDEX |
-        COLLO_HPACK_PREPARED_STATIC_MISS;
-    if (encoder == NULL || dst == NULL || offset == NULL || *offset > dst_len)
-        return COLLO_HPACK_INVALID_ARGUMENT;
-    if (headers == NULL && header_count != 0)
-        return COLLO_HPACK_INVALID_ARGUMENT;
-
-    for (size_t index = 0; index < header_count; ++index) {
-        const struct collo_hpack_prepared_header *const prepared = &headers[index];
-        if (prepared->reserved != 0 || (prepared->flags & ~known_flags) != 0)
-            return COLLO_HPACK_INVALID_ARGUMENT;
-        if (prepared->static_index > LSHPACK_HDR_WWW_AUTHENTICATE)
-            return COLLO_HPACK_INVALID_ARGUMENT;
-        if ((prepared->flags & COLLO_HPACK_PREPARED_NAME_VALUE_HASH) != 0 &&
-            (prepared->flags & COLLO_HPACK_PREPARED_NAME_HASH) == 0)
-            return COLLO_HPACK_INVALID_ARGUMENT;
-        if ((prepared->flags & COLLO_HPACK_PREPARED_VALUE_MATCHED) != 0 &&
-            ((prepared->flags & COLLO_HPACK_PREPARED_NAME_VALUE_HASH) == 0 ||
-             prepared->static_index == LSHPACK_HDR_UNKNOWN))
-            return COLLO_HPACK_INVALID_ARGUMENT;
-        if ((prepared->flags & COLLO_HPACK_PREPARED_STATIC_MISS) != 0 &&
-            (prepared->static_index != LSHPACK_HDR_UNKNOWN ||
-             (prepared->flags & COLLO_HPACK_PREPARED_NAME_HASH) == 0 ||
-             (prepared->flags & COLLO_HPACK_PREPARED_NAME_VALUE_HASH) == 0 ||
-             (prepared->flags & COLLO_HPACK_PREPARED_VALUE_MATCHED) != 0))
-            return COLLO_HPACK_INVALID_ARGUMENT;
-
-        const size_t name_len = prepared->name_len;
-        const size_t value_len = prepared->value_len;
-        const size_t combined_len = name_len + value_len;
-        const size_t storage_offset = prepared->storage_offset;
-        if ((combined_len != 0 && storage == NULL) ||
-            storage_offset > storage_len ||
-            combined_len > storage_len - storage_offset)
-            return COLLO_HPACK_INVALID_ARGUMENT;
-
-        const char *const combined = storage == NULL
-            ? NULL
-            : (const char *)storage + storage_offset;
-        const char *const value = combined == NULL
-            ? NULL
-            : combined + name_len;
-        int status;
-        if (prepared->flags & COLLO_HPACK_PREPARED_NEVER_INDEX) {
-            status = collo_hpack_encode_never_index_header_with_static_name(
-                dst,
-                dst_len,
-                offset,
-                combined,
-                name_len,
-                value,
-                value_len,
-                prepared->static_index);
-        } else {
-            struct lsxpack_header xhdr;
-            lsxpack_header_set_offset2(
-                &xhdr,
-                combined,
-                0,
-                name_len,
-                name_len,
-                value_len);
-            xhdr.name_hash = prepared->name_hash;
-            xhdr.nameval_hash = prepared->name_value_hash;
-            xhdr.hpack_index = prepared->static_index;
-            if (prepared->flags & COLLO_HPACK_PREPARED_NAME_HASH)
-                xhdr.flags |= LSXPACK_NAME_HASH;
-            if (prepared->flags & COLLO_HPACK_PREPARED_NAME_VALUE_HASH)
-                xhdr.flags |= LSXPACK_NAMEVAL_HASH;
-            if (prepared->flags & COLLO_HPACK_PREPARED_VALUE_MATCHED)
-                xhdr.flags |= LSXPACK_HPACK_VAL_MATCHED;
-            if (prepared->flags & COLLO_HPACK_PREPARED_STATIC_MISS)
-                xhdr.flags |= LSXPACK_HPACK_STATIC_MISS;
-
-            unsigned char *const start = dst + *offset;
-            unsigned char *const encoded = lshpack_enc_encode(
-                &encoder->enc,
-                start,
-                dst + dst_len,
-                &xhdr);
-            if (encoded == start)
-                status = COLLO_HPACK_OUTPUT_TOO_SMALL;
-            else {
-                *offset = (size_t)(encoded - dst);
-                status = COLLO_HPACK_OK;
-            }
-        }
-        if (status != COLLO_HPACK_OK)
-            return status;
-    }
     return COLLO_HPACK_OK;
 }

@@ -167,6 +167,45 @@ describe("AbortController and AbortSignal", () => {
     assert.equal(secondCalls, 1);
   });
 
+  // HTML: replacing an event handler keeps the listener slot its first value took; null removes it, and a later value
+  // starts again at the end.
+  test("onabort keeps its position among the listeners when replaced", () => {
+    const order = [];
+    const controller = new AbortController();
+    const signal = controller.signal;
+    signal.addEventListener("abort", () => order.push("before"));
+    signal.onabort = () => order.push("first handler");
+    signal.addEventListener("abort", () => order.push("after"));
+    signal.onabort = () => order.push("replacement");
+    assert.equal(typeof signal.onabort, "function");
+    controller.abort();
+    assert.deepEqual(order, ["before", "replacement", "after"]);
+
+    const reset = new AbortController();
+    const resetOrder = [];
+    reset.signal.onabort = () => resetOrder.push("removed");
+    reset.signal.addEventListener("abort", () => resetOrder.push("listener"));
+    reset.signal.onabort = null;
+    assert.equal(reset.signal.onabort, null);
+    reset.signal.onabort = () => resetOrder.push("reattached");
+    reset.abort();
+    assert.deepEqual(resetOrder, ["listener", "reattached"]);
+  });
+
+  // Web IDL's EventHandler keeps any object; only a callable one runs.
+  test("onabort keeps a non-callable object without calling it, and turns other values into null", () => {
+    const controller = new AbortController();
+    // An exception from the handler would be reported rather than thrown, so the test records the call instead.
+    let called = false;
+    const handler = { handleEvent() { called = true; } };
+    controller.signal.onabort = handler;
+    assert.equal(controller.signal.onabort, handler);
+    controller.abort();
+    assert.equal(called, false);
+    controller.signal.onabort = 1;
+    assert.equal(controller.signal.onabort, null);
+  });
+
   test("AbortSignal.abort creates an already-aborted signal", () => {
     const defaultSignal = AbortSignal.abort();
     assert(defaultSignal instanceof AbortSignal);

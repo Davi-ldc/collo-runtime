@@ -34,13 +34,6 @@ namespace {
 
 } // namespace
 
-bool bodyValueIsCallable(JSC::JSValue value)
-{
-    if (!value.isCell())
-        return false;
-    return JSC::getCallData(value).type != JSC::CallData::Type::None;
-}
-
 void releaseReadableStreamReader(JSC::JSGlobalObject* global_object, JSC::JSObject* reader)
 {
     if (!reader)

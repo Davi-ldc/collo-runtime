@@ -1,118 +1,89 @@
-//! A worker's egress state: its fetch tasks, its fetch body views and their
-//! decoders, the per-request fetch counts, the pending-upload queue and the
-//! upload reservations, the mapped gateway endpoint and the callbacks that
-//! return body-pool extents. `runtime/egress.zig` holds it beside the
-//! scheduler, request and VM state the worker runtime owns, and only the
-//! worker's event loop thread touches it.
+//! A worker's egress state: the fetches the gateway may still count, the
+//! fetch tasks waiting for an answer, the fetch body views with their
+//! decoders, the pending-upload queue and the mapped gateway endpoint.
+//! `runtime/egress.zig` holds it beside the scheduler, request and VM state
+//! the worker runtime owns, and only the worker's VM thread touches it.
 //!
 //! The worker is attached while it holds an endpoint and detached otherwise.
 //! It boots attached when WorkerInit carries a session's regions, detaches
-//! when its gateway closes (`gateway_runtime.disconnect`), and attaches again
-//! when the server sends the half of a new session (`attach`). A worker whose
-//! definition grants some route network access (`Grant.granted`) gets its
-//! wake descriptors with WorkerInit, and the worker ring polls their
-//! completion eventfd and liveness pipe from fixed slots for the worker's
-//! whole life, because a restricted ring can never register another file
-//! (`common/io/restricted_uring.zig`). The server builds every session of the
-//! worker on the same wake set (`egress_shared.WakeSet`), and `attach` takes
-//! only a half whose liveness pipe is the one WorkerInit carried. A worker
-//! without a grant gets no egress descriptor at all: it never holds a
-//! session, refuses every fetch before anything leaves
-//! (`fetch_runtime.refusal`), and its ring leaves both egress slots empty.
+//! when its gateway closes (`gateway_runtime.disconnectWithReason`) or when
+//! the session breaks in a way only a gateway defect causes
+//! (`gateway_runtime.detachForGatewayFault`), and attaches again when the
+//! server sends the half of a new session (`attach`).
+//! A worker whose definition grants some route network access gets its wake
+//! descriptors with WorkerInit; while attached, the event loop polls the
+//! endpoint's completion eventfd and liveness pipe. A worker launched without
+//! a session holds the wake descriptors WorkerInit carried until its first
+//! attach, since closing its end of the peer liveness pipe would tell a
+//! gateway it exited (`egress_shared/session_fds.zig`). A worker without a
+//! grant gets no egress descriptor at all: it never holds a session and
+//! refuses every fetch before anything leaves (`fetch_runtime.refusal`).
 //!
-//! The upload reservations mirror what the gateway counts against the
-//! session's `ipc.fetch_limits.request_body_pooled_in_flight_bytes_max`: the
-//! announced length of each pooled start the worker sent, from that start
-//! until the worker sees the gateway end its fetch (an error, the body's end
-//! or the abort acknowledgment). The gateway lets an upload go only when the
-//! fetch retires there, which after the body's end waits for the worker to
-//! return the body's last extent, so a pooled start sent in between can be
-//! refused by the gateway, without a strike.
+//! `fetches` holds every fetch the gateway may still count, from
+//! `fetch_runtime.schedule` until the worker reads the fetch's terminal
+//! packet (its body end, its error or the acknowledgment of its stop), until
+//! a start that never left ends in the worker, or until the session goes. The
+//! gateway counts a fetch from its start until it publishes that packet, so
+//! this count never trails the gateway's, and a worker held to
+//! `fetches_per_worker_max` here never meets the gateway's session cap. The
+//! same entry holds what a pooled upload holds in the gateway, its announced
+//! length plus the copies of its start
+//! (`ipc.fetch_limits.pooledStartHeldBytes`), which the gateway counts on
+//! the same lifetime against
+//! `ipc.fetch_limits.request_body_pooled_in_flight_bytes_max`, and the
+//! request whose record the fetch's body bytes enter.
 //!
 //! Teardown runs in a fixed order: `deinitTasks`, which drops each task's
 //! reference on its response body, then the release of every body
-//! (`body/cleanup.zig` `releaseAllForShutdown`), then
+//! (`body/cleanup.zig:releaseAllForShutdown`), then
 //! `deinitAfterBodiesReleased`.
 
 const std = @import("std");
 const bindings = @import("collo_bindings");
 const ipc = @import("collo_ipc");
-const runtime_types = @import("../runtime/types.zig");
+const request_context = @import("collo_worker_request").context;
+const ready_queue = @import("../scheduler/queue.zig");
 const task_mod = @import("task.zig");
-const encoded_body = @import("collo_egress_core").encoded_body;
-const fetch_body = @import("collo_egress_core").fetch_body;
+const body_mod = @import("body/body.zig");
 
 pub const Task = task_mod.Task;
-pub const Body = fetch_body.Body;
-pub const BodyDecoder = encoded_body.Decoder;
+pub const Body = body_mod.Body;
 
-/// Where borrowed body-pool extents go back to the gateway. `bind` points it at
-/// the runtime (`gateway_control.bindBodyPoolRelease`); until then a release
-/// does nothing.
-pub const BodyPoolReleaseContext = struct {
-    context: ?*anyopaque = null,
-    release_fn: *const fn (?*anyopaque, u64, usize) void = noop,
+/// Whether the worker's definition grants some route network access, which
+/// WorkerInit's `flag_egress` says and its wake descriptors show.
+pub const Grant = enum { granted, none };
 
-    pub fn bind(
-        self: *BodyPoolReleaseContext,
-        context: ?*anyopaque,
-        release_fn: *const fn (?*anyopaque, u64, usize) void,
-    ) void {
-        self.context = context;
-        self.release_fn = release_fn;
-    }
-
-    pub fn release(context: ?*anyopaque, seq: u64, len: usize) void {
-        const self: *BodyPoolReleaseContext = @ptrCast(@alignCast(context orelse return));
-        self.release_fn(self.context, seq, len);
-    }
-
-    fn noop(_: ?*anyopaque, _: u64, _: usize) void {}
-};
-
-/// Where the credits of released chunks go, bound like
-/// `BodyPoolReleaseContext`. Worker chunks carry credit `.none`
-/// (`gateway_control.releaseBodyCredit`).
-pub const BodyCreditReleaseContext = struct {
-    context: ?*anyopaque = null,
-    release_fn: *const fn (?*anyopaque, fetch_body.Credit) void = noop,
-
-    pub fn bind(
-        self: *BodyCreditReleaseContext,
-        context: ?*anyopaque,
-        release_fn: *const fn (?*anyopaque, fetch_body.Credit) void,
-    ) void {
-        self.context = context;
-        self.release_fn = release_fn;
-    }
-
-    pub fn release(context: *BodyCreditReleaseContext, credit: fetch_body.Credit) void {
-        context.release_fn(context.context, credit);
-    }
-
-    fn noop(_: ?*anyopaque, _: fetch_body.Credit) void {}
-};
-
-/// A pipe by device and inode, which every descriptor of the pipe shares, so
-/// two descriptors with equal identities are ends of one pipe.
+/// A pipe named by device and inode, which every descriptor of it shares.
 pub const PipeIdentity = struct {
     device: u64,
     inode: u64,
 
-    fn of(fd: std.posix.fd_t) !PipeIdentity {
+    /// The identity of the pipe `fd` is an end of. Fails as `fstat` does.
+    pub fn of(fd: std.posix.fd_t) !PipeIdentity {
         const stat = try std.posix.fstat(fd);
         return .{ .device = @intCast(stat.dev), .inode = @intCast(stat.ino) };
     }
 
-    fn eql(self: PipeIdentity, other: PipeIdentity) bool {
+    pub fn eql(self: PipeIdentity, other: PipeIdentity) bool {
         return self.device == other.device and self.inode == other.inode;
     }
 };
 
-/// Whether the worker's definition grants some route network access, which
-/// WorkerInit's `flag_egress` says and its wake descriptors show
-/// (`State.grant`).
-pub const Grant = enum { granted, none };
+/// One fetch the gateway may still count (`State.fetches`).
+pub const Fetch = struct {
+    /// The request whose record this fetch's body bytes enter, under the
+    /// generation that started it.
+    request_id: u64,
+    request_generation: u64,
+    /// What its pooled upload holds in the gateway once the start left, its
+    /// announced length plus the copies of its start, or 0.
+    upload_reserved_bytes: u64 = 0,
+    /// The start is in the command ring, so the gateway answers for the
+    /// fetch, and a stop must reach it.
+    start_sent: bool = false,
+    /// The worker sent its one stop for the fetch (`task_runtime.stopFetch`).
+    stop_sent: bool = false,
+};
 
 pub const State = struct {
     /// The mapped gateway endpoint while the worker is attached. It owns the
@@ -123,15 +94,15 @@ pub const State = struct {
     /// own; null once the worker has had an endpoint, and for a worker
     /// without a grant.
     detached_wake: ?ipc.egress_shared.WakeFds = null,
-    /// The liveness pipe of the wake descriptors WorkerInit carried, which
-    /// the worker ring watches for the worker's whole life; null exactly for
-    /// a worker without a grant. `attach` takes only a half built on it.
+    /// The liveness pipe of the wake descriptors WorkerInit carried, null for
+    /// a worker without a grant. The server builds every session of a worker
+    /// on its one wake set (`session_fds.zig:WakeSet`), so a session whose
+    /// liveness pipe is another is a server bug, such as a session sent to
+    /// the wrong worker's socket, which would let this worker read another
+    /// worker's responses; `attach` refuses it.
     boot_liveness_pipe: ?PipeIdentity = null,
-    /// The announced length of each pooled start sent on the current
-    /// session, by fetch id, until the gateway ends that fetch
-    /// (`reserveUpload`, `releaseUpload`).
-    upload_reservations: std.AutoHashMapUnmanaged(u64, u64) = .{},
-    /// The sum of `upload_reservations`, never above
+    fetches: std.AutoHashMapUnmanaged(u64, Fetch) = .{},
+    /// The sum of every fetch's `upload_reserved_bytes`, never above
     /// `ipc.fetch_limits.request_body_pooled_in_flight_bytes_max`.
     upload_reserved_bytes: u64 = 0,
     /// A pooled start parked because the reservations had no room for it, so
@@ -139,15 +110,23 @@ pub const State = struct {
     /// The upload pump clears it before each pass, and each start that still
     /// finds no room sets it again (`upload_runtime.zig`).
     upload_room_waiter: bool = false,
-    body_pool_release_context: BodyPoolReleaseContext = .{},
-    body_credit_release_context: BodyCreditReleaseContext = .{},
     tasks: std.AutoHashMapUnmanaged(u64, *Task) = .{},
+    /// `fetch_completion` items still in the ready queue whose task was
+    /// destroyed before they popped (`task_runtime.destroyTask`). Each keeps
+    /// its place in the queue until it pops, so the tasks and these items
+    /// together stay within `fetches_per_worker_max`
+    /// (`fetch_runtime.schedule`), and the queue holds at most that many
+    /// completion items.
+    completion_ready_orphans: u32 = 0,
+    /// Every body view, by body id, holding the table's reference on each
+    /// (`body/root.zig`).
     bodies: std.AutoHashMapUnmanaged(u64, *Body) = .{},
-    /// Streaming decoders for bodies the gateway sends encoded, keyed by the
-    /// source body id the gateway's chunks name, never a tee branch's. A
-    /// decoder implies its body is in `bodies`: every path that removes a body
-    /// removes its decoder in the same step.
-    body_decoders: std.AutoHashMapUnmanaged(u64, *BodyDecoder) = .{},
+    /// `fetch_body_ready` items still in the ready queue whose body left
+    /// `bodies` before they popped (`body/cleanup.zig:removeFromTable`). The
+    /// bodies and these items together stay within
+    /// `fetch_bodies_per_worker_max` (`body/register.zig`), and the queue
+    /// holds at most that many body items.
+    body_ready_orphans: u32 = 0,
     /// Set whenever a release-queue entry is written and cleared by
     /// `gateway_control.flushBodyPoolReleases`, so one command-eventfd write
     /// covers a whole batch.
@@ -165,100 +144,79 @@ pub const State = struct {
     /// returns (`gateway_runtime.detachAfterFailedRelease`), and the detach
     /// clears the flag.
     body_pool_release_failed: bool = false,
+    /// Set while a detach runs (`gateway_runtime.disconnectWithReason`); a
+    /// failed write met inside it, which would detach again, does nothing.
+    detach_in_progress: bool = false,
+    /// The worker detached on its own, on a packet, a ring or a pool state
+    /// only a gateway defect produces (`gateway_runtime.detachForGatewayFault`).
+    /// No session replaces such a one, so the worker asks to be retired
+    /// (`runtime/retirement.zig`). Never cleared, as the notice is sent once.
+    detached_for_gateway_fault: bool = false,
     next_fetch_id: u64 = 1,
     next_body_id: u64 = 1,
-    /// Set when a full ready queue dropped a `fetch_completion` or a
-    /// `fetch_body_ready` item; the collect pass for that kind then rescans.
-    fetch_task_rescan_needed: bool = false,
-    fetch_body_rescan_needed: bool = false,
 
     /// Takes the worker's egress descriptors WorkerInit carried. None, as
     /// `shared_fds` null or empty brings, makes a worker without a grant.
-    /// Otherwise it records the liveness pipe of the wake descriptors, maps
-    /// the session's endpoint when the regions came and holds the wake
-    /// descriptors in `detached_wake` when none did. It reserves the task
-    /// table for `limits.max_fetches_per_worker`. The descriptors leave
-    /// `shared_fds` once they check out, and a later failure closes them.
-    /// Fails with `error.InvalidEgressSharedEndpoint` for regions without
-    /// wake descriptors, an incomplete wake set or some regions without the
-    /// rest, as `attach` does when `fstat` fails on the liveness pipe or the
-    /// endpoint cannot be mapped, with `error.CapacityTooLarge`, or with
-    /// `error.OutOfMemory`.
-    pub fn init(
-        allocator: std.mem.Allocator,
-        limits: runtime_types.RuntimeLimits,
-        shared_fds: ?*ipc.egress_shared.RawFds,
-    ) !State {
-        var boot_liveness_pipe: ?PipeIdentity = null;
-        var shared: ?ipc.egress_shared.Endpoint = null;
-        var detached_wake: ?ipc.egress_shared.WakeFds = null;
+    /// Otherwise it maps the session's endpoint when the regions came and
+    /// holds the wake descriptors in `detached_wake` when none did. The
+    /// descriptors leave `shared_fds` once they check out. Fails with
+    /// `error.InvalidEgressSharedEndpoint` for regions without wake
+    /// descriptors, an incomplete wake set or some regions without the rest,
+    /// as `fstat` does on the liveness pipe, or as `attach` does when the
+    /// endpoint cannot be mapped.
+    pub fn init(shared_fds: ?*ipc.egress_shared.RawFds) !State {
         const granted_fds: ?*ipc.egress_shared.RawFds = if (shared_fds) |fds|
             (if (fds.isEmpty()) null else fds)
         else
             null;
-        if (granted_fds) |fds| {
-            if (!fds.wakeFds().isValid())
-                return error.InvalidEgressSharedEndpoint;
-            boot_liveness_pipe = try PipeIdentity.of(fds.liveness_fd);
-            switch (fds.regionCount()) {
-                0 => {
-                    detached_wake = fds.wakeFds();
-                    fds.* = .{};
-                },
-                ipc.egress_shared.region_fd_count => shared = try mapWorkerHalf(fds),
-                else => return error.InvalidEgressSharedEndpoint,
-            }
+        const fds = granted_fds orelse return .{};
+        const wake = fds.wakeFds();
+        if (!wake.isValid())
+            return error.InvalidEgressSharedEndpoint;
+        const liveness_pipe = try PipeIdentity.of(wake.liveness_fd);
+        switch (fds.regionCount()) {
+            0 => {
+                fds.* = .{};
+                return .{ .detached_wake = wake, .boot_liveness_pipe = liveness_pipe };
+            },
+            ipc.egress_shared.region_fd_count => return .{
+                .shared = try mapWorkerHalf(fds),
+                .boot_liveness_pipe = liveness_pipe,
+            },
+            else => return error.InvalidEgressSharedEndpoint,
         }
-        errdefer if (shared) |*endpoint| endpoint.deinit();
-        errdefer if (detached_wake) |*wake| wake.close();
-
-        var tasks = std.AutoHashMapUnmanaged(u64, *Task){};
-        errdefer tasks.deinit(allocator);
-        try tasks.ensureTotalCapacity(allocator, try hashCapacity(limits.max_fetches_per_worker));
-
-        var bodies = std.AutoHashMapUnmanaged(u64, *Body){};
-        errdefer {
-            var body_it = bodies.iterator();
-            while (body_it.next()) |entry|
-                entry.value_ptr.*.releaseAfterQueuedResourcesReleased(allocator);
-            bodies.deinit(allocator);
-        }
-
-        return .{
-            .shared = shared,
-            .detached_wake = detached_wake,
-            .boot_liveness_pipe = boot_liveness_pipe,
-            .tasks = tasks,
-            .bodies = bodies,
-        };
     }
 
     /// Maps the worker half `fds` of a session the server attached after the
     /// worker's gateway was replaced (`ipc.egress_attach.decode`), with the
     /// checks of the boot mapping, and takes the fds once the mapping
     /// succeeds; on failure `fds` keeps every descriptor. The half brings the
-    /// session's own wake descriptors, so the ones a detached boot held
-    /// close. The worker must be detached. Fails with
-    /// `error.EgressNotGranted` for a worker without a grant, whose ring
-    /// watches no liveness pipe, with
-    /// `error.EgressAttachLivenessPipeMismatch` when the half's liveness pipe
-    /// is not the one WorkerInit carried, with the error of `fstat` on it, or
-    /// when the endpoint cannot be mapped or its rings disagree on the
-    /// session. The server is the only sender, so each failure is a server
-    /// bug.
+    /// session's own wake descriptors, which the loop polls from then on, so
+    /// the ones a detached boot held close. The worker must be detached.
+    /// Fails with `error.EgressNotGranted` for a worker without a grant,
+    /// `error.EgressAttachLivenessPipeMismatch` for a half whose liveness
+    /// pipe is not the one WorkerInit carried (`boot_liveness_pipe`), or when
+    /// the endpoint cannot be mapped or its rings disagree on the session.
+    /// The server is the only sender, so each failure is a server bug.
     pub fn attach(self: *State, fds: *ipc.egress_shared.RawFds) !void {
         std.debug.assert(self.shared == null);
-        std.debug.assert(self.body_decoders.count() == 0);
-        const boot_pipe = self.boot_liveness_pipe orelse return error.EgressNotGranted;
-        // The completion eventfd cannot be checked the same way: every
-        // eventfd shares one anonymous inode.
-        const pipe = try PipeIdentity.of(fds.liveness_fd);
-        if (!pipe.eql(boot_pipe))
-            return error.EgressAttachLivenessPipeMismatch;
+        try self.checkAttach(fds);
         self.shared = try mapWorkerHalf(fds);
-        if (self.detached_wake) |*wake|
-            wake.close();
+        if (self.detached_wake) |*detached|
+            detached.close();
         self.detached_wake = null;
+    }
+
+    /// The checks `attach` makes before it maps anything, which change no
+    /// state, so a caller can refuse a half before it detaches the session
+    /// the worker holds.
+    pub fn checkAttach(self: *const State, fds: *const ipc.egress_shared.RawFds) !void {
+        const boot_liveness_pipe = self.boot_liveness_pipe orelse return error.EgressNotGranted;
+        const wake = fds.wakeFds();
+        if (!wake.isValid())
+            return error.InvalidEgressSharedEndpoint;
+        if (!boot_liveness_pipe.eql(try PipeIdentity.of(wake.liveness_fd)))
+            return error.EgressAttachLivenessPipeMismatch;
     }
 
     /// Whether the worker's definition grants some route network access: it
@@ -267,65 +225,57 @@ pub const State = struct {
         return if (self.boot_liveness_pipe != null) .granted else .none;
     }
 
-    /// The wake descriptors the worker holds now: its endpoint's while
-    /// attached, `detached_wake` while it has had no session, null for a
-    /// worker without a grant. The worker ring registers their completion
-    /// eventfd and liveness pipe once, at boot (`scheduler/resources.zig`),
-    /// and every later session of the worker carries the same two files.
-    pub fn wakeFds(self: *const State) ?ipc.egress_shared.WakeFds {
-        if (self.shared) |*endpoint| {
-            return .{
-                .command_eventfd = endpoint.command_eventfd,
-                .completion_eventfd = endpoint.completion_eventfd,
-                .liveness_fd = endpoint.liveness_fd,
-                .peer_liveness_fd = endpoint.peer_liveness_fd,
-            };
-        }
-        return self.detached_wake;
-    }
-
     /// Unmaps the endpoint and closes its descriptors, which detaches the
     /// worker. Closing the worker's end of the peer liveness pipe tells the
-    /// gateway, as the worker's exit would. Decoders must be gone first,
-    /// since they return their extents into the body pool's release queue.
-    /// The upload reservations go with the session: the gateway of the next
-    /// one counts from nothing.
+    /// gateway, as the worker's exit would. Every decoder must be gone
+    /// first, since decoders return their extents into the body pool's
+    /// release queue. The fetches and their upload reservations go with the
+    /// session: the gateway of the next one counts from nothing.
     pub fn releaseEndpoint(self: *State) void {
-        std.debug.assert(self.body_decoders.count() == 0);
         if (self.shared) |*endpoint|
             endpoint.deinit();
         self.shared = null;
         self.releases_need_notify = false;
-        self.upload_reservations.clearRetainingCapacity();
+        self.fetches.clearRetainingCapacity();
         self.upload_reserved_bytes = 0;
         self.upload_room_waiter = false;
     }
 
-    /// The pooled bytes a start may still announce on this session.
+    /// Counts the fetch `fetch_id` of `request` from now; the caller made
+    /// room for the entry (`ensureUnusedCapacity` on `fetches`), so counting
+    /// cannot fail after the task exists.
+    pub fn beginFetch(self: *State, fetch_id: u64, request: *const request_context.RequestContext) void {
+        self.fetches.putAssumeCapacityNoClobber(fetch_id, .{
+            .request_id = request.exec.request_id,
+            .request_generation = request.request_generation,
+        });
+    }
+
+    /// Stops counting `fetch_id` and gives back its upload reservation; an id
+    /// the table does not hold, as one a late or hostile packet names,
+    /// changes nothing.
+    pub fn endFetch(self: *State, fetch_id: u64) void {
+        const removed = self.fetches.fetchRemove(fetch_id) orelse return;
+        std.debug.assert(removed.value.upload_reserved_bytes <= self.upload_reserved_bytes);
+        self.upload_reserved_bytes -= removed.value.upload_reserved_bytes;
+    }
+
+    /// The bytes a pooled start may still reserve on this session.
     pub fn uploadRoom(self: *const State) u64 {
         const in_flight_max: u64 = ipc.fetch_limits.request_body_pooled_in_flight_bytes_max;
         std.debug.assert(self.upload_reserved_bytes <= in_flight_max);
         return in_flight_max - self.upload_reserved_bytes;
     }
 
-    /// Records that the pooled start of `fetch_id` announcing `bytes` left
-    /// the worker. `bytes` must fit in `uploadRoom`, and the caller made room
-    /// for the entry first (`ensureUnusedCapacity` on
-    /// `upload_reservations`), so recording cannot fail after the start is
-    /// on the wire.
-    pub fn reserveUpload(self: *State, fetch_id: u64, bytes: u64) void {
-        std.debug.assert(bytes <= self.uploadRoom());
-        self.upload_reservations.putAssumeCapacityNoClobber(fetch_id, bytes);
-        self.upload_reserved_bytes += bytes;
-    }
-
-    /// Gives back the reservation of `fetch_id` once the gateway ended that
-    /// fetch; a fetch that holds none, as an inline start or an id a hostile
-    /// packet names, changes nothing.
-    pub fn releaseUpload(self: *State, fetch_id: u64) void {
-        const removed = self.upload_reservations.fetchRemove(fetch_id) orelse return;
-        std.debug.assert(removed.value <= self.upload_reserved_bytes);
-        self.upload_reserved_bytes -= removed.value;
+    /// Records that the start of `fetch`, counted in `fetches`, left the
+    /// worker, reserving `reserved_bytes` for its pooled upload (0 for an
+    /// inline body); `reserved_bytes` must fit in `uploadRoom`.
+    pub fn noteStartSent(self: *State, fetch: *Fetch, reserved_bytes: u64) void {
+        std.debug.assert(!fetch.start_sent);
+        std.debug.assert(reserved_bytes <= self.uploadRoom());
+        fetch.start_sent = true;
+        fetch.upload_reserved_bytes = reserved_bytes;
+        self.upload_reserved_bytes += reserved_bytes;
     }
 
     pub fn deinitTasks(self: *State, allocator: std.mem.Allocator) void {
@@ -337,69 +287,93 @@ pub const State = struct {
         self.tasks.deinit(allocator);
     }
 
-    /// Frees the tables, unmaps the endpoint and closes the wake descriptors
-    /// once every body was released.
+    /// Frees the tables, unmaps the endpoint and closes the wake descriptors.
+    /// Request cleanup and `releaseAllForShutdown` leave no body behind; one
+    /// that is still here broke that contract, and it is logged and released
+    /// with its decoder before the endpoint goes, so its extents still reach
+    /// the mapped release queue.
     pub fn deinitAfterBodiesReleased(self: *State, allocator: std.mem.Allocator) void {
-        std.debug.assert(self.bodies.count() == 0);
-        std.debug.assert(self.body_decoders.count() == 0);
         if (self.bodies.count() != 0) {
-            // A body left here means request cleanup broke its contract, which
-            // Debug and ReleaseSafe builds catch with the assert above. FIXME:
-            // under ReleaseFast that assert lets the optimizer assume the
-            // table is empty and delete this fallback, so production builds
-            // may never release the stragglers.
             std.log.err("egress bodies still registered during state shutdown count={d}", .{
                 self.bodies.count(),
             });
-            releaseRemainingBodies(self, allocator);
+            var iterator = self.bodies.iterator();
+            while (iterator.next()) |entry| {
+                const body = entry.value_ptr.*;
+                body.dropDecoder(allocator);
+                body.releaseQueuedChunks(allocator);
+                body.detachTeeLinks(allocator);
+                body.release(allocator);
+            }
+            self.bodies.clearRetainingCapacity();
         }
-        // Decoders go before the endpoint: their pending extents return
-        // through the bound callback into the release queue, which must still
-        // be mapped.
-        self.removeAllBodyDecoders(allocator);
         self.releaseEndpoint();
         if (self.detached_wake) |*wake|
             wake.close();
         self.detached_wake = null;
-        self.body_decoders.deinit(allocator);
         self.bodies.deinit(allocator);
+        self.fetches.deinit(allocator);
         self.pending_uploads.deinit(allocator);
-        self.upload_reservations.deinit(allocator);
     }
 
-    /// Drops the decoder of `body_id`, returning its pending pool extents
-    /// through the release queue. Returns false when there was none.
-    pub fn removeBodyDecoder(self: *State, allocator: std.mem.Allocator, body_id: u64) bool {
-        const removed = self.body_decoders.fetchRemove(body_id) orelse return false;
-        removed.value.deinit(allocator);
-        allocator.destroy(removed.value);
-        return true;
-    }
-
-    /// Drops every decoder, for a gateway disconnect or state teardown. It must
-    /// run before the endpoint is unmapped, so the pending extents still reach
-    /// the release queue.
-    pub fn removeAllBodyDecoders(self: *State, allocator: std.mem.Allocator) void {
-        var iterator = self.body_decoders.iterator();
-        while (iterator.next()) |entry| {
-            entry.value_ptr.*.deinit(allocator);
-            allocator.destroy(entry.value_ptr.*);
+    /// Gives back the place an egress item held in the ready queue, for every
+    /// item the queue pops, whether or not the loop then runs it
+    /// (`scheduler/loop.zig:executeWorkItem`): a task or body still listed
+    /// may queue its next item, and an item whose task or body went before it
+    /// stops counting against the slots `fetch_runtime.schedule` and
+    /// `body/register.zig` hand out. Ids never repeat within the worker, so
+    /// the item of a task or body still listed is that one's item. Any other
+    /// kind changes nothing.
+    pub fn noteReadyItemPopped(self: *State, item: ready_queue.WorkItem) void {
+        switch (item) {
+            .fetch_completion => |fetch_id| {
+                if (self.tasks.get(fetch_id)) |task| {
+                    task.noteReadyItemPopped();
+                } else {
+                    std.debug.assert(self.completion_ready_orphans != 0);
+                    self.completion_ready_orphans -= 1;
+                }
+            },
+            .fetch_body_ready => |body_id| {
+                if (self.bodies.get(body_id)) |body| {
+                    body.noteReadyItemPopped();
+                } else {
+                    std.debug.assert(self.body_ready_orphans != 0);
+                    self.body_ready_orphans -= 1;
+                }
+            },
+            .request,
+            .timer_callback,
+            .immediate_callback,
+            .request_completion,
+            .request_body_ready,
+            .request_cancelled,
+            .request_deadline,
+            .response_advance,
+            => {},
         }
-        self.body_decoders.clearRetainingCapacity();
     }
 
-    /// The next body identity under `request`'s id and generation, where
-    /// `request` is a `RequestContext`. Body ids wrap and skip zero.
+    /// Drops every decoder, for a detach or teardown. It must run before the
+    /// endpoint is unmapped, so the pending extents still reach the release
+    /// queue.
+    pub fn dropAllDecoders(self: *State, allocator: std.mem.Allocator) void {
+        var iterator = self.bodies.valueIterator();
+        while (iterator.next()) |body|
+            body.*.dropDecoder(allocator);
+    }
+
+    /// The next body identity under `request`'s id and generation. Body ids
+    /// wrap and skip zero.
     pub fn nextBodyIdentity(
         self: *State,
-        request: anytype,
+        request: *const request_context.RequestContext,
         fetch_id: u64,
     ) bindings.FetchBodyIdentity {
         const body_id = self.next_body_id;
         self.next_body_id +%= 1;
         if (self.next_body_id == 0)
             self.next_body_id = 1;
-
         return .{
             .request_id = request.exec.request_id,
             .request_generation = request.request_generation,
@@ -416,28 +390,4 @@ fn mapWorkerHalf(fds: *ipc.egress_shared.RawFds) !ipc.egress_shared.Endpoint {
     errdefer endpoint.deinit();
     try endpoint.validateConsistentSession();
     return endpoint;
-}
-
-fn releaseRemainingBodies(self: *State, allocator: std.mem.Allocator) void {
-    var iterator = self.bodies.iterator();
-    while (iterator.next()) |entry| {
-        // The cleanup contract already broke, so nothing is assumed: queued
-        // chunks are released and tee links severed before the final release,
-        // which requires both and would otherwise leak the chunks' bytes,
-        // credits and extents.
-        entry.value_ptr.*.releaseQueuedChunksCallback(
-            allocator,
-            &self.body_credit_release_context,
-            BodyCreditReleaseContext.release,
-        );
-        entry.value_ptr.*.detachTeeLinks(allocator);
-        entry.value_ptr.*.releaseAfterQueuedResourcesReleased(allocator);
-    }
-    self.bodies.clearRetainingCapacity();
-}
-
-fn hashCapacity(value: usize) !u32 {
-    if (value > std.math.maxInt(u32))
-        return error.CapacityTooLarge;
-    return @intCast(value);
 }

@@ -236,9 +236,8 @@ test "the owner's CPU reaches the page before the termination request, and a fir
     defer vm.deinit();
     const page_fd = try worker_shared_page.createMemfd("collo-sentinel-running-cpu");
     defer std.posix.close(page_fd);
-    var page = try worker_shared_page.mapReadWrite(page_fd);
+    var page = try worker_shared_page.mapWorkerWriter(page_fd);
     defer page.deinit();
-    page.initializeCrashDefault();
 
     var stand_in = StandIn{ .spin = true };
     const thread = try stand_in.start();
@@ -283,9 +282,8 @@ test "a memory events descriptor that turns invalid under the poll ends the work
     defer vm.deinit();
     const page_fd = try worker_shared_page.createMemfd("collo-sentinel-failure");
     defer std.posix.close(page_fd);
-    var page = try worker_shared_page.mapReadWrite(page_fd);
+    var page = try worker_shared_page.mapWorkerWriter(page_fd);
     defer page.deinit();
-    page.initializeCrashDefault();
 
     // A memfd holding a parseable `memory.events.local` stands in for the
     // cgroup file: the poll waits on it for POLLPRI, which a regular file
@@ -339,9 +337,8 @@ test "worker sentinel memory stop path works through command fd" {
 
     const metrics_fd = try worker_shared_page.createMemfd("collo-sentinel-stop-test");
     defer std.posix.close(metrics_fd);
-    var metrics = try worker_shared_page.mapReadWrite(metrics_fd);
+    var metrics = try worker_shared_page.mapWorkerWriter(metrics_fd);
     defer metrics.deinit();
-    metrics.initializeCrashDefault();
 
     var vm = try bindings.Vm.createDefault();
     defer vm.deinit();

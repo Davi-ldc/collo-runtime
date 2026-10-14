@@ -1,6 +1,6 @@
 // AbortController and AbortSignal: their host functions, the AbortController cell, and JSColloAbortSignal's
 // implementation, including the DOM standard's signal abort. VM thread only. The ownership and locking rules of the
-// signal's lists are in abort.h.
+// signal's lists are in abort.h; onabort is an event handler record in the signal's listener list (event.h).
 
 #include "host_functions/webapi/events/abort.h"
 
@@ -34,14 +34,15 @@ namespace {
     using WTF::String;
     using namespace JSC;
 
-    // Owns one signal, created with the controller and never replaced.
-    class JSColloAbortController final : public JSC::JSDestructibleObject {
-        using Base = JSC::JSDestructibleObject;
+    // Owns one signal, created with the controller and never replaced. Its only field is a WriteBarrier, so the cell
+    // needs no destructor and lives in the heap's plain cell space.
+    class JSColloAbortController final : public JSC::JSNonFinalObject {
+        using Base = JSC::JSNonFinalObject;
 
     public:
         template <typename CellType, JSC::SubspaceAccess> static JSC::CompleteSubspace* subspaceFor(JSC::VM& vm)
         {
-            return &vm.destructibleObjectSpace();
+            return &vm.cellSpace();
         }
 
         static JSC::Structure* createStructure(JSC::VM& vm, JSC::JSGlobalObject* global_object, JSValue prototype)
@@ -59,11 +60,6 @@ namespace {
             return object;
         }
 
-        static void destroy(JSC::JSCell* cell)
-        {
-            static_cast<JSColloAbortController*>(cell)->~JSColloAbortController();
-        }
-
         DECLARE_INFO;
         DECLARE_VISIT_CHILDREN;
 
@@ -74,8 +70,6 @@ namespace {
             : Base(vm, structure)
         {
         }
-
-        ~JSColloAbortController() = default;
 
         void finishCreation(JSC::VM& vm, Collo::GlobalObject* global_object)
         {
@@ -162,19 +156,15 @@ namespace {
         return static_cast<uint32_t>(delay);
     }
 
+    // The timer AbortSignal.timeout schedules calls this with the signal as its one argument.
     JSC_DEFINE_HOST_FUNCTION(
         abortSignalTimeoutCallback, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
     {
         auto& vm = global_object->vm();
         auto scope = DECLARE_THROW_SCOPE(vm);
-        auto* callee = call_frame->jsCallee();
-        auto signal_value = callee->get(global_object, JSC::Identifier::fromString(vm, "__colloAbortSignal"_s));
-        RETURN_IF_EXCEPTION(scope, {});
-        auto* signal = webApiAbortSignalFromValue(signal_value);
+        auto* signal = webApiAbortSignalFromValue(call_frame->argument(0));
         if (!signal)
             return JSValue::encode(JSC::jsUndefined());
-        // The timer has fired, so the abort below must not try to cancel it.
-        signal->clearTimeoutTimerId();
         signal->signalAbort(vm, global_object, createDOMException(global_object, DOMExceptionCode::TimeoutError));
         RETURN_IF_EXCEPTION(scope, {});
         return JSValue::encode(JSC::jsUndefined());
@@ -280,28 +270,18 @@ namespace {
         auto* callback = JSC::JSFunction::create(vm, global_object, 0, "AbortSignal timeout"_s,
             abortSignalTimeoutCallback, JSC::ImplementationVisibility::Public);
         RELEASE_ASSERT(callback);
-        // The timer retains only the callback, so the signal rides on it as a property and lives until the timer
-        // fires or is cancelled.
-        callback->putDirect(vm, JSC::Identifier::fromString(vm, "__colloAbortSignal"_s), signal,
-            static_cast<unsigned>(JSC::PropertyAttribute::DontEnum));
         Runtime::ActiveRequestRuntime runtime { owner_result.owner, runtime_handle, exec_ctx };
-        // Node and Bun unref this timer so that it never keeps the process alive. The runtime has no unref bit and
-        // needs none: request finish cancels every pending timer of the request (cleanupRequestSubresources in
-        // worker/serve/response_finish.zig). Only this timer aborts a timeout signal, which has no controller and
-        // never becomes a dependent, so the timer holds the callback, the signal and a max_timers_per_worker slot
-        // until it fires or its request finishes. The id recorded below serves only collectAbortSteps' cancel branch,
-        // which never runs.
+        // The timer retains the callback and its argument, the signal, until it fires or its request finishes:
+        // request finish cancels every pending timer of the request (cleanupRequestSubresources in
+        // worker/serve/response_finish.zig), so the runtime needs no unref bit, which Node and Bun use to keep such a
+        // timer from holding the process alive. Nothing else aborts a timeout signal, since it has no controller and
+        // never becomes a dependent, so the timer is never cancelled early and its id is not kept.
+        JSValue arguments[] = { signal };
         auto scheduled = Runtime::scheduleTimerValue(
-            global_object, scope, runtime, callback, nullptr, 0, timerDelayMsFromAbortDelay(*delay), false);
+            global_object, scope, runtime, callback, arguments, 1, timerDelayMsFromAbortDelay(*delay), false);
         RETURN_IF_EXCEPTION(scope, {});
         if (!scheduled)
             return {};
-        JSValue timer_id_value = JSValue::decode(*scheduled);
-        if (timer_id_value.isNumber()) {
-            double timer_id = timer_id_value.asNumber();
-            if (timer_id >= 1.0)
-                signal->setTimeoutTimerId(static_cast<uint64_t>(timer_id));
-        }
         return JSValue::encode(signal);
     }
 
@@ -336,8 +316,8 @@ namespace {
             if (++yielded > WebApiAbortSignalAnySourcesMax) {
                 failed = true;
                 JSC::throwException(global_object, scope,
-                    createDOMException(global_object, DOMExceptionCode::QuotaExceededError,
-                        "AbortSignal.any input limit exceeded"_s));
+                    createDOMException(
+                        global_object, DOMExceptionCode::QuotaExceededError, "AbortSignal.any input limit exceeded"_s));
                 return;
             }
             for (auto* seen : sources) {
@@ -372,7 +352,8 @@ namespace {
 
     COLLO_ABORT_SIGNAL_GETTER(abortSignalGetAborted, JSC::jsBoolean(signal->aborted()))
     COLLO_ABORT_SIGNAL_GETTER(abortSignalGetReason, signal->reason())
-    COLLO_ABORT_SIGNAL_GETTER(abortSignalGetOnAbort, signal->onabort())
+    COLLO_ABORT_SIGNAL_GETTER(
+        abortSignalGetOnAbort, webApiEventHandler({ signal, signal, &signal->eventTargetData() }, "abort"_s))
 
 #undef COLLO_ABORT_SIGNAL_GETTER
 
@@ -384,7 +365,10 @@ namespace {
         RETURN_IF_EXCEPTION(scope, {});
         if (!signal)
             return {};
-        if (!signal->setOnAbort(vm, global_object, scope, call_frame->argument(0)))
+        auto stored = setWebApiEventHandler(
+            global_object, scope, { signal, signal, &signal->eventTargetData() }, "abort"_s, call_frame->argument(0));
+        RETURN_IF_EXCEPTION(scope, {});
+        if (!stored)
             return {};
         return JSValue::encode(JSC::jsUndefined());
     }
@@ -434,7 +418,6 @@ void JSColloAbortSignal::finishCreation(JSC::VM& vm, Collo::GlobalObject* global
     Base::finishCreation(vm);
     ASSERT(inherits(info()));
     m_reason.set(vm, this, reason);
-    m_onabort.set(vm, this, JSC::jsNull());
     if (m_aborted && reason.isUndefined())
         m_reason.set(vm, this, createDOMException(global_object, DOMExceptionCode::AbortError));
 }
@@ -445,7 +428,6 @@ template <typename Visitor> void JSColloAbortSignal::visitChildrenImpl(JSC::JSCe
     ASSERT_GC_OBJECT_INHERITS(this_object, info());
     Base::visitChildren(this_object, visitor);
     appendWebApiUnknown(visitor, this_object->m_reason);
-    appendWebApiUnknown(visitor, this_object->m_onabort);
     this_object->m_event_target.visit(this_object, visitor);
     this_object->m_cleanup_records.visit(this_object, visitor);
     this_object->m_abort_algorithms.visit(this_object, visitor);
@@ -461,57 +443,6 @@ JSC::JSValue JSColloAbortSignal::normalizedAbortReason(JSC::JSGlobalObject* glob
     return createDOMException(global_object, DOMExceptionCode::AbortError);
 }
 
-static void removeAbortAttributeHandler(JSColloAbortSignal* signal, JSC::JSValue callback)
-{
-    auto& data = signal->eventTargetData();
-    const auto& listeners = data.listeners();
-    for (size_t index = 0; index < listeners.size(); index++) {
-        const auto& listener = listeners.at(index);
-        if (listener.removed || !listener.attribute_handler || listener.type != "abort"_s)
-            continue;
-        if (!JSC::JSValue::strictEqual(nullptr, listener.callback.get(), callback))
-            continue;
-        data.markRemoved(index);
-        break;
-    }
-    data.compactRemovedIfIdle(signal);
-}
-
-// The previous handler's record goes before the new one is added, so replacing the handler on a signal at the
-// listener cap succeeds; a new record that cannot be stored leaves onabort null.
-bool JSColloAbortSignal::setOnAbort(
-    JSC::VM& vm, JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSC::JSValue value)
-{
-    auto previous = m_onabort.get();
-    auto call_data = JSC::getCallData(value);
-    JSValue normalized = call_data.type == JSC::CallData::Type::None ? JSC::jsNull() : value;
-    if (!previous.isNull())
-        removeAbortAttributeHandler(this, previous);
-    m_onabort.set(vm, this, JSC::jsNull());
-    if (normalized.isNull())
-        return true;
-
-    WebApiEventListenerRecord record;
-    record.type = "abort"_s;
-    record.callback.setWithoutWriteBarrier(normalized);
-    record.order = m_event_target.allocateListenerOrder();
-    record.attribute_handler = true;
-    switch (m_event_target.appendListener(vm, this, WTF::move(record))) {
-    case WebApiEventTargetData::AppendResult::Appended:
-        m_onabort.set(vm, this, normalized);
-        return true;
-    case WebApiEventTargetData::AppendResult::LimitReached:
-        JSC::throwException(global_object, scope,
-            createDOMException(
-                global_object, DOMExceptionCode::QuotaExceededError, "AbortSignal listener limit exceeded"_s));
-        return false;
-    case WebApiEventTargetData::AppendResult::OutOfMemory:
-        JSC::throwOutOfMemoryError(global_object, scope);
-        return false;
-    }
-    return false;
-}
-
 void JSColloAbortSignal::collectAbortSteps(JSC::VM& vm, JSC::JSGlobalObject* global_object, JSC::JSValue reason,
     JSC::MarkedVector<JSColloAbortSignal*>& dispatch_targets)
 {
@@ -519,14 +450,6 @@ void JSColloAbortSignal::collectAbortSteps(JSC::VM& vm, JSC::JSGlobalObject* glo
         return;
     m_aborted = true;
     m_reason.set(vm, this, normalizedAbortReason(global_object, reason));
-    // FIXME: this branch never runs. Only its own timer aborts a timeout signal, which has no controller and never
-    // becomes a dependent, and that timer's callback clears the id first. Runtime::clearTimer would cancel only a
-    // timer of the currently active request and does nothing outside a request.
-    if (m_timeout_timer_id) {
-        uint64_t timer_id = m_timeout_timer_id;
-        m_timeout_timer_id = 0;
-        Runtime::clearTimer(global_object, timer_id);
-    }
     for (auto& source : m_source_signals) {
         if (auto* signal = source.signal.get())
             signal->removeDependentSignal(this);
@@ -566,7 +489,7 @@ void JSColloAbortSignal::signalAbort(JSC::VM& vm, JSC::JSGlobalObject* global_ob
     auto scope = DECLARE_THROW_SCOPE(vm);
     for (auto* signal : dispatch_targets) {
         // runInternalAbortAlgorithms clears every exception except a termination, which ends the walk.
-        signal->runInternalAbortAlgorithms(vm, global_object);
+        signal->runInternalAbortAlgorithms(vm);
         RETURN_IF_EXCEPTION(scope, void());
         auto* event = createWebApiEvent(global_object, "abort"_s);
         WebApiEventTargetHandle target { signal, signal, &signal->m_event_target };
@@ -625,39 +548,38 @@ void JSColloAbortSignal::removeEventTargetCleanupsForTarget(JSC::JSObject* targe
         this, [target](const EventTargetCleanup& cleanup) { return cleanupTargets(cleanup.target, target); });
 }
 
-bool JSColloAbortSignal::addInternalAbortAlgorithm(
-    JSC::VM& vm, JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSC::JSValue callback)
+bool JSColloAbortSignal::addInternalAbortAlgorithm(JSC::VM& vm, JSC::JSGlobalObject* global_object,
+    JSC::ThrowScope& scope, AbortAlgorithm algorithm, JSC::JSObject* context)
 {
-    ASSERT(JSC::getCallData(callback).type != JSC::CallData::Type::None);
-    for (auto& algorithm : m_abort_algorithms) {
-        if (!algorithm.removed && JSC::JSValue::strictEqual(nullptr, algorithm.callback.get(), callback))
+    ASSERT(algorithm);
+    ASSERT(context);
+    for (auto& entry : m_abort_algorithms) {
+        if (entry.algorithm == algorithm && entry.context.get() == context)
             return true;
     }
 
-    InternalAbortAlgorithm algorithm;
-    algorithm.callback.setWithoutWriteBarrier(callback);
-    if (!m_abort_algorithms.tryAppend(vm, this, WTF::move(algorithm))) {
+    // The list stores the entry under the cell lock and then barriers the signal (cell_edges.h), so the concurrent
+    // marker sees the context before it can scan the signal without it.
+    InternalAbortAlgorithm entry;
+    entry.algorithm = algorithm;
+    entry.context.setWithoutWriteBarrier(context);
+    if (!m_abort_algorithms.tryAppend(vm, this, WTF::move(entry))) {
         JSC::throwOutOfMemoryError(global_object, scope);
         return false;
     }
     return true;
 }
 
-void JSColloAbortSignal::removeInternalAbortAlgorithm(JSC::JSValue callback)
+void JSColloAbortSignal::removeInternalAbortAlgorithm(AbortAlgorithm algorithm, JSC::JSObject* context)
 {
-    if (m_dispatching_internal_abort_algorithms) {
-        for (auto& algorithm : m_abort_algorithms) {
-            if (JSC::JSValue::strictEqual(nullptr, algorithm.callback.get(), callback))
-                algorithm.removed = true;
-        }
+    if (m_dispatching_internal_abort_algorithms)
         return;
-    }
-    m_abort_algorithms.removeIf(this, [callback](const InternalAbortAlgorithm& algorithm) {
-        return algorithm.removed || JSC::JSValue::strictEqual(nullptr, algorithm.callback.get(), callback);
+    m_abort_algorithms.removeIf(this, [algorithm, context](const InternalAbortAlgorithm& entry) {
+        return entry.algorithm == algorithm && entry.context.get() == context;
     });
 }
 
-void JSColloAbortSignal::runInternalAbortAlgorithms(JSC::VM& vm, JSC::JSGlobalObject* global_object)
+void JSColloAbortSignal::runInternalAbortAlgorithms(JSC::VM& vm)
 {
     if (m_abort_algorithms.isEmpty())
         return;
@@ -667,26 +589,21 @@ void JSColloAbortSignal::runInternalAbortAlgorithms(JSC::VM& vm, JSC::JSGlobalOb
         m_abort_algorithms.clear(this);
     });
 
-    // Only the algorithms present when the run starts are invoked; one added during the run is dropped with the list
-    // afterwards. That matches the DOM standard, where adding an algorithm to an aborted signal does nothing. The loop
-    // indexes the list on every iteration because a re-entrant append may move its storage. During the run entries
-    // only join the end, since a removal only marks them, so indices below algorithm_count stay valid.
+    // The list stays in the signal until the run ends, so visitChildren keeps tracing every context, and the run
+    // allocates nothing that could fail halfway through an abort. Nothing shrinks or reorders it meanwhile: a removal
+    // waits for the clear above, and an append, which never runs, only adds entries past algorithm_count. The loop
+    // indexes the list on every iteration and copies the entry out before the call, because an append may move the
+    // storage while the algorithm runs.
     const size_t algorithm_count = m_abort_algorithms.size();
     for (size_t index = 0; index < algorithm_count; index++) {
-        auto& algorithm = m_abort_algorithms.at(index);
-        if (algorithm.removed)
-            continue;
-        JSValue callback = algorithm.callback.get();
-        auto* callback_object = callback.isObject() ? callback.getObject() : nullptr;
-        if (!callback_object)
-            continue;
-        auto call_data = JSC::getCallData(callback_object);
-        if (call_data.type == JSC::CallData::Type::None)
+        const auto& entry = m_abort_algorithms.at(index);
+        AbortAlgorithm algorithm = entry.algorithm;
+        JSC::JSObject* context = entry.context.get();
+        if (!context)
             continue;
 
         auto scope = DECLARE_TOP_EXCEPTION_SCOPE(vm);
-        JSC::MarkedArgumentBuffer arguments;
-        JSC::call(global_object, callback_object, call_data, this, arguments);
+        algorithm(context);
         if (scope.exception() && !scope.clearExceptionExceptTermination())
             return;
     }

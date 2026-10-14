@@ -452,6 +452,109 @@ describe("TextDecoder", () => {
     }
   });
 
+  test("streaming UTF-8 decodes a carried prefix as soon as the next byte makes it invalid", () => {
+    // E0 needs a second byte in A0..BF and F4 one in 80..8F, so E0 80 and F4 90 can never become valid sequences.
+    const replacement = new TextDecoder();
+    assert.equal(replacement.decode(new Uint8Array([0xe0]), { stream: true }), "");
+    assert.equal(replacement.decode(new Uint8Array([0x80]), { stream: true }), "��");
+    assert.equal(replacement.decode(), "");
+
+    const fatal = new TextDecoder("utf-8", { fatal: true });
+    assert.equal(fatal.decode(new Uint8Array([0xf4]), { stream: true }), "");
+    assert.throws(() => fatal.decode(new Uint8Array([0x90]), { stream: true }), TypeError);
+    // The throw reset the decoder, so the next call starts a new stream.
+    assert.equal(fatal.decode(new Uint8Array([0xef, 0xbb, 0xbf, 0x41])), "A");
+  });
+
+  test("streaming UTF-16 split anywhere equals the whole-buffer decode", () => {
+    // A BMP character in each UTF-8 length class, a surrogate pair, a lone lead and a lone trail surrogate.
+    const units = [0x61, 0xe9, 0x4e2d, 0xd83d, 0xde00, 0xd800, 0x41, 0xdc00, 0x7a];
+    const expected = "aé中😀�A�z";
+    for (const [label, bigEndian] of [["utf-16le", false], ["utf-16be", true]]) {
+      const input = new Uint8Array(units.flatMap(unit => bigEndian ? [unit >> 8, unit & 0xff] : [unit & 0xff, unit >> 8]));
+      assert.equal(new TextDecoder(label).decode(input), expected, `${label} whole buffer`);
+
+      const streamed = new TextDecoder(label);
+      let out = "";
+      for (let i = 0; i < input.length; i++)
+        out += streamed.decode(input.subarray(i, i + 1), { stream: true });
+      out += streamed.decode();
+      assert.equal(out, expected, `${label} byte by byte`);
+
+      for (let split = 0; split <= input.length; split++) {
+        const decoder = new TextDecoder(label);
+        const head = decoder.decode(input.subarray(0, split), { stream: true });
+        assert.equal(head + decoder.decode(input.subarray(split)), expected, `${label} split at ${split}`);
+      }
+    }
+  });
+
+  test("a UTF-16 flush turns a cut-off code unit, a waiting lead surrogate or both into one U+FFFD", () => {
+    for (const [label, bigEndian] of [["utf-16le", false], ["utf-16be", true]]) {
+      const a = bigEndian ? [0x00, 0x61] : [0x61, 0x00];
+      const lead = bigEndian ? [0xd8, 0x3d] : [0x3d, 0xd8];
+      assert.equal(new TextDecoder(label).decode(new Uint8Array([0x41])), "�", `${label} lone byte`);
+      assert.equal(new TextDecoder(label).decode(new Uint8Array([...a, 0x41])), "a�", `${label} trailing byte`);
+      assert.equal(new TextDecoder(label).decode(new Uint8Array([...a, ...lead])), "a�", `${label} lead`);
+      assert.equal(new TextDecoder(label).decode(new Uint8Array([...a, ...lead, 0x41])), "a�", `${label} both`);
+
+      const streaming = new TextDecoder(label);
+      assert.equal(streaming.decode(new Uint8Array([...a, ...lead, 0x41]), { stream: true }), "a");
+      assert.equal(streaming.decode(), "�", `${label} flush after streaming`);
+
+      assert.throws(() => new TextDecoder(label, { fatal: true }).decode(new Uint8Array([...a, 0x41])), TypeError);
+    }
+  });
+
+  test("a UTF-16 BOM split across streaming calls is dropped once, and only at the stream's start", () => {
+    for (const [label, bom, a] of [["utf-16le", [0xff, 0xfe], [0x41, 0x00]], ["utf-16be", [0xfe, 0xff], [0x00, 0x41]]]) {
+      const split = new TextDecoder(label);
+      assert.equal(split.decode(new Uint8Array([bom[0]]), { stream: true }), "", `${label} first BOM byte`);
+      assert.equal(split.decode(new Uint8Array([bom[1]]), { stream: true }), "", `${label} second BOM byte`);
+      assert.equal(split.decode(new Uint8Array(a), { stream: true }), "A", `${label} after the BOM`);
+      assert.equal(split.decode(new Uint8Array([...bom, ...a])), "\u{feff}A", `${label} BOM inside the stream`);
+
+      const carried = new TextDecoder(label);
+      assert.equal(carried.decode(new Uint8Array([bom[0]]), { stream: true }), "");
+      assert.equal(carried.decode(new Uint8Array([bom[1], ...a])), "A", `${label} BOM completed by the next chunk`);
+
+      const kept = new TextDecoder(label, { ignoreBOM: true });
+      assert.equal(kept.decode(new Uint8Array([bom[0]]), { stream: true }), "");
+      assert.equal(kept.decode(new Uint8Array([bom[1], ...a])), "\u{feff}A", `${label} ignoreBOM`);
+    }
+  });
+
+  test("a fatal UTF-16 decoder throws when a lead surrogate carried from an earlier call meets no trail", () => {
+    for (const [label, bigEndian] of [["utf-16le", false], ["utf-16be", true]]) {
+      const unit = (value) => bigEndian ? [value >> 8, value & 0xff] : [value & 0xff, value >> 8];
+      const fatal = new TextDecoder(label, { fatal: true });
+      assert.equal(fatal.decode(new Uint8Array([...unit(0x41), ...unit(0xd83d)]), { stream: true }), "A");
+      assert.throws(() => fatal.decode(new Uint8Array(unit(0x42)), { stream: true }), TypeError, `${label} lone lead`);
+
+      const paired = new TextDecoder(label, { fatal: true });
+      assert.equal(paired.decode(new Uint8Array(unit(0xd83d)), { stream: true }), "");
+      assert.equal(paired.decode(new Uint8Array(unit(0xde00))), "\u{1f600}", `${label} pair across calls`);
+    }
+  });
+
+  test("the constructors read their options before they reject an unknown label", () => {
+    for (const Constructor of [TextDecoder, TextDecoderStream]) {
+      const read = [];
+      const options = {
+        get fatal() {
+          read.push("fatal");
+          return false;
+        },
+        get ignoreBOM() {
+          read.push("ignoreBOM");
+          return false;
+        },
+      };
+      assert.throws(() => new Constructor("no-such-label", options), RangeError);
+      assert.deepEqual(read, ["fatal", "ignoreBOM"], Constructor.name);
+    }
+  });
+
   test("legacy single-byte encodings match Bun/WPT behavior", () => {
     assert.equal(new TextDecoder("latin1").decode(new Uint8Array([0x80, 0x81, 0x82, 0x83])), "€\u0081‚ƒ");
     assert.equal(new TextDecoder("ibm866").decode(new Uint8Array([0x8f, 0xe0, 0xa8, 0xa2, 0xa5, 0xe2])), "Привет");
@@ -544,13 +647,9 @@ describe("TextDecoder", () => {
     assert.throws(() => new TextDecoder("utf-16le", { fatal: true }).decode(new Uint8Array([0x00])), TypeError);
     assert.equal(new TextDecoder("utf-16le").decode(new Uint8Array([0x00])), "\ufffd");
 
-    // UTF-16LE fast path equivalence (regression guard for the simdutf
-    // validate+memcpy fast path that bypasses ICU for valid LE input):
-    // - a valid surrogate pair (astral code point) must round-trip,
-    // - an unpaired surrogate must fall back to ICU and become U+FFFD (the fast
-    //   path must reject it via validate_utf16le, not memcpy garbage),
-    // - a larger buffer exercises the bulk memcpy,
-    // - a misaligned (odd byte offset) source must decode identically.
+    // A chunk of whole, well-formed units takes the copying fast path and anything else the unit-by-unit decoder, with
+    // the same output: a surrogate pair round-trips, an unpaired surrogate fails validation and becomes U+FFFD, a
+    // larger buffer takes the bulk copy, and a source at an odd byte offset decodes identically.
     assert.equal(new TextDecoder("utf-16le").decode(new Uint8Array([0x3d, 0xd8, 0x00, 0xde])), "\ud83d\ude00");
     assert.equal(new TextDecoder("utf-16le").decode(new Uint8Array([0x00, 0xd8, 0x41, 0x00])), "\ufffdA");
     assert.equal(new TextDecoder("utf-16le", { fatal: true })
@@ -566,7 +665,7 @@ describe("TextDecoder", () => {
     assert.equal(new TextDecoder("utf-16le").decode(new Uint8Array(new ArrayBuffer(4), 1, 2)), "\u0000");
     const oddSurrogate = new Uint8Array([0x00, 0x00, 0xd8, 0x41, 0x00]); // lone surrogate at offset 1
     assert.equal(new TextDecoder("utf-16le").decode(new Uint8Array(oddSurrogate.buffer, 1, 4)), "�A");
-    // A BOM ahead of input the fast path declines is still dropped once, by the ICU path.
+    // A BOM ahead of input the fast path declines is still dropped once, by the unit-by-unit decoder.
     assert.equal(new TextDecoder("utf-16le").decode(new Uint8Array([0xff, 0xfe, 0x00, 0xd8, 0x41, 0x00])), "�A");
 
     const streaming = new TextDecoder("utf-16le");
@@ -635,147 +734,72 @@ describe("Encoding streams", () => {
     assert.deepEqual(await reader.read(), { value: undefined, done: true });
   });
 
-  test("TextDecoderStream rejects oversized pending input beyond the native queue limit", async () => {
-    const stream = new TextDecoderStream();
-    const writer = stream.writable.getWriter();
+  test("codec streams take chunks larger than the old queue limits and deliver them whole", async () => {
+    const bigBytes = new Uint8Array(4 * 1024 * 1024 + 1).fill(65);
+    const decoder = new TextDecoderStream();
+    const decoderWriter = decoder.writable.getWriter();
+    const decoderReader = decoder.readable.getReader();
+    const decoded = decoderReader.read();
+    const decoderWrite = decoderWriter.write(bigBytes);
+    assert.equal((await decoded).value.length, bigBytes.length);
+    await decoderWrite;
 
-    const writeError = await assertPromiseRejects(
-      writer.write(new Uint8Array(4 * 1024 * 1024 + 1)),
-      DOMException,
-      "TextDecoderStream pending input limit",
-    );
-    assert.equal(writeError.name, "QuotaExceededError");
-
-    const reader = stream.readable.getReader();
-    const readError = await assertPromiseRejects(
-      reader.closed,
-      DOMException,
-      "TextDecoderStream readable after input limit",
-    );
-    assert.equal(readError.name, "QuotaExceededError");
+    const bigText = "\u0800".repeat(Math.floor((4 * 1024 * 1024) / 3) + 1);
+    const encoder = new TextEncoderStream();
+    const encoderWriter = encoder.writable.getWriter();
+    const encoderReader = encoder.readable.getReader();
+    const encoded = encoderReader.read();
+    const encoderWrite = encoderWriter.write(bigText);
+    assert.equal((await encoded).value.length, bigText.length * 3);
+    await encoderWrite;
   });
 
-  test("TextDecoderStream rejects oversized resizable input capacity", async () => {
-    if (typeof ArrayBuffer.prototype.resize !== "function")
-      return;
-
-    const stream = new TextDecoderStream();
-    const writer = stream.writable.getWriter();
-    const buffer = new ArrayBuffer(1, { maxByteLength: 4 * 1024 * 1024 + 1 });
-    const view = new Uint8Array(buffer);
-
-    const writeError = await assertPromiseRejects(
-      writer.write(view),
-      DOMException,
-      "TextDecoderStream resizable input capacity limit",
-    );
-    assert.equal(writeError.name, "QuotaExceededError");
-
-    const reader = stream.readable.getReader();
-    const readError = await assertPromiseRejects(
-      reader.closed,
-      DOMException,
-      "TextDecoderStream readable after resizable input capacity limit",
-    );
-    assert.equal(readError.name, "QuotaExceededError");
-  });
-
-  test("TextDecoderStream charges out-of-bounds resizable input capacity", async () => {
-    if (typeof ArrayBuffer.prototype.resize !== "function")
-      return;
-
-    const stream = new TextDecoderStream();
-    const writer = stream.writable.getWriter();
-    const buffer = new ArrayBuffer(2, { maxByteLength: 4 * 1024 * 1024 + 1 });
-    const view = new Uint8Array(buffer, 1, 1);
-    buffer.resize(0);
-
-    const writeError = await assertPromiseRejects(
-      writer.write(view),
-      DOMException,
-      "TextDecoderStream out-of-bounds resizable input capacity limit",
-    );
-    assert.equal(writeError.name, "QuotaExceededError");
-
-    const reader = stream.readable.getReader();
-    const readError = await assertPromiseRejects(
-      reader.closed,
-      DOMException,
-      "TextDecoderStream readable after out-of-bounds resizable input capacity limit",
-    );
-    assert.equal(readError.name, "QuotaExceededError");
-  });
-
-  test("TextEncoderStream rejects oversized pending input beyond the native queue limit", async () => {
-    const stream = new TextEncoderStream();
-    const writer = stream.writable.getWriter();
-
-    const writeError = await assertPromiseRejects(
-      writer.write("x".repeat(2 * 1024 * 1024 + 1)),
-      DOMException,
-      "TextEncoderStream pending input limit",
-    );
-    assert.equal(writeError.name, "QuotaExceededError");
-
-    const reader = stream.readable.getReader();
-    const readError = await assertPromiseRejects(
-      reader.closed,
-      DOMException,
-      "TextEncoderStream readable after input limit",
-    );
-    assert.equal(readError.name, "QuotaExceededError");
-  });
-
-  test("TextDecoderStream rejects queued output beyond the native queue limit", async () => {
-    const stream = new TextDecoderStream();
-    const writer = stream.writable.getWriter();
-    const reader = stream.readable.getReader();
-
-    const read = reader.read();
-    await writer.write(new Uint8Array([0xe2]));
-    reader.releaseLock();
-    await assertPromiseRejects(read, TypeError, "TextDecoderStream released pending read");
-
-    const writeError = await assertPromiseRejects(
-      writer.write(new Uint8Array(2 * 1024 * 1024 + 1).fill(65)),
-      DOMException,
-      "TextDecoderStream pending output limit",
-    );
-    assert.equal(writeError.name, "QuotaExceededError");
-
-    const errorReader = stream.readable.getReader();
-    const readError = await assertPromiseRejects(
-      errorReader.closed,
-      DOMException,
-      "TextDecoderStream readable after pending output limit",
-    );
-    assert.equal(readError.name, "QuotaExceededError");
-  });
-
-  test("TextEncoderStream rejects queued output beyond the native queue limit", async () => {
+  test("a codec stream write settles only once its output is read", async () => {
     const stream = new TextEncoderStream();
     const writer = stream.writable.getWriter();
     const reader = stream.readable.getReader();
+    let settled = false;
+    const write = writer.write("abc").then(() => { settled = true; });
+    for (let turn = 0; turn < 8; turn++)
+      await Promise.resolve();
+    assert.equal(settled, false);
+    assert.deepEqual(bytes((await reader.read()).value), [97, 98, 99]);
+    await write;
+    assert.equal(settled, true);
+  });
 
+  // The cancel errors the writable side with its reason while the transformer still holds the chunk, so the stream
+  // releases the transformer once the conversion returns and rejects the write with the writable side's error.
+  test("a TextEncoderStream chunk whose conversion cancels the stream rejects its write with the cancel reason", async () => {
+    const stream = new TextEncoderStream();
+    const writer = stream.writable.getWriter();
+    const reader = stream.readable.getReader();
+    // A pending read lifts the readable side's backpressure, so the write reaches the transformer at once.
     const read = reader.read();
-    await writer.write("");
-    reader.releaseLock();
-    await assertPromiseRejects(read, TypeError, "TextEncoderStream released pending read");
-
-    const writeError = await assertPromiseRejects(
-      writer.write("\u0800".repeat(Math.floor((4 * 1024 * 1024) / 3) + 1)),
-      DOMException,
-      "TextEncoderStream pending output limit",
-    );
-    assert.equal(writeError.name, "QuotaExceededError");
-
-    const errorReader = stream.readable.getReader();
-    const readError = await assertPromiseRejects(
-      errorReader.closed,
-      DOMException,
-      "TextEncoderStream readable after pending output limit",
-    );
-    assert.equal(readError.name, "QuotaExceededError");
+    const reason = new Error("canceled during conversion");
+    let canceled = null;
+    const chunk = {
+      toString() {
+        canceled = reader.cancel(reason);
+        return "abc";
+      },
+    };
+    let writeError = null;
+    try {
+      await writer.write(chunk);
+    } catch (error) {
+      writeError = error;
+    }
+    assert.equal(writeError, reason);
+    await canceled;
+    assert.deepEqual(await read, { value: undefined, done: true });
+    let closedError = null;
+    try {
+      await writer.closed;
+    } catch (error) {
+      closedError = error;
+    }
+    assert.equal(closedError, reason);
   });
 
   test("TextDecoderStream handles resizable buffer chunks by current bounds", async () => {

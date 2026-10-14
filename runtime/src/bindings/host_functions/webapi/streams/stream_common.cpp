@@ -1,408 +1,53 @@
-// Helpers every stream class shares: receiver checks, the per-realm property
-// identifiers, buffer copies and transfers, promise plumbing, and the native
-// source that serves a byte buffer as a readable stream. Runs on the VM thread.
-//
-// A native callback reaches its cell through a DontEnum property of its
-// JSFunction, never through a captured pointer, so the collector traces the
-// edge. The identifiers are private names cached in the main realm's
-// ColloWebApiCache, which destroyVmContents clears.
-#include "host_functions/webapi/streams/pipe_transform_stream_private.h"
+// Helpers every stream family shares: interface installation, buffer copies and transfers, promise and read-result
+// plumbing, Web IDL argument conversion, the clone budget, the bytes of one chunk, and the native source that serves a
+// byte buffer as a readable stream. Runs on the VM thread.
+
+#include "host_functions/webapi/streams/stream_common_private.h"
 
 #include "host_functions/webapi/dom/dom_exception.h"
-
-#include <JavaScriptCore/PrivateName.h>
+#include "host_functions/webapi/limits.h"
 
 namespace Collo::HostFunctions {
 
-static size_t retainedArrayBufferMemoryCost(JSC::ArrayBuffer* buffer)
-{
-    if (!buffer || buffer->isDetached())
-        return 0;
-    if (auto max_byte_length = buffer->maxByteLength())
-        return *max_byte_length;
-    return buffer->byteLength();
-}
+namespace {
 
-size_t streamChunkMemoryCost(JSValue value)
-{
-    if (auto* view = dynamicDowncast<JSC::JSArrayBufferView>(value)) {
-        if (view->isDetached())
-            return 0;
-        auto buffer = view->possiblySharedBuffer();
-        return retainedArrayBufferMemoryCost(buffer);
+    // Every stream interface's constructor called without new, and every construction of an interface without a public
+    // constructor, ends here; the callee's name says which interface it was.
+    JSC_DEFINE_HOST_FUNCTION(
+        streamConstructorRequiresNew, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
+    {
+        auto& vm = global_object->vm();
+        auto scope = DECLARE_THROW_SCOPE(vm);
+        auto name = uncheckedDowncast<JSC::JSFunction>(call_frame->jsCallee())->name(vm);
+        return JSC::throwVMTypeError(global_object, scope, WTF::makeString(name, " constructor requires 'new'"_s));
     }
-    if (auto* array_buffer = dynamicDowncast<JSC::JSArrayBuffer>(value)) {
-        auto* buffer = array_buffer->impl();
-        return retainedArrayBufferMemoryCost(buffer);
+
+    JSC_DEFINE_HOST_FUNCTION(
+        streamConstructorNotPublic, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
+    {
+        auto& vm = global_object->vm();
+        auto scope = DECLARE_THROW_SCOPE(vm);
+        auto name = uncheckedDowncast<JSC::JSFunction>(call_frame->jsCallee())->name(vm);
+        return JSC::throwVMTypeError(global_object, scope, WTF::makeString(name, " constructor is not public"_s));
     }
-    if (auto* string = dynamicDowncast<JSC::JSString>(value)) {
-        size_t length = string->length();
-        if (length > std::numeric_limits<size_t>::max() / sizeof(char16_t))
-            return std::numeric_limits<size_t>::max();
-        return length * sizeof(char16_t);
-    }
-    return 1;
-}
 
-JSC::JSObject* createStreamQueueLimitExceededError(JSC::JSGlobalObject* global_object, WTF::ASCIILiteral message)
-{
-    return createDOMException(global_object, DOMExceptionCode::QuotaExceededError, WTF::String(message));
-}
+} // namespace
 
-JSColloReadableStream* requireReadableStream(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSValue value)
+JSC::JSFunction* installStreamInterface(Collo::GlobalObject* global_object, JSC::VM& vm, WTF::ASCIILiteral name,
+    unsigned length, JSC::JSObject* prototype, JSC::NativeFunction construct)
 {
-    if (auto* stream = dynamicDowncast<JSColloReadableStream>(value))
-        return stream;
-    JSC::throwVMTypeError(global_object, scope, "ReadableStream method called on incompatible receiver"_s);
-    return nullptr;
-}
-
-JSColloReadableStreamDefaultReader* requireReadableStreamDefaultReader(
-    JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSValue value)
-{
-    if (auto* reader = dynamicDowncast<JSColloReadableStreamDefaultReader>(value))
-        return reader;
-    JSC::throwVMTypeError(global_object, scope, "ReadableStreamDefaultReader method called on incompatible receiver"_s);
-    return nullptr;
-}
-
-JSColloReadableStreamDefaultController* requireReadableStreamDefaultController(
-    JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSValue value)
-{
-    if (auto* controller = dynamicDowncast<JSColloReadableStreamDefaultController>(value))
-        return controller;
-    JSC::throwVMTypeError(
-        global_object, scope, "ReadableStreamDefaultController method called on incompatible receiver"_s);
-    return nullptr;
-}
-
-JSColloReadableStreamBYOBReader* requireReadableStreamBYOBReader(
-    JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSValue value)
-{
-    if (auto* reader = dynamicDowncast<JSColloReadableStreamBYOBReader>(value))
-        return reader;
-    JSC::throwVMTypeError(global_object, scope, "ReadableStreamBYOBReader method called on incompatible receiver"_s);
-    return nullptr;
-}
-
-JSColloReadableStreamBYOBRequest* requireReadableStreamBYOBRequest(
-    JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSValue value)
-{
-    if (auto* request = dynamicDowncast<JSColloReadableStreamBYOBRequest>(value))
-        return request;
-    JSC::throwVMTypeError(global_object, scope, "ReadableStreamBYOBRequest method called on incompatible receiver"_s);
-    return nullptr;
-}
-
-JSColloReadableByteStreamController* requireReadableByteStreamController(
-    JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSValue value)
-{
-    if (auto* controller = dynamicDowncast<JSColloReadableByteStreamController>(value))
-        return controller;
-    JSC::throwVMTypeError(
-        global_object, scope, "ReadableByteStreamController method called on incompatible receiver"_s);
-    return nullptr;
-}
-
-JSColloReadableStreamAsyncIterator* requireReadableStreamAsyncIterator(
-    JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSValue value)
-{
-    if (auto* iterator = dynamicDowncast<JSColloReadableStreamAsyncIterator>(value))
-        return iterator;
-    JSC::throwVMTypeError(
-        global_object, scope, "ReadableStream async iterator method called on incompatible receiver"_s);
-    return nullptr;
-}
-
-JSColloWritableStream* requireWritableStream(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSValue value)
-{
-    if (auto* stream = dynamicDowncast<JSColloWritableStream>(value))
-        return stream;
-    JSC::throwVMTypeError(global_object, scope, "WritableStream method called on incompatible receiver"_s);
-    return nullptr;
-}
-
-JSColloWritableStreamDefaultWriter* requireWritableStreamDefaultWriter(
-    JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSValue value)
-{
-    if (auto* writer = dynamicDowncast<JSColloWritableStreamDefaultWriter>(value))
-        return writer;
-    JSC::throwVMTypeError(global_object, scope, "WritableStreamDefaultWriter method called on incompatible receiver"_s);
-    return nullptr;
-}
-
-JSColloWritableStreamDefaultController* requireWritableStreamDefaultController(
-    JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSValue value)
-{
-    if (auto* controller = dynamicDowncast<JSColloWritableStreamDefaultController>(value))
-        return controller;
-    JSC::throwVMTypeError(
-        global_object, scope, "WritableStreamDefaultController method called on incompatible receiver"_s);
-    return nullptr;
-}
-
-JSColloTransformStream* requireTransformStream(
-    JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSValue value)
-{
-    if (auto* stream = dynamicDowncast<JSColloTransformStream>(value))
-        return stream;
-    JSC::throwVMTypeError(global_object, scope, "TransformStream method called on incompatible receiver"_s);
-    return nullptr;
-}
-
-JSColloTransformStreamDefaultController* requireTransformStreamDefaultController(
-    JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSValue value)
-{
-    if (auto* controller = dynamicDowncast<JSColloTransformStreamDefaultController>(value))
-        return controller;
-    JSC::throwVMTypeError(
-        global_object, scope, "TransformStreamDefaultController method called on incompatible receiver"_s);
-    return nullptr;
-}
-
-// Each identifier is a private name, so script can neither read nor enumerate the property, as it could on a read's
-// promise when these were strings. One name serves every realm of the VM, kept in the main realm's cache, so a stream
-// one realm's code linked is found again from any realm.
-const JSC::Identifier& cachedReadableStreamIdentifier(
-    JSC::JSGlobalObject* global_object, JSC::Identifier ColloWebApiCache::* field, WTF::ASCIILiteral name)
-{
-    auto& cache = uncheckedDowncast<Collo::GlobalObject>(global_object)->owner().main_realm->webapi_cache;
-    auto& identifier = cache.*field;
-    if (identifier.isNull())
-        identifier = JSC::Identifier::fromUid(JSC::PrivateName(JSC::PrivateName::PrivateSymbol, WTF::String(name)));
-    return identifier;
-}
-
-const JSC::Identifier& readableStreamIdentifier(JSC::JSGlobalObject* global_object)
-{
-    return cachedReadableStreamIdentifier(
-        global_object, &ColloWebApiCache::readable_stream_identifier, "__colloReadableStream"_s);
-}
-
-const JSC::Identifier& readableStreamOwnerIdentifier(JSC::JSGlobalObject* global_object)
-{
-    return cachedReadableStreamIdentifier(
-        global_object, &ColloWebApiCache::readable_stream_owner_identifier, "__colloReadableStreamOwner"_s);
-}
-
-const JSC::Identifier& readableStreamIteratorIdentifier(JSC::JSGlobalObject* global_object)
-{
-    return cachedReadableStreamIdentifier(
-        global_object, &ColloWebApiCache::readable_stream_iterator_identifier, "__colloReadableStreamIterator"_s);
-}
-
-const JSC::Identifier& readableStreamIteratorReturnValueIdentifier(JSC::JSGlobalObject* global_object)
-{
-    return cachedReadableStreamIdentifier(global_object,
-        &ColloWebApiCache::readable_stream_iterator_return_value_identifier,
-        "__colloReadableStreamIteratorReturnValue"_s);
-}
-
-const JSC::Identifier& readableStreamIteratorReturnPendingIdentifier(JSC::JSGlobalObject* global_object)
-{
-    return cachedReadableStreamIdentifier(global_object,
-        &ColloWebApiCache::readable_stream_iterator_return_pending_identifier,
-        "__colloReadableStreamIteratorReturnPending"_s);
-}
-
-const JSC::Identifier& readableStreamControllerIdentifier(JSC::JSGlobalObject* global_object)
-{
-    return cachedReadableStreamIdentifier(
-        global_object, &ColloWebApiCache::readable_stream_controller_identifier, "__colloController"_s);
-}
-
-const JSC::Identifier& readableStreamTeeStateIdentifier(JSC::JSGlobalObject* global_object)
-{
-    return cachedReadableStreamIdentifier(
-        global_object, &ColloWebApiCache::readable_stream_tee_state_identifier, "__colloReadableStreamTeeState"_s);
-}
-
-const JSC::Identifier& teeOriginalIdentifier(JSC::JSGlobalObject* global_object)
-{
-    return cachedReadableStreamIdentifier(
-        global_object, &ColloWebApiCache::readable_stream_tee_original_identifier, "__colloOriginal"_s);
-}
-
-const JSC::Identifier& teeBranchAIdentifier(JSC::JSGlobalObject* global_object)
-{
-    return cachedReadableStreamIdentifier(
-        global_object, &ColloWebApiCache::readable_stream_tee_branch_a_identifier, "__colloBranchA"_s);
-}
-
-const JSC::Identifier& teeBranchBIdentifier(JSC::JSGlobalObject* global_object)
-{
-    return cachedReadableStreamIdentifier(
-        global_object, &ColloWebApiCache::readable_stream_tee_branch_b_identifier, "__colloBranchB"_s);
-}
-
-const JSC::Identifier& teeReadingIdentifier(JSC::JSGlobalObject* global_object)
-{
-    return cachedReadableStreamIdentifier(
-        global_object, &ColloWebApiCache::readable_stream_tee_reading_identifier, "__colloReading"_s);
-}
-
-const JSC::Identifier& teeFulfilledIdentifier(JSC::JSGlobalObject* global_object)
-{
-    return cachedReadableStreamIdentifier(
-        global_object, &ColloWebApiCache::readable_stream_tee_fulfilled_identifier, "__colloTeeFulfilled"_s);
-}
-
-const JSC::Identifier& teeRejectedIdentifier(JSC::JSGlobalObject* global_object)
-{
-    return cachedReadableStreamIdentifier(
-        global_object, &ColloWebApiCache::readable_stream_tee_rejected_identifier, "__colloTeeRejected"_s);
-}
-
-const JSC::Identifier& teeBranchACanceledIdentifier(JSC::JSGlobalObject* global_object)
-{
-    return cachedReadableStreamIdentifier(
-        global_object, &ColloWebApiCache::readable_stream_tee_branch_a_canceled_identifier, "__colloBranchACanceled"_s);
-}
-
-const JSC::Identifier& teeBranchBCanceledIdentifier(JSC::JSGlobalObject* global_object)
-{
-    return cachedReadableStreamIdentifier(
-        global_object, &ColloWebApiCache::readable_stream_tee_branch_b_canceled_identifier, "__colloBranchBCanceled"_s);
-}
-
-const JSC::Identifier& teeBranchAReasonIdentifier(JSC::JSGlobalObject* global_object)
-{
-    return cachedReadableStreamIdentifier(
-        global_object, &ColloWebApiCache::readable_stream_tee_branch_a_reason_identifier, "__colloBranchAReason"_s);
-}
-
-const JSC::Identifier& teeBranchBReasonIdentifier(JSC::JSGlobalObject* global_object)
-{
-    return cachedReadableStreamIdentifier(
-        global_object, &ColloWebApiCache::readable_stream_tee_branch_b_reason_identifier, "__colloBranchBReason"_s);
-}
-
-const JSC::Identifier& readableStreamFromStateIdentifier(JSC::JSGlobalObject* global_object)
-{
-    return cachedReadableStreamIdentifier(
-        global_object, &ColloWebApiCache::readable_stream_from_state_identifier, "__colloReadableStreamFromState"_s);
-}
-
-const JSC::Identifier& readableStreamFromIteratorIdentifier(JSC::JSGlobalObject* global_object)
-{
-    return cachedReadableStreamIdentifier(
-        global_object, &ColloWebApiCache::readable_stream_from_iterator_identifier, "__colloIterator"_s);
-}
-
-const JSC::Identifier& readableStreamFromNextIdentifier(JSC::JSGlobalObject* global_object)
-{
-    return cachedReadableStreamIdentifier(
-        global_object, &ColloWebApiCache::readable_stream_from_next_identifier, "__colloNext"_s);
-}
-
-const JSC::Identifier& readableStreamFromIsAsyncIdentifier(JSC::JSGlobalObject* global_object)
-{
-    return cachedReadableStreamIdentifier(
-        global_object, &ColloWebApiCache::readable_stream_from_is_async_identifier, "__colloIsAsync"_s);
-}
-
-const JSC::Identifier& readableStreamFromDoneIdentifier(JSC::JSGlobalObject* global_object)
-{
-    return cachedReadableStreamIdentifier(
-        global_object, &ColloWebApiCache::readable_stream_from_done_identifier, "__colloDone"_s);
-}
-
-const JSC::Identifier& readableStreamFromNextFulfilledIdentifier(JSC::JSGlobalObject* global_object)
-{
-    return cachedReadableStreamIdentifier(
-        global_object, &ColloWebApiCache::readable_stream_from_next_fulfilled_identifier, "__colloNextFulfilled"_s);
-}
-
-const JSC::Identifier& readableStreamFromNextRejectedIdentifier(JSC::JSGlobalObject* global_object)
-{
-    return cachedReadableStreamIdentifier(
-        global_object, &ColloWebApiCache::readable_stream_from_next_rejected_identifier, "__colloNextRejected"_s);
-}
-
-const JSC::Identifier& readableStreamFromValueFulfilledIdentifier(JSC::JSGlobalObject* global_object)
-{
-    return cachedReadableStreamIdentifier(
-        global_object, &ColloWebApiCache::readable_stream_from_value_fulfilled_identifier, "__colloValueFulfilled"_s);
-}
-
-const JSC::Identifier& readableStreamFromValueRejectedIdentifier(JSC::JSGlobalObject* global_object)
-{
-    return cachedReadableStreamIdentifier(
-        global_object, &ColloWebApiCache::readable_stream_from_value_rejected_identifier, "__colloValueRejected"_s);
-}
-
-const JSC::Identifier& readableStreamFromReturnFulfilledIdentifier(JSC::JSGlobalObject* global_object)
-{
-    return cachedReadableStreamIdentifier(
-        global_object, &ColloWebApiCache::readable_stream_from_return_fulfilled_identifier, "__colloReturnFulfilled"_s);
-}
-
-const JSC::Identifier& readableStreamFromReturnRejectedIdentifier(JSC::JSGlobalObject* global_object)
-{
-    return cachedReadableStreamIdentifier(
-        global_object, &ColloWebApiCache::readable_stream_from_return_rejected_identifier, "__colloReturnRejected"_s);
-}
-
-const JSC::Identifier& writableStreamIdentifier(JSC::JSGlobalObject* global_object)
-{
-    return cachedReadableStreamIdentifier(
-        global_object, &ColloWebApiCache::writable_stream_identifier, "__colloWritableStream"_s);
-}
-
-const JSC::Identifier& writableStreamControllerIdentifier(JSC::JSGlobalObject* global_object)
-{
-    return cachedReadableStreamIdentifier(
-        global_object, &ColloWebApiCache::writable_stream_controller_identifier, "__colloWritableStreamController"_s);
-}
-
-const JSC::Identifier& transformStreamIdentifier(JSC::JSGlobalObject* global_object)
-{
-    return cachedReadableStreamIdentifier(
-        global_object, &ColloWebApiCache::transform_stream_identifier, "__colloTransformStream"_s);
-}
-
-const JSC::Identifier& pipeToStateIdentifier(JSC::JSGlobalObject* global_object)
-{
-    return cachedReadableStreamIdentifier(
-        global_object, &ColloWebApiCache::pipe_to_state_identifier, "__colloPipeToState"_s);
-}
-
-const JSC::Identifier& compressionStreamStateIdentifier(JSC::JSGlobalObject* global_object)
-{
-    return cachedReadableStreamIdentifier(
-        global_object, &ColloWebApiCache::compression_stream_state_identifier, "__colloCompressionStream"_s);
-}
-
-const JSC::Identifier& textEncoderStreamStateIdentifier(JSC::JSGlobalObject* global_object)
-{
-    return cachedReadableStreamIdentifier(
-        global_object, &ColloWebApiCache::text_encoder_stream_state_identifier, "__colloTextEncoderStream"_s);
-}
-
-const JSC::Identifier& textDecoderStreamStateIdentifier(JSC::JSGlobalObject* global_object)
-{
-    return cachedReadableStreamIdentifier(
-        global_object, &ColloWebApiCache::text_decoder_stream_state_identifier, "__colloTextDecoderStream"_s);
-}
-
-// The public property a ByteLengthQueuingStrategy reads from a chunk, unlike the private names above.
-const JSC::Identifier& byteLengthIdentifier(JSC::JSGlobalObject* global_object)
-{
-    return global_object->vm().propertyNames->byteLength;
-}
-
-JSC::JSFunction* cachedThenCallback(JSC::JSGlobalObject* global_object, JSC::WriteBarrier<JSC::JSFunction>& slot,
-    JSC::JSCell* owner, WTF::ASCIILiteral name, JSC::NativeFunction callback, const JSC::Identifier& state_identifier,
-    JSC::JSCell* state_cell)
-{
-    if (auto* function = slot.get())
-        return function;
-    auto& vm = global_object->vm();
-    auto* function
-        = JSC::JSFunction::create(vm, global_object, 1, name, callback, JSC::ImplementationVisibility::Public);
-    function->putDirect(vm, state_identifier, state_cell, static_cast<unsigned>(JSC::PropertyAttribute::DontEnum));
-    slot.set(vm, owner, function);
-    return function;
+    auto* constructor = JSC::JSFunction::create(vm, global_object, length, WTF::String(name),
+        construct ? streamConstructorRequiresNew : streamConstructorNotPublic, JSC::ImplementationVisibility::Public,
+        JSC::NoIntrinsic, construct ? construct : streamConstructorNotPublic, nullptr);
+    constructor->putDirect(vm, vm.propertyNames->prototype, prototype,
+        JSC::PropertyAttribute::ReadOnly | JSC::PropertyAttribute::DontEnum | JSC::PropertyAttribute::DontDelete);
+    prototype->putDirect(
+        vm, vm.propertyNames->constructor, constructor, static_cast<unsigned>(JSC::PropertyAttribute::DontEnum));
+    prototype->putDirect(vm, vm.propertyNames->toStringTagSymbol, JSC::jsString(vm, WTF::String(name)),
+        JSC::PropertyAttribute::ReadOnly | JSC::PropertyAttribute::DontEnum);
+    global_object->putDirect(vm, JSC::Identifier::fromString(vm, name), constructor,
+        static_cast<unsigned>(JSC::PropertyAttribute::DontEnum));
+    return constructor;
 }
 
 JSC::JSUint8Array* createUint8ArrayCopy(
@@ -412,7 +57,7 @@ JSC::JSUint8Array* createUint8ArrayCopy(
     auto* array = JSC::JSUint8Array::createUninitialized(global_object, structure, bytes.size());
     RETURN_IF_EXCEPTION(scope, nullptr);
     if (!bytes.empty())
-        std::memcpy(array->vector(), bytes.data(), bytes.size());
+        memcpySpan(mutableArrayBufferViewBytes(array), bytes);
     return array;
 }
 
@@ -422,14 +67,8 @@ JSC::JSUint8Array* createUint8Array(JSC::JSGlobalObject* global_object, JSC::Thr
     auto* array = JSC::JSUint8Array::createUninitialized(global_object, structure, byte_length);
     RETURN_IF_EXCEPTION(scope, nullptr);
     if (byte_length)
-        std::memset(array->vector(), 0, byte_length);
+        std::ranges::fill(mutableArrayBufferViewBytes(array), 0);
     return array;
-}
-
-JSC::JSUint8Array* createUint8ArrayCopy(
-    JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, std::span<uint8_t> bytes)
-{
-    return createUint8ArrayCopy(global_object, scope, std::span<const uint8_t> { bytes.data(), bytes.size() });
 }
 
 static WTF::RefPtr<JSC::ArrayBuffer> createArrayBufferImplFromExclusiveSharedBytes(JSC::JSGlobalObject* global_object,
@@ -497,7 +136,7 @@ JSC::JSUint8Array* createUint8ArrayView(JSC::JSGlobalObject* global_object, JSC:
         return nullptr;
     }
     const size_t byte_offset = source->byteOffset() + relative_byte_offset;
-    RefPtr<JSC::ArrayBuffer> retained_buffer(buffer);
+    WTF::RefPtr<JSC::ArrayBuffer> retained_buffer(buffer);
     auto* structure = global_object->typedArrayStructure(JSC::TypeUint8, source->isResizableOrGrowableShared());
     auto* array = JSC::JSUint8Array::create(
         global_object, structure, WTF::move(retained_buffer), byte_offset, std::optional<size_t> { byte_length });
@@ -515,7 +154,8 @@ JSC::JSUint8Array* transferArrayBufferViewToUint8Array(
     return transferArrayBufferViewRangeToUint8Array(global_object, scope, source, 0, source->byteLength(), name);
 }
 
-JSC::JSUint8Array* transferArrayBufferViewRangeToUint8Array(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope,
+// Detaches the source view's buffer and returns the transferred buffer, or throws as the transfer helpers describe.
+static WTF::RefPtr<JSC::ArrayBuffer> transferViewBuffer(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope,
     JSC::JSArrayBufferView* source, size_t relative_byte_offset, size_t byte_length, WTF::ASCIILiteral name)
 {
     if (arrayBufferViewIsUnavailable(source)) {
@@ -541,14 +181,21 @@ JSC::JSUint8Array* transferArrayBufferViewRangeToUint8Array(JSC::JSGlobalObject*
         return nullptr;
     }
 
-    const size_t byte_offset = source->byteOffset() + relative_byte_offset;
     JSC::ArrayBufferContents transferred_contents;
     if (!buffer->transferTo(global_object->vm(), transferred_contents)) {
         JSC::throwVMTypeError(global_object, scope, WTF::makeString(name, " buffer could not be transferred"_s));
         return nullptr;
     }
+    return JSC::ArrayBuffer::create(WTF::move(transferred_contents));
+}
 
-    RefPtr<JSC::ArrayBuffer> transferred_buffer = JSC::ArrayBuffer::create(WTF::move(transferred_contents));
+JSC::JSUint8Array* transferArrayBufferViewRangeToUint8Array(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope,
+    JSC::JSArrayBufferView* source, size_t relative_byte_offset, size_t byte_length, WTF::ASCIILiteral name)
+{
+    // The view's offset is read before the transfer detaches it.
+    const size_t byte_offset = arrayBufferViewIsUnavailable(source) ? 0 : source->byteOffset() + relative_byte_offset;
+    auto transferred_buffer = transferViewBuffer(global_object, scope, source, relative_byte_offset, byte_length, name);
+    RETURN_IF_EXCEPTION(scope, nullptr);
     auto* array = JSC::JSUint8Array::create(global_object, global_object->typedArrayStructure(JSC::TypeUint8, false),
         WTF::move(transferred_buffer), byte_offset, std::optional<size_t> { byte_length });
     RETURN_IF_EXCEPTION(scope, nullptr);
@@ -557,7 +204,7 @@ JSC::JSUint8Array* transferArrayBufferViewRangeToUint8Array(JSC::JSGlobalObject*
 
 template <typename View>
 static JSC::JSArrayBufferView* createTransferredTypedArrayView(JSC::JSGlobalObject* global_object,
-    JSC::ThrowScope& scope, RefPtr<JSC::ArrayBuffer>&& buffer, size_t byte_offset, size_t byte_length,
+    JSC::ThrowScope& scope, WTF::RefPtr<JSC::ArrayBuffer>&& buffer, size_t byte_offset, size_t byte_length,
     WTF::ASCIILiteral name)
 {
     if (byte_length % View::elementSize != 0) {
@@ -578,39 +225,15 @@ JSC::JSArrayBufferView* transferArrayBufferViewRangeToSameView(JSC::JSGlobalObje
         JSC::throwVMTypeError(global_object, scope, WTF::makeString(name, " must not be detached or out of bounds"_s));
         return nullptr;
     }
-    const size_t source_length = source->byteLength();
-    if (relative_byte_offset > source_length || byte_length > source_length - relative_byte_offset) {
-        JSC::throwVMRangeError(global_object, scope, WTF::makeString(name, " range is out of bounds"_s));
-        return nullptr;
-    }
-    if (source->isShared() || source->isResizableOrGrowableShared()) {
-        JSC::throwVMTypeError(
-            global_object, scope, WTF::makeString(name, " must use a fixed-length non-shared ArrayBuffer"_s));
-        return nullptr;
-    }
-
     const auto type = JSC::typedArrayType(source->type());
     if (type == JSC::NotTypedArray) {
         JSC::throwVMTypeError(global_object, scope, WTF::makeString(name, " must be an ArrayBufferView"_s));
         return nullptr;
     }
-
-    JSC::JSArrayBuffer* js_buffer = source->unsharedJSBuffer(global_object);
-    RETURN_IF_EXCEPTION(scope, nullptr);
-    auto* raw_buffer = js_buffer ? js_buffer->impl() : nullptr;
-    if (!raw_buffer || raw_buffer->isDetached() || !raw_buffer->isDetachable()) {
-        JSC::throwVMTypeError(global_object, scope, WTF::makeString(name, " buffer cannot be transferred"_s));
-        return nullptr;
-    }
-
+    // The view's offset is read before the transfer detaches it.
     const size_t byte_offset = source->byteOffset() + relative_byte_offset;
-    JSC::ArrayBufferContents transferred_contents;
-    if (!raw_buffer->transferTo(global_object->vm(), transferred_contents)) {
-        JSC::throwVMTypeError(global_object, scope, WTF::makeString(name, " buffer could not be transferred"_s));
-        return nullptr;
-    }
-
-    RefPtr<JSC::ArrayBuffer> transferred_buffer = JSC::ArrayBuffer::create(WTF::move(transferred_contents));
+    auto transferred_buffer = transferViewBuffer(global_object, scope, source, relative_byte_offset, byte_length, name);
+    RETURN_IF_EXCEPTION(scope, nullptr);
     switch (type) {
     case JSC::TypeInt8:
         return createTransferredTypedArrayView<JSC::JSInt8Array>(
@@ -678,10 +301,6 @@ JSC::JSArrayBufferView* requireArrayBufferView(
     return view;
 }
 
-std::span<uint8_t> mutableViewBytes(JSC::JSArrayBufferView* view) { return mutableArrayBufferViewBytes(view); }
-
-std::span<const uint8_t> viewBytes(JSC::JSArrayBufferView* view) { return arrayBufferViewBytes(view); }
-
 bool viewRangeIsInside(JSC::JSArrayBufferView* inner, JSC::JSArrayBufferView* outer)
 {
     if (arrayBufferViewIsUnavailable(inner) || arrayBufferViewIsUnavailable(outer))
@@ -707,7 +326,7 @@ bool viewSharesBuffer(JSC::JSArrayBufferView* left, JSC::JSArrayBufferView* righ
     return left_buffer && left_buffer == right_buffer;
 }
 
-bool valueIsCallable(JSValue value)
+bool valueIsCallable(JSC::JSValue value)
 {
     if (!value.isCell())
         return false;
@@ -715,7 +334,7 @@ bool valueIsCallable(JSValue value)
 }
 
 bool settleAndClearPromise(
-    JSC::JSGlobalObject* global_object, JSC::WriteBarrier<JSC::JSPromise>& slot, JSValue value, bool is_rejection)
+    JSC::JSGlobalObject* global_object, JSC::WriteBarrier<JSC::JSPromise>& slot, JSC::JSValue value, bool is_rejection)
 {
     auto* promise = slot.get();
     if (!promise)
@@ -725,7 +344,7 @@ bool settleAndClearPromise(
 }
 
 bool ensurePromiseRejected(JSC::JSGlobalObject* global_object, const JSC::JSCell* owner,
-    JSC::WriteBarrier<JSC::JSPromise>& slot, JSValue reason)
+    JSC::WriteBarrier<JSC::JSPromise>& slot, JSC::JSValue reason)
 {
     auto* promise = slot.get();
     if (!promiseIsPending(promise)) {
@@ -737,79 +356,76 @@ bool ensurePromiseRejected(JSC::JSGlobalObject* global_object, const JSC::JSCell
     return Collo::settlePromise(promise, reason, true);
 }
 
-JSC::JSObject* createReadResult(JSC::JSGlobalObject* global_object, JSC::JSValue value, bool done)
+JSC::JSPromise* promiseForCallbackCompletion(
+    JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSC::JSValue result)
 {
-    auto& vm = global_object->vm();
-    auto* object = JSC::constructEmptyObject(global_object, global_object->objectPrototype(), 2);
-    object->putDirect(vm, vm.propertyNames->value, value);
-    object->putDirect(vm, vm.propertyNames->done, JSC::jsBoolean(done));
-    return object;
-}
-
-JSC_DEFINE_HOST_FUNCTION(resolveUndefinedCallback, (JSC::JSGlobalObject*, JSC::CallFrame*))
-{
-    return JSValue::encode(JSC::jsUndefined());
-}
-
-JSC_DEFINE_HOST_FUNCTION(rethrowCallback, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
-{
-    auto& vm = global_object->vm();
-    auto scope = DECLARE_THROW_SCOPE(vm);
-    return JSValue::encode(JSC::throwException(global_object, scope, call_frame->argument(0)));
-}
-
-EncodedJSValue promiseThenUndefined(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSValue value)
-{
-    auto* promise = dynamicDowncast<JSC::JSPromise>(value);
-    if (!promise)
-        return resolvedPromise(global_object, JSC::jsUndefined());
-
-    auto& vm = global_object->vm();
-    auto* result_promise = JSC::JSPromise::create(vm, global_object->promiseStructure());
-    auto* fulfilled = JSC::JSFunction::create(vm, global_object, 1, "ReadableStream settle undefined"_s,
-        resolveUndefinedCallback, JSC::ImplementationVisibility::Public);
-    promise->performPromiseThen(vm, global_object, fulfilled, JSC::jsUndefined(), result_promise);
-    RETURN_IF_EXCEPTION(scope, {});
-    return JSValue::encode(result_promise);
-}
-
-EncodedJSValue resolvedReadResult(JSC::JSGlobalObject* global_object, JSC::JSValue value, bool done)
-{
-    return resolvedPromise(global_object, createReadResult(global_object, value, done));
-}
-
-JSValue propertyOrUndefined(
-    JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSC::JSObject* object, WTF::ASCIILiteral name)
-{
-    JSValue value = object->getIfPropertyExists(global_object, JSC::Identifier::fromString(global_object->vm(), name));
-    RETURN_IF_EXCEPTION(scope, {});
-    if (value.isEmpty())
-        return JSC::jsUndefined();
-    return value;
-}
-
-bool normalizeOptionalCallback(
-    JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSValue& value, WTF::ASCIILiteral name)
-{
-    if (value.isUndefined() || value.isNull()) {
-        value = JSC::jsUndefined();
-        return true;
+    if (auto* exception = scope.exception()) {
+        JSC::JSValue reason = exception->value();
+        if (!scope.tryClearException())
+            return nullptr;
+        return JSC::JSPromise::rejectedPromise(global_object, reason);
     }
-    if (valueIsCallable(value))
-        return true;
-    JSC::throwException(
-        global_object, scope, JSC::createTypeError(global_object, WTF::makeString(name, " must be callable"_s)));
-    return false;
+    auto* promise = promiseResolvedWith(global_object, result ? result : JSC::jsUndefined());
+    RETURN_IF_EXCEPTION(scope, nullptr);
+    return promise;
+}
+
+JSC::EncodedJSValue readResultPromise(JSC::JSGlobalObject* global_object, JSC::JSValue value, bool done)
+{
+    return resolvedPromise(global_object, readResult(global_object, value, done));
+}
+
+namespace {
+
+    // An own data property, read from property storage so that no getter runs; the empty value when there is none.
+    // Script can redefine a read result's property as an accessor before the stream reads it (a `then` getter on
+    // Object.prototype runs while the read promise resolves). Such a slot holds the engine's GetterSetter or
+    // CustomGetterSetter cell, which must never reach script, so it counts as absent.
+    JSC::JSValue ownDataProperty(JSC::VM& vm, JSC::JSObject* object, JSC::PropertyName name)
+    {
+        unsigned attributes = 0;
+        JSC::JSValue value = object->getDirect(vm, name, attributes);
+        if (!value || (attributes & JSC::PropertyAttribute::AccessorOrCustomAccessorOrValue))
+            return {};
+        return value;
+    }
+
+} // namespace
+
+bool readResultDone(JSC::JSGlobalObject* global_object, JSC::JSValue result, bool& out_done, JSC::JSValue& out_error)
+{
+    out_done = false;
+    out_error = {};
+    auto* object = result.getObject();
+    if (!object) {
+        out_error = JSC::createTypeError(global_object, "ReadableStream read result is not an object"_s);
+        return false;
+    }
+    JSC::JSValue done = ownDataProperty(global_object->vm(), object, global_object->vm().propertyNames->done);
+    if (!done) {
+        out_error = JSC::createTypeError(global_object, "ReadableStream read result has no done property"_s);
+        return false;
+    }
+    out_done = done.isBoolean() && done.asBoolean();
+    return true;
+}
+
+JSC::JSValue readResultValue(JSC::JSGlobalObject* global_object, JSC::JSValue result)
+{
+    auto* object = result.getObject();
+    if (!object)
+        return JSC::jsUndefined();
+    JSC::JSValue value = ownDataProperty(global_object->vm(), object, global_object->vm().propertyNames->value);
+    return value ? value : JSC::jsUndefined();
 }
 
 bool strictCallbackPropertyOrUndefined(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope,
-    JSC::JSObject* object, WTF::ASCIILiteral property_name, WTF::ASCIILiteral error_name, JSValue& out)
+    JSC::JSObject* object, WTF::ASCIILiteral property_name, WTF::ASCIILiteral error_name, JSC::JSValue& out)
 {
-    JSValue value
+    JSC::JSValue value
         = object->getIfPropertyExists(global_object, JSC::Identifier::fromString(global_object->vm(), property_name));
     RETURN_IF_EXCEPTION(scope, false);
-    // Web IDL dictionary conversion treats an explicitly-undefined member the
-    // same as a missing one.
+    // Web IDL dictionary conversion treats an explicitly undefined member the same as a missing one.
     if (value.isEmpty() || value.isUndefined()) {
         out = JSC::jsUndefined();
         return true;
@@ -823,13 +439,128 @@ bool strictCallbackPropertyOrUndefined(JSC::JSGlobalObject* global_object, JSC::
     return false;
 }
 
-// Serves a byte range as a readable stream's native source, one chunk_size
-// piece per pull. Every pull copies into a new Uint8Array, so script never
-// writes the storage and tee branches can share one ColloSharedBytes.
+// Members are read in lexicographic order (highWaterMark, then size), an undefined member counts as absent, and
+// undefined or null converts to an empty dictionary. On success out_has_high_water_mark says whether highWaterMark was
+// present, out_high_water_mark holds it as a number, and out_size holds the size callback or undefined. The range check
+// is ExtractHighWaterMark, which the constructor steps run later through validateHighWaterMark. Throws a TypeError
+// prefixed with context for a strategy that is not an object or a size that is not callable.
+bool parseQueuingStrategy(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSC::JSValue strategy,
+    WTF::ASCIILiteral context, bool& out_has_high_water_mark, double& out_high_water_mark, JSC::JSValue& out_size)
+{
+    out_has_high_water_mark = false;
+    out_high_water_mark = 0;
+    out_size = JSC::jsUndefined();
+    if (strategy.isUndefinedOrNull())
+        return true;
+    if (!strategy.isObject()) {
+        JSC::throwException(global_object, scope,
+            JSC::createTypeError(global_object, WTF::makeString(context, " strategy must be an object"_s)));
+        return false;
+    }
+
+    auto& vm = global_object->vm();
+    auto* strategy_object = strategy.getObject();
+    JSC::JSValue high_water_mark
+        = strategy_object->getIfPropertyExists(global_object, JSC::Identifier::fromString(vm, "highWaterMark"_s));
+    RETURN_IF_EXCEPTION(scope, false);
+    if (!high_water_mark.isEmpty() && !high_water_mark.isUndefined()) {
+        out_high_water_mark = high_water_mark.toNumber(global_object);
+        RETURN_IF_EXCEPTION(scope, false);
+        out_has_high_water_mark = true;
+    }
+
+    JSC::JSValue size = strategy_object->getIfPropertyExists(global_object, JSC::Identifier::fromString(vm, "size"_s));
+    RETURN_IF_EXCEPTION(scope, false);
+    if (!size.isEmpty() && !size.isUndefined()) {
+        if (!valueIsCallable(size)) {
+            JSC::throwException(global_object, scope,
+                JSC::createTypeError(global_object, WTF::makeString(context, " strategy size must be callable"_s)));
+            return false;
+        }
+        out_size = size;
+    }
+    return true;
+}
+
+bool validateHighWaterMark(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, WTF::ASCIILiteral context,
+    bool has_high_water_mark, double default_high_water_mark, double& high_water_mark)
+{
+    if (!has_high_water_mark) {
+        high_water_mark = default_high_water_mark;
+        return true;
+    }
+    if (std::isnan(high_water_mark) || high_water_mark < 0) {
+        JSC::throwException(global_object, scope,
+            JSC::createRangeError(
+                global_object, WTF::makeString(context, " highWaterMark must be a non-negative number"_s)));
+        return false;
+    }
+    return true;
+}
+
+JSC::Structure* streamStructureForNewTarget(
+    JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSC::CallFrame* call_frame, JSC::Structure* base)
+{
+    auto* new_target = call_frame->newTarget().getObject();
+    auto* constructor = call_frame->jsCallee();
+    if (!new_target || new_target == constructor)
+        return base;
+    auto* structure = JSC::InternalFunction::createSubclassStructure(global_object, new_target, base);
+    RETURN_IF_EXCEPTION(scope, nullptr);
+    return structure;
+}
+
+bool StreamCloneBudget::ensure(
+    JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, WTF::RefPtr<StreamCloneBudget>& budget)
+{
+    if (budget)
+        return true;
+    void* storage = nullptr;
+    if (!WTF::tryFastMalloc(sizeof(StreamCloneBudget)).getValue(storage)) {
+        JSC::throwOutOfMemoryError(global_object, scope);
+        return false;
+    }
+    auto* created = new (NotNull, storage) StreamCloneBudget;
+    budget = WTF::adoptRef(*created);
+    return true;
+}
+
+bool StreamCloneBudget::checkRoom(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope) const
+{
+    if (m_clone_count < WebApiBodyCloneFanoutMax)
+        return true;
+    JSC::throwException(global_object, scope,
+        createDOMException(global_object, DOMExceptionCode::QuotaExceededError,
+            "clone count exceeds the limit for one body and its streams"_s));
+    return false;
+}
+
+bool readableStreamChunkBytes(
+    JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSC::JSValue chunk, std::span<const uint8_t>& out)
+{
+    out = {};
+    if (auto* view = dynamicDowncast<JSC::JSArrayBufferView>(chunk)) {
+        if (!validateArrayBufferViewForCopy(
+                global_object, scope, view, "ReadableStream chunk ArrayBufferView is detached or out of bounds"_s))
+            return false;
+        out = arrayBufferViewBytes(view);
+        return true;
+    }
+    if (auto* array_buffer = dynamicDowncast<JSC::JSArrayBuffer>(chunk)) {
+        if (!validateArrayBufferForCopy(global_object, scope, array_buffer,
+                "ReadableStream chunk must be a fixed-length attached ArrayBuffer"_s))
+            return false;
+        out = arrayBufferBytes(array_buffer);
+        return true;
+    }
+    JSC::throwVMTypeError(global_object, scope, readable_stream_chunk_type_message);
+    return false;
+}
+
+// Serves a byte range as a readable stream's native source, one WebApiReadableStreamChunkBytes piece per pull. Each
+// pull copies into a new Uint8Array, so script never writes the storage and tee branches share one ColloSharedBytes.
 class BufferedBytesSource final : public ReadableStreamNativeSource {
 public:
-    static constexpr size_t chunk_size = 64 * 1024;
-
     static WTF::RefPtr<BufferedBytesSource> create(std::span<const uint8_t> bytes)
     {
         auto storage = ColloSharedBytes::copy(bytes);
@@ -851,32 +582,23 @@ public:
         return adoptRef(*source);
     }
 
-    EncodedJSValue pull(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope) override
+    ReadableStreamPull pull(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope) override
     {
         if (!m_bytes || m_position >= m_size)
-            return resolvedReadResult(global_object, JSC::jsUndefined(), true);
-        size_t length = std::min(chunk_size, m_size - m_position);
+            return ReadableStreamPull::done();
+        const size_t length = std::min(WebApiReadableStreamChunkBytes, m_size - m_position);
         auto* value = createUint8ArrayCopy(global_object, scope, m_bytes->slice(m_offset + m_position, length));
-        RETURN_IF_EXCEPTION(scope, {});
-        if (!value)
-            return {};
+        RETURN_IF_EXCEPTION(scope, ReadableStreamPull::threw());
         m_position += length;
-        if (m_position >= m_size) {
-            m_bytes = nullptr;
-            m_position = 0;
-            m_offset = 0;
-            m_size = 0;
-        }
-        return resolvedReadResult(global_object, value, false);
+        if (m_position >= m_size)
+            drop();
+        return ReadableStreamPull::withChunk(value);
     }
 
-    EncodedJSValue cancel(JSC::JSGlobalObject* global_object, JSC::ThrowScope&, JSValue) override
+    JSC::EncodedJSValue cancel(JSC::JSGlobalObject*, JSC::ThrowScope&, JSC::JSValue) override
     {
-        m_bytes = nullptr;
-        m_position = 0;
-        m_offset = 0;
-        m_size = 0;
-        return resolvedPromise(global_object, JSC::jsUndefined());
+        drop();
+        return JSC::JSValue::encode(JSC::jsUndefined());
     }
 
     bool tee(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope,
@@ -895,21 +617,14 @@ public:
         const size_t remaining_offset = m_offset + m_position;
         const size_t remaining_size = m_size - m_position;
         auto first = create(WTF::Ref<ColloSharedBytes> { *m_bytes }, remaining_offset, remaining_size);
-        if (!first) {
-            JSC::throwOutOfMemoryError(global_object, scope);
-            return false;
-        }
         auto second = create(WTF::Ref<ColloSharedBytes> { *m_bytes }, remaining_offset, remaining_size);
-        if (!second) {
+        if (!first || !second) {
             JSC::throwOutOfMemoryError(global_object, scope);
             return false;
         }
         out_first = first.releaseNonNull();
         out_second = second.releaseNonNull();
-        m_bytes = nullptr;
-        m_position = 0;
-        m_offset = 0;
-        m_size = 0;
+        drop();
         return true;
     }
 
@@ -919,10 +634,7 @@ public:
         out_exceeds_limit = false;
         out_supported = true;
         if (!m_bytes || m_position >= m_size) {
-            m_bytes = nullptr;
-            m_position = 0;
-            m_offset = 0;
-            m_size = 0;
+            drop();
             return true;
         }
         auto remaining = m_bytes->slice(m_offset + m_position, m_size - m_position);
@@ -932,10 +644,7 @@ public:
         }
         if (!out.tryAppend(remaining))
             return false;
-        m_bytes = nullptr;
-        m_position = 0;
-        m_offset = 0;
-        m_size = 0;
+        drop();
         return true;
     }
 
@@ -945,6 +654,14 @@ private:
         , m_offset(offset)
         , m_size(size)
     {
+    }
+
+    void drop()
+    {
+        m_bytes = nullptr;
+        m_position = 0;
+        m_offset = 0;
+        m_size = 0;
     }
 
     WTF::RefPtr<ColloSharedBytes> m_bytes;

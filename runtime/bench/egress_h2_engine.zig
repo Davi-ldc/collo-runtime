@@ -1,8 +1,8 @@
-//! Measures the HTTP/2 throughput of the egress engine's owner thread
-//! (`h2Main`) across a matrix of engines, h2 connectors, origins, streams and
-//! response sizes. The engine is the one each gateway shard runs, and every
-//! origin is a local C++ test origin on its own thread that accepts exactly
-//! one connection. Like every egress bench it builds ReleaseFast without JSC.
+//! Measures the HTTP/2 throughput and stream latency of the egress engine's
+//! owner thread across a matrix of engines, origins, streams and response
+//! sizes. The engine is the one each gateway shard runs, and every origin is
+//! a local C++ test origin on its own thread that accepts exactly one
+//! connection. Like every egress bench it builds ReleaseFast without JSC.
 //!
 //! Each engine stands for one gateway shard and gets its own driver thread,
 //! its own `egress.Engine` and its own origins, since an origin cannot serve
@@ -11,18 +11,25 @@
 //! on every wake, because the engine opens HTTP/2 flow-control windows only
 //! as credits come back, and it sleeps on an eventfd that the engine's wake
 //! callback writes.
+//!
+//! By default one untimed request per origin pays for its dial before the
+//! timed window, which then measures established connections. With
+//! COLLO_BENCH_H2_ENGINE_DIAL_IN_WINDOW=1 the window starts with no
+//! connection, so each origin's first stream waits on the owner's own DNS,
+//! TCP connect and TLS handshake while the other origins' streams run: many
+//! origins with few requests each make the handshake-heavy mix whose stream
+//! latency decides whether handshakes stay on the owner thread.
 
 const std = @import("std");
 const bench_common = @import("common.zig");
 const bench_metadata = @import("metadata.zig");
 const local_origin = @import("local_origin.zig");
-const bindings = @import("collo_bindings");
 const egress = @import("collo_egress_client");
 
 const egress_engine = egress.engine;
-const fetch_body = egress.fetch_body;
 const task_model = egress.task;
 const body_credit = egress.core.body_credit;
+const ResponseQueue = egress.core.ResponseQueue;
 
 const tls_shim = @import("collo_test_tls_shim");
 const TestH2Origin = tls_shim.TestH2Origin;
@@ -31,7 +38,6 @@ const collo_test_h2_origin_stop = tls_shim.collo_test_h2_origin_stop;
 const collo_test_h2_origin_last_error = tls_shim.collo_test_h2_origin_last_error;
 
 const default_engines = [_]usize{ 1, 2, 4 };
-const default_connectors = [_]usize{ 1, 2 };
 const default_origins = [_]usize{ 1, 4, 16 };
 const default_streams = [_]usize{ 8, 32 };
 const default_response_bytes = [_]usize{ 1024, 16384, 262144 };
@@ -46,8 +52,7 @@ const default_warmup_iterations: usize = 1;
 /// bodies that together receive 70% of the requests, one at 32 KiB receiving
 /// 25% and one at 256 KiB receiving 5%. Skewed weights over one size model a
 /// hot origin ("4096x1:80,4096x7:20"). A MIX replaces the ORIGINS and
-/// RESPONSE_BYTES lists; the ENGINES, CONNECTORS and STREAMS lists still
-/// apply.
+/// RESPONSE_BYTES lists; the ENGINES and STREAMS lists still apply.
 const MixGroup = struct {
     response_bytes: usize,
     origins: usize,
@@ -63,15 +68,13 @@ const max_mix_classes: usize = 8;
 /// pool evicts an idle entry or fails the request with
 /// `error.Http2PoolExhausted`. This bound stays below that limit.
 const max_origins_per_engine: usize = 32;
-/// The test origin sends DATA in frames of this payload size; used only to
-/// budget the engine command queue for eager credit releases.
+/// The payload size of the DATA frames the test origin sends (`cellConfig`).
 const origin_data_frame_bytes: usize = 16 * 1024;
 const stall_timeout_ns: u64 = 30 * std.time.ns_per_s;
 const h2_max_window: u64 = (1 << 31) - 1;
 
 const Cell = struct {
     engines: usize,
-    connectors: usize,
     origins: usize,
     streams: usize,
     response_bytes: usize,
@@ -79,10 +82,9 @@ const Cell = struct {
     inflight: usize,
     /// Measured requests per engine.
     requests: usize,
-    /// True, as the gateway sets it, unless COLLO_BENCH_H2_ENGINE_PREREGISTER=0
-    /// turns it off to debug a kernel whose sealed, restricted io_uring data
-    /// path misbehaves.
-    pre_register_recv_buffers: bool,
+    /// Each origin's dial runs inside the timed window
+    /// (COLLO_BENCH_H2_ENGINE_DIAL_IN_WINDOW=1).
+    dial_in_window: bool,
     /// Per-engine origin population (always populated; a uniform run is a
     /// single group). One class index per group for TTFB reporting.
     mix: []const MixGroup,
@@ -104,41 +106,6 @@ const Sample = struct {
     ttfb_class_p99_ns: [max_mix_classes]u64,
     rss_kib: u64,
     peak_rss_kib: u64,
-    /// Aggregate h2 owner busy% across engines (sum busy / sum busy+wait).
-    h2_busy_pct: f64,
-    /// Worst single-engine busy%, which shows when one owner thread saturates.
-    h2_busy_pct_max: f64,
-    h2_busy_ns: u64,
-    h2_wait_ns: u64,
-    h2_process_ns: u64,
-    h2_maintain_ns: u64,
-    h2_handle_ns: u64,
-    h2_iterations: u64,
-    h2_batch_messages: u64,
-    h2_queue_depth_max: u64,
-    h2_watch_list_len_max: u64,
-};
-
-/// One engine's H2Stats over its timed window. Counters are end minus start.
-/// Maxima are the end values: every sample starts a fresh engine, and the
-/// priming requests put at most one request per origin in flight.
-const H2Window = struct {
-    busy_ns: u64 = 0,
-    wait_ns: u64 = 0,
-    process_ns: u64 = 0,
-    maintain_ns: u64 = 0,
-    handle_ns: u64 = 0,
-    iterations: u64 = 0,
-    batch_messages: u64 = 0,
-    queue_depth_max: u64 = 0,
-    watch_list_len_max: u64 = 0,
-
-    fn busyPct(self: H2Window) f64 {
-        const total = self.busy_ns + self.wait_ns;
-        if (total == 0)
-            return 0;
-        return 100.0 * @as(f64, @floatFromInt(self.busy_ns)) / @as(f64, @floatFromInt(total));
-    }
 };
 
 /// Where the test origins, which listen on every address, are dialed: the
@@ -164,8 +131,6 @@ pub fn main() !void {
 
     const engines_list = try bench_common.parseCommaSeparatedUsizeList(allocator, "COLLO_BENCH_H2_ENGINE_ENGINES", &default_engines);
     defer allocator.free(engines_list);
-    const connectors_list = try bench_common.parseCommaSeparatedUsizeList(allocator, "COLLO_BENCH_H2_ENGINE_CONNECTORS", &default_connectors);
-    defer allocator.free(connectors_list);
     const origins_list = try bench_common.parseCommaSeparatedUsizeList(allocator, "COLLO_BENCH_H2_ENGINE_ORIGINS", &default_origins);
     defer allocator.free(origins_list);
     const streams_list = try bench_common.parseCommaSeparatedUsizeList(allocator, "COLLO_BENCH_H2_ENGINE_STREAMS", &default_streams);
@@ -176,7 +141,7 @@ pub fn main() !void {
     const requests = try envUsize(allocator, "COLLO_BENCH_H2_ENGINE_REQUESTS", default_requests);
     const iterations = try envUsize(allocator, "COLLO_BENCH_H2_ENGINE_ITERATIONS", default_iterations);
     const warmup_iterations = try envUsize(allocator, "COLLO_BENCH_H2_ENGINE_WARMUP", default_warmup_iterations);
-    const pre_register = (try envUsize(allocator, "COLLO_BENCH_H2_ENGINE_PREREGISTER", 1)) != 0;
+    const dial_in_window = (try envUsize(allocator, "COLLO_BENCH_H2_ENGINE_DIAL_IN_WINDOW", 0)) != 0;
     const mix_env = try parseMixEnv(allocator, "COLLO_BENCH_H2_ENGINE_MIX");
     if (requests == 0 or iterations == 0)
         return error.InvalidBenchConfig;
@@ -189,11 +154,11 @@ pub fn main() !void {
             return error.InvalidBenchConfig;
         }
     }
-    for ([_][]const usize{ engines_list, connectors_list, origins_list, streams_list }) |list| {
+    for ([_][]const usize{ engines_list, origins_list, streams_list }) |list| {
         for (list) |value| {
             if (value == 0) {
                 std.debug.print(
-                    "egress_h2_engine: engines/connectors/origins/streams matrix entries must be nonzero\n",
+                    "egress_h2_engine: engines/origins/streams matrix entries must be nonzero\n",
                     .{},
                 );
                 return error.InvalidBenchConfig;
@@ -202,8 +167,8 @@ pub fn main() !void {
     }
 
     // Resolve the per-cell origin populations: either the explicit MIX (one
-    // population shared by every engines/connectors/streams combination) or
-    // one single-class population per origins x response-size matrix entry.
+    // population shared by every engines/streams combination) or one
+    // single-class population per origins x response-size matrix entry.
     var populations = std.ArrayList(MixEntry).empty;
     defer populations.deinit(allocator);
     if (mix_env) |entry| {
@@ -218,41 +183,38 @@ pub fn main() !void {
         }
     }
 
-    const total_cells = engines_list.len * connectors_list.len * populations.items.len * streams_list.len;
+    const total_cells = engines_list.len * populations.items.len * streams_list.len;
     std.debug.print(
-        "egress_h2_engine: {d} cells ({d} engines x {d} connectors x {d} populations x {d} streams), {d} requests/engine, {d} warmup + {d} measured iterations\n",
+        "egress_h2_engine: {d} cells ({d} engines x {d} populations x {d} streams), {d} requests/engine, {d} warmup + {d} measured iterations, dial_in_window={}\n",
         .{
             total_cells,
             engines_list.len,
-            connectors_list.len,
             populations.items.len,
             streams_list.len,
             requests,
             warmup_iterations,
             iterations,
+            dial_in_window,
         },
     );
 
     for (engines_list) |engine_count| {
-        for (connectors_list) |connector_count| {
-            for (populations.items) |population| {
-                for (streams_list) |stream_count| {
-                    const totals = mixTotals(population.groups);
-                    const cell = Cell{
-                        .engines = engine_count,
-                        .connectors = connector_count,
-                        .origins = totals.origins,
-                        .streams = stream_count,
-                        .response_bytes = totals.mean_bytes,
-                        .inflight = if (inflight == 0) totals.origins * stream_count else inflight,
-                        .requests = requests,
-                        .pre_register_recv_buffers = pre_register,
-                        .mix = population.groups,
-                        .mix_desc = population.desc,
-                        .max_response_bytes = totals.max_bytes,
-                    };
-                    try runCell(allocator, cell, iterations, warmup_iterations);
-                }
+        for (populations.items) |population| {
+            for (streams_list) |stream_count| {
+                const totals = mixTotals(population.groups);
+                const cell = Cell{
+                    .engines = engine_count,
+                    .origins = totals.origins,
+                    .streams = stream_count,
+                    .response_bytes = totals.mean_bytes,
+                    .inflight = if (inflight == 0) totals.origins * stream_count else inflight,
+                    .requests = requests,
+                    .dial_in_window = dial_in_window,
+                    .mix = population.groups,
+                    .mix_desc = population.desc,
+                    .max_response_bytes = totals.max_bytes,
+                };
+                try runCell(allocator, cell, iterations, warmup_iterations);
             }
         }
     }
@@ -335,10 +297,6 @@ fn runCell(allocator: std.mem.Allocator, cell: Cell, iterations: usize, warmup_i
     defer allocator.free(ttfb_p50_samples);
     const ttfb_p99_samples = try allocator.alloc(u64, iterations);
     defer allocator.free(ttfb_p99_samples);
-    const h2_busy_pct_samples = try allocator.alloc(f64, iterations);
-    defer allocator.free(h2_busy_pct_samples);
-    const h2_busy_pct_max_samples = try allocator.alloc(f64, iterations);
-    defer allocator.free(h2_busy_pct_max_samples);
     const class_count = cell.mix.len;
     const class_p50_samples = try allocator.alloc(u64, class_count * iterations);
     defer allocator.free(class_p50_samples);
@@ -357,8 +315,6 @@ fn runCell(allocator: std.mem.Allocator, cell: Cell, iterations: usize, warmup_i
         mb_per_s_samples[iteration] = sample.mb_per_s;
         ttfb_p50_samples[iteration] = sample.ttfb_p50_ns;
         ttfb_p99_samples[iteration] = sample.ttfb_p99_ns;
-        h2_busy_pct_samples[iteration] = sample.h2_busy_pct;
-        h2_busy_pct_max_samples[iteration] = sample.h2_busy_pct_max;
         for (0..class_count) |class| {
             class_p50_samples[class * iterations + iteration] = sample.ttfb_class_p50_ns[class];
             class_p99_samples[class * iterations + iteration] = sample.ttfb_class_p99_ns[class];
@@ -371,18 +327,16 @@ fn runCell(allocator: std.mem.Allocator, cell: Cell, iterations: usize, warmup_i
     std.mem.sort(f64, mb_per_s_samples, {}, std.sort.asc(f64));
     std.mem.sort(u64, ttfb_p50_samples, {}, std.sort.asc(u64));
     std.mem.sort(u64, ttfb_p99_samples, {}, std.sort.asc(u64));
-    std.mem.sort(f64, h2_busy_pct_samples, {}, std.sort.asc(f64));
-    std.mem.sort(f64, h2_busy_pct_max_samples, {}, std.sort.asc(f64));
     std.debug.print(
-        "egress_h2_engine_summary engines={d} h2_connectors={d} origins={d} streams={d} response_body_bytes={d} inflight={d} requests={d} samples={d} elapsed_p50_ns={d} req_per_s_p50={d:.1} req_per_s_best={d:.1} mb_per_s_p50={d:.2} ttfb_p50_ns={d} ttfb_p99_ns={d} h2_busy_pct_p50={d:.1} h2_busy_pct_max={d:.1} mix={s}\n",
+        "egress_h2_engine_summary engines={d} origins={d} streams={d} response_body_bytes={d} inflight={d} requests={d} dial_in_window={} samples={d} elapsed_p50_ns={d} req_per_s_p50={d:.1} req_per_s_best={d:.1} mb_per_s_p50={d:.2} ttfb_p50_ns={d} ttfb_p99_ns={d} mix={s}\n",
         .{
             cell.engines,
-            cell.connectors,
             cell.origins,
             cell.streams,
             cell.response_bytes,
             cell.inflight,
             cell.requests,
+            cell.dial_in_window,
             iterations,
             bench_common.percentileNearestRank(u64, elapsed_samples, 50),
             bench_common.percentileNearestRank(f64, req_per_s_samples, 50),
@@ -390,8 +344,6 @@ fn runCell(allocator: std.mem.Allocator, cell: Cell, iterations: usize, warmup_i
             bench_common.percentileNearestRank(f64, mb_per_s_samples, 50),
             bench_common.percentileNearestRank(u64, ttfb_p50_samples, 50),
             bench_common.percentileNearestRank(u64, ttfb_p99_samples, 50),
-            bench_common.percentileNearestRank(f64, h2_busy_pct_samples, 50),
-            h2_busy_pct_max_samples[h2_busy_pct_max_samples.len - 1],
             cell.mix_desc,
         },
     );
@@ -420,10 +372,9 @@ fn runCell(allocator: std.mem.Allocator, cell: Cell, iterations: usize, warmup_i
     }
 }
 
-/// One transport config per cell, because the pool key holds the config's
-/// HTTP/2 limits and buffer sizes next to the origin: with one config, every
-/// request to an origin matches that origin's single pooled connection. The
-/// test origin ignores client flow control and sends `origin_data_frame_bytes`
+/// One transport config per cell, so every request to an origin carries the
+/// same isolation ids and matches that origin's single pooled connection,
+/// whose HTTP/2 limits come from the first request's config. The test origin ignores client flow control and sends `origin_data_frame_bytes`
 /// DATA frames, so the receive windows must cover everything it can send: the
 /// stream window covers the largest response, and the connection window
 /// covers every stream's window, both capped at the HTTP/2 maximum.
@@ -493,7 +444,6 @@ const EngineContext = struct {
     /// Exact body bytes this engine should receive over the timed window
     /// (sum over origins of assigned * response_bytes).
     expected_bytes: u64 = 0,
-    h2: H2Window = .{},
     ready_posted: bool = false,
     err: ?anyerror = null,
     fail_detail: [768]u8 = undefined,
@@ -560,37 +510,12 @@ fn runSample(allocator: std.mem.Allocator, cell: Cell, config: egress.Config) !S
     var ttfb_total: usize = 0;
     var credited_bytes: u64 = 0;
     var expected_bytes: u64 = 0;
-    var h2_busy_ns: u64 = 0;
-    var h2_wait_ns: u64 = 0;
-    var h2_process_ns: u64 = 0;
-    var h2_maintain_ns: u64 = 0;
-    var h2_handle_ns: u64 = 0;
-    var h2_busy_pct_max: f64 = 0;
-    var h2_iterations: u64 = 0;
-    var h2_batch_messages: u64 = 0;
-    var h2_queue_depth_max: u64 = 0;
-    var h2_watch_list_len_max: u64 = 0;
     for (contexts) |*context| {
         finished_max = @max(finished_max, context.finished_ns);
         ttfb_total += context.ttfb_count;
         credited_bytes += context.credited_bytes;
         expected_bytes += context.expected_bytes;
-        h2_busy_ns += context.h2.busy_ns;
-        h2_wait_ns += context.h2.wait_ns;
-        h2_process_ns += context.h2.process_ns;
-        h2_maintain_ns += context.h2.maintain_ns;
-        h2_handle_ns += context.h2.handle_ns;
-        h2_busy_pct_max = @max(h2_busy_pct_max, context.h2.busyPct());
-        h2_iterations += context.h2.iterations;
-        h2_batch_messages += context.h2.batch_messages;
-        h2_queue_depth_max = @max(h2_queue_depth_max, context.h2.queue_depth_max);
-        h2_watch_list_len_max = @max(h2_watch_list_len_max, context.h2.watch_list_len_max);
     }
-    const h2_total_ns = h2_busy_ns + h2_wait_ns;
-    const h2_busy_pct: f64 = if (h2_total_ns == 0)
-        0
-    else
-        100.0 * @as(f64, @floatFromInt(h2_busy_ns)) / @as(f64, @floatFromInt(h2_total_ns));
     if (ttfb_total != merged_ttfb.len)
         return error.BenchSampleIncomplete;
     if (credited_bytes != expected_bytes)
@@ -637,17 +562,6 @@ fn runSample(allocator: std.mem.Allocator, cell: Cell, config: egress.Config) !S
         .ttfb_class_p99_ns = ttfb_class_p99_ns,
         .rss_kib = memory.rss_kib,
         .peak_rss_kib = memory.peak_rss_kib,
-        .h2_busy_pct = h2_busy_pct,
-        .h2_busy_pct_max = h2_busy_pct_max,
-        .h2_busy_ns = h2_busy_ns,
-        .h2_wait_ns = h2_wait_ns,
-        .h2_process_ns = h2_process_ns,
-        .h2_maintain_ns = h2_maintain_ns,
-        .h2_handle_ns = h2_handle_ns,
-        .h2_iterations = h2_iterations,
-        .h2_batch_messages = h2_batch_messages,
-        .h2_queue_depth_max = h2_queue_depth_max,
-        .h2_watch_list_len_max = h2_watch_list_len_max,
     };
 }
 
@@ -684,9 +598,11 @@ fn runEngine(context: *EngineContext) !void {
     // The measured requests are split deterministically: in proportion to
     // group weight across the mix, with the leftovers dealt round-robin over
     // the groups, then evenly across each group's origins. An origin serves
-    // exactly one priming response plus its assigned ones on its one
-    // connection, then closes it without GOAWAY. A uniform run is a single
-    // group, so every origin gets the base share and the first ones one more.
+    // its streams on its one connection, then closes it without GOAWAY, and
+    // answers its first stream with an empty body: the priming request's, or
+    // with the dial in the window, the first measured one's. A uniform run is
+    // a single group, so every origin gets the base share and the first ones
+    // one more.
     var weight_total: usize = 0;
     for (cell.mix) |group|
         weight_total += group.weight;
@@ -714,11 +630,13 @@ fn runEngine(context: *EngineContext) !void {
             origin.remaining = origin.assigned;
             origin.response_bytes = group.response_bytes;
             origin.class = @intCast(group_index);
-            context.expected_bytes += @as(u64, @intCast(origin.assigned)) * @as(u64, @intCast(group.response_bytes));
+            const full_responses = if (cell.dial_in_window) origin.assigned -| 1 else origin.assigned;
+            context.expected_bytes += @as(u64, @intCast(full_responses)) * @as(u64, @intCast(group.response_bytes));
+            const priming_streams: usize = if (cell.dial_in_window) 0 else 1;
             var handle: ?*TestH2Origin = null;
             var port: u16 = 0;
             if (collo_bench_h2_origin_start(
-                @intCast(1 + origin.assigned),
+                @intCast(priming_streams + origin.assigned),
                 origin.response_bytes,
                 &handle,
                 &port,
@@ -781,49 +699,47 @@ fn runEngine(context: *EngineContext) !void {
     for (slots) |*slot|
         slot.* = .{ .origin_index = 0 };
 
-    var engine = try egress_engine.Engine.init(allocator, queueCapacity(cell, total_slots), .{
-        .connector_count = cell.connectors,
-    });
-    // The gateway pre-registers receive buffers before starting its engine
-    // (egress/gateway/engine.zig), so the bench measures that io_uring
-    // data path unless the knob turns it off.
-    engine.setPreRegisterRecvBuffers(cell.pre_register_recv_buffers);
+    // Each slot runs one fetch at a time, and the priming phase one per
+    // origin, including an origin no measured request drew.
+    var engine = try egress_engine.Engine.init(allocator, slots.len);
     defer {
-        // Queued body credits go back first, then `engine.deinit` stops the
-        // engine, joining its threads and settling every pending task. Only
-        // then are the chunk queues final: the second release drains them,
-        // and `Task.deinit` asserts that its body holds no queued chunk.
+        // Queued body credits go back first, then `engine.stop` settles every
+        // pending task and drops the engine's references. Only then are the
+        // queues final: the second release drains them (a stopped engine
+        // takes no credit), the bench drops its own task references, and
+        // the engine goes last.
         for (slots) |*slot| {
             if (slot.task) |task|
                 releaseTaskCredits(context, &engine, task);
         }
-        engine.deinit();
+        engine.stop();
         for (slots) |*slot| {
             if (slot.task) |task| {
                 releaseTaskCredits(context, &engine, task);
-                destroyTask(context, task);
+                destroyTask(task);
                 slot.task = null;
             }
         }
+        engine.deinit();
     }
 
-    // One untimed request per origin pays for the TLS handshake, the HTTP/2
-    // session setup and the pool adoption. The origin answers its first
-    // stream with an empty body, so the timed window below measures only
-    // reuse of established connections.
-    for (slots[0..origin_count], 0..) |*slot, index| {
-        slot.* = .{ .origin_index = index };
-        try submitSlot(context, &engine, slot, origins);
+    try engine.start(context, wakeFromEngine);
+
+    // Unless the dial belongs in the window, one untimed request per origin
+    // pays for the DNS lookup, the TCP connect, the TLS handshake and the
+    // HTTP/2 session setup. The origin answers it with an empty body, so the
+    // timed window below measures only established connections.
+    if (!cell.dial_in_window) {
+        for (slots[0..origin_count], 0..) |*slot, index| {
+            slot.* = .{ .origin_index = index };
+            try submitSlot(context, &engine, slot, origins);
+        }
+        try driveLoop(context, &engine, slots[0..origin_count], origins, origin_count, .prime);
     }
-    try driveLoop(context, &engine, slots[0..origin_count], origins, origin_count, .prime);
 
     context.ready_posted = true;
     context.ready_sem.post();
     context.go_event.wait();
-
-    // A blocking wait that straddles the window boundary attributes its full
-    // duration to wait_ns inside the window; negligible over a whole sample.
-    const h2_stats_start = engine.snapshotH2Stats();
 
     var slot_index: usize = 0;
     for (slot_quota, 0..) |quota, origin_index| {
@@ -844,18 +760,6 @@ fn runEngine(context: *EngineContext) !void {
     }
     try driveLoop(context, &engine, slots[0..total_slots], origins, cell.requests, .timed);
     context.finished_ns = try monotonicNowNs();
-    const h2_stats_end = engine.snapshotH2Stats();
-    context.h2 = .{
-        .busy_ns = h2_stats_end.busy_ns -| h2_stats_start.busy_ns,
-        .wait_ns = h2_stats_end.wait_ns -| h2_stats_start.wait_ns,
-        .process_ns = h2_stats_end.process_ns -| h2_stats_start.process_ns,
-        .maintain_ns = h2_stats_end.maintain_ns -| h2_stats_start.maintain_ns,
-        .handle_ns = h2_stats_end.handle_ns -| h2_stats_start.handle_ns,
-        .iterations = h2_stats_end.iterations -| h2_stats_start.iterations,
-        .batch_messages = h2_stats_end.batch_messages_total -| h2_stats_start.batch_messages_total,
-        .queue_depth_max = h2_stats_end.queue_depth_enqueue_max,
-        .watch_list_len_max = h2_stats_end.watch_list_len_max,
-    };
 
     for (origins) |*origin| {
         const last_error = std.mem.span(collo_test_h2_origin_last_error(origin.handle.?));
@@ -969,7 +873,7 @@ fn scanSlots(
         // The producer is finished, so this drains everything that is still
         // queued and nothing new can arrive afterwards.
         releaseTaskCredits(context, engine, task);
-        destroyTask(context, task);
+        destroyTask(task);
         slot.task = null;
         completed.* += 1;
         progress = true;
@@ -995,10 +899,10 @@ fn submitSlot(
     origins: []OriginState,
 ) !void {
     const task = try createTask(context, origins[slot.origin_index].url);
-    errdefer destroyTask(context, task);
+    errdefer destroyTask(task);
     slot.ttfb_ns = null;
     slot.submit_ns = try monotonicNowNs();
-    try engine.submit(.{ .task = task, .config = context.config }, context, wakeFromEngine);
+    try engine.submit(.{ .task = task, .config = context.config });
     slot.task = task;
 }
 
@@ -1006,40 +910,28 @@ fn createTask(context: *EngineContext, url: []const u8) !*task_model.Task {
     const allocator = context.allocator;
     context.next_task_id += 1;
     const id = context.next_task_id;
-    const identity = bindings.FetchBodyIdentity{
+    const identity = egress.core.FetchBodyIdentity{
         .request_id = id,
         .request_generation = 1,
         .fetch_id = id,
         .body_id = id,
     };
-    const body = try allocator.create(fetch_body.Body);
-    var body_owned = true;
-    errdefer if (body_owned) {
-        body.deinitAfterQueuedResourcesReleased(allocator);
-        allocator.destroy(body);
-    };
-    body.* = fetch_body.Body.initOpen(allocator, identity, null);
+    const queue = try allocator.create(ResponseQueue);
+    var queue_owned = true;
+    errdefer if (queue_owned) queue.release(allocator);
+    queue.* = ResponseQueue.init(identity, null);
     const task = try allocator.create(task_model.Task);
     errdefer allocator.destroy(task);
-    task.* = try task_model.Task.init(
-        allocator,
-        id,
-        id,
-        url,
-        "GET",
-        "",
-        &.{},
-        0,
-        identity,
-        body,
-    );
-    body_owned = false;
+    task.* = try task_model.Task.init(allocator, id, url, "GET", "", &.{}, 0, queue);
+    queue_owned = false;
     return task;
 }
 
-fn destroyTask(context: *EngineContext, task: *task_model.Task) void {
-    task.deinit();
-    context.allocator.destroy(task);
+/// Drops the bench's reference. The engine may still hold its own for a
+/// moment after it woke the bench on the body's end, and the last holder
+/// frees the task.
+fn destroyTask(task: *task_model.Task) void {
+    task.release();
 }
 
 const CreditRelease = struct {
@@ -1057,13 +949,13 @@ fn releaseCreditToEngine(release: *CreditRelease, credit: body_credit.Handle) vo
 
 fn releaseTaskCredits(context: *EngineContext, engine: *egress_engine.Engine, task: *task_model.Task) void {
     var release = CreditRelease{ .context = context, .engine = engine };
-    task.response_body.releaseQueuedChunksCallback(context.allocator, &release, releaseCreditToEngine);
+    task.response_body.releaseQueued(context.allocator, &release, releaseCreditToEngine);
 }
 
-fn bodyState(body: *fetch_body.Body) fetch_body.State {
-    body.mutex.lock();
-    defer body.mutex.unlock();
-    return body.state;
+fn bodyState(queue: *ResponseQueue) egress.core.response_queue.State {
+    queue.mutex.lock();
+    defer queue.mutex.unlock();
+    return queue.state;
 }
 
 fn wakeFromEngine(ctx: ?*anyopaque, event: egress_engine.WakeEvent) void {
@@ -1079,8 +971,8 @@ fn drainEventFd(fd: std.posix.fd_t) void {
 }
 
 /// Waits for an engine wake or a bounded rescan tick. The engine always wakes
-/// on response headers, but a clean body completion wakes only registered
-/// body waiters, which this bench does not register, so the last completion
+/// on response headers, but a queue wakes on its completion only while its
+/// consumer armed it, which this bench does not do, so the last completion
 /// of a phase may bring no wake at all. Returning on the tick lets driveLoop
 /// rescan, and a real stall still reaches the caller's deadline and fails
 /// with `error.BenchStalled`.
@@ -1100,16 +992,6 @@ fn waitWakeReadable(fd: std.posix.fd_t, deadline_ns: u64) !void {
         return;
     if (pollfds[0].revents & (std.posix.POLL.ERR | std.posix.POLL.NVAL) != 0)
         return error.BenchWakeFdFailed;
-}
-
-/// Sized so the credit releases, one engine command per released body chunk
-/// and roughly one chunk per `origin_data_frame_bytes` DATA frame, never fill
-/// the h2 command queue. `releaseFetchBodyCredit` blocks the releasing driver
-/// thread while that queue is full, which would turn queue pressure into
-/// latency the samples report.
-fn queueCapacity(cell: Cell, total_slots: usize) usize {
-    const chunks_per_response = cell.max_response_bytes / origin_data_frame_bytes + 4;
-    return 2 * total_slots + cell.origins + 16 + total_slots * chunks_per_response;
 }
 
 fn failEngine(
@@ -1154,28 +1036,25 @@ fn reportStall(
         "egress_h2_engine engine[{d}] stalled at {d}/{d} completions\n",
         .{ context.engine_index, completed, target_completions },
     );
-    // A frozen owner makes no iterations while messages sit queued; an idle
-    // owner that lost a wake or a credit has an empty queue and waits for an
-    // event that never comes. Each in-flight slot's body state then shows
-    // which stream the missing wake or credit belongs to.
+    // A frozen owner leaves work queued: submissions or cancels linked, or
+    // credit sources listed. An idle owner that lost a wake or a credit has
+    // nothing queued and waits for an event that never comes. Each in-flight
+    // slot's body state then shows which stream the missing wake or credit
+    // belongs to.
     {
-        const iterations_before = engine.h2_stats.iterations.load(.monotonic);
         std.Thread.sleep(100 * std.time.ns_per_ms);
-        const iterations_after = engine.h2_stats.iterations.load(.monotonic);
         engine.mutex.lock();
-        const queue_len = engine.h2_len;
-        const queue_capacity = engine.h2_queue.len;
+        const submissions_queued = engine.submitted_head != null;
+        const cancels_queued = engine.canceled_head != null;
+        var sources_listed: usize = 0;
+        for (engine.credit_sources.slots.items) |slot| {
+            if (slot.queued) sources_listed += 1;
+        }
+        const sources_live = engine.credit_sources.live;
         engine.mutex.unlock();
         std.debug.print(
-            "DIAG stall engine[{d}]: owner_iterations {d}->{d} (alive={}) h2_queue {d}/{d}\n",
-            .{
-                context.engine_index,
-                iterations_before,
-                iterations_after,
-                iterations_after != iterations_before,
-                queue_len,
-                queue_capacity,
-            },
+            "DIAG stall engine[{d}]: submissions queued={} cancels queued={} credit sources listed {d} of {d} live\n",
+            .{ context.engine_index, submissions_queued, cancels_queued, sources_listed, sources_live },
         );
         for (slots, 0..) |*slot, index| {
             const task = slot.task orelse continue;
@@ -1183,13 +1062,13 @@ fn reportStall(
             const done = task.done;
             task.mutex.unlock();
             std.debug.print(
-                "DIAG stall slot[{d}]: origin={d} done={} body_state={s} queued_decoded={d}\n",
+                "DIAG stall slot[{d}]: origin={d} done={} body_state={s} queued_bytes={d}\n",
                 .{
                     index,
                     slot.origin_index,
                     done,
                     @tagName(bodyState(task.response_body)),
-                    task.response_body.queuedDecodedBytes(),
+                    task.response_body.queuedBytes(),
                 },
             );
         }
@@ -1207,16 +1086,16 @@ fn reportStall(
 
 fn printJsonSample(cell: Cell, iteration: usize, sample: Sample) void {
     std.debug.print(
-        "{{\"bench\":\"egress_h2_engine\",\"mix\":\"{s}\",\"engines\":{d},\"h2_connectors\":{d},\"origins\":{d},\"streams\":{d},\"response_body_bytes\":{d},\"inflight\":{d},\"requests\":{d},\"iteration\":{d},\"elapsed_ns\":{d},\"req_per_s\":{d:.1},\"mb_per_s\":{d:.2},\"ttfb_p50_ns\":{d},\"ttfb_p99_ns\":{d},\"rss_kib\":{d},\"peak_rss_kib\":{d},\"h2_busy_pct\":{d:.1},\"h2_busy_pct_max\":{d:.1},\"h2_busy_ns\":{d},\"h2_wait_ns\":{d},\"h2_process_ns\":{d},\"h2_maintain_ns\":{d},\"h2_handle_ns\":{d},\"h2_iterations\":{d},\"h2_batch_messages\":{d},\"h2_queue_depth_max\":{d},\"h2_watch_list_len_max\":{d}}}\n",
+        "{{\"bench\":\"egress_h2_engine\",\"mix\":\"{s}\",\"engines\":{d},\"origins\":{d},\"streams\":{d},\"response_body_bytes\":{d},\"inflight\":{d},\"requests\":{d},\"dial_in_window\":{},\"iteration\":{d},\"elapsed_ns\":{d},\"req_per_s\":{d:.1},\"mb_per_s\":{d:.2},\"ttfb_p50_ns\":{d},\"ttfb_p99_ns\":{d},\"rss_kib\":{d},\"peak_rss_kib\":{d}}}\n",
         .{
             cell.mix_desc,
             cell.engines,
-            cell.connectors,
             cell.origins,
             cell.streams,
             cell.response_bytes,
             cell.inflight,
             cell.requests,
+            cell.dial_in_window,
             iteration,
             sample.elapsed_ns,
             sample.req_per_s,
@@ -1225,17 +1104,6 @@ fn printJsonSample(cell: Cell, iteration: usize, sample: Sample) void {
             sample.ttfb_p99_ns,
             sample.rss_kib,
             sample.peak_rss_kib,
-            sample.h2_busy_pct,
-            sample.h2_busy_pct_max,
-            sample.h2_busy_ns,
-            sample.h2_wait_ns,
-            sample.h2_process_ns,
-            sample.h2_maintain_ns,
-            sample.h2_handle_ns,
-            sample.h2_iterations,
-            sample.h2_batch_messages,
-            sample.h2_queue_depth_max,
-            sample.h2_watch_list_len_max,
         },
     );
     if (cell.mix.len > 1) {

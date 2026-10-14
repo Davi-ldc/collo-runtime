@@ -58,7 +58,7 @@ pub const WorkerSpec = struct {
     /// The definition's value, which every route without one inherits.
     network: ?NetworkValue = null,
     isolate_realm: ?bool = null,
-    /// The definition's own limits; each one left null keeps the global
+    /// The definition's own limits; each one left null keeps the top-level
     /// value.
     concurrency: ?u32 = null,
     timeout_ms: ?u32 = null,
@@ -83,14 +83,14 @@ fn limitValues(worker: WorkerSpec) [4]LimitValue {
 }
 
 /// The text of a configuration declaring `workers`, under the static
-/// fixture's global limits. The caller owns it.
+/// fixture's top-level limits. The caller owns it.
 pub fn configText(allocator: std.mem.Allocator, workers: []const WorkerSpec) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const writer = &out.writer;
     try writer.writeAll(
         \\{
-        \\  "globalSettings": { "limits": { "memoryMiB": 1024, "timeoutMs": 15000 } },
+        \\  "settings": { "limits": { "memoryMiB": 1024, "timeoutMs": 15000 } },
         \\  "workers": {
         \\
     );
@@ -384,7 +384,7 @@ test "local e2e network: the configuration template writes what the parser reads
 
     const plain = parsed.definition(parsed.findDefinition("plain") orelse return error.TemplateDefinitionMissing);
     try std.testing.expect((try findRoute(plain, "/plain")).network == null);
-    // A definition that names no limit keeps the global ones.
+    // A definition that names no limit keeps the top-level ones.
     try std.testing.expectEqual(@as(u32, 15000), plain.settings.limits.timeout_ms);
     try std.testing.expectEqual(@as(?u32, null), plain.settings.limits.cpu_ms);
 }

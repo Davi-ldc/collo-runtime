@@ -1,12 +1,12 @@
 //! The ingress side of one worker request, played inside a bench process on
 //! the caller's thread. It hands a DispatchWork to an in-process worker
 //! runtime as one request-begin descriptor with inline bytes, and reads the
-//! response back as every host does (`host.dispatch.readResponse`), which
-//! grants the worker response credit for each chunk it takes. The read runs
-//! one pass of the runtime before each look at the channels
-//! (`worker.runPass`), so the request runs to its end inside the read, and a
-//! response longer than its credit window finishes as it would under a
-//! server.
+//! response back as every host does (`host.dispatch.readResponse`), up to
+//! the request's `request_done` on the control socket, granting the worker
+//! response credit for each chunk it takes. The read runs one pass of the
+//! runtime before each look at the socket (`worker.runPass`), so the request
+//! runs to its end inside the read, and a response longer than its credit
+//! window finishes as it would under a server.
 //!
 //! The runtime must be built as a real worker's is: the worker's end of the
 //! control socket does not block, and a payload ring is mapped for bodies
@@ -81,10 +81,8 @@ pub fn readResponse(
     request_id: u64,
     wall_ms: u32,
 ) !host.dispatch.Response {
-    const channels: host.dispatch.CompletionChannels = .{
+    const channels: host.dispatch.ResponseChannels = .{
         .control_fd = ends.control_fd,
-        .completion_eventfd = runtime.egress.completion_eventfd,
-        .metrics = runtime.observability.metrics_view,
         .ingress_payload = ends.ingress_payload,
     };
     return host.dispatch.readResponse(allocator, channels, request_id, .{

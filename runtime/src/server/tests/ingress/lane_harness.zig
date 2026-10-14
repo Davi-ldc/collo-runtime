@@ -1,8 +1,8 @@
 //! A whole ingress lane driven from the test thread, for the suites that need
 //! the lane's own handlers: `worker_faults.zig`, `lane_commands.zig`,
 //! `lane_connections.zig`, `lane_ring.zig`, `request_deadlines.zig`,
-//! `completion_ring.zig`, `fs_fault.zig`, `egress_tokens.zig` and
-//! `listener_accept.zig`. Not a suite of its own.
+//! `request_done.zig`, `response_credit.zig`, `early_answers.zig`,
+//! `egress_tokens.zig` and `listener_accept.zig`. Not a suite of its own.
 //!
 //! Each lane is a `runner.LaneWorker` over `TestService`, which stands in for
 //! the ingress service: it holds the fixture supervisor and the lanes, posts
@@ -28,10 +28,13 @@
 //! A client connection sits in a lane connection slot already in HTTP/2
 //! state, over a socketpair with no TLS. A stub worker is a real worker handle
 //! published into the fixture supervisor's pool, whose other ends the test
-//! holds: the worker's end of its control and fault sockets, its own mappings
-//! of the shared state page and of the payload rings, and a child process
-//! that waits until the test kills it, so the worker's pidfd reports an exit
-//! only then.
+//! holds: the worker's end of its control socket, on which it sends its
+//! responses and each request's `request_done`, its own mappings of the
+//! shared state page and of the payload rings, and a child process that
+//! waits until the test kills it, so the worker's pidfd reports an exit only
+//! then. Its cgroup leaf is a plain directory of the harness's own
+//! `supervisor_fixture.LeafDir` holding a `memory.events.local` that counts
+//! no event, so a death the lane classifies reads as a crash off a real file.
 //!
 //! The lane reads CLOCK_MONOTONIC. A test moves a request past its deadline
 //! with `expireDeadlines`, which runs the lane's deadline sweep at a time the
@@ -70,6 +73,7 @@ pub const lane_commands = ingress.lane_commands;
 pub const pool = supervision.pool;
 pub const page = worker_state.page;
 pub const ingress_channel = ipc.ingress_channel;
+pub const access = analytics.access;
 
 pub const Supervisor = supervision.Supervisor;
 pub const WorkerPool = supervision.WorkerPool;
@@ -102,6 +106,9 @@ const stranded_batch_max: usize = 32;
 /// Sleeps `waitUntilClockPasses` takes before it gives up. A sleep lasts at
 /// least as long as asked, so the first one normally passes the deadline.
 const clock_naps_max: usize = 8;
+/// Control passes `drainControl` runs before it gives up: one per packet a
+/// test sends to a reader that yields after each, far above what one sends.
+const control_passes_max: usize = 64;
 /// The fixture's limits, whose values a scene keeps unless a test asks for
 /// others.
 const default_routes: fixture.RoutesOptions = .{};
@@ -117,26 +124,23 @@ pub const default_path = "/demo/request";
 /// The key a lease holds while no gateway is current.
 const no_egress_key: ipc.egress_token.Key = .{ .bytes = @splat(0) };
 
+/// The HPACK scratch every client's coders share: a field being decoded, and
+/// the encoded blocks, each of which borrows this buffer until the next
+/// encode. Clients run on the test's thread and send each block at once.
+var client_decode_scratch: [hpack.max_single_header_decode_bytes]u8 = undefined;
+var client_encode_scratch: [64 * 1024]u8 = undefined;
+
 /// The egress gateway manager as a lane reads it at the start of a pass
 /// (`currentGeneration` and `renewLease`, which `Manager` in
 /// `server/gateway/manager.zig` answers in service). No gateway is current
-/// until a test calls `install`. An installed gateway is a socket pair: each
-/// renewal hands the lease a dup of `lease_end`, as the manager dups the
-/// gateway's control socket, and the test reads the lanes' `request_ended`
-/// batches from `gateway_end`.
+/// until a test calls `install`.
 pub const EgressGateways = struct {
     generation: u64 = 0,
     key: ipc.egress_token.Key = no_egress_key,
-    lease_end: os.fd.OwnedFd = .{},
-    gateway_end: os.fd.OwnedFd = .{},
     /// Every `renewLease` call, including the ones that change nothing.
     renewals: u32 = 0,
-    /// Renewals whose dup failed, which empty the lease as the manager's do.
-    renewals_failed: u32 = 0,
 
     pub fn deinit(self: *EgressGateways) void {
-        self.lease_end.deinit();
-        self.gateway_end.deinit();
         self.* = undefined;
     }
 
@@ -151,40 +155,24 @@ pub const EgressGateways = struct {
         self.renewals += 1;
         if (self.generation == 0) {
             if (lease.generation != 0)
-                lease.replace(0, no_egress_key, .{});
+                lease.replace(0, no_egress_key);
             return;
         }
         if (lease.generation == self.generation)
             return;
-        const control = os.fd.OwnedFd.dupCloexec(self.lease_end.fd()) catch {
-            self.renewals_failed += 1;
-            lease.replace(0, no_egress_key, .{});
-            return;
-        };
-        lease.replace(self.generation, self.key, control);
+        lease.replace(self.generation, self.key);
     }
 
-    /// Makes gateway `generation` current under `key`, over a new
-    /// nonblocking socket pair. The previous gateway's ends close, so a lease
-    /// that still holds a dup of its socket sends to nobody.
-    pub fn install(self: *EgressGateways, generation: u64, key: ipc.egress_token.Key) !void {
+    /// Makes gateway `generation` current under `key`.
+    pub fn install(self: *EgressGateways, generation: u64, key: ipc.egress_token.Key) void {
         std.debug.assert(generation != 0);
-        const pair = try os.fd.socketPairType(
-            std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC | std.posix.SOCK.NONBLOCK,
-        );
-        self.lease_end.deinit();
-        self.gateway_end.deinit();
-        self.gateway_end = .fromRaw(pair[0]);
-        self.lease_end = .fromRaw(pair[1]);
         self.generation = generation;
         self.key = key;
     }
 
     /// Leaves no gateway current, as the manager does when it retires its
-    /// gateway, and closes the gateway's ends.
+    /// gateway.
     pub fn retire(self: *EgressGateways) void {
-        self.lease_end.deinit();
-        self.gateway_end.deinit();
         self.generation = 0;
         self.key = no_egress_key;
     }
@@ -199,7 +187,6 @@ pub const TestService = struct {
     supervisor: *Supervisor,
     egress_gateways: *EgressGateways,
     routes: *const routes_mod.Routes,
-    analytics: *analytics.Sink,
     hard_timeout_grace_ns: u64,
     /// Read only on the accept path, which the harness never runs: its
     /// connections arrive past the handshake. A test that runs the stop drain
@@ -328,12 +315,7 @@ pub const TestService = struct {
             view.departure orelse .died
         else
             .died;
-        self.reaper.queueRetirement(worker, switch (departure) {
-            .idle => .idle,
-            .died => .died,
-            .egress => .egress_reattach,
-            .recycled => .recycled,
-        });
+        self.reaper.queueRetirement(worker, RetireReason.fromDeparture(departure));
     }
 };
 
@@ -458,6 +440,9 @@ pub const Reaper = struct {
 
 pub const Harness = struct {
     gpa: std.mem.Allocator,
+    /// The workers directory of the stub workers' cgroup leaves, which
+    /// outlives the supervisor whose teardown removes each leaf.
+    leaves: fixture.LeafDir,
     supervisor: Supervisor,
     egress_gateways: EgressGateways,
     /// Every `worker_died` a lane accepted from another, which
@@ -493,6 +478,7 @@ pub const Harness = struct {
             return error.InvalidLaneCount;
         self.* = .{
             .gpa = gpa,
+            .leaves = fixture.LeafDir.init(),
             .supervisor = undefined,
             .egress_gateways = .{},
             .deaths = .{},
@@ -505,6 +491,7 @@ pub const Harness = struct {
             .stubs = @splat(null),
             .clients = @splat(null),
         };
+        errdefer self.leaves.deinit();
         self.supervisor = try fixture.minimalSupervisorWith(gpa, .{ .routes = options.routes });
         errdefer fixture.deinitMinimal(&self.supervisor);
         self.lanes = try gpa.alloc(Lane, options.lane_count);
@@ -521,7 +508,6 @@ pub const Harness = struct {
             .supervisor = &self.supervisor,
             .egress_gateways = &self.egress_gateways,
             .routes = self.supervisor.routes,
-            .analytics = self.supervisor.analytics,
             .hard_timeout_grace_ns = self.supervisor.hard_timeout_grace_ns,
             .lanes = self.lanes,
             .launcher = &self.launcher,
@@ -534,8 +520,9 @@ pub const Harness = struct {
     }
 
     /// Tears the lanes down first, which finishes every request still open as
-    /// a shutdown, then the clients and the stub workers' own ends, and last
-    /// the supervisor, which tears down every worker still in a pool.
+    /// a shutdown, then the clients and the stub workers' own ends, then the
+    /// supervisor, which tears down every worker still in a pool and removes
+    /// its leaf, and last the leaves' directory.
     pub fn deinit(self: *Harness) void {
         self.stopLanes();
         for (&self.clients) |*entry| {
@@ -552,6 +539,7 @@ pub const Harness = struct {
         self.gpa.free(self.lanes);
         self.egress_gateways.deinit();
         fixture.deinitMinimal(&self.supervisor);
+        self.leaves.deinit();
         self.* = undefined;
     }
 
@@ -611,8 +599,7 @@ pub const Harness = struct {
 
     /// Ends the loop pass a handler call stands for: the connections the
     /// handler queued for a turn, then the worker faults it deferred, then
-    /// the `request_ended` batch of the requests the pass finished, then the
-    /// submit of what the pass prepared on the ring.
+    /// the submit of what the pass prepared on the ring.
     pub fn finishPass(self: *Harness, index: u16) !void {
         _ = try runner.ring_driver.Methods(Lane).runQueuedWork(self.lane(index));
         try self.rings[index].submit();
@@ -729,7 +716,7 @@ pub const Harness = struct {
     /// Lane `lane_index`'s registration of the stub worker, which exists
     /// while the lane reads the worker.
     pub fn registration(self: *Harness, lane_index: u16, stub: *const StubWorker) ?u32 {
-        return runner.worker_registration.Methods(Lane).findCompletionRegistrationIndex(self.lane(lane_index), stub.key);
+        return runner.worker_registration.Methods(Lane).findRegistrationIndex(self.lane(lane_index), stub.key);
     }
 
     pub fn expectRegistration(self: *Harness, lane_index: u16, stub: *const StubWorker) !u32 {
@@ -745,6 +732,25 @@ pub const Harness = struct {
         try self.finishPass(lane_index);
     }
 
+    /// Runs `handleControl` until the worker's control socket holds no
+    /// packet. A drain that yields to a connection with bytes to write
+    /// leaves the rest in the socket, and the lane's read poll, armed again,
+    /// fires at once for it (`worker_control.zig:drainWorkerControl`); each
+    /// pass here is one such firing.
+    pub fn drainControl(self: *Harness, lane_index: u16, stub: *const StubWorker) !void {
+        for (0..control_passes_max) |_| {
+            var poll_fds = [1]std.posix.pollfd{.{
+                .fd = stub.record.handle.control_fd,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            }};
+            if (try std.posix.poll(&poll_fds, 0) == 0)
+                return;
+            try self.handleControl(lane_index, stub);
+        }
+        return error.TestControlNotDrained;
+    }
+
     /// Runs the handler the lane runs when the worker's control socket takes
     /// bytes again after a send would have blocked.
     pub fn handleControlWritable(self: *Harness, lane_index: u16, stub: *const StubWorker) !void {
@@ -755,25 +761,12 @@ pub const Harness = struct {
     }
 
     /// Runs the handler the lane runs when the worker's completion eventfd is
-    /// readable.
-    pub fn handleCompletions(self: *Harness, lane_index: u16, stub: *const StubWorker) !void {
+    /// readable, which the worker writes when it frees room in its
+    /// server-to-worker payload ring.
+    pub fn handleRingCredit(self: *Harness, lane_index: u16, stub: *const StubWorker) !void {
         const index = try self.expectRegistration(lane_index, stub);
         try self.discardPollCompletions(lane_index);
-        try self.lane(lane_index).handleWorkerCompletions(index);
-        try self.finishPass(lane_index);
-    }
-
-    /// The control socket, then the completion ring: the order the lane
-    /// reads a worker in, so a request's descriptors precede its completion.
-    pub fn serveWorker(self: *Harness, lane_index: u16, stub: *const StubWorker) !void {
-        try self.handleControl(lane_index, stub);
-        try self.handleCompletions(lane_index, stub);
-    }
-
-    pub fn handleFsFault(self: *Harness, lane_index: u16, stub: *const StubWorker) !void {
-        const index = try self.expectRegistration(lane_index, stub);
-        try self.discardPollCompletions(lane_index);
-        try self.lane(lane_index).handleWorkerFsFault(index);
+        try self.lane(lane_index).handleWorkerRingCredit(index);
         try self.finishPass(lane_index);
     }
 
@@ -1029,6 +1022,9 @@ pub const Dispatched = struct {
     deadline_monotonic_ns: u64,
     /// The token the worker presents in the request's fetches.
     egress_token: ipc.egress_token.Bytes,
+    /// The pool slot the lane dispatched on, the index of the request's live
+    /// slot on the worker's page.
+    worker_slot: u8,
 
     pub fn requestKey(self: Dispatched) lifecycle.RequestKey {
         return .{
@@ -1039,12 +1035,32 @@ pub const Dispatched = struct {
     }
 };
 
-/// How a stub worker ends a request on its shared page.
-pub const Completion = struct {
+/// How a stub worker ends a request: the `request_done` it sends.
+pub const Done = struct {
     http_status: u16 = 200,
     done: ipc.RequestDoneStatus = .ok,
-    /// The worker generation the record names; the worker's own by default.
-    worker_generation: ?u64 = null,
+    exec_ns: u64 = 0,
+    waiting_ns: u64 = 0,
+    io_ns: u64 = 0,
+    cpu_ns: u64 = 0,
+    client_served_bytes: u64 = 0,
+    fetch_sent_bytes: u64 = 0,
+    fetch_received_bytes: u64 = 0,
+
+    /// The `request_done` the worker sends.
+    pub fn record(self: Done) ingress_channel.RequestDone {
+        return .{
+            .status = self.done,
+            .http_status = self.http_status,
+            .exec_ns = self.exec_ns,
+            .waiting_ns = self.waiting_ns,
+            .io_ns = self.io_ns,
+            .cpu_ns = self.cpu_ns,
+            .client_served_bytes = self.client_served_bytes,
+            .fetch_sent_bytes = self.fetch_sent_bytes,
+            .fetch_received_bytes = self.fetch_received_bytes,
+        };
+    }
 };
 
 /// The request body a stub worker read, appended to its caller's buffer.
@@ -1064,11 +1080,12 @@ pub const StubWorker = struct {
     child_pid: std.posix.pid_t,
     /// The test's own pidfd of the worker's process.
     child_pidfd: os.fd.OwnedFd,
+    /// The worker's cgroup leaf in `Harness.leaves`, which the record's
+    /// handle names.
+    leaf: host.cgroup_root.WorkerLeaf,
     child_reaped: bool = false,
     /// The worker's end of its control socket, nonblocking; -1 once closed.
     control: std.posix.fd_t,
-    /// The worker's end of its fault socket, nonblocking.
-    fault: std.posix.fd_t,
     /// The worker's own mappings of its state page and payload rings.
     page_view: page.WorkerWriterView,
     payload: ingress_channel.SharedPayloadView,
@@ -1120,21 +1137,14 @@ pub const StubWorker = struct {
             try std.posix.setsockopt(control[0], std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, std.mem.asBytes(&value));
         }
 
-        const fault_pair = try os.fd.socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
-        var fault_server_owned = true;
-        errdefer if (fault_server_owned) std.posix.close(fault_pair[0]);
-        errdefer std.posix.close(fault_pair[1]);
-        try os.fd.setNonblocking(fault_pair[0], true);
-        try os.fd.setNonblocking(fault_pair[1], true);
-
+        // Both sides map the page and the payload memfd, then the memfds
+        // close, as a launch closes its copies once the child holds its own.
         const metrics_fd = try page.createMemfd("collo-lane-harness-page");
-        var metrics_fd_owned = true;
-        errdefer if (metrics_fd_owned) std.posix.close(metrics_fd);
-        var server_page = try page.mapReadWrite(metrics_fd);
+        defer std.posix.close(metrics_fd);
+        var server_page = try page.mapHostReader(metrics_fd);
         var server_page_owned = true;
         errdefer if (server_page_owned) server_page.deinit();
-        server_page.initializeCrashDefault();
-        var worker_page = try page.mapReadWrite(metrics_fd);
+        var worker_page = try page.mapWorkerWriter(metrics_fd);
         errdefer worker_page.deinit();
 
         const completion_eventfd = try std.posix.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK);
@@ -1145,46 +1155,31 @@ pub const StubWorker = struct {
         errdefer if (credit_eventfd_owned) std.posix.close(credit_eventfd);
 
         const payload_fd = try ingress_channel.createSharedPayloadMemfd();
-        var payload_fd_owned = true;
-        errdefer if (payload_fd_owned) std.posix.close(payload_fd);
+        defer std.posix.close(payload_fd);
         var server_payload = try ingress_channel.mapSharedPayloadReadWrite(payload_fd, .server);
         var server_payload_owned = true;
         errdefer if (server_payload_owned) server_payload.deinit();
         var worker_payload = try ingress_channel.mapSharedPayloadReadWrite(payload_fd, .worker);
         errdefer worker_payload.deinit();
 
-        var cgroup_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        // A fresh path under /tmp that is never created, so the teardown's
-        // cgroup removal finds nothing, never reaches a real cgroup and
-        // leaves nothing behind.
-        const cgroup_dir = try uniqueTempPath(&cgroup_buffer);
-
-        const handle = try host.WorkerHandle.init(
-            gpa,
-            @intCast(child_pid),
-            pidfd,
-            control[0],
-            cgroup_dir,
-            64 * 1024 * 1024,
-            1,
-            metrics_fd,
-            completion_eventfd,
-            payload_fd,
-            credit_eventfd,
-            server_payload,
-            server_page,
-            fault_pair[0],
-        );
+        const leaf = try harness.leaves.leaf(&.{fixture.LeafDir.quiet_memory_events});
+        const handle: host.WorkerHandle = .{
+            .pid = @intCast(child_pid),
+            .pidfd = pidfd,
+            .control_fd = control[0],
+            .leaf = leaf,
+            .completion_eventfd = completion_eventfd,
+            .ingress_payload_credit_eventfd = credit_eventfd,
+            .ingress_payload = server_payload,
+            .metrics = server_page,
+        };
         // The handle owns the server's ends from here on, and the publish
         // takes it whether it succeeds or not.
         pidfd_owned = false;
         control_server_owned = false;
-        fault_server_owned = false;
-        metrics_fd_owned = false;
         server_page_owned = false;
         completion_eventfd_owned = false;
         credit_eventfd_owned = false;
-        payload_fd_owned = false;
         server_payload_owned = false;
 
         const publish_options: fixture.PublishOptions = .{
@@ -1214,8 +1209,8 @@ pub const StubWorker = struct {
             .definition = options.definition,
             .child_pid = child_pid,
             .child_pidfd = child_pidfd,
+            .leaf = leaf,
             .control = control[1],
-            .fault = fault_pair[1],
             .page_view = worker_page,
             .payload = worker_payload,
             .recv_scratch = recv_scratch,
@@ -1224,12 +1219,15 @@ pub const StubWorker = struct {
         return stub;
     }
 
+    /// Leaves the worker's leaf empty, so the record's teardown removes it
+    /// with one rmdir, and frees the stub's own ends.
     fn destroy(self: *StubWorker) void {
         const gpa = self.harness.gpa;
         self.kill() catch |err|
             std.log.warn("lane harness could not end a stub worker: {s}", .{@errorName(err)});
+        self.harness.leaves.emptyLeaf(self.leaf) catch |err|
+            std.log.warn("lane harness could not empty a stub worker's leaf: {s}", .{@errorName(err)});
         self.closeControl();
-        std.posix.close(self.fault);
         self.page_view.deinit();
         self.payload.deinit();
         self.child_pidfd.deinit();
@@ -1306,7 +1304,26 @@ pub const StubWorker = struct {
             .body_follows = !descriptor.hasFlag(ingress_channel.flags.end_stream),
             .deadline_monotonic_ns = work.deadline_monotonic_ns,
             .egress_token = work.egress_token,
+            .worker_slot = work.worker_slot,
         };
+    }
+
+    /// The descriptor of the next packet the lane sent that carries no
+    /// payload the test reads, such as a `request_reset`, after the response
+    /// credit notifications before it. Fails with `error.WouldBlock` when
+    /// none waits.
+    pub fn readDescriptor(self: *StubWorker) !ingress_channel.Descriptor {
+        var packet = try self.nextRequestPacket();
+        var received = try ingress_channel.decodeReceivedPacket(self.harness.gpa, &packet);
+        defer received.deinit();
+        return received.descriptor;
+    }
+
+    /// Writes `cpu_ns` into the live slot of `request` on the worker's page,
+    /// as the worker's VM thread does while it runs the request.
+    pub fn chargeLiveSlot(self: *StubWorker, request: Dispatched, cpu_ns: u64) void {
+        self.page_view.beginLiveSlot(request.worker_slot, request.identity.request_id, request.identity.request_generation);
+        self.page_view.storeLiveSlotCpu(request.worker_slot, request.identity.request_id, cpu_ns);
     }
 
     /// Whether a packet waits on the worker's end of its control socket.
@@ -1444,34 +1461,66 @@ pub const StubWorker = struct {
             try self.sendChunk(request, body, true);
     }
 
-    /// A whole response and then its completion, what a worker that served
-    /// `request` writes.
+    /// A whole response and then its `request_done`, what a worker that
+    /// served `request` sends.
     pub fn answer(self: *StubWorker, request: Dispatched, status: u16, body: []const u8) !void {
         try self.respond(request, status, body);
-        try self.publishCompletion(request, .{ .http_status = status });
+        try self.sendDone(request, .{ .http_status = status });
     }
 
-    /// Publishes the request's completion on the shared page and wakes the
-    /// lane through the completion eventfd.
-    pub fn publishCompletion(self: *StubWorker, request: Dispatched, completion: Completion) !void {
-        try self.page_view.publishWorkerCompletion(.{
-            .external_request_id = request.identity.request_id,
-            .request_lane_id = request.identity.request_lane_id,
-            .request_slot = request.identity.request_slot,
-            .request_generation = request.identity.request_generation,
-            .worker_id = self.key.worker_id,
-            .worker_generation = completion.worker_generation orelse self.key.worker_generation,
-            .status = @intFromEnum(completion.done),
-            .http_status = completion.http_status,
-        });
-        try page.signalCompletionEventfd(self.record.handle.completion_eventfd);
+    /// A whole response with its `request_done` as one batch packet: the
+    /// head, then the body with END_STREAM, or the head with END_STREAM for
+    /// an empty body, then the `request_done`.
+    pub fn answerInOneBatch(self: *StubWorker, request: Dispatched, status: u16, body: []const u8, done: Done) !void {
+        const headers = [_]ingress_channel.ResponseHeader{.{ .name = "content-type", .value = "text/plain" }};
+        var head_buffer: [256]u8 = undefined;
+        const head = try ingress_channel.encodeResponseHeadInto(&head_buffer, status, &headers);
+        const record = ingress_channel.encodeRequestDone(done.record());
+        var entries: [3]ingress_channel.BatchEntry = undefined;
+        var count: usize = 0;
+        entries[count] = .{
+            .descriptor = ingress_channel.Descriptor.responseHead(request.identity, request.stream_id, 0, 0, status, headers.len, body.len == 0),
+            .payload = head,
+        };
+        count += 1;
+        if (body.len != 0) {
+            entries[count] = .{
+                .descriptor = ingress_channel.Descriptor.responseChunk(request.identity, request.stream_id, 0, 0, true),
+                .payload = body,
+            };
+            count += 1;
+        }
+        entries[count] = .{
+            .descriptor = ingress_channel.Descriptor.requestDone(request.identity, request.stream_id),
+            .payload = std.mem.asBytes(&record),
+        };
+        count += 1;
+        try ingress_channel.sendDescriptorBatchPayloads(self.control, entries[0..count], self.send_scratch);
     }
 
-    /// Sets the completion ring's fatal flag, as a worker that overran its
-    /// ring does, and wakes the lane.
-    pub fn markCompletionRingFatal(self: *StubWorker) !void {
-        @atomicStore(u32, &self.page_view.completion_header.fatal, 1, .release);
-        try page.signalCompletionEventfd(self.record.handle.completion_eventfd);
+    /// `entries`, descriptors with their inline payloads, as one batch
+    /// packet of at most `ingress_channel.max_batch_descriptors`.
+    pub fn sendBatch(self: *StubWorker, entries: []const ingress_channel.BatchEntry) !void {
+        try ingress_channel.sendDescriptorBatchPayloads(self.control, entries, self.send_scratch);
+    }
+
+    /// The request's `request_done`, the last descriptor a worker sends for
+    /// it, as its own packet.
+    pub fn sendDone(self: *StubWorker, request: Dispatched, done: Done) !void {
+        try ingress_channel.sendRequestDone(self.control, request.identity, request.stream_id, done.record(), self.send_scratch);
+    }
+
+    /// A `request_done` descriptor whose payload is `payload` exactly, so a
+    /// test can send one the lane's decoder refuses.
+    pub fn sendRawDone(self: *StubWorker, request: Dispatched, payload: []const u8) !void {
+        const descriptor = ingress_channel.Descriptor.requestDone(request.identity, request.stream_id);
+        try ingress_channel.sendDescriptorPayload(self.control, descriptor, payload, self.send_scratch);
+    }
+
+    /// Wakes the lane through the worker's completion eventfd, as a worker
+    /// does when it frees room in its server-to-worker payload ring.
+    pub fn signalRingCredit(self: *StubWorker) void {
+        ingress_channel.notifyEventFd(self.record.handle.completion_eventfd);
     }
 
     /// Stores a read cursor of the server-to-worker ring 4 KiB past the start,
@@ -1492,30 +1541,6 @@ pub const StubWorker = struct {
     /// descriptors attached.
     pub fn sendControlWithDescriptors(self: *StubWorker, bytes: []const u8, descriptor_count: usize) !void {
         try sendWithEventfds(self.control, bytes, descriptor_count);
-    }
-
-    /// One datagram on the fault socket with `descriptor_count` fresh
-    /// descriptors attached.
-    pub fn sendFaultWithDescriptors(self: *StubWorker, bytes: []const u8, descriptor_count: usize) !void {
-        try sendWithEventfds(self.fault, bytes, descriptor_count);
-    }
-
-    /// An fs-fault request for `request`, on the fault socket.
-    pub fn sendFsFault(self: *StubWorker, fault_id: u64, request_id: u64, request_generation: u64, path: []const u8) !void {
-        try ipc.fs_fault.sendRequest(self.fault, self.send_scratch, .{
-            .fault_id = fault_id,
-            .request_id = request_id,
-            .request_generation = request_generation,
-            .worker_id = self.key.worker_id,
-            .worker_generation = self.key.worker_generation,
-            .path = path,
-        });
-    }
-
-    /// The lane's answer to an fs-fault request, waiting on the fault socket.
-    pub fn readFsFaultAnswer(self: *StubWorker) !ipc.fs_fault.ResponseWithFd {
-        var packet = try ipc.recvPacketWithFdsScratch(self.harness.gpa, self.fault, self.recv_scratch);
-        return ipc.fs_fault.decodeResponseFromPacket(&packet);
     }
 };
 
@@ -1690,11 +1715,10 @@ pub const Client = struct {
             };
             count += 1;
         }
-        var block = try self.encoder.encodeHeaders(self.harness.gpa, headers[0..count], 16 * 1024);
-        defer block.deinit(self.harness.gpa);
+        const block = try self.encoder.encodeHeaders(&client_encode_scratch, headers[0..count], 16 * 1024);
         const end_headers: u8 = 0x4;
         const end_stream: u8 = if (options.body_follows) 0 else 0x1;
-        try self.writeFrame(.headers, end_headers | end_stream, stream_id, block.bytes());
+        try self.writeFrame(.headers, end_headers | end_stream, stream_id, block);
         try self.trackStream(stream_id);
     }
 
@@ -1707,11 +1731,10 @@ pub const Client = struct {
     /// fields included, as a client the lane must refuse sends one. It ends
     /// the stream unless a body follows.
     pub fn requestFields(self: *Client, stream_id: u32, fields: []const hpack.Header, options: RequestOptions) !void {
-        var block = try self.encoder.encodeHeaders(self.harness.gpa, fields, 64 * 1024);
-        defer block.deinit(self.harness.gpa);
+        const block = try self.encoder.encodeHeaders(&client_encode_scratch, fields, 64 * 1024);
         const end_headers: u8 = 0x4;
         const end_stream: u8 = if (options.body_follows) 0 else 0x1;
-        try self.writeFrame(.headers, end_headers | end_stream, stream_id, block.bytes());
+        try self.writeFrame(.headers, end_headers | end_stream, stream_id, block);
         try self.trackStream(stream_id);
     }
 
@@ -1840,7 +1863,7 @@ pub const Client = struct {
                 // block split over CONTINUATION frames.
                 if (!header.flags.end_headers_or_ack)
                     return error.ContinuedResponseHeaderBlock;
-                var decoded = try self.decoder.decodeBlock(self.harness.gpa, payload, 64, 64 * 1024);
+                var decoded = try self.decoder.decodeBlock(self.harness.gpa, &client_decode_scratch, payload, 64, 64 * 1024);
                 defer decoded.deinit(self.harness.gpa);
                 const entry = self.streamEntry(header.stream_id) orelse return error.FrameOnUnknownStream;
                 for (decoded.headers) |field| {
@@ -1959,15 +1982,4 @@ fn reapChild(child_pid: std.posix.pid_t, kill_first: bool) void {
             std.log.warn("lane harness could not kill child {d}: {s}", .{ child_pid, @errorName(err) });
     var status: c_int = 0;
     _ = std.c.waitpid(child_pid, &status, 0);
-}
-
-var temp_path_sequence: std.atomic.Value(u64) = .init(0);
-
-/// A fresh path under /tmp for a stub worker's cgroup, never created: the
-/// pid separates test processes, the sequence the workers of one process.
-fn uniqueTempPath(buffer: []u8) ![]const u8 {
-    return std.fmt.bufPrint(buffer, "/tmp/collo-lane-harness-cgroup-{d}-{d}", .{
-        linux.getpid(),
-        temp_path_sequence.fetchAdd(1, .monotonic),
-    });
 }

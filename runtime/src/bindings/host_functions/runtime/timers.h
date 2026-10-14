@@ -14,11 +14,9 @@ namespace Collo::HostFunctions::Runtime {
 // Schedules the call frame's first argument with the arguments after the delay; returns the timer id as a number.
 JSC::EncodedJSValue scheduleTimer(JSC::JSGlobalObject*, JSC::ThrowScope&, const ActiveRequestRuntime&, JSC::CallFrame*,
     uint32_t delay_ms, bool repeats);
-// Schedules the call frame's first argument with the arguments after it. `this_value` must be a JSColloImmediate (a
-// RELEASE_ASSERT ends the process otherwise); it becomes the callback's receiver and the return value, carrying the
-// new id.
+// Schedules the call frame's first argument with the arguments after it; returns the immediate id as a number.
 JSC::EncodedJSValue scheduleImmediate(
-    JSC::JSGlobalObject*, JSC::ThrowScope&, const ActiveRequestRuntime&, JSC::CallFrame*, JSC::JSValue this_value);
+    JSC::JSGlobalObject*, JSC::ThrowScope&, const ActiveRequestRuntime&, JSC::CallFrame*);
 // scheduleTimer for a callback and arguments that do not come from a call frame. The caller keeps `args` rooted for
 // the call. Returns nullopt with the exception pending on failure.
 std::optional<JSC::EncodedJSValue> scheduleTimerValue(JSC::JSGlobalObject*, JSC::ThrowScope&,

@@ -1,13 +1,13 @@
-//! The flow-control credit a fetch body chunk carries from the transport
-//! engine until the consumer has taken the chunk, when it goes back to the
-//! engine. A `Body` stores a handle beside its chunk and hands it out on drain
-//! or release without interpreting it; the engine decides what a credit
-//! reopens (`Engine.tryReleaseFetchBodyCredit` in
+//! The flow-control credit a response chunk carries from the transport
+//! engine until the gateway loop has taken the chunk, when it goes back to
+//! the engine. A `ResponseQueue` stores a handle beside its chunk and hands it
+//! out on pull or release without interpreting it; the engine decides what a
+//! credit reopens (`Engine.releaseFetchBodyCredit` in
 //! `egress/client/engine/root.zig`).
 //!
-//! Only the gateway's bodies carry credits. A worker's chunks carry `.none`,
-//! because returning a body-pool extent to the gateway is the worker's
-//! flow-control signal, and the gateway turns that release into the credit.
+//! Credits never leave the gateway. The worker's flow-control signal is the
+//! body-pool extent it returns, which the gateway turns back into the credit
+//! of the chunk that extent held.
 
 const std = @import("std");
 

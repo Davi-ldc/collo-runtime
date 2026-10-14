@@ -1,7 +1,11 @@
 //! Settles a fetch task: stores its result, or only marks a canceled task
-//! done, and wakes the consumer with the task's ready token, all under
-//! `task.mutex`. A failure whose message cannot be allocated publishes a
-//! static message instead, so every path settles the task.
+//! done, under `task.mutex`, then wakes the gateway with the task's ready
+//! token. The wake runs after the mutex is released, so the gateway's wake
+//! path (its ready ring's lock, its eventfd) never nests inside a task's
+//! lock; the caller's task reference keeps the task alive across it. A
+//! failure whose message cannot be allocated publishes a static message
+//! instead, so every path settles the task. A task is settled once: the
+//! owner holds each fetch in exactly one place, and that place settles it.
 //!
 //! A hop the network policy refused (`transport.denialOf`) fails with
 //! `FailureCause.network_denied` and the text `collo_network.writeDenial`
@@ -10,17 +14,16 @@
 //! `fetch failed: <error name>`.
 
 const std = @import("std");
-const transport = @import("collo_egress_transport");
+const transport = @import("../transport/root.zig");
 const task_model = @import("../task.zig");
 
 const network = transport.network;
 
 pub fn completeCanceled(task: *task_model.Task, wake_ctx: ?*anyopaque, wake_fn: anytype) void {
     task.mutex.lock();
-    const ready = task.readyToken();
     task.done = true;
-    wake_fn(wake_ctx, .{ .task_ready = ready });
     task.mutex.unlock();
+    wake_fn(wake_ctx, .{ .task_ready = task.readyToken() });
 }
 
 pub fn publishFailure(task: *task_model.Task, err: anyerror, wake_ctx: ?*anyopaque, wake_fn: anytype) void {
@@ -29,10 +32,10 @@ pub fn publishFailure(task: *task_model.Task, err: anyerror, wake_ctx: ?*anyopaq
         return;
     }
     const message = std.fmt.allocPrint(task.resultAllocator(), "fetch failed: {s}", .{@errorName(err)}) catch {
-        publishResult(task, .{ .failure = .{ .message = "fetch failed: out of memory", .owned = false } }, wake_ctx, wake_fn);
+        publishResult(task, .{ .failure = .{ .message = "fetch failed: out of memory" } }, wake_ctx, wake_fn);
         return;
     };
-    publishResult(task, .{ .failure = .{ .message = message, .owned = true } }, wake_ctx, wake_fn);
+    publishResult(task, .{ .failure = .{ .message = message } }, wake_ctx, wake_fn);
 }
 
 pub fn publishResult(
@@ -42,13 +45,10 @@ pub fn publishResult(
     wake_fn: anytype,
 ) void {
     task.mutex.lock();
-    const ready = task.readyToken();
-    if (task.result) |*old_result|
-        old_result.deinit();
     task.result = result;
     task.done = true;
-    wake_fn(wake_ctx, .{ .task_ready = ready });
     task.mutex.unlock();
+    wake_fn(wake_ctx, .{ .task_ready = task.readyToken() });
 }
 
 /// The failure of a hop `denial` refused. Without the origin's text, which
@@ -57,7 +57,6 @@ pub fn publishResult(
 fn denialResult(task: *task_model.Task, denial: network.Denial) task_model.Result {
     const fallback: task_model.Result = .{ .failure = .{
         .message = denial.describe(),
-        .owned = false,
         .cause = .network_denied,
     } };
     const origin = hopOrigin(task.url) orelse return fallback;
@@ -66,7 +65,7 @@ fn denialResult(task: *task_model.Task, denial: network.Denial) task_model.Resul
     // `denial_bytes_max` is the longest text `writeDenial` writes.
     network.writeDenial(&writer, origin, denial) catch unreachable;
     const message = task.resultAllocator().dupe(u8, writer.buffered()) catch return fallback;
-    return .{ .failure = .{ .message = message, .owned = true, .cause = .network_denied } };
+    return .{ .failure = .{ .message = message, .cause = .network_denied } };
 }
 
 /// The origin a denial names for `url`: its scheme, its host as the URL

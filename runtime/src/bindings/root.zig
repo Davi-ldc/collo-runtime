@@ -20,9 +20,9 @@
 //! wrapper that releases the exception and returns `error.JsException`
 //! instead. Any other failing status becomes a Zig error through
 //! `statusToError`. The worker exports the `collo_runtime_*` functions the
-//! bridge calls (`worker/host/`, `worker/fs/index.zig`), returning the
-//! `status_*` values below, except `collo_runtime_mapping_release`, which
-//! lives here with the mappings it ends.
+//! bridge calls (`worker/host/`), returning the `status_*` values below,
+//! except `collo_runtime_mapping_release`, which lives here with the mappings
+//! it ends.
 //!
 //! The bridge reads no clock: which `ExecCtx` owns the running JavaScript is
 //! decided in the bridge (`collo_vm_set_turnless_exec_ctx` in `abi.h`), and
@@ -44,7 +44,6 @@ pub const Error = error{
     ResponseBodyTooLarge,
     ResponseHeaderCountTooLarge,
     ResponseHeaderBytesTooLarge,
-    NotFound,
 };
 
 // The `COLLO_STATUS_*` values of `abi.h`, which the worker's `collo_runtime_*`
@@ -55,6 +54,7 @@ pub const status_invalid_argument: RawStatus = 2;
 pub const status_js_exception: RawStatus = 3;
 pub const status_unsupported: RawStatus = 4;
 pub const status_out_of_memory: RawStatus = 5;
+/// The VM already holds a module pack (`Vm.registerModulePackMapping`).
 pub const status_already_exists: RawStatus = 6;
 pub const status_response_body_too_large: RawStatus = 7;
 pub const status_response_header_count_too_large: RawStatus = 8;
@@ -63,9 +63,16 @@ pub const status_response_header_bytes_too_large: RawStatus = 9;
 /// evaluation promise and reports its settlement through
 /// `collo_runtime_module_eval_settled`.
 pub const status_pending: RawStatus = 10;
-/// The thing asked for does not exist: a file the fs fault's host does not
-/// have, or no further entry of a listing.
-pub const status_not_found: RawStatus = 11;
+
+/// `COLLO_MODULE_PACK_MAX_BYTES` in `abi.h`, the largest module pack; it
+/// equals `max_pack_bytes` in `common/ipc/module_pack.zig`, which this module
+/// does not import, so `runtime/tests/contracts/abi.zig` compares the two.
+pub const module_pack_max_bytes: usize = 16 * 1024 * 1024;
+
+/// `COLLO_MODULE_PACK_MAX_MODULES` in `abi.h`, the most modules one pack
+/// holds; it equals `max_module_count` in `common/ipc/module_pack.zig`, and
+/// `runtime/tests/contracts/abi.zig` compares the two.
+pub const module_pack_max_modules: usize = 4096;
 
 /// `COLLO_OWNER_SLOT_COUNT` in `abi.h`: the owners a worker's VM can hold
 /// microtask owner tokens for at once, every request a worker runs at once,
@@ -106,7 +113,6 @@ pub const RawVm = opaque {};
 pub const RawRealm = opaque {};
 pub const RawValue = opaque {};
 pub const RawPromiseDeferred = opaque {};
-pub const RawCryptoJob = opaque {};
 pub const RawOwnedByteSegments = opaque {};
 pub const RawOwnedHeaderBlock = opaque {};
 pub const RawResponseBodyStream = opaque {};
@@ -248,17 +254,6 @@ pub const RequestCompletionToken = extern struct {
 pub const RequestIdentity = extern struct {
     request_id: u64,
     request_generation: u64,
-};
-
-/// The `COLLO_MODULE_LIFETIME_*` values of `ColloModuleLifetime`.
-pub const ModuleLifetime = enum(u8) {
-    evictable = 0,
-    permanent = 1,
-};
-
-pub const ModuleEvictStats = extern struct {
-    sources_removed: usize = 0,
-    namespaces_removed: usize = 0,
 };
 
 /// Mirror of `ColloRequestInit`, the input of `Realm.requestValue`. Every
@@ -566,40 +561,6 @@ pub const HeapStats = extern struct {
     extra_memory_bytes: u64 = 0,
 };
 
-/// The `COLLO_FS_ROUTE_*` values of `ColloFsRouteClass`: the namespace
-/// `collo_runtime_fs_route` sorts a path into.
-pub const FsRouteClass = enum(u8) {
-    none = 0,
-    tmp = 1,
-    deploy_file = 2,
-    deploy_dir = 3,
-};
-
-/// Mirror of `ColloFsRoute`, the output of `collo_runtime_fs_route`, which
-/// the worker implements. Cleared, it names no namespace.
-pub const FsRoute = extern struct {
-    size: u64 = 0,
-    mtime_ms: u64 = 0,
-    normalized_len: u32 = 0,
-    /// A `FsRouteClass`.
-    route_class: u8 = @intFromEnum(FsRouteClass.none),
-    reserved0: u8 = 0,
-    reserved1: u16 = 0,
-};
-
-/// `COLLO_FS_PATH_BYTES_MAX`: a normalized path buffer with its trailing NUL,
-/// PATH_MAX.
-pub const fs_path_bytes_max: usize = 4096;
-/// `COLLO_FS_NAME_BYTES_MAX`: the longest name a listing of the tree returns.
-pub const fs_name_bytes_max: usize = 1024;
-/// `COLLO_FS_READDIR_CURSOR_START`: the cursor that starts a listing.
-pub const fs_readdir_cursor_start: u64 = std.math.maxInt(u64);
-
-comptime {
-    if (fs_path_bytes_max != std.posix.PATH_MAX)
-        @compileError("COLLO_FS_PATH_BYTES_MAX is PATH_MAX");
-}
-
 extern fn collo_vm_create(flags: u32, out_vm: *?*RawVm) RawStatus;
 extern fn collo_vm_destroy(vm: *RawVm) void;
 extern fn collo_vm_main_realm(vm: *RawVm) ?*RawRealm;
@@ -643,17 +604,8 @@ extern fn collo_set_memory_status_override(limit_bytes: u64, memory_current_fd: 
 extern fn collo_clear_memory_status_override() void;
 extern fn collo_memory_status(out: *MemoryStatus) RawStatus;
 
-extern fn collo_tool_generate_module_bytecode(
-    source: RawBuffer,
-    specifier: RawString,
-    out_bytes: *?[*]u8,
-    out_len: *usize,
-) RawStatus;
-extern fn collo_tool_bytecode_release(bytes: ?[*]u8) void;
-
-extern fn collo_module_register_pack(vm: *RawVm, pack: Mapping, lifetime: u8) RawStatus;
-extern fn collo_module_evict_specifier(vm: *RawVm, specifier: RawString, out_stats: *ModuleEvictStats) RawStatus;
-extern fn collo_module_evict_lifetime(vm: *RawVm, lifetime: u8, out_stats: *ModuleEvictStats) RawStatus;
+extern fn collo_module_register_pack(vm: *RawVm, pack: Mapping) RawStatus;
+extern fn collo_module_unregister_pack(vm: *RawVm) RawStatus;
 extern fn collo_module_evaluate(realm: *RawRealm, specifier: RawString, out_exception: *?*RawValue) RawStatus;
 extern fn collo_module_get_export(realm: *RawRealm, specifier: RawString, export_name: RawString, out_value: *?*RawValue, out_exception: *?*RawValue) RawStatus;
 
@@ -666,7 +618,7 @@ extern fn collo_vm_pump_deferred_work(vm: *RawVm, exec_ctx: *ExecCtx, out_state:
 
 extern fn collo_value_retain(value: *RawValue, out_value: *?*RawValue) RawStatus;
 extern fn collo_value_release(value: *RawValue) void;
-extern fn collo_value_is_callable(vm: *RawVm, value: *const RawValue, out_is_callable: *u8) RawStatus;
+extern fn collo_value_kind(vm: *RawVm, value: *const RawValue, out_kind: *u8) RawStatus;
 extern fn collo_value_is_thenable(realm: *RawRealm, value: *const RawValue, out_is_thenable: *u8, out_exception: *?*RawValue) RawStatus;
 extern fn collo_promise_await_sync(realm: *RawRealm, promise: *const RawValue, out_value: *?*RawValue, out_exception: *?*RawValue) RawStatus;
 extern fn collo_promise_deferred_resolve(vm: *RawVm, deferred: *RawPromiseDeferred, value: *const RawValue, out_exception: *?*RawValue) RawStatus;
@@ -674,9 +626,6 @@ extern fn collo_promise_deferred_reject(vm: *RawVm, deferred: *RawPromiseDeferre
 extern fn collo_promise_deferred_realm(deferred: *const RawPromiseDeferred) ?*RawRealm;
 extern fn collo_promise_deferred_release(deferred: *RawPromiseDeferred) void;
 extern fn collo_request_task_settle_thenable(realm: *RawRealm, token: *const RequestCompletionToken, value: *const RawValue, out_exception: *?*RawValue) RawStatus;
-extern fn collo_crypto_job_run(job: *RawCryptoJob) void;
-extern fn collo_crypto_job_settle(vm: *RawVm, job: *RawCryptoJob, out_exception: *?*RawValue) RawStatus;
-extern fn collo_crypto_job_destroy(job: *RawCryptoJob) void;
 extern fn collo_json_parse_utf8(realm: *RawRealm, source: RawString, out_value: *?*RawValue, out_exception: *?*RawValue) RawStatus;
 
 extern fn collo_undefined(vm: *RawVm, out_value: *?*RawValue) RawStatus;
@@ -730,7 +679,6 @@ extern fn collo_response_body_stream_chunk(stream: *RawResponseBodyStream, chunk
 extern fn collo_response_body_stream_cancel(stream: *RawResponseBodyStream, reason: u32, out_exception: *?*RawValue) RawStatus;
 extern fn collo_response_body_stream_destroy(stream: *RawResponseBodyStream) void;
 extern fn collo_webapi_cleanup_request(vm: *RawVm, request_id: u64) RawStatus;
-extern fn collo_webapi_immediate_mark_destroyed(vm: *RawVm, value: *const RawValue) RawStatus;
 
 comptime {
     if (@sizeOf(Mapping) != 16)
@@ -767,12 +715,6 @@ comptime {
         @compileError("RequestIdentity.request_id offset mismatch");
     if (@offsetOf(RequestIdentity, "request_generation") != 8)
         @compileError("RequestIdentity.request_generation offset mismatch");
-    if (@sizeOf(ModuleEvictStats) != 16)
-        @compileError("ModuleEvictStats ABI size mismatch");
-    if (@offsetOf(ModuleEvictStats, "sources_removed") != 0)
-        @compileError("ModuleEvictStats.sources_removed offset mismatch");
-    if (@offsetOf(ModuleEvictStats, "namespaces_removed") != 8)
-        @compileError("ModuleEvictStats.namespaces_removed offset mismatch");
     if (@sizeOf(NameValuePair) != 32)
         @compileError("NameValuePair ABI size mismatch");
     if (@offsetOf(NameValuePair, "name") != 0)
@@ -933,20 +875,6 @@ comptime {
         @compileError("HeapStats.size_bytes offset mismatch");
     if (@offsetOf(HeapStats, "extra_memory_bytes") != 8)
         @compileError("HeapStats.extra_memory_bytes offset mismatch");
-    if (@sizeOf(FsRoute) != 24)
-        @compileError("FsRoute ABI size mismatch");
-    if (@offsetOf(FsRoute, "size") != 0)
-        @compileError("FsRoute.size offset mismatch");
-    if (@offsetOf(FsRoute, "mtime_ms") != 8)
-        @compileError("FsRoute.mtime_ms offset mismatch");
-    if (@offsetOf(FsRoute, "normalized_len") != 16)
-        @compileError("FsRoute.normalized_len offset mismatch");
-    if (@offsetOf(FsRoute, "route_class") != 20)
-        @compileError("FsRoute.route_class offset mismatch");
-    if (@offsetOf(FsRoute, "reserved0") != 21)
-        @compileError("FsRoute.reserved0 offset mismatch");
-    if (@offsetOf(FsRoute, "reserved1") != 22)
-        @compileError("FsRoute.reserved1 offset mismatch");
 }
 
 pub const OwnedString = struct {
@@ -1057,6 +985,20 @@ pub const DeferredWorkState = struct {
             .pending_imminent = (raw & 0x2) != 0,
         };
     }
+};
+
+/// The `COLLO_VALUE_KIND_*` values of `ColloValueKind`: a value's type as
+/// `typeof` names it, with null apart and every callable object a function.
+pub const ValueKind = enum(u8) {
+    undefined = 0,
+    null = 1,
+    boolean = 2,
+    number = 3,
+    bigint = 4,
+    string = 5,
+    symbol = 6,
+    object = 7,
+    function = 8,
 };
 
 pub const BoolResult = union(enum) {
@@ -1263,33 +1205,36 @@ pub const Vm = struct {
         try statusToError(collo_vm_install_process(self.ptr()));
     }
 
+    /// Opens `node:fs` for the whole process and installs it on every realm
+    /// (`collo_vm_enable_node_fs_for_worker` in `abi.h` owns the contract).
+    /// Call it only once the process is inside the worker's chroot and seccomp
+    /// filter, or in a test process; nothing closes it again.
     pub fn enableNodeFsForWorker(self: *Vm) Error!void {
         try statusToError(collo_vm_enable_node_fs_for_worker(self.ptr()));
     }
 
-    /// Registers a pack of evictable ES modules held in memory, as
-    /// `registerModulePackWithLifetime` does.
-    pub fn registerModulePack(self: *Vm, pack: []const u8) Error!void {
-        try self.registerModulePackWithLifetime(pack, .evictable);
-    }
-
-    /// Registers the modules of a pack mapping and consumes `pack` on every
-    /// path, error included: the bridge keeps it while any registered module
-    /// reads from it and releases it otherwise, so the caller must not read
-    /// `pack` afterwards. Workers load their definition's pack this way: every
-    /// worker of a definition maps the same sealed memfd, and providers that
-    /// read the mapping in place keep those pages in the shared page cache. The
-    /// `local-e2e` benchmark "private bytes per byte of module pack" measures
-    /// what a worker pays per pack byte.
-    pub fn registerModulePackMapping(self: *Vm, pack: Mapping, lifetime: ModuleLifetime) Error!void {
-        try statusToError(collo_module_register_pack(self.ptr(), pack, @intFromEnum(lifetime)));
+    /// Makes `pack`, a mapping of a sealed module pack
+    /// (`common/ipc/module_pack.zig`), the VM's module source, and consumes
+    /// it on every path, error included. On success the mapping stays valid
+    /// until `unregisterModulePack` or `destroy`, so a caller that parsed it
+    /// may keep reading those bytes until then; on failure it is already
+    /// released. Workers load their definition's artifact this way: every
+    /// worker of a definition maps the same sealed memfd, and the engine
+    /// wraps each source in place, so those pages stay in the shared page
+    /// cache. The `local-e2e` benchmark "private bytes per byte of module
+    /// pack" measures what a worker pays per pack byte. Fails with
+    /// `error.AlreadyExists` when the VM holds a pack and
+    /// `error.InvalidArgument` for a header the format refuses.
+    pub fn registerModulePackMapping(self: *Vm, pack: Mapping) Error!void {
+        try statusToError(collo_module_register_pack(self.ptr(), pack));
     }
 
     /// Registers a pack held in memory by sealing it into a memfd and mapping
     /// that, so the bridge sees one representation of a pack wherever it came
     /// from. For callers that own bytes rather than an fd: the zygote's warmup
-    /// pack and tests.
-    pub fn registerModulePackWithLifetime(self: *Vm, pack: []const u8, lifetime: ModuleLifetime) Error!void {
+    /// pack, tests and benchmarks. The VM keeps its own mapping, so `pack` is
+    /// the caller's again on return.
+    pub fn registerModulePack(self: *Vm, pack: []const u8) Error!void {
         if (pack.len == 0) return error.InvalidArgument;
         const fd = try sealedMemfdFromBytes(pack);
         defer std.posix.close(fd);
@@ -1297,19 +1242,15 @@ pub const Vm = struct {
             error.OutOfMemory => error.OutOfMemory,
             else => error.Internal,
         };
-        try self.registerModulePackMapping(mapping, lifetime);
+        try self.registerModulePackMapping(mapping);
     }
 
-    pub fn evictModuleSpecifier(self: *Vm, specifier: []const u8) Error!ModuleEvictStats {
-        var stats: ModuleEvictStats = .{};
-        try statusToError(collo_module_evict_specifier(self.ptr(), borrowedString(specifier), &stats));
-        return stats;
-    }
-
-    pub fn evictModulesByLifetime(self: *Vm, lifetime: ModuleLifetime) Error!ModuleEvictStats {
-        var stats: ModuleEvictStats = .{};
-        try statusToError(collo_module_evict_lifetime(self.ptr(), @intFromEnum(lifetime), &stats));
-        return stats;
+    /// Drops the VM's pack, as the zygote does after its warmup so that no
+    /// worker inherits a registration; a module already evaluated stays in
+    /// the engine's module registry. Fails with `error.InvalidArgument` when
+    /// the VM holds no pack.
+    pub fn unregisterModulePack(self: *Vm) Error!void {
+        try statusToError(collo_module_unregister_pack(self.ptr()));
     }
 
     pub fn turnEnter(self: *Vm, exec_ctx: *ExecCtx) Error!void {
@@ -1352,10 +1293,11 @@ pub const Vm = struct {
 
     /// Registers `wakeup_fd`, which the VM writes after setting the pending
     /// flag whenever deferred work is scheduled, including from the wasm
-    /// worklist thread. It wakes a worker loop blocked in its ring wait, the
-    /// job a RunLoop does elsewhere. A new registration replaces the old
-    /// one; a negative fd unregisters, and must come before the fd is closed,
-    /// as `Runtime.deinit` does.
+    /// worklist thread. It wakes a worker loop blocked in its `ppoll` wait
+    /// (`worker/scheduler/poll_backend.zig`), the job a RunLoop does
+    /// elsewhere. A new registration replaces the old one; a negative fd
+    /// unregisters, and must come before the fd is closed, as
+    /// `Runtime.deinit` does.
     pub fn setDeferredWorkWakeupFd(self: *Vm, wakeup_fd: std.posix.fd_t) Error!void {
         try statusToError(collo_vm_set_deferred_work_wakeup_fd(self.ptr(), wakeup_fd));
     }
@@ -1384,10 +1326,16 @@ pub const Vm = struct {
         };
     }
 
+    /// The type of `value` (`collo_value_kind` in `abi.h`). Runs no
+    /// JavaScript, so no getter or proxy trap observes it.
+    pub fn valueKind(self: *Vm, value: *const Value) Error!ValueKind {
+        var out_kind: u8 = 0;
+        try statusToError(collo_value_kind(self.ptr(), try value.ptrConst(), &out_kind));
+        return std.enums.fromInt(ValueKind, out_kind) orelse error.Internal;
+    }
+
     pub fn isCallable(self: *Vm, value: *const Value) Error!bool {
-        var out_is_callable: u8 = 0;
-        try statusToError(collo_value_is_callable(self.ptr(), try value.ptrConst(), &out_is_callable));
-        return out_is_callable != 0;
+        return try self.valueKind(value) == .function;
     }
 
     pub fn promiseDeferredResolve(self: *Vm, deferred: *RawPromiseDeferred, value: *const Value) Error!VoidResult {
@@ -1405,18 +1353,6 @@ pub const Vm = struct {
     pub fn promiseDeferredReject(self: *Vm, deferred: *RawPromiseDeferred, reason: *const Value) Error!VoidResult {
         var exception: ?*RawValue = null;
         return switch (collo_promise_deferred_reject(self.ptr(), deferred, try reason.ptrConst(), &exception)) {
-            status_ok => .success,
-            status_js_exception => .{ .exception = try Value.fromRawOwned(exception) },
-            else => |status| {
-                try statusToError(status);
-                unreachable;
-            },
-        };
-    }
-
-    pub fn cryptoJobSettle(self: *Vm, job: *RawCryptoJob) Error!VoidResult {
-        var exception: ?*RawValue = null;
-        return switch (collo_crypto_job_settle(self.ptr(), job, &exception)) {
             status_ok => .success,
             status_js_exception => .{ .exception = try Value.fromRawOwned(exception) },
             else => |status| {
@@ -1456,10 +1392,6 @@ pub const Vm = struct {
 
     pub fn cleanupWebApiRequest(self: *Vm, request_id: u64) Error!void {
         try statusToError(collo_webapi_cleanup_request(self.ptr(), request_id));
-    }
-
-    pub fn markImmediateDestroyed(self: *Vm, value: *const Value) Error!void {
-        try statusToError(collo_webapi_immediate_mark_destroyed(self.ptr(), try value.ptrConst()));
     }
 
     pub fn exceptionFormat(self: *Vm, exception: *const Value) Error!OwnedString {
@@ -1896,14 +1828,6 @@ pub fn releasePromiseDeferred(raw: *RawPromiseDeferred) void {
     collo_promise_deferred_release(raw);
 }
 
-pub fn runCryptoJob(raw: *RawCryptoJob) void {
-    collo_crypto_job_run(raw);
-}
-
-pub fn destroyCryptoJob(raw: *RawCryptoJob) void {
-    collo_crypto_job_destroy(raw);
-}
-
 // Process-wide engine settings, not scoped to a `Vm`; `abi.h` says which
 // thread may call each one.
 
@@ -1969,36 +1893,6 @@ pub fn memoryStatus() Error!MemoryStatus {
     return status;
 }
 
-/// Serializes one ESM module's CachedBytecode blob, for a module pack's
-/// bytecode segment, through the process-wide tooling VM
-/// (`jsc/runtime/tooling_bytecode.cpp`). `specifier` must be the exact pack
-/// specifier the worker's loader registers the module under, because the
-/// blob is built from a source provider that mirrors the loader's;
-/// `tooling_bytecode.cpp` lists what has to match. The caller owns the
-/// returned bytes, allocated with `allocator`. Fails with
-/// `error.InvalidArgument` for an empty source or specifier, with
-/// `error.Internal` when parsing or serialization fails, and with
-/// `error.OutOfMemory`.
-pub fn generateModuleBytecodeAlloc(
-    allocator: std.mem.Allocator,
-    specifier: []const u8,
-    source: []const u8,
-) Error![]u8 {
-    var out_ptr: ?[*]u8 = null;
-    var out_len: usize = 0;
-    try statusToError(collo_tool_generate_module_bytecode(
-        borrowedBuffer(source),
-        borrowedString(specifier),
-        &out_ptr,
-        &out_len,
-    ));
-    const bytes = out_ptr orelse return error.Internal;
-    defer collo_tool_bytecode_release(bytes);
-    const copy = try allocator.alloc(u8, out_len);
-    @memcpy(copy, bytes[0..out_len]);
-    return copy;
-}
-
 fn borrowedString(value: []const u8) RawString {
     return .{
         .ptr = if (value.len == 0) null else value.ptr,
@@ -2021,9 +1915,9 @@ pub fn rawBufferSlice(value: RawBuffer) []const u8 {
     return if (value.ptr) |ptr| ptr[0..value.len] else "";
 }
 
-/// Seals `bytes` into a read-only memfd with the seal set route packs travel
-/// with (`F_SEAL_WRITE|SHRINK|GROW|SEAL`), so a mapping of it carries the
-/// same guarantee as a route pack's: its bytes cannot change.
+/// Seals `bytes` into a read-only memfd with the seal set definition
+/// artifacts travel with (`F_SEAL_WRITE|SHRINK|GROW|SEAL`), so a mapping of
+/// it carries the same guarantee as an artifact's: its bytes cannot change.
 fn sealedMemfdFromBytes(bytes: []const u8) Error!std.posix.fd_t {
     const linux = std.os.linux;
     const fd = std.posix.memfd_create(
@@ -2064,7 +1958,6 @@ fn statusToError(status: RawStatus) Error!void {
         status_response_body_too_large => return error.ResponseBodyTooLarge,
         status_response_header_count_too_large => return error.ResponseHeaderCountTooLarge,
         status_response_header_bytes_too_large => return error.ResponseHeaderBytesTooLarge,
-        status_not_found => return error.NotFound,
         else => return error.Internal,
     }
 }

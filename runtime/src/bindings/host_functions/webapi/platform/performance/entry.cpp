@@ -101,7 +101,7 @@ static std::optional<ParsedMarkOptions> parseMarkOptions(
     JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSColloPerformance& performance, JSValue options_value)
 {
     ParsedMarkOptions options;
-    options.start_time = performance.nowMs(global_object);
+    options.start_time = performance.nowMs();
     if (options_value.isUndefinedOrNull())
         return options;
 
@@ -174,7 +174,7 @@ static double nonNegativeDuration(double start, double end) { return std::max(0.
 static std::optional<ParsedMeasureOptions> parseMeasureOptions(JSC::JSGlobalObject* global_object,
     JSC::ThrowScope& scope, JSColloPerformance& performance, JSValue start_or_options, JSValue end_mark)
 {
-    const double now = performance.nowMs(global_object);
+    const double now = performance.nowMs();
     ParsedMeasureOptions options;
     options.duration = now;
 
@@ -385,7 +385,6 @@ JSC_DEFINE_HOST_FUNCTION(performanceMark, (JSC::JSGlobalObject * global_object, 
         return {};
     if (!requireArgumentCount(global_object, scope, call_frame, 1, "performance.mark requires a name"_s))
         return {};
-    performance->ensureTimeOriginForAccess();
 
     auto name = argumentToWebApiString(global_object, scope, call_frame, 0);
     RETURN_IF_EXCEPTION(scope, {});
@@ -410,7 +409,6 @@ JSC_DEFINE_HOST_FUNCTION(performanceMeasure, (JSC::JSGlobalObject * global_objec
         return {};
     if (!requireArgumentCount(global_object, scope, call_frame, 1, "performance.measure requires a name"_s))
         return {};
-    performance->ensureTimeOriginForAccess();
 
     auto name = argumentToWebApiString(global_object, scope, call_frame, 0);
     RETURN_IF_EXCEPTION(scope, {});
@@ -434,7 +432,6 @@ JSC_DEFINE_HOST_FUNCTION(performanceClearMarks, (JSC::JSGlobalObject * global_ob
     RETURN_IF_EXCEPTION(scope, {});
     if (!performance)
         return {};
-    performance->ensureTimeOriginForAccess();
     if (call_frame->argument(0).isUndefined())
         performance->clearEntries(std::nullopt, PerformanceEntryKind::Mark);
     else {
@@ -453,7 +450,6 @@ JSC_DEFINE_HOST_FUNCTION(performanceClearMeasures, (JSC::JSGlobalObject * global
     RETURN_IF_EXCEPTION(scope, {});
     if (!performance)
         return {};
-    performance->ensureTimeOriginForAccess();
     if (call_frame->argument(0).isUndefined())
         performance->clearEntries(std::nullopt, PerformanceEntryKind::Measure);
     else {

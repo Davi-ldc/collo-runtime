@@ -19,12 +19,10 @@ bench("globals.lookup-installed-webapis", iterations => {
     checksum += typeof removeEventListener === "function";
     checksum += typeof dispatchEvent === "function";
     checksum += globalThis.onerror === null || typeof globalThis.onerror === "function";
-    checksum += globalThis.onmessage === null || typeof globalThis.onmessage === "function";
     checksum += typeof Performance === "function";
     checksum += typeof PerformanceEntry === "function";
     checksum += typeof PerformanceMark === "function";
     checksum += typeof PerformanceMeasure === "function";
-    checksum += typeof PerformanceTiming === "function";
     checksum += typeof PerformanceObserver === "function";
     checksum += typeof PerformanceObserverEntryList === "function";
     checksum += typeof performance === "object";

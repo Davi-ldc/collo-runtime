@@ -1,9 +1,12 @@
-//! The worker sandbox without a full worker: the environment allowlist and
-//! clearing, tmp root validation, and the seccomp policy, checked both in the
-//! emitted program and by installing it in forked children that probe what it
-//! allows, denies and filters by argument, and whether a thread created before
-//! it can still start, and name itself, under it. The `zygote-integration`
-//! lane covers a real worker booting into the sandbox.
+//! The worker sandbox without a full worker: the root a forked child builds
+//! inside fresh namespaces (its layout and modes, read-only but for `/tmp`,
+//! its mounts' flags, which the capability drop alone keeps from any
+//! remount, and its absence from the host's `/tmp`), and the seccomp filter,
+//! checked in the emitted program and by installing it in forked children
+//! that probe what it allows, denies and filters by argument, and whether a
+//! thread created before it can still start, and name itself, under it. The
+//! `zygote-integration` lane covers a real worker booting into the sandbox
+//! and its root as `node:fs` sees it.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -12,101 +15,219 @@ const support = @import("zygote_support");
 
 const sandbox = zygote.worker_boot.sandbox;
 
-extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern fn pthread_attr_setaffinity_np(
     attr: *std.c.pthread_attr_t,
     cpuset_size: usize,
     cpuset: *const std.os.linux.cpu_set_t,
 ) c_int;
 
-test "worker environment allowlist excludes server secrets and trace controls" {
-    const retained = zygote.child_boot.worker_environment_retained_names;
-    try std.testing.expectEqual(@as(usize, 2), retained.len);
-    try std.testing.expect(containsRetainedEnv(&retained, "TZ"));
-    try std.testing.expect(containsRetainedEnv(&retained, "LANG"));
-    try std.testing.expect(!containsRetainedEnv(&retained, "COLLO_ORACLE_TOKEN"));
-    try std.testing.expect(!containsRetainedEnv(&retained, "COLLO_BENCH_TRACE_REQUEST"));
-    try std.testing.expect(!containsRetainedEnv(&retained, "SSL_CERT_FILE"));
+/// What the child of the root test found, one bit per probe.
+const RootProbe = enum(u4) {
+    working_directory_is_task_root,
+    root_is_private_directory,
+    task_root_is_read_only_directory,
+    root_lists_tmp_and_var,
+    create_in_root_is_erofs,
+    mkdir_in_var_is_erofs,
+    unlink_in_task_root_is_erofs,
+    tmp_is_writable,
+    rename_out_of_tmp_is_exdev,
+    host_file_is_absent,
+    marker_written,
+    root_mount_is_read_only_nosuid_nodev_noexec,
+    tmp_mount_is_writable_nosuid_nodev_noexec,
+    root_remount_is_eperm,
+    tmp_remount_is_eperm,
+};
+
+comptime {
+    // The probes report through a u16 whose all-ones value means a skip.
+    std.debug.assert(@typeInfo(RootProbe).@"enum".fields.len < 16);
 }
 
-test "worker environment policy clears inherited secrets in child" {
+/// The kernel's `struct statfs` on the 64-bit targets, for the raw `statfs`.
+const Statfs = extern struct {
+    f_type: c_long,
+    f_bsize: c_long,
+    f_blocks: c_ulong,
+    f_bfree: c_ulong,
+    f_bavail: c_ulong,
+    f_files: c_ulong,
+    f_ffree: c_ulong,
+    f_fsid: [2]c_int,
+    f_namelen: c_long,
+    f_frsize: c_long,
+    f_flags: c_long,
+    f_spare: [4]c_long,
+};
+
+/// The mount flags `statfs` reports in `f_flags` (the kernel's `ST_*`).
+const st_rdonly: c_long = 0x1;
+const st_nosuid: c_long = 0x2;
+const st_nodev: c_long = 0x4;
+const st_noexec: c_long = 0x8;
+
+test "a sandboxed child's root holds tmp and var/task, is read-only but for /tmp, keeps nosuid, nodev and noexec on both, cannot be remounted without capabilities, and leaves the host's /tmp alone" {
+    const skip_result: u16 = 0xffff;
+    const expected_result: u16 = (1 << @typeInfo(RootProbe).@"enum".fields.len) - 1;
+    // The child writes this name into its /tmp, which must stay out of the
+    // host's.
+    const marker_path = try support.makeTempPath(std.testing.allocator, "collo-sandbox-marker");
+    defer std.testing.allocator.free(marker_path);
+    const marker_path_z = try std.testing.allocator.dupeZ(u8, marker_path);
+    defer std.testing.allocator.free(marker_path_z);
     const pipe_pair = try std.posix.pipe2(.{ .CLOEXEC = true });
     defer std.posix.close(pipe_pair[0]);
 
     const pid = try std.posix.fork();
     if (pid == 0) {
         std.posix.close(pipe_pair[0]);
-        if (setenv("COLLO_ORACLE_TOKEN", "secret", 1) != 0)
-            childExit(111);
-        if (setenv("SSL_CERT_FILE", "/tmp/evil-ca.pem", 1) != 0)
-            childExit(112);
-        if (setenv("COLLO_BENCH_TRACE_REQUEST", "1", 1) != 0)
-            childExit(113);
-
-        zygote.child_boot.applyWorkerEnvironmentPolicy() catch childExit(114);
-
-        const tz = std.posix.getenv("TZ") orelse childExit(115);
-        const lang = std.posix.getenv("LANG") orelse childExit(116);
-        const ok = std.mem.eql(u8, tz, "UTC") and
-            std.mem.eql(u8, lang, "C.UTF-8") and
-            std.posix.getenv("COLLO_ORACLE_TOKEN") == null and
-            std.posix.getenv("SSL_CERT_FILE") == null and
-            std.posix.getenv("COLLO_BENCH_TRACE_REQUEST") == null;
-        const byte: [1]u8 = .{if (ok) 1 else 0};
-        _ = std.posix.write(pipe_pair[1], &byte) catch childExit(117);
-        childExit(if (ok) 0 else 118);
+        rootProbeChild(pipe_pair[1], marker_path_z, skip_result);
     }
 
     std.posix.close(pipe_pair[1]);
-    var result: [1]u8 = undefined;
-    const read_len = try std.posix.read(pipe_pair[0], &result);
-    try std.testing.expectEqual(@as(usize, 1), read_len);
-    try std.testing.expectEqual(@as(u8, 1), result[0]);
-
+    var result_bytes: [2]u8 = undefined;
+    const read_len = try std.posix.read(pipe_pair[0], &result_bytes);
     const wait = std.posix.waitpid(pid, 0);
     try std.testing.expect(std.c.W.IFEXITED(wait.status));
     try std.testing.expectEqual(@as(u32, 0), std.c.W.EXITSTATUS(wait.status));
+    try std.testing.expectEqual(@as(usize, 2), read_len);
+    const result = std.mem.readInt(u16, &result_bytes, .little);
+    if (result == skip_result)
+        return error.SkipZigTest;
+    inline for (@typeInfo(RootProbe).@"enum".fields) |field| {
+        if (result & (@as(u16, 1) << field.value) == 0)
+            std.debug.print("the sandboxed root failed the probe {s}\n", .{field.name});
+    }
+    try std.testing.expectEqual(expected_result, result);
+    try std.testing.expectError(error.FileNotFound, std.fs.accessAbsolute(marker_path, .{}));
 }
 
-test "worker sandbox validates tmp root directory fd" {
-    const root_path = try support.makeTempPath(std.testing.allocator, "collo-sandbox-root");
-    defer std.testing.allocator.free(root_path);
-    defer support.cleanupTmpRoot(root_path);
+/// Enters fresh namespaces, builds the worker's root as a worker child does
+/// (`applyPreThread`) and reports what it finds there, its mounts' flags
+/// and whether it can remount them included.
+fn rootProbeChild(result_fd: std.posix.fd_t, marker_path: [*:0]const u8, skip_result: u16) noreturn {
+    const linux = std.os.linux;
+    sandbox.applyPostForkNamespaces() catch |err| switch (err) {
+        // No unprivileged user namespaces on this host.
+        error.PermissionDenied, error.UnsupportedKernel => writeRootProbeResult(result_fd, skip_result),
+        else => childExit(191),
+    };
+    sandbox.applyPreThread(.{ .tmpfs_size_bytes = 1024 * 1024 }) catch childExit(192);
 
-    try std.posix.mkdir(root_path, 0o700);
-    var root = try std.fs.openDirAbsolute(root_path, .{
-        .iterate = true,
-        .no_follow = true,
-    });
+    var result: u16 = 0;
+    var cwd_buffer: [64]u8 = undefined;
+    // A failed read leaves the probe's bit clear.
+    const cwd = std.posix.getcwd(&cwd_buffer) catch "";
+    if (std.mem.eql(u8, cwd, sandbox.task_root))
+        result |= rootProbeBit(.working_directory_is_task_root);
+    if (directoryMode("/") == 0o700)
+        result |= rootProbeBit(.root_is_private_directory);
+    if (directoryMode(sandbox.task_root) == 0o755)
+        result |= rootProbeBit(.task_root_is_read_only_directory);
+    if (rootListsTmpAndVar())
+        result |= rootProbeBit(.root_lists_tmp_and_var);
+    const create_rc = linux.openat(linux.AT.FDCWD, "/created", .{ .ACCMODE = .WRONLY, .CREAT = true, .CLOEXEC = true }, 0o644);
+    if (linux.E.init(create_rc) == .ROFS)
+        result |= rootProbeBit(.create_in_root_is_erofs);
+    if (linux.E.init(linux.mkdirat(linux.AT.FDCWD, "/var/made", 0o755)) == .ROFS)
+        result |= rootProbeBit(.mkdir_in_var_is_erofs);
+    if (linux.E.init(linux.unlinkat(linux.AT.FDCWD, "/var/task/missing", 0)) == .ROFS)
+        result |= rootProbeBit(.unlink_in_task_root_is_erofs);
+    if (writeFile("/tmp/probe"))
+        result |= rootProbeBit(.tmp_is_writable);
+    if (linux.E.init(linux.renameat(linux.AT.FDCWD, "/tmp/probe", linux.AT.FDCWD, "/var/task/probe")) == .XDEV)
+        result |= rootProbeBit(.rename_out_of_tmp_is_exdev);
+    var stat: linux.Stat = undefined;
+    if (linux.E.init(linux.fstatat(linux.AT.FDCWD, "/etc/passwd", &stat, 0)) == .NOENT)
+        result |= rootProbeBit(.host_file_is_absent);
+    if (writeFile(marker_path))
+        result |= rootProbeBit(.marker_written);
+    // The bind gave `/tmp` the tmpfs mount's flags, and the remount kept
+    // them on the root alongside read-only.
+    if (mountFlagsAre("/", st_rdonly | st_nosuid | st_nodev | st_noexec))
+        result |= rootProbeBit(.root_mount_is_read_only_nosuid_nodev_noexec);
+    if (mountFlagsAre("/tmp", st_nosuid | st_nodev | st_noexec))
+        result |= rootProbeBit(.tmp_mount_is_writable_nosuid_nodev_noexec);
+    // No filter is installed here, so these probe the capability drop
+    // alone: without CAP_SYS_ADMIN over its mount namespace the child can
+    // turn neither the root writable nor `/tmp` read-only. They come last,
+    // so a remount that wrongly succeeds changes no probe above.
+    if (linux.E.init(linux.mount(null, "/", null, linux.MS.REMOUNT | linux.MS.BIND, 0)) == .PERM)
+        result |= rootProbeBit(.root_remount_is_eperm);
+    if (linux.E.init(linux.mount(null, "/tmp", null, linux.MS.REMOUNT | linux.MS.BIND | linux.MS.RDONLY, 0)) == .PERM)
+        result |= rootProbeBit(.tmp_remount_is_eperm);
+    writeRootProbeResult(result_fd, result);
+}
+
+/// Whether the mount at `path` reports exactly `expected` among read-only,
+/// nosuid, nodev and noexec.
+fn mountFlagsAre(path: [*:0]const u8, expected: c_long) bool {
+    const linux = std.os.linux;
+    var fs: Statfs = undefined;
+    if (linux.E.init(linux.syscall2(.statfs, @intFromPtr(path), @intFromPtr(&fs))) != .SUCCESS)
+        return false;
+    return (fs.f_flags & (st_rdonly | st_nosuid | st_nodev | st_noexec)) == expected;
+}
+
+fn rootProbeBit(probe: RootProbe) u16 {
+    return @as(u16, 1) << @intFromEnum(probe);
+}
+
+fn writeRootProbeResult(fd: std.posix.fd_t, result: u16) noreturn {
+    var bytes: [2]u8 = undefined;
+    std.mem.writeInt(u16, &bytes, result, .little);
+    const rc = std.os.linux.write(fd, &bytes, bytes.len);
+    if (std.os.linux.E.init(rc) != .SUCCESS or rc != bytes.len)
+        childExit(193);
+    childExit(0);
+}
+
+/// The permission bits of the directory at `path`, or a value no directory
+/// of the root has when it is missing or not a directory.
+fn directoryMode(path: [*:0]const u8) u32 {
+    const linux = std.os.linux;
+    var stat: linux.Stat = undefined;
+    if (linux.E.init(linux.fstatat(linux.AT.FDCWD, path, &stat, 0)) != .SUCCESS)
+        return 0o10000;
+    if ((stat.mode & linux.S.IFMT) != linux.S.IFDIR)
+        return 0o10000;
+    return stat.mode & 0o7777;
+}
+
+fn rootListsTmpAndVar() bool {
+    var root = std.fs.openDirAbsolute("/", .{ .iterate = true }) catch return false;
     defer root.close();
-
-    try sandbox.tmp_root.validateFd(root.fd);
-    try std.posix.fchmod(root.fd, 0o750);
-    try std.testing.expectError(error.PermissionDenied, sandbox.tmp_root.validateFd(root.fd));
-    try std.posix.fchmod(root.fd, 0o1700);
-    try std.testing.expectError(error.PermissionDenied, sandbox.tmp_root.validateFd(root.fd));
-    try std.posix.fchmod(root.fd, 0o2700);
-    try std.testing.expectError(error.PermissionDenied, sandbox.tmp_root.validateFd(root.fd));
-    try std.posix.fchmod(root.fd, 0o4700);
-    try std.testing.expectError(error.PermissionDenied, sandbox.tmp_root.validateFd(root.fd));
-    try std.posix.fchmod(root.fd, sandbox.tmp_root.required_mode);
-    try std.testing.expectError(error.InvalidWorkerTmpRoot, sandbox.tmp_root.validateFd(-1));
-
-    var not_dir = try root.createFile("not-dir", .{});
-    defer not_dir.close();
-    try std.testing.expectError(
-        error.InvalidWorkerTmpRoot,
-        sandbox.tmp_root.validateFd(not_dir.handle),
-    );
+    var saw_tmp = false;
+    var saw_var = false;
+    var entries = root.iterate();
+    while (entries.next() catch return false) |entry| {
+        if (std.mem.eql(u8, entry.name, "tmp")) {
+            saw_tmp = true;
+        } else if (std.mem.eql(u8, entry.name, "var")) {
+            saw_var = true;
+        } else {
+            return false;
+        }
+    }
+    return saw_tmp and saw_var;
 }
 
-test "worker direct-egress seccomp policy denies unexpected syscalls with narrow runtime allowlist" {
-    const security = sandbox.security;
+fn writeFile(path: [*:0]const u8) bool {
+    const linux = std.os.linux;
+    const rc = linux.openat(linux.AT.FDCWD, path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 0o600);
+    if (linux.E.init(rc) != .SUCCESS)
+        return false;
+    const fd: std.posix.fd_t = @intCast(rc);
+    defer _ = linux.close(fd);
+    const written = linux.write(fd, "probe", 5);
+    return linux.E.init(written) == .SUCCESS and written == 5;
+}
 
-    try std.testing.expect(!security.denyDirectEgressUsesLearningMode());
-    try std.testing.expect(security.denyDirectEgressUsesPrecomputedTemplate());
-    try std.testing.expect(security.denyDirectEgressTemplateHasFdPatch());
-
+test "the worker filter denies every call that creates authority or escapes, io_uring and timerfd included, and allows the runtime's own" {
+    // Evaluates the emitted program, so the verdict is the kernel's for every
+    // call whether or not this host can install a filter. Arguments are zero,
+    // so this list holds no call the filter narrows by argument.
     const authority_creating_or_escape_syscalls = [_][]const u8{
         "socket",
         "connect",
@@ -141,22 +262,34 @@ test "worker direct-egress seccomp policy denies unexpected syscalls with narrow
         "bpf",
         "ptrace",
         "prlimit64",
+        "io_uring_enter",
+        "timerfd_create",
+        "timerfd_settime",
+        "ftruncate",
+        "eventfd2",
+        "memfd_create",
+        "kill",
+        "tgkill",
+        "process_vm_readv",
+        "seccomp",
+        "fchmod",
+        "fchmodat",
+        "mount_setattr",
+        "open_tree",
+        "move_mount",
+        "fsopen",
     };
-    inline for (authority_creating_or_escape_syscalls) |name|
-        try std.testing.expect(security.denyDirectEgressDeniesUnexpectedSyscall(name));
+    const denied = std.os.linux.SECCOMP.RET.ERRNO | @as(u32, @intFromEnum(std.os.linux.E.PERM));
+    inline for (authority_creating_or_escape_syscalls) |name| {
+        if (comptime @hasField(std.os.linux.SYS, name)) {
+            const action = try evaluateZeroArgumentSyscall(name);
+            if (action != denied)
+                std.debug.print("the worker filter lets {s} through: action=0x{x}\n", .{ name, action });
+            try std.testing.expectEqual(denied, action);
+        }
+    }
 
-    try std.testing.expect(security.denyDirectEgressFiltersFcntlDup());
-    try std.testing.expect(security.denyDirectEgressFiltersFcntlCommands());
-    try std.testing.expect(security.denyDirectEgressFiltersOpenAtFlags());
-    try std.testing.expect(security.denyDirectEgressFiltersNewFstatAtArgs());
-    try std.testing.expect(security.denyDirectEgressFiltersStatxArgs());
-    try std.testing.expect(security.denyDirectEgressFiltersMkdirAtArgs());
-    try std.testing.expect(security.denyDirectEgressFiltersUnlinkAtArgs());
-    try std.testing.expect(security.denyDirectEgressFiltersRenameAt2Args());
-    try std.testing.expect(security.denyDirectEgressFiltersPrctlName());
-    try std.testing.expect(!security.denyDirectEgressFiltersCloseRingFds());
-
-    const expected_runtime_syscalls = [_][]const u8{
+    const runtime_syscalls = [_][]const u8{
         "read",
         "write",
         "close",
@@ -165,16 +298,9 @@ test "worker direct-egress seccomp policy denies unexpected syscalls with narrow
         "sendto",
         "recvfrom",
         "fstat",
-        "newfstatat",
-        "statx",
         "pread64",
         "lseek",
-        "openat",
         "getdents64",
-        "mkdirat",
-        "unlinkat",
-        "renameat2",
-        "ftruncate",
         "fsync",
         "fdatasync",
         "mmap",
@@ -183,7 +309,6 @@ test "worker direct-egress seccomp policy denies unexpected syscalls with narrow
         "futex",
         "clock_gettime",
         "clock_nanosleep",
-        "timerfd_settime",
         "getrandom",
         "poll",
         "ppoll",
@@ -192,25 +317,24 @@ test "worker direct-egress seccomp policy denies unexpected syscalls with narrow
         "exit",
         "exit_group",
     };
-    inline for (expected_runtime_syscalls) |name|
-        try std.testing.expect(security.denyDirectEgressAllowsSyscall(name));
-
-    const argument_filtered_syscalls = [_][]const u8{
-        "fcntl",
-        "prctl",
-    };
-    inline for (argument_filtered_syscalls) |name|
-        try std.testing.expect(!security.denyDirectEgressAllowsSyscall(name));
+    inline for (runtime_syscalls) |name| {
+        if (comptime @hasField(std.os.linux.SYS, name)) {
+            const action = try evaluateZeroArgumentSyscall(name);
+            if (action != std.os.linux.SECCOMP.RET.ALLOW)
+                std.debug.print("the worker filter denies {s}: action=0x{x}\n", .{ name, action });
+            try std.testing.expectEqual(std.os.linux.SECCOMP.RET.ALLOW, action);
+        }
+    }
 }
 
-test "worker direct-egress emitted seccomp filters AT_FDCWD by its low int word" {
+test "worker filter admits path calls only relative to AT_FDCWD, matched on its low int word" {
     // Evaluate the emitted classic-BPF program so every representation and
     // negative case is deterministic even when the host cannot install seccomp.
     const canonical: u64 = 0xffff_ffff_ffff_ff9c;
     const variadic_cpp: u64 = 0x0000_0000_ffff_ff9c;
     const arbitrary_high: u64 = 0x1234_5678_ffff_ff9c;
     const wrong_low: u64 = 0xffff_ffff_ffff_ff9d;
-    const program = sandbox.security.denyDirectEgressFilterInstructions();
+    const program = sandbox.security.instructions;
     const filters = [_]AtFdcwdFilter{
         .init(program, "openat.arg0", syscallNumber("openat"), 0, null),
         .init(program, "newfstatat.arg0", @intCast(@intFromEnum(newFstatAtSyscall())), 0, null),
@@ -233,7 +357,7 @@ test "worker seccomp admits prctl only for PR_SET_NAME, with a zero high word" {
     // Evaluates the emitted program, so every option is checked even where
     // the host cannot install a filter.
     const linux = std.os.linux;
-    const program = sandbox.security.denyDirectEgressFilterInstructions();
+    const program = sandbox.security.instructions;
     const set_name = prctlOption(.SET_NAME);
     try std.testing.expectEqual(linux.SECCOMP.RET.ALLOW, try evaluatePrctl(program, set_name));
 
@@ -255,25 +379,7 @@ test "worker seccomp admits prctl only for PR_SET_NAME, with a zero high word" {
     }
 }
 
-test "worker direct-egress seccomp only opens io_uring_enter for an explicit worker ring fd" {
-    const security = sandbox.security;
-
-    try std.testing.expect(!security.denyDirectEgressFiltersIoUringEnterByFd(.{
-        .mode = .disabled,
-        .allowed_io_uring_enter_fd = 42,
-    }));
-    try std.testing.expect(!security.denyDirectEgressFiltersIoUringEnterByFd(.{
-        .mode = .deny_direct_egress,
-        .allowed_io_uring_enter_fd = -1,
-    }));
-    try std.testing.expect(security.denyDirectEgressFiltersIoUringEnterByFd(.{
-        .mode = .deny_direct_egress,
-        .allowed_io_uring_enter_fd = 42,
-        .allowed_timer_fd = 43,
-    }));
-}
-
-test "worker direct-egress seccomp enforces runtime authority denies" {
+test "worker filter enforces the runtime's authority denies in a filtered child" {
     const skip_result: u8 = 0xff;
     const expected_result: u8 = 0b0111_1111;
     const pipe_pair = try std.posix.pipe2(.{ .CLOEXEC = true });
@@ -283,41 +389,22 @@ test "worker direct-egress seccomp enforces runtime authority denies" {
     if (pid == 0) {
         std.posix.close(pipe_pair[0]);
 
-        const ring_fd = std.posix.eventfd(
+        const probe_fd = std.posix.eventfd(
             0,
             std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK,
         ) catch childExit(121);
-        const timer_fd = std.posix.eventfd(
-            0,
-            std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK,
-        ) catch childExit(122);
 
-        if (!enableNoNewPrivsForSeccompTest()) {
-            writeSeccompSmokeResult(pipe_pair[1], skip_result) catch childExit(123);
-            childExit(0);
-        }
-        sandbox.applySeccomp(.{
-            .mode = .deny_direct_egress,
-            .allowed_io_uring_enter_fd = ring_fd,
-            .allowed_timer_fd = timer_fd,
-        }) catch |err| switch (err) {
-            error.PermissionDenied,
-            error.UnsupportedKernel,
-            => {
-                writeSeccompSmokeResult(pipe_pair[1], skip_result) catch childExit(124);
-                childExit(0);
-            },
-            else => childExit(124),
-        };
+        if (!installWorkerFilterForTest())
+            writeSkipAndExit(pipe_pair[1], skip_result);
 
         var result: u8 = 0;
         if (socketDeniedBySeccomp())
             result |= @as(u8, 1) << 0;
-        if (fcntlDupDeniedBySeccomp(ring_fd))
+        if (fcntlDupDeniedBySeccomp(probe_fd))
             result |= @as(u8, 1) << 1;
-        if (fcntlGetFdAllowedBySeccomp(ring_fd))
+        if (fcntlGetFdAllowedBySeccomp(probe_fd))
             result |= @as(u8, 1) << 2;
-        if (ioUringEnterDeniedBySeccomp(timer_fd))
+        if (ioUringEnterDeniedBySeccomp(probe_fd))
             result |= @as(u8, 1) << 3;
         if (openByHandleAtDeniedBySeccomp())
             result |= @as(u8, 1) << 4;
@@ -330,75 +417,85 @@ test "worker direct-egress seccomp enforces runtime authority denies" {
         childExit(0);
     }
 
-    std.posix.close(pipe_pair[1]);
-    var result: [1]u8 = undefined;
-    const read_len = try std.posix.read(pipe_pair[0], &result);
-
-    const wait = std.posix.waitpid(pid, 0);
-    try std.testing.expect(std.c.W.IFEXITED(wait.status));
-    try std.testing.expectEqual(@as(u32, 0), std.c.W.EXITSTATUS(wait.status));
-    try std.testing.expectEqual(@as(usize, 1), read_len);
-    if (result[0] == skip_result)
-        return error.SkipZigTest;
-    try std.testing.expectEqual(expected_result, result[0]);
+    try expectSeccompChildResult(pid, pipe_pair[0], pipe_pair[1], skip_result, expected_result);
 }
 
-test "worker direct-egress seccomp only arms the explicit worker timer fd" {
+test "a filtered child gets EPERM from io_uring_setup, io_uring_enter and timerfd_settime on its own descriptors" {
+    // The worker waits in ppoll, so no ring and no timerfd may be reached
+    // after the filter, not even ones the worker made before it.
     const skip_result: u8 = 0xff;
-    const expected_result: u8 = 0b0000_0011;
+    const expected_result: u8 = 0b0000_0111;
     const pipe_pair = try std.posix.pipe2(.{ .CLOEXEC = true });
     defer std.posix.close(pipe_pair[0]);
 
     const pid = try std.posix.fork();
     if (pid == 0) {
         std.posix.close(pipe_pair[0]);
+        const linux = std.os.linux;
 
-        const ring_fd = std.posix.eventfd(
-            0,
-            std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK,
-        ) catch childExit(126);
-        const timer_fd_allowed = std.posix.timerfd_create(.MONOTONIC, .{
-            .CLOEXEC = true,
-            .NONBLOCK = true,
-        }) catch childExit(127);
-        const timer_fd_denied = std.posix.timerfd_create(.MONOTONIC, .{
-            .CLOEXEC = true,
-            .NONBLOCK = true,
-        }) catch childExit(128);
+        const ring_fd = ringFdForTest() catch childExit(126);
+        const timer_fd = std.posix.timerfd_create(.MONOTONIC, .{ .CLOEXEC = true, .NONBLOCK = true }) catch childExit(127);
 
-        if (!enableNoNewPrivsForSeccompTest()) {
-            writeSeccompSmokeResult(pipe_pair[1], skip_result) catch childExit(129);
-            childExit(0);
-        }
-        sandbox.applySeccomp(.{
-            .mode = .deny_direct_egress,
-            .allowed_io_uring_enter_fd = ring_fd,
-            .allowed_timer_fd = timer_fd_allowed,
-        }) catch |err| switch (err) {
-            error.PermissionDenied,
-            error.UnsupportedKernel,
-            => {
-                writeSeccompSmokeResult(pipe_pair[1], skip_result) catch childExit(130);
-                childExit(0);
-            },
-            else => childExit(130),
-        };
+        if (!installWorkerFilterForTest())
+            writeSkipAndExit(pipe_pair[1], skip_result);
 
         var result: u8 = 0;
-        if (timerFdSetTimeAllowedBySeccomp(timer_fd_allowed)) {
+        var params = std.mem.zeroes(linux.io_uring_params);
+        if (linux.E.init(linux.io_uring_setup(4, &params)) == .PERM)
             result |= @as(u8, 1) << 0;
-        }
-        if (timerFdSetTimeDeniedBySeccomp(timer_fd_denied)) {
+        if (ioUringEnterDeniedBySeccomp(ring_fd))
             result |= @as(u8, 1) << 1;
-        }
+        if (timerFdSetTimeDeniedBySeccomp(timer_fd))
+            result |= @as(u8, 1) << 2;
 
-        writeSeccompSmokeResult(pipe_pair[1], result) catch childExit(131);
+        writeSeccompSmokeResult(pipe_pair[1], result) catch childExit(128);
         childExit(0);
     }
 
-    std.posix.close(pipe_pair[1]);
+    try expectSeccompChildResult(pid, pipe_pair[0], pipe_pair[1], skip_result, expected_result);
+}
+
+/// A real io_uring when this host lets the child make one, else an eventfd:
+/// the filter must refuse `io_uring_enter` whatever the descriptor is.
+fn ringFdForTest() !std.posix.fd_t {
+    const linux = std.os.linux;
+    var params = std.mem.zeroes(linux.io_uring_params);
+    const rc = linux.io_uring_setup(4, &params);
+    if (linux.E.init(rc) == .SUCCESS)
+        return @intCast(rc);
+    return std.posix.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK);
+}
+
+/// Sets no-new-privileges and installs the worker's filter in this forked
+/// child; false when the host cannot install one, which the test turns into
+/// a skip.
+fn installWorkerFilterForTest() bool {
+    if (!enableNoNewPrivsForSeccompTest())
+        return false;
+    sandbox.applySeccomp() catch |err| switch (err) {
+        error.PermissionDenied, error.UnsupportedKernel => return false,
+        else => childExit(124),
+    };
+    return true;
+}
+
+fn writeSkipAndExit(fd: std.posix.fd_t, skip_result: u8) noreturn {
+    writeSeccompSmokeResult(fd, skip_result) catch childExit(123);
+    childExit(0);
+}
+
+/// Reads the one result byte the filtered child `pid` writes, waits for it
+/// and expects `expected_result`; a skip byte skips the test.
+fn expectSeccompChildResult(
+    pid: std.posix.pid_t,
+    read_fd: std.posix.fd_t,
+    write_fd: std.posix.fd_t,
+    skip_result: u8,
+    expected_result: u8,
+) !void {
+    std.posix.close(write_fd);
     var result: [1]u8 = undefined;
-    const read_len = try std.posix.read(pipe_pair[0], &result);
+    const read_len = try std.posix.read(read_fd, &result);
 
     const wait = std.posix.waitpid(pid, 0);
     try std.testing.expect(std.c.W.IFEXITED(wait.status));
@@ -409,7 +506,7 @@ test "worker direct-egress seccomp only arms the explicit worker timer fd" {
     try std.testing.expectEqual(expected_result, result[0]);
 }
 
-test "worker direct-egress seccomp pins stat-at syscalls to safe cwd paths" {
+test "worker filter pins stat-at calls to AT_FDCWD paths in a filtered child" {
     const skip_result: u8 = 0xff;
     const expected_result: u8 = 0b0011_1111;
     const pipe_pair = try std.posix.pipe2(.{ .CLOEXEC = true });
@@ -419,43 +516,24 @@ test "worker direct-egress seccomp pins stat-at syscalls to safe cwd paths" {
     if (pid == 0) {
         std.posix.close(pipe_pair[0]);
 
-        const ring_fd = std.posix.eventfd(
+        const probe_fd = std.posix.eventfd(
             0,
             std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK,
         ) catch childExit(131);
-        const timer_fd = std.posix.eventfd(
-            0,
-            std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK,
-        ) catch childExit(132);
 
-        if (!enableNoNewPrivsForSeccompTest()) {
-            writeSeccompSmokeResult(pipe_pair[1], skip_result) catch childExit(133);
-            childExit(0);
-        }
-        sandbox.applySeccomp(.{
-            .mode = .deny_direct_egress,
-            .allowed_io_uring_enter_fd = ring_fd,
-            .allowed_timer_fd = timer_fd,
-        }) catch |err| switch (err) {
-            error.PermissionDenied,
-            error.UnsupportedKernel,
-            => {
-                writeSeccompSmokeResult(pipe_pair[1], skip_result) catch childExit(134);
-                childExit(0);
-            },
-            else => childExit(134),
-        };
+        if (!installWorkerFilterForTest())
+            writeSkipAndExit(pipe_pair[1], skip_result);
 
         var result: u8 = 0;
         if (newFstatAtAllowedBySeccomp())
             result |= @as(u8, 1) << 0;
-        if (newFstatAtDirfdDeniedBySeccomp(ring_fd))
+        if (newFstatAtDirfdDeniedBySeccomp(probe_fd))
             result |= @as(u8, 1) << 1;
         if (newFstatAtEmptyPathDeniedBySeccomp())
             result |= @as(u8, 1) << 2;
         if (statxAllowedBySeccomp())
             result |= @as(u8, 1) << 3;
-        if (statxDirfdDeniedBySeccomp(ring_fd))
+        if (statxDirfdDeniedBySeccomp(probe_fd))
             result |= @as(u8, 1) << 4;
         if (statxEmptyPathDeniedBySeccomp())
             result |= @as(u8, 1) << 5;
@@ -464,20 +542,10 @@ test "worker direct-egress seccomp pins stat-at syscalls to safe cwd paths" {
         childExit(0);
     }
 
-    std.posix.close(pipe_pair[1]);
-    var result: [1]u8 = undefined;
-    const read_len = try std.posix.read(pipe_pair[0], &result);
-
-    const wait = std.posix.waitpid(pid, 0);
-    try std.testing.expect(std.c.W.IFEXITED(wait.status));
-    try std.testing.expectEqual(@as(u32, 0), std.c.W.EXITSTATUS(wait.status));
-    try std.testing.expectEqual(@as(usize, 1), read_len);
-    if (result[0] == skip_result)
-        return error.SkipZigTest;
-    try std.testing.expectEqual(expected_result, result[0]);
+    try expectSeccompChildResult(pid, pipe_pair[0], pipe_pair[1], skip_result, expected_result);
 }
 
-test "worker direct-egress seccomp lets a thread rename itself and denies every other prctl" {
+test "worker filter lets a thread rename itself and denies every other prctl in a filtered child" {
     const skip_result: u8 = 0xff;
     const expected_result: u8 = 0b0000_0111;
     const thread_name = "collo-sandbox";
@@ -488,14 +556,6 @@ test "worker direct-egress seccomp lets a thread rename itself and denies every 
     if (pid == 0) {
         std.posix.close(pipe_pair[0]);
 
-        const ring_fd = std.posix.eventfd(
-            0,
-            std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK,
-        ) catch childExit(181);
-        const timer_fd = std.posix.eventfd(
-            0,
-            std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK,
-        ) catch childExit(182);
         // Opened before the filter, as a worker has no /proc after its
         // chroot. The forked child has one thread, the one renamed below.
         const comm_fd = std.posix.openZ(
@@ -504,23 +564,8 @@ test "worker direct-egress seccomp lets a thread rename itself and denies every 
             0,
         ) catch childExit(183);
 
-        if (!enableNoNewPrivsForSeccompTest()) {
-            writeSeccompSmokeResult(pipe_pair[1], skip_result) catch childExit(184);
-            childExit(0);
-        }
-        sandbox.applySeccomp(.{
-            .mode = .deny_direct_egress,
-            .allowed_io_uring_enter_fd = ring_fd,
-            .allowed_timer_fd = timer_fd,
-        }) catch |err| switch (err) {
-            error.PermissionDenied,
-            error.UnsupportedKernel,
-            => {
-                writeSeccompSmokeResult(pipe_pair[1], skip_result) catch childExit(185);
-                childExit(0);
-            },
-            else => childExit(185),
-        };
+        if (!installWorkerFilterForTest())
+            writeSkipAndExit(pipe_pair[1], skip_result);
 
         var result: u8 = 0;
         if (prctlSetNameAllowedBySeccomp(thread_name))
@@ -534,17 +579,7 @@ test "worker direct-egress seccomp lets a thread rename itself and denies every 
         childExit(0);
     }
 
-    std.posix.close(pipe_pair[1]);
-    var result: [1]u8 = undefined;
-    const read_len = try std.posix.read(pipe_pair[0], &result);
-
-    const wait = std.posix.waitpid(pid, 0);
-    try std.testing.expect(std.c.W.IFEXITED(wait.status));
-    try std.testing.expectEqual(@as(u32, 0), std.c.W.EXITSTATUS(wait.status));
-    try std.testing.expectEqual(@as(usize, 1), read_len);
-    if (result[0] == skip_result)
-        return error.SkipZigTest;
-    try std.testing.expectEqual(expected_result, result[0]);
+    try expectSeccompChildResult(pid, pipe_pair[0], pipe_pair[1], skip_result, expected_result);
 }
 
 test "worker seccomp lets a thread created before the filter start after it" {
@@ -601,8 +636,6 @@ const affinity_notification_timeout_ms: i32 = 5_000;
 const WorkerFilterInstaller = struct {
     go_fd: std.posix.fd_t,
     installed_fd: std.posix.fd_t,
-    ring_fd: std.posix.fd_t,
-    timer_fd: std.posix.fd_t,
     installed: std.atomic.Value(bool) = .init(false),
     outcome: Outcome = .not_signaled,
 
@@ -613,11 +646,7 @@ const WorkerFilterInstaller = struct {
         const read_len = std.posix.read(self.go_fd, &go) catch childExit(171);
         if (read_len != 1)
             return;
-        sandbox.applySeccomp(.{
-            .mode = .deny_direct_egress,
-            .allowed_io_uring_enter_fd = self.ring_fd,
-            .allowed_timer_fd = self.timer_fd,
-        }) catch |err| switch (err) {
+        sandbox.applySeccomp() catch |err| switch (err) {
             error.PermissionDenied, error.UnsupportedKernel => {
                 self.outcome = .unsupported;
                 writeSeccompSmokeResult(self.installed_fd, 0) catch childExit(172);
@@ -646,8 +675,6 @@ fn lateStartThreadMain(context: ?*anyopaque) callconv(.c) ?*anyopaque {
 
 fn startThreadUnderWorkerFilterChild(result_fd: std.posix.fd_t, skip_result: u8) noreturn {
     const linux = std.os.linux;
-    const ring_fd = std.posix.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK) catch childExit(141);
-    const timer_fd = std.posix.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK) catch childExit(142);
     if (!enableNoNewPrivsForSeccompTest()) {
         writeSeccompSmokeResult(result_fd, skip_result) catch childExit(143);
         childExit(0);
@@ -689,8 +716,6 @@ fn startThreadUnderWorkerFilterChild(result_fd: std.posix.fd_t, skip_result: u8)
     var installer: WorkerFilterInstaller = .{
         .go_fd = go_pipe[0],
         .installed_fd = installed_pipe[1],
-        .ring_fd = ring_fd,
-        .timer_fd = timer_fd,
     };
     const installer_thread = std.Thread.spawn(.{}, WorkerFilterInstaller.run, .{&installer}) catch childExit(149);
 
@@ -768,13 +793,6 @@ fn superviseAffinityCall(listener: std.posix.fd_t, go_fd: std.posix.fd_t, instal
     if (linux.E.init(linux.ioctl(listener, linux.SECCOMP.IOCTL_NOTIF.SEND, @intFromPtr(&response))) != .SUCCESS)
         childExit(167);
     childExit(0);
-}
-
-fn containsRetainedEnv(retained: []const []const u8, name: []const u8) bool {
-    for (retained) |entry|
-        if (std.mem.eql(u8, entry, name))
-            return true;
-    return false;
 }
 
 const AtFdcwdFilter = struct {
@@ -859,6 +877,22 @@ fn evaluatePrctl(program: []const sandbox.security.FilterInstruction, option: u6
         .arg5 = 0,
     };
     return evaluateSeccompFilter(program, &data);
+}
+
+/// The worker filter's action for syscall `name` with every argument zero.
+fn evaluateZeroArgumentSyscall(comptime name: []const u8) !u32 {
+    const data = std.os.linux.SECCOMP.data{
+        .nr = @intCast(syscallNumber(name)),
+        .arch = auditArchCurrent(),
+        .instruction_pointer = 0,
+        .arg0 = 0,
+        .arg1 = 0,
+        .arg2 = 0,
+        .arg3 = 0,
+        .arg4 = 0,
+        .arg5 = 0,
+    };
+    return evaluateSeccompFilter(sandbox.security.instructions, &data);
 }
 
 /// The option as glibc and Zig pass a positive `int`: zero-extended.
@@ -1001,15 +1035,6 @@ fn fcntlGetFdAllowedBySeccomp(fd: std.posix.fd_t) bool {
 fn ioUringEnterDeniedBySeccomp(fd: std.posix.fd_t) bool {
     const rc = std.os.linux.io_uring_enter(fd, 0, 0, 0, null);
     return std.os.linux.E.init(rc) == .PERM;
-}
-
-fn timerFdSetTimeAllowedBySeccomp(fd: std.posix.fd_t) bool {
-    var spec = std.os.linux.itimerspec{
-        .it_interval = .{ .sec = 0, .nsec = 0 },
-        .it_value = .{ .sec = 0, .nsec = 1 },
-    };
-    const rc = std.os.linux.timerfd_settime(fd, .{}, &spec, null);
-    return std.os.linux.E.init(rc) == .SUCCESS;
 }
 
 fn timerFdSetTimeDeniedBySeccomp(fd: std.posix.fd_t) bool {

@@ -3,33 +3,34 @@
 //! builds and drives it (`zygote/child_boot.zig`).
 //!
 //! `runtime/` holds the `Runtime` and its state per domain; `scheduler/` the
-//! event loop with its ready queue, timers, immediates and request
-//! deadlines; `serve/` a request's run from its dispatch to its completed
-//! record; `modules/` route pack registration and evaluation; `egress/`
-//! fetches through the egress gateway; `fs/` the node:fs view of the
-//! read-only file tree and its fault plane; `js/` the crypto pool and the
-//! handler's `Request` and `Response`; `host/` the `collo_runtime_*`
+//! event loop with its `ppoll` wait, ready queue, timers, immediates and
+//! request deadlines; `serve/` a request's run from its dispatch to its
+//! `request_done`; `modules/` the registration of the definition's artifact
+//! and the evaluation of its routes;
+//! `egress/` fetches through the egress gateway; `js/` the handler's
+//! `Request` and `Response`; `host/` the `collo_runtime_*`
 //! functions the engine bridge calls on the runtime that
 //! `Runtime.attachHostRuntime` installed. Request state and the JSC plumbing
 //! are modules of their own that this one imports: `collo_worker_request`
 //! (`request_api.zig`) and `collo_worker_js` (`js/jsc/root.zig`).
 //!
 //! Everything here belongs to the worker's VM thread, which runs the loop.
-//! The crypto pool's threads run native jobs and hand each back to the VM
-//! thread. The sentinel's thread can terminate the running JavaScript or end
-//! the process, and touches no state the VM thread owns. Both start before
-//! seccomp denies clone, as every worker thread must (`zygote/child_boot.zig`).
+//! The sentinel's thread can terminate the running JavaScript or end the
+//! process, and touches no state the VM thread owns. It starts before seccomp
+//! denies clone, as every worker thread must (`zygote/child_boot.zig`).
 //!
-//! Every eventfd, socket, timer and ring the runtime uses is created or
-//! received before seccomp, which denies creating them; after it, files can
-//! be opened only inside the chroot's tmpfs (`zygote/worker_boot/sandbox.zig`).
-//! The worker ring registers several of them as fixed files without owning
-//! them, and each is closed by the domain that created or received it.
+//! Every eventfd and socket the runtime uses is created before seccomp,
+//! which denies creating them (`zygote/worker_boot/sandbox.zig`), or
+//! received on the control socket: WorkerInit's at boot, and each
+//! `egress_attach`'s after the filter, which allows the receive
+//! (`scheduler/loop.zig:collectControlPacket`). Each is closed by the domain
+//! that created or received it. After boot the runtime tells the operator
+//! anything only through `std.log`.
 //!
 //! What each `collo_runtime_*` function does with the handles it receives is
 //! stated in `abi.h`: promise deferreds and values are consumed on every
-//! call, while a crypto job passes to Zig only on success. Every crypto job,
-//! fetch, fetch body and timer carries the id of the owner that started it,
+//! call. Every fetch, fetch body and timer carries the id of the owner that
+//! started it,
 //! a request or an evaluation, and that owner's end cancels or releases each
 //! one (`cleanupRequestSubresources` in `serve/response_finish.zig`, and
 //! `Runtime.closeEvaluation` in `runtime/evaluations.zig`).
@@ -44,17 +45,10 @@ const scheduler_loop = @import("scheduler/loop.zig");
 const host_completion = @import("host/completion.zig");
 const host_crypto = @import("host/crypto.zig");
 const host_fetch = @import("host/fetch.zig");
-const host_fs_fault = @import("host/fs_fault.zig");
 const host_module_settlement = @import("host/module_settlement.zig");
 const host_request_body = @import("host/request_body.zig");
 const host_response_body_stream = @import("host/response_body_stream.zig");
 const host_timers = @import("host/timers.zig");
-
-/// The node:fs view of the worker's read-only file tree. The zygote's worker
-/// child initializes it between the chroot and seccomp, and the C++ fs
-/// binding calls it through the `collo_runtime_fs_*` functions referenced
-/// below.
-pub const fs = @import("fs/index.zig");
 
 pub const Clock = runtime_types.Clock;
 pub const Runtime = runtime_core.Runtime;
@@ -79,16 +73,20 @@ pub const testing = if (builtin.is_test) struct {
     pub const response_flow = @import("serve/response.zig");
     pub const response_finish = @import("serve/response_finish.zig");
     pub const response_payload_writer = @import("serve/response_payload_writer.zig");
+    pub const done_carry = @import("serve/done_carry.zig");
+    pub const owner = @import("runtime/owner.zig");
+    pub const runtime_requests = @import("runtime/requests.zig");
     pub const sentinel = @import("runtime/sentinel.zig");
     pub const turn = @import("collo_worker_js").turn;
-    pub const crypto_jobs = @import("js/crypto/jobs.zig");
+    pub const egress_body = @import("egress/body/root.zig");
+    pub const egress_gateway_control = @import("egress/gateway_control.zig");
 
     pub const scheduler = struct {
         pub const loop = @import("scheduler/loop.zig");
         pub const queue = @import("scheduler/queue.zig");
         pub const immediates = @import("scheduler/immediates.zig");
         pub const timers = @import("scheduler/timers.zig");
-        pub const uring_backend = @import("scheduler/uring_backend.zig");
+        pub const poll_backend = @import("scheduler/poll_backend.zig");
     };
 
     pub fn executeWorkItem(runtime: *runtime_core.Runtime, item: scheduler.queue.WorkItem) !void {
@@ -101,7 +99,7 @@ pub const testing = if (builtin.is_test) struct {
 // `export fn`s.
 comptime {
     _ = host_completion.collo_runtime_complete_request_task;
-    _ = host_crypto.collo_runtime_crypto_job_enqueue;
+    _ = host_crypto.collo_runtime_native_time_left_ns;
     _ = host_fetch.collo_runtime_fetch;
     _ = host_fetch.collo_runtime_fetch_cancel;
     _ = host_fetch.collo_runtime_fetch_body_consume;
@@ -110,9 +108,6 @@ comptime {
     _ = host_fetch.collo_runtime_fetch_body_clone;
     _ = host_fetch.collo_runtime_fetch_body_cancel;
     _ = host_fetch.collo_runtime_fetch_body_release;
-    _ = host_fs_fault.collo_runtime_fs_fault_read_file;
-    _ = host_fs_fault.collo_runtime_fs_fault_sync;
-    _ = host_fs_fault.collo_runtime_fs_fault_hit_local;
     _ = host_module_settlement.collo_runtime_module_eval_settled;
     _ = host_request_body.collo_runtime_request_text;
     _ = host_request_body.collo_runtime_request_json;
@@ -125,15 +120,12 @@ comptime {
     _ = host_timers.collo_runtime_clear_timeout;
     _ = host_timers.collo_runtime_set_immediate;
     _ = host_timers.collo_runtime_clear_immediate;
-    _ = fs.collo_runtime_fs_route;
-    _ = fs.collo_runtime_fs_readdir_next;
-    _ = fs.collo_runtime_fs_materialized_path;
 }
 
 /// Builds the runtime of one worker; `Runtime.init` says what it takes and
 /// what stays the caller's. Once the result sits at its final address, the
-/// caller sets up the worker ring, calls `attachHostRuntime` and starts the
-/// sentinel, all before seccomp, as `zygote/child_boot.zig` does.
+/// caller calls `attachHostRuntime` and starts the sentinel, both before
+/// seccomp, as `zygote/child_boot.zig` does.
 pub fn initRuntime(
     allocator: std.mem.Allocator,
     vm: *bindings.Vm,

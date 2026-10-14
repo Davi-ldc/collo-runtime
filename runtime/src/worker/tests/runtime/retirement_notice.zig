@@ -1,7 +1,8 @@
 //! Support for the worker tests that watch a runtime ask to retire
 //! (`runtime/retirement.zig`): reads the `worker_retiring` notice from the
 //! server's end of the control socket pair, or checks that none came. It
-//! holds no tests; `arbiter.zig`, `boot_eval.zig` and `routes.zig` import it.
+//! holds no tests; `arbiter.zig`, `boot_eval.zig`, `fetch.zig`, `limits.zig`
+//! and `routes.zig` import it.
 
 const std = @import("std");
 const ipc = @import("collo_ipc");

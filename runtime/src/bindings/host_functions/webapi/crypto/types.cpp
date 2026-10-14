@@ -1,20 +1,18 @@
-// The hash table and the numeric range checks declared in `types.h`. The table is constant data and nothing here
-// touches JSC, so any thread may call these functions.
+// The hash table declared in types.h. It is constant data in the zygote's read-only pages, and nothing here touches
+// JSC.
 
 #include "host_functions/webapi/crypto/types.h"
 
 #include <openssl/digest.h>
-#include <wtf/StdLibExtras.h>
 #include <wtf/text/WTFString.h>
 
 #include <array>
-#include <cmath>
-#include <limits>
 #include <type_traits>
 
 namespace Collo::HostFunctions::WebCrypto {
 namespace {
 
+    // Indexed by WebCryptoHash; the static_assert below holds the order.
     constexpr std::array allHashSpecs {
         HashSpec { WebCryptoHash::SHA1, "SHA-1"_s, EVP_sha1, 20, 512, "HS1"_s },
         HashSpec { WebCryptoHash::SHA224, "SHA-224"_s, EVP_sha224, 28, 512, "HS224"_s },
@@ -27,45 +25,23 @@ namespace {
         HashSpec { WebCryptoHash::SHA3_512, "SHA3-512"_s, EVP_sha3_512, 64, 576, ""_s },
     };
 
+    constexpr bool hashTableFollowsEnumOrder()
+    {
+        for (size_t index = 0; index < allHashSpecs.size(); ++index) {
+            if (static_cast<size_t>(allHashSpecs[index].id) != index)
+                return false;
+        }
+        return true;
+    }
+
+    static_assert(hashTableFollowsEnumOrder());
+    // HMAC with a SHA-3 hash keys a block of the hash's rate, which BoringSSL's HMAC holds only because the patch
+    // series raises EVP_MAX_MD_BLOCK_SIZE to SHA3-224's 144 bytes.
+    static_assert(EVP_MAX_MD_BLOCK_SIZE * 8 >= 1152);
+
 } // namespace
 
-bool checkedIntegerInRange(double number, double min, double max)
-{
-    return std::isfinite(number) && std::floor(number) == number && number >= min && number <= max;
-}
-
-bool checkedSizeFromNumber(double number, size_t min, size_t max, size_t& out)
-{
-    if (!checkedIntegerInRange(number, static_cast<double>(min), static_cast<double>(max)))
-        return false;
-    out = static_cast<size_t>(number);
-    return true;
-}
-
-bool checkedUInt32FromNumber(double number, uint32_t min, uint32_t max, uint32_t& out)
-{
-    if (!checkedIntegerInRange(number, static_cast<double>(min), static_cast<double>(max)))
-        return false;
-    out = static_cast<uint32_t>(number);
-    return true;
-}
-
-bool checkedUInt8FromNumber(double number, uint8_t min, uint8_t max, uint8_t& out)
-{
-    if (!checkedIntegerInRange(number, static_cast<double>(min), static_cast<double>(max)))
-        return false;
-    out = static_cast<uint8_t>(number);
-    return true;
-}
-
-const HashSpec& hashSpec(WebCryptoHash hash)
-{
-    for (const auto& spec : allHashSpecs) {
-        if (spec.id == hash)
-            return spec;
-    }
-    RELEASE_ASSERT_NOT_REACHED();
-}
+const HashSpec& hashSpec(WebCryptoHash hash) { return allHashSpecs[static_cast<size_t>(hash)]; }
 
 const HashSpec* hashSpecFromName(const WTF::String& name)
 {
@@ -75,15 +51,6 @@ const HashSpec* hashSpecFromName(const WTF::String& name)
     }
     return nullptr;
 }
-
-const EVP_MD* hashEvp(const HashSpec& hash)
-{
-    if (!hash.evp)
-        return nullptr;
-    return hash.evp();
-}
-
-bool hashHasOpenSslEvp(const HashSpec& hash) { return !!hashEvp(hash); }
 
 static_assert(!std::is_copy_constructible_v<SecretBytes>);
 static_assert(!std::is_copy_assignable_v<SecretBytes>);

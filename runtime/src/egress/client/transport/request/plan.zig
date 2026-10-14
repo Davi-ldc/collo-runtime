@@ -1,45 +1,105 @@
-//! Request plan shared by the HTTP/1 and HTTP/2 egress paths: the target
-//! parsed and admitted under the fetch's network policy, which makes this
-//! the one place every hop's target is decided, the canonical method,
-//! validated headers
-//! with a default accept-encoding, the origin-form request target and the
-//! authority, which omits a port equal to the scheme's default.
+//! The request plan of one hop, shared by the HTTP/1 and HTTP/2 paths, and the
+//! origin key every connection pool and dial of the engine is keyed by.
 //!
-//! Preparing a plan never touches the network. The plan is validated as an
-//! HTTP/1 head even when it will go out over HTTP/2, so a bad request fails
-//! before any dial and the same way on both paths.
+//! A plan holds the target parsed and admitted under the fetch's network
+//! policy, which makes this the one place every hop's target is decided, the
+//! canonical method, validated headers with a default accept-encoding, the
+//! origin-form request target, the authority (which omits a port equal to the
+//! scheme's default) and the hop's `OriginKey`. The engine prepares one plan
+//! per hop and keeps it until the hop ends; preparing a plan never touches the
+//! network. The plan is validated as an HTTP/1 head even when it will go out
+//! over HTTP/2, so a bad request fails before any dial and the same way on
+//! both paths.
+//!
+//! An `OriginKey` carries everything that decides whether two hops may share
+//! a connection: the security cell and network policy the gateway gives each
+//! fetch, the scheme, host and port, the admission's private-network verdict
+//! (which decided which addresses the dial accepted) and the test-only
+//! `insecure_tls` knob. Two hops with equal keys may share connections and
+//! TLS sessions; no field may leave the key without that becoming true across
+//! security cells or policies.
 
 const std = @import("std");
 const core = @import("collo_egress_core");
-const hpack = @import("collo_hpack");
-const http = @import("collo_http");
 
 const config_mod = @import("../config.zig");
 const headers_mod = @import("headers.zig");
-const http1 = @import("../http1/protocol/root.zig");
+const http1 = @import("../http1/protocol.zig");
 const policy_mod = @import("policy.zig");
-const http2 = @import("collo_egress_http2");
+const http2 = @import("../h2/codec/root.zig");
 
 const decompress = core.decompress;
 const Config = config_mod.Config;
 const Header = headers_mod.Header;
 const ParsedHeaders = headers_mod.ParsedHeaders;
+const PoolIsolationId = config_mod.PoolIsolationId;
+const Protocol = config_mod.Protocol;
 const RequestTarget = policy_mod.RequestTarget;
 const cloneHeader = headers_mod.cloneHeader;
 const parseFetchHeaders = headers_mod.parseFetchHeaders;
+
+pub const OriginKey = struct {
+    security_cell_id: PoolIsolationId,
+    policy_id: PoolIsolationId,
+    protocol: Protocol,
+    port: u16,
+    insecure_tls: bool,
+    allow_private_networks: bool,
+    host_len: u8,
+    /// The URL's host, lowercased, IPv6 literals in brackets.
+    host_lower: [host_bytes_max]u8,
+
+    /// `policy.zig:parseTarget` admits only hosts `collo_network` can name,
+    /// at most `name_bytes_max` (253) bytes plus one trailing dot, or a
+    /// bracketed IPv6 literal, so every admitted host fits.
+    pub const host_bytes_max: usize = std.math.maxInt(u8);
+
+    /// Fails with `error.InvalidFetchUrl` for a host longer than
+    /// `host_bytes_max`, which no admitted target has.
+    pub fn init(target: *const RequestTarget, config: Config) !OriginKey {
+        const authority_host = target.authority_host;
+        if (authority_host.len > host_bytes_max)
+            return error.InvalidFetchUrl;
+        var key: OriginKey = .{
+            .security_cell_id = config.pool_security_cell_id,
+            .policy_id = config.pool_policy_id,
+            .protocol = target.protocol,
+            .port = target.port,
+            .insecure_tls = config.insecure_tls,
+            .allow_private_networks = target.admission.allow_private_networks,
+            .host_len = @intCast(authority_host.len),
+            .host_lower = undefined,
+        };
+        _ = std.ascii.lowerString(key.host_lower[0..authority_host.len], authority_host);
+        return key;
+    }
+
+    pub fn host(self: *const OriginKey) []const u8 {
+        return self.host_lower[0..self.host_len];
+    }
+
+    pub fn eql(self: *const OriginKey, other: *const OriginKey) bool {
+        return self.port == other.port and
+            self.protocol == other.protocol and
+            self.insecure_tls == other.insecure_tls and
+            self.allow_private_networks == other.allow_private_networks and
+            std.mem.eql(u8, &self.security_cell_id, &other.security_cell_id) and
+            std.mem.eql(u8, &self.policy_id, &other.policy_id) and
+            std.mem.eql(u8, self.host(), other.host());
+    }
+};
 
 pub const RequestPlan = struct {
     allocator: std.mem.Allocator,
     url: []const u8,
     target: RequestTarget,
+    origin_key: OriginKey,
     method: []const u8,
     parsed_headers: ParsedHeaders,
     request_target: []u8,
     request_authority: []u8,
-    h2_headers: []hpack.Header,
 
     pub fn deinit(self: *RequestPlan) void {
-        self.allocator.free(self.h2_headers);
         self.allocator.free(self.request_authority);
         self.allocator.free(self.request_target);
         self.parsed_headers.deinit();
@@ -55,12 +115,15 @@ pub const RequestPlan = struct {
             },
             .authority = self.request_authority,
             .path = self.request_target,
-            .headers = self.h2_headers,
+            .headers = self.parsed_headers.headers.items,
             .body = body,
         };
     }
 };
 
+/// Borrows `url` and `headers` only for the call; the plan owns copies of
+/// everything it keeps except `url`, which must outlive the plan (the task's
+/// URL for the hop).
 pub fn prepareRequest(
     allocator: std.mem.Allocator,
     url: []const u8,
@@ -69,6 +132,7 @@ pub fn prepareRequest(
     config: Config,
 ) !RequestPlan {
     const target = try policy_mod.parseTarget(config.network, url);
+    const origin_key = try OriginKey.init(&target, config);
 
     const method = try canonicalHttpMethod(method_text);
     var parsed_headers = try parseFetchHeaders(allocator, headers);
@@ -78,10 +142,6 @@ pub fn prepareRequest(
     errdefer allocator.free(request_target);
     const request_authority = try requestAuthorityAlloc(allocator, target);
     errdefer allocator.free(request_authority);
-    const h2_headers = try allocator.alloc(hpack.Header, parsed_headers.headers.items.len);
-    errdefer allocator.free(h2_headers);
-    for (parsed_headers.headers.items, 0..) |header, index|
-        h2_headers[index] = .{ .name = header.name, .value = header.value };
     try http1.validateRequestSerializeOptions(.{
         .method = method,
         .target = request_target,
@@ -95,11 +155,11 @@ pub fn prepareRequest(
         .allocator = allocator,
         .url = url,
         .target = target,
+        .origin_key = origin_key,
         .method = method,
         .parsed_headers = parsed_headers,
         .request_target = request_target,
         .request_authority = request_authority,
-        .h2_headers = h2_headers,
     };
 }
 
@@ -191,10 +251,4 @@ fn requestAuthorityAlloc(allocator: std.mem.Allocator, target: RequestTarget) ![
     if (target.port != policy_mod.defaultPort(target.protocol))
         try authority.writer(allocator).print(":{d}", .{target.port});
     return authority.toOwnedSlice(allocator);
-}
-
-pub fn appendResponseChunk(allocator: std.mem.Allocator, buffer: *std.array_list.Aligned(u8, null), chunk: []const u8, max_response_body_bytes: usize) !void {
-    if (chunk.len > max_response_body_bytes -| buffer.items.len)
-        return error.FetchResponseTooLarge;
-    try buffer.appendSlice(allocator, chunk);
 }

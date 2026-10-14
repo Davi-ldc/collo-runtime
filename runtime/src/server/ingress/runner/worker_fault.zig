@@ -12,30 +12,30 @@
 //! - When this lane reads the worker and the reason leaves its output trusted
 //!   (`finalDrainTrusted`), the last of that output is read and forwarded
 //!   before the other lanes hear of the death, so what was forwarded to them
-//!   precedes the notice in their queues.
+//!   precedes the notice in their queues, and a request whose `request_done`
+//!   is in it ends as the worker reported it.
 //! - Each request of this lane on the dead worker ends with 502, with 504
 //!   when the worker died of a deadline (the grace backstop or the metrics
 //!   thread's `owner_overran`) and the request is past its own, or with
 //!   RST_STREAM once its response head went out.
 //! - Every retirement is the reaper's (`queueRetirement`). No kill, exit
-//!   wait, usage drain or cgroup removal runs on the lane.
+//!   wait or cgroup removal runs on the lane.
 
 const lifecycle = @import("collo_server_lifecycle");
 const supervision = @import("collo_server_supervisor");
-const worker_shared_page = @import("collo_worker_state").page;
+const access_log = @import("collo_server_analytics").access;
 const fault = @import("../fault.zig");
 const completions = @import("../completions.zig");
 const admission = @import("admission.zig");
 const request_finish = @import("request_finish.zig");
 const work_queues = @import("work_queues.zig");
-const worker_completions = @import("worker_completions.zig");
 const worker_control = @import("worker_control.zig");
 const worker_registration = @import("worker_registration.zig");
 
 const WorkerPool = supervision.WorkerPool;
 const WorkerRecord = supervision.worker_table.Record;
 const LaneFault = fault.LaneFault;
-const CompletedStatus = worker_shared_page.CompletedStatus;
+const ErrorCode = access_log.ErrorCode;
 const RequestOutcome = request_finish.RequestOutcome;
 
 /// Rounds of `drainWorkerControl` the last read of a dead worker's control
@@ -48,7 +48,7 @@ const final_drain_rounds_max: usize = 64;
 /// end does not say more (`deathStatus`). Failures on the server's side of
 /// the channel record `internal_error`, so they do not count against the
 /// tenant's error rate.
-pub fn errorCodeForFault(reason: fault.WorkerFaultReason) CompletedStatus {
+pub fn errorCodeForFault(reason: fault.WorkerFaultReason) ErrorCode {
     return switch (reason) {
         .allocation_failed, .egress_session_failed => .internal_error,
         .deadline_grace_expired, .owner_overran => .deadline,
@@ -59,21 +59,16 @@ pub fn errorCodeForFault(reason: fault.WorkerFaultReason) CompletedStatus {
         .too_many_descriptors,
         .zero_length_datagram_with_descriptors,
         .ingress_channel_undecodable,
-        .fs_fault_request_undecodable,
         .descriptor_names_no_request,
         .response_head_invalid,
         .response_descriptor_invalid,
-        .completion_ring_fatal,
-        .completion_ring_corrupt,
-        .completion_sequence_mismatch,
-        .completion_record_invalid,
         .payload_ring_invalid,
         .channel_failed,
         .peer_closed,
         .exited,
-        .usage_record_protocol,
         .log_ring_corrupt,
         .retiring_notice_invalid,
+        .egress_session_removed,
         => .crash,
     };
 }
@@ -88,8 +83,10 @@ fn diedOfDeadline(reason: fault.WorkerFaultReason) bool {
 
 /// Whether what a worker wrote before a fault for `reason` is worth reading:
 /// a worker that hung up, exited, overran a deadline or lost its egress
-/// session wrote honest output, while one that broke the protocol did not,
-/// and a failed channel or allocation would fail the read again.
+/// session wrote honest output, as did one whose gateway removed its session,
+/// which broke the egress protocol and not the ingress one, while one that
+/// broke the ingress protocol did not, and a failed channel or allocation
+/// would fail the read again.
 pub fn finalDrainTrusted(reason: fault.WorkerFaultReason) bool {
     return switch (reason) {
         .peer_closed,
@@ -97,6 +94,7 @@ pub fn finalDrainTrusted(reason: fault.WorkerFaultReason) bool {
         .deadline_grace_expired,
         .owner_overran,
         .egress_session_failed,
+        .egress_session_removed,
         => true,
         .packet_short,
         .packet_too_large,
@@ -105,18 +103,12 @@ pub fn finalDrainTrusted(reason: fault.WorkerFaultReason) bool {
         .too_many_descriptors,
         .zero_length_datagram_with_descriptors,
         .ingress_channel_undecodable,
-        .fs_fault_request_undecodable,
         .descriptor_names_no_request,
         .response_head_invalid,
         .response_descriptor_invalid,
-        .completion_ring_fatal,
-        .completion_ring_corrupt,
-        .completion_sequence_mismatch,
-        .completion_record_invalid,
         .payload_ring_invalid,
         .allocation_failed,
         .channel_failed,
-        .usage_record_protocol,
         .log_ring_corrupt,
         .retiring_notice_invalid,
         => false,
@@ -126,7 +118,6 @@ pub fn finalDrainTrusted(reason: fault.WorkerFaultReason) bool {
 pub fn Methods(comptime Self: type) type {
     return struct {
         const Admission = admission.Methods(Self);
-        const Completions = worker_completions.Methods(Self);
         const Queues = work_queues.Methods(Self);
         const RequestFinish = request_finish.Methods(Self);
         const WorkerControl = worker_control.Methods(Self);
@@ -155,8 +146,12 @@ pub fn Methods(comptime Self: type) type {
             const death = registration.death_notice orelse
                 self.service.supervisor.poolFor(definition).markDead(worker, registration.worker_key);
             registration.death_notice = null;
+            // The last read of a dead worker this lane reads finishes this
+            // lane's requests whose `request_done` it finds and forwards
+            // what belongs to other lanes. A fault in that output, a hang-up
+            // included, ends the read, and the rest is left unread.
             if (registration.reading() and finalDrainTrusted(recorded))
-                try drainDeadWorker(self, registration_index);
+                _ = try drainControlToEnd(self, registration_index);
             if (death) |notice|
                 try announceDeath(self, worker, recorded, notice);
             try finishRequestsOnWorker(self, registration_index, worker, recorded);
@@ -221,7 +216,7 @@ pub fn Methods(comptime Self: type) type {
                 // worker until this runs
                 // (`worker_registration.releaseRegistrationIfIdle`).
                 const registration = try WorkerRegistration.registrationAt(self, registration_index);
-                const reason = registration.fault orelse return error.InvalidCompletionRegistration;
+                const reason = registration.fault orelse return error.InvalidWorkerRegistration;
                 try faultWorker(self, registration_index, reason);
                 did_work = true;
             }
@@ -245,24 +240,6 @@ pub fn Methods(comptime Self: type) type {
                 }
             }
             return .ok;
-        }
-
-        /// The last read of a dead worker this lane reads: its control socket
-        /// to the end, then its completion ring, forwarding what belongs to
-        /// other lanes. A fault in that output ends the read, and the rest is
-        /// left unread.
-        fn drainDeadWorker(self: *Self, registration_index: u32) LaneFault!void {
-            switch (try drainControlToEnd(self, registration_index)) {
-                .would_block => {},
-                .ok => return,
-                // A hang-up ends a dead worker's output, which stays trusted,
-                // and leaves its socket empty.
-                .fault => |cause| switch (cause) {
-                    .peer_closed => {},
-                    else => return,
-                },
-            }
-            _ = try Completions.drainCompletions(self, registration_index);
         }
 
         /// Posts `worker_died` to every other lane `notice` names, and queues
@@ -305,7 +282,7 @@ pub fn Methods(comptime Self: type) type {
             const request_count = registration.copyInflight(&request_keys);
             if (request_count == 0)
                 return;
-            const status = deathStatus(self, worker, reason);
+            const status = deathStatus(worker, reason);
             const now = self.monotonicNowNs();
             for (request_keys[0..request_count]) |request_key| {
                 const request_slot = Admission.findRequestSlot(self, request_key) orelse continue;
@@ -323,10 +300,16 @@ pub fn Methods(comptime Self: type) type {
         /// The status the requests of a dead worker carry. A worker that
         /// hung up or exited may have been ended for memory, by its sentinel
         /// or the kernel, which only its page and cgroup can tell
-        /// (`Supervisor.classifyWorkerDeath`, one cgroup read).
-        fn deathStatus(self: *Self, worker: *WorkerRecord, reason: fault.WorkerFaultReason) CompletedStatus {
+        /// (`Record.classifyDeath`, one cgroup read). The launcher's egress
+        /// retirements can overtake the worker's own death on the way to the
+        /// lanes, so a memory death found then wins too.
+        fn deathStatus(worker: *WorkerRecord, reason: fault.WorkerFaultReason) ErrorCode {
             return switch (reason) {
-                .exited, .peer_closed => self.service.supervisor.classifyWorkerDeath(worker),
+                .exited, .peer_closed => worker.classifyDeath().errorCode(),
+                .egress_session_failed, .egress_session_removed => switch (worker.classifyDeath()) {
+                    .memory_high, .memory_max => .memory,
+                    .crash => errorCodeForFault(reason),
+                },
                 else => errorCodeForFault(reason),
             };
         }

@@ -42,10 +42,10 @@ pub export fn collo_runtime_module_eval_settled(
     };
     // A drain under `executeWorkItem` is followed by the loop's collect pass,
     // but one inside `handleEvent`, such as a fetch completion that settles
-    // a module's top-level `await`, can be followed by the blocking ring wait
-    // with this entry still queued (`scheduler/loop.zig`). The wake makes
-    // that wait return `wakeup_ready`, whose handler runs the collect pass,
-    // as `tryQueueReadyWorkReadySince` does for its backlog.
+    // a module's top-level `await`, can be followed by the loop's blocking
+    // wait with this entry still queued (`scheduler/loop.zig`). The wake
+    // makes that wait return `wakeup_ready`, whose handler runs the collect
+    // pass, as `tryQueueReadyWorkReadySince` does for its backlog.
     runtime.wake();
 }
 

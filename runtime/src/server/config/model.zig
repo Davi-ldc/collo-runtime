@@ -1,6 +1,6 @@
 //! The server configuration after parsing, validation and the settings
-//! cascade: global settings, then the worker definitions in file order, each
-//! with its resolved settings and its routes.
+//! cascade: the top-level `settings`, then the worker definitions in file
+//! order, each with its resolved settings and its routes.
 //!
 //! A `Config` owns one arena that holds every string and slice reachable
 //! from it, so nothing inside it is freed piecemeal and `deinit` frees all of
@@ -11,7 +11,7 @@
 //!
 //! Every value here is final: defaults are filled in, relative paths are
 //! absolute (resolved against the configuration file's directory), a
-//! definition's `settings` already merge the global defaults with its own
+//! definition's `settings` already merge `Config.defaults` with its own
 //! overrides, and a route's `network` is already the value it runs under.
 //! A configured limit is enforced by the runtime; a limit with no enforcing
 //! mechanism is rejected by the parser and has no field here.
@@ -32,7 +32,8 @@ pub const Config = struct {
     tls: ?Tls,
     /// Null when only console lines are written, to stderr.
     analytics: ?Analytics,
-    /// The global settings every definition starts from.
+    /// `default_settings` with the top-level `settings` applied; every
+    /// definition starts from it.
     defaults: Settings,
     definitions: []const WorkerDefinition,
     /// Routes across every definition; at least one, at most
@@ -75,8 +76,8 @@ pub const Analytics = struct {
     directory_path: []const u8,
 };
 
-/// Settings that cascade from `globalSettings` to a worker definition. A
-/// definition overrides only the fields it names.
+/// Settings that cascade from the top-level `settings` to a worker
+/// definition's `settings`. A definition overrides only the fields it names.
 pub const Settings = struct {
     /// Whether each route of a worker runs in a realm of its own, with its
     /// own globals, intrinsics and module registry; false runs every route of
@@ -109,10 +110,9 @@ pub const Limits = struct {
     /// counts against it, and the handler gets what remains.
     timeout_ms: u32,
     /// CPU budget of one request, from 1 to `request_cpu_ms_max`, or null
-    /// for none: the worker's VM thread while the request owns it plus the
-    /// crypto pool's CPU for the request's jobs. It is independent of
-    /// `timeout_ms` and the first limit reached ends the request; since
-    /// crypto jobs run beside the VM thread, it may exceed the deadline.
+    /// for none: the worker's VM thread while the request owns it. It is
+    /// independent of `timeout_ms` and the first limit reached ends the
+    /// request.
     cpu_ms: ?u32,
 
     pub fn memoryBytes(self: Limits) u64 {
@@ -150,7 +150,7 @@ pub const Route = struct {
     bindings: []const Binding,
     /// The value the route's requests fetch under: the route's own when it
     /// names `network`, else its definition's `settings.network`, which
-    /// already holds the global value when the definition names none. Null
+    /// already holds the top-level value when the definition names none. Null
     /// or an empty list grants nothing.
     network: ?Network,
 };

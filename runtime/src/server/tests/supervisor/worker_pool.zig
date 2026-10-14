@@ -8,8 +8,9 @@
 //! memory gate, which refuses growth at the node's memory ceiling and wakes
 //! demand reclaim above the high water; a slot that frees, which goes to the
 //! request waiting for it at once; a worker whose launch ends after another
-//! worker served its waiter, which stays idle for the reaper; and a settle,
-//! which takes no pool lock. One pool on its own, through every interleaving
+//! worker served its waiter, which stays idle for the reaper; and the end of
+//! a request's table entry and its usage floor, which take no pool lock. One
+//! pool on its own, through every interleaving
 //! of two lanes, is covered in `pool.zig`, and lanes acting on these results
 //! in `server/tests/ingress/`. Lane `server-supervisor-test`.
 
@@ -38,6 +39,14 @@ fn requestKey(lane: pool_mod.LaneId, request: u32) lifecycle.RequestKey {
     return .{ .lane_id = lane, .slot = request, .generation = 1 };
 }
 
+/// The ticket a claim started, or null when it started none.
+fn claimedTicket(start: pool_mod.LaunchStart) ?pool_mod.LaunchTicket {
+    return switch (start) {
+        .started => |ticket| ticket,
+        .watch, .none => null,
+    };
+}
+
 fn expectAcquired(worker_pool: *WorkerPool, lane: pool_mod.LaneId, request: u32) !WorkerPool.Acquired {
     return switch (worker_pool.acquire(lane, requestKey(lane, request), far_ns)) {
         .acquired => |acquired| acquired,
@@ -57,7 +66,7 @@ fn expectHandoff(released: WorkerPool.Released) !WorkerPool.Handoff {
 fn claimTicket(worker_pool: *WorkerPool) !pool_mod.LaunchTicket {
     const waiter = requestKey(9, 1);
     if (worker_pool.acquire(9, waiter, far_ns) != .wait) return error.TestExpectedWait;
-    const ticket = worker_pool.launchStarted(true) orelse return error.TestExpectedLaunch;
+    const ticket = fixture.startLaunch(worker_pool) orelse return error.TestExpectedLaunch;
     if (!worker_pool.cancelWaiter(waiter)) return error.TestExpectedWaiter;
     return ticket;
 }
@@ -151,7 +160,7 @@ test "a launch ticket names the record storage its worker is built in" {
     const beta_pool = supervisor.poolFor(beta);
 
     try testing.expect(beta_pool.acquire(1, requestKey(1, 7), far_ns) == .wait);
-    const ticket = beta_pool.launchStarted(true) orelse return error.TestExpectedLaunch;
+    const ticket = fixture.startLaunch(beta_pool) orelse return error.TestExpectedLaunch;
     const storage = supervisor.ticketRecord(beta, ticket);
     try testing.expect(storage == &supervisor.records[@as(usize, beta) * limits.pool.pool_workers_max + ticket.entry]);
     try testing.expect(storage == fixture.recordFor(&supervisor, beta, ticket.entry));
@@ -172,9 +181,7 @@ test "a launch ticket names the record storage its worker is built in" {
 }
 
 test "a record holds one worker at a time, built under a fresh key and torn down vacant for its entry's next launch" {
-    var analytics_dir = try fixture.AnalyticsDir.init(testing.allocator);
-    defer analytics_dir.deinit(testing.allocator);
-    var supervisor = try fixture.minimalSupervisorWithAnalytics(testing.allocator, analytics_dir.path);
+    var supervisor = try fixture.minimalSupervisor(testing.allocator);
     defer fixture.deinitMinimal(&supervisor);
     const demo_pool = supervisor.poolFor(demo);
     const beta_pool = supervisor.poolFor(beta);
@@ -192,19 +199,14 @@ test "a record holds one worker at a time, built under a fresh key and torn down
     try testing.expect(second.key().eql(.{ .worker_id = 2, .worker_generation = 2 }));
     _ = try beta_pool.publish(second_ticket, second, 10);
 
-    // The first worker retires with a usage record still in its ring. The
-    // teardown writes that record, unmaps the page and leaves the storage
-    // vacant, and only then does the pool let the entry go.
-    try fixture.publishCompletedRecord(first, 61);
+    // The first worker retires. The teardown unmaps the page for every drain
+    // and leaves the storage vacant, and only then does the pool let the
+    // entry go.
     try testing.expect(demo_pool.retireIdle(first) == .retire);
     worker_registry.teardown(&supervisor, first, .idle);
     try testing.expectEqual(@as(u64, 0), first.id);
     try testing.expect(!first.page_mapped);
     try demo_pool.remove(first);
-    var lines = try analytics_dir.readUsage(testing.allocator, supervisor.analytics);
-    defer lines.deinit();
-    try testing.expectEqual(@as(usize, 1), lines.items.len);
-    try testing.expectEqual(@as(u64, 61), lines.items[0].request_id);
 
     // The entry's next launch builds its worker in the same storage, under a
     // key no earlier worker had.
@@ -219,6 +221,12 @@ test "a pool claims at most pool_cold_starts_in_flight_max launches at once" {
     var supervisor = try fixture.minimalSupervisor(testing.allocator);
     defer fixture.deinitMinimal(&supervisor);
     const demo_pool = supervisor.poolFor(demo);
+    // A live worker with every slot held, so further launches are
+    // scale-outs, here all allowed.
+    _ = try fixture.publishInertWorker(&supervisor, .{});
+    var held: u32 = 0;
+    while (held < demo_pool.concurrency) : (held += 1)
+        _ = try expectAcquired(demo_pool, 0, 100 + held);
 
     // More requests wait than the capped launches can serve between them.
     const waiting = capacity.pool_cold_starts_in_flight_max * demo_pool.concurrency + 1;
@@ -227,15 +235,30 @@ test "a pool claims at most pool_cold_starts_in_flight_max launches at once" {
         try testing.expect(demo_pool.acquire(0, requestKey(0, request), far_ns) == .wait);
     var tickets: [capacity.pool_cold_starts_in_flight_max]pool_mod.LaunchTicket = undefined;
     for (&tickets) |*ticket|
-        ticket.* = demo_pool.launchStarted(true) orelse return error.TestExpectedLaunch;
+        ticket.* = fixture.startLaunch(demo_pool) orelse return error.TestExpectedLaunch;
     // One waiter is left uncovered, and the cap still refuses a third launch.
-    try testing.expect(demo_pool.launchStarted(true) == null);
+    try testing.expect(demo_pool.launchStarted(true, true) == .none);
     try testing.expectEqual(capacity.pool_cold_starts_in_flight_max, demo_pool.snapshot().launching);
-
-    // With the launches gone and no worker live, nothing can serve the
-    // waiters, and the pool hands every one of them back.
     for (tickets) |ticket|
         try demo_pool.launchEnded(ticket);
+}
+
+test "with no worker live a pool starts its first launch and no other until it publishes" {
+    var supervisor = try fixture.minimalSupervisor(testing.allocator);
+    defer fixture.deinitMinimal(&supervisor);
+    const demo_pool = supervisor.poolFor(demo);
+
+    const waiting = capacity.pool_cold_starts_in_flight_max * demo_pool.concurrency + 1;
+    var request: u32 = 0;
+    while (request < waiting) : (request += 1)
+        try testing.expect(demo_pool.acquire(0, requestKey(0, request), far_ns) == .wait);
+    const first = fixture.startLaunch(demo_pool) orelse return error.TestExpectedLaunch;
+    try testing.expect(!first.scale_out);
+    try testing.expect(demo_pool.launchStarted(true, true) == .none);
+
+    // With the launch gone and no worker live, nothing can serve the
+    // waiters, and the pool hands every one of them back.
+    try demo_pool.launchEnded(first);
     var stranded: [8]pool_mod.Waiter = undefined;
     try testing.expectEqual(@as(usize, waiting), demo_pool.takeStranded(&stranded).len);
 }
@@ -253,15 +276,15 @@ test "the memory gate refuses growth at the node's memory ceiling, and a claim f
 
     // Below the high water a claim launches and asks nothing of the reaper.
     supervisor.cached_used_percent.store(memory_limits.autoscale_high_water_percent - 1, .monotonic);
-    try testing.expect(demo_pool.growthWanted(supervisor.memoryGate()));
-    const calm_ticket = supervisor.claimLaunch(demo) orelse return error.TestExpectedLaunch;
+    try testing.expectEqual(pool_mod.Growth.launch, demo_pool.growthWanted(supervisor.memoryGate()));
+    const calm_ticket = claimedTicket(supervisor.claimLaunch(demo, false)) orelse return error.TestExpectedLaunch;
     try demo_pool.launchEnded(calm_ticket);
     try testing.expectEqual(@as(u64, 0), try takeNudges(nudges));
 
     // From the high water to just below the ceiling a claim still launches,
     // and wakes the reaper to give idle workers' memory back.
     supervisor.cached_used_percent.store(memory_limits.autoscale_high_water_percent, .monotonic);
-    const high_ticket = supervisor.claimLaunch(demo) orelse return error.TestExpectedLaunch;
+    const high_ticket = claimedTicket(supervisor.claimLaunch(demo, false)) orelse return error.TestExpectedLaunch;
     try demo_pool.launchEnded(high_ticket);
     try testing.expectEqual(@as(u64, 1), try takeNudges(nudges));
 
@@ -269,31 +292,37 @@ test "the memory gate refuses growth at the node's memory ceiling, and a claim f
     // refuse, and the refused claim wakes the reaper too.
     supervisor.cached_used_percent.store(memory_limits.fork_deny_percent, .monotonic);
     try testing.expect(!supervisor.memoryGate());
-    try testing.expect(!demo_pool.growthWanted(supervisor.memoryGate()));
-    try testing.expect(supervisor.claimLaunch(demo) == null);
+    try testing.expectEqual(pool_mod.Growth.none, demo_pool.growthWanted(supervisor.memoryGate()));
+    try testing.expect(supervisor.claimLaunch(demo, true) == .none);
     try testing.expectEqual(@as(u64, 1), try takeNudges(nudges));
     try testing.expect(demo_pool.cancelWaiter(requestKey(0, 1)));
 }
 
-test "a settle takes no pool lock, so it finishes while its worker's pool is locked" {
+test "the end of a request's table entry and its usage floor take no pool lock, so they finish while its worker's pool is locked" {
     var supervisor = try fixture.minimalSupervisor(testing.allocator);
     defer fixture.deinitMinimal(&supervisor);
     const worker = try fixture.publishInertWorker(&supervisor, .{});
     const demo_pool = supervisor.poolFor(demo);
     const served = try expectAcquired(demo_pool, 0, 1);
-    try worker.requests.record(fixture.dispatchedRequest(1));
+    const dispatched = fixture.dispatchedRequest(1);
+    try worker.requests.record(dispatched);
 
-    // A lane settles its request before it gives the slot back, under the
-    // worker's own locks only, so no other lane's pool call can hold it up.
-    // This thread holding the pool's mutex stands in for such a call: a
-    // settle that took the mutex would deadlock here, which a Debug build
-    // reports as a panic.
+    // A lane takes its request's floor and ends its entry before it gives
+    // the slot back, under the worker's own locks only, so no other lane's
+    // pool call can hold it up. This thread holding the pool's mutex stands
+    // in for such a call: a finish that took the mutex would deadlock here,
+    // which a Debug build reports as a panic.
     demo_pool.mutex.lock();
-    supervisor.settleRequest(worker, 1, .{ .floor = .{ .status = .crash } }, fixture.request_ended_ns);
+    const floor = worker.usageFloor(served.slot, .{
+        .request_id = dispatched.request_id,
+        .request_generation = dispatched.request_key.generation,
+    }, .crash);
+    worker.requests.end(dispatched.request_id);
     demo_pool.mutex.unlock();
 
-    // The floor is written and its entry parked for a late record of it.
-    try testing.expect(worker.requests.verdict(1) == .skip);
+    // The worker never charged the request, and its entry is gone.
+    try testing.expectEqual(@as(u64, 0), floor.cpu_ns);
+    try testing.expect(worker.requests.forwardCheck(1, dispatched.request_key) == .absent);
     try testing.expect((try demo_pool.release(worker, served.slot, 1)) == .idle);
 }
 
@@ -333,11 +362,11 @@ test "a worker whose launch ends after its waiter was served stays idle for the 
     const demo_pool = supervisor.poolFor(demo);
 
     // The next request arrives while the warm worker's only slot is still
-    // held, waits, and starts a launch.
+    // held, waits, and a scale-out verdict starts a launch.
     const busy = try expectAcquired(demo_pool, 0, 1);
     try testing.expect(demo_pool.acquire(0, requestKey(0, 2), far_ns) == .wait);
-    try testing.expect(demo_pool.growthWanted(true));
-    const ticket = demo_pool.launchStarted(true) orelse return error.TestExpectedLaunch;
+    try testing.expectEqual(pool_mod.Growth.watch, demo_pool.growthWanted(true));
+    const ticket = fixture.startLaunch(demo_pool) orelse return error.TestExpectedLaunch;
 
     // The warm slot frees before the launch ends, and the waiter takes it.
     const handoff = try expectHandoff(try demo_pool.release(warm, busy.slot, 10));

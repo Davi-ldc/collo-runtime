@@ -1,11 +1,14 @@
 //! The ready queue: a bounded FIFO of work items the worker loop runs one per
 //! turn. It is not shared between threads; every producer runs on the VM
 //! thread, after reading the control channel, a timer, request I/O or a
-//! completion another thread published. The runtime keeps two, the queue
-//! and its backlog, each of `RuntimeLimits.ready_queue_capacity` items. When
-//! both are full, `tryQueueReadyWorkReadySince` (`runtime/scheduler.zig`)
-//! sets the rescan flag of the item's producer, while timers, immediates and
-//! request deadlines stay in their own containers for the next pass.
+//! completion another thread published. The runtime keeps two, the queue of
+//! `RuntimeLimits.ready_queue_capacity` items and its backlog, which has
+//! `worker_limits.egress_ready_items_max` slots more for the egress items
+//! (`runtime/scheduler.zig:queueReadyWork`), which always find room. When
+//! the queue is full and the backlog holds `ready_queue_capacity` items,
+//! `tryQueueReadyWorkReadySince` sets the rescan flag of any other item's
+//! producer, while timers, immediates and request deadlines stay in their
+//! own containers for the next pass.
 
 const std = @import("std");
 const request_task = @import("collo_worker_request").task;
@@ -20,9 +23,6 @@ pub const WorkItem = union(enum) {
     request_deadline: u64,
     fetch_completion: u64,
     fetch_body_ready: u64,
-    /// A response arrived for this fault id; settles the reads waiting on
-    /// it (`fs/fault_completion.zig`).
-    fs_fault_completion: u64,
     /// The response of this request can move on: a grant, room in the
     /// control socket or the payload ring, or a body stream's read settled
     /// (`serve/response.zig:executeAdvance`).

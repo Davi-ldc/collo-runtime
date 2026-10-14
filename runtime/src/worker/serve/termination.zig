@@ -198,8 +198,10 @@ pub fn endAfterFire(runtime: *state.Runtime, fired: sentinel_mod.Fired) void {
             continue;
         if (request_ctx.exec.request_id != fired.owner_id and responseDecided(request_ctx))
             continue;
-        // A dispatched request holds a live slot, and the page has
-        // `LIVE_SLOT_COUNT` of them, so the array cannot overflow.
+        // Each dispatched request in the map holds a pool slot of its own,
+        // since a begin on a held one is refused
+        // (`request/ingress/runtime.zig:requireUnheld`), and a worker has
+        // `LIVE_SLOT_COUNT` of them.
         std.debug.assert(count < ids.len);
         ids[count] = request_ctx.exec.request_id;
         count += 1;
@@ -228,6 +230,7 @@ pub fn endSpentBudgets(runtime: *state.Runtime) void {
             continue;
         if (request_context.isReservedId(request_ctx.exec.request_id))
             continue;
+        // Bounded as in `endAfterFire`.
         std.debug.assert(count < ids.len);
         ids[count] = request_ctx.exec.request_id;
         count += 1;

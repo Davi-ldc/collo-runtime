@@ -1,4 +1,4 @@
-//! The certificate the server presents when its configuration names none (`globalSettings.tls`):
+//! The certificate the server presents when its configuration names none (`settings.tls`):
 //! an EC P-256 key and a certificate signed by that same key, valid for `validity_days` from the
 //! moment of generation. The BoringSSL shim generates both at boot
 //! (`collo_boringssl_self_signed_generate`), and neither is ever written to disk, so every start
@@ -129,7 +129,7 @@ pub const SelfSignedCertificate = struct {
     /// connect.
     pub fn writeWarning(self: *const SelfSignedCertificate, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         try writer.writeAll(
-            "collo: warning: no certificate is configured (globalSettings.tls), so the server " ++
+            "collo: warning: no certificate is configured (settings.tls), so the server " ++
                 "presents a self-signed certificate generated at startup for ",
         );
         const listen_name = self.listen_name_buffer[0..self.listen_name_len];

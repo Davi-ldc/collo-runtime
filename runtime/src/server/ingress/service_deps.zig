@@ -168,10 +168,9 @@ pub fn Methods(comptime Self: type) type {
             if (death.retire)
                 self.queueRetirement(worker);
             const definition = worker.definition_index;
-            if (self.supervisor.poolFor(definition).growthWanted(self.supervisor.memoryGate())) {
-                self.launcher.submit(definition, .replacement);
-            } else {
-                self.strandWaiters(definition, .growth_refused) catch |err| self.recordFatalError(err);
+            switch (self.supervisor.poolFor(definition).growthWanted(self.supervisor.memoryGate())) {
+                .launch, .watch => self.launcher.submit(definition, .replacement),
+                .none => self.strandWaiters(definition, .growth_refused) catch |err| self.recordFatalError(err),
             }
         }
 
@@ -185,20 +184,26 @@ pub fn Methods(comptime Self: type) type {
                 view.departure orelse .died
             else
                 .died;
-            self.reaper.queueRetirement(worker, switch (departure) {
-                .idle => .idle,
-                .died => .died,
-                .egress => .egress_reattach,
-                .recycled => .recycled,
-            });
+            self.reaper.queueRetirement(worker, supervision.reaper.RetireReason.fromDeparture(departure));
         }
 
         // The launcher's `Deps`, on the launcher thread.
 
         /// Claims a launch when the pool wants one under the memory gate
         /// (`Supervisor.claimLaunch`).
-        pub fn launchClaim(ctx: *anyopaque, definition: DefinitionIndex) ?pool.LaunchTicket {
-            return fromContext(ctx).supervisor.claimLaunch(definition);
+        pub fn launchClaim(ctx: *anyopaque, definition: DefinitionIndex, allow_scale_out: bool) pool.LaunchStart {
+            return fromContext(ctx).supervisor.claimLaunch(definition, allow_scale_out);
+        }
+
+        /// One scale-out sample over the watched definitions
+        /// (`Supervisor.sampleScaleOut`).
+        pub fn launchScaleOut(
+            ctx: *anyopaque,
+            watch: *launcher_mod.DefinitionSet,
+            granted: *launcher_mod.DefinitionSet,
+            now_ns: u64,
+        ) void {
+            fromContext(ctx).supervisor.sampleScaleOut(watch, granted, now_ns);
         }
 
         pub fn launchAttachEgress(
@@ -240,8 +245,16 @@ pub fn Methods(comptime Self: type) type {
             self.announceWorkerDeath(target.record, target.worker_key, death, .egress_session_failed);
         }
 
-        pub fn launchDropEgressSession(ctx: *anyopaque, generation: u64, session_id: u64) bool {
-            return fromContext(ctx).supervisor.dropEgressSession(generation, session_id);
+        /// Takes the live worker on a session its gateway removed for a
+        /// protocol violation out of service
+        /// (`Supervisor.retireEgressSession`) and announces the death as
+        /// `egress_session_removed`, which counts against the tenant. False
+        /// when no live worker held that session.
+        pub fn launchRetireEgressSession(ctx: *anyopaque, generation: u64, session_id: u64) bool {
+            const self = fromContext(ctx);
+            const retired = self.supervisor.retireEgressSession(generation, session_id) orelse return false;
+            self.announceWorkerDeath(retired.record, retired.worker_key, retired.death, .egress_session_removed);
+            return true;
         }
 
         /// Builds the record of a ready worker in the storage of its ticket's

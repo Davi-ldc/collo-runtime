@@ -4,7 +4,8 @@
 // Every entry is a JSC::Strong on the realm, rooted for the VM's lifetime and cleared by destroyVmContents. A global
 // reads and writes only its own realm's cache, so an object a host function builds always takes its prototype from
 // the realm it was called in. A generated getter aborts on an entry that was never stored, since its callers use the
-// result as a live cell.
+// result as a live cell. The stream classes store their rows from their own installers (streams_install.cpp and the
+// installers it calls), so they have no setter here.
 
 #include "jsc/runtime/state.h"
 
@@ -54,78 +55,6 @@ void GlobalObject::cacheResponseApi(
     cache.response_constructor.set(vm(), response_constructor);
     cache.response_prototype.set(vm(), response_prototype);
     cache.response_structure.set(vm(), response_structure);
-}
-
-void GlobalObject::cacheReadableStreamApi(JSC::JSObject* readable_stream_constructor,
-    JSC::JSObject* readable_stream_prototype, JSC::Structure* readable_stream_structure,
-    JSC::JSObject* readable_stream_default_reader_constructor, JSC::JSObject* readable_stream_default_reader_prototype,
-    JSC::Structure* readable_stream_default_reader_structure,
-    JSC::JSObject* readable_stream_default_controller_constructor,
-    JSC::JSObject* readable_stream_default_controller_prototype,
-    JSC::Structure* readable_stream_default_controller_structure,
-    JSC::JSObject* readable_stream_byob_reader_constructor, JSC::JSObject* readable_stream_byob_reader_prototype,
-    JSC::Structure* readable_stream_byob_reader_structure, JSC::JSObject* readable_stream_byob_request_constructor,
-    JSC::JSObject* readable_stream_byob_request_prototype, JSC::Structure* readable_stream_byob_request_structure,
-    JSC::JSObject* readable_byte_stream_controller_constructor,
-    JSC::JSObject* readable_byte_stream_controller_prototype, JSC::Structure* readable_byte_stream_controller_structure,
-    JSC::JSObject* readable_stream_async_iterator_prototype, JSC::Structure* readable_stream_async_iterator_structure)
-{
-    auto& cache = webApiCache();
-    cache.readable_stream_constructor.set(vm(), readable_stream_constructor);
-    cache.readable_stream_prototype.set(vm(), readable_stream_prototype);
-    cache.readable_stream_structure.set(vm(), readable_stream_structure);
-    cache.readable_stream_default_reader_constructor.set(vm(), readable_stream_default_reader_constructor);
-    cache.readable_stream_default_reader_prototype.set(vm(), readable_stream_default_reader_prototype);
-    cache.readable_stream_default_reader_structure.set(vm(), readable_stream_default_reader_structure);
-    cache.readable_stream_default_controller_constructor.set(vm(), readable_stream_default_controller_constructor);
-    cache.readable_stream_default_controller_prototype.set(vm(), readable_stream_default_controller_prototype);
-    cache.readable_stream_default_controller_structure.set(vm(), readable_stream_default_controller_structure);
-    cache.readable_stream_byob_reader_constructor.set(vm(), readable_stream_byob_reader_constructor);
-    cache.readable_stream_byob_reader_prototype.set(vm(), readable_stream_byob_reader_prototype);
-    cache.readable_stream_byob_reader_structure.set(vm(), readable_stream_byob_reader_structure);
-    cache.readable_stream_byob_request_constructor.set(vm(), readable_stream_byob_request_constructor);
-    cache.readable_stream_byob_request_prototype.set(vm(), readable_stream_byob_request_prototype);
-    cache.readable_stream_byob_request_structure.set(vm(), readable_stream_byob_request_structure);
-    cache.readable_byte_stream_controller_constructor.set(vm(), readable_byte_stream_controller_constructor);
-    cache.readable_byte_stream_controller_prototype.set(vm(), readable_byte_stream_controller_prototype);
-    cache.readable_byte_stream_controller_structure.set(vm(), readable_byte_stream_controller_structure);
-    cache.readable_stream_async_iterator_prototype.set(vm(), readable_stream_async_iterator_prototype);
-    cache.readable_stream_async_iterator_structure.set(vm(), readable_stream_async_iterator_structure);
-}
-
-void GlobalObject::cacheWritableStreamApi(JSC::JSObject* writable_stream_constructor,
-    JSC::JSObject* writable_stream_prototype, JSC::Structure* writable_stream_structure,
-    JSC::JSObject* writable_stream_default_writer_constructor, JSC::JSObject* writable_stream_default_writer_prototype,
-    JSC::Structure* writable_stream_default_writer_structure,
-    JSC::JSObject* writable_stream_default_controller_constructor,
-    JSC::JSObject* writable_stream_default_controller_prototype,
-    JSC::Structure* writable_stream_default_controller_structure)
-{
-    auto& cache = webApiCache();
-    cache.writable_stream_constructor.set(vm(), writable_stream_constructor);
-    cache.writable_stream_prototype.set(vm(), writable_stream_prototype);
-    cache.writable_stream_structure.set(vm(), writable_stream_structure);
-    cache.writable_stream_default_writer_constructor.set(vm(), writable_stream_default_writer_constructor);
-    cache.writable_stream_default_writer_prototype.set(vm(), writable_stream_default_writer_prototype);
-    cache.writable_stream_default_writer_structure.set(vm(), writable_stream_default_writer_structure);
-    cache.writable_stream_default_controller_constructor.set(vm(), writable_stream_default_controller_constructor);
-    cache.writable_stream_default_controller_prototype.set(vm(), writable_stream_default_controller_prototype);
-    cache.writable_stream_default_controller_structure.set(vm(), writable_stream_default_controller_structure);
-}
-
-void GlobalObject::cacheTransformStreamApi(JSC::JSObject* transform_stream_constructor,
-    JSC::JSObject* transform_stream_prototype, JSC::Structure* transform_stream_structure,
-    JSC::JSObject* transform_stream_default_controller_constructor,
-    JSC::JSObject* transform_stream_default_controller_prototype,
-    JSC::Structure* transform_stream_default_controller_structure)
-{
-    auto& cache = webApiCache();
-    cache.transform_stream_constructor.set(vm(), transform_stream_constructor);
-    cache.transform_stream_prototype.set(vm(), transform_stream_prototype);
-    cache.transform_stream_structure.set(vm(), transform_stream_structure);
-    cache.transform_stream_default_controller_constructor.set(vm(), transform_stream_default_controller_constructor);
-    cache.transform_stream_default_controller_prototype.set(vm(), transform_stream_default_controller_prototype);
-    cache.transform_stream_default_controller_structure.set(vm(), transform_stream_default_controller_structure);
 }
 
 void GlobalObject::cacheDOMExceptionApi(JSC::JSObject* dom_exception_constructor,
@@ -266,39 +195,6 @@ void ColloWebApiCache::clear()
 #include "webapi_cache.def"
 #undef COLLO_WEBAPI_CACHE_GETTER
 #undef COLLO_WEBAPI_CACHE_FIELD
-    readable_stream_identifier = {};
-    readable_stream_owner_identifier = {};
-    readable_stream_iterator_identifier = {};
-    readable_stream_iterator_return_value_identifier = {};
-    readable_stream_iterator_return_pending_identifier = {};
-    readable_stream_controller_identifier = {};
-    readable_stream_tee_state_identifier = {};
-    readable_stream_tee_original_identifier = {};
-    readable_stream_tee_branch_a_identifier = {};
-    readable_stream_tee_branch_b_identifier = {};
-    readable_stream_tee_reading_identifier = {};
-    readable_stream_tee_fulfilled_identifier = {};
-    readable_stream_tee_rejected_identifier = {};
-    readable_stream_tee_branch_a_canceled_identifier = {};
-    readable_stream_tee_branch_b_canceled_identifier = {};
-    readable_stream_tee_branch_a_reason_identifier = {};
-    readable_stream_tee_branch_b_reason_identifier = {};
-    readable_stream_from_state_identifier = {};
-    readable_stream_from_iterator_identifier = {};
-    readable_stream_from_next_identifier = {};
-    readable_stream_from_is_async_identifier = {};
-    readable_stream_from_done_identifier = {};
-    readable_stream_from_next_fulfilled_identifier = {};
-    readable_stream_from_next_rejected_identifier = {};
-    readable_stream_from_value_fulfilled_identifier = {};
-    readable_stream_from_value_rejected_identifier = {};
-    readable_stream_from_return_fulfilled_identifier = {};
-    readable_stream_from_return_rejected_identifier = {};
-    writable_stream_identifier = {};
-    writable_stream_controller_identifier = {};
-    transform_stream_identifier = {};
-    pipe_to_state_identifier = {};
-    compression_stream_state_identifier = {};
-    text_encoder_stream_state_identifier = {};
-    text_decoder_stream_state_identifier = {};
+    for (auto& function : stream_functions)
+        function.clear();
 }

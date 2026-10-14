@@ -21,26 +21,6 @@ bench("performance.to-json", iterations => {
   return checksum;
 }, { iterations: 100000, warmup: 5000 });
 
-bench("performance.timing-read", iterations => {
-  let checksum = 0;
-  for (let i = 0; i < iterations; i++)
-    checksum += performance.timing.responseEnd;
-  return checksum;
-}, { iterations: 100000, warmup: 5000 });
-
-bench("performance.event-target-dispatch", iterations => {
-  let checksum = 0;
-  const event = new Event("bench-performance");
-  function listener() {
-    checksum++;
-  }
-  performance.addEventListener("bench-performance", listener);
-  for (let i = 0; i < iterations; i++)
-    performance.dispatchEvent(event);
-  performance.removeEventListener("bench-performance", listener);
-  return checksum;
-}, { iterations: 50000, warmup: 1000 });
-
 bench("performance.mark-clear", iterations => {
   let checksum = 0;
   for (let i = 0; i < iterations; i++) {

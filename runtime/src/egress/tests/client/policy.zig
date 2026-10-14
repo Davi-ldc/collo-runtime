@@ -1,19 +1,17 @@
 //! Tests of the gateway's outbound transport rules: how `parseTarget` reads
-//! a hop's URL and decides it under a network policy, the check of every DNS
-//! answer against the hop's admission, the DNS cache's coalescing, negative
-//! caching, invalidation and deadlines, connect racing, body and window
-//! limits, and the stall, request and HTTP/1 park deadlines. The address
-//! classes and the grant matching beneath `parseTarget` are tested in
-//! `common/tests/network/`. The DNS cache cases swap in test resolvers
-//! wherever they need a lookup to fail, block or stall.
+//! a hop's URL once, through the host grammar allow entries are written in,
+//! and decides it under a network policy; that every host the transport ever
+//! refused as unreadable is still refused; the check of every DNS answer
+//! against the hop's admission; body and window limits; and the stall and
+//! request deadlines. The address classes and the grant matching beneath
+//! `parseTarget` are tested in `common/tests/network/`, the DNS cache in
+//! `dns_cache.zig`.
 
 const std = @import("std");
 const gateway_egress = @import("collo_egress_client");
 const network_policy = @import("network_policy.zig");
-const dns_cache = gateway_egress.dns_cache;
 const egress_transport = gateway_egress.transport;
 const network = gateway_egress.network;
-const readiness = gateway_egress.readiness;
 
 /// `api.example.com` and `[2606:4700::1111]`, over HTTPS on port 443.
 const listed_grant: network.Grant = .{
@@ -207,21 +205,20 @@ test "egress answer check refuses a private answer for a name * admits, even bes
     try std.testing.expect(!public_only.admission.allow_private_networks);
     try std.testing.expectError(
         error.EgressPrivateAddressDenied,
-        egress_transport.selectResolvedAddress(public_only.admission, &private_answer),
+        egress_transport.admitResolvedAddresses(public_only.admission, &private_answer),
     );
 
     const beside = try egress_transport.parseTarget(public_and_internal_policy, "https://api.example.com/");
     try std.testing.expect(!beside.admission.allow_private_networks);
     try std.testing.expectError(
         error.EgressPrivateAddressDenied,
-        egress_transport.selectResolvedAddress(beside.admission, &private_answer),
+        egress_transport.admitResolvedAddresses(beside.admission, &private_answer),
     );
 
     // The flag follows the entry that names the host.
     const internal = try egress_transport.parseTarget(public_and_internal_policy, "https://db.internal/");
     try std.testing.expect(internal.admission.allow_private_networks);
-    const selected = try egress_transport.selectResolvedAddress(internal.admission, &private_answer);
-    try std.testing.expectEqualSlices(u8, &[_]u8{ 10, 0, 0, 1 }, &egress_transport.ipv4Bytes(selected));
+    try egress_transport.admitResolvedAddresses(internal.admission, &private_answer);
 }
 
 test "egress answer check refuses an answer mixing a public and a loopback address whole with EgressReservedAddressDenied" {
@@ -232,22 +229,25 @@ test "egress answer check refuses an answer mixing a public and a loopback addre
     };
     try std.testing.expectError(
         error.EgressReservedAddressDenied,
-        egress_transport.selectResolvedAddress(target.admission, &answers),
+        egress_transport.admitResolvedAddresses(target.admission, &answers),
     );
     try std.testing.expectError(
         error.EgressReservedAddressDenied,
-        egress_transport.selectResolvedAddress(.{ .allow_private_networks = true }, &answers),
+        egress_transport.admitResolvedAddresses(.{ .allow_private_networks = true }, &answers),
     );
 }
 
-test "egress answer check returns the first answer once every answer passes" {
+test "egress answer check passes an answer once every address passes and refuses an empty one" {
     const target = try egress_transport.parseTarget(network.public_https, "https://api.example.com/");
     const answers = [_]std.net.Address{
         try std.net.Address.parseIp4("93.184.216.34", 443),
         try std.net.Address.parseIp6("2606:2800:220:1:248:1893:25c8:1946", 443),
     };
-    const selected = try egress_transport.selectResolvedAddress(target.admission, &answers);
-    try std.testing.expectEqualSlices(u8, &[_]u8{ 93, 184, 216, 34 }, &egress_transport.ipv4Bytes(selected));
+    try egress_transport.admitResolvedAddresses(target.admission, &answers);
+    try std.testing.expectError(
+        error.HostLacksNetworkAddresses,
+        egress_transport.admitResolvedAddresses(target.admission, &.{}),
+    );
 }
 
 test "egress target and answer check refuse metadata addresses under every policy and admission" {
@@ -277,7 +277,7 @@ test "egress target and answer check refuse metadata addresses under every polic
             const single = [_]std.net.Address{answer};
             try std.testing.expectError(
                 error.EgressReservedAddressDenied,
-                egress_transport.selectResolvedAddress(.{ .allow_private_networks = allow_private_networks }, &single),
+                egress_transport.admitResolvedAddresses(.{ .allow_private_networks = allow_private_networks }, &single),
             );
         }
     }
@@ -308,222 +308,75 @@ test "egress target refuses localhost in any spelling with EgressReservedAddress
     }
 }
 
-test "egress target refuses hosts a URL parser could read another way as invalid before the policy sees them" {
+test "egress target refuses as an invalid URL every host the transport ever refused before the policy" {
+    // Each host reaches `parseTarget` intact: std.Uri ends an authority only
+    // at `/`, `?` or `#` and splits userinfo at the first `@`, so a host can
+    // hold every other byte. Every one of them fails the host grammar
+    // (`pattern.parseHost`): a byte outside letters, digits, `-`, `_` and
+    // `.`, an empty label, a number other than a strict dotted quad, or a
+    // zoned or malformed IPv6 literal.
     const urls = [_][]const u8{
-        "https://exämple.com/",
+        "https://a b.example/",
+        "https://a\x01b.example/",
+        "https://a\x7fb.example/",
+        "https://ex\xc3\xa4mple.com/",
         "https://%6cocalhost/",
-        "https://0177.0.0.1/",
+        "https://a\\b.example/",
+        "https://user@a@b.example/",
+        "https:///path",
+        "https://./",
         "https://127.1/",
+        "https://010.0.0.1/",
+        "https://0177.0.0.1/",
+        "https://2130706433/",
+        "https://1.2.3.4.5/",
+        "https://256.1.1.1/",
+        "https://0x7f.1/",
+        "https://[fe80::1%25eth0]/",
+        "https://[example.com]/",
     };
     for (urls) |url|
         try std.testing.expectError(error.InvalidFetchUrl, egress_transport.parseTarget(network.public_https, url));
-
-    const dotted = try egress_transport.parseTarget(network.public_https, "https://example.com./data");
-    try std.testing.expectEqualStrings("example.com", dotted.tls_server_name);
 }
 
-test "egress DNS cache coalesces completed lookups and invalidates entries" {
-    var cache = egress_transport.DnsCache.init(std.testing.allocator, .{});
-    defer cache.deinit();
-
-    const first = try cache.resolve(std.testing.allocator, "127.0.0.1", 80);
-    defer std.testing.allocator.free(first);
-    try std.testing.expect(first.len > 0);
-
-    const second = try cache.resolve(std.testing.allocator, "127.0.0.1", 80);
-    defer std.testing.allocator.free(second);
-    try std.testing.expect(second.len > 0);
-
-    cache.invalidate("127.0.0.1", 80);
-    const third = try cache.resolve(std.testing.allocator, "127.0.0.1", 80);
-    defer std.testing.allocator.free(third);
-    try std.testing.expect(third.len > 0);
-}
-
-var negative_lookup_count = std.atomic.Value(usize).init(0);
-
-fn failingResolver(allocator: std.mem.Allocator, host: []const u8, port: u16) dns_cache.LookupResult {
-    _ = allocator;
-    _ = host;
-    _ = port;
-    _ = negative_lookup_count.fetchAdd(1, .acq_rel);
-    return .{ .failure = error.UnknownHostName };
-}
-
-test "egress DNS cache keeps negative lookups for short TTL and invalidates explicitly" {
-    negative_lookup_count.store(0, .release);
-    var cache = egress_transport.DnsCache.init(std.testing.allocator, .{
-        .ttl_ns = std.time.ns_per_hour,
-        .negative_ttl_ns = std.time.ns_per_hour,
-        .resolver = failingResolver,
-    });
-    defer cache.deinit();
-
-    try std.testing.expectError(error.UnknownHostName, cache.resolve(std.testing.allocator, "missing.example.test", 443));
-    try std.testing.expectError(error.UnknownHostName, cache.resolve(std.testing.allocator, "missing.example.test", 443));
-    try std.testing.expectEqual(@as(usize, 1), negative_lookup_count.load(.acquire));
-
-    cache.invalidate("missing.example.test", 443);
-    try std.testing.expectError(error.UnknownHostName, cache.resolve(std.testing.allocator, "missing.example.test", 443));
-    try std.testing.expectEqual(@as(usize, 2), negative_lookup_count.load(.acquire));
-}
-
-fn transientResolver(allocator: std.mem.Allocator, host: []const u8, port: u16) dns_cache.LookupResult {
-    _ = allocator;
-    _ = host;
-    _ = port;
-    _ = negative_lookup_count.fetchAdd(1, .acq_rel);
-    return .{ .failure = error.DnsLookupFailed };
-}
-
-test "egress DNS cache does not negative-cache transient resolver failures" {
-    negative_lookup_count.store(0, .release);
-    var cache = egress_transport.DnsCache.init(std.testing.allocator, .{
-        .ttl_ns = std.time.ns_per_hour,
-        .negative_ttl_ns = std.time.ns_per_hour,
-        .resolver = transientResolver,
-        .resolver_worker_count = 0,
-    });
-    defer cache.deinit();
-
-    try std.testing.expectError(error.DnsLookupFailed, cache.resolve(std.testing.allocator, "flaky.example.test", 443));
-    try std.testing.expectError(error.DnsLookupFailed, cache.resolve(std.testing.allocator, "flaky.example.test", 443));
-    try std.testing.expectEqual(@as(usize, 2), negative_lookup_count.load(.acquire));
-}
-
-var blocking_resolver_entered: std.Thread.ResetEvent = .{};
-var blocking_resolver_release: std.Thread.ResetEvent = .{};
-
-fn blockingResolver(allocator: std.mem.Allocator, host: []const u8, port: u16) dns_cache.LookupResult {
-    blocking_resolver_entered.set();
-    blocking_resolver_release.wait();
-    const addresses = allocator.alloc(std.net.Address, 1) catch |err|
-        return .{ .failure = err };
-    addresses[0] = std.net.Address.parseIp4(host, port) catch |err| {
-        allocator.free(addresses);
-        return .{ .failure = err };
+test "a host the grammar cannot read is an invalid URL, never a policy denial" {
+    // These hosts pass every byte check a looser reader would make, so they
+    // reach the grammar, which alone refuses them; the tenant learns its URL
+    // is wrong rather than that its network setting refused it.
+    const urls = [_][]const u8{
+        "https://a..b.example/",
+        "https://example.com../",
+        "https://-lead.example/",
+        "https://trail-.example/",
+        "https://foo.0xff/",
+        "https://" ++ "a" ** 64 ++ ".example/",
     };
-    return .{ .success = addresses };
+    for (urls) |url|
+        try std.testing.expectError(error.InvalidFetchUrl, egress_transport.parseTarget(network.public_https, url));
 }
 
-var blocking_resolve_ok = std.atomic.Value(bool).init(false);
+test "egress target names DNS and TLS by the URL's host without brackets or one trailing dot" {
+    const dotted = try egress_transport.parseTarget(network.public_https, "https://Example.COM./data");
+    try std.testing.expectEqualStrings("Example.COM.", dotted.authority_host);
+    try std.testing.expectEqualStrings("Example.COM", dotted.tls_server_name);
 
-fn resolveWhileInvalidated(cache: *egress_transport.DnsCache) void {
-    const addresses = cache.resolve(std.testing.allocator, "93.184.216.34", 443) catch return;
-    std.testing.allocator.free(addresses);
-    blocking_resolve_ok.store(true, .release);
-}
+    const numeric = try egress_transport.parseTarget(network.public_https, "https://93.184.216.34/");
+    try std.testing.expectEqualStrings("93.184.216.34", numeric.authority_host);
+    try std.testing.expectEqualStrings("93.184.216.34", numeric.tls_server_name);
+    try std.testing.expectEqual(@as(u16, 443), numeric.port);
 
-test "egress DNS cache invalidate defers removal while a lookup is in flight" {
-    // Destroying a busy entry would be a use-after-free: the resolver thread
-    // reads `host_lower` with the mutex released and clears `job_active`
-    // when it finishes, and the caller thread waits on the entry.
-    // `invalidate` must defer the removal like every other remover.
-    blocking_resolver_entered.reset();
-    blocking_resolver_release.reset();
-    blocking_resolve_ok.store(false, .release);
-    var cache = egress_transport.DnsCache.init(std.testing.allocator, .{
-        .resolver = blockingResolver,
-        .resolver_worker_count = 1,
-    });
-    defer cache.deinit();
-
-    const resolver_thread = try std.Thread.spawn(.{}, resolveWhileInvalidated, .{&cache});
-    // The resolver thread is inside the lookup: the entry is in flight with
-    // `job_active` set, and the caller thread is parked as a waiter.
-    blocking_resolver_entered.wait();
-    cache.invalidate("93.184.216.34", 443);
-    {
-        cache.mutex.lock();
-        defer cache.mutex.unlock();
-        // Deferred, not destroyed.
-        try std.testing.expectEqual(@as(usize, 1), cache.entries.items.len);
-    }
-    blocking_resolver_release.set();
-    resolver_thread.join();
-    try std.testing.expect(blocking_resolve_ok.load(.acquire));
-}
-
-fn slowResolver(allocator: std.mem.Allocator, host: []const u8, port: u16) dns_cache.LookupResult {
-    std.Thread.sleep(20 * std.time.ns_per_ms);
-    const addresses = allocator.alloc(std.net.Address, 1) catch |err|
-        return .{ .failure = err };
-    addresses[0] = std.net.Address.parseIp4(host, port) catch |err| {
-        allocator.free(addresses);
-        return .{ .failure = err };
-    };
-    return .{ .success = addresses };
-}
-
-test "egress DNS cache wait respects request deadline while resolver continues" {
-    var cache = egress_transport.DnsCache.init(std.testing.allocator, .{
-        .resolver = slowResolver,
-        .resolver_worker_count = 1,
-    });
-    defer cache.deinit();
-
-    try std.testing.expectError(
-        error.FetchRequestDeadlineExceeded,
-        cache.resolveUntil(
-            std.testing.allocator,
-            "93.184.216.34",
-            443,
-            try readiness.deadlineAfterMs(1),
-        ),
+    const bracketed = try egress_transport.parseTarget(
+        ipv6_8443_policy,
+        "https://[2606:2800:220:1:248:1893:25c8:1946]:8443/",
     );
-}
-
-test "egress DNS cache applies stall ceiling when caller has no request deadline" {
-    var cache = egress_transport.DnsCache.init(std.testing.allocator, .{
-        .resolver = slowResolver,
-        .resolver_worker_count = 1,
-        .resolver_stall_timeout_ns = std.time.ns_per_ms,
-    });
-    defer cache.deinit();
-
-    try std.testing.expectError(
-        error.DnsLookupTimeout,
-        cache.resolveUntil(std.testing.allocator, "93.184.216.34", 443, 0),
-    );
+    try std.testing.expectEqualStrings("[2606:2800:220:1:248:1893:25c8:1946]", bracketed.authority_host);
+    try std.testing.expectEqualStrings("2606:2800:220:1:248:1893:25c8:1946", bracketed.tls_server_name);
+    try std.testing.expectEqual(@as(u16, 8443), bracketed.port);
 }
 
 test "ipv4 policy reads network-order address bytes" {
     const address = try std.net.Address.parseIp4("1.2.3.4", 443);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 2, 3, 4 }, &egress_transport.ipv4Bytes(address));
-}
-
-test "egress target uses validated numeric connect host" {
-    var cache = egress_transport.DnsCache.init(std.testing.allocator, .{});
-    defer cache.deinit();
-    const request_target = try egress_transport.parseTarget(network.public_https, "https://93.184.216.34/");
-    var target = try egress_transport.resolveRequestTargetUntil(std.testing.allocator, &cache, request_target, 0);
-    defer target.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("93.184.216.34", target.authority_host);
-    try std.testing.expectEqualStrings("93.184.216.34", target.tls_server_name);
-    try std.testing.expectEqualStrings("93.184.216.34", target.connect_host);
-    try std.testing.expectEqual(@as(u16, 443), target.port);
-}
-
-test "egress target keeps ipv6 authority separate from tls server name" {
-    var cache = egress_transport.DnsCache.init(std.testing.allocator, .{});
-    defer cache.deinit();
-    const request_target = try egress_transport.parseTarget(
-        ipv6_8443_policy,
-        "https://[2606:2800:220:1:248:1893:25c8:1946]:8443/",
-    );
-    var target = try egress_transport.resolveRequestTargetUntil(std.testing.allocator, &cache, request_target, 0);
-    defer target.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("[2606:2800:220:1:248:1893:25c8:1946]", target.authority_host);
-    try std.testing.expectEqualStrings("2606:2800:220:1:248:1893:25c8:1946", target.tls_server_name);
-    try std.testing.expectEqualStrings("2606:2800:220:1:248:1893:25c8:1946", target.connect_host);
-    try std.testing.expectEqual(@as(u16, 8443), target.port);
-}
-
-test "egress target rejects bracketed non-ipv6 hosts" {
-    try std.testing.expectError(
-        error.InvalidFetchUrl,
-        egress_transport.parseTarget(network.public_https, "https://[example.com]/"),
-    );
 }
 
 test "binary fetch headers clone to http1 headers" {
@@ -538,16 +391,7 @@ test "binary fetch headers clone to http1 headers" {
     try std.testing.expectEqualStrings("yes", parsed.headers.items[0].value);
 }
 
-test "response body buffering enforces maximum" {
-    var body = try std.array_list.Aligned(u8, null).initCapacity(std.testing.allocator, 16);
-    defer body.deinit(std.testing.allocator);
-    try egress_transport.appendResponseChunk(std.testing.allocator, &body, "12345678", 16);
-    try egress_transport.appendResponseChunk(std.testing.allocator, &body, "abcdefgh", 16);
-    try std.testing.expectEqualStrings("12345678abcdefgh", body.items);
-    try std.testing.expectError(error.FetchResponseTooLarge, egress_transport.appendResponseChunk(std.testing.allocator, &body, "!", 16));
-}
-
-test "compressed stream pump keeps decoded queue watermark separate from body cap" {
+test "stream pump limits keep the decoded queue watermark separate from the body cap" {
     const config = egress_transport.Config{
         .network = network.public_https,
         .max_response_body_bytes = 4 * 1024 * 1024,
@@ -555,13 +399,10 @@ test "compressed stream pump keeps decoded queue watermark separate from body ca
         .max_pending_decoded_body_bytes = 256 * 1024,
     };
 
-    const identity_limits = config.streamPumpLimitsForEncoding(.identity);
-    try std.testing.expectEqual(@as(usize, 256 * 1024), identity_limits.max_pending_decoded_bytes);
-    try std.testing.expectEqual(@as(usize, 512 * 1024), identity_limits.max_encoded_bytes);
-
-    const compressed_limits = config.streamPumpLimitsForEncoding(.gzip);
-    try std.testing.expectEqual(@as(usize, 256 * 1024), compressed_limits.max_pending_decoded_bytes);
-    try std.testing.expectEqual(@as(usize, 512 * 1024), compressed_limits.max_encoded_bytes);
+    const limits = try config.streamPumpLimits().normalized();
+    try std.testing.expectEqual(@as(usize, 4 * 1024 * 1024), limits.max_decoded_bytes);
+    try std.testing.expectEqual(@as(usize, 256 * 1024), limits.max_pending_decoded_bytes);
+    try std.testing.expectEqual(@as(usize, 512 * 1024), limits.max_encoded_bytes);
 }
 
 test "http2 advertised receive window respects encoded budget" {
@@ -574,132 +415,4 @@ test "http2 advertised receive window respects encoded budget" {
     };
     const limits = try config.http2Limits().normalized();
     try std.testing.expectEqual(@as(u32, 32 * 1024), limits.stream_receive_window);
-}
-
-test "connect racing continues past first parallel candidate window" {
-    var server_address = try std.net.Address.parseIp4("127.0.0.1", 0);
-    var server = try server_address.listen(.{ .reuse_address = true });
-    defer server.deinit();
-
-    const accept_thread = try std.Thread.spawn(.{}, acceptOneForConnectRace, .{&server});
-    defer accept_thread.join();
-
-    const port = server.listen_address.getPort();
-    var refused_ports: [4]u16 = undefined;
-    for (&refused_ports) |*refused_port|
-        refused_port.* = try closedLoopbackPort();
-    const addresses = [_]std.net.Address{
-        try std.net.Address.parseIp4("127.0.0.1", refused_ports[0]),
-        try std.net.Address.parseIp4("127.0.0.1", refused_ports[1]),
-        try std.net.Address.parseIp4("127.0.0.1", refused_ports[2]),
-        try std.net.Address.parseIp4("127.0.0.1", refused_ports[3]),
-        try std.net.Address.parseIp4("127.0.0.1", port),
-    };
-    var driver = try readiness.Driver.initWithBackend(std.testing.allocator, .poll);
-    defer driver.deinit();
-
-    const deadline = try readiness.deadlineAfterMs(2000);
-    errdefer {
-        if (std.net.Address.parseIp4("127.0.0.1", port)) |wake_address| {
-            if (std.net.tcpConnectToAddress(wake_address)) |wake| {
-                wake.close();
-            } else |_| {}
-        } else |_| {}
-    }
-    var stream = try egress_transport.connectStreamWithReadiness(&addresses, deadline, &driver, null, .{});
-    defer stream.close();
-}
-
-fn acceptOneForConnectRace(server: *std.net.Server) void {
-    var connection = server.accept() catch return;
-    connection.stream.close();
-}
-
-fn closedLoopbackPort() !u16 {
-    var address = try std.net.Address.parseIp4("127.0.0.1", 0);
-    var server = try address.listen(.{ .reuse_address = true });
-    const port = server.listen_address.getPort();
-    server.deinit();
-    return port;
-}
-
-test "h1 owner-loop pending deadlines follow the two-clock model" {
-    const engine = gateway_egress.engine;
-    const ms = std.time.ns_per_ms;
-
-    var pending = engine.H1Pending{
-        .command = .{
-            .task = undefined,
-            .config = .{ .network = network.public_https, .socket_timeout_ms = 5_000 },
-        },
-        .body_pipe = undefined,
-        .source_id = 1,
-        .phase = .{ .exchange = undefined },
-        .park = .runnable,
-    };
-
-    // Connector waits and runnable pendings arm no deadline: the connector's
-    // own connect and handshake budgets bound the dial, as they do for an
-    // HTTP/2 connect group, and runnables are stepped before the next wait.
-    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), pending.effectiveDeadlineMonoNs());
-    pending.park = .awaiting_connect;
-    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), pending.effectiveDeadlineMonoNs());
-
-    // An io park carries the stall deadline recorded when it parked, a fresh
-    // `socket_timeout_ms` window per park.
-    pending.park = .{ .io = .{
-        .fd = -1,
-        .interest = .read,
-        .timeout_err = error.FetchReadTimeout,
-        .deadline_mono_ns = 42_000 * ms,
-    } };
-    try std.testing.expectEqual(@as(u64, 42_000 * ms), pending.effectiveDeadlineMonoNs());
-    // Before the total deadline, expiry surfaces the park's stage error...
-    try std.testing.expectEqual(error.FetchReadTimeout, pending.expiredErrorAt(42_000 * ms));
-    pending.park.io.timeout_err = error.FetchWriteTimeout;
-    try std.testing.expectEqual(error.FetchWriteTimeout, pending.expiredErrorAt(42_000 * ms));
-
-    // A credit park (consumer backpressure) suspends the stall clock
-    // entirely: without a total request deadline it never expires...
-    pending.park = .credit;
-    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), pending.effectiveDeadlineMonoNs());
-
-    // ...and with one, the total clock still caps the fetch, and expiry is
-    // attributed to the request deadline, not a read timeout.
-    pending.command.config.request_deadline_mono_ns = 90_000 * ms;
-    try std.testing.expectEqual(@as(u64, 90_000 * ms), pending.effectiveDeadlineMonoNs());
-    try std.testing.expectEqual(error.FetchRequestDeadlineExceeded, pending.expiredErrorAt(90_000 * ms));
-
-    // The total clock also reattributes an io-park expiry once it has passed.
-    pending.park = .{ .io = .{
-        .fd = -1,
-        .interest = .read,
-        .timeout_err = error.FetchReadTimeout,
-        .deadline_mono_ns = 89_000 * ms,
-    } };
-    try std.testing.expectEqual(error.FetchReadTimeout, pending.expiredErrorAt(89_000 * ms));
-    try std.testing.expectEqual(error.FetchRequestDeadlineExceeded, pending.expiredErrorAt(90_000 * ms));
-
-    // A dial-retry park, made when the connector queue is full at dispatch,
-    // waits on its recorded retry-tick deadline with no fd, like a credit
-    // park, and expiry past the total clock is attributed to the request
-    // deadline.
-    pending.park = .{ .dial_retry = .{ .deadline_mono_ns = 88_000 * ms } };
-    try std.testing.expectEqual(@as(u64, 88_000 * ms), pending.effectiveDeadlineMonoNs());
-    try std.testing.expectEqual(error.FetchRequestDeadlineExceeded, pending.expiredErrorAt(90_000 * ms));
-
-    // The park deadline is one retry tick from now, capped by the total
-    // request deadline: the tick only decides when the dispatch retries;
-    // the total clock alone decides when the fetch fails.
-    const tick = engine.H1Pending.dial_retry_tick_ns;
-    try std.testing.expectEqual(@as(u64, 50_000 * ms + tick), pending.dialRetryParkDeadline(50_000 * ms));
-    try std.testing.expectEqual(@as(u64, 90_000 * ms), pending.dialRetryParkDeadline(90_000 * ms - 1));
-
-    // Without a request deadline, which is zero in production for a boot
-    // permit, the tick still bounds the park, so a queue-full dial parks on
-    // the tick instead of spinning runnable at full CPU.
-    pending.command.config.request_deadline_mono_ns = 0;
-    try std.testing.expectEqual(@as(u64, 50_000 * ms + tick), pending.dialRetryParkDeadline(50_000 * ms));
-    pending.park = .{ .dial_retry = .{ .deadline_mono_ns = 50_000 * ms + tick } };
-    try std.testing.expectEqual(@as(u64, 50_000 * ms + tick), pending.effectiveDeadlineMonoNs());
 }

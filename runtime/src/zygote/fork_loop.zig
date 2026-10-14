@@ -2,9 +2,10 @@
 //! (`spawnZygote` in `host_client.zig`), its boot preparation, and the fork
 //! loop that serves the host's fork requests. It runs on the zygote's main
 //! thread. The launch contract is declared here: the zygote runs under
-//! `process_name`, with its control socket at `inherited_control_fd`, the
-//! write end of the trace pipe at `inherited_trace_fd` and its options in the
-//! `zygote_env_*` variables.
+//! `process_name` with `environment` as its whole environment, its control
+//! socket at `inherited_control_fd` and, only when the host asked for a
+//! trace, the write end of the trace pipe at `inherited_trace_fd`; every
+//! other descriptor from 3 up is closed.
 //!
 //! Invariants:
 //! - The zygote is single-threaded at every fork. A fork from a
@@ -14,10 +15,15 @@
 //!   single-threaded before it reports ready, and every fork checks again; a
 //!   second thread ends the zygote.
 //! - After `prepareZygoteAtBoot` the fork loop neither allocates nor touches
-//!   the VM, so every worker inherits the same copy-on-write pages. The
-//!   conventions gate `zygote fork loop stays VM-free and allocation-free
-//!   after prepare` reads only the body of `serveForkRequests`; what it calls
-//!   keeps the rule without a gate.
+//!   the VM, so every worker inherits the same copy-on-write pages.
+//!   `serveForkRequests` takes the `Prepared` value only the preparation
+//!   returns, so no fork comes before it. The conventions gate `zygote fork
+//!   loop stays VM-free and allocation-free after prepare` reads only the
+//!   body of `serveForkRequests`; what it calls keeps the rule without a gate.
+//! - Every child is born inside the cgroup leaf its request carries
+//!   (`CLONE_INTO_CGROUP`), and only into an empty cgroup2 directory. A
+//!   request without exactly one leaf ends the zygote at its receive, so no
+//!   path forks a child into the zygote's own cgroup.
 //! - Every child starts with its own thread id in glibc, as a child of
 //!   glibc's fork does: the clone hands the kernel the zygote thread's
 //!   thread-id word (`CloneForkOptions.thread_id_word` in `common/os.zig`),
@@ -29,11 +35,18 @@
 //!   the zygote.
 //! - The kernel reaps every child (`installWorkerChildAutoReap`), so the
 //!   zygote never waits for one.
+//! - The zygote ends by exiting at once (`runFromInheritedFds`): with status
+//!   0 when the host hangs up, and with status 1 after one line naming the
+//!   error for any failure. It tears nothing down on the way out, the VM
+//!   included. Everything it holds is its own memory and descriptors, which
+//!   the kernel releases at exit, and the host waits for that exit on the
+//!   zygote's pidfd, so teardown would only delay it.
 
 const std = @import("std");
 const bindings = @import("collo_bindings");
 const ipc = @import("collo_ipc");
 const fd_mod = @import("collo_os").fd;
+const linux_helpers = @import("collo_os").linux;
 const process = @import("collo_os").process;
 const process_limits = @import("collo_limits").process;
 const child_boot = @import("child_boot.zig");
@@ -49,10 +62,12 @@ const workerChildMain = child_boot.workerChildMain;
 pub const process_name = "collo-zygote";
 pub const inherited_control_fd: std.posix.fd_t = 3;
 pub const inherited_trace_fd: std.posix.fd_t = 4;
-pub const zygote_env_vm_flags = "COLLO_INTERNAL_ZYGOTE_VM_FLAGS";
-pub const zygote_env_postfork_exit_probe_path = "COLLO_INTERNAL_ZYGOTE_POSTFORK_EXIT_PROBE_PATH";
-pub const zygote_env_warmup_corpus = "COLLO_INTERNAL_ZYGOTE_WARMUP_CORPUS";
-pub const zygote_generated_env_count: usize = 3;
+/// The zygote's whole environment, which every worker inherits as it is.
+/// The values are fixed rather than the machine's because the JSC and ICU
+/// timezone and locale caches the zygote fills before its first fork must
+/// be the same in every worker, and nothing else of the host's reaches the
+/// zygote.
+pub const environment = [_:null]?[*:0]const u8{ "TZ=UTC", "LANG=C.UTF-8" };
 // Control sockets must preserve message boundaries and carry SCM_RIGHTS fds.
 pub const ipc_socket_type: u32 = std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC;
 
@@ -65,52 +80,63 @@ const PREFORK_DRAIN_CHECK_INTERVAL_NS = 1 * std.time.ns_per_ms;
 // about 50 ms.
 const PREFORK_DRAIN_MAX_CHECKS: u32 = 50;
 
-pub fn runFromInheritedFds() !void {
-    var control_owned = true;
-    defer if (control_owned)
-        std.posix.close(inherited_control_fd);
-    var trace_owned = true;
-    errdefer if (trace_owned)
-        std.posix.close(inherited_trace_fd);
+/// What only `prepareZygoteAtBoot` returns, and what every fork needs.
+pub const Prepared = struct {
+    /// The zygote's main thread's thread-id word
+    /// (`collo_os.process.callingThreadIdWord`), read and checked by the
+    /// preparation. Every clone hands it to the kernel, so each child's glibc
+    /// knows the child's own thread id.
+    thread_id_word: *std.os.linux.pid_t,
+};
 
-    const options = try zygoteOptionsFromEnv();
-    var zygote = try state.Zygote.init(inherited_trace_fd, options);
-    trace_owned = false;
-    defer zygote.deinit();
+/// Runs the zygote from the launch the host set up to its exit, as the
+/// header's last invariant says. The exit is `_exit`, which runs no exit
+/// handler, static destructor or error trace: a zygote can end with a second
+/// thread alive (`assertSingleThreadedSelf`), beside which exit handlers can
+/// hang or crash, and a Debug build's error trace parses the binary's whole
+/// debug info, which takes seconds.
+pub fn runFromInheritedFds() noreturn {
+    serve() catch |err| {
+        std.log.err("zygote failed: {s}", .{@errorName(err)});
+        std.c._exit(1);
+    };
+    std.c._exit(0);
+}
 
-    try prepareZygoteAtBoot(&zygote);
+/// Boots and serves until the host hangs up; any error ends the zygote.
+fn serve() !void {
+    const trace_fd = try inheritedTraceFd();
+    var zygote = try state.Zygote.init(trace_fd);
+    const prepared = try prepareZygoteAtBoot(&zygote);
     try installWorkerChildAutoReap();
     try ipc.sendZygoteReady(inherited_control_fd);
-    try serveForkRequests(&zygote, inherited_control_fd);
-    std.posix.close(inherited_control_fd);
-    control_owned = false;
+    try serveForkRequests(&zygote, prepared, inherited_control_fd);
 }
 
-fn zygoteOptionsFromEnv() !state.ZygoteOptions {
-    var options = state.ZygoteOptions{};
-    if (std.posix.getenv(zygote_env_vm_flags)) |value| {
-        options.vm_options = try bindings.VmOptions.fromFlags(try std.fmt.parseUnsigned(u32, value, 10));
+/// The write end of the trace pipe at `inherited_trace_fd`, or null when the
+/// host asked for no trace and so left that descriptor closed. Any other file
+/// there breaks the launch contract.
+fn inheritedTraceFd() !?std.posix.fd_t {
+    var stat: std.os.linux.Stat = undefined;
+    switch (linux_helpers.syscallErrno(std.os.linux.fstat(inherited_trace_fd, &stat))) {
+        .SUCCESS => {},
+        .BADF => return null,
+        else => |errno| return std.posix.unexpectedErrno(errno),
     }
-    if (std.posix.getenv(zygote_env_postfork_exit_probe_path)) |value| {
-        const path = value;
-        if (path.len != 0)
-            options.postfork_exit_probe_path = path;
-    }
-    if (std.posix.getenv(zygote_env_warmup_corpus)) |value| {
-        options.warmup_corpus = std.mem.eql(u8, value, "1");
-    }
-    return options;
+    if ((stat.mode & std.os.linux.S.IFMT) != std.os.linux.S.IFIFO)
+        return error.InheritedTraceFdNotPipe;
+    return inherited_trace_fd;
 }
 
-fn prepareZygoteAtBoot(zygote: *state.Zygote) !void {
-    if (zygote.prepared_for_fork)
-        return;
-
+/// Prepares the zygote's VM once, so every worker inherits the same warmed
+/// pages, and returns what every fork needs. The caller calls it once, before
+/// it reports ready.
+fn prepareZygoteAtBoot(zygote: *state.Zygote) !Prepared {
     // Every clone hands the kernel this thread's thread-id word, which is how
     // a worker's glibc learns the worker's own thread id. A zygote that
     // cannot name the word would fork workers whose glibc names this thread,
     // so it ends here.
-    zygote.thread_id_word = process.callingThreadIdWord() catch |err| {
+    const thread_id_word = process.callingThreadIdWord() catch |err| {
         switch (err) {
             error.CheckpointRestoreUnavailable => std.log.err(
                 "the kernel lacks CONFIG_CHECKPOINT_RESTORE, which the zygote needs for PR_GET_TID_ADDRESS",
@@ -127,16 +153,15 @@ fn prepareZygoteAtBoot(zygote: *state.Zygote) !void {
 
     try bindings.setHelperThreadsTimeoutOverrideNs(PREFORK_HELPER_THREAD_IDLE_TIMEOUT_NS);
     traceEventFmt(zygote.trace_fd, "zygote.helper_timeout.override={d}", .{PREFORK_HELPER_THREAD_IDLE_TIMEOUT_NS});
-    if (zygote.warmup_corpus) {
-        // The corpus runs before prepareForFork so the helper threads it
-        // starts retire within the short idle timeout. The full GC afterwards
-        // drops its garbage, leaving only the engine state it warmed in the
-        // pages workers inherit.
-        traceEvent(zygote.trace_fd, "zygote.warmup_corpus.run");
-        try warmup.runCorpus(&zygote.vm);
-        try zygote.vm.collectFullGCAndTrim();
-        traceEvent(zygote.trace_fd, "zygote.warmup_corpus.done");
-    }
+    // The corpus runs before prepareForFork so the helper threads it starts
+    // retire within the short idle timeout. The full GC afterwards drops its
+    // garbage, leaving only the engine state it warmed in the pages workers
+    // inherit.
+    traceEvent(zygote.trace_fd, "zygote.warmup_corpus.run");
+    try warmup.runCorpus(&zygote.vm);
+    try zygote.vm.collectFullGCAndTrim();
+    traceEvent(zygote.trace_fd, "zygote.warmup_corpus.done");
+
     traceEvent(zygote.trace_fd, "zygote.prepare_for_fork");
     try zygote.vm.prepareForFork();
     // One idle timeout lets the helper threads retire before the probes start.
@@ -148,63 +173,49 @@ fn prepareZygoteAtBoot(zygote: *state.Zygote) !void {
     // fork.
     const inheritable_mappings = try process.makeAddressSpaceForkInheritable();
     traceEventFmt(zygote.trace_fd, "zygote.address_space.inheritable={d}", .{inheritable_mappings});
-    zygote.prepared_for_fork = true;
-    zygote.prepare_count += 1;
     traceEvent(zygote.trace_fd, "zygote.prepared");
+    return .{ .thread_id_word = thread_id_word };
 }
 
-fn serveForkRequests(zygote: *state.Zygote, control_fd: std.posix.fd_t) !void {
+fn serveForkRequests(zygote: *state.Zygote, prepared: Prepared, control_fd: std.posix.fd_t) !void {
     while (true) {
         // A truncated control message, caused by fd pressure during the
         // receive, still ends the zygote: the datagram is consumed and its job
         // id lost, and serving on without a reply would silently wedge the
-        // host's one-at-a-time fork queue.
+        // host's one-at-a-time fork queue. So does a request without exactly
+        // one leaf.
         var request = recvForkRequestRetryingPressure(control_fd) catch |err| switch (err) {
             error.ShortRead, error.PeerClosed => return,
             else => return err,
         };
-        // The cgroup directory fd is closed by the parent after the clone and
-        // by the child right after birth; this covers failures before either.
-        errdefer request.deinit();
-
-        try assertPreparedForkBaseline(zygote);
+        // Closes the leaf on every path of this process; the child closes its
+        // own copy before it boots, since it never returns here.
+        defer request.deinit();
+        const fork_job_id = request.message.fork_job_id;
         traceEvent(zygote.trace_fd, "zygote.fork_request");
 
         // A child is never born outside a validated, empty worker cgroup. The
         // check runs before the clone, with the VM untouched, so any failure
         // here, whether a bad fd from the host or fd pressure, fails only this
         // fork.
-        if (request.cgroup_dir_fd) |dir_fd| {
-            worker_cgroup.validateEmptyWorkerCgroupDirFd(dir_fd) catch |err| {
-                std.log.err("fork request cgroup fd rejected job_id={d}: {s}", .{
-                    request.message.fork_job_id,
-                    @errorName(err),
-                });
-                try ipc.sendForkFailed(control_fd, request.message.fork_job_id);
-                traceEvent(zygote.trace_fd, "zygote.fork_failed.cgroup");
-                request.deinit();
-                continue;
-            };
-        }
+        worker_cgroup.validateEmptyWorkerCgroupDirFd(request.cgroup_dir_fd) catch |err| {
+            std.log.err("fork request cgroup fd rejected job_id={d}: {s}", .{ fork_job_id, @errorName(err) });
+            try refuseFork(zygote.trace_fd, control_fd, fork_job_id, "zygote.fork_failed.cgroup");
+            continue;
+        };
 
         // Transient fd pressure before the fork fails only this job, so the
         // host can retry; the VM is untouched and the zygote keeps serving.
         const init_pair = fd_mod.socketPairType(ipc_socket_type) catch |err| {
             if (!isTransientForkError(err))
                 return err;
-            try ipc.sendForkFailed(control_fd, request.message.fork_job_id);
-            traceEvent(zygote.trace_fd, "zygote.fork_failed.transient");
-            request.deinit();
+            try refuseFork(zygote.trace_fd, control_fd, fork_job_id, "zygote.fork_failed.transient");
             continue;
         };
-        var parent_init_fd: ?std.posix.fd_t = init_pair[0];
-        var child_init_fd: ?std.posix.fd_t = init_pair[1];
-        errdefer {
-            if (parent_init_fd) |fd|
-                std.posix.close(fd);
-            if (child_init_fd) |fd|
-                std.posix.close(fd);
-        }
+        var host_init = fd_mod.OwnedFd.fromRaw(init_pair[0]);
+        defer host_init.deinit();
+        var child_init = fd_mod.OwnedFd.fromRaw(init_pair[1]);
+        defer child_init.deinit();
 
         // A fork from a multi-threaded process can leave a lock held forever
         // by a thread the child does not have. clone3 also runs no
@@ -216,51 +227,36 @@ fn serveForkRequests(zygote: *state.Zygote, control_fd: std.posix.fd_t) !void {
         process.assertSingleThreadedSelf() catch |err| switch (err) {
             error.ProcessNotSingleThreaded => return err,
             else => {
-                std.posix.close(parent_init_fd.?);
-                parent_init_fd = null;
-                std.posix.close(child_init_fd.?);
-                child_init_fd = null;
-                try ipc.sendForkFailed(control_fd, request.message.fork_job_id);
-                traceEvent(zygote.trace_fd, "zygote.fork_failed.transient");
-                request.deinit();
+                try refuseFork(zygote.trace_fd, control_fd, fork_job_id, "zygote.fork_failed.transient");
                 continue;
             },
         };
         var worker_pidfd_raw: std.posix.fd_t = -1;
         const clone_options: process.CloneForkOptions = .{
             .cgroup_dir_fd = request.cgroup_dir_fd,
-            .thread_id_word = zygote.thread_id_word orelse return error.ZygoteNotPreparedForFork,
+            .thread_id_word = prepared.thread_id_word,
         };
         const worker_pid = process.cloneForkWithPidFd(clone_options, &worker_pidfd_raw) catch |err| {
             // A failed clone created no child and left the VM intact, so a
             // transient failure ends only this job.
             if (!isTransientForkError(err))
                 return err;
-            std.posix.close(parent_init_fd.?);
-            parent_init_fd = null;
-            std.posix.close(child_init_fd.?);
-            child_init_fd = null;
-            try ipc.sendForkFailed(control_fd, request.message.fork_job_id);
-            traceEvent(zygote.trace_fd, "zygote.fork_failed.transient");
-            request.deinit();
+            try refuseFork(zygote.trace_fd, control_fd, fork_job_id, "zygote.fork_failed.transient");
             continue;
         };
         if (worker_pid == 0) {
-            if (request.cgroup_dir_fd) |fd|
-                std.posix.close(fd);
+            // The child keeps only its end of the init socket. The defers of
+            // this loop never run in it, since it never returns.
+            std.posix.close(request.cgroup_dir_fd);
             std.posix.close(control_fd);
-            std.posix.close(parent_init_fd.?);
-            parent_init_fd = null;
-            workerChildMain(zygote, child_init_fd.?);
+            std.posix.close(host_init.fd());
+            workerChildMain(zygote, child_init.fd());
         }
 
-        if (request.cgroup_dir_fd) |fd| {
-            std.posix.close(fd);
-            request.cgroup_dir_fd = null;
-            traceEvent(zygote.trace_fd, "zygote.fork_into_cgroup");
-        }
-        std.posix.close(child_init_fd.?);
-        child_init_fd = null;
+        traceEvent(zygote.trace_fd, "zygote.fork_into_cgroup");
+        // The host reads the child's exit as the end of its init socket, which
+        // takes every copy of the child's end closed, this one first.
+        child_init.deinit();
         var worker_pidfd = fd_mod.OwnedFd.fromRaw(worker_pidfd_raw);
         defer worker_pidfd.deinit();
         // Workers are the kernel's first OOM victims. The zygote raises the
@@ -270,18 +266,22 @@ fn serveForkRequests(zygote: *state.Zygote, control_fd: std.posix.fd_t) !void {
         // failed write only warns.
         process.writeOomScoreAdj(@intCast(worker_pid), process_limits.OOM_SCORE_ADJ_WORKER) catch |err|
             std.log.warn("failed to set worker oom_score_adj pid={d}: {s}", .{ worker_pid, @errorName(err) });
-        try ipc.sendForkReply(control_fd, request.message.fork_job_id, @intCast(worker_pid), parent_init_fd.?, worker_pidfd.fd());
+        try ipc.sendForkReply(control_fd, fork_job_id, @intCast(worker_pid), host_init.fd(), worker_pidfd.fd());
         traceEventFmt(zygote.trace_fd, "zygote.fork_reply={d}", .{worker_pid});
-        std.posix.close(parent_init_fd.?);
-        parent_init_fd = null;
     }
 }
 
-fn assertPreparedForkBaseline(zygote: *const state.Zygote) !void {
-    if (!zygote.prepared_for_fork)
-        return error.ZygoteNotPreparedForFork;
-    if (zygote.prepare_count != 1)
-        return error.ZygotePrepareCountChanged;
+/// Answers the request of `fork_job_id` with a refusal, after which the host
+/// may retry and the zygote serves the next request (`sendForkFailed` in
+/// `common/ipc/zygote_worker.zig`).
+fn refuseFork(
+    trace_fd: ?std.posix.fd_t,
+    control_fd: std.posix.fd_t,
+    fork_job_id: u64,
+    comptime event: []const u8,
+) !void {
+    try ipc.sendForkFailed(control_fd, fork_job_id);
+    traceEvent(trace_fd, event);
 }
 
 /// Fork failures caused by one job's resources rather than the zygote's state.
@@ -322,7 +322,7 @@ const RECV_PRESSURE_RETRY_INTERVAL_NS: u64 = 10 * std.time.ns_per_ms;
 fn recvForkRequestRetryingPressure(control_fd: std.posix.fd_t) !ipc.ForkRequestWithFd {
     var attempts: u32 = 0;
     while (true) {
-        return ipc.recvForkRequestWithFd(control_fd) catch |err| switch (err) {
+        return ipc.recvForkRequest(control_fd) catch |err| switch (err) {
             error.SystemResources => {
                 attempts += 1;
                 if (attempts >= RECV_PRESSURE_MAX_ATTEMPTS)

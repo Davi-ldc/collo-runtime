@@ -7,8 +7,8 @@
 
 #pragma once
 
-#include <wtf/Forward.h>
 #include <wtf/FastMalloc.h>
+#include <wtf/Forward.h>
 #include <wtf/Ref.h>
 #include <wtf/RefPtr.h>
 #include <wtf/StdLibExtras.h>

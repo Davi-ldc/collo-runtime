@@ -90,20 +90,20 @@ test "a session the gateway removed reaches session_removed on the reader, and t
     defer client.deinit();
 
     // Reports arrive while no attach waits and between an attach and its acknowledgement.
-    try control.sendSessionRemoved(gateway.gateway_end, 9);
+    try control.sendSessionRemoved(gateway.gateway_end, 9, .liveness_closed);
     try recorder.waitRemoved(1);
     var call = AttachCall{ .client = &client, .fds = session.rawForGateway() };
     try call.start();
     defer call.join();
     const request_id = try gateway.receiveAttach();
-    try control.sendSessionRemoved(gateway.gateway_end, 10);
+    try control.sendSessionRemoved(gateway.gateway_end, 10, .protocol_violation);
     try control.sendAttachAck(gateway.gateway_end, .ok, request_id, 11);
     call.join();
     try std.testing.expectEqual(@as(?u64, 11), call.session_id);
     try recorder.waitRemoved(2);
 
-    try std.testing.expectEqual(@as(u64, 9), recorder.removedAt(0));
-    try std.testing.expectEqual(@as(u64, 10), recorder.removedAt(1));
+    try std.testing.expectEqual(control.RemovedSession{ .session_id = 9, .cause = .liveness_closed }, recorder.removedAt(0));
+    try std.testing.expectEqual(control.RemovedSession{ .session_id = 10, .cause = .protocol_violation }, recorder.removedAt(1));
     try std.testing.expect(recorder.removedThread() != std.Thread.getCurrentId());
     try std.testing.expect(recorder.removedThread() != call.thread_id);
     try std.testing.expectEqual(@as(usize, 0), recorder.calls());
@@ -261,7 +261,7 @@ const FailureRecorder = struct {
     count: usize = 0,
     first: ?anyerror = null,
     first_thread: std.Thread.Id = 0,
-    removed: [removed_sessions_max]u64 = undefined,
+    removed: [removed_sessions_max]control.RemovedSession = undefined,
     removed_len: usize = 0,
     removed_thread: std.Thread.Id = 0,
 
@@ -271,12 +271,12 @@ const FailureRecorder = struct {
         return .{ .ctx = self, .failed = failed, .session_removed = sessionRemoved };
     }
 
-    fn sessionRemoved(ctx: *anyopaque, session_id: u64) void {
+    fn sessionRemoved(ctx: *anyopaque, removed: control.RemovedSession) void {
         const self: *FailureRecorder = @ptrCast(@alignCast(ctx));
         self.mutex.lock();
         defer self.mutex.unlock();
         if (self.removed_len < self.removed.len) {
-            self.removed[self.removed_len] = session_id;
+            self.removed[self.removed_len] = removed;
             self.removed_len += 1;
         }
         self.removed_thread = std.Thread.getCurrentId();
@@ -299,7 +299,7 @@ const FailureRecorder = struct {
     }
 
     /// The `index`-th session reported, in report order.
-    fn removedAt(self: *FailureRecorder, index: usize) u64 {
+    fn removedAt(self: *FailureRecorder, index: usize) control.RemovedSession {
         self.mutex.lock();
         defer self.mutex.unlock();
         std.debug.assert(index < self.removed_len);

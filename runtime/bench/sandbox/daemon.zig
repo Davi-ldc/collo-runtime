@@ -38,12 +38,13 @@
 //! reports carries the definition index as the route.
 //!
 //! The main thread runs each command to completion before it reads the next.
-//! A server thread runs `Server.run`, and a trace thread drains the zygote's
-//! trace pipe. The main thread reads the pools and their records while the
-//! server runs; a record it reads is live in its pool, and nothing retires a
-//! live worker but this daemon's drop, the reaper's idle TTL, which outlasts
-//! every trial, and memory pressure, which a trial that sees it is invalid
-//! for anyway.
+//! A server thread runs `Server.run`. The zygote is spawned without a boot
+//! trace pipe, as a server that logs no trace spawns it, so no thread drains
+//! one and no worker writes trace events. The main thread reads the pools
+//! and their records while the server runs; a record it reads is live in its
+//! pool, and nothing retires a live worker but this daemon's drop, the
+//! reaper's idle TTL, which outlasts every trial, and memory pressure, which
+//! a trial that sees it is invalid for anyway.
 
 const std = @import("std");
 const host = @import("collo_host");
@@ -126,17 +127,12 @@ const Daemon = struct {
     paths: Paths = undefined,
     main_cgroup: []u8 = undefined,
     worker_root: host.WorkerCgroupRoot = undefined,
-    /// The one directory every worker of this node mounts its tmpfs over.
-    tmp_mount_point: host.TmpMountPoint = undefined,
     spawned: zygote.host_client.SpawnedZygote = undefined,
     /// Owns the routes built from the configuration (`Server.routes`).
     runtime: server_main.Server = undefined,
     ready: protocol.Ready = undefined,
     server_thread: ?std.Thread = null,
-    trace_thread: ?std.Thread = null,
-    stop_trace: std.atomic.Value(bool) = .init(false),
     server_failed: std.atomic.Value(bool) = .init(false),
-    trace_failed: std.atomic.Value(bool) = .init(false),
     gateway_watch: os.fd.OwnedFd = .{},
     zygote_watch: os.fd.OwnedFd = .{},
     worker_buffer: [protocol.route_count_max]protocol.Worker = undefined,
@@ -186,27 +182,20 @@ const Daemon = struct {
             .{ .env_root = worker_parent },
         );
         errdefer self.worker_root.deinit(allocator);
-        try self.tmp_mount_point.init(host.tmp_mount.default_parent_dir);
-        errdefer self.tmp_mount_point.deinit();
         const executable = try std.fs.selfExePathAlloc(allocator);
         defer allocator.free(executable);
         self.spawned = try zygote.host_client.spawnZygote(.{
             .executable_path = executable,
-            .warmup_corpus = true,
+            .trace = false,
         });
         errdefer self.spawned.deinit();
         self.zygote_watch = try os.fd.OwnedFd.dupCloexec(self.spawned.pidfd);
         errdefer self.zygote_watch.deinit();
         try requireProcessPlacement(allocator, self.spawned.pid, self.main_cgroup);
-        self.trace_thread = try std.Thread.spawn(.{}, traceMain, .{self});
-        errdefer self.stopTrace();
         // `Server.init` owns the routes from here on, failure included.
         routes_owned = false;
         self.runtime = try server_main.Server.init(allocator, &self.spawned, .{
-            .worker_host = .{
-                .cgroup_root = &self.worker_root,
-                .tmp_mount_point = &self.tmp_mount_point,
-            },
+            .worker_host = .{ .cgroup_root = &self.worker_root },
             .routes = routes,
             // One lane on any machine, so the node's fixed memory and the
             // sampled cold starts never depend on how many CPUs or receive
@@ -476,8 +465,8 @@ const Daemon = struct {
         const worker_pool = self.runtime.supervisor.poolFor(record.definition_index);
         var pidfd = try os.fd.OwnedFd.dupCloexec(record.handle.pidfd);
         defer pidfd.deinit();
-        var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const path = try std.fmt.bufPrint(&path_buffer, "{s}", .{record.handle.cgroup_dir});
+        // A copy names the leaf after the retirement freed the record.
+        const leaf = record.handle.leaf;
         const worker_key = record.key();
         const deadline_ns = try deadlineNs();
 
@@ -501,7 +490,7 @@ const Daemon = struct {
         }
         if (!try os.process.waitForPidFdExit(pidfd.fd(), 2000)) return error.WorkerExitTimeout;
         while (try os.process.monotonicNowNs() < deadline_ns) {
-            const missing = try pathMissing(path);
+            const missing = try leafMissing(leaf);
             const removed = worker_pool.inspect(record) == null;
             // The gateway drops its side of the session only when it sees the
             // worker's liveness descriptor hang up, later and asynchronously,
@@ -541,7 +530,6 @@ const Daemon = struct {
 
     fn checkAlive(self: *Daemon) !void {
         if (self.server_failed.load(.acquire)) return error.ServerFailed;
-        if (self.trace_failed.load(.acquire)) return error.TraceDrainFailed;
         if (os.process.pidFdHasExited(self.zygote_watch.fd())) return error.ZygoteDied;
         if (self.gateway_watch.isValid() and os.process.pidFdHasExited(self.gateway_watch.fd()))
             return error.GatewayDied;
@@ -568,12 +556,6 @@ const Daemon = struct {
         }
     }
 
-    fn stopTrace(self: *Daemon) void {
-        self.stop_trace.store(true, .release);
-        if (self.trace_thread) |thread| thread.join();
-        self.trace_thread = null;
-    }
-
     fn deinit(self: *Daemon) !void {
         var worker_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
         const path_len = self.worker_root.workers_dir_path.len;
@@ -581,9 +563,7 @@ const Daemon = struct {
         @memcpy(worker_path_buffer[0..path_len], self.worker_root.workers_dir_path);
         self.stopServer();
         self.runtime.deinit();
-        self.tmp_mount_point.deinit();
         self.worker_root.deinit(self.allocator);
-        self.stopTrace();
         self.spawned.deinit();
         // Without a grant no gateway ever ran.
         const gateway_exited = !self.gateway_watch.isValid() or
@@ -597,7 +577,6 @@ const Daemon = struct {
         if (!children_exited) return error.RuntimeChildrenStillAlive;
         if (!workers_removed) return error.WorkerResourcesNotRetired;
         if (self.server_failed.load(.acquire)) return error.ServerFailed;
-        if (self.trace_failed.load(.acquire)) return error.TraceDrainFailed;
     }
 };
 
@@ -606,32 +585,6 @@ fn serverMain(daemon: *Daemon) void {
         daemon.server_failed.store(true, .release);
         std.log.err("benchmark server failed: {s}", .{@errorName(err)});
     };
-}
-
-fn traceMain(daemon: *Daemon) void {
-    drainTrace(daemon) catch |err| {
-        daemon.trace_failed.store(true, .release);
-        std.log.err("benchmark trace drain failed: {s}", .{@errorName(err)});
-    };
-}
-
-/// Keeps the zygote's trace pipe empty and discards what it reads, as the
-/// server's boot does (`TraceDrain` in `server/boot/trace_drain.zig`): both
-/// ends are nonblocking, so without a reader the pipe fills and every later
-/// event is dropped. End of file fails the trial, since the daemon holds a
-/// write end until after this thread stops.
-fn drainTrace(daemon: *Daemon) !void {
-    const fd = daemon.spawned.trace_read_fd orelse return error.TraceDescriptorMissing;
-    var bytes: [4096]u8 = undefined;
-    while (!daemon.stop_trace.load(.acquire)) {
-        var descriptors = [_]std.posix.pollfd{.{
-            .fd = fd,
-            .events = std.posix.POLL.IN,
-            .revents = 0,
-        }};
-        if (try std.posix.poll(&descriptors, 20) == 0) continue;
-        if (try std.posix.read(fd, &bytes) == 0) return error.TraceClosed;
-    }
 }
 
 /// The route of sampler route `route_index`: the only route of the
@@ -713,6 +666,18 @@ fn requireRoute(route: ?u32) !u32 {
 
 fn pathMissing(path: []const u8) !bool {
     std.fs.accessAbsolute(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return true,
+        else => return err,
+    };
+    return false;
+}
+
+/// Whether the worker's leaf is gone, looked up by its name under the
+/// workers directory, as the host names it (`host.WorkerLeaf`).
+fn leafMissing(leaf: host.WorkerLeaf) !bool {
+    var name_buffer: [host.WorkerLeaf.name_bytes_max]u8 = undefined;
+    const workers_dir = std.fs.Dir{ .fd = leaf.workers_dir_fd };
+    workers_dir.access(leaf.name(&name_buffer), .{}) catch |err| switch (err) {
         error.FileNotFound => return true,
         else => return err,
     };

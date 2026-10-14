@@ -1,9 +1,10 @@
 //! The event loop of an ingress lane thread in the server: the lane's one
 //! io_uring, the dispatch of each completion to its handler, the handlers of
-//! a worker registration's polls, the writability poll of a worker's control
-//! socket, the wake bits other threads raise, the shutdown drain, the renewal
-//! and the sends of the lane's egress lease, and the per-lane tables and
-//! buffers the loop serves.
+//! a worker registration's control, writability and pidfd polls (the
+//! completion eventfd's is `request_body.handleWorkerRingCredit`), the
+//! writability poll of a worker's control socket, the wake bits other
+//! threads raise, the shutdown drain, the renewal and the sends of the
+//! lane's egress lease, and the per-lane tables and buffers the loop serves.
 //!
 //! Invariants:
 //! - The loop runs a handler per completion, per queued connection and per
@@ -13,8 +14,8 @@
 //!   outcome (`fault.zig`), so an error that leaves `run` is the lane's own.
 //! - A handler runs to its end before the next one starts, and none runs
 //!   another, except the deadline backstop, which first takes the worker's
-//!   output or the lane's commands so that a completion that came in time
-//!   wins over the fault (`deadline_driver.zig`).
+//!   output or the lane's commands so that a `request_done` that came in
+//!   time wins over the fault (`deadline_driver.zig`).
 //! - A completion of a worker registration's poll reaches its handler only
 //!   while the registration still holds the worker it was armed for (its
 //!   generation) and, for a poll only a reader arms, while the lane still
@@ -25,11 +26,9 @@
 //!   (`event_sources.LaneRing`). Only a pass that fills the submission queue
 //!   enters early.
 //! - A pass first renews the lane's egress lease when the manager's current
-//!   gateway is not the one the lease holds (`renewEgressLease`), and last
-//!   sends the `request_ended` entries its finishes noted (`runQueuedWork`).
-//!   It waits for a completion only after both, and the wait ends the pass,
-//!   so no handler mints a token under a lease older than the lane's last
-//!   wait and no entry sits in the batch while the lane sleeps.
+//!   gateway is not the one the lease holds (`renewEgressLease`). It waits
+//!   for a completion only after that, and the wait ends the pass, so no
+//!   handler mints a token under a lease older than the lane's last wait.
 //! - Shutdown refuses new work first (accepts in `accept_flow.zig`, new
 //!   streams in `admission.zig`), then serves until no request of the lane is
 //!   live and the lane reads no worker, because a reader that left would
@@ -40,8 +39,7 @@
 //! - Only the lane thread touches what `initRuntime` allocates and the
 //!   egress lease. Teardown gives back what commands still queued hold,
 //!   finishes every request, closes every connection, gives its reader roles
-//!   back, sends the `request_ended` entries its finishes noted and closes
-//!   the lease's descriptor, and checks that every table is empty again,
+//!   back, closes the lease's descriptor, and checks that every table is empty again,
 //!   asserting it after a clean stop; only then does it free the tables.
 
 const std = @import("std");
@@ -63,11 +61,9 @@ const connection_slot = @import("connection_slot.zig");
 const deadline_driver = @import("deadline_driver.zig");
 const dispatch = @import("dispatch.zig");
 const event_sources = @import("event_sources.zig");
-const fs_fault_control = @import("fs_fault_control.zig");
 const request_finish = @import("request_finish.zig");
 const request_slot = @import("request_slot.zig");
 const work_queues = @import("work_queues.zig");
-const worker_completions = @import("worker_completions.zig");
 const worker_control = @import("worker_control.zig");
 const worker_fault = @import("worker_fault.zig");
 const worker_registration = @import("worker_registration.zig");
@@ -117,10 +113,8 @@ pub fn Methods(comptime Self: type) type {
         const Connection = connection_flow.Methods(Self);
         const Deadlines = deadline_driver.Methods(Self);
         const Dispatch = dispatch.Methods(Self);
-        const FsFaultControl = fs_fault_control.Methods(Self);
         const Queues = work_queues.Methods(Self);
         const RequestFinish = request_finish.Methods(Self);
-        const WorkerCompletions = worker_completions.Methods(Self);
         const WorkerControl = worker_control.Methods(Self);
         const WorkerFault = worker_fault.Methods(Self);
         const WorkerRegistration = worker_registration.Methods(Self);
@@ -208,27 +202,16 @@ pub fn Methods(comptime Self: type) type {
         }
 
         /// Loop handler: the reader drains the worker's control socket and
-        /// re-arms its polls, or runs the death path on a fault.
+        /// re-arms its polls, or runs the death path on a fault
+        /// (`worker_control.readWorkerControl`).
         pub fn handleWorkerControlReadable(self: *Self, registration_index: u32) LaneFault!void {
-            switch (try WorkerControl.drainWorkerControl(self, registration_index, .yield_to_backlog)) {
-                .ok, .would_block => try WorkerRegistration.armWorkerPolls(self, registration_index),
-                .fault => |reason| try WorkerFault.faultWorker(self, registration_index, reason),
-            }
+            try WorkerControl.readWorkerControl(self, registration_index);
         }
 
         /// Loop handler: the worker's control socket has room for the bytes
         /// this lane parked on it (`armWorkerControlWritable`).
         pub fn handleWorkerControlWritable(self: *Self, registration_index: u32) LaneFault!void {
             try Dispatch.flushBlockedSends(self, registration_index);
-        }
-
-        /// Loop handler: the reader answers the worker's fault requests and
-        /// re-arms its polls, or runs the death path on a fault.
-        pub fn handleWorkerFsFault(self: *Self, registration_index: u32) LaneFault!void {
-            switch (try FsFaultControl.drainWorkerFsFault(self, registration_index)) {
-                .ok, .would_block => try WorkerRegistration.armWorkerPolls(self, registration_index),
-                .fault => |reason| try WorkerFault.faultWorker(self, registration_index, reason),
-            }
         }
 
         /// Loop handler: the pidfd of a worker this lane reads reported its
@@ -264,7 +247,7 @@ pub fn Methods(comptime Self: type) type {
                 try Dispatch.retryRingBlockedSends(self);
             }
             if (bits & runner.wake.window_reopened != 0)
-                try WorkerCompletions.resumeWindowBlockedReaders(self);
+                try WorkerControl.resumeWindowBlockedReaders(self);
         }
 
         pub fn initRuntime(self: *Self) LaneFault!void {
@@ -284,7 +267,7 @@ pub fn Methods(comptime Self: type) type {
             self.requests = try request_slot.RequestSlab.init(capacities.requests);
             errdefer self.requests.deinit();
             self.request_count = 0;
-            self.registrations = try completions.RegistrationSlab.init(runner.max_completion_registrations);
+            self.registrations = try completions.RegistrationSlab.init(runner.max_worker_registrations);
             errdefer self.registrations.deinit();
             self.deferred_deaths = .{};
             self.h2_lane = try http2_lane.LaneResources.init(capacities.streams);
@@ -311,8 +294,7 @@ pub fn Methods(comptime Self: type) type {
                 self.service.allocator,
                 .{
                     .lane_id = self.listener_index,
-                    .definition_count = self.service.routes.definitionCount(),
-                    .slots_per_worker_total = self.service.routes.slotsPerWorkerTotal(),
+                    .served = runner.servedDefinitions(self.service.routes),
                     .max_requests = self.table_capacities.requests,
                 },
                 self.monotonicNowNs(),
@@ -381,19 +363,8 @@ pub fn Methods(comptime Self: type) type {
                     noteTeardownFailure(self, "end a worker registration", err);
                 };
             }
-            // The finishes above noted their `request_ended` entries on the
-            // lease, which sends them before it closes its descriptor. Its
-            // counts move into the retained counters in the same critical
-            // section that resets it, so a snapshot counts them once.
-            self.egress_lease.flush();
-            {
-                self.counters_mutex.lock();
-                defer self.counters_mutex.unlock();
-                self.retained_counters.egress_ended_batches_dropped_full += self.egress_lease.ended_batches_dropped_full;
-                self.retained_counters.egress_ended_batches_dropped_closed += self.egress_lease.ended_batches_dropped_closed;
-                self.egress_lease.deinit();
-                self.egress_lease = .{};
-            }
+            self.egress_lease.deinit();
+            self.egress_lease = .{};
             // Every request is finished and every connection closed, so each
             // table must be empty here. The runner's count and the slabs'
             // own are kept by different code on different paths, so their
@@ -501,10 +472,10 @@ pub fn Methods(comptime Self: type) type {
             ring.submitAndWait() catch |err| try retries.note(err);
         }
 
-        /// Gives the lane's egress lease the current gateway's key and a
-        /// descriptor of its control socket, or empties it while no gateway
-        /// is current (`Manager.renewLease` in `server/gateway/manager.zig`),
-        /// when the manager's current gateway is not the one the lease holds.
+        /// Gives the lane's egress lease the current gateway's generation and
+        /// key, or empties it while no gateway is current
+        /// (`Manager.renewLease` in `server/gateway/manager.zig`), when the
+        /// manager's current gateway is not the one the lease holds.
         /// Comparing the generations is one atomic load, so every pass makes
         /// it, and only a gateway change takes the manager's mutex.
         pub fn renewEgressLease(self: *Self) void {
@@ -514,14 +485,11 @@ pub fn Methods(comptime Self: type) type {
         }
 
         /// The rest of a pass after the completions it ran: the connections
-        /// handlers queued for a turn, then the worker faults they deferred,
-        /// then one `request_ended` packet with the entries the pass's
-        /// finishes noted on the egress lease (`Lease.flush`), which never
-        /// waits. Returns whether the connections or the faults found work.
+        /// handlers queued for a turn, then the worker faults they deferred.
+        /// Returns whether the connections or the faults found work.
         pub fn runQueuedWork(self: *Self) LaneFault!bool {
             const drove = try driveQueuedConnections(self);
             const faulted = try WorkerFault.processDeferredWorkerFaults(self);
-            self.egress_lease.flush();
             return drove or faulted;
         }
 
@@ -588,14 +556,12 @@ pub fn Methods(comptime Self: type) type {
                         else => unreachable,
                     }
                 },
-                .worker_completion => if (workerPollReady(self, data, cqe.res))
-                    try self.handleWorkerCompletions(data.index),
+                .worker_ring_credit => if (workerPollReady(self, data, cqe.res))
+                    try self.handleWorkerRingCredit(data.index),
                 .worker_control => if (workerPollReady(self, data, cqe.res))
                     try self.handleWorkerControlReadable(data.index),
                 .worker_control_writable => if (workerPollReady(self, data, cqe.res))
                     try self.handleWorkerControlWritable(data.index),
-                .worker_fs_fault => if (workerPollReady(self, data, cqe.res))
-                    try self.handleWorkerFsFault(data.index),
                 .worker_pidfd => if (workerPollReady(self, data, cqe.res))
                     try self.handleWorkerPidfd(data.index),
             }
@@ -631,7 +597,7 @@ pub fn Methods(comptime Self: type) type {
             if (registration.generation != data.generation)
                 return null;
             switch (data.kind) {
-                .worker_completion, .worker_control, .worker_fs_fault, .worker_pidfd => {
+                .worker_ring_credit, .worker_control, .worker_pidfd => {
                     if (!registration.reading())
                         return null;
                 },
@@ -668,7 +634,7 @@ pub fn Methods(comptime Self: type) type {
         /// worker: a handler reaches one only through a completion or a call
         /// that checked it, so anything else is the lane's own mistake.
         fn registrationAt(self: *Self, registration_index: u32) LaneFault!*completions.Registration {
-            return self.registrations.get(registration_index) orelse error.InvalidCompletionRegistration;
+            return self.registrations.get(registration_index) orelse error.InvalidWorkerRegistration;
         }
 
         /// Gives up every tenure over a worker on which the lane has no
@@ -713,10 +679,9 @@ pub fn Methods(comptime Self: type) type {
 /// no registration polls.
 fn pollInFlight(registration: *completions.Registration, kind: event_sources.EventKind) ?*bool {
     return switch (kind) {
-        .worker_completion => &registration.poll_registered,
+        .worker_ring_credit => &registration.ring_credit_poll_registered,
         .worker_control => &registration.control_poll_registered,
         .worker_control_writable => &registration.control_writable_poll_registered,
-        .worker_fs_fault => &registration.fs_fault_poll_registered,
         .worker_pidfd => &registration.pidfd_poll_registered,
         .command,
         .deadline_timer,

@@ -41,28 +41,38 @@
 //! Memory pressure means the `high` count of `memory.events.local` rose
 //! above the count read at init, so the worker went past `memory.high`, its
 //! configured memory limit. The sentinel then publishes the dead state with
-//! reason `memory` on the shared page and exits the process at once with
-//! `memory_pressure_exit_status`, without unwinding the VM thread.
+//! reason `memory` on the shared page, logs the field that rose, and exits
+//! the process at once with `memory_pressure_exit_status`, without unwinding
+//! the VM thread.
 //!
 //! A sentinel that cannot watch any more ends its worker (`failWorker`): the
 //! server relies on every worker having one, since it is the only thread
 //! that can stop the VM thread. Its poll, its command read, its memory
 //! events read and its CPU clock read are the failures it cannot recover
-//! from. It publishes the dead state with reason `sentinel`, writes
-//! `child.sentinel.failed=<cause>` to the trace fd and logs it, and exits
-//! with `sentinel_failure_exit_status`.
+//! from. It publishes the dead state with reason `sentinel`, logs the cause,
+//! and exits with `sentinel_failure_exit_status`.
 //!
-//! `start` runs before seccomp (`zygote/child_boot.zig`), which denies the
-//! clone a later start would need. The sentinel's thread touches only this
-//! state, the page's lifecycle and running-owner fields, the trace fd and the
-//! VM's termination request, which takes no JavaScript lock.
+//! The sentinel tells the operator anything only through `std.log`, under
+//! the `sentinel` scope, whose lines take the log sink's and the console
+//! ring's locks only when they are free and are dropped otherwise
+//! (`zygote/log_sink.zig:never_wait_scope`): a thread the kernel throttles
+//! past `memory.high` inside one of those locks must not hold up the exit
+//! that ends a worker past its limit. A fire writes no line: it reaches the
+//! server as the `worker_retiring` notice the VM thread sends (`retirement.zig`), and
+//! as the statuses of the requests it ended. `start` runs before seccomp
+//! (`zygote/child_boot.zig`), which denies the clone a later start would
+//! need. The sentinel's thread touches only this state, the page's
+//! lifecycle, running-owner and console fields, and the VM's termination
+//! request, which takes no JavaScript lock.
 
 const std = @import("std");
 const bindings = @import("collo_bindings");
 const cgroup = @import("collo_cgroup");
 const process = @import("collo_os").process;
-const process_limits = @import("collo_limits").process;
 const worker_shared_page = @import("collo_worker_state").page;
+
+/// Every line of this file waits for no lock (`zygote/log_sink.zig:never_wait_scope`).
+const log = std.log.scoped(.sentinel);
 
 const poll_events: u32 = std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR;
 const memory_events_poll: u32 = std.posix.POLL.PRI | std.posix.POLL.HUP | std.posix.POLL.ERR;
@@ -153,7 +163,6 @@ pub const Config = struct {
     /// memory pressure.
     memory_events_fd: ?std.posix.fd_t = null,
     metrics: ?*worker_shared_page.WorkerWriterView = null,
-    trace_fd: ?std.posix.fd_t = null,
     /// The kernel id of the thread whose CPU the CPU deadline measures; null
     /// for the thread that calls `init`, which in a worker is the VM thread
     /// (`Observability.init`). A test names a stand-in thread here.
@@ -182,7 +191,6 @@ pub const Sentinel = struct {
     command_fd: std.posix.fd_t,
     memory_events_fd: ?std.posix.fd_t,
     metrics: ?*worker_shared_page.WorkerWriterView,
-    trace_fd: ?std.posix.fd_t,
     memory_events_baseline: cgroup.memory.Events,
     vm_thread_cpu_clock: std.os.linux.clockid_t,
     thread: ?std.Thread = null,
@@ -210,11 +218,10 @@ pub const Sentinel = struct {
         const command_fd = try std.posix.eventfd(0, std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK);
         errdefer std.posix.close(command_fd);
 
-        const baseline = if (config.memory_events_fd) |fd| blk: {
-            const snapshot = try cgroup.memory.readEvents(fd);
-            traceEvent(config.trace_fd, "child.memory_events.registered");
-            break :blk snapshot;
-        } else cgroup.memory.Events{};
+        const baseline = if (config.memory_events_fd) |fd|
+            try cgroup.memory.readEvents(fd)
+        else
+            cgroup.memory.Events{};
 
         const hook = config.termination_hook orelse TerminationHook{
             .ctx = vm,
@@ -229,7 +236,6 @@ pub const Sentinel = struct {
             .command_fd = command_fd,
             .memory_events_fd = config.memory_events_fd,
             .metrics = config.metrics,
-            .trace_fd = config.trace_fd,
             .memory_events_baseline = baseline,
             .vm_thread_cpu_clock = process.threadCpuClockId(vm_thread_tid),
             .owner_lease = .{},
@@ -254,7 +260,6 @@ pub const Sentinel = struct {
             }
             return err;
         };
-        traceEvent(self.trace_fd, "child.sentinel.started");
     }
 
     pub fn deinit(self: *Sentinel) void {
@@ -312,12 +317,12 @@ pub const Sentinel = struct {
             // A full counter means a wake is already pending.
             error.WouldBlock => return,
             else => {
-                std.log.warn("worker sentinel wake write failed: {s}", .{@errorName(err)});
+                log.warn("worker sentinel wake write failed: {s}", .{@errorName(err)});
                 return;
             },
         };
         if (written != @sizeOf(u64))
-            std.log.warn("worker sentinel wake write was short: {d}", .{written});
+            log.warn("worker sentinel wake write was short: {d}", .{written});
     }
 
     fn drainCommandFd(self: *Sentinel) !void {
@@ -376,9 +381,8 @@ pub const Sentinel = struct {
         std.debug.assert(owner_id != 0);
         self.fired_cause.store(@intFromEnum(cause), .monotonic);
         self.fired_owner_id.store(owner_id, .release);
-        traceEventFmt(self.trace_fd, "child.sentinel.fired={d},{s}", .{ owner_id, @tagName(cause) });
         self.termination_fn(self.termination_ctx) catch |err|
-            std.log.warn("VM termination request failed owner_id={d}: {s}", .{ owner_id, @errorName(err) });
+            log.warn("VM termination request failed owner_id={d}: {s}", .{ owner_id, @errorName(err) });
     }
 
     /// The published owner's CPU so far on the page: its CPU before the
@@ -410,12 +414,12 @@ pub const Sentinel = struct {
         const events = try cgroup.memory.readEvents(fd);
         const fatal_field = events.highPressureFieldSince(self.memory_events_baseline) orelse return;
 
-        traceEventFmt(self.trace_fd, "child.memory_pressure.detected={s}", .{fatal_field});
         self.publishRunningCpuBestEffort();
         if (self.metrics) |metrics|
             metrics.setState(.dead, .memory);
-        traceEvent(self.trace_fd, "child.memory_state_published");
-        traceEvent(self.trace_fd, "child.memory_exit");
+        // Warn, not err: a worker past its memory limit is the tenant's
+        // event, and the server records it as the worker's ending.
+        log.warn("worker memory pressure: memory.events.local {s} rose past its count at boot; exiting", .{fatal_field});
         std.c._exit(memory_pressure_exit_status);
     }
 
@@ -426,8 +430,7 @@ pub const Sentinel = struct {
         self.publishRunningCpuBestEffort();
         if (self.metrics) |metrics|
             metrics.setState(.dead, .sentinel);
-        traceEventFmt(self.trace_fd, "child.sentinel.failed={s}", .{@tagName(cause)});
-        std.log.err("worker sentinel failed: {s}", .{@tagName(cause)});
+        log.err("worker sentinel failed: {s}", .{@tagName(cause)});
         if (self.failure_hook) |hook| {
             hook.fail(hook.ctx, cause);
             return;
@@ -437,12 +440,11 @@ pub const Sentinel = struct {
 
     fn sentinelPollLoop(self: *Sentinel, start_signal: *StartSignal) void {
         self.validatePollBackend() catch |err| {
-            std.log.err("worker sentinel poll backend validation failed: {s}", .{@errorName(err)});
+            log.err("worker sentinel poll backend validation failed: {s}", .{@errorName(err)});
             start_signal.fail(err);
             return;
         };
         start_signal.succeed();
-        traceEvent(self.trace_fd, "child.sentinel.poll_backend");
 
         // Ends only when `deinit` asks or a failure ends the worker; every
         // iteration blocks in `ppoll` until a deadline, a wake or an event.
@@ -553,38 +555,4 @@ fn timespecFromNs(ns: u64) std.posix.timespec {
         .sec = @intCast(ns / std.time.ns_per_s),
         .nsec = @intCast(ns % std.time.ns_per_s),
     };
-}
-
-fn traceEvent(trace_fd: ?std.posix.fd_t, event: []const u8) void {
-    if (trace_fd == null)
-        return;
-
-    var buffer: [process_limits.TRACE_EVENT_BUFFER_BYTES]u8 = undefined;
-    const line = std.fmt.bufPrint(&buffer, "{s}\n", .{event}) catch return;
-    writeBestEffort(trace_fd.?, line, "trace event");
-}
-
-fn traceEventFmt(trace_fd: ?std.posix.fd_t, comptime fmt: []const u8, args: anytype) void {
-    if (trace_fd == null)
-        return;
-
-    var buffer: [process_limits.TRACE_EVENT_BUFFER_BYTES]u8 = undefined;
-    const line = std.fmt.bufPrint(&buffer, fmt ++ "\n", args) catch return;
-    writeBestEffort(trace_fd.?, line, "trace event");
-}
-
-fn writeBestEffort(fd: std.posix.fd_t, bytes: []const u8, context: []const u8) void {
-    var remaining = bytes;
-    while (remaining.len != 0) {
-        const written = std.posix.write(fd, remaining) catch |err| switch (err) {
-            error.WouldBlock, error.BrokenPipe, error.ConnectionResetByPeer => return,
-            else => |unexpected| {
-                std.log.warn("{s} write failed: {s}", .{ context, @errorName(unexpected) });
-                return;
-            },
-        };
-        if (written == 0)
-            return;
-        remaining = remaining[written..];
-    }
 }

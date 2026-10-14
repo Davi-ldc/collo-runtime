@@ -7,14 +7,18 @@
 //! inline, large ones through the shared payload ring and segmented ones
 //! without flattening, with exact bytes at chunk boundaries.
 //!
-//! When the control socket, whose worker end does not block, has no room,
-//! the response waits in the request's outbox (its head with it when the
-//! head has not gone out, and a fetch-streamed one at its head, its chunk or
-//! its end), and the writable event, handled by the loop or by the test,
-//! queues the advance that finishes it, with the completion published after
-//! the last packet. A deadline, a client reset or a local failure drops the
-//! parked rest before it answers, and a fetch completion skipped while a
-//! deadline answer waits frees its task. A fetch aborted under a parked head
+//! The packet that ends a response carries the request's `request_done` as
+//! its last entry, whatever the response's kind. When the control socket,
+//! whose worker end does not block, has no room, the response waits in the
+//! request's outbox (its head with it when the head has not gone out, and a
+//! fetch-streamed one at its head, its chunk or its end), and the writable
+//! event, handled by the loop or by the test, queues the advance that sends
+//! it. A last packet that waits has finished its request, which no deadline
+//! answers again. A deadline, a client reset or a local failure drops the
+//! parked rest of an unfinished response before it answers, a client reset
+//! drops a finished request's parked last packet, and a fetch completion
+//! skipped while a deadline answer waits frees its task. A fetch aborted
+//! under a parked head
 //! fails only its own stream, and a send that finds the server gone stops
 //! the loop as a hangup does.
 //!
@@ -23,9 +27,11 @@
 //! waits, and leaves its sibling runnable. A full ready queue wakes no loop,
 //! a grant keeps its first readiness stamp until the rescan queues it, a
 //! grant of another identity fails, and a cancel withdraws a queued advance.
-//! Endings, a fire under another request and a gateway detach at zero credit
-//! reset or finish the response and release what it held, and a held
-//! JavaScript chunk is borrowed again on each try. An ending whose answer
+//! Endings and a fire under another request at zero credit reset or finish
+//! the response and release what it held; a fetch chunk parks as the
+//! worker's own copy, so its pool extent goes back at once and the chunk
+//! outlives a gateway detach; and a held JavaScript chunk is borrowed again
+//! on each try. An ending whose answer
 //! fails still finishes its request, a client reset finishes a request whose
 //! ending's answer waits, and after a fire under another request a decided
 //! response's leftover timer leaves it to finish. The one-pass driver a bench
@@ -41,7 +47,6 @@ const h2 = @import("collo_http").http2;
 const host = @import("collo_host");
 const ipc = @import("collo_ipc");
 const limits = @import("collo_limits");
-const worker_shared_page = @import("collo_worker_state").page;
 const worker = @import("collo_worker");
 const worker_request = @import("collo_worker_request");
 const rt = @import("collo_test_harness");
@@ -49,10 +54,15 @@ const rt = @import("collo_test_harness");
 const fakeNow = rt.fakeNow;
 const initDispatchWork = rt.initDispatchWork;
 const socketPairType = rt.socketPairType;
-const readWorkerCompletion = rt.readWorkerCompletion;
 const runRouteAndReadBody = rt.runRouteAndReadBody;
 const runH2Route = rt.runH2Route;
-const uring_backend = worker.testing.scheduler.uring_backend;
+const poll_backend = worker.testing.scheduler.poll_backend;
+
+/// The `request_done` of `request_id`, which follows the packets of its
+/// response the test already read.
+fn readRequestDone(server_fd: std.posix.fd_t, request_id: u64) !ipc.RequestDone {
+    return (try rt.readRequestDoneOf(server_fd, request_id)).done;
+}
 
 test "Response brand prevents plain objects from becoming HTTP responses" {
     var vm = try support.createVm();
@@ -156,11 +166,14 @@ test "H2 route response emits descriptor batch and request done" {
     var batch = try ipc.ingress_channel.decodeReceivedBatchPacket(std.testing.allocator, &packet);
     defer batch.deinit();
 
-    try std.testing.expectEqual(@as(usize, 2), batch.items.len);
+    // The head, the body that ends the stream and the request's
+    // `request_done`, in one packet.
+    try std.testing.expectEqual(@as(usize, 3), batch.items.len);
     try std.testing.expectEqual(@intFromEnum(ipc.ingress_channel.Op.response_head), batch.items[0].descriptor.op);
     try std.testing.expectEqual(@intFromEnum(ipc.ingress_channel.Op.response_chunk), batch.items[1].descriptor.op);
     try std.testing.expect(batch.items[1].descriptor.hasFlag(ipc.ingress_channel.flags.end_stream));
     try std.testing.expectEqualStrings("h2-ok", batch.items[1].payload);
+    try std.testing.expectEqual(@intFromEnum(ipc.ingress_channel.Op.request_done), batch.items[2].descriptor.op);
 
     var head = try ipc.ingress_channel.decodeResponseHead(std.testing.allocator, batch.items[0].payload);
     defer head.deinit();
@@ -172,10 +185,117 @@ test "H2 route response emits descriptor batch and request done" {
     }
     try std.testing.expect(saw_mode);
 
-    const done = try readWorkerCompletion(&runtime, control_pair[1], 91);
-    try std.testing.expectEqual(@as(u64, 91), done.external_request_id);
-    try std.testing.expectEqual(ipc.RequestDoneStatus.ok, @as(ipc.RequestDoneStatus, @enumFromInt(done.status)));
+    const done = try ipc.ingress_channel.decodeRequestDone(batch.items[2].payload);
+    try std.testing.expectEqual(ipc.RequestDoneStatus.ok, done.status);
     try std.testing.expectEqual(@as(u16, 201), done.http_status);
+    try std.testing.expectEqual(@as(u64, "h2-ok".len), done.client_served_bytes);
+}
+
+/// Where a request's response ended and its `request_done` arrived among the
+/// packets the worker sent, counted from 0.
+const ResponseEnding = struct {
+    end_packet: ?usize = null,
+    done_packet: ?usize = null,
+    done_is_last_entry: bool = false,
+};
+
+/// Whether `descriptor` is the last one of its response: a head or chunk that
+/// ends the stream, the stream's end or its reset.
+fn endsResponse(descriptor: ipc.ingress_channel.Descriptor) bool {
+    const op = descriptor.op;
+    if (op == @intFromEnum(ipc.ingress_channel.Op.response_end)) return true;
+    if (op == @intFromEnum(ipc.ingress_channel.Op.response_reset)) return true;
+    if (op == @intFromEnum(ipc.ingress_channel.Op.response_head) or op == @intFromEnum(ipc.ingress_channel.Op.response_chunk))
+        return descriptor.hasFlag(ipc.ingress_channel.flags.end_stream);
+    return false;
+}
+
+/// Reads the server's end of the control socket up to the `request_done` of
+/// `request_id` and says which packet held the response's last descriptor
+/// and which held the `request_done`. Every payload is inline.
+fn readResponseEnding(server_fd: std.posix.fd_t, request_id: u64) !ResponseEnding {
+    var ending: ResponseEnding = .{};
+    const scratch = try std.testing.allocator.alloc(u8, ipc.max_message_bytes);
+    defer std.testing.allocator.free(scratch);
+    var packet_index: usize = 0;
+    while (ending.done_packet == null) : (packet_index += 1) {
+        var polls = [_]std.posix.pollfd{.{ .fd = server_fd, .events = std.posix.POLL.IN, .revents = 0 }};
+        if (try std.posix.poll(&polls, 1000) == 0)
+            return error.RequestDoneMissing;
+        var packet = try ipc.recvPacketWithFdsScratch(std.testing.allocator, server_fd, scratch);
+        var descriptors: [ipc.ingress_channel.max_batch_descriptors]ipc.ingress_channel.Descriptor = undefined;
+        var count: usize = 0;
+        if (ipc.ingress_channel.isDescriptorBatchPacket(packet.bytes)) {
+            var batch = try ipc.ingress_channel.decodeReceivedBatchPacket(std.testing.allocator, &packet);
+            defer batch.deinit();
+            for (batch.items) |item| {
+                descriptors[count] = item.descriptor;
+                count += 1;
+            }
+        } else {
+            var single = try ipc.ingress_channel.decodeReceivedPacket(std.testing.allocator, &packet);
+            defer single.deinit();
+            descriptors[0] = single.descriptor;
+            count = 1;
+        }
+        for (descriptors[0..count], 0..) |descriptor, index| {
+            if (descriptor.request_id != request_id) continue;
+            if (endsResponse(descriptor)) ending.end_packet = packet_index;
+            if (descriptor.op == @intFromEnum(ipc.ingress_channel.Op.request_done)) {
+                ending.done_packet = packet_index;
+                ending.done_is_last_entry = index + 1 == count;
+            }
+        }
+    }
+    return ending;
+}
+
+test "a response's last descriptor and its request_done leave in one packet, so the server frees the slot as it reads the response's end (#157)" {
+    var vm = try support.createVm();
+    defer vm.deinit();
+
+    const control_pair = try socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
+    defer std.posix.close(control_pair[0]);
+    defer std.posix.close(control_pair[1]);
+
+    var now_mono_ns: u64 = 0;
+    var completion_fixture = try rt.CompletionFixture.init();
+    defer completion_fixture.deinit();
+    var runtime = try worker.Runtime.init(std.testing.allocator, &vm, control_pair[0], &completion_fixture.view, try rt.createCompletionEventfd(), .{
+        .ctx = &now_mono_ns,
+        .now_fn = fakeNow,
+    });
+    defer runtime.deinit();
+    try runtime.attachHostRuntime();
+
+    // A buffered body that rides one inline batch with its head, a head that
+    // ends the stream itself, and a JavaScript stream, whose end goes out
+    // after its chunk.
+    const source =
+        \\export default function handle(request) {
+        \\    const kind = request.query.get("kind");
+        \\    if (kind === "empty") return new Response(null, { status: 204 });
+        \\    if (kind === "stream") {
+        \\        const body = new ReadableStream({
+        \\            start(controller) {
+        \\                controller.enqueue(new TextEncoder().encode("streamed"));
+        \\                controller.close();
+        \\            }
+        \\        });
+        \\        return new Response(body);
+        \\    }
+        \\    return new Response("ending-ok");
+        \\}
+    ;
+    const queries = [_][]const u8{ "kind=buffered", "kind=empty", "kind=stream" };
+    for (queries, 0..) |query, index| {
+        const request_id: u64 = 171 + index;
+        try runH2Route(&runtime, source, request_id, @intCast(11 + 2 * index), "/ending.js", .{ .path = "/ending.js", .raw_query = query });
+        const ending = try readResponseEnding(control_pair[1], request_id);
+        try std.testing.expect(ending.end_packet != null);
+        try std.testing.expectEqual(ending.end_packet, ending.done_packet);
+        try std.testing.expect(ending.done_is_last_entry);
+    }
 }
 
 test "H2 large route response uses shared payload ring" {
@@ -220,7 +340,9 @@ test "H2 large route response uses shared payload ring" {
         .worker_to_server = &server_payload,
     });
     defer body_batch.deinit();
-    try std.testing.expectEqual(@as(usize, 2), body_batch.items.len);
+    // The head, the ring chunk that ends the stream and the request's
+    // `request_done`, inline after them, in one packet.
+    try std.testing.expectEqual(@as(usize, 3), body_batch.items.len);
     try std.testing.expectEqual(@intFromEnum(ipc.ingress_channel.Op.response_head), body_batch.items[0].descriptor.op);
     try std.testing.expectEqual(@intFromEnum(ipc.ingress_channel.Op.response_chunk), body_batch.items[1].descriptor.op);
     try std.testing.expect(body_batch.items[1].descriptor.hasFlag(ipc.ingress_channel.flags.end_stream));
@@ -228,10 +350,10 @@ test "H2 large route response uses shared payload ring" {
     try std.testing.expectEqual(@as(usize, 64 * 1024), body_batch.items[1].payload.len);
     try std.testing.expectEqual(@as(u8, 'x'), body_batch.items[1].payload[0]);
     try std.testing.expectEqual(@as(u8, 'x'), body_batch.items[1].payload[body_batch.items[1].payload.len - 1]);
+    try std.testing.expectEqual(@intFromEnum(ipc.ingress_channel.Op.request_done), body_batch.items[2].descriptor.op);
 
-    const done = try readWorkerCompletion(&runtime, control_pair[1], 92);
-    try std.testing.expectEqual(@as(u64, 92), done.external_request_id);
-    try std.testing.expectEqual(ipc.RequestDoneStatus.ok, @as(ipc.RequestDoneStatus, @enumFromInt(done.status)));
+    const done = try ipc.ingress_channel.decodeRequestDone(body_batch.items[2].payload);
+    try std.testing.expectEqual(ipc.RequestDoneStatus.ok, done.status);
     try std.testing.expectEqual(@as(u16, 200), done.http_status);
 }
 
@@ -286,22 +408,29 @@ test "H2 segmented Blob response emits chunks without flattening first" {
         &[_]u8{ 0, 255 },
         "tail",
     };
-    for (expected_chunks, 0..) |expected, index| {
+    for (expected_chunks[0 .. expected_chunks.len - 1]) |expected| {
         var chunk_packet = try ipc.recvPacketWithFdsScratch(std.testing.allocator, control_pair[1], &scratch);
         try std.testing.expect(!ipc.ingress_channel.isDescriptorBatchPacket(chunk_packet.bytes));
         var chunk = try ipc.ingress_channel.decodeReceivedPacket(std.testing.allocator, &chunk_packet);
         defer chunk.deinit();
         try std.testing.expectEqual(@intFromEnum(ipc.ingress_channel.Op.response_chunk), chunk.descriptor.op);
         try std.testing.expectEqualSlices(u8, expected, chunk.payload);
-        try std.testing.expectEqual(
-            index + 1 == expected_chunks.len,
-            chunk.descriptor.hasFlag(ipc.ingress_channel.flags.end_stream),
-        );
+        try std.testing.expect(!chunk.descriptor.hasFlag(ipc.ingress_channel.flags.end_stream));
     }
 
-    const done = try readWorkerCompletion(&runtime, control_pair[1], 93);
-    try std.testing.expectEqual(@as(u64, 93), done.external_request_id);
-    try std.testing.expectEqual(ipc.RequestDoneStatus.ok, @as(ipc.RequestDoneStatus, @enumFromInt(done.status)));
+    // The last segment's chunk ends the stream and rides with the request's
+    // `request_done`.
+    var last_packet = try ipc.recvPacketWithFdsScratch(std.testing.allocator, control_pair[1], &scratch);
+    try std.testing.expect(ipc.ingress_channel.isDescriptorBatchPacket(last_packet.bytes));
+    var last = try ipc.ingress_channel.decodeReceivedBatchPacket(std.testing.allocator, &last_packet);
+    defer last.deinit();
+    try std.testing.expectEqual(@as(usize, 2), last.items.len);
+    try std.testing.expectEqual(@intFromEnum(ipc.ingress_channel.Op.response_chunk), last.items[0].descriptor.op);
+    try std.testing.expectEqualSlices(u8, expected_chunks[expected_chunks.len - 1], last.items[0].payload);
+    try std.testing.expect(last.items[0].descriptor.hasFlag(ipc.ingress_channel.flags.end_stream));
+    try std.testing.expectEqual(@intFromEnum(ipc.ingress_channel.Op.request_done), last.items[1].descriptor.op);
+    const done = try ipc.ingress_channel.decodeRequestDone(last.items[1].payload);
+    try std.testing.expectEqual(ipc.RequestDoneStatus.ok, done.status);
     try std.testing.expectEqual(@as(u16, 202), done.http_status);
 }
 
@@ -323,7 +452,7 @@ test "public Response property tampering does not affect internal response state
     defer runtime.deinit();
     try runtime.attachHostRuntime();
 
-    var injected = try rt.runRouteAndReadIngressResponse(&runtime, control_pair[1],
+    const injected_source =
         \\export default function handle() {
         \\    const response = new Response("bad", { headers: { "x-safe": "ok" } });
         \\    try {
@@ -331,13 +460,8 @@ test "public Response property tampering does not affect internal response state
         \\    } catch (_) {}
         \\    return response;
         \\}
-    , 16, "/tampered-response-header.js");
-    defer injected.deinit();
-    try std.testing.expectEqual(@as(u16, 200), injected.status);
-    try std.testing.expect(std.mem.containsAtLeast(u8, injected.headers_wire, 1, "x-safe: ok"));
-    try std.testing.expect(!std.mem.containsAtLeast(u8, injected.headers_wire, 1, "x-injected"));
-
-    var invalid_status = try rt.runRouteAndReadIngressResponse(&runtime, control_pair[1],
+    ;
+    const invalid_status_source =
         \\export default function handle() {
         \\    const response = new Response("bad");
         \\    try {
@@ -345,28 +469,44 @@ test "public Response property tampering does not affect internal response state
         \\    } catch (_) {}
         \\    return response;
         \\}
-    , 17, "/tampered-response-status.js");
-    defer invalid_status.deinit();
-    try std.testing.expectEqual(@as(u16, 200), invalid_status.status);
-
-    var immediate_header_reject = try rt.runRouteAndReadIngressResponse(&runtime, control_pair[1],
+    ;
+    const header_reject_source =
         \\export default function handle() {
         \\    const response = new Response("bad");
         \\    response.headers.set("x-safe", "ok\r\nx-injected: yes");
         \\    return response;
         \\}
-    , 18, "/mutated-header-injection.js");
-    defer immediate_header_reject.deinit();
-    try std.testing.expectEqual(@as(u16, 500), immediate_header_reject.status);
-    try std.testing.expect(!std.mem.containsAtLeast(u8, immediate_header_reject.headers_wire, 1, "x-injected"));
-
-    var server_controlled_header = try rt.runRouteAndReadIngressResponse(&runtime, control_pair[1],
+    ;
+    const server_header_source =
         \\export default function handle() {
         \\    const response = new Response("bad");
         \\    response.headers.set("content-length", "999");
         \\    return response;
         \\}
-    , 19, "/server-controlled-response-header.js");
+    ;
+    try rt.bootRoutes(&runtime, &.{
+        .{ .specifier = "/tampered-response-header.js", .source = injected_source },
+        .{ .specifier = "/tampered-response-status.js", .source = invalid_status_source },
+        .{ .specifier = "/mutated-header-injection.js", .source = header_reject_source },
+        .{ .specifier = "/server-controlled-response-header.js", .source = server_header_source },
+    });
+
+    var injected = try rt.runRouteAndReadIngressResponse(&runtime, control_pair[1], injected_source, 16, "/tampered-response-header.js");
+    defer injected.deinit();
+    try std.testing.expectEqual(@as(u16, 200), injected.status);
+    try std.testing.expect(std.mem.containsAtLeast(u8, injected.headers_wire, 1, "x-safe: ok"));
+    try std.testing.expect(!std.mem.containsAtLeast(u8, injected.headers_wire, 1, "x-injected"));
+
+    var invalid_status = try rt.runRouteAndReadIngressResponse(&runtime, control_pair[1], invalid_status_source, 17, "/tampered-response-status.js");
+    defer invalid_status.deinit();
+    try std.testing.expectEqual(@as(u16, 200), invalid_status.status);
+
+    var immediate_header_reject = try rt.runRouteAndReadIngressResponse(&runtime, control_pair[1], header_reject_source, 18, "/mutated-header-injection.js");
+    defer immediate_header_reject.deinit();
+    try std.testing.expectEqual(@as(u16, 500), immediate_header_reject.status);
+    try std.testing.expect(!std.mem.containsAtLeast(u8, immediate_header_reject.headers_wire, 1, "x-injected"));
+
+    var server_controlled_header = try rt.runRouteAndReadIngressResponse(&runtime, control_pair[1], server_header_source, 19, "/server-controlled-response-header.js");
     defer server_controlled_header.deinit();
     try std.testing.expectEqual(@as(u16, 500), server_controlled_header.status);
     try std.testing.expect(!std.mem.containsAtLeast(u8, server_controlled_header.headers_wire, 1, "content-length: 999"));
@@ -460,54 +600,67 @@ test "Response extraction uses current headers and preserves undefined string bo
     defer runtime.deinit();
     try runtime.attachHostRuntime();
 
-    var mutated_headers = try rt.runRouteAndReadIngressResponse(&runtime, control_pair[1],
+    const mutated_headers_source =
         \\export default function handle() {
         \\    const response = new Response("ok", { headers: { "x-state": "old" } });
         \\    response.headers.set("x-state", "new");
         \\    response.headers.set("x-added", "yes");
         \\    return response;
         \\}
-    , 18, "/response-mutated-headers.js");
-    defer mutated_headers.deinit();
-    try std.testing.expect(std.mem.containsAtLeast(u8, mutated_headers.headers_wire, 1, "x-state: new"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, mutated_headers.headers_wire, 1, "x-added: yes"));
-    try std.testing.expect(!std.mem.containsAtLeast(u8, mutated_headers.headers_wire, 1, "x-state: old"));
-
-    var undefined_body = try rt.runRouteAndReadIngressResponse(&runtime, control_pair[1],
+    ;
+    const undefined_body_source =
         \\export default function handle() {
         \\    return new Response("undefined", { headers: { "x-word": "undefined" } });
         \\}
-    , 19, "/response-undefined-body.js");
-    defer undefined_body.deinit();
-    try std.testing.expect(std.mem.containsAtLeast(u8, undefined_body.headers_wire, 1, "x-word: undefined"));
-    try std.testing.expectEqualStrings("undefined", undefined_body.body);
-
-    var undefined_empty = try rt.runRouteAndReadIngressResponseWithRequest(&runtime, control_pair[1],
+    ;
+    const undefined_empty_source =
         \\export default function handle() {
         \\    return new Response(undefined);
         \\}
-    , 20, "/response-undefined-empty.js", .{});
-    defer undefined_empty.deinit();
-    try std.testing.expectEqual(@as(u16, 200), undefined_empty.status);
-    try std.testing.expectEqual(@as(usize, 0), undefined_empty.body.len);
-
-    var null_empty = try rt.runRouteAndReadIngressResponseWithRequest(&runtime, control_pair[1],
+    ;
+    const null_empty_source =
         \\export default function handle() {
         \\    return new Response(null);
         \\}
-    , 21, "/response-null-empty.js", .{});
-    defer null_empty.deinit();
-    try std.testing.expectEqual(@as(u16, 200), null_empty.status);
-    try std.testing.expectEqual(@as(usize, 0), null_empty.body.len);
-
-    var set_cookie = try rt.runRouteAndReadIngressResponse(&runtime, control_pair[1],
+    ;
+    const set_cookie_source =
         \\export default function handle() {
         \\    const response = new Response("ok");
         \\    response.headers.append("set-cookie", "a=1");
         \\    response.headers.append("set-cookie", "b=2");
         \\    return response;
         \\}
-    , 22, "/response-set-cookie.js");
+    ;
+    try rt.bootRoutes(&runtime, &.{
+        .{ .specifier = "/response-mutated-headers.js", .source = mutated_headers_source },
+        .{ .specifier = "/response-undefined-body.js", .source = undefined_body_source },
+        .{ .specifier = "/response-undefined-empty.js", .source = undefined_empty_source },
+        .{ .specifier = "/response-null-empty.js", .source = null_empty_source },
+        .{ .specifier = "/response-set-cookie.js", .source = set_cookie_source },
+    });
+
+    var mutated_headers = try rt.runRouteAndReadIngressResponse(&runtime, control_pair[1], mutated_headers_source, 18, "/response-mutated-headers.js");
+    defer mutated_headers.deinit();
+    try std.testing.expect(std.mem.containsAtLeast(u8, mutated_headers.headers_wire, 1, "x-state: new"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, mutated_headers.headers_wire, 1, "x-added: yes"));
+    try std.testing.expect(!std.mem.containsAtLeast(u8, mutated_headers.headers_wire, 1, "x-state: old"));
+
+    var undefined_body = try rt.runRouteAndReadIngressResponse(&runtime, control_pair[1], undefined_body_source, 19, "/response-undefined-body.js");
+    defer undefined_body.deinit();
+    try std.testing.expect(std.mem.containsAtLeast(u8, undefined_body.headers_wire, 1, "x-word: undefined"));
+    try std.testing.expectEqualStrings("undefined", undefined_body.body);
+
+    var undefined_empty = try rt.runRouteAndReadIngressResponseWithRequest(&runtime, control_pair[1], undefined_empty_source, 20, "/response-undefined-empty.js", .{});
+    defer undefined_empty.deinit();
+    try std.testing.expectEqual(@as(u16, 200), undefined_empty.status);
+    try std.testing.expectEqual(@as(usize, 0), undefined_empty.body.len);
+
+    var null_empty = try rt.runRouteAndReadIngressResponseWithRequest(&runtime, control_pair[1], null_empty_source, 21, "/response-null-empty.js", .{});
+    defer null_empty.deinit();
+    try std.testing.expectEqual(@as(u16, 200), null_empty.status);
+    try std.testing.expectEqual(@as(usize, 0), null_empty.body.len);
+
+    var set_cookie = try rt.runRouteAndReadIngressResponse(&runtime, control_pair[1], set_cookie_source, 22, "/response-set-cookie.js");
     defer set_cookie.deinit();
     try std.testing.expect(std.mem.containsAtLeast(u8, set_cookie.headers_wire, 1, "set-cookie: a=1"));
     try std.testing.expect(std.mem.containsAtLeast(u8, set_cookie.headers_wire, 1, "set-cookie: b=2"));
@@ -531,32 +684,41 @@ test "Response extraction rejects oversized native response payloads before work
     defer runtime.deinit();
     try runtime.attachHostRuntime();
 
-    var oversized_body = try rt.runRouteAndReadIngressResponse(&runtime, control_pair[1],
+    const oversized_body_source =
         \\export default function handle() {
         \\    return new Response("x".repeat(4 * 1024 * 1024 + 1));
         \\}
-    , 31, "/response-oversized-body.js");
-    defer oversized_body.deinit();
-    try std.testing.expectEqual(@as(u16, 500), oversized_body.status);
-
-    var too_many_headers = try rt.runRouteAndReadIngressResponse(&runtime, control_pair[1],
+    ;
+    const too_many_headers_source =
         \\export default function handle() {
         \\    const headers = new Headers();
         \\    for (let index = 0; index < 257; index++)
         \\        headers.set("x-" + index, "ok");
         \\    return new Response("ok", { headers });
         \\}
-    , 32, "/response-too-many-headers.js");
-    defer too_many_headers.deinit();
-    try std.testing.expectEqual(@as(u16, 500), too_many_headers.status);
-
-    var oversized_headers = try rt.runRouteAndReadIngressResponse(&runtime, control_pair[1],
+    ;
+    const oversized_headers_source =
         \\export default function handle() {
         \\    return new Response("ok", {
         \\        headers: { "x-big": "a".repeat(16 * 1024) }
         \\    });
         \\}
-    , 33, "/response-oversized-headers.js");
+    ;
+    try rt.bootRoutes(&runtime, &.{
+        .{ .specifier = "/response-oversized-body.js", .source = oversized_body_source },
+        .{ .specifier = "/response-too-many-headers.js", .source = too_many_headers_source },
+        .{ .specifier = "/response-oversized-headers.js", .source = oversized_headers_source },
+    });
+
+    var oversized_body = try rt.runRouteAndReadIngressResponse(&runtime, control_pair[1], oversized_body_source, 31, "/response-oversized-body.js");
+    defer oversized_body.deinit();
+    try std.testing.expectEqual(@as(u16, 500), oversized_body.status);
+
+    var too_many_headers = try rt.runRouteAndReadIngressResponse(&runtime, control_pair[1], too_many_headers_source, 32, "/response-too-many-headers.js");
+    defer too_many_headers.deinit();
+    try std.testing.expectEqual(@as(u16, 500), too_many_headers.status);
+
+    var oversized_headers = try rt.runRouteAndReadIngressResponse(&runtime, control_pair[1], oversized_headers_source, 33, "/response-oversized-headers.js");
     defer oversized_headers.deinit();
     try std.testing.expectEqual(@as(u16, 500), oversized_headers.status);
 }
@@ -783,7 +945,6 @@ test "flushBufferedBody delivers exact bytes at chunk boundaries without overrea
             std.testing.allocator,
             @intCast(21 + case_index),
             dispatch,
-            .{ .index = 0, .generation = 1 },
             0,
         );
         defer ctx.deinit();
@@ -798,7 +959,15 @@ test "flushBufferedBody delivers exact bytes at chunk boundaries without overrea
             .offset = 0,
         };
         const writer = worker.testing.response_payload_writer;
-        try std.testing.expectEqual(writer.BodyProgress.sent, try writer.flushBufferedBody(&runtime, &ctx, &buffered));
+        // A held write sends every packet before the one that ends the body,
+        // which then carries the request's `request_done`.
+        try std.testing.expectEqual(writer.BodyProgress.last, try writer.flushBufferedBody(&runtime, &ctx, &buffered, .hold));
+        var carry: worker.testing.done_carry.DoneCarry = .{
+            .done_status = .ok,
+            .http_status = 200,
+            .done = .{ .status = .ok, .http_status = 200 },
+        };
+        try std.testing.expectEqual(writer.BodyProgress.sent, try writer.flushBufferedBody(&runtime, &ctx, &buffered, .{ .carry = &carry }));
         try std.testing.expectEqual(body_len, buffered.offset);
         try std.testing.expectEqual(@as(u64, body_len), ctx.client_served_bytes);
 
@@ -815,6 +984,10 @@ test "flushBufferedBody delivers exact bytes at chunk boundaries without overrea
                 });
                 defer batch.deinit();
                 for (batch.items) |item| {
+                    if (item.descriptor.op == @intFromEnum(ipc.ingress_channel.Op.request_done)) {
+                        try std.testing.expect(saw_end);
+                        continue;
+                    }
                     try std.testing.expect(!saw_end);
                     try std.testing.expectEqual(@intFromEnum(ipc.ingress_channel.Op.response_chunk), item.descriptor.op);
                     try std.testing.expect(item.payload.len <= body_len - received);
@@ -929,6 +1102,51 @@ test "streaming body clone fan-out and Response.json enforce serverless quota ca
     try std.testing.expect(std.mem.containsAtLeast(u8, response, 1, "\"jsonCyclicThrowsTypeError\":true"));
 }
 
+test "an in-memory body cloned before either has a stream shares one clone budget with its clone, so their tees count together" {
+    var vm = try support.createVm();
+    defer vm.deinit();
+
+    const control_pair = try socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
+    defer std.posix.close(control_pair[0]);
+    defer std.posix.close(control_pair[1]);
+
+    var now_mono_ns: u64 = 0;
+    var completion_fixture = try rt.CompletionFixture.init();
+    defer completion_fixture.deinit();
+    var runtime = try worker.Runtime.init(std.testing.allocator, &vm, control_pair[0], &completion_fixture.view, try rt.createCompletionEventfd(), .{
+        .ctx = &now_mono_ns,
+        .now_fn = fakeNow,
+    });
+    defer runtime.deinit();
+    try runtime.attachHostRuntime();
+
+    // The two bodies' streams take turns at teeing; one budget for the tree refuses the tee past
+    // the cap whichever stream asks for it.
+    const response = try runRouteAndReadBody(&runtime, control_pair[1],
+        \\export default async function handle() {
+        \\    const source = new Response("x");
+        \\    const copy = source.clone();
+        \\    const streams = [source.body, copy.body];
+        \\    let tees = 0;
+        \\    let teeError = null;
+        \\    try {
+        \\        for (let index = 0; index < 64; index++) {
+        \\            const side = index % 2;
+        \\            streams[side] = streams[side].tee()[0];
+        \\            tees++;
+        \\        }
+        \\    } catch (err) {
+        \\        teeError = err;
+        \\    }
+        \\    const teeRejected = teeError instanceof DOMException && teeError.name === "QuotaExceededError";
+        \\    return Response.json({ teeRejected, tees });
+        \\}
+    , 41, "/in-memory-clone-budget.js");
+    defer std.testing.allocator.free(response);
+    try std.testing.expect(std.mem.containsAtLeast(u8, response, 1, "\"teeRejected\":true"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, response, 1, "\"tees\":16"));
+}
+
 test "a response whose head finds the control socket full waits in the outbox until the socket drains" {
     var fixture: SocketFullWorker = undefined;
     try fixture.init(.{});
@@ -957,7 +1175,7 @@ test "a response whose head finds the control socket full waits in the outbox un
         ipc.ingress_channel.shared_payload_ring_capacity,
         try worker_payload.availableCapacity(.worker_to_server),
     );
-    try fixture.expectNoCompletion();
+    try fixture.expectNoCompletion(401);
     try fixture.expectWritablePollArmed();
 
     try std.testing.expectEqual(filler_count, try drainFiller(fixture.control_pair[1]));
@@ -965,12 +1183,12 @@ test "a response whose head finds the control socket full waits in the outbox un
     defer response.deinit();
     try fixture.serveUntilFinished(&response, 401);
     try std.testing.expect(!runtime.requests.control_send_blocked);
-    try response.readUntilEnd(&fixture);
+    try response.readUntilDone(&fixture);
     try std.testing.expectEqual(@as(?u16, 201), response.status);
     try expectAlphabetBody(response.body.items);
 
-    const done = try readWorkerCompletion(runtime, fixture.control_pair[1], 401);
-    try std.testing.expectEqual(@intFromEnum(ipc.RequestDoneStatus.ok), done.status);
+    const done = try response.requestDone();
+    try std.testing.expectEqual(ipc.RequestDoneStatus.ok, done.status);
     try std.testing.expectEqual(@as(u16, 201), done.http_status);
 }
 
@@ -996,7 +1214,7 @@ test "a response larger than the control socket's send buffer finishes from its 
     try std.testing.expect(parked_offset > 0);
     try std.testing.expect(parked_offset < parts_body_len);
     try std.testing.expectEqual(@as(usize, 0), parked_offset % part_bytes);
-    try fixture.expectNoCompletion();
+    try fixture.expectNoCompletion(402);
     try fixture.expectWritablePollArmed();
 
     var response: ReadResponse = .{};
@@ -1004,15 +1222,15 @@ test "a response larger than the control socket's send buffer finishes from its 
     try response.readAvailable(&fixture);
     try std.testing.expectEqual(@as(?u16, 202), response.status);
     try std.testing.expectEqual(parked_offset, response.body.items.len);
-    try std.testing.expect(!response.credit.ended);
+    try std.testing.expect(!response.ended);
 
     try fixture.serveUntilFinished(&response, 402);
-    try response.readUntilEnd(&fixture);
+    try response.readUntilDone(&fixture);
     try std.testing.expectEqual(parts_body_len, response.body.items.len);
     try expectPartsBytes(response.body.items);
 
-    const done = try readWorkerCompletion(runtime, fixture.control_pair[1], 402);
-    try std.testing.expectEqual(@intFromEnum(ipc.RequestDoneStatus.ok), done.status);
+    const done = try response.requestDone();
+    try std.testing.expectEqual(ipc.RequestDoneStatus.ok, done.status);
     try std.testing.expectEqual(@as(u16, 202), done.http_status);
 }
 
@@ -1022,10 +1240,12 @@ test "a deadline answers 504 in place of a response whose head waits in the outb
     defer fixture.deinit();
     const runtime = &fixture.runtime;
 
+    // A body past one credit window, so the packet with its head does not
+    // end the response and the request does not finish while it waits.
     const filler_count = try fillSendBuffer(fixture.control_pair[0]);
     try fixture.dispatch(403,
         \\export default function handle() {
-        \\    return new Response("first answer", { status: 200 });
+        \\    return new Response("x".repeat(300 * 1024), { status: 200 });
         \\}
     , "/socket-full-deadline.js");
     _ = try runUntilParked(runtime, 403);
@@ -1043,20 +1263,63 @@ test "a deadline answers 504 in place of a response whose head waits in the outb
         },
         else => return error.TestUnexpectedResult,
     }
-    try fixture.expectNoCompletion();
+    try fixture.expectNoCompletion(403);
 
     try std.testing.expectEqual(filler_count, try drainFiller(fixture.control_pair[1]));
     var response: ReadResponse = .{};
     defer response.deinit();
     try fixture.serveUntilFinished(&response, 403);
-    try response.readUntilEnd(&fixture);
+    try response.readUntilDone(&fixture);
     try std.testing.expectEqual(@as(?u16, 504), response.status);
     try std.testing.expectEqualStrings("gateway timeout", response.body.items);
     try std.testing.expect(!(try socketReadable(fixture.control_pair[1], 0)));
 
-    const done = try readWorkerCompletion(runtime, fixture.control_pair[1], 403);
-    try std.testing.expectEqual(@intFromEnum(ipc.RequestDoneStatus.deadline_timeout), done.status);
+    const done = try response.requestDone();
+    try std.testing.expectEqual(ipc.RequestDoneStatus.deadline_timeout, done.status);
     try std.testing.expectEqual(@as(u16, 504), done.http_status);
+}
+
+test "a response whose last packet waits for the socket has finished its request, so its deadline replaces nothing and the packet carries its request_done once the socket drains (#157)" {
+    var fixture: SocketFullWorker = undefined;
+    try fixture.init(.{});
+    defer fixture.deinit();
+    const runtime = &fixture.runtime;
+
+    // The whole answer is one packet, the response's last.
+    const filler_count = try fillSendBuffer(fixture.control_pair[0]);
+    try fixture.dispatch(404,
+        \\export default function handle() {
+        \\    return new Response("first answer", { status: 200 });
+        \\}
+    , "/socket-full-finished.js");
+    const request_ctx = try runUntilParked(runtime, 404);
+    try std.testing.expect(request_ctx.finish_started);
+    try std.testing.expect(request_ctx.last_packet_done != null);
+    try std.testing.expect(!request_ctx.response_committed);
+    try std.testing.expect(runtime.requests.done_outbox.isEmpty());
+
+    // The deadline was disarmed with the request's cleanup.
+    try worker.testing.request_dispatch.deadlineTimeout(runtime, 404);
+    switch (request_ctx.response_outbox.pending) {
+        .buffered_body => |buffered| {
+            const head = buffered.head orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(@as(u16, 200), head.status);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    try std.testing.expectEqual(filler_count, try drainFiller(fixture.control_pair[1]));
+    var response: ReadResponse = .{};
+    defer response.deinit();
+    try fixture.serveUntilFinished(&response, 404);
+    try response.readUntilDone(&fixture);
+    try std.testing.expectEqual(@as(?u16, 200), response.status);
+    try std.testing.expectEqualStrings("first answer", response.body.items);
+    const done = try response.requestDone();
+    try std.testing.expectEqual(ipc.RequestDoneStatus.ok, done.status);
+    try std.testing.expectEqual(@as(u16, 200), done.http_status);
+    try std.testing.expectEqual(@as(u64, "first answer".len), done.client_served_bytes);
+    try std.testing.expect(!(try socketReadable(fixture.control_pair[1], 0)));
 }
 
 // A task leaves the table only when its completion runs, so a completion
@@ -1090,11 +1353,11 @@ test "a fetch completion that pops while a deadline answer waits for the socket 
     var response: ReadResponse = .{};
     defer response.deinit();
     try fixture.serveUntilFinished(&response, 411);
-    try response.readUntilEnd(&fixture);
+    try response.readUntilDone(&fixture);
     try std.testing.expectEqual(@as(?u16, 504), response.status);
     try std.testing.expectEqualStrings("gateway timeout", response.body.items);
-    const done = try readWorkerCompletion(runtime, fixture.control_pair[1], 411);
-    try std.testing.expectEqual(@intFromEnum(ipc.RequestDoneStatus.deadline_timeout), done.status);
+    const done = try response.requestDone();
+    try std.testing.expectEqual(ipc.RequestDoneStatus.deadline_timeout, done.status);
 }
 
 test "a local failure resets a committed response whose rest waits in the outbox, and the worker keeps running" {
@@ -1164,20 +1427,20 @@ test "a fetch-streamed response waits in the outbox at its head, its chunk and i
     try fixture.pumpWhenWritable();
     try response.readAvailable(&fixture);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 255, 65 }, response.body.items);
-    try std.testing.expect(!response.credit.ended);
+    try std.testing.expect(!response.ended);
 
     filler_count = try fillSendBuffer(fixture.control_pair[0]);
     _ = try runUntilParked(runtime, 407);
     try std.testing.expectEqual(.stream_end, std.meta.activeTag(request_ctx.response_outbox.pending));
-    try fixture.expectNoCompletion();
+    try fixture.expectNoCompletion(407);
     try std.testing.expectEqual(filler_count, try drainFiller(fixture.control_pair[1]));
     try fixture.pumpWhenWritable();
     try std.testing.expect(!runtime.requests.active.contains(407));
-    try response.readUntilEnd(&fixture);
+    try response.readUntilDone(&fixture);
     try std.testing.expect(response.reset_code == null);
 
-    const done = try readWorkerCompletion(runtime, fixture.control_pair[1], 407);
-    try std.testing.expectEqual(@intFromEnum(ipc.RequestDoneStatus.ok), done.status);
+    const done = try response.requestDone();
+    try std.testing.expectEqual(ipc.RequestDoneStatus.ok, done.status);
     try std.testing.expectEqual(@as(u16, 200), done.http_status);
 }
 
@@ -1196,32 +1459,39 @@ test "a fetch aborted while its streamed response's head waits resets that one s
     const request_ctx = try runUntilParked(runtime, 408);
     try std.testing.expectEqual(.stream_head, std.meta.activeTag(request_ctx.response_outbox.pending));
 
-    // The gateway's acknowledgment of the fetch's abort releases the body's
-    // view (`gateway_runtime.handleAbortAck`), so the pull the head's advance
-    // starts cannot begin.
+    // The abort a fetch's signal sends (`host/fetch.zig:collo_runtime_fetch_cancel`)
+    // fails the body even when its end already arrived, as the in-process
+    // gateway's usually has by now, and returns its queued extent at once
+    // (`body/cleanup.zig:cancelForFetch`). Whatever the gateway still sends
+    // for the fetch, its chunk, its end or the stop's acknowledgment, leaves
+    // the body failed and empty. The view stays the response stream's until
+    // the advance resets the stream.
     const identity = switch (request_ctx.response_stream) {
         .fetch => |fetch| fetch.identity,
         else => return error.TestUnexpectedResult,
     };
-    const ack = ipc.messages.EgressAbortAck.init(identity.fetch_id, identity.body_id);
-    const gateway = fixture.gateway orelse return error.TestUnexpectedResult;
-    try gateway.queueCompletionPacket(std.mem.asBytes(&ack));
+    runtime.cancelFetch(identity.fetch_id, null);
     _ = try runtime.collectEgressGatewayPacketsBounded(64);
     const body = runtime.egress.state.bodies.get(identity.body_id) orelse return error.TestUnexpectedResult;
-    try std.testing.expect(body.viewReleased());
+    try std.testing.expect(body.isFailed());
+    try std.testing.expectEqual(@as(usize, 0), body.queuedBytes());
+    try std.testing.expect(!body.viewReleased());
 
     try std.testing.expectEqual(filler_count, try drainFiller(fixture.control_pair[1]));
     var response: ReadResponse = .{};
     defer response.deinit();
     try fixture.serveUntilFinished(&response, 408);
     try std.testing.expect(runtime.core.running);
-    try response.readUntilEnd(&fixture);
+    // Once the request finished, no view of the body is left to hold a pool
+    // extent.
+    try std.testing.expect(runtime.egress.state.bodies.get(identity.body_id) == null);
+    try response.readUntilDone(&fixture);
     try std.testing.expectEqual(@as(?u16, 200), response.status);
     try std.testing.expectEqual(@as(usize, 0), response.body.items.len);
     try std.testing.expectEqual(@as(?u32, @intFromEnum(h2.ErrorCode.internal_error)), response.reset_code);
 
-    const done = try readWorkerCompletion(runtime, fixture.control_pair[1], 408);
-    try std.testing.expectEqual(@intFromEnum(ipc.RequestDoneStatus.internal_error), done.status);
+    const done = try response.requestDone();
+    try std.testing.expectEqual(ipc.RequestDoneStatus.internal_error, done.status);
     try std.testing.expectEqual(@as(u16, 200), done.http_status);
 }
 
@@ -1251,11 +1521,11 @@ test "the loop sends a parked response once the server drains the socket, and pu
     const filler_count = try fillSendBuffer(fixture.control_pair[0]);
     try fixture.dispatch(410, alphabet_source, "/socket-full-loop.js");
     _ = try runUntilParked(runtime, 410);
-    try fixture.expectNoCompletion();
+    try fixture.expectNoCompletion(410);
 
     // A second thread plays the server while this one runs the loop: it
-    // drains the socket, reads the response to its end and hangs up, which
-    // stops the loop.
+    // drains the socket, reads the response up to its `request_done` and
+    // hangs up, which stops the loop.
     var server: LoopServer = .{ .fixture = &fixture, .filler_count = filler_count };
     defer server.response.deinit();
     const thread = try std.Thread.spawn(.{}, LoopServer.run, .{&server});
@@ -1270,8 +1540,8 @@ test "the loop sends a parked response once the server drains the socket, and pu
     try std.testing.expect(!runtime.requests.control_send_blocked);
     try std.testing.expectEqual(@as(?u16, 201), server.response.status);
     try expectAlphabetBody(server.response.body.items);
-    const done = try readWorkerCompletion(runtime, fixture.control_pair[1], 410);
-    try std.testing.expectEqual(@intFromEnum(ipc.RequestDoneStatus.ok), done.status);
+    const done = try server.response.requestDone();
+    try std.testing.expectEqual(ipc.RequestDoneStatus.ok, done.status);
     try std.testing.expectEqual(@as(u16, 201), done.http_status);
 }
 
@@ -1299,21 +1569,20 @@ test "buffered segmented and oversized JS responses publish no fifth chunk befor
         try fixture.dispatch(request_id, source, "/response-credit.js");
         _ = try runUntilCreditWait(&fixture, request_id);
         try std.testing.expect(!fixture.runtime.requests.control_send_blocked);
-        try fixture.backend.arm(&fixture.runtime);
-        try std.testing.expect(!fixture.backend.control_writable_poll_armed);
+        try std.testing.expect(!poll_backend.controlSendWaits(&fixture.runtime));
         var response: ReadResponse = .{};
         defer response.deinit();
         try response.readAvailable(&fixture);
         try std.testing.expectEqual(@as(u64, 4), response.credit.window.spent);
         try std.testing.expectEqual(@as(usize, 4 * credit_chunk_bytes), response.body.items.len);
-        try std.testing.expect(!response.credit.ended);
+        try std.testing.expect(!response.ended);
         try std.testing.expect(!try socketReadable(fixture.control_pair[1], 0));
         try fixture.serveUntilFinished(&response, request_id);
-        try response.readUntilEnd(&fixture);
+        try response.readUntilDone(&fixture);
         try std.testing.expectEqual(@as(usize, credit_body_bytes), response.body.items.len);
         try std.testing.expect(std.mem.allEqual(u8, response.body.items, 65));
-        const done = try readWorkerCompletion(&fixture.runtime, fixture.control_pair[1], request_id);
-        try std.testing.expectEqual(@intFromEnum(ipc.RequestDoneStatus.ok), done.status);
+        const done = try response.requestDone();
+        try std.testing.expectEqual(ipc.RequestDoneStatus.ok, done.status);
     }
 }
 
@@ -1321,23 +1590,28 @@ test "a credit-blocked response leaves its sibling runnable" {
     var fixture: SocketFullWorker = undefined;
     try fixture.init(.{});
     defer fixture.deinit();
+    const sibling_source = "export default () => new Response('sibling');";
+    try fixture.bootRoutes(&.{
+        .{ .specifier = "/blocked-sibling.js", .source = credit_sources[0] },
+        .{ .specifier = "/ready-sibling.js", .source = sibling_source },
+    });
     try fixture.dispatch(9620, credit_sources[0], "/blocked-sibling.js");
     _ = try runUntilCreditWait(&fixture, 9620);
     var blocked: ReadResponse = .{};
     defer blocked.deinit();
     try blocked.readAvailable(&fixture);
-    try fixture.dispatch(9621, "export default () => new Response('sibling');", "/ready-sibling.js");
+    try fixture.dispatch(9621, sibling_source, "/ready-sibling.js");
     try rt.executeQueuedBegin(&fixture.runtime);
     try std.testing.expect(!fixture.runtime.requests.active.contains(9621));
     var sibling: ReadResponse = .{};
     defer sibling.deinit();
-    try sibling.readAvailable(&fixture);
+    try sibling.readUntilDone(&fixture);
     try std.testing.expectEqualStrings("sibling", sibling.body.items);
-    try std.testing.expect(sibling.credit.ended);
-    _ = try readWorkerCompletion(&fixture.runtime, fixture.control_pair[1], 9621);
+    try std.testing.expect(sibling.ended);
+    try std.testing.expectEqual(ipc.RequestDoneStatus.ok, (try sibling.requestDone()).status);
     try fixture.serveUntilFinished(&blocked, 9620);
-    try blocked.readUntilEnd(&fixture);
-    _ = try readWorkerCompletion(&fixture.runtime, fixture.control_pair[1], 9620);
+    try blocked.readUntilDone(&fixture);
+    try std.testing.expectEqual(ipc.RequestDoneStatus.ok, (try blocked.requestDone()).status);
 }
 
 test "a full ready queue wakes no loop for any item, and a grant keeps its first readiness stamp until the rescan queues it" {
@@ -1348,8 +1622,13 @@ test "a full ready queue wakes no loop for any item, and a grant keeps its first
     try fixture.dispatch(9630, credit_sources[0], "/credit-rescan.js");
     const ctx = try runUntilCreditWait(&fixture, 9630);
     const runtime = &fixture.runtime;
-    while (runtime.scheduler.ready_queue.remainingCapacity() != 0 or runtime.scheduler.ready_backlog.remainingCapacity() != 0)
+    // Items other than egress ones fill the backlog only to the ready
+    // queue's capacity (`runtime/scheduler.zig:queueReadyWork`).
+    while (runtime.scheduler.ready_queue.remainingCapacity() != 0 or
+        runtime.scheduler.ready_backlog.len < runtime.core.limits.ready_queue_capacity)
+    {
         try std.testing.expect(runtime.tryQueueReadyWork(.{ .request_deadline = 0 }));
+    }
     runtime.drainWakeup();
     try std.testing.expect(!runtime.tryQueueReadyWork(.{ .request = 0 }));
     try worker_request.ingress.runtime.enqueueResponseCredit(runtime, creditFor(ctx, ipc.response_credit.window + 1));
@@ -1406,12 +1685,16 @@ test "cancellation withdraws a response advance and a late grant queues nothing"
     defer response.deinit();
     try response.readAvailable(&fixture);
     try std.testing.expectEqual(@as(u64, 4), response.credit.window.spent);
-    try std.testing.expect(!response.credit.ended);
-    const done = try readWorkerCompletion(runtime, fixture.control_pair[1], 9631);
-    try std.testing.expectEqual(@intFromEnum(ipc.RequestDoneStatus.client_closed), done.status);
+    try response.readUntilDone(&fixture);
+    // The client's reset sends nothing more of the response, only its
+    // `request_done`.
+    try std.testing.expect(!response.ended);
+    try std.testing.expect(response.reset_code == null);
+    const done = try response.requestDone();
+    try std.testing.expectEqual(ipc.RequestDoneStatus.client_closed, done.status);
 }
 
-test "a fetch response holds borrowed bytes at zero credit and releases them on finish cancellation or failure" {
+test "a fetch response parks a borrowed chunk at zero credit as its own copy, returns the extent at once, and finishes, cancels or fails with the copy" {
     const ReleaseCounter = struct {
         count: usize = 0,
         fn release(context: ?*anyopaque, _: u64, _: usize) void {
@@ -1419,6 +1702,7 @@ test "a fetch response holds borrowed bytes at zero credit and releases them on 
             self.count += 1;
         }
     };
+    const egress_body = worker.testing.egress_body;
     const Ending = enum { finish, cancel, fail };
     for ([_]Ending{ .finish, .cancel, .fail }, 0..) |ending, index| {
         const bytes = try std.testing.allocator.alloc(u8, credit_body_bytes);
@@ -1433,28 +1717,33 @@ test "a fetch response holds borrowed bytes at zero credit and releases them on 
         try fixture.dispatch(request_id, "export default () => new Promise(() => {});", "/fetch-credit.js");
         try rt.executeQueuedBegin(runtime);
         const ctx = runtime.requests.active.get(request_id) orelse return error.TestUnexpectedResult;
-        const identity = try runtime.registerFetchBodyOpen(ctx, 77, null);
-        const body = runtime.egress.state.bodies.get(identity.body_id).?;
-        _ = try body.appendBorrowedChunk(std.testing.allocator, .{
+        const identity = try egress_body.registerOpen(runtime, ctx, 77);
+        const body = egress_body.ptr(runtime, identity).?;
+        try body.appendBorrowedChunk(std.testing.allocator, .{
             .bytes = bytes,
-            .release = .{ .context = &releases, .seq = 1, .len = bytes.len, .release_fn = ReleaseCounter.release },
-        }, .none);
+            .release = .{ .context = &releases, .handle = 1, .len = bytes.len, .release_fn = ReleaseCounter.release },
+        });
         const last = try std.testing.allocator.dupe(u8, "Z");
-        _ = try body.appendOwnedChunk(std.testing.allocator, last, .none);
-        if (ending == .finish)
-            try runtime.completeFetchBody(identity);
+        try body.appendOwnedChunk(std.testing.allocator, last);
+        if (ending == .finish) {
+            body.complete();
+            egress_body.queueReadyViews(runtime, body);
+        }
         ctx.response_stream = .{ .fetch = .{ .identity = identity } };
         const head: worker_request.response_model.Response = .{};
         try std.testing.expectEqual(worker.testing.response_payload_writer.Sent.sent, try worker.testing.response_payload_writer.writeStreamHead(runtime, ctx, &head));
         try std.testing.expect(worker_request.response_stream.queueAdvance(runtime, ctx));
         _ = try runUntilCreditWait(&fixture, request_id);
-        try std.testing.expectEqual(@as(usize, 0), releases.count);
+        // The parked chunk holds a copy, so the extent went back when it
+        // parked, and no ending releases it again.
+        try std.testing.expectEqual(.stream_chunk, std.meta.activeTag(ctx.response_outbox.pending));
+        try std.testing.expectEqual(@as(usize, 1), releases.count);
         var response: ReadResponse = .{};
         defer response.deinit();
         switch (ending) {
             .finish => {
                 try fixture.serveUntilFinished(&response, request_id);
-                try response.readUntilEnd(&fixture);
+                try response.readUntilDone(&fixture);
                 try std.testing.expectEqual(@as(usize, credit_body_bytes + 1), response.body.items.len);
                 try std.testing.expectEqual(@as(u8, 'Z'), response.body.items[credit_body_bytes]);
             },
@@ -1464,15 +1753,23 @@ test "a fetch response holds borrowed bytes at zero credit and releases them on 
                 try std.testing.expectEqual(@as(u64, 4), response.credit.window.spent);
             },
             .fail => {
-                try runtime.failFetchBody(identity, "upstream failed while response waited for credit");
+                const failing = egress_body.ptr(runtime, identity).?;
+                failing.fail(std.testing.allocator, "upstream failed while response waited for credit");
+                egress_body.queueReadyViews(runtime, failing);
                 try fixture.serveUntilFinished(&response, request_id);
-                try response.readUntilEnd(&fixture);
+                try response.readUntilDone(&fixture);
                 try std.testing.expectEqual(@as(u64, 4), response.credit.window.spent);
                 try std.testing.expectEqual(@as(?u32, @intFromEnum(h2.ErrorCode.internal_error)), response.reset_code);
             },
         }
         try std.testing.expectEqual(@as(usize, 1), releases.count);
-        _ = try readWorkerCompletion(runtime, fixture.control_pair[1], request_id);
+        try response.readUntilDone(&fixture);
+        const done = try response.requestDone();
+        switch (ending) {
+            .finish => try std.testing.expectEqual(ipc.RequestDoneStatus.ok, done.status),
+            .cancel => try std.testing.expectEqual(ipc.RequestDoneStatus.client_closed, done.status),
+            .fail => {},
+        }
     }
 }
 
@@ -1500,13 +1797,13 @@ test "CPU and deadline endings at zero credit publish one reset after socket rea
         try std.testing.expectEqual(.stream_reset, std.meta.activeTag(ending_ctx.response_outbox.pending));
         try std.testing.expectEqual(filler, try drainFiller(fixture.control_pair[1]));
         try fixture.serveUntilFinished(&response, request_id);
-        try response.readUntilEnd(&fixture);
+        try response.readUntilDone(&fixture);
         try std.testing.expectEqual(@as(u64, 4), response.credit.window.spent);
         try std.testing.expectEqual(@as(?u32, @intFromEnum(h2.ErrorCode.internal_error)), response.reset_code);
         try std.testing.expect(!try socketReadable(fixture.control_pair[1], 0));
-        const done = try readWorkerCompletion(runtime, fixture.control_pair[1], request_id);
+        const done = try response.requestDone();
         const expected: ipc.RequestDoneStatus = if (cpu) .cpu_exceeded else .deadline_timeout;
-        try std.testing.expectEqual(@intFromEnum(expected), done.status);
+        try std.testing.expectEqual(expected, done.status);
     }
 }
 
@@ -1527,21 +1824,22 @@ test "a fire under another request lets a buffered response waiting for credit f
         runtime.observability.sentinel.fired_cause.store(@intFromEnum(worker.testing.sentinel.Cause.deadline), .monotonic);
         runtime.observability.sentinel.fired_owner_id.store(9999, .release);
         try fixture.serveUntilFinished(&response, request_id);
-        try response.readUntilEnd(&fixture);
-        const done = try readWorkerCompletion(runtime, fixture.control_pair[1], request_id);
+        try response.readUntilDone(&fixture);
+        const done = try response.requestDone();
         if (source_index == 0) {
             try std.testing.expectEqual(@as(usize, credit_body_bytes), response.body.items.len);
             try std.testing.expect(response.reset_code == null);
-            try std.testing.expectEqual(@intFromEnum(ipc.RequestDoneStatus.ok), done.status);
+            try std.testing.expectEqual(ipc.RequestDoneStatus.ok, done.status);
         } else {
             try std.testing.expectEqual(@as(usize, 4 * credit_chunk_bytes), response.body.items.len);
             try std.testing.expect(response.reset_code != null);
-            try std.testing.expectEqual(@intFromEnum(ipc.RequestDoneStatus.worker_stopped), done.status);
+            try std.testing.expectEqual(ipc.RequestDoneStatus.worker_stopped, done.status);
         }
     }
 }
 
-test "gateway death and replacement release a credit-blocked pool lease before unmap" {
+test "a credit-blocked fetch chunk returns its pool extent when it parks and outlives a gateway death and replacement" {
+    const egress_body = worker.testing.egress_body;
     for ([_]bool{ false, true }, 0..) |disconnect_first, index| {
         var fixture: SocketFullWorker = undefined;
         try fixture.init(.{});
@@ -1556,27 +1854,23 @@ test "gateway death and replacement release a credit-blocked pool lease before u
         try fixture.dispatch(request_id, "export default () => new Promise(() => {});", "/fetch-detach-credit.js");
         try rt.executeQueuedBegin(runtime);
         const ctx = runtime.requests.active.get(request_id).?;
-        const identity = try runtime.registerFetchBodyOpen(ctx, 88, null);
-        const body = runtime.egress.state.bodies.get(identity.body_id).?;
+        const identity = try egress_body.registerOpen(runtime, ctx, 88);
+        const body = egress_body.ptr(runtime, identity).?;
         const pool_bytes = try runtime.egress.state.shared.?.body_pool.borrowContiguousChunk(old_handle, bytes.len);
-        _ = try body.appendBorrowedChunk(std.testing.allocator, .{
+        try body.appendBorrowedChunk(std.testing.allocator, .{
             .bytes = pool_bytes,
-            .release = .{
-                .context = &runtime.egress.state.body_pool_release_context,
-                .seq = old_handle,
-                .len = bytes.len,
-                .release_fn = @TypeOf(runtime.egress.state.body_pool_release_context).release,
-            },
-        }, .none);
-        try runtime.completeFetchBody(identity);
+            .release = worker.testing.egress_gateway_control.bodyPoolRelease(runtime, old_handle, bytes.len),
+        });
+        body.complete();
+        egress_body.queueReadyViews(runtime, body);
         ctx.response_stream = .{ .fetch = .{ .identity = identity } };
         const head: worker_request.response_model.Response = .{};
         _ = try worker.testing.response_payload_writer.writeStreamHead(runtime, ctx, &head);
         try std.testing.expect(worker_request.response_stream.queueAdvance(runtime, ctx));
         _ = try runUntilCreditWait(&fixture, request_id);
-        try std.testing.expectEqual(.borrowed, std.meta.activeTag(ctx.response_outbox.pending.stream_chunk.bytes));
+        try std.testing.expectEqual(.stream_chunk, std.meta.activeTag(ctx.response_outbox.pending));
         try old_gateway.body_pool.drainReleasedChunks();
-        try std.testing.expect((try old_gateway.body_pool.usage()).used != 0);
+        try std.testing.expectEqual(@as(usize, 0), (try old_gateway.body_pool.usage()).used);
         if (disconnect_first)
             runtime.disconnectEgressGatewayWithReason("test_gateway_death");
 
@@ -1587,27 +1881,22 @@ test "gateway death and replacement release a credit-blocked pool lease before u
         const new_used = (try replacement.gateway.body_pool.usage()).used;
         try ipc.egress_attach.send(fixture.control_pair[1], replacement.worker_raw);
         try worker.testing.scheduler.loop.collectControlPacket(runtime);
-        try std.testing.expect(ctx.response_outbox.isEmpty());
-        try std.testing.expect(ctx.response_stream.fetch.failed);
-        try old_gateway.body_pool.drainReleasedChunks();
-        try std.testing.expectEqual(@as(usize, 0), (try old_gateway.body_pool.usage()).used);
-        for (0..16) |_| {
-            if (!runtime.requests.active.contains(request_id))
-                break;
-            try rt.pumpOnce(runtime);
-        }
+        // The body had completed with nothing queued, so the detach failed
+        // nothing, and the parked copy still holds the rest of the response.
+        try std.testing.expectEqual(.stream_chunk, std.meta.activeTag(ctx.response_outbox.pending));
+
+        var response: ReadResponse = .{};
+        defer response.deinit();
+        try fixture.serveUntilFinished(&response, request_id);
+        try response.readUntilDone(&fixture);
+        try std.testing.expectEqual(@as(usize, credit_body_bytes), response.body.items.len);
+        for (response.body.items) |byte|
+            try std.testing.expectEqual(@as(u8, 'P'), byte);
+        try std.testing.expect(response.reset_code == null);
+        try std.testing.expectEqual(ipc.RequestDoneStatus.ok, (try response.requestDone()).status);
         try std.testing.expect(!runtime.requests.active.contains(request_id));
         try replacement.gateway.body_pool.drainReleasedChunks();
         try std.testing.expectEqual(new_used, (try replacement.gateway.body_pool.usage()).used);
-        runtime.disconnectEgressGatewayWithReason("test_replacement_death");
-        try replacement.gateway.body_pool.drainReleasedChunks();
-        try std.testing.expectEqual(new_used, (try replacement.gateway.body_pool.usage()).used);
-        var response: ReadResponse = .{};
-        defer response.deinit();
-        try response.readAvailable(&fixture);
-        try std.testing.expectEqual(@as(u64, 4), response.credit.window.spent);
-        try std.testing.expect(response.reset_code != null);
-        _ = try readWorkerCompletion(runtime, fixture.control_pair[1], request_id);
     }
 }
 
@@ -1637,16 +1926,17 @@ test "a retained JS chunk reborrows mutations and rejects detachment before resu
         var changed: ReadResponse = .{};
         defer changed.deinit();
         try changed.readAvailable(&fixture);
+        try changed.readUntilDone(&fixture);
         try std.testing.expectEqualStrings("changed", changed.body.items);
-        _ = try readWorkerCompletion(&fixture.runtime, fixture.control_pair[1], 9671);
+        try std.testing.expectEqual(ipc.RequestDoneStatus.ok, (try changed.requestDone()).status);
         try fixture.serveUntilFinished(&response, 9670);
-        try response.readUntilEnd(&fixture);
+        try response.readUntilDone(&fixture);
         try std.testing.expect(std.mem.allEqual(u8, response.body.items[0 .. 4 * credit_chunk_bytes], 65));
-        const done = try readWorkerCompletion(&fixture.runtime, fixture.control_pair[1], 9670);
+        const done = try response.requestDone();
         if (detach) {
             try std.testing.expectEqual(@as(u64, 4), response.credit.window.spent);
             try std.testing.expect(response.reset_code != null);
-            try std.testing.expectEqual(@intFromEnum(ipc.RequestDoneStatus.js_exception), done.status);
+            try std.testing.expectEqual(ipc.RequestDoneStatus.js_exception, done.status);
         } else {
             try std.testing.expectEqual(@as(usize, credit_body_bytes), response.body.items.len);
             try std.testing.expect(std.mem.allEqual(u8, response.body.items[4 * credit_chunk_bytes ..], 66));
@@ -1663,7 +1953,13 @@ test "a CPU ending whose answer fails finishes its request with a 500 internal e
     try fixture.init(.{});
     defer fixture.deinit();
     const runtime = &fixture.runtime;
-    try fixture.dispatch(9680, "export default () => new Promise(() => {});", "/cpu-answer-fails.js");
+    const pending_source = "export default () => new Promise(() => {});";
+    const serving_source = "export default () => new Response('still serving');";
+    try fixture.bootRoutes(&.{
+        .{ .specifier = "/cpu-answer-fails.js", .source = pending_source },
+        .{ .specifier = "/after-failed-answer.js", .source = serving_source },
+    });
+    try fixture.dispatch(9680, pending_source, "/cpu-answer-fails.js");
     try rt.executeQueuedBegin(runtime);
     const ctx = runtime.requests.active.get(9680) orelse return error.TestUnexpectedResult;
 
@@ -1679,20 +1975,28 @@ test "a CPU ending whose answer fails finishes its request with a 500 internal e
 
     try std.testing.expect(!runtime.requests.active.contains(9680));
     try std.testing.expect(runtime.core.running);
-    const done = try readWorkerCompletion(runtime, fixture.control_pair[1], 9680);
-    try std.testing.expectEqual(@intFromEnum(ipc.RequestDoneStatus.internal_error), done.status);
-    try std.testing.expectEqual(@as(u16, 500), done.http_status);
+    // The socket is still full, so the `request_done` waits for room with no
+    // response packet ahead of it.
+    try std.testing.expect(!runtime.requests.done_outbox.isEmpty());
     try std.testing.expectEqual(filler_count, try drainFiller(fixture.control_pair[1]));
+    try fixture.pumpWhenWritable();
+    try std.testing.expect(runtime.requests.done_outbox.isEmpty());
+    var failed: ReadResponse = .{};
+    defer failed.deinit();
+    try failed.readUntilDone(&fixture);
+    try std.testing.expect(failed.status == null);
+    const done = try failed.requestDone();
+    try std.testing.expectEqual(ipc.RequestDoneStatus.internal_error, done.status);
+    try std.testing.expectEqual(@as(u16, 500), done.http_status);
     try std.testing.expect(!try socketReadable(fixture.control_pair[1], 0));
 
-    try fixture.dispatch(9681, "export default () => new Response('still serving');", "/after-failed-answer.js");
+    try fixture.dispatch(9681, serving_source, "/after-failed-answer.js");
     try rt.executeQueuedBegin(runtime);
     var next: ReadResponse = .{};
     defer next.deinit();
-    try next.readAvailable(&fixture);
+    try next.readUntilDone(&fixture);
     try std.testing.expectEqualStrings("still serving", next.body.items);
-    const next_done = try readWorkerCompletion(runtime, fixture.control_pair[1], 9681);
-    try std.testing.expectEqual(@intFromEnum(ipc.RequestDoneStatus.ok), next_done.status);
+    try std.testing.expectEqual(ipc.RequestDoneStatus.ok, (try next.requestDone()).status);
 }
 
 test "after a fire under another request a decided response's leftover timer leaves it to finish" {
@@ -1725,11 +2029,11 @@ test "after a fire under another request a decided response's leftover timer lea
     var response: ReadResponse = .{};
     defer response.deinit();
     try fixture.serveUntilFinished(&response, 9690);
-    try response.readUntilEnd(&fixture);
+    try response.readUntilDone(&fixture);
     try std.testing.expect(response.reset_code == null);
     try std.testing.expectEqual(@as(usize, credit_body_bytes), response.body.items.len);
-    const done = try readWorkerCompletion(runtime, fixture.control_pair[1], 9690);
-    try std.testing.expectEqual(@intFromEnum(ipc.RequestDoneStatus.ok), done.status);
+    const done = try response.requestDone();
+    try std.testing.expectEqual(ipc.RequestDoneStatus.ok, done.status);
 }
 
 // A reset request's advance sends nothing, so its cancel is all that can
@@ -1759,12 +2063,19 @@ test "a client reset while an ending's answer waits for the socket finishes the 
     });
     try rt.executeNextReady(runtime);
     try std.testing.expect(!runtime.requests.active.contains(9695));
-    const done = try readWorkerCompletion(runtime, fixture.control_pair[1], 9695);
-    try std.testing.expectEqual(@intFromEnum(ipc.RequestDoneStatus.client_closed), done.status);
+    try std.testing.expect(!runtime.requests.done_outbox.isEmpty());
 
-    // The 504 that waited left with the request.
+    // The 504 that waited left with the request: once the socket has room,
+    // the request's `request_done` is all the worker sends.
     try std.testing.expectEqual(filler_count, try drainFiller(fixture.control_pair[1]));
     try fixture.pumpWhenWritable();
+    var response: ReadResponse = .{};
+    defer response.deinit();
+    try response.readUntilDone(&fixture);
+    try std.testing.expect(response.status == null);
+    try std.testing.expect(response.reset_code == null);
+    const done = try response.requestDone();
+    try std.testing.expectEqual(ipc.RequestDoneStatus.client_closed, done.status);
     try std.testing.expect(!try socketReadable(fixture.control_pair[1], 0));
 }
 
@@ -1775,7 +2086,7 @@ test "one pass per read of the host's reader runs a response past its credit win
     try fixture.init(.{});
     defer fixture.deinit();
     try fixture.dispatch(9700, credit_sources[0], "/run-pass.js");
-    var channels = rt.runtimeCompletionChannels(&fixture.runtime, fixture.control_pair[1]);
+    var channels = rt.runtimeResponseChannels(&fixture.runtime, fixture.control_pair[1]);
     // The reader takes ring payloads through the server's mapping of the
     // ring; the worker's own mapping writes the direction it reads.
     channels.ingress_payload = &fixture.server_payload;
@@ -1844,9 +2155,10 @@ const ParkedRestCase = struct {
 };
 
 /// Parks the rest of a committed response, ends the request as `case.end`
-/// says, which needs no frame of its own, and checks the completion, that
-/// the client got the head and a prefix of the body, and that the worker
-/// sends nothing more once the socket the parked send found full has room.
+/// says, which needs no frame of its own, and checks that the client got the
+/// head and a prefix of the body, that the request's `request_done`, which
+/// waits for the room the parked send found missing, follows them with the
+/// ending's statuses, and that the worker sends nothing after it.
 fn expectParkedRestDropped(case: ParkedRestCase) !void {
     var fixture: SocketFullWorker = undefined;
     try fixture.init(.{});
@@ -1859,18 +2171,22 @@ fn expectParkedRestDropped(case: ParkedRestCase) !void {
     try endRequest(runtime, case.request_id, case.end);
     try std.testing.expect(!runtime.requests.active.contains(case.request_id));
     try std.testing.expect(runtime.core.running);
-    const done = try readWorkerCompletion(runtime, fixture.control_pair[1], case.request_id);
-    try std.testing.expectEqual(@intFromEnum(case.done_status), done.status);
-    try std.testing.expectEqual(case.http_status, done.http_status);
+    try std.testing.expect(!runtime.requests.done_outbox.isEmpty());
 
     var response: ReadResponse = .{};
     defer response.deinit();
     try response.readAvailable(&fixture);
+    try fixture.pumpWhenWritable();
+    try std.testing.expect(runtime.requests.done_outbox.isEmpty());
+    try response.readUntilDone(&fixture);
     try std.testing.expectEqual(@as(?u16, 202), response.status);
-    try std.testing.expect(!response.credit.ended);
+    try std.testing.expect(!response.ended);
+    try std.testing.expect(response.reset_code == null);
     try std.testing.expect(response.body.items.len < parts_body_len);
     try expectPartsBytes(response.body.items);
-    try fixture.pumpWhenWritable();
+    const done = try response.requestDone();
+    try std.testing.expectEqual(case.done_status, done.status);
+    try std.testing.expectEqual(case.http_status, done.http_status);
     try std.testing.expect(!runtime.requests.control_send_blocked);
     try std.testing.expect(!(try socketReadable(fixture.control_pair[1], 0)));
 }
@@ -1878,9 +2194,9 @@ fn expectParkedRestDropped(case: ParkedRestCase) !void {
 /// Parks the rest of a committed response and ends the request as
 /// `case.end` says, which resets the client's stream: the socket is still
 /// full, so the reset waits in the outbox in place of the rest of the body,
-/// and the request finishes, publishing its completion, once its advance
+/// and the request finishes, sending its `request_done`, once its advance
 /// sends it. Checks that the client got the head, a prefix of the body and
-/// the reset, and the completion.
+/// the reset, then the `request_done`.
 fn expectParkedRestReset(case: ParkedRestCase) !void {
     var fixture: SocketFullWorker = undefined;
     try fixture.init(.{});
@@ -1899,19 +2215,19 @@ fn expectParkedRestReset(case: ParkedRestCase) !void {
         .stream_reset => |reset_code| try std.testing.expectEqual(internal_error_code, reset_code),
         else => return error.TestUnexpectedResult,
     }
-    try fixture.expectNoCompletion();
+    try fixture.expectNoCompletion(case.request_id);
 
     var response: ReadResponse = .{};
     defer response.deinit();
     try fixture.serveUntilFinished(&response, case.request_id);
-    try response.readUntilEnd(&fixture);
+    try response.readUntilDone(&fixture);
     try std.testing.expectEqual(@as(?u16, 202), response.status);
     try std.testing.expectEqual(@as(?u32, internal_error_code), response.reset_code);
     try std.testing.expect(response.body.items.len < parts_body_len);
     try expectPartsBytes(response.body.items);
 
-    const done = try readWorkerCompletion(runtime, fixture.control_pair[1], case.request_id);
-    try std.testing.expectEqual(@intFromEnum(case.done_status), done.status);
+    const done = try response.requestDone();
+    try std.testing.expectEqual(case.done_status, done.status);
     try std.testing.expectEqual(case.http_status, done.http_status);
 }
 
@@ -1943,7 +2259,7 @@ const LoopServer = struct {
             try std.testing.expectEqual(filler_packet_bytes, received);
             try std.testing.expect(std.mem.allEqual(u8, packet[0..received], filler_byte));
         }
-        try self.response.readUntilEnd(self.fixture);
+        try self.response.readUntilDone(self.fixture);
     }
 };
 
@@ -1990,16 +2306,13 @@ const max_filler_packets: usize = 1024;
 /// millisecond.
 const max_wait_rounds: usize = 1000;
 
-// The worker ring's `fs_fault` fixed file comes from the installed fs index,
-// so the fixture installs the placeholder index with a live SEQPACKET pair.
-const ring_index_bytes: []const u8 = &worker.fs.fs_index.placeholder_bytes;
-
-/// A worker on its restricted ring whose control socket's worker end does
-/// not block, as `zygote/child_boot.zig` leaves it, with a send buffer small
-/// enough to fill. The test plays the server on the socket's other end and
-/// on the shared payload ring, and, without a gateway, the gateway's end of
-/// the egress session. It is initialized in place, because the runtime keeps
-/// pointers to the fields beside it.
+/// A worker whose control socket's worker end does not block, as
+/// `zygote/child_boot.zig` leaves it, with a send buffer small enough to
+/// fill, and the loop's wait (`scheduler/poll_backend.zig`). The test plays
+/// the server on the socket's other end and on the shared payload ring, and,
+/// without a gateway, the gateway's end of the egress session. It is
+/// initialized in place, because the runtime keeps pointers to the fields
+/// beside it.
 const SocketFullWorker = struct {
     now_mono_ns: u64,
     /// The runtime's allocator, over the testing allocator. It fails nothing
@@ -2017,13 +2330,10 @@ const SocketFullWorker = struct {
     /// The worker's half of the gateway's session, which `Runtime.init`
     /// takes; empty without a gateway.
     worker_raw: ipc.egress_shared.RawFds,
-    fault_pair: [2]std.posix.fd_t,
     vm: bindings.Vm,
     completion_fixture: rt.CompletionFixture,
     runtime: worker.Runtime,
-    /// Arms its polls at its first `arm`, so a test that runs the loop,
-    /// which brings a backend of its own, leaves none of these in flight.
-    backend: uring_backend.UringBackend,
+    backend: poll_backend.PollBackend,
 
     // Linux doubles SO_SNDBUF. This leaves room for individual inline
     // packets but forces EAGAIN before all four body credits can be spent.
@@ -2079,11 +2389,6 @@ const SocketFullWorker = struct {
         errdefer if (!credit_fd_owned_by_runtime)
             std.posix.close(ingress_payload_credit_fd);
 
-        self.fault_pair = try socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
-        errdefer closePair(self.fault_pair);
-        try worker.fs.installForTestWithFault(ring_index_bytes, worker.fs.deploy_root, self.fault_pair[0], worker.fs.deploy_root);
-        errdefer worker.fs.uninstallForTest();
-
         self.vm = try support.createVm();
         errdefer self.vm.deinit();
         self.completion_fixture = try rt.CompletionFixture.init();
@@ -2105,17 +2410,13 @@ const SocketFullWorker = struct {
         );
         errdefer self.runtime.deinit();
         try self.runtime.attachHostRuntime();
-        try self.runtime.initRestrictedWorkerRing();
         self.backend = .{};
     }
 
     fn deinit(self: *SocketFullWorker) void {
-        self.backend.deinit();
         self.runtime.deinit();
         self.completion_fixture.deinit();
         self.vm.deinit();
-        worker.fs.uninstallForTest();
-        closePair(self.fault_pair);
         if (self.session) |*session|
             session.deinit();
         if (self.gateway) |gateway|
@@ -2128,8 +2429,15 @@ const SocketFullWorker = struct {
         self.* = undefined;
     }
 
-    /// Registers `source` as the route at `specifier` and queues one request
-    /// for it, as the server's request begin would.
+    /// Boots the runtime on every route of `routes` at once, for a test that
+    /// dispatches to more than one: a runtime boots once.
+    fn bootRoutes(self: *SocketFullWorker, routes: []const rt.RouteSource) !void {
+        try rt.bootRoutes(&self.runtime, routes);
+    }
+
+    /// Boots `source` as the route at `specifier`, unless the runtime serves
+    /// it already, and queues one request for it, as the server's request
+    /// begin would.
     fn dispatch(self: *SocketFullWorker, request_id: u64, source: []const u8, specifier: []const u8) !void {
         const route_specifier = try rt.routeSpecifier(std.testing.allocator, specifier);
         defer std.testing.allocator.free(route_specifier);
@@ -2144,17 +2452,16 @@ const SocketFullWorker = struct {
         try rt.enqueueIngressRoute(&self.runtime, &dispatch_work, 3, request);
     }
 
-    /// Fails when the worker published any completion.
-    fn expectNoCompletion(self: *SocketFullWorker) !void {
-        var records: [worker_shared_page.COMPLETION_RING_COUNT]worker_shared_page.WorkerCompletionRecord = undefined;
-        try std.testing.expectEqual(@as(usize, 0), try self.completion_fixture.view.drainWorkerCompletions(&records));
+    /// Fails when the worker sent `request_id`'s `request_done`, which its
+    /// finish sends, or holds it waiting for room.
+    fn expectNoCompletion(self: *SocketFullWorker, request_id: u64) !void {
+        try std.testing.expect(self.runtime.requests.active.contains(request_id));
+        try std.testing.expect(self.runtime.requests.done_outbox.isEmpty());
     }
 
-    /// Arms the backend as the loop does before it waits, and fails unless
-    /// that queued the poll for room in the control socket.
+    /// Fails unless the loop's next wait asks the control socket for room.
     fn expectWritablePollArmed(self: *SocketFullWorker) !void {
-        try self.backend.arm(&self.runtime);
-        try std.testing.expect(self.backend.control_writable_poll_armed);
+        try std.testing.expect(poll_backend.controlSendWaits(&self.runtime));
     }
 
     /// Runs one pass of the worker (`rt.pumpOnce`). When a send found the
@@ -2162,14 +2469,13 @@ const SocketFullWorker = struct {
     /// socket writable and handles that event as the loop does
     /// (`scheduler/loop.zig:handleControlWritable`).
     fn pumpWhenWritable(self: *SocketFullWorker) !void {
-        if (!self.runtime.requests.control_send_blocked) {
+        if (!poll_backend.controlSendWaits(&self.runtime)) {
             try rt.pumpOnce(&self.runtime);
             return;
         }
         var round: usize = 0;
         while (round < max_wait_rounds) : (round += 1) {
-            try self.backend.arm(&self.runtime);
-            var events: [8]uring_backend.Event = undefined;
+            var events: [poll_backend.events_max]poll_backend.Event = undefined;
             const ready = try self.backend.drain(&self.runtime, &events);
             for (events[0..ready]) |event| {
                 switch (event) {
@@ -2205,12 +2511,18 @@ const SocketFullWorker = struct {
     }
 };
 
-/// What a test, playing the server, read of one response. A second head
-/// fails the read, since it would answer the request twice.
+/// What a test, playing the server, read of one response, up to its
+/// `request_done`. A second head fails the read, since it would answer the
+/// request twice, and so does anything after the `request_done`, which the
+/// worker sends last.
 const ReadResponse = struct {
     status: ?u16 = null,
     body: std.ArrayList(u8) = .empty,
+    /// The response's end came: a `response_end`, or a head or chunk that
+    /// carries `end_stream`. A reset sets `reset_code` instead.
+    ended: bool = false,
     reset_code: ?u32 = null,
+    done: ?ipc.RequestDone = null,
     credit: rt.ResponseReadCredit = .{ .request_id = 0 },
 
     fn deinit(self: *ReadResponse) void {
@@ -2225,14 +2537,20 @@ const ReadResponse = struct {
             try self.readPacket(fixture);
     }
 
-    /// Reads packets until the response ends or resets. The worker sent them
-    /// all already, so a packet that does not arrive within a second fails.
-    fn readUntilEnd(self: *ReadResponse, fixture: *SocketFullWorker) !void {
-        while (!self.credit.ended) {
+    /// Reads packets until the request's `request_done`, which follows the
+    /// response's end or reset. The worker sent them all already, so a
+    /// packet that does not arrive within a second fails.
+    fn readUntilDone(self: *ReadResponse, fixture: *SocketFullWorker) !void {
+        while (self.done == null) {
             if (!try socketReadable(fixture.control_pair[1], 1000))
                 return error.TestUnexpectedResult;
             try self.readPacket(fixture);
         }
+    }
+
+    /// The `request_done` the read ended at.
+    fn requestDone(self: *const ReadResponse) !ipc.RequestDone {
+        return self.done orelse error.RequestDoneMissing;
     }
 
     fn readPacket(self: *ReadResponse, fixture: *SocketFullWorker) !void {
@@ -2254,9 +2572,17 @@ const ReadResponse = struct {
     }
 
     fn take(self: *ReadResponse, descriptor: ipc.ingress_channel.Descriptor, payload: []const u8) !void {
+        try std.testing.expect(self.done == null);
         if (self.credit.identity == null)
             self.credit.request_id = descriptor.request_id;
+        if (descriptor.op == @intFromEnum(ipc.ingress_channel.Op.request_done)) {
+            try self.credit.admitDone(descriptor);
+            self.done = try ipc.ingress_channel.decodeRequestDone(payload);
+            return;
+        }
         try self.credit.admit(descriptor);
+        if (descriptor.hasFlag(ipc.ingress_channel.flags.end_stream))
+            self.ended = true;
         switch (descriptor.op) {
             @intFromEnum(ipc.ingress_channel.Op.response_head) => {
                 var head = try ipc.ingress_channel.decodeResponseHead(std.testing.allocator, payload);
@@ -2264,7 +2590,7 @@ const ReadResponse = struct {
                 self.status = head.status;
             },
             @intFromEnum(ipc.ingress_channel.Op.response_chunk) => try self.body.appendSlice(std.testing.allocator, payload),
-            @intFromEnum(ipc.ingress_channel.Op.response_end) => {},
+            @intFromEnum(ipc.ingress_channel.Op.response_end) => self.ended = true,
             @intFromEnum(ipc.ingress_channel.Op.response_reset) => self.reset_code = descriptor.aux,
             else => return error.TestUnexpectedResult,
         }
@@ -2283,9 +2609,6 @@ fn runUntilParked(runtime: *worker.Runtime, request_id: u64) !*worker_request.co
         }
         _ = try runtime.collectEgressGatewayPacketsBounded(64);
         runtime.collectModuleSettlements();
-        try runtime.collectCompletedCryptoJobs();
-        try runtime.collectCompletedFetches();
-        try runtime.collectReadyFetchBodies();
         try runtime.collectDueTimers();
         try runtime.collectReadyImmediates();
         try runtime.collectDueRequestDeadlines();

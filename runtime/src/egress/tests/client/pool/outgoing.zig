@@ -5,19 +5,7 @@
 const std = @import("std");
 const test_support = @import("support.zig");
 const pool = test_support.pool;
-const data_io = test_support.data_io;
-const readiness = test_support.readiness;
 const transport = test_support.transport;
-const TestH2Origin = test_support.TestH2Origin;
-const collo_test_h2_origin_start = test_support.collo_test_h2_origin_start;
-const collo_test_h2_origin_stop = test_support.collo_test_h2_origin_stop;
-const collo_test_h2_origin_last_error = test_support.collo_test_h2_origin_last_error;
-const collo_test_h2_origin_stream_count = test_support.collo_test_h2_origin_stream_count;
-const collo_test_h2_origin_selected_alpn = test_support.collo_test_h2_origin_selected_alpn;
-const test_h2_origin_alpn_h2 = test_support.test_h2_origin_alpn_h2;
-const test_h2_origin_alpn_http11 = test_support.test_h2_origin_alpn_http11;
-const test_alpn_h2 = test_support.test_alpn_h2;
-const routableLocalIpv4 = test_support.routableLocalIpv4;
 const FakeWriteTransport = test_support.FakeWriteTransport;
 
 test "bounded outgoing refuses writes before growing past its budget" {

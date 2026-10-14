@@ -47,7 +47,6 @@ pub const RequestTask = struct {
     completion_queued: bool = false,
     response_value: ?js_value.JsValueOwned = null,
     pending_thenable: ?js_value.JsValueOwned = null,
-    trace: ?*request_context.RequestTrace = null,
 
     pub fn deinit(self: *RequestTask) void {
         if (self.pending_thenable) |*value| {

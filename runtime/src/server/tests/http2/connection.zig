@@ -76,6 +76,12 @@ const shared_stream_capacity: u32 = 1 << 14;
 var shared_lane: LaneResources = undefined;
 var shared_lane_mapped = false;
 
+/// The HPACK scratch of the tests' own client-side coders, apart from the
+/// lane's: a field being decoded, and the encoded blocks, each of which
+/// borrows this buffer until the next encode. The tests run one at a time.
+var client_decode_scratch: [hpack.max_single_header_decode_bytes]u8 = undefined;
+var client_encode_scratch: [max_response_header_block_bytes]u8 = undefined;
+
 fn sharedLane() *LaneResources {
     if (!shared_lane_mapped) {
         shared_lane = LaneResources.init(shared_stream_capacity) catch |err|
@@ -1074,10 +1080,10 @@ fn writeHeadersFrameWithFd(
     headers: []const hpack.Header,
     end_stream: bool,
 ) !void {
-    var block = try encoder.encodeHeaders(allocator, headers, max_response_header_block_bytes);
-    defer block.deinit(allocator);
+    _ = allocator;
+    const block = try encoder.encodeHeaders(&client_encode_scratch, headers, max_response_header_block_bytes);
     const flags: u8 = 0x4 | if (end_stream) @as(u8, 0x1) else 0;
-    try writeFrameFd(fd, .headers, flags, stream_id, block.bytes());
+    try writeFrameFd(fd, .headers, flags, stream_id, block);
 }
 
 fn writeHeadersFrameFdAdvanced(
@@ -1091,12 +1097,11 @@ fn writeHeadersFrameFdAdvanced(
 ) !void {
     var encoder = try hpack.Encoder.init();
     defer encoder.deinit();
-    var block = try encoder.encodeHeaders(allocator, headers, max_response_header_block_bytes);
-    defer block.deinit(allocator);
+    const block = try encoder.encodeHeaders(&client_encode_scratch, headers, max_response_header_block_bytes);
 
     const pad_len: usize = if (padded) 2 else 0;
     const priority_len: usize = if (priority) 5 else 0;
-    const payload_len = (if (padded) @as(usize, 1) else 0) + priority_len + block.bytes().len + pad_len;
+    const payload_len = (if (padded) @as(usize, 1) else 0) + priority_len + block.len + pad_len;
     const payload = try allocator.alloc(u8, payload_len);
     defer allocator.free(payload);
 
@@ -1109,8 +1114,8 @@ fn writeHeadersFrameFdAdvanced(
         @memset(payload[cursor..][0..priority_len], 0);
         cursor += priority_len;
     }
-    @memcpy(payload[cursor..][0..block.bytes().len], block.bytes());
-    cursor += block.bytes().len;
+    @memcpy(payload[cursor..][0..block.len], block);
+    cursor += block.len;
     if (pad_len != 0)
         @memset(payload[cursor..][0..pad_len], 0);
 
@@ -1183,7 +1188,6 @@ fn writeGetOfFieldCountFd(
 }
 
 fn writeHeaderBlockFramesFd(
-    allocator: std.mem.Allocator,
     fd: std.posix.fd_t,
     stream_id: u32,
     headers: []const hpack.Header,
@@ -1192,19 +1196,18 @@ fn writeHeaderBlockFramesFd(
 ) !void {
     var encoder = try hpack.Encoder.init();
     defer encoder.deinit();
-    var block = try encoder.encodeHeaders(allocator, headers, max_response_header_block_bytes);
-    defer block.deinit(allocator);
+    const block = try encoder.encodeHeaders(&client_encode_scratch, headers, max_response_header_block_bytes);
 
-    const first_len = @min(first_chunk_len, block.bytes().len);
-    if (first_len == block.bytes().len) {
+    const first_len = @min(first_chunk_len, block.len);
+    if (first_len == block.len) {
         const flags: u8 = 0x4 | if (end_stream) @as(u8, 0x1) else 0;
-        try writeFrameFd(fd, .headers, flags, stream_id, block.bytes());
+        try writeFrameFd(fd, .headers, flags, stream_id, block);
         return;
     }
 
     const header_flags: u8 = if (end_stream) 0x1 else 0;
-    try writeFrameFd(fd, .headers, header_flags, stream_id, block.bytes()[0..first_len]);
-    try writeFrameFd(fd, .continuation, 0x4, stream_id, block.bytes()[first_len..]);
+    try writeFrameFd(fd, .headers, header_flags, stream_id, block[0..first_len]);
+    try writeFrameFd(fd, .continuation, 0x4, stream_id, block[first_len..]);
 }
 
 const FoundFrame = struct {
@@ -1275,7 +1278,7 @@ fn streamEnded(bytes: []const u8, stream_id: u32) bool {
 fn decodeStatus(allocator: std.mem.Allocator, block: []const u8, out: *[3]u8) ![]const u8 {
     var decoder = try hpack.Decoder.init();
     defer decoder.deinit();
-    var decoded = try decoder.decodeBlock(allocator, block, 16, max_response_header_block_bytes);
+    var decoded = try decoder.decodeBlock(allocator, &client_decode_scratch, block, 16, max_response_header_block_bytes);
     defer decoded.deinit(allocator);
     for (decoded.headers) |header| {
         if (!std.mem.eql(u8, header.name, ":status"))
@@ -1415,7 +1418,7 @@ fn expectResponseHeader(
     const frame = findFrame(bytes, .headers, stream_id) orelse return error.MissingResponseHeaders;
     var decoder = try hpack.Decoder.init();
     defer decoder.deinit();
-    var decoded = try decoder.decodeBlock(allocator, frame.payload, 16, max_response_header_block_bytes);
+    var decoded = try decoder.decodeBlock(allocator, &client_decode_scratch, frame.payload, 16, max_response_header_block_bytes);
     defer decoded.deinit(allocator);
 
     var saw_status = false;
@@ -1529,7 +1532,7 @@ test "http2 driver applies peer header table size before response encoding" {
                 try std.testing.expect(payload.len != 0);
                 try std.testing.expectEqual(@as(u8, 0x20), payload[0]);
             }
-            var decoded = try decoder.decodeBlock(allocator, payload, 16, max_response_header_block_bytes);
+            var decoded = try decoder.decodeBlock(allocator, &client_decode_scratch, payload, 16, max_response_header_block_bytes);
             defer decoded.deinit(allocator);
             try std.testing.expectEqual(@as(usize, 2), decoded.headers.len);
             response_header_blocks += 1;
@@ -1872,15 +1875,14 @@ test "http2 driver closes connection on DATA inside an open header block" {
     // connection error of type PROTOCOL_ERROR.
     var encoder = try hpack.Encoder.init();
     defer encoder.deinit();
-    var block = try encoder.encodeHeaders(allocator, &.{
+    const block = try encoder.encodeHeaders(&client_encode_scratch, &.{
         .{ .name = ":method", .value = "GET" },
         .{ .name = ":scheme", .value = "https" },
         .{ .name = ":authority", .value = "example.com" },
         .{ .name = ":path", .value = "/interleaved" },
     }, max_response_header_block_bytes);
-    defer block.deinit(allocator);
-    const first_len = block.bytes().len - 1;
-    try writeFrameFd(setup.pair[1], .headers, 0, 1, block.bytes()[0..first_len]);
+    const first_len = block.len - 1;
+    try writeFrameFd(setup.pair[1], .headers, 0, 1, block[0..first_len]);
     try writeFrameFd(setup.pair[1], .data, 0, 1, "x");
 
     try driveUntilIdle(TestWorker, &worker, &setup.runtime);
@@ -2008,20 +2010,19 @@ test "http2 the read that completes a request head is when it arrived, whatever 
     // the lane's clock; it arrives with the read that completes it.
     var encoder = try hpack.Encoder.init();
     defer encoder.deinit();
-    var block = try encoder.encodeHeaders(allocator, &.{
+    const block = try encoder.encodeHeaders(&client_encode_scratch, &.{
         .{ .name = ":method", .value = "GET" },
         .{ .name = ":scheme", .value = "https" },
         .{ .name = ":authority", .value = "example.com" },
         .{ .name = ":path", .value = "/split" },
     }, 16 * 1024);
-    defer block.deinit(allocator);
-    const cut = block.bytes().len / 2;
-    try writeFrameFd(setup.pair[1], .headers, 0x1, 1, block.bytes()[0..cut]);
+    const cut = block.len / 2;
+    try writeFrameFd(setup.pair[1], .headers, 0x1, 1, block[0..cut]);
     worker.clock_ns = 2_000_000_000;
     try driveUntilIdle(TestWorker, &worker, &setup.runtime);
     try std.testing.expectEqual(@as(usize, 0), worker.request_count);
 
-    try writeFrameFd(setup.pair[1], .continuation, 0x4, 1, block.bytes()[cut..]);
+    try writeFrameFd(setup.pair[1], .continuation, 0x4, 1, block[cut..]);
     worker.clock_ns = 3_000_000_000;
     try driveUntilIdle(TestWorker, &worker, &setup.runtime);
     try std.testing.expectEqual(@as(usize, 1), worker.request_count);
@@ -2044,7 +2045,7 @@ test "http2 request head over the decoded byte bound answers 431 and keeps its c
     @memset(header_value, 'a');
 
     try writeClientPrefaceAndSettings(setup.pair[1]);
-    try writeHeaderBlockFramesFd(allocator, setup.pair[1], 1, &.{
+    try writeHeaderBlockFramesFd(setup.pair[1], 1, &.{
         .{ .name = ":method", .value = "GET" },
         .{ .name = ":scheme", .value = "https" },
         .{ .name = ":authority", .value = "example.com" },
@@ -2349,7 +2350,7 @@ test "http2 driver parses fragmented request headers through continuation" {
     var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
     try writeClientPrefaceAndSettings(setup.pair[1]);
-    try writeHeaderBlockFramesFd(allocator, setup.pair[1], 1, &.{
+    try writeHeaderBlockFramesFd(setup.pair[1], 1, &.{
         .{ .name = ":method", .value = "GET" },
         .{ .name = ":scheme", .value = "https" },
         .{ .name = ":authority", .value = "example.com" },
@@ -2479,16 +2480,15 @@ test "http2 a header block the lane's budget cannot hold closes only its own con
 
     var encoder = try hpack.Encoder.init();
     defer encoder.deinit();
-    var block = try encoder.encodeHeaders(allocator, &.{
+    const block = try encoder.encodeHeaders(&client_encode_scratch, &.{
         .{ .name = ":method", .value = "GET" },
         .{ .name = ":scheme", .value = "https" },
         .{ .name = ":authority", .value = "example.com" },
         .{ .name = ":path", .value = "/held" },
     }, max_response_header_block_bytes);
-    defer block.deinit(allocator);
-    const split = block.bytes().len / 2;
+    const split = block.len / 2;
     try writeClientPrefaceAndSettings(holder.pair[1]);
-    try writeFrameFd(holder.pair[1], .headers, 0x1, 1, block.bytes()[0..split]);
+    try writeFrameFd(holder.pair[1], .headers, 0x1, 1, block[0..split]);
     try driveUntilIdle(TestWorker, &holder_worker, &holder.runtime);
     try std.testing.expect(holder.runtime.h2HasPendingHeaderBlock());
     // The held fragment took a block's first growth; the budget keeps less
@@ -2510,7 +2510,7 @@ test "http2 a header block the lane's budget cannot hold closes only its own con
     try std.testing.expectEqual(@intFromEnum(h2.ErrorCode.enhance_your_calm), readU32(goaway.payload[4..8]));
     try std.testing.expectEqual(held, shared_lane.header_blocks.used);
 
-    try writeFrameFd(holder.pair[1], .continuation, 0x4, 1, block.bytes()[split..]);
+    try writeFrameFd(holder.pair[1], .continuation, 0x4, 1, block[split..]);
     try driveUntilIdle(TestWorker, &holder_worker, &holder.runtime);
     try std.testing.expect(holder.runtime.isOpen());
     try std.testing.expectEqual(@as(?fault.ConnectionClose, null), holder_worker.close);
@@ -4021,7 +4021,7 @@ test "http2 a response head the encoder fails midway poisons it, and the connect
         error.HpackEncoderPoisoned,
         http2_writing.queueResponseHead(TestWorker, &worker, &setup.runtime, 9, 200, &headers, true),
     );
-    try std.testing.expectError(error.HpackEncoderPoisoned, setup.runtime.h2_hpack_encoder.encodeHeadersScratch(allocator, &.{
+    try std.testing.expectError(error.HpackEncoderPoisoned, setup.runtime.h2_hpack_encoder.encodeHeaders(&client_encode_scratch, &.{
         .{ .name = ":status", .value = "200" },
     }, 1024));
     try std.testing.expect(setup.runtime.isOpen());
@@ -4088,9 +4088,11 @@ test "http2 worker response descriptors queue a head and body in order" {
     };
 
     try std.testing.expect(!setup.runtime.responseHeadQueued(13));
-    _ = try queueWorkerResponseDescriptor(TestWorker, &worker, &setup.runtime, &items[0]);
-    const body_bytes = try queueWorkerResponseDescriptor(TestWorker, &worker, &setup.runtime, &items[1]);
-    try std.testing.expectEqual(@as(usize, body_payload.len), body_bytes);
+    const head = try queueWorkerResponseDescriptor(TestWorker, &worker, &setup.runtime, &items[0]);
+    try std.testing.expectEqual(@as(?u16, 201), head.head_status);
+    const body = try queueWorkerResponseDescriptor(TestWorker, &worker, &setup.runtime, &items[1]);
+    try std.testing.expectEqual(@as(usize, body_payload.len), body.body_bytes);
+    try std.testing.expectEqual(@as(?u16, null), body.head_status);
     try std.testing.expect(setup.runtime.responseHeadQueued(13));
 
     var out: [512]u8 = undefined;
@@ -4370,10 +4372,10 @@ test "http2 worker response descriptors queue split head chunk and explicit end"
     };
 
     _ = try queueWorkerResponseDescriptor(TestWorker, &worker, &setup.runtime, &head_received);
-    const chunk_body_bytes = try queueWorkerResponseDescriptor(TestWorker, &worker, &setup.runtime, &chunk_received);
-    const end_body_bytes = try queueWorkerResponseDescriptor(TestWorker, &worker, &setup.runtime, &end_received);
-    try std.testing.expectEqual(@as(usize, body_payload.len), chunk_body_bytes);
-    try std.testing.expectEqual(@as(usize, 0), end_body_bytes);
+    const chunk = try queueWorkerResponseDescriptor(TestWorker, &worker, &setup.runtime, &chunk_received);
+    const end = try queueWorkerResponseDescriptor(TestWorker, &worker, &setup.runtime, &end_received);
+    try std.testing.expectEqual(@as(usize, body_payload.len), chunk.body_bytes);
+    try std.testing.expectEqual(@as(usize, 0), end.body_bytes);
 
     var out: [512]u8 = undefined;
     const received = try readAvailableFd(setup.pair[1], &out);

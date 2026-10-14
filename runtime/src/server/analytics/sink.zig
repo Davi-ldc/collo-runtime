@@ -6,21 +6,17 @@
 //!
 //! Ownership and threads: the server opens the sink before the supervisor and
 //! closes it after the supervisor's teardown, the last producer
-//! (`server/main.zig`). Producers are the ingress metrics thread's drains, the
-//! usage drains on the metrics, reaper, lane and exiting threads, a lane that
-//! writes the floor usage record for a request its worker could not account
-//! for, and worker teardown on whichever thread runs it. A stream's mutex
-//! guards its ring cursors and counters and is held only to copy a record in
-//! or move a cursor, never across a write.
+//! (`server/main.zig`). Producers are the ingress metrics thread's drains and
+//! worker teardown on whichever thread runs it, the reaper's or, at
+//! shutdown, the exiting thread. A stream's mutex guards its ring cursors and
+//! counters and is held only to copy a record in or move a cursor, never
+//! across a write.
 //!
 //! The record files and the console have separate flushers, so a stderr
 //! reader that stops reading blocks only the console's. `flush` writes the
 //! files under `flush_mutex`: the ingress metrics thread calls it every tick,
-//! and a usage drain on a thread that may block (the metrics, reaper and
-//! exiting threads) calls it whenever a batch finds the usage stream full
-//! (`drainWorkerFlushing` in `server/supervisor/usage_drain.zig`), as a
-//! worker teardown does when its line finds the workers stream full
-//! (`writeWorkerRecord` in `server/supervisor/worker_registry.zig`).
+//! and a worker teardown calls it when its line finds the workers stream
+//! full (`writeWorkerRecord` in `server/supervisor/worker_registry.zig`).
 //! `flushConsole` writes stderr under `console_flush_mutex`, from the ingress
 //! service's console thread. `close` runs both last. A console write holds
 //! the process stderr lock for one batch of whole lines at a time, so
@@ -47,28 +43,21 @@
 //! - A record stream with no file (no directory configured) buffers nothing,
 //!   counts each record it discards and has nothing to reopen. The console
 //!   stream always writes.
-//! - A stream that refuses a record (`append`, `appendKeepingFree`) or drops
-//!   one (`appendLossy`) is full (`full`, one atomic any thread reads without
-//!   the stream's lock) until its flusher has made room again for the
-//!   largest record it refused. A full usage or workers stream is logged once
-//!   at `err` when it begins: usage records and worker lines are the server's
-//!   account of what each request and each worker used, and one the stream
-//!   refuses is lost for good. A producer
-//!   that keeps a record the stream has no room for, and offers it again once
-//!   the stream is written out, asks with `tryAppendKeepingFree`, whose
-//!   refusal loses nothing and so marks nothing.
-//! - Every loss is counted per stream in `Stats`, and drops and refusals are
-//!   logged at most once per sync interval.
+//! - A record enters a stream in one of two ways. `appendLossy` drops a
+//!   record the stream has no room for, and counts it. `tryAppend` leaves
+//!   such a record with its producer, which writes the stream out and offers
+//!   it again, so its refusal loses nothing and counts nothing.
+//! - Every loss is counted per stream in `Stats` and logged at most once per
+//!   sync interval.
 
 const std = @import("std");
 const fd_mod = @import("collo_os").fd;
 
-/// Where a record goes. `logs`, `access`, `usage` and `workers` are files in
-/// the analytics directory; `console` is stderr.
+/// Where a record goes. `logs`, `access` and `workers` are files in the
+/// analytics directory; `console` is stderr.
 pub const Stream = enum {
     logs,
     access,
-    usage,
     workers,
     console,
 };
@@ -77,16 +66,15 @@ const stream_count = @typeInfo(Stream).@"enum".fields.len;
 
 /// Ring capacity of each stream. The ingress metrics thread flushes once per
 /// `metrics_drain_interval_ns` (`server/ingress/service_observability.zig`),
-/// and a ring holds many intervals of ordinary traffic: about five thousand
-/// access or usage records of a few hundred bytes, console lines at the
-/// message cap number about a thousand in `logs` and two hundred and fifty
-/// in `console`, and about a thousand worker lines in `workers`, whose
+/// and a ring holds many intervals of ordinary traffic: about six thousand
+/// access lines of a dispatched request's few hundred bytes, console lines at
+/// the message cap number about a thousand in `logs` and two hundred and
+/// fifty in `console`, and about a thousand worker lines in `workers`, whose
 /// producer writes the stream out and offers its line again when it finds no
 /// room (`writeWorkerRecord` in `server/supervisor/worker_registry.zig`). A
 /// stream that outruns its ring loses records, counted, instead of growing.
 pub const logs_buffer_bytes_max: usize = 4 * 1024 * 1024;
-pub const access_buffer_bytes_max: usize = 2 * 1024 * 1024;
-pub const usage_buffer_bytes_max: usize = 2 * 1024 * 1024;
+pub const access_buffer_bytes_max: usize = 4 * 1024 * 1024;
 pub const workers_buffer_bytes_max: usize = 256 * 1024;
 pub const console_buffer_bytes_max: usize = 1024 * 1024;
 
@@ -111,7 +99,6 @@ pub fn bufferBytesMax(stream: Stream) usize {
     return switch (stream) {
         .logs => logs_buffer_bytes_max,
         .access => access_buffer_bytes_max,
-        .usage => usage_buffer_bytes_max,
         .workers => workers_buffer_bytes_max,
         .console => console_buffer_bytes_max,
     };
@@ -123,7 +110,6 @@ pub fn fileName(stream: Stream) ?[]const u8 {
     return switch (stream) {
         .logs => "logs.jsonl",
         .access => "access.jsonl",
-        .usage => "usage.jsonl",
         .workers => "workers.jsonl",
         .console => null,
     };
@@ -134,12 +120,8 @@ pub const Stats = struct {
     /// Records buffered.
     appended: u64 = 0,
     /// Records `appendLossy` found no room for, plus records producers lost
-    /// before offering them or after the stream refused them (`noteDropped`).
+    /// before offering them (`noteDropped`).
     dropped: u64 = 0,
-    /// Calls to `append` and `appendKeepingFree` that found no room, each one
-    /// record or one batch of lines. The caller decides what becomes of them
-    /// and reports what it loses with `noteDropped`.
-    refused: u64 = 0,
     /// Records for a stream with no file.
     discarded: u64 = 0,
     bytes_written: u64 = 0,
@@ -237,13 +219,6 @@ pub const Sink = struct {
         return self.channels[@intFromEnum(stream)].destination != .none;
     }
 
-    /// Whether `stream` refused or dropped a record and has not had room
-    /// for the largest such record since (the header's invariant). One
-    /// atomic load, so any thread may ask without the stream's lock.
-    pub fn full(self: *const Sink, stream: Stream) bool {
-        return self.channels[@intFromEnum(stream)].full.load(.acquire);
-    }
-
     /// Asks the next `flush` to reopen the record files by name, for a
     /// rotation that renamed them. Any thread may call it, the signal
     /// monitor included; a sink with no directory has nothing to reopen.
@@ -251,84 +226,37 @@ pub const Sink = struct {
         self.reopen_requested.store(true, .release);
     }
 
-    /// Buffers one encoded record, or refuses it whole when the stream has
-    /// no room, for a caller that decides what a refusal costs it and reports
-    /// what it loses (`noteDropped`). `record` is one or more complete lines
-    /// joined by newlines, without the final newline the sink adds, so a
-    /// batch that must land whole is one call; it is copied before this
-    /// returns. A disabled stream discards and counts it and still returns
-    /// success.
-    pub fn append(self: *Sink, stream: Stream, record: []const u8) error{SinkBufferFull}!void {
-        return self.appendKeepingFree(stream, record, 0);
-    }
-
-    /// `append` that also refuses unless `keep_free_bytes` stay free after
-    /// the record. For a producer whose records matter less when room is
-    /// short, so the last bytes of the stream go to one whose records matter
-    /// more.
-    pub fn appendKeepingFree(
-        self: *Sink,
-        stream: Stream,
-        record: []const u8,
-        keep_free_bytes: usize,
-    ) error{SinkBufferFull}!void {
-        const target = self.streamChannel(stream);
-        target.mutex.lock();
-        switch (enqueueLocked(target, record, keep_free_bytes)) {
-            .buffered, .discarded => target.mutex.unlock(),
-            .full => {
-                target.stats.refused +|= 1;
-                const began = markFullLocked(target, record.len + 1 +| keep_free_bytes);
-                target.mutex.unlock();
-                // Logged after the unlock, so a slow stderr does not hold the
-                // stream's lock.
-                if (began)
-                    reportFullBegan(stream);
-                return error.SinkBufferFull;
-            },
-        }
-    }
-
-    /// `appendKeepingFree` for a producer that keeps a record the stream has
-    /// no room for and offers it again once the stream is written out, so a
-    /// refusal loses nothing: it is neither counted nor marked full. Returns
-    /// whether the stream took the record; a disabled stream discards and
-    /// counts it, and takes it.
-    pub fn tryAppendKeepingFree(
-        self: *Sink,
-        stream: Stream,
-        record: []const u8,
-        keep_free_bytes: usize,
-    ) bool {
+    /// Buffers one encoded record, one complete line without the final
+    /// newline the sink adds, copied before this returns, or drops it and
+    /// counts it when the stream has no room. A disabled stream discards and
+    /// counts it.
+    pub fn appendLossy(self: *Sink, stream: Stream, record: []const u8) void {
         const target = self.streamChannel(stream);
         target.mutex.lock();
         defer target.mutex.unlock();
-        return switch (enqueueLocked(target, record, keep_free_bytes)) {
+        switch (enqueueLocked(target, record)) {
+            .buffered, .discarded => {},
+            .full => target.stats.dropped +|= 1,
+        }
+    }
+
+    /// `appendLossy` for a producer that keeps a record the stream has no
+    /// room for and offers it again once the stream is written out
+    /// (`flush`): a refusal loses nothing and counts nothing. Returns whether
+    /// the stream took the record; a disabled stream discards and counts it,
+    /// and takes it.
+    pub fn tryAppend(self: *Sink, stream: Stream, record: []const u8) bool {
+        const target = self.streamChannel(stream);
+        target.mutex.lock();
+        defer target.mutex.unlock();
+        return switch (enqueueLocked(target, record)) {
             .buffered, .discarded => true,
             .full => false,
         };
     }
 
-    /// `append` for a record its producer cannot keep: one that finds no room
-    /// is dropped and counted.
-    pub fn appendLossy(self: *Sink, stream: Stream, record: []const u8) void {
-        const target = self.streamChannel(stream);
-        target.mutex.lock();
-        switch (enqueueLocked(target, record, 0)) {
-            .buffered, .discarded => target.mutex.unlock(),
-            .full => {
-                target.stats.dropped +|= 1;
-                const began = markFullLocked(target, record.len + 1);
-                target.mutex.unlock();
-                if (began)
-                    reportFullBegan(stream);
-            },
-        }
-    }
-
-    /// Counts records a producer lost, before offering them, such as those a
-    /// full lane handoff ring turned away, or after the stream refused them,
-    /// such as a usage batch.
+    /// Counts records a producer lost before offering them, such as those a
+    /// full lane handoff ring turned away.
     pub fn noteDropped(self: *Sink, stream: Stream, count: u64) void {
         const target = self.streamChannel(stream);
         target.mutex.lock();
@@ -466,12 +394,10 @@ pub const Sink = struct {
             const current = self.stats(stream);
             const previous = &self.reported[@intFromEnum(stream)];
             const dropped = current.dropped - previous.dropped;
-            const refused = current.refused - previous.refused;
-            if (dropped != 0 or refused != 0) {
-                std.log.warn("analytics {s}: {d} records dropped and {d} appends refused since the last report", .{
+            if (dropped != 0) {
+                std.log.warn("analytics {s}: {d} records dropped since the last report", .{
                     @tagName(stream),
                     dropped,
-                    refused,
                 });
             }
             previous.* = current;
@@ -507,14 +433,6 @@ const Channel = struct {
     head: usize = 0,
     tail: usize = 0,
     stats: Stats = .{},
-    /// The stream refused or dropped a record and has not had room for
-    /// `full_needed_bytes` since. Written under `mutex`, so exactly one
-    /// refusal sees it begin; read by anyone without it (`Sink.full`).
-    full: std.atomic.Value(bool) = .init(false),
-    /// The room the largest record refused in the current full episode
-    /// needed, its newline and kept-free bytes included, and never more than
-    /// the whole ring. Guarded by `mutex`.
-    full_needed_bytes: usize = 0,
     /// Bytes reached the file since its last sync. The stream's flusher only.
     unsynced: bool = false,
     /// The last write failed. The stream's flusher only; logs the transitions
@@ -546,7 +464,7 @@ fn openChannel(
 ) !Channel {
     const destination: Destination = switch (stream) {
         .console => .{ .console = console_fd },
-        .logs, .access, .usage, .workers => if (directory) |dir|
+        .logs, .access, .workers => if (directory) |dir|
             .{ .file = try openRecordFile(dir, fileName(stream).?) }
         else
             .none,
@@ -575,55 +493,20 @@ fn openRecordFile(directory: std.fs.Dir, name: []const u8) !fd_mod.OwnedFd {
 const Enqueued = enum { buffered, discarded, full };
 
 /// Caller holds `target.mutex`.
-fn enqueueLocked(target: *Channel, record: []const u8, keep_free_bytes: usize) Enqueued {
+fn enqueueLocked(target: *Channel, record: []const u8) Enqueued {
     std.debug.assert(record.len != 0);
     if (target.destination == .none) {
         target.stats.discarded +|= 1;
         return .discarded;
     }
     const free = target.ring.len - (target.head - target.tail);
-    if (record.len + 1 +| keep_free_bytes > free)
+    if (record.len + 1 > free)
         return .full;
     copyIn(target.ring, target.head, record);
     copyIn(target.ring, target.head + record.len, "\n");
     target.head += record.len + 1;
     target.stats.appended +|= 1;
     return .buffered;
-}
-
-/// Caller holds `target.mutex` and the stream just refused a record that
-/// needed `needed_bytes` of room. Returns whether this refusal began the
-/// stream's full episode.
-fn markFullLocked(target: *Channel, needed_bytes: usize) bool {
-    target.full_needed_bytes = @max(target.full_needed_bytes, @min(needed_bytes, target.ring.len));
-    const began = !target.full.load(.monotonic);
-    target.full.store(true, .release);
-    return began;
-}
-
-/// Caller holds `target.mutex`. Ends the stream's full episode once the
-/// stream has room again for the largest record it refused. A record that
-/// merely fits, such as a floor usage record in the room batches must keep
-/// free, does not end it.
-fn clearFullIfRoomLocked(target: *Channel) void {
-    if (!target.full.load(.monotonic))
-        return;
-    const free = target.ring.len - (target.head - target.tail);
-    if (free < target.full_needed_bytes)
-        return;
-    target.full_needed_bytes = 0;
-    target.full.store(false, .release);
-}
-
-/// The start of a stream's full episode. Only a full usage or workers
-/// stream is logged here, at `err`; the other streams' losses are left to
-/// the counts `reportLosses` logs.
-fn reportFullBegan(stream: Stream) void {
-    switch (stream) {
-        .usage => std.log.err("analytics usage: the stream is full, so the usage records it refuses are lost until it has room again", .{}),
-        .workers => std.log.err("analytics workers: the stream is full, so the worker lines it refuses are lost until it has room again", .{}),
-        .logs, .access, .console => {},
-    }
 }
 
 fn copyIn(ring: []u8, cursor: usize, bytes: []const u8) void {
@@ -635,25 +518,15 @@ fn copyIn(ring: []u8, cursor: usize, bytes: []const u8) void {
 }
 
 /// The stream's flusher only: writes the stream's buffered bytes, then frees
-/// the space that reached the destination and ends a full episode the freed
-/// space covers.
+/// the space that reached the destination.
 fn writeOut(target: *Channel, stream: Stream) void {
     const raw_fd = target.destination.rawFd() orelse return;
     target.mutex.lock();
     const tail = target.tail;
     const head = target.head;
     target.mutex.unlock();
-    if (tail == head) {
-        // Nothing to write. An empty ring has all the room a refused record
-        // is owed (`markFullLocked` caps it at the ring), so a full episode
-        // still open ends here.
-        if (target.full.load(.acquire)) {
-            target.mutex.lock();
-            clearFullIfRoomLocked(target);
-            target.mutex.unlock();
-        }
+    if (tail == head)
         return;
-    }
 
     const progress = if (target.destination == .console)
         writeConsoleLines(raw_fd, target.ring, tail, head)
@@ -669,7 +542,6 @@ fn writeOut(target: *Channel, stream: Stream) void {
     target.stats.bytes_written +|= progress.bytes;
     if (progress.failure != null)
         target.stats.write_errors +|= 1;
-    clearFullIfRoomLocked(target);
     target.mutex.unlock();
 
     if (progress.bytes != 0)

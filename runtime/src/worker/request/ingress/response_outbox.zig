@@ -3,20 +3,15 @@
 //! socket, whose worker end does not block. Each request holds at most one
 //! pending item and sends nothing else while it does: the rest of a buffered
 //! or segmented body, with its head when the head has not gone out, a
-//! streamed response's head, one fetch chunk with its upstream credits, or a
-//! stream's end or reset. A send that found no room sent nothing, so the
-//! item resumes at the step it holds. A response completes only after its
-//! pending item is sent, and request cleanup releases an item that never
-//! was. A body stream's chunk waits in `response_stream.BodyStream` instead.
-//! It belongs to the worker's VM thread.
+//! streamed response's head, one fetch chunk, or a stream's end or reset. A
+//! send that found no room sent nothing, so the item resumes at the step it
+//! holds. A response completes only after its pending item is sent, and
+//! request cleanup releases an item that never was. A body stream's chunk
+//! waits in `response_stream.BodyStream` instead. It belongs to the worker's
+//! VM thread.
 
 const std = @import("std");
-const egress_core = @import("collo_egress_core");
 const response_model = @import("../response_model.zig");
-
-pub const Credit = egress_core.body_credit.Handle;
-pub const ByteLease = egress_core.ByteLease;
-pub const PullCredits = egress_core.PullCredits;
 
 /// A response head the worker decided and has not sent: its encoded payload,
 /// owned by the worker's base allocator, and the fields of its descriptor.
@@ -41,18 +36,19 @@ pub const BufferedBody = struct {
     offset: usize = 0,
 };
 
-/// One chunk of a fetch body, with the credits that return to the gateway
-/// once all of it is sent.
+/// One chunk of a fetch body, in bytes the worker's base allocator owns. A
+/// parked chunk never borrows a gateway body-pool extent: the extent goes
+/// back to the gateway when the chunk parks
+/// (`serve/response.zig:executeFetchBodyStreamReady`), so a detach that
+/// unmaps the pool leaves the chunk valid.
 pub const StreamChunk = struct {
-    bytes: ByteLease = .empty,
+    bytes: []u8,
     /// The bytes of `bytes` already sent; the next send resumes here.
     offset: usize = 0,
-    credits: PullCredits = .{},
     done: bool,
 
     pub fn deinit(self: *StreamChunk, allocator: std.mem.Allocator) void {
-        self.bytes.deinit(allocator);
-        self.credits.deinit(allocator);
+        allocator.free(self.bytes);
         self.* = undefined;
     }
 };

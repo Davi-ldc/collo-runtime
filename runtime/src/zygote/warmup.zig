@@ -6,6 +6,12 @@
 //! belongs to no application moves it into pages all workers share. The caller
 //! runs a full GC and trims the allocator afterwards, so only that state
 //! survives. The corpus must stay free of tenant code and data.
+//!
+//! A VM holds one module pack at a time and every worker registers its
+//! definition's artifact on the VM it inherits, so the corpus's pack is
+//! unregistered before the warmup returns, whatever its outcome. The module
+//! record stays in the main realm's registry, and the corpus's source strings
+//! keep its mapping alive in the zygote, where every worker shares it.
 
 const std = @import("std");
 const bindings = @import("collo_bindings");
@@ -18,9 +24,10 @@ const boot_allocator = std.heap.smp_allocator;
 // The corpus serves no request; the execution context only needs a nonzero id.
 const warmup_request_id: u64 = 1;
 
-/// Evaluates the corpus module and calls its default export inside one VM
-/// turn, so microtasks drain, then evicts the module so none of it outlives
-/// the warmup. Any JavaScript exception fails the warmup.
+/// Registers the corpus's pack, evaluates the corpus module and calls its
+/// default export inside one VM turn, so microtasks drain, then unregisters
+/// the pack. Any JavaScript exception fails the warmup, and so does a pack
+/// left registered, since no worker could then register its own.
 pub fn runCorpus(vm: *bindings.Vm) !void {
     const pack = try ipc.module_pack.buildSingleAlloc(
         boot_allocator,
@@ -29,7 +36,13 @@ pub fn runCorpus(vm: *bindings.Vm) !void {
     );
     defer boot_allocator.free(pack);
     try vm.registerModulePack(pack);
+    const outcome = runRegisteredCorpus(vm);
+    const unregistered = vm.unregisterModulePack();
+    try outcome;
+    try unregistered;
+}
 
+fn runRegisteredCorpus(vm: *bindings.Vm) !void {
     const realm = vm.mainRealm();
     switch (try realm.evaluateModule(corpus_specifier)) {
         .success => {},
@@ -65,10 +78,6 @@ pub fn runCorpus(vm: *bindings.Vm) !void {
     };
     defer digest_text.deinit();
     if (digest_text.slice().len == 0)
-        return error.WarmupCorpusFailed;
-
-    const evicted = try vm.evictModuleSpecifier(corpus_specifier);
-    if (evicted.sources_removed == 0)
         return error.WarmupCorpusFailed;
 }
 

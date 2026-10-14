@@ -1,10 +1,10 @@
 //! The module domain of the worker runtime. `Modules` is its state: the
-//! routes of the worker's definition, registered packs and route module
-//! state (`modules/state.zig`). `Methods` holds the runtime's module
-//! operations, which `Runtime` declares as its own (`root.zig`): the modules
-//! context, the realm of a route, and the settlements and expiries of route
-//! module evaluations with the close of the evaluations they end
-//! (`evaluations.zig`). A worker none of whose routes can serve asks to
+//! routes of the worker's definition and their module state
+//! (`modules/state.zig`). `Methods` holds the runtime's module operations,
+//! which `Runtime` declares as its own (`root.zig`): the modules context, the
+//! lookup of a request's route handler, the realm of a route, and the
+//! settlements and expiries of route module evaluations with the close of
+//! the evaluations they end (`evaluations.zig`). A worker none of whose routes can serve asks to
 //! retire (`retirement.zig`). It belongs to the worker's VM thread.
 //!
 //! `collo_runtime_module_eval_settled` only parks a settlement, in the
@@ -15,7 +15,7 @@
 
 const std = @import("std");
 const bindings = @import("collo_bindings");
-const route_table = @import("collo_ipc").route_table;
+const request_context = @import("collo_worker_request").context;
 const modules_context = @import("../modules/context.zig");
 const modules_routes = @import("../modules/routes.zig");
 const modules_state = @import("../modules/state.zig");
@@ -23,21 +23,10 @@ const modules_state = @import("../modules/state.zig");
 pub const Modules = struct {
     state: modules_state.State,
 
-    /// Adds every route of `table`, the definition's route table, after
-    /// checking it whole (`route_table.decode`), so a malformed table or
-    /// bindings section fails the runtime's start instead of a request.
-    /// `table` stays borrowed for the runtime's life, since every route's
-    /// bindings point into it. Fails with `error.InvalidRouteTable` or
-    /// `error.OutOfMemory`.
-    pub fn init(allocator: std.mem.Allocator, table: []const u8, isolate_realm: bool) !Modules {
-        var decoded: route_table.Routes = undefined;
-        const routes = try route_table.decode(table, &decoded);
-        var state: modules_state.State = .{ .isolate_realm = isolate_realm };
-        errdefer state.deinit(allocator);
-        try state.routes.ensureTotalCapacityPrecise(allocator, routes.len);
-        for (routes) |route|
-            _ = try state.addRoute(allocator, route.entry_specifier, route.bindings);
-        return .{ .state = state };
+    /// Starts with no route: the boot takes the routes from the definition's
+    /// artifact (`Runtime.evaluateBootRoutes`).
+    pub fn init(isolate_realm: bool) Modules {
+        return .{ .state = .{ .isolate_realm = isolate_realm } };
     }
 
     pub fn deinit(self: *Modules, allocator: std.mem.Allocator) void {
@@ -149,6 +138,14 @@ pub fn Methods(comptime Runtime: type) type {
                     std.log.err("module settlement re-queue dropped request_id={d}", .{request_id});
                 };
             }
+        }
+
+        /// The handler and `env` of the route `request_ctx` dispatches to, or
+        /// `.pending` once the request waits on its route's evaluation
+        /// (`modules_routes.lookupRouteHandler`, which says how it fails).
+        pub fn lookupRouteHandler(self: *Runtime, request_ctx: *request_context.RequestContext) !modules_routes.RouteLookup {
+            var ctx = self.modulesContext();
+            return modules_routes.lookupRouteHandler(&ctx, request_ctx);
         }
 
         pub fn modulesContext(self: *Runtime) modules_context.Context {

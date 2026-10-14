@@ -9,7 +9,7 @@ Each section ends with the files that define its rules and the gates that check 
 | Path | Holds |
 | --- | --- |
 | `runtime/src/<module>/` | One module. Its root `//!` header is the module doc; [MAP.md](../../../runtime/MAP.md) names its process and lane. |
-| `runtime/src/<module>/tests/`, `runtime/build/tests/` | A module's suites, mirroring source paths: `egress/core/fetch_body.zig` is tested in `egress/tests/core/fetch_body.zig`. |
+| `runtime/src/<module>/tests/`, `runtime/build/tests/` | A module's suites, mirroring source paths: `server/routes/table.zig` is tested in `server/tests/routes/table.zig`. |
 | `runtime/tests/` | The cross-module layer: `conventions.zig`, `contracts/`, `integration/`, `support/`, `webapi/`. |
 | `runtime/bench/` | Benchmarks, with no `test` declarations; `runtime/tests/contracts/benchmark_*.zig` tests their parsers. |
 | `runtime/all_tests.zig` | The one collection root. Every test file is reachable from it through a suite aggregator, or from a root registered in `runtime/build/tests.zig`. |
@@ -20,11 +20,11 @@ Contracts: `runtime/all_tests.zig`, `runtime/build/tests.zig`. Enforced by: `con
 
 ## Dependencies and patches
 
-Every pinned dependency is listed in build.md's Pins table, provisioned under `runtime/deps/` and never edited in place. A change to a pinned tree is a patch in `runtime/patches/<dep>/`, indexed in that directory's `readme.md`; the commit body is the rationale. Moving a pin or adding a dependency is a design change that updates build.md, the version file and the series together. Code never includes generated trees (`.zig-cache`, `zig-out`, `WebKitBuild`) or the JITCache checkout.
+Every library Collo builds from source is pinned in build.md's Pins table, provisioned under `runtime/deps/` by `zig build deps-provision`, linked into the binary and never edited in place; the binary loads no library at run time. A change to a pinned tree is a patch in `runtime/patches/<dep>/`, indexed in that directory's `readme.md`; the commit body is the rationale. Moving a pin or adding a dependency is a design change that updates build.md, the version file and the series together. Code never includes generated trees (`.zig-cache`, `zig-out`, `WebKitBuild`) or the JITCache checkout.
 
 Each foreign symbol is declared once on the Zig side: `abi.h` functions in `bindings/root.zig`, a library shim's functions in its `bindings/<lib>/root.zig`, a test shim's in one support module, and libc calls missing from the standard library in `common/os.zig`. Everyone else imports those declarations.
 
-Contracts: `internals/build.md`, `runtime/patches/*/readme.md`. Enforced by: `conventions.zig` test `runtime code does not import reference trees`; the build tool refuses a WebKit checkout or engine off the pin. Single declaration has no gate.
+Contracts: `internals/build.md`, `runtime/patches/*/readme.md`, `runtime/build/pins.zig`. Enforced by: `conventions.zig` tests `runtime code does not import reference trees` and `runtime code loads no native code at run time` (no loader call such as `dlopen` or `dlsym`, no `dlfcn.h` and no `std.DynLib` in the sources under `runtime/src`, `runtime/bench` and `runtime/tests`, and no `libdl` in the build); `runtime/tests/contracts/binary_dependencies.zig`, which pins the binary's dynamic dependencies to the platform's libraries; the build tool, which refuses a WebKit checkout, engine, ICU or BoringSSL build off its pin and, through `deps-verify`, a tree the build compiles in place unless it is pristine at its pin. Single declaration has no gate.
 
 ## The C ABI
 
@@ -60,9 +60,9 @@ Every allocation has a named lifetime, decided by the allocator or holder in sco
 
 Every queue, table, buffer, ring and retry loop has a named maximum, defined in `common/limits/` or a domain file listed in its `//!` header. Hot paths reserve capacity up front.
 
-An fd is owned (`collo_os.fd.OwnedFd`) or borrowed (`FdRef`), created close-on-exec, and changes owner explicitly. Zig decides every mapping and every size read from an fd; read-only data shared with workers travels as a sealed memfd. Socket options go through `collo_os.socket`.
+An fd is owned (`collo_os.fd.OwnedFd`) or borrowed (`FdRef`), created close-on-exec, and changes owner explicitly. Zig decides every mapping and every size read from an fd. Read-only data the server builds for workers, such as a definition's artifact of modules and routes, travels as a sealed memfd. Any other file on the node's disk that a worker may read reaches it through a read-only bind mount in its root, never as a copy per worker or a descriptor per file, so the page cache holds one copy for every worker. Socket options go through `collo_os.socket`.
 
-Contracts: `common/limits/root.zig`, `common/os.zig`. Enforced by: `conventions.zig` tests `zygote fork loop stays VM-free and allocation-free after prepare` (reads only `serveForkRequests`, not its callees), `debug allocator declarations use explicit init`, `TCP socket options stay centralized in the common socket helper`, `workers do not regain a direct gateway fd field`; `runtime/tests/contracts/limits.zig`. Process allocator sites have no gate.
+Contracts: `common/limits/root.zig`, `common/os.zig`. Enforced by: `conventions.zig` tests `zygote fork loop stays VM-free and allocation-free after prepare` (reads only `serveForkRequests`, not its callees), `debug allocator declarations use explicit init`, `TCP socket options stay centralized in the common socket helper` (every raw `setsockopt` or `getsockopt` in production source outside `common/os.zig`, whatever the option), `workers do not regain a direct gateway fd field`; `runtime/tests/contracts/limits.zig`. Process allocator sites have no gate.
 
 ## Errors and assertions
 
@@ -82,7 +82,7 @@ Enforced by: `conventions.zig` tests `production error handling stays explicit`,
 
 Mutable state has one owner thread, named in the `//!` header of the directory or type holding it: an ingress lane's io_uring thread, an egress shard's thread, a worker's VM thread. State shared under locks has its lock order written next to the locks.
 
-A worker's threads all exist before its seccomp filter: the libpas scavenger `collo_vm_post_fork_child` restarts, the crypto pool, the sentinel, and the JSC compiler and collector threads `collo_vm_prespawn_compiler_threads` starts. Anything that starts a thread on first use (a JSC worklist, a WTF work queue, a lazy `std.Thread.spawn`) is started at that boot step or stays out of the worker. Work sent to another thread carries only native data and settles back on the VM thread. The zygote is single-threaded whenever it forks.
+A worker's threads all exist before its seccomp filter: the libpas scavenger `collo_vm_post_fork_child` restarts, the sentinel, and the JSC compiler and collector threads `collo_vm_prespawn_compiler_threads` starts. Anything that starts a thread on first use (a JSC worklist, a WTF work queue, a lazy `std.Thread.spawn`) is started at that boot step or stays out of the worker. Work sent to another thread carries only native data and settles back on the VM thread. The zygote is single-threaded whenever it forks.
 
 Contracts: `zygote/child_boot.zig` (worker boot order). Enforced by: the zygote fork-loop gate, which requires `assertSingleThreadedSelf`; the `zygote-integration` test of wasm tier-up after seccomp. Lazy thread starts have no gate.
 

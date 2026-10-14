@@ -1,36 +1,32 @@
 //! HTTP/1 response body continuation: after the exchange publishes the head,
-//! it streams the framed body from the connection into the fetch body pipe
-//! and returns the connection to the pool when the body ended cleanly.
+//! it moves the framed body from the wire into the fetch's response queue
+//! and returns the wire to the pool when the body ended cleanly.
 //!
-//! A continuation runs on the owner thread and never blocks it. A read that
-//! would block unwinds with the cancel probe's would-block error, consumer
-//! backpressure returns `paused`, and an exhausted `DriveBudget` returns
-//! `yielded`. The budget is checked before each socket read, so a yield never
-//! leaves read bytes unappended, and input a paused pump has not taken stays
-//! buffered (`pending_input` or the chunked decoder's output) for the next
-//! step. Meters are absolute totals for the whole redirect chain.
+//! A continuation runs on the owner thread and never blocks it. One `step`
+//! consumes only what the wire already holds and returns `.wait` when the
+//! wire must hear from the network first, so a step is bounded by one
+//! receive, the same grain an HTTP/2 connection advances by, and needs no
+//! budget of its own. Consumer backpressure returns `.paused`, and input the
+//! paused pump has not taken stays buffered (`pending_input` or the chunked
+//! decoder's output) for the next step.
 
 const std = @import("std");
-const accounting = @import("collo_egress_accounting");
 const core = @import("collo_egress_core");
 
-const cancel_probe_mod = @import("../cancel_probe.zig");
 const config_mod = @import("../config.zig");
 const http1_client = @import("root.zig");
-const connection_mod = @import("../connection.zig");
-const http1 = @import("protocol/root.zig");
-const http1_wire = @import("wire.zig");
+const message = @import("message.zig");
+const protocol = @import("protocol.zig");
+const wire_mod = @import("../wire.zig");
 
 const body_credit = core.body_credit;
 const decompress = core.decompress;
-const fetch_body = core.fetch_body;
 const stream_pump = core.stream_pump;
 
-const CancelProbe = cancel_probe_mod.CancelProbe;
-const Config = config_mod.Config;
-const HttpConnection = connection_mod.HttpConnection;
-const OwnedResponseHead = http1_wire.OwnedResponseHead;
-const readConnectionChunk = http1_wire.readConnectionChunk;
+const IoInterest = config_mod.IoInterest;
+const OwnedResponseHead = message.OwnedResponseHead;
+const ResponseQueue = core.ResponseQueue;
+const Wire = wire_mod.Wire;
 
 /// Size of the read buffer each continuation leases from the pool's
 /// freelist.
@@ -40,41 +36,6 @@ pub const continuation_read_buffer_bytes: usize = 64 * 1024;
 /// enough that a slow stream's per-read allocation stays cheap, and four
 /// doublings from the full read buffer for bulk streams.
 pub const initial_direct_read_bytes: usize = 4 * 1024;
-
-/// Fairness quantum for one drive of a continuation on the single owner
-/// thread. The body loop keeps reading while the socket produces, so without
-/// a bound a fast origin with a large body and ample consumer credit would
-/// hold the thread from head to EOF while every other request waits. HTTP/2
-/// bounds its read pass with the codec's `max_frames_without_event_per_read`;
-/// HTTP/1 stops a drive after `drive_budget_max_reads` socket reads or
-/// `drive_budget_max_bytes` delivered, whichever comes first. Sixteen reads
-/// cover the direct-read ramp (4 KiB doubling to the 64 KiB buffer in five
-/// reads) plus a run of full reads, and 256 KiB is four full read buffers.
-/// An exhausted budget makes the step return `Step.yielded`: the
-/// continuation waits on nothing, so it stays runnable with no deadline, and
-/// the owner returns to it on its next drive pass. The owner also bounds each
-/// whole pass with `H1TurnBudget` in engine/h2_engine.zig, which documents
-/// how the two budgets share the thread between HTTP/1 and HTTP/2.
-pub const drive_budget_max_reads: usize = 16;
-pub const drive_budget_max_bytes: usize = 256 * 1024;
-
-pub const DriveBudget = struct {
-    reads_left: usize = drive_budget_max_reads,
-    bytes_left: usize = drive_budget_max_bytes,
-
-    /// Checked before touching the socket, never after a read, so exhaustion
-    /// cannot strand bytes read but not yet appended: the step hands
-    /// everything already read to the pump before it reaches the next check.
-    fn beginRead(self: *const DriveBudget) error{Http1BodyYielded}!void {
-        if (self.reads_left == 0 or self.bytes_left == 0)
-            return error.Http1BodyYielded;
-    }
-
-    fn charge(self: *DriveBudget, bytes: usize) void {
-        self.reads_left -|= 1;
-        self.bytes_left -|= bytes;
-    }
-};
 
 pub const BodyReadyEvent = union(enum) {
     generic,
@@ -90,30 +51,22 @@ pub const Http1BodyReadyFn = *const fn (?*anyopaque, BodyReadyEvent) void;
 
 pub const Continuation = struct {
     allocator: std.mem.Allocator,
-    connection: HttpConnection,
+    pool: *http1_client.Http1Pool,
+    wire: *Wire,
     response: OwnedResponseHead,
-    wire_bytes: accounting.Bytes,
-    /// Ciphertext cost of the whole redirect chain, seeded by the exchange;
-    /// each meter fold adds the connection's BIO delta since the last take.
-    /// It stays flat on plain and `.fd_tls` connections, which cannot observe
-    /// ciphertext.
-    cost_bytes: u64,
     source_id: u64,
-    head_request: bool,
     encoding: decompress.Encoding,
     pump: stream_pump.Pump,
-    config: Config,
-    body: *fetch_body.Body,
+    queue: *ResponseQueue,
     ready_ctx: ?*anyopaque,
     ready_fn: Http1BodyReadyFn,
     ready_event: BodyReadyEvent,
-    /// Socket read buffer, leased from the pool's freelist at init and
-    /// returned at deinit. `pending_input` borrows from it, or from the
-    /// response's owned wire bytes at startup, so a read needs no
-    /// intermediate copy. Identity bodies on the direct route skip it and
-    /// read into right-sized owned allocations.
+    /// Read buffer, leased from the pool's freelist at init and returned at
+    /// deinit. `pending_input` borrows from it, or from the response's
+    /// received bytes at startup, so a read needs no intermediate copy.
+    /// Identity bodies on the direct route skip it and read into right-sized
+    /// owned allocations.
     read_buffer: []u8,
-    read_buffer_pool: *http1_client.Http1Pool,
     pending_input: []const u8 = &.{},
     pending_offset: usize = 0,
     /// Allocation cap for the identity direct-read path. It doubles on a
@@ -131,12 +84,11 @@ pub const Continuation = struct {
     /// streams.
     direct_read_enabled: bool = true,
     state: BodyState,
-    resume_requested: bool = false,
-    /// Hand-back ticket for the shared pool; present only when the response
-    /// head allows reuse. Redeemed after a clean framed completion,
-    /// discarded on every failure path.
+    /// Hand-back ticket for the pool; present only when the response head
+    /// allows reuse. Redeemed after a clean framed completion, dropped on
+    /// every failure path.
     pooled_return: ?http1_client.ConnectionReturn = null,
-    connection_returned: bool = false,
+    wire_returned: bool = false,
     clean_for_pool: bool = true,
 
     const BodyState = union(enum) {
@@ -147,14 +99,14 @@ pub const Continuation = struct {
     };
 
     const ChunkedState = struct {
-        decoder: http1.ChunkedDecoder = .{},
+        decoder: protocol.ChunkedDecoder = .{},
         decoded_body: std.array_list.Aligned(u8, null) = .empty,
-        /// Bytes of `decoded_body` already appended to the fetch body; the
-        /// live remainder is `decoded_body.items[consumed..]`. Compacting
-        /// after every partial append would cost O(n²) over a backpressured
-        /// burst, so compaction waits for the next decode (`compactForRefill`).
-        /// That keeps `decoded_body.items.len` equal to the remainder whenever
-        /// the decoder checks its output limit.
+        /// Bytes of `decoded_body` already appended to the queue; the live
+        /// remainder is `decoded_body.items[consumed..]`. Compacting after
+        /// every partial append would cost O(n²) over a backpressured burst,
+        /// so compaction waits for the next decode (`compactForRefill`).
+        /// That keeps `decoded_body.items.len` equal to the remainder
+        /// whenever the decoder checks its output limit.
         consumed: usize = 0,
         done: bool = false,
 
@@ -191,148 +143,145 @@ pub const Continuation = struct {
         }
     };
 
-    pub const Step = enum {
+    pub const Step = union(enum) {
+        /// The body ended and the queue completed.
         done,
+        /// The queue is at its watermark; the resume credit of a queued
+        /// chunk wakes the continuation.
         paused,
-        /// The drive budget ran out. The continuation waits on nothing and
-        /// arms no deadline, so the owner must drive it again after its other
-        /// runnable requests and watches have had their turn.
-        yielded,
+        /// The wire must receive (or, under TLS, send) before the body can
+        /// go on.
+        wait: IoInterest,
     };
 
+    const PauseError = error{Http1BodyPaused};
+
+    /// Takes `wire` and `response` on success; on error the caller keeps
+    /// both. Retains `queue` for the continuation's life.
     pub fn init(
         allocator: std.mem.Allocator,
-        read_buffer_pool: *http1_client.Http1Pool,
-        connection: HttpConnection,
+        pool: *http1_client.Http1Pool,
+        wire: *Wire,
         response: OwnedResponseHead,
-        wire_bytes: accounting.Bytes,
-        cost_bytes: u64,
         source_id: u64,
         head_request: bool,
         encoding: decompress.Encoding,
         pump_limits: stream_pump.Limits,
-        config: Config,
-        body: *fetch_body.Body,
+        queue: *ResponseQueue,
         ready_ctx: ?*anyopaque,
         ready_fn: Http1BodyReadyFn,
         ready_event: BodyReadyEvent,
         pooled_return: ?http1_client.ConnectionReturn,
     ) !*Continuation {
-        var pump = try stream_pump.Pump.initWithLimits(encoding, pump_limits);
-        errdefer pump.deinit(allocator);
-        const read_buffer = try read_buffer_pool.acquireBodyReadBuffer();
-        errdefer read_buffer_pool.releaseBodyReadBuffer(read_buffer);
+        var pump = try stream_pump.Pump.init(encoding, pump_limits);
+        errdefer pump.deinit();
+        const read_buffer = try pool.acquireBodyReadBuffer();
+        errdefer pool.releaseBodyReadBuffer(read_buffer);
         const state: BodyState = if (head_request or response.head.body_framing == .none)
             .finished
         else switch (response.head.body_framing) {
             .none => .finished,
             .content_length => blk: {
-                if (response.head.post_head_bytes.len > response.head.content_length)
-                    return error.InvalidResponseBodyFraming;
-                if (encoding == .identity and response.head.content_length > pump_limits.max_decoded_bytes)
+                if (encoding == .identity and response.head.content_length > pump.limits.max_decoded_bytes)
                     return error.FetchResponseTooLarge;
                 break :blk .{ .content_length = response.head.content_length - response.head.initial_body_bytes.len };
             },
             .close_delimited => .close_delimited,
             .http1_chunked => .{ .chunked = .{} },
         };
+        // Bytes the head's receive carried past this response's framing
+        // answer no request. The response still completes and its wire is
+        // dropped instead of pooled, as when such bytes arrive in a later
+        // receive and stay unread in the wire, so the outcome never depends
+        // on how the peer's bytes were segmented.
+        const surplus_after_framing = switch (state) {
+            .finished => response.head.post_head_bytes.len != 0,
+            .content_length => response.head.post_head_bytes.len > response.head.content_length,
+            .close_delimited, .chunked => false,
+        };
         const continuation = try allocator.create(Continuation);
-        body.retain();
+        queue.retain();
         continuation.* = .{
             .allocator = allocator,
-            .connection = connection,
+            .pool = pool,
+            .wire = wire,
             .response = response,
-            .wire_bytes = wire_bytes,
-            .cost_bytes = cost_bytes,
             .source_id = source_id,
-            .head_request = head_request,
             .encoding = encoding,
             .pump = pump,
-            .config = config,
-            .body = body,
+            .queue = queue,
             .ready_ctx = ready_ctx,
             .ready_fn = ready_fn,
             .ready_event = ready_event,
             .read_buffer = read_buffer,
-            .read_buffer_pool = read_buffer_pool,
-            .pending_input = response.head.initial_body_bytes,
+            // A HEAD or bodiless response has no body, so bytes read after
+            // its head are dropped; a framed body keeps them as its first
+            // bytes.
+            .pending_input = if (state == .finished) &.{} else response.head.initial_body_bytes,
             .state = state,
             .pooled_return = pooled_return,
+            .clean_for_pool = !surplus_after_framing,
         };
         return continuation;
     }
 
-    /// Returns the connection to the pool after a clean completion: the body
-    /// ended by its own framing (close-delimited bodies carry no ticket)
-    /// without bare-LF leniency in its chunk lines, and no byte was read past
-    /// it. Otherwise deinit closes the connection.
-    pub fn returnConnectionIfReusable(self: *Continuation) void {
-        var ticket = self.pooled_return orelse return;
-        self.pooled_return = null;
-        if (!self.clean_for_pool or self.state != .finished or self.pendingSlice().len != 0) {
-            ticket.discard();
-            return;
-        }
-        const connection = self.connection;
-        self.connection = undefined;
-        self.connection_returned = true;
-        ticket.give(connection);
-    }
-
-    /// Folds the meters into the fetch body as totals for the whole redirect
-    /// chain: billed plaintext per direction, and ciphertext cost including
-    /// this connection's latest BIO delta. After the connection went back to
-    /// the pool the take is skipped, since the pool owns it.
-    pub fn foldMetersIntoBody(self: *Continuation) void {
-        if (!self.connection_returned)
-            self.cost_bytes +|= self.connection.takeWireBytes().total();
-        self.body.setEgressMeters(.{
-            .billed_sent = self.wire_bytes.sent,
-            .billed_received = self.wire_bytes.received,
-            .cost = self.cost_bytes,
-        });
-    }
-
-    pub fn step(self: *Continuation, cancel_probe: CancelProbe, budget: *DriveBudget) !Step {
-        return self.runUntilBlocked(cancel_probe, budget) catch |err| switch (err) {
+    pub fn step(self: *Continuation) !Step {
+        return self.runUntilBlocked() catch |err| switch (err) {
             error.Http1BodyPaused => return .paused,
-            error.Http1BodyYielded => return .yielded,
             else => return err,
         };
     }
 
-    pub fn failAndDeinit(self: *Continuation, message: []const u8) void {
-        // A failed fetch is billed for what crossed the wire, so the meters,
-        // including this connection's final ciphertext delta, are folded
-        // before the failure reaches the consumer. The HTTP/2 path folds the
-        // same way before failing a published body.
-        self.foldMetersIntoBody();
-        failFetchBody(self.body, self.allocator, message);
+    /// Ends a continuation whose `step` returned `.done`: wakes the fetch's
+    /// reader, returns the wire to the pool when the body ended cleanly or
+    /// releases it otherwise, and frees the continuation.
+    pub fn finish(self: *Continuation) void {
+        std.debug.assert(self.state == .finished);
+        self.ready_fn(self.ready_ctx, self.ready_event);
+        self.returnWireIfReusable();
+        self.deinit();
+    }
+
+    /// Ends a continuation on an error or a cancel: fails the queue with
+    /// `message_text`, wakes the fetch's reader, releases the wire and frees
+    /// the continuation.
+    pub fn failAndDeinit(self: *Continuation, message_text: []const u8) void {
+        _ = self.queue.fail(self.allocator, message_text);
         self.ready_fn(self.ready_ctx, self.ready_event);
         self.deinit();
     }
 
-    pub fn deinit(self: *Continuation) void {
+    /// Returns the wire to the pool after a clean completion: the body ended
+    /// by its own framing (close-delimited bodies carry no ticket) without
+    /// bare-LF leniency in its chunk lines, and no byte was read past it.
+    /// Otherwise `deinit` releases the wire.
+    fn returnWireIfReusable(self: *Continuation) void {
+        const ticket = self.pooled_return orelse return;
+        self.pooled_return = null;
+        if (!self.clean_for_pool or self.pendingSlice().len != 0)
+            return;
+        const now_ns = config_mod.monotonicNowNs() catch return;
+        self.wire_returned = true;
+        ticket.give(self.wire, now_ns);
+    }
+
+    fn deinit(self: *Continuation) void {
         const allocator = self.allocator;
-        self.body.releaseAfterQueuedResourcesReleased(allocator);
+        self.queue.release(allocator);
         switch (self.state) {
             .chunked => |*chunked| chunked.deinit(allocator),
             else => {},
         }
-        self.pump.deinit(allocator);
+        self.pump.deinit();
         self.response.deinit();
-        if (self.pooled_return) |*ticket|
-            ticket.discard();
-        if (!self.connection_returned)
-            self.connection.deinit();
-        self.read_buffer_pool.releaseBodyReadBuffer(self.read_buffer);
+        if (!self.wire_returned)
+            self.pool.releaseWire(self.wire);
+        self.pool.releaseBodyReadBuffer(self.read_buffer);
         allocator.destroy(self);
     }
 
-    fn runUntilBlocked(self: *Continuation, cancel_probe: CancelProbe, budget: *DriveBudget) !Step {
+    fn runUntilBlocked(self: *Continuation) !Step {
         while (true) {
-            if (cancel_probe.isCanceled())
-                return error.FetchAborted;
             if (try self.drainPendingInput())
                 continue;
             switch (self.state) {
@@ -343,58 +292,56 @@ pub const Continuation = struct {
                         continue;
                     }
                     if (self.encoding == .identity) {
-                        if (try self.stepIdentityDirect(remaining_wire, cancel_probe, budget)) |read_len| {
-                            if (read_len == 0)
-                                return error.FetchResponseTruncated;
-                            self.state.content_length = remaining_wire - read_len;
-                            continue;
+                        switch (try self.stepIdentityDirect(remaining_wire)) {
+                            .read => |read_len| {
+                                self.state.content_length = remaining_wire - read_len;
+                                continue;
+                            },
+                            .eof => return error.FetchResponseTruncated,
+                            .wait => |interest| return .{ .wait = interest },
+                            // A spent decoded budget or the drip route
+                            // falls through to the buffered read, whose pump
+                            // append tells a body ending exactly at the
+                            // budget from one that exceeds it.
+                            .buffered => {},
                         }
-                        // Null means the decoded budget is spent or the drip
-                        // route is active. The buffered read below covers
-                        // both; with a spent budget, its pump append tells a
-                        // body ending exactly at the budget from one that
-                        // exceeds it.
                     }
-                    try budget.beginRead();
-                    const read_len = try readConnectionChunk(
-                        &self.connection,
-                        self.read_buffer[0..@min(self.read_buffer.len, remaining_wire)],
-                        self.config,
-                        cancel_probe,
-                    );
-                    budget.charge(read_len);
-                    if (read_len == 0)
-                        return error.FetchResponseTruncated;
+                    const read_len = switch (try self.wire.readStep(self.read_buffer[0..@min(self.read_buffer.len, remaining_wire)])) {
+                        .ready => |read_len| read_len,
+                        .eof => return error.FetchResponseTruncated,
+                        .wait => |interest| return .{ .wait = interest },
+                    };
                     // A buffered read this large means bulk arrivals, so the
                     // next read takes the direct route again.
                     if (read_len >= initial_direct_read_bytes)
                         self.direct_read_enabled = true;
-                    self.wire_bytes.addReceived(read_len);
-                    self.foldMetersIntoBody();
                     self.state.content_length = remaining_wire - read_len;
                     self.setPendingInput(self.read_buffer[0..read_len]);
                 },
                 .close_delimited => {
                     if (self.encoding == .identity) {
-                        if (try self.stepIdentityDirect(self.read_buffer.len, cancel_probe, budget)) |read_len| {
-                            if (read_len == 0)
+                        switch (try self.stepIdentityDirect(self.read_buffer.len)) {
+                            .read => continue,
+                            .eof => {
                                 self.state = .finished;
-                            continue;
+                                continue;
+                            },
+                            .wait => |interest| return .{ .wait = interest },
+                            .buffered => {},
                         }
                     }
-                    try budget.beginRead();
-                    const read_len = try readConnectionChunk(&self.connection, self.read_buffer, self.config, cancel_probe);
-                    budget.charge(read_len);
-                    if (read_len == 0) {
-                        self.state = .finished;
-                        continue;
-                    }
+                    const read_len = switch (try self.wire.readStep(self.read_buffer)) {
+                        .ready => |read_len| read_len,
+                        .eof => {
+                            self.state = .finished;
+                            continue;
+                        },
+                        .wait => |interest| return .{ .wait = interest },
+                    };
                     // As in the content-length arm, a large buffered read
                     // returns to the direct route.
                     if (read_len >= initial_direct_read_bytes)
                         self.direct_read_enabled = true;
-                    self.wire_bytes.addReceived(read_len);
-                    self.foldMetersIntoBody();
                     self.setPendingInput(self.read_buffer[0..read_len]);
                 },
                 .chunked => |*chunked| {
@@ -407,46 +354,43 @@ pub const Continuation = struct {
                         self.state = .finished;
                         continue;
                     }
-                    try budget.beginRead();
-                    const read_len = try readConnectionChunk(&self.connection, self.read_buffer, self.config, cancel_probe);
-                    budget.charge(read_len);
-                    if (read_len == 0)
-                        return error.FetchResponseTruncated;
-                    self.wire_bytes.addReceived(read_len);
-                    self.foldMetersIntoBody();
+                    const read_len = switch (try self.wire.readStep(self.read_buffer)) {
+                        .ready => |read_len| read_len,
+                        .eof => return error.FetchResponseTruncated,
+                        .wait => |interest| return .{ .wait = interest },
+                    };
                     self.setPendingInput(self.read_buffer[0..read_len]);
                 },
             }
         }
     }
 
+    const DirectRead = union(enum) {
+        /// `read_len` bytes went to the queue.
+        read: usize,
+        eof,
+        wait: IoInterest,
+        /// Take the buffered route for this read.
+        buffered,
+    };
+
     /// Direct route for identity bodies: read into a fresh allocation of the
-    /// right size and hand it to the body pipe, which takes ownership instead
-    /// of copying it. Capacity is probed before the read with the same check
+    /// right size and hand it to the queue, which takes ownership instead of
+    /// copying it. Capacity is probed before the read with the same check
     /// the pump's append makes, so a full queue pauses before reading instead
     /// of holding bytes it cannot append. The pause stays live because the
     /// append that exhausted capacity carried the resume credit
-    /// (`resumeCreditFor` in core/stream_pump.zig).
-    ///
-    /// Returns null when the decoded budget is spent or the drip route is
-    /// active; the caller then uses the buffered read, whose pump append tells
-    /// a clean EOF exactly at the budget from an over-budget body. Otherwise
-    /// returns the wire bytes read, where 0 is EOF and the caller interprets
-    /// it by framing.
-    fn stepIdentityDirect(self: *Continuation, wire_cap: usize, cancel_probe: CancelProbe, budget: *DriveBudget) !?usize {
+    /// (`stream_pump.zig:Pump.resumeCreditFor`).
+    fn stepIdentityDirect(self: *Continuation, wire_cap: usize) !DirectRead {
         std.debug.assert(self.pendingSlice().len == 0);
         // Drip origins take the buffered route (see `direct_read_enabled`).
         if (!self.direct_read_enabled)
-            return null;
-        const available = switch (self.pump.identityCapacity(self.body)) {
-            .budget_exhausted => return null,
+            return .buffered;
+        const available = switch (self.pump.identityCapacity(self.queue)) {
+            .budget_exhausted => return .buffered,
             .paused => return error.Http1BodyPaused,
             .available => |n| n,
         };
-        // Checked after the capacity probe so a real pause, woken by its
-        // resume credit, takes precedence over a budget yield, which would
-        // only be re-driven at once.
-        try budget.beginRead();
         // `direct_read_hint` caps the allocation so a slow stream (1 KiB
         // arrivals) does not allocate and free 64 KiB per read, which would
         // cost more than the buffered route's copy. A bulk body reaches the
@@ -457,13 +401,13 @@ pub const Continuation = struct {
             @min(self.read_buffer.len, self.direct_read_hint),
         );
         var owned = try self.allocator.alloc(u8, target);
-        errdefer self.allocator.free(owned);
-        const read_len = try readConnectionChunk(&self.connection, owned, self.config, cancel_probe);
-        budget.charge(read_len);
-        if (read_len == 0) {
-            self.allocator.free(owned);
-            return 0;
-        }
+        var owned_kept = false;
+        defer if (!owned_kept) self.allocator.free(owned);
+        const read_len = switch (try self.wire.readStep(owned)) {
+            .ready => |read_len| read_len,
+            .eof => return .eof,
+            .wait => |interest| return .{ .wait = interest },
+        };
         self.direct_read_hint = if (read_len == target)
             @min(self.direct_read_hint *| 2, self.read_buffer.len)
         else
@@ -472,8 +416,6 @@ pub const Continuation = struct {
         // buffered route before the allocate-and-shrink cost repeats.
         if (read_len < initial_direct_read_bytes / 2 and read_len < target)
             self.direct_read_enabled = false;
-        self.wire_bytes.addReceived(read_len);
-        self.foldMetersIntoBody();
         if (read_len < owned.len) {
             // The allocator usually shrinks in place. A copy across size
             // classes is rare and costs no more than the buffered route's
@@ -482,14 +424,15 @@ pub const Continuation = struct {
         }
         const result = try self.pump.appendHttp1IdentityOwned(
             self.allocator,
-            self.body,
+            self.queue,
             owned,
             body_credit.h1Resume(self.source_id),
         );
+        owned_kept = true;
         std.debug.assert(result.consumed == read_len);
         if (result.ready)
             self.ready_fn(self.ready_ctx, self.ready_event);
-        return read_len;
+        return .{ .read = read_len };
     }
 
     fn drainPendingInput(self: *Continuation) !bool {
@@ -516,14 +459,18 @@ pub const Continuation = struct {
                 );
                 self.advancePending(decoded.consumed);
                 chunked.done = decoded.done;
-                if (decoded.done and self.pendingSlice().len != 0)
-                    return error.InvalidResponseBodyFraming;
+                // Bytes past the last chunk answer no request, as in `init`:
+                // they cost the wire's reuse, not the body.
+                if (decoded.done and self.pendingSlice().len != 0) {
+                    self.clean_for_pool = false;
+                    self.advancePending(self.pendingSlice().len);
+                }
                 return decoded.consumed != 0 or chunked.remainder().len != 0 or decoded.done;
             },
             else => {
                 const result = try self.pump.appendHttp1DataAvailable(
                     self.allocator,
-                    self.body,
+                    self.queue,
                     pending,
                     body_credit.h1Resume(self.source_id),
                 );
@@ -543,7 +490,7 @@ pub const Continuation = struct {
             return false;
         const result = try self.pump.appendHttp1DataAvailable(
             self.allocator,
-            self.body,
+            self.queue,
             remainder,
             body_credit.h1Resume(self.source_id),
         );
@@ -559,7 +506,7 @@ pub const Continuation = struct {
     fn finishPumpAvailable(self: *Continuation) !Step {
         const result = try self.pump.finishHttp1Available(
             self.allocator,
-            self.body,
+            self.queue,
             body_credit.h1Resume(self.source_id),
         );
         if (result.ready)
@@ -587,10 +534,3 @@ pub const Continuation = struct {
         }
     }
 };
-
-pub fn failFetchBody(body_pipe: anytype, allocator: std.mem.Allocator, message: []const u8) void {
-    _ = body_pipe.fail(allocator, message) catch |err| {
-        std.log.warn("failed to mark fetch body failed: {s}", .{@errorName(err)});
-        _ = body_pipe.failNoAlloc();
-    };
-}

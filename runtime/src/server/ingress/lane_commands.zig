@@ -1,10 +1,10 @@
 //! The payloads of the commands a worker definition's pool and the reading
 //! of a worker add to an ingress lane's queue (`commands.zig`): a slot handed
-//! to a waiting request, what a worker's reader forwards to the lane that
-//! owns a request, the answers that let the reader free ring bytes and give
-//! its role up, and the failure of a request no worker can serve. Pure data:
-//! a payload does nothing beyond freeing what it owns. The pool's side of
-//! each exchange is in `server/supervisor/pool.zig`.
+//! to a waiting request, the descriptors a worker's reader forwards to the
+//! lane that owns a request, the answers that let the reader free ring bytes
+//! and give its role up, and the failure of a request no worker can serve.
+//! Pure data: a payload does nothing beyond freeing what it owns. The pool's
+//! side of each exchange is in `server/supervisor/pool.zig`.
 //!
 //! A command waits in a queue while its subject moves on: the request may
 //! end, the worker may die, and the record behind a pointer may come to hold
@@ -12,8 +12,9 @@
 //! and its worker by `WorkerKey`, and the receiving lane checks both against
 //! its own state before it acts. Commands to one lane run in the order they
 //! were posted. A reader forwards a request's descriptors in the order it
-//! read them and its completion after them, and an owner answers each ring
-//! payload before it gives the request's slot back to the pool, so once the
+//! read them, its `request_done` last, and an owner answers each ring
+//! payload as it applies the descriptor that carried it, before the
+//! `request_done` gives the request's slot back to the pool, so once the
 //! worker is idle no answer is left to come: a reader giving its role up then
 //! frees what it still holds, and an answer still queued to it drops
 //! (`Pool.transferReader`).
@@ -21,7 +22,6 @@
 const std = @import("std");
 const ipc = @import("collo_ipc");
 const lifecycle = @import("collo_server_lifecycle");
-const worker_shared_page = @import("collo_worker_state").page;
 const supervision = @import("collo_server_supervisor");
 
 const pool = supervision.pool;
@@ -35,13 +35,16 @@ pub const ReaderGrant = pool.ReaderGrant;
 ///
 /// Sent by the lane whose `Pool.release` handed the slot on, or by the
 /// launcher's `Deps.publish` for a fresh worker, to the waiter's lane,
-/// `request_key.lane_id`. The receiver first discharges `reader`: it
-/// registers the worker's output channels, or posts `release_worker` to the
-/// lane `transfer_from` names. Then it dispatches the request on the slot by
-/// the path an inline acquire takes, when the request still waits and no
-/// `worker_died` naming `worker_key` reached it first; otherwise it gives the
-/// slot back with `Pool.release` and acts on the result. The slot keeps the
-/// worker in the pool's table, so `worker` stays valid until that release.
+/// `request_key.lane_id`. When the worker is still in service, the receiver
+/// first discharges `reader`: it registers the worker's output channels, or
+/// posts `release_worker` to the lane `transfer_from` names. Then it
+/// dispatches the request on the slot by the path an inline acquire takes,
+/// when the request still waits; otherwise it gives the slot back with
+/// `Pool.release` and acts on the result. When the worker left service while
+/// the command travelled, the receiver gives the slot back with the grant it
+/// never took up (`Pool.returnHandoff`), and a request that still waits asks
+/// its pool again. The slot keeps the worker in the pool's table, so
+/// `worker` stays valid until that release.
 ///
 /// A sender whose post fails gives the slot back itself, with the grant it
 /// carried (`Pool.returnHandoff`), and so does a lane that tears down with
@@ -89,17 +92,18 @@ pub const ForwardedPayload = union(enum) {
     ring: RingRef,
 };
 
-/// A response descriptor the reader of a worker read for a request another
-/// lane owns.
+/// A descriptor of the response of a request another lane owns, as the
+/// reader of the worker read it.
 ///
 /// Sent by the reader lane to the owner, `request_key.lane_id`, in the order
 /// the reader read it, and only while the worker's request table holds the
-/// request under that key (`RequestTable.forwardCheck`). The owner checks
-/// both keys and applies the descriptor as one it read itself
-/// (`runner/h2_worker_ipc.zig`), taking a `ring` payload from the worker's
-/// ring through the record its request slot holds. For a `ring` payload it
-/// answers `payload_consumed` to `reader_lane_id` whether it used the bytes
-/// or not, and before it gives the request's slot back.
+/// request under that key and has forwarded no `request_done` for it
+/// (`RequestTable.forwardCheck`). The owner checks both keys and applies the
+/// descriptor as one it read itself (`runner/h2_worker_ipc.zig`), taking a
+/// `ring` payload from the worker's ring through the record its request
+/// slot holds. For a `ring` payload it answers `payload_consumed` to
+/// `reader_lane_id` whether it used the bytes or not, and before it gives
+/// the request's slot back.
 ///
 /// The command holds one unit of the worker's forwarding window
 /// (`Record.forwarded_in_queues`) from before its post: the owner releases it
@@ -136,27 +140,40 @@ pub const ForwardedDescriptor = struct {
     }
 };
 
-/// A completion the reader drained from the worker's completion ring for a
-/// request another lane owns, copied out of shared memory once.
+/// The `request_done` of a request another lane owns, as the reader of the
+/// worker decoded it (`ipc.ingress_channel.decodeRequestDone`).
 ///
 /// Sent by the reader lane to the owner, `request_key.lane_id`, after every
-/// descriptor of that request it read before the completion, and only for a
-/// request the worker's request table holds under that key and id whose
-/// completion it has not forwarded yet (`RequestTable.claimCompletion`), so
-/// a worker cannot send more of them than it has requests. The owner checks
-/// both keys and finalizes the request as for a completion it drained
-/// itself, parking it while the stream's response is still open
-/// (`runner/h2_worker_ipc.zig`). The record is the copy the reader's drain
-/// loaded once and validated.
+/// descriptor of the request it forwarded, and only while the worker's
+/// request table holds the request under that key and has forwarded no
+/// `request_done` for it; the table marks the request's `request_done`
+/// forwarded once the post took it (`RequestTable.markDoneForwarded`), so a
+/// request sends its owner at most one. The owner checks both keys and
+/// finishes the request as if it had read the `request_done` itself
+/// (`runner/request_done.zig`).
 ///
-/// The post takes a reserved place, or an ordinary one once the reserve is
-/// full (`commands.zig`), so it is refused only when the owner lane is not
-/// running or every place of its queue is taken; the reader then drops the
-/// record.
-pub const ForwardedCompletion = struct {
+/// It holds no unit of the forwarding window. A request keeps its pool slot
+/// until its owner applies this command or the worker dies, so a worker
+/// table entry has at most its definition's `concurrency` of them waiting,
+/// and each lane reserves that many places per entry for them
+/// (`lane.obligationReserve`). The post takes a reserved place, or an
+/// ordinary one once the reserve is full (`commands.zig`): a lost one would
+/// leave a request its worker answered to the grace backstop, which faults
+/// the worker. It is refused only when the owner lane is not running or both
+/// kinds of places are full; the reader then logs the loss, and the request
+/// waits for that backstop.
+///
+/// A `request_done` that names no request of the owner's at the keys, or one
+/// of another worker, is a worker fault on the owner, run through `worker`
+/// when the owner has no request on the worker (`runner/worker_fault.zig`).
+pub const ForwardedRequestDone = struct {
     request_key: RequestKey,
     worker_key: WorkerKey,
-    record: worker_shared_page.WorkerCompletionRecord,
+    /// The record the reader reads the worker through.
+    worker: *WorkerRecord,
+    /// The request's identity and stream, as the reader decoded them.
+    descriptor: ipc.ingress_channel.Descriptor,
+    done: ipc.ingress_channel.RequestDone,
 };
 
 /// The owner's answer for a `ring` payload it was forwarded, used or not.

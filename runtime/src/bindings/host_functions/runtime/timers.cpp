@@ -1,13 +1,11 @@
 // Retains a timer's or immediate's callback, receiver and arguments as value handles and passes them to
-// collo_runtime_set_timer or collo_runtime_set_immediate, on the VM thread. A timer's receiver is the globalThis of the
-// realm whose setTimeout or setInterval ran, an immediate's its Immediate object. The runtime consumes every handle it
-// receives, also when it fails; a handle that cannot be made releases the ones made before it, so no handle outlives a
-// failed schedule.
+// collo_runtime_set_timer or collo_runtime_set_immediate, on the VM thread. The receiver is the globalThis of the realm
+// whose setTimeout, setInterval or setImmediate ran. The runtime consumes every handle it receives, also when it fails;
+// a handle that cannot be made releases the ones made before it, so no handle outlives a failed schedule.
 
 #include "host_functions/runtime/timers.h"
 
 #include "host_functions/runtime/bridge.h"
-#include "host_functions/webapi/platform/timer_handle.h"
 
 #include <JavaScriptCore/JSCInlines.h>
 
@@ -30,7 +28,7 @@ WTF::ASCIILiteral scheduleMessage(
 
 std::optional<JSC::EncodedJSValue> scheduleCallbackValue(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope,
     const ActiveRequestRuntime& runtime, JSC::JSValue callback_value, JSC::JSValue* args_values, size_t args_len,
-    uint32_t delay_ms, bool repeats, ScheduleKind kind, JSC::JSValue this_value = JSC::JSValue())
+    uint32_t delay_ms, bool repeats, ScheduleKind kind)
 {
     ColloValue* callback_handle = nullptr;
     if (Collo::makeValueHandle(runtime.owner, callback_value, &callback_handle) != COLLO_STATUS_OK
@@ -74,8 +72,8 @@ std::optional<JSC::EncodedJSValue> scheduleCallbackValue(JSC::JSGlobalObject* gl
     }
 
     ColloValue* this_handle = nullptr;
-    JSC::JSValue receiver = kind == ScheduleKind::Timer ? global_object->globalThis() : this_value;
-    if (Collo::makeValueHandle(runtime.owner, receiver, &this_handle) != COLLO_STATUS_OK || !this_handle) {
+    if (Collo::makeValueHandle(runtime.owner, global_object->globalThis(), &this_handle) != COLLO_STATUS_OK
+        || !this_handle) {
         for (size_t release_index = 0; release_index < retained_args; ++release_index)
             Collo::releaseValueHandle(args[release_index]);
         Collo::releaseValueHandle(callback_handle);
@@ -95,13 +93,6 @@ std::optional<JSC::EncodedJSValue> scheduleCallbackValue(JSC::JSGlobalObject* gl
         Collo::HostFunctions::throwRuntimeError(global_object, scope,
             scheduleMessage(kind, "Failed to schedule timer callback."_s, "Failed to schedule immediate callback."_s));
         return std::nullopt;
-    }
-
-    if (kind == ScheduleKind::Immediate) {
-        auto* handle = immediateHandleFromValue(this_value);
-        RELEASE_ASSERT(handle);
-        handle->setId(callback_id);
-        return JSC::JSValue::encode(handle);
     }
 
     return JSC::JSValue::encode(JSC::jsNumber(static_cast<double>(callback_id)));
@@ -155,35 +146,9 @@ JSC::EncodedJSValue scheduleTimer(JSC::JSGlobalObject* global_object, JSC::Throw
 }
 
 JSC::EncodedJSValue scheduleImmediate(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope,
-    const ActiveRequestRuntime& runtime, JSC::CallFrame* call_frame, JSC::JSValue this_value)
+    const ActiveRequestRuntime& runtime, JSC::CallFrame* call_frame)
 {
-    JSC::JSValue callback_value = call_frame->argument(0);
-    const unsigned first_argument_index = 1;
-    const size_t args_len
-        = call_frame->argumentCount() > first_argument_index ? call_frame->argumentCount() - first_argument_index : 0;
-    // Rooted by the call frame, as in scheduleCallback.
-    JSC::JSValue stack_args[8];
-    std::unique_ptr<JSC::JSValue[]> heap_args;
-    JSC::JSValue* args = nullptr;
-    if (args_len != 0) {
-        if (args_len <= std::size(stack_args)) {
-            args = stack_args;
-        } else {
-            heap_args.reset(new (std::nothrow) JSC::JSValue[args_len]);
-            if (!heap_args)
-                return JSC::JSValue::encode(JSC::throwOutOfMemoryError(global_object, scope));
-            args = heap_args.get();
-        }
-        for (size_t index = 0; index < args_len; ++index)
-            args[index] = call_frame->argument(static_cast<unsigned>(index + first_argument_index));
-    }
-
-    auto result = scheduleCallbackValue(
-        global_object, scope, runtime, callback_value, args, args_len, 0, false, ScheduleKind::Immediate, this_value);
-    RETURN_IF_EXCEPTION(scope, {});
-    if (!result)
-        return {};
-    return *result;
+    return scheduleCallback(global_object, scope, runtime, call_frame, 1, 0, false, ScheduleKind::Immediate);
 }
 
 JSC::EncodedJSValue clearTimer(JSC::JSGlobalObject* global_object, uint64_t timer_id)

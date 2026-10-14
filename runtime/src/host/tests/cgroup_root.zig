@@ -1,9 +1,11 @@
 //! Worker cgroup subtree directory management, exercised against a plain
 //! temp directory standing in for the delegated env root: the host claims
 //! its `host-<pid>-<start>-<n>` directory under it and keeps its
-//! `worker-<id>` leaves inside. The limit-file writes, controller enabling
-//! and the real boot path need a cgroup2 mount and are covered by the
-//! integration lane.
+//! `worker-<id>` leaves inside, each named by the root and its job id
+//! (`WorkerLeaf`), whose files open only beneath the host directory with no
+//! link followed. The limit-file writes, controller enabling, the kill
+//! through `cgroup.kill` and the real boot path need a cgroup2 mount and are
+//! covered by the integration lane.
 
 const std = @import("std");
 const host = @import("collo_host");
@@ -135,20 +137,76 @@ test "sweepDeadHostDirs reclaims dead hosts and leaves everything else" {
     try std.testing.expect(dirExists(tmp.dir, "host-1-1-1"));
 }
 
-test "removeWorkerDir removes the worker directory" {
+test "a leaf named by its job id is removed by that name, and removing it again is no error" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var root = try rootOverTempDir(std.testing.allocator, &tmp);
     defer root.deinit(std.testing.allocator);
     try makeLeaf(&root, "worker-7");
+    try makeLeaf(&root, "worker-8");
 
+    const leaf = root.leaf(7);
+    var name_buffer: [host.WorkerLeaf.name_bytes_max]u8 = undefined;
+    try std.testing.expectEqualStrings("worker-7", leaf.name(&name_buffer));
     try std.testing.expect(leafExists(&root, "worker-7"));
-    root.removeWorkerDir(7);
+    leaf.remove();
     try std.testing.expect(!leafExists(&root, "worker-7"));
+    // Its neighbour keeps its own name.
+    try std.testing.expect(leafExists(&root, "worker-8"));
 
-    // Removing an absent directory is a no-op, not an error.
-    root.removeWorkerDir(7);
+    leaf.remove();
+}
+
+test "a leaf's files are read by name without a path or an allocation, and fail once the leaf is gone" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var root = try rootOverTempDir(std.testing.allocator, &tmp);
+    defer root.deinit(std.testing.allocator);
+    try makeLeaf(&root, "worker-12");
+    const host_dir = std.fs.Dir{ .fd = root.workers_dir_fd };
+    try host_dir.writeFile(.{ .sub_path = "worker-12/memory.current", .data = "4096\n" });
+
+    const leaf = root.leaf(12);
+    var buffer: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("4096\n", try leaf.readFile("memory.current", &buffer));
+    // One read fills a cgroup file's whole contents, so a buffer it fills
+    // cannot tell a longer file from this one.
+    var short: [5]u8 = undefined;
+    try std.testing.expectError(error.CgroupFileTooLarge, leaf.readFile("memory.current", &short));
+
+    try host_dir.deleteFile("worker-12/memory.current");
+    leaf.remove();
+    try std.testing.expectError(error.FileNotFound, leaf.openFile("memory.current"));
+}
+
+test "a leaf's files open only beneath the workers directory: a leaf name that is a link is neither read nor killed through, and a path that climbs out is refused" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var root = try rootOverTempDir(std.testing.allocator, &tmp);
+    defer root.deinit(std.testing.allocator);
+    // A directory beside the host directory, standing in for a cgroup the
+    // host must never touch, such as its own.
+    try tmp.dir.makeDir("elsewhere");
+    try tmp.dir.writeFile(.{ .sub_path = "elsewhere/memory.current", .data = "4096\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "elsewhere/cgroup.kill", .data = "" });
+    try std.posix.symlinkat("../elsewhere", root.workers_dir_fd, "worker-6");
+
+    const linked = root.leaf(6);
+    try std.testing.expectError(error.SymLinkLoop, linked.openFile("memory.current"));
+    // The kill finds no leaf to write through, and the rmdir of the link
+    // fails and is logged.
+    linked.remove();
+    var kill_buffer: [8]u8 = undefined;
+    try std.testing.expectEqualStrings("", try tmp.dir.readFile("elsewhere/cgroup.kill", &kill_buffer));
+
+    try makeLeaf(&root, "worker-7");
+    try std.testing.expectError(error.PathEscapesDirectory, root.leaf(7).openFile("../../elsewhere/memory.current"));
+
+    // The root's teardown removes only directories, so the link goes here.
+    try std.posix.unlinkat(root.workers_dir_fd, "worker-6", 0);
 }
 
 test "removeWorkerDirsUnder removes every worker leaf and leaves other entries" {

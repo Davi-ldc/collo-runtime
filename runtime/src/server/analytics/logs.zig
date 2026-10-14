@@ -3,14 +3,19 @@
 //! sink. The ingress metrics thread drains every mapped worker's ring each
 //! tick (`server/ingress/analytics_drain.zig`), and a worker's teardown
 //! drains its dying ring once, on the reaper or, at shutdown, on the exiting
-//! thread (`drainDyingRing`, called from `usage_drain.drainFinal`).
+//! thread (`drainDyingRing`, called from the worker's teardown,
+//! `server/supervisor/worker_registry.zig:teardown`). The reaper also drains
+//! the ring of a failed launch's child once, after it killed the child,
+//! through `drainRing` (`server/supervisor/reaper/root.zig:drainLaunchConsole`).
 //!
 //! Invariants:
 //! - One thread consumes a given ring at a time. Both drains run under the
 //!   worker record's `metrics_mutex` and only while its `page_mapped` is set
 //!   (`server/supervisor/worker_table.zig`), and the teardown clears the flag
 //!   under that mutex before it unmaps the page, so no drain reads a ring
-//!   another is reading or one that is gone.
+//!   another is reading or one that is gone. A failed launch's ring has no
+//!   record: the reaper holds its only mapping, so its one drain is the
+//!   ring's only consumer.
 //! - A line's request id and route come from the server's request table of
 //!   the worker whose ring held the line, never from the line alone.
 //! - Every frame is worker-written and hostile. The ring validates lengths
@@ -32,7 +37,10 @@
 //!
 //! The second shape counts the lines the worker's ring dropped since that
 //! worker's previous drop marker. `request_id` and `route` name the request
-//! that wrote the line as the server's tables confirm it. A worker writes a
+//! that wrote the line as the server's tables confirm it. A failed launch's
+//! child has no worker id, since the server numbers a worker only at its
+//! publish, so its lines carry `worker_id` and `worker_generation` 0, which
+//! no worker has, and request id 0. A worker writes a
 //! request id with each line, 0 outside any request, and that id is its own
 //! claim; the drain keeps it only when the worker's request table holds that
 //! request or ended it recently (`WorkerRequests`), and prints the route that
@@ -338,9 +346,9 @@ pub fn WorkerRequests(comptime Table: type, comptime Route: type) type {
 /// Drains up to `line_budget` lines of a worker's log ring into `sink`: each
 /// line becomes a `logs.jsonl` record and a stderr line, and the lines the
 /// ring counted as dropped since `drop_reported.*` become one drop marker,
-/// after which `drop_reported.*` holds the ring's counter. `view` reads the
-/// ring like `WorkerWriterView` (`drainLogLinesChecked`,
-/// `loadLogDropCounters`), and the caller must be its only consumer.
+/// after which `drop_reported.*` holds the ring's counter. `view` is the
+/// host's mapping of the worker's page, and the caller must be the ring's
+/// only consumer.
 /// `requests` provides `routeOf(request_id) ?[]const u8`, as
 /// `WorkerRequests` does: a line keeps its request id and takes that route
 /// when it answers, and otherwise prints request id 0 under `identity`, whose
@@ -349,7 +357,7 @@ pub fn WorkerRequests(comptime Table: type, comptime Route: type) type {
 /// a faulted ring gets no drop marker, because its counter is no longer
 /// trustworthy.
 pub fn drainRing(
-    view: anytype,
+    view: *worker_shared_page.HostReaderView,
     requests: anytype,
     identity: Identity,
     drop_reported: *u64,
@@ -402,7 +410,7 @@ pub fn drainRing(
 /// makes this the ring's only consumer. A fault ends the drain, and lines
 /// still in the ring are lost with the page. Returns the lines whose request
 /// id was refused, for the caller's count.
-pub fn drainDyingRing(view: anytype, requests: anytype, identity: Identity, drop_reported: *u64, sink: *Sink) u64 {
+pub fn drainDyingRing(view: *worker_shared_page.HostReaderView, requests: anytype, identity: Identity, drop_reported: *u64, sink: *Sink) u64 {
     const drained = drainRing(view, requests, identity, drop_reported, sink, Clock.capture(), dying_ring_line_budget) catch |err| {
         std.log.warn("log ring of a dying worker failed; its remaining lines are lost worker_id={d}: {s}", .{
             identity.worker_id,

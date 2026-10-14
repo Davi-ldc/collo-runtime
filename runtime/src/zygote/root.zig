@@ -6,9 +6,9 @@
 //! `child_boot.zig` in a worker child, from the clone through its boot to
 //! its event loop. `worker_boot/` holds the cgroup checks the fork loop and
 //! the child run and the sandbox the child applies, `trace.zig` the boot
-//! trace pipe all three write to, `log_sink.zig` the binary's `std.log`
-//! handler, which a child points at its state page, `state.zig` the
-//! zygote's state and a child's, and `warmup.zig` the corpus that fills
+//! trace pipe the three write to when the host asks for one, `log_sink.zig`
+//! the binary's `std.log` handler, which a child points at its state page,
+//! `state.zig` the zygote's state, and `warmup.zig` the corpus that fills
 //! shared engine state before the first fork.
 
 pub const host_client = @import("host_client.zig");

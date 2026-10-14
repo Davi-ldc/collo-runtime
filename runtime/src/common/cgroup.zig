@@ -1,15 +1,17 @@
 //! cgroup v2 primitives for a worker's cgroup: writing and checking its
-//! memory, swap, CPU and pids limits, reading its events and CPU usage, and
-//! finding a process's cgroup. A leaf is written and checked through its
-//! directory fd, and neither the writers nor the checks allocate, so the
-//! zygote's child can check its own leaf before it has a heap of its own;
-//! only the readers a host calls on a leaf it holds by path
-//! (`memory.readEventsLocal`, `cpu.readStatUsageUsec`) and the lookups in
-//! `path` allocate. The worker's memory limit is its `memory.high`, and
-//! `memory.max` and the threshold at which the engine requests a collection
-//! are derived from it here; `memory.swap.max` is 0, so `memory.max` bounds
-//! the worker's memory on a node with swap too. Stateless, so any thread may
-//! call it.
+//! memory, swap, CPU and pids limits, reading the figures the server takes
+//! off its leaf (`LeafFigure`), the CPU use and the cpuset of the cgroups
+//! above the workers, and finding a process's cgroup. A leaf is
+//! written and checked through its directory fd, and neither the writers,
+//! the checks nor the figure reads allocate, so the zygote's child can check
+//! its own leaf before it has a heap of its own and the server reads a
+//! figure into a stack buffer; only the lookups in `path` allocate. Every
+//! read takes one `read` into a buffer sized for its file, and a read that
+//! fills the buffer fails with `error.CgroupFileTooLarge`. The worker's
+//! memory limit is its `memory.high`, and `memory.max` and the threshold at
+//! which the engine requests a collection are derived from it here;
+//! `memory.swap.max` is 0, so `memory.max` bounds the worker's memory on a
+//! node with swap too. Stateless, so any thread may call it.
 
 const std = @import("std");
 
@@ -70,21 +72,20 @@ pub const memory = struct {
         _ = maxBytes(memory_limit_bytes);
     }
 
-    pub fn readEvents(fd: std.posix.fd_t) !Events {
-        var buffer: [256]u8 = undefined;
-        const read_len = try std.posix.pread(fd, &buffer, 0);
-        return parseEvents(buffer[0..read_len]);
-    }
+    /// Room for one read of a `memory.events` or `memory.events.local` file:
+    /// six `<key> <count>` lines since Linux 5.17 added `oom_group_kill`,
+    /// which take at most 167 bytes with 20-digit counts.
+    pub const events_bytes_max: usize = 256;
 
-    /// The events of this cgroup alone (`memory.events.local`), read by path.
-    /// A worker's cgroup outlives the worker until the host removes it, so
-    /// this still answers after the worker was killed. With
-    /// `memory.oom.group` set, `oom_kill` counts every task one OOM kill
-    /// took, so a single group kill reads as at least 1.
-    pub fn readEventsLocal(allocator: std.mem.Allocator, cgroup_dir: []const u8) !Events {
-        const contents = try readLimitFileAlloc(allocator, cgroup_dir, "memory.events.local", 256);
-        defer allocator.free(contents);
-        return parseEvents(contents);
+    /// The events of the open `memory.events` file `fd`, read from its start
+    /// into a stack buffer, so a caller polling the file reads it again
+    /// without seeking.
+    pub fn readEvents(fd: std.posix.fd_t) !Events {
+        var buffer: [events_bytes_max]u8 = undefined;
+        const read_len = try std.posix.pread(fd, &buffer, 0);
+        if (read_len == buffer.len)
+            return error.CgroupFileTooLarge;
+        return parseEvents(buffer[0..read_len]);
     }
 
     /// Writes `memory.max`, `memory.swap.max` (`SWAP_MAX_BYTES`),
@@ -134,7 +135,11 @@ pub const memory = struct {
             return error.WorkerCgroupSwapMismatch;
     }
 
-    fn parseEvents(contents: []const u8) !Events {
+    /// Parses the text of a `memory.events` or `memory.events.local` file
+    /// the caller read. A line without a key and a value fails with
+    /// `error.InvalidMemoryEventsFile`, and a value that is not decimal with
+    /// `std.fmt.parseUnsigned`'s error.
+    pub fn parseEvents(contents: []const u8) !Events {
         var events = Events{};
         var lines = std.mem.splitScalar(u8, contents, '\n');
         while (lines.next()) |line| {
@@ -239,15 +244,10 @@ pub const cpu = struct {
         return .{ .quota_us = quota_us, .period_us = period_us };
     }
 
-    /// CPU time of every thread in the cgroup (`usage_usec` in `cpu.stat`).
-    /// The kernel keeps it, so the worker cannot forge it, and it can still
-    /// be read after the worker is killed.
-    pub fn readStatUsageUsec(allocator: std.mem.Allocator, cgroup_dir: []const u8) !u64 {
-        const contents = try readLimitFileAlloc(allocator, cgroup_dir, "cpu.stat", 1024);
-        defer allocator.free(contents);
-        return parseStatUsageUsec(contents);
-    }
-
+    /// `usage_usec` in the text of a `cpu.stat` file the caller read. A file
+    /// without it, or without its value, fails with
+    /// `error.InvalidCpuStatFile`, and a value that is not decimal with
+    /// `std.fmt.parseUnsigned`'s error.
     pub fn parseStatUsageUsec(contents: []const u8) !u64 {
         var lines = std.mem.splitScalar(u8, contents, '\n');
         while (lines.next()) |line| {
@@ -260,6 +260,73 @@ pub const cpu = struct {
             return std.fmt.parseUnsigned(u64, value_text, 10);
         }
         return error.InvalidCpuStatFile;
+    }
+
+    /// `usage_usec` of the `cpu.stat` of the cgroup `cgroup_dir_fd` names,
+    /// read without allocating. Fails as the read and `parseStatUsageUsec`
+    /// do.
+    pub fn readStatUsageUsecAt(cgroup_dir_fd: std.posix.fd_t) !u64 {
+        var buffer: [LeafFigure.bytesMax(.cpu_usage_usec)]u8 = undefined;
+        return parseStatUsageUsec(try readLimitFileAtBounded(cgroup_dir_fd, "cpu.stat", &buffer));
+    }
+
+    /// The `total` of the `some` line of a `cpu.pressure` file the caller
+    /// read: the microseconds during which at least one task of the cgroup
+    /// was runnable and not running. A file without that line or its total
+    /// fails with `error.InvalidCpuPressureFile`, and a total that is not
+    /// decimal with `std.fmt.parseUnsigned`'s error.
+    pub fn parsePressureSomeTotalUsec(contents: []const u8) !u64 {
+        var lines = std.mem.splitScalar(u8, contents, '\n');
+        while (lines.next()) |line| {
+            var fields = std.mem.tokenizeScalar(u8, line, ' ');
+            const kind = fields.next() orelse continue;
+            if (!std.mem.eql(u8, kind, "some"))
+                continue;
+            while (fields.next()) |field| {
+                if (std.mem.startsWith(u8, field, "total="))
+                    return std.fmt.parseUnsigned(u64, field["total=".len..], 10);
+            }
+            return error.InvalidCpuPressureFile;
+        }
+        return error.InvalidCpuPressureFile;
+    }
+};
+
+pub const cpuset = struct {
+    /// Room for `cpuset.cpus.effective`: a list of CPU ranges, such as
+    /// `0-3,8,10-11`, which on the largest machines stays far below this.
+    pub const effective_cpus_bytes_max: usize = 4096;
+
+    /// Sets in `cpus` each CPU that the `cpuset.cpus.effective` of the
+    /// cgroup `cgroup_dir_fd` names, read without allocating; `cpus` is a
+    /// `std.bit_set` whose `bit_length` bounds the CPU numbers taken. The
+    /// file exists only where the cpuset controller is enabled, so a cgroup
+    /// without it fails with `error.FileNotFound`; a list the parser refuses
+    /// fails with `error.InvalidCpusetList`.
+    pub fn readEffectiveCpusAt(cgroup_dir_fd: std.posix.fd_t, cpus: anytype) !void {
+        var buffer: [effective_cpus_bytes_max]u8 = undefined;
+        try parseList(try readLimitFileAtBounded(cgroup_dir_fd, "cpuset.cpus.effective", &buffer), cpus);
+    }
+
+    /// Sets in `cpus` each CPU of a cpuset list, comma-separated numbers and
+    /// inclusive ranges with a trailing newline allowed; CPUs at or past
+    /// `cpus`'s `bit_length` are left out.
+    pub fn parseList(contents: []const u8, cpus: anytype) !void {
+        const trimmed = std.mem.trim(u8, contents, &std.ascii.whitespace);
+        var items = std.mem.tokenizeScalar(u8, trimmed, ',');
+        while (items.next()) |item| {
+            const dash = std.mem.indexOfScalar(u8, item, '-');
+            const first_text = if (dash) |index| item[0..index] else item;
+            const last_text = if (dash) |index| item[index + 1 ..] else item;
+            const first = std.fmt.parseUnsigned(usize, first_text, 10) catch return error.InvalidCpusetList;
+            const last = std.fmt.parseUnsigned(usize, last_text, 10) catch return error.InvalidCpusetList;
+            if (last < first)
+                return error.InvalidCpusetList;
+            const bit_length = @TypeOf(cpus.*).bit_length;
+            var cpu_index = first;
+            while (cpu_index <= last and cpu_index < bit_length) : (cpu_index += 1)
+                cpus.set(cpu_index);
+        }
     }
 };
 
@@ -287,6 +354,82 @@ pub const pids = struct {
             return error.WorkerCgroupPidsMaxMismatch;
     }
 };
+
+/// A figure the server reads off a worker's leaf, while the worker runs or
+/// after it exited and before the leaf goes. The kernel keeps every one of
+/// them, so the worker cannot forge them.
+pub const LeafFigure = enum {
+    /// `memory.events.local`, the events of the leaf alone. With
+    /// `memory.oom.group` set, `oom_kill` counts every task one OOM kill
+    /// took, so a single group kill reads as at least 1.
+    memory_events,
+    /// `memory.current`, the bytes charged to the leaf now.
+    memory_current,
+    /// `memory.peak`, the most bytes ever charged to the leaf; Linux 5.19
+    /// and later.
+    memory_peak,
+    /// `usage_usec` of `cpu.stat`, the CPU every task of the leaf used, in
+    /// microseconds.
+    cpu_usage_usec,
+    /// The `some` total of `cpu.pressure`, the microseconds during which at
+    /// least one task of the leaf was runnable and not running. The file
+    /// exists only on a kernel with PSI.
+    cpu_pressure_some_usec,
+
+    pub fn Value(comptime figure: LeafFigure) type {
+        return switch (figure) {
+            .memory_events => memory.Events,
+            .memory_current, .memory_peak, .cpu_usage_usec, .cpu_pressure_some_usec => u64,
+        };
+    }
+
+    pub fn fileName(figure: LeafFigure) []const u8 {
+        return switch (figure) {
+            .memory_events => "memory.events.local",
+            .memory_current => "memory.current",
+            .memory_peak => "memory.peak",
+            .cpu_usage_usec => "cpu.stat",
+            .cpu_pressure_some_usec => "cpu.pressure",
+        };
+    }
+
+    /// Room for one read of the figure's file. A file outgrowing it fails
+    /// the read (`readLeafFigure`), never parses a truncated count.
+    pub fn bytesMax(figure: LeafFigure) usize {
+        return switch (figure) {
+            .memory_events => memory.events_bytes_max,
+            // One count of at most 20 digits and its newline.
+            .memory_current, .memory_peak => 64,
+            // The kernel's cgroup v2 documentation lists nine `<key> <count>`
+            // lines, the longest key `core_sched.force_idle_usec`; with
+            // 20-digit counts they take under 450 bytes.
+            .cpu_usage_usec => 1024,
+            // Two lines of three averages and a 20-digit total each, about
+            // 130 bytes.
+            .cpu_pressure_some_usec => 256,
+        };
+    }
+};
+
+/// Reads `figure` off `leaf` without allocating: one read of its file into a
+/// stack buffer of `LeafFigure.bytesMax`, then the parse. `leaf` is anything
+/// with `readFile(file_name, buffer) ![]const u8` that reads the leaf's file
+/// once into `buffer` and fails with `error.CgroupFileTooLarge` for a read
+/// that fills it: `host/cgroup_root.zig:WorkerLeaf`, which opens the file
+/// relative to the server's workers directory. This module sits below the
+/// host, so it takes the leaf by that method alone. Fails with the read's
+/// error, `error.FileNotFound` once the leaf is gone among them, or with the
+/// parser's.
+pub fn readLeafFigure(leaf: anytype, comptime figure: LeafFigure) !figure.Value() {
+    var buffer: [figure.bytesMax()]u8 = undefined;
+    const contents = try leaf.readFile(figure.fileName(), &buffer);
+    switch (figure) {
+        .memory_events => return memory.parseEvents(contents),
+        .memory_current, .memory_peak => return parseCount(contents),
+        .cpu_usage_usec => return cpu.parseStatUsageUsec(contents),
+        .cpu_pressure_some_usec => return cpu.parsePressureSomeTotalUsec(contents),
+    }
+}
 
 pub const path = struct {
     pub const CGROUP2_MOUNT_PATH = "/sys/fs/cgroup";
@@ -338,14 +481,6 @@ pub const path = struct {
         defer allocator.free(current_relative);
 
         return join(allocator, CGROUP2_MOUNT_PATH, current_relative, null);
-    }
-
-    pub fn file(
-        allocator: std.mem.Allocator,
-        cgroup_dir: []const u8,
-        file_name: []const u8,
-    ) ![]u8 {
-        return std.fmt.allocPrint(allocator, "{s}/{s}", .{ cgroup_dir, file_name });
     }
 
     pub fn openDir(cgroup_dir: []const u8) !std.posix.fd_t {
@@ -403,16 +538,6 @@ pub const worker = struct {
         pids_max: u64 = pids.DEFAULT_MAX,
     };
 
-    /// Fails unless every file the worker's limits and events use exists. A
-    /// limit file exists only when its controller is enabled in the parent's
-    /// `cgroup.subtree_control`, so this catches a missing controller.
-    pub fn ensureSurfaceAt(cgroup_dir_fd: std.posix.fd_t) !void {
-        inline for (surface_file_names) |file_name| {
-            const fd = try openReadOnlyAt(cgroup_dir_fd, file_name);
-            std.posix.close(fd);
-        }
-    }
-
     pub fn validateLimitsConfig(limits: Limits) !void {
         try memory.validateLimitBytes(limits.memory_limit_bytes);
         try cpu.validateConfig(limits.cpu_max_cores, limits.cpu_period_us);
@@ -469,16 +594,6 @@ pub const membership = struct {
             .only_expected = contains_expected and non_empty_count == 1,
         };
     }
-};
-
-const surface_file_names = [_][]const u8{
-    "cgroup.procs",
-    "memory.high",
-    "memory.max",
-    "memory.current",
-    "memory.events.local",
-    "cpu.max",
-    "pids.max",
 };
 
 pub fn openReadOnlyAt(cgroup_dir_fd: std.posix.fd_t, file_name: []const u8) !std.posix.fd_t {
@@ -554,17 +669,8 @@ fn readLimitFileAtBounded(
     return buffer[0..read_len];
 }
 
-fn readLimitFileAlloc(
-    allocator: std.mem.Allocator,
-    cgroup_dir: []const u8,
-    file_name: []const u8,
-    max_bytes: usize,
-) ![]u8 {
-    const file_path = try path.file(allocator, cgroup_dir, file_name);
-    defer allocator.free(file_path);
-
-    var file_handle = try std.fs.openFileAbsolute(file_path, .{});
-    defer file_handle.close();
-
-    return file_handle.readToEndAlloc(allocator, max_bytes);
+/// One count of a `memory.current` or `memory.peak` file, its trailing
+/// newline allowed.
+fn parseCount(contents: []const u8) !u64 {
+    return std.fmt.parseUnsigned(u64, std.mem.trim(u8, contents, &std.ascii.whitespace), 10);
 }

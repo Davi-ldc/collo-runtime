@@ -2,8 +2,8 @@
 //! client aggregate.
 
 comptime {
-    _ = @import("readiness.zig");
     _ = @import("integration.zig");
+    _ = @import("entry.zig");
     _ = @import("outgoing.zig");
     _ = @import("lifecycle.zig");
 }

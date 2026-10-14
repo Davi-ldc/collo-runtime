@@ -4,13 +4,8 @@
 //! the production path. Holds no tests.
 
 const std = @import("std");
-const gateway = @import("collo_egress_gateway");
-const ipc = @import("collo_ipc");
 const os = @import("collo_os");
 const network = @import("collo_egress_client").network;
-
-const control_flow = gateway.testing.control_flow;
-const policy = gateway.policy;
 
 /// Policy 1 of `standard`: any public host over HTTPS on port 443.
 pub const public_https_id: network.PolicyId = 1;
@@ -35,6 +30,29 @@ const standard_policies = [_][]const usize{ &standard_https_members, &standard_h
 /// The image every suite's hello carries unless the suite says otherwise; the caller frees it.
 pub fn standard(gpa: std.mem.Allocator) ![]u8 {
     return encode(gpa, &standard_settings, &standard_policies);
+}
+
+/// Policy 3 of `withOrigin`: plain HTTP to one IPv4 address and port.
+pub const origin_id: network.PolicyId = 3;
+
+/// `standard` with policy `origin_id`, which grants plain HTTP to `ipv4` on `port`, private
+/// networks included when `ipv4` is private, as a configuration naming that literal grants it.
+/// Loopback stays refused, as under every grant. The caller frees the image.
+pub fn withOrigin(gpa: std.mem.Allocator, ipv4: [4]u8, port: u16) ![]u8 {
+    const entry = [_]network.Pattern{.{ .host = .{ .ipv4 = ipv4 }, .port = port }};
+    const settings = [_]network.Setting{
+        standard_settings[0],
+        standard_settings[1],
+        .{
+            .allow = &entry,
+            .allow_http = true,
+            .allow_private_networks = entry[0].canReachPrivate(),
+        },
+    };
+    const origin_members = [_]usize{standard_settings.len};
+    const policies = [_][]const usize{ standard_policies[0], standard_policies[1], &origin_members };
+    comptime std.debug.assert(standard_policies.len + 1 == origin_id);
+    return encode(gpa, &settings, &policies);
 }
 
 /// The image of `settings`, in which policy `index + 1` holds the grants of the settings that
@@ -64,12 +82,6 @@ pub fn encode(
     return builder.encode(gpa);
 }
 
-/// The digest the image's header carries, which the gateway folds into each policy's isolation
-/// id.
-pub fn digest(image: []const u8) [std.crypto.hash.sha2.Sha256.digest_length]u8 {
-    return network.table.readHeader(image).digest;
-}
-
 /// A memfd that holds `image` under `seals`, as the server lends its image to a hello when
 /// `seals` is `memfd_readonly_seals`. The caller closes it; a hello carries a copy the kernel
 /// makes.
@@ -82,27 +94,4 @@ pub fn memfdHolding(image: []const u8, seals: usize) !os.fd.OwnedFd {
     try os.fd.writeAllRaw(memfd.fd(), image);
     try os.fd.addSeals(memfd.fd(), seals);
     return memfd;
-}
-
-/// What the gateway keeps after a hello that carries `image` under `key`: the decoded table and
-/// each policy's isolation id under the production limits, as `runtime/control_flow.zig`
-/// computes them, for suites that run the gateway's mixins without its control socket. The
-/// caller frees it with `HelloState.deinit` and `gpa`.
-pub fn helloState(
-    gpa: std.mem.Allocator,
-    image: []const u8,
-    key: ipc.egress_token.Key,
-) !control_flow.HelloState {
-    var table = try network.Table.decode(gpa, image);
-    errdefer table.deinit(gpa);
-    const isolation_ids = try gpa.alloc(policy.PoolIsolationId, table.policies.len);
-    const limits_id = policy.policyIsolationId(policy.production);
-    for (isolation_ids, 0..) |*isolation_id, index|
-        isolation_id.* = policy.networkPolicyIsolationId(limits_id, table.digest, @intCast(index));
-    return .{
-        .received = true,
-        .key = key,
-        .table = table,
-        .isolation_ids = isolation_ids,
-    };
 }

@@ -1,9 +1,9 @@
-//! The egress token (`common/ipc/egress_token.zig`): its pinned layout, the mint and verify
-//! round trip for both kinds, the tag checked against HMAC-SHA256 computed here, every single-byte
-//! change to the body and to the tag, other and zero keys, the version and kind checks that only
-//! run behind a matching tag, expiry at the deadline, and the byte round trip at any alignment.
-//! The gateway's admission, which binds a token to its session and keeps its budget, is covered by
-//! the egress-gateway lane.
+//! The egress token (`common/ipc/egress_token.zig`): its pinned layout with zeroed reserved
+//! fields, the mint and verify round trip for both kinds, the tag checked against HMAC-SHA256
+//! computed here, every single-byte change to the body and to the tag, other and zero keys, the
+//! kind check that only runs behind a matching tag, expiry at the deadline, and the byte round
+//! trip at any alignment. The gateway's admission, which binds a token to its session, is covered
+//! by the egress-gateway lane.
 
 const std = @import("std");
 const ipc = @import("collo_ipc");
@@ -21,7 +21,6 @@ const zero_key: Key = .{ .bytes = @splat(0) };
 const request_fields: egress_token.Fields = .{
     .kind = .request,
     .policy_id = 3,
-    .budget = 16,
     .session_id = 0x0102_0304_0506_0708,
     .request_id = 0x1112_1314_1516_1718,
     .request_generation = 0x2122_2324_2526_2728,
@@ -31,7 +30,6 @@ const request_fields: egress_token.Fields = .{
 const boot_fields: egress_token.Fields = .{
     .kind = .boot,
     .policy_id = 0,
-    .budget = 16,
     .session_id = 0x0102_0304_0506_0708,
     .request_id = 0,
     .request_generation = 0,
@@ -57,7 +55,7 @@ fn referenceTag(
 }
 
 /// `bytes` with the tag recomputed over its body, so the token passes the tag check whatever its
-/// version and kind bytes say.
+/// kind byte says.
 fn retagged(key: *const Key, bytes: egress_token.Bytes) Token {
     var copy = bytes;
     copy[egress_token.body_bytes..].* = referenceTag(key, copy[0..egress_token.body_bytes]);
@@ -71,10 +69,10 @@ test "the token keeps its pinned size and field offsets" {
     try std.testing.expectEqual(@as(usize, 40), egress_token.body_bytes);
     try std.testing.expectEqual(@as(usize, 16), egress_token.tag_bytes);
     try std.testing.expectEqual(@as(usize, 32), @sizeOf(Key));
-    try std.testing.expectEqual(@as(usize, 0), @offsetOf(Token, "version"));
-    try std.testing.expectEqual(@as(usize, 1), @offsetOf(Token, "kind"));
+    try std.testing.expectEqual(@as(usize, 0), @offsetOf(Token, "kind"));
+    try std.testing.expectEqual(@as(usize, 1), @offsetOf(Token, "reserved0"));
     try std.testing.expectEqual(@as(usize, 2), @offsetOf(Token, "policy_id"));
-    try std.testing.expectEqual(@as(usize, 4), @offsetOf(Token, "budget"));
+    try std.testing.expectEqual(@as(usize, 4), @offsetOf(Token, "reserved1"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(Token, "session_id"));
     try std.testing.expectEqual(@as(usize, 16), @offsetOf(Token, "request_id"));
     try std.testing.expectEqual(@as(usize, 24), @offsetOf(Token, "request_generation"));
@@ -82,10 +80,11 @@ test "the token keeps its pinned size and field offsets" {
     try std.testing.expectEqual(@as(usize, 40), @offsetOf(Token, "tag"));
 }
 
-test "a minted request token verifies to the fields it was minted with" {
+test "a minted request token verifies to the fields it was minted with and zeroes its reserved fields" {
     const token = egress_token.mint(&key_a, request_fields);
-    try std.testing.expectEqual(egress_token.version, token.version);
     try std.testing.expectEqual(egress_token.kind_request, token.kind);
+    try std.testing.expectEqual(@as(u8, 0), token.reserved0);
+    try std.testing.expectEqual(@as(u32, 0), token.reserved1);
     try std.testing.expectEqual(request_fields, try egress_token.verify(&key_a, &token));
 }
 
@@ -113,7 +112,7 @@ test "every single-byte change to the body fails with BadTag" {
     const token = egress_token.mint(&key_a, request_fields);
     const original = egress_token.asBytes(&token).*;
     // Each delta from 1 to 255 at each body offset is every value the byte can take other than
-    // its own; the version and kind bytes are among them and still fail on the tag.
+    // its own; the kind and reserved bytes are among them and still fail on the tag.
     for (0..egress_token.body_bytes) |offset| {
         for (1..256) |delta| {
             var tampered = original;
@@ -171,19 +170,7 @@ test "the zero key verifies nothing, not even a token tagged under it" {
     try std.testing.expectError(error.BadTag, egress_token.verify(&zero_key, &minted));
 }
 
-test "a tagged token with another version fails with BadVersion, and an untagged one with BadTag" {
-    const minted = egress_token.mint(&key_a, request_fields);
-    for ([_]u8{ 0, egress_token.version + 1, 0xff }) |other_version| {
-        var bytes = egress_token.asBytes(&minted).*;
-        bytes[@offsetOf(Token, "version")] = other_version;
-        const tagged = retagged(&key_a, bytes);
-        try std.testing.expectError(error.BadVersion, egress_token.verify(&key_a, &tagged));
-        const untagged = egress_token.fromBytes(&bytes);
-        try std.testing.expectError(error.BadTag, egress_token.verify(&key_a, &untagged));
-    }
-}
-
-test "a tagged token with an unknown kind fails with BadKind" {
+test "a tagged token with an unknown kind fails with BadKind, and an untagged one with BadTag" {
     const minted = egress_token.mint(&key_a, request_fields);
     for ([_]u8{ 0, egress_token.kind_boot + 1, 0xff }) |other_kind| {
         var bytes = egress_token.asBytes(&minted).*;
@@ -191,6 +178,8 @@ test "a tagged token with an unknown kind fails with BadKind" {
         const tagged = retagged(&key_a, bytes);
         try std.testing.expectError(error.BadKind, egress_token.verify(&key_a, &tagged));
         try std.testing.expectError(error.BadKind, egress_token.decodeKind(other_kind));
+        const untagged = egress_token.fromBytes(&bytes);
+        try std.testing.expectError(error.BadTag, egress_token.verify(&key_a, &untagged));
     }
     const request_kind = try egress_token.decodeKind(egress_token.kind_request);
     const boot_kind = try egress_token.decodeKind(egress_token.kind_boot);

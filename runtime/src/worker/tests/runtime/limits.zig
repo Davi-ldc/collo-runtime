@@ -3,8 +3,7 @@
 //! its definition's `cpuMs`, stops a handler that spins at the sentinel's
 //! CPU deadline with 503 `cpu` and retires the worker; a request that
 //! spends its budget across short turns is answered 503 at a boundary and
-//! leaves the VM serving; waiting is not CPU; the crypto pool's CPU on a
-//! request's job counts at the settlement; and JavaScript no request owns, a
+//! leaves the VM serving; waiting is not CPU; and JavaScript no request owns, a
 //! FinalizationRegistry callback the deferred-work pump runs, is stopped by
 //! the worker owner's wall limit. Fires of a request's wall deadline are in
 //! `arbiter.zig`, and a reaction of a finished request stopped inside
@@ -18,7 +17,6 @@ const worker = @import("collo_worker");
 const rt = @import("collo_test_harness");
 const process = @import("collo_os").process;
 const request_context = @import("collo_worker_request").context;
-const worker_shared_page = @import("collo_worker_state").page;
 const retirement_notice = @import("retirement_notice.zig");
 
 const sentinel = worker.testing.sentinel;
@@ -32,7 +30,6 @@ const Fixture = struct {
     completion: rt.CompletionFixture,
     now_mono_ns: u64,
     runtime: worker.Runtime,
-    records: worker_shared_page.RecordCursor,
 
     const Limits = struct {
         request_cpu_budget_ns: u64 = 0,
@@ -51,7 +48,6 @@ const Fixture = struct {
         self.completion = try rt.CompletionFixture.init();
         errdefer self.completion.deinit();
         self.now_mono_ns = 0;
-        self.records = .{};
         self.runtime = try worker.Runtime.init(
             std.testing.allocator,
             &self.vm,
@@ -88,43 +84,7 @@ const Fixture = struct {
         defer dispatch.deinit();
         try rt.enqueueIngressRoute(&self.runtime, &dispatch, stream_id, .{ .path = "/limits" });
     }
-
-    /// The usage record of `request_id`, from the records published since
-    /// the last call.
-    fn usageRecord(self: *Fixture, request_id: u64) !worker_shared_page.CompletedRecord {
-        var out: [8]worker_shared_page.CompletedRecord = undefined;
-        const count = self.records.drain(
-            self.completion.view.header,
-            self.completion.view.completed_records,
-            &out,
-        ) orelse return error.UsageRingCorrupt;
-        for (out[0..count]) |record| {
-            if (record.request_id == request_id)
-                return record;
-        }
-        return error.UsageRecordMissing;
-    }
 };
-
-/// Runs the collectors a crypto job and a handler's settlement need, and the
-/// ready queue, until `request_id` ends, for up to `budget_ns` of real time:
-/// a pool thread's job takes real time the harness's pass count does not
-/// bound.
-fn runUntilDone(runtime: *worker.Runtime, request_id: u64, budget_ns: u64) !void {
-    const stop_ns = process.monotonicNowNsOrZero() + budget_ns;
-    while (runtime.requests.active.contains(request_id)) {
-        if (process.monotonicNowNsOrZero() >= stop_ns)
-            return error.RequestDidNotComplete;
-        try runtime.collectCompletedCryptoJobs();
-        runtime.collectReadyRequestCompletions();
-        try runtime.collectDueTimers();
-        if (runtime.scheduler.ready_queue.pop()) |item| {
-            try worker.testing.executeWorkItem(runtime, item);
-            continue;
-        }
-        std.Thread.sleep(std.time.ns_per_ms);
-    }
-}
 
 test "a handler that spins past its CPU budget is stopped for CPU and answers 503 cpu, and the worker asks to retire" {
     var fixture: Fixture = undefined;
@@ -132,7 +92,7 @@ test "a handler that spins past its CPU budget is stopped for CPU and answers 50
     defer fixture.deinit();
     const runtime = &fixture.runtime;
 
-    const route_index = try rt.registerRoute(runtime, "/__collo_route/demo/limits-spin.js",
+    const route_index = try rt.registerRoute(runtime, "/var/task/limits-spin.js",
         \\export default function handle() {
         \\    for (;;) {}
         \\}
@@ -152,9 +112,7 @@ test "a handler that spins past its CPU budget is stopped for CPU and answers 50
     defer response.deinit();
     try std.testing.expectEqual(@as(u16, 503), response.status);
     try std.testing.expectEqual(ipc.RequestDoneStatus.cpu_exceeded, response.doneStatus());
-    const record = try fixture.usageRecord(request_id);
-    try std.testing.expectEqual(@intFromEnum(worker_shared_page.CompletedStatus.cpu), record.status);
-    try std.testing.expect(record.cpu_ns >= 30 * std.time.ns_per_ms);
+    try std.testing.expect(response.done.cpu_ns >= 30 * std.time.ns_per_ms);
 
     try runtime.checkRetirement();
     try std.testing.expectEqual(ipc.WorkerRetiringReason.vm_terminated, try retirement_notice.read(fixture.control_pair[1]));
@@ -166,7 +124,7 @@ test "a handler that waits on a timer spends no CPU budget waiting and answers 2
     defer fixture.deinit();
     const runtime = &fixture.runtime;
 
-    const route_index = try rt.registerRoute(runtime, "/__collo_route/demo/limits-wait.js",
+    const route_index = try rt.registerRoute(runtime, "/var/task/limits-wait.js",
         \\export default async function handle() {
         \\    await new Promise((resolve) => setTimeout(resolve, 200));
         \\    return new Response("waited");
@@ -179,11 +137,10 @@ test "a handler that waits on a timer spends no CPU budget waiting and answers 2
 
     fixture.now_mono_ns += 200 * std.time.ns_per_ms;
     try rt.executeUntilRequestDone(runtime, request_id);
-    const body = try rt.readIngressResponseBody(runtime, fixture.control_pair[1], request_id);
-    defer std.testing.allocator.free(body);
-    try std.testing.expectEqualStrings("waited", body);
-    const record = try fixture.usageRecord(request_id);
-    try std.testing.expectEqual(@intFromEnum(worker_shared_page.CompletedStatus.done), record.status);
+    var response = try rt.readIngressResponse(runtime, fixture.control_pair[1], request_id);
+    defer response.deinit();
+    try std.testing.expectEqualStrings("waited", response.body);
+    try std.testing.expectEqual(ipc.RequestDoneStatus.ok, response.doneStatus());
 }
 
 test "a handler that spends its CPU budget across short turns answers 503 at a boundary, and the worker serves on" {
@@ -194,7 +151,7 @@ test "a handler that spends its CPU budget across short turns answers 503 at a b
 
     // Each timer turn spins 5 ms of real time; 40 of them would take
     // 200 ms, far past the budget, unless a boundary stops the chain.
-    const route_index = try rt.registerRoute(runtime, "/__collo_route/demo/limits-turns.js",
+    const route_index = try rt.registerRoute(runtime, "/var/task/limits-turns.js",
         \\export default function handle(request) {
         \\    if (new URL(request.url).pathname.endsWith("/quick"))
         \\        return new Response("quick");
@@ -239,37 +196,6 @@ test "a handler that spends its CPU budget across short turns answers 503 at a b
     try std.testing.expect(runtime.retirement.reason == null);
 }
 
-test "the crypto pool's CPU on a request's job counts against its budget at the settlement" {
-    var fixture: Fixture = undefined;
-    try fixture.init(.{ .request_cpu_budget_ns = 30 * std.time.ns_per_ms, .start_sentinel = false });
-    defer fixture.deinit();
-    const runtime = &fixture.runtime;
-
-    // PBKDF2 at the bridge's largest iteration count costs the pool thread
-    // well over 30 ms of CPU, while the handler's own turns cost a few
-    // milliseconds.
-    const route_index = try rt.registerRoute(runtime, "/__collo_route/demo/limits-crypto.js",
-        \\export default async function handle() {
-        \\    const key = await crypto.subtle.importKey(
-        \\        "raw", new TextEncoder().encode("password"), "PBKDF2", false, ["deriveBits"]);
-        \\    await crypto.subtle.deriveBits(
-        \\        { name: "PBKDF2", hash: "SHA-256", salt: new Uint8Array(16), iterations: 1000000 },
-        \\        key, 256);
-        \\    return new Response("derived");
-        \\}
-    );
-    const request_id: u64 = 35;
-    try fixture.enqueue(request_id, route_index, 1, std.time.ns_per_hour);
-    try rt.executeNextReady(runtime);
-    try runUntilDone(runtime, request_id, 30 * std.time.ns_per_s);
-    var response = try rt.readIngressResponse(runtime, fixture.control_pair[1], request_id);
-    defer response.deinit();
-    try std.testing.expectEqual(@as(u16, 503), response.status);
-    try std.testing.expectEqual(ipc.RequestDoneStatus.cpu_exceeded, response.doneStatus());
-    const record = try fixture.usageRecord(request_id);
-    try std.testing.expect(record.cpu_ns >= 30 * std.time.ns_per_ms);
-}
-
 test "a FinalizationRegistry callback that spins is stopped by the worker owner's limit, and the worker asks to retire" {
     var fixture: Fixture = undefined;
     try fixture.init(.{
@@ -281,7 +207,7 @@ test "a FinalizationRegistry callback that spins is stopped by the worker owner'
 
     // Many targets, so a collection finds some of them dead whatever a
     // conservative scan of the stack keeps.
-    const route_index = try rt.registerRoute(runtime, "/__collo_route/demo/limits-registry.js",
+    const route_index = try rt.registerRoute(runtime, "/var/task/limits-registry.js",
         \\export default function handle() {
         \\    globalThis.__registry = new FinalizationRegistry(() => { for (;;) {} });
         \\    for (let i = 0; i < 4096; i++) globalThis.__registry.register({ i }, i);

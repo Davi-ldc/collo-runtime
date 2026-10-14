@@ -72,6 +72,7 @@ fn addReleaseStep(
         return;
     };
     const target = b.resolveTargetQuery(query);
+    const cxx_sysroot = options_mod.cxxSysrootFor(b, opts, target);
 
     const compiler_rt = b.graph.env_map.get("COLLO_COMPILER_RT_BUILTINS") orelse
         options_mod.discoverCompilerRtBuiltins(b, spec.arch) orelse {
@@ -85,7 +86,7 @@ fn addReleaseStep(
         b,
         target,
         opts.cxx_stdlib_version,
-        opts.cxx_sysroot,
+        cxx_sysroot,
         opts.native_cxx_linker,
         compiler_rt,
     ) orelse {
@@ -105,7 +106,7 @@ fn addReleaseStep(
     // whose tools generate its data.
     const native_target: deps_mod.Target = .{
         .target = target,
-        .cxx_sysroot = opts.cxx_sysroot,
+        .cxx_sysroot = cxx_sysroot,
         .mcpu = toolchain_ptr.target_mcpu,
     };
     const icu = shared.native.icu(native_target);
@@ -127,7 +128,7 @@ fn addReleaseStep(
             .cmake_build_type = jsc_cmake_build_type,
             .jsc_build_dir = engine.jsc,
             .webkit_source_dir = engine.webkit_src,
-            .cxx_sysroot = opts.cxx_sysroot,
+            .cxx_sysroot = cxx_sysroot,
             .mcpu = toolchain_ptr.target_mcpu,
             .icu = icu,
         }),

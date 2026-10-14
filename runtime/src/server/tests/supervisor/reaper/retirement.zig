@@ -1,27 +1,35 @@
-//! Retirement on the reaper (`server/supervisor/reaper/`). A lane's deadline
-//! floor leaves its worker alive, and a worker that left service is torn down
-//! by the reaper, never by the thread that decided it was done. An idle
-//! worker past its TTL with no reader retires at once, and one with a reader
-//! leaves service and is torn down only after that reader gives its role up;
-//! the idle pass asks such a reader again, whichever retirement it holds up.
-//! The watch over the idle workers no lane reads retires one that sends its
-//! retiring notice as recycled, and one that exits or hangs up its control
-//! socket as dead, and leaves a worker a lane reads to that lane. A
-//! retirement naming a worker still in service is refused, a removal that
-//! leaves its pool wanting a worker asks for a launch, and a failed launch's
-//! leftovers are torn down like a worker. Each worker the reaper retires gets
-//! one line in `workers.jsonl` saying how it ended, even when the stream is
-//! full; the shutdown's lines are `supervisor.zig`'s. The reaper's queue, idle
-//! pass and watch run on the test thread here
-//! (`drainRetirements`, `retireIdleWorkers`, `pollWatchedWorkers`), with the
-//! lanes and the launcher replaced by a double that records what the reaper
-//! asks of them. The reaper thread's loop, with its waits and its readings of
-//! the node's memory, runs only in a whole server (`local-e2e`). Lane
+//! Retirement on the reaper (`server/supervisor/reaper/`). A lane that ends a
+//! request at its deadline leaves its worker alive, and a worker that left
+//! service is torn down by the reaper, never by the thread that decided it
+//! was done. An idle worker past its TTL with no reader retires at once, and
+//! one with a reader leaves service and is torn down only after that reader
+//! gives its role up; the idle pass asks such a reader again, whichever
+//! retirement it holds up. The watch over the idle workers no lane reads
+//! retires one that sends its retiring notice as recycled, and one that exits
+//! or hangs up its control socket as dead, and leaves a worker a lane reads
+//! to that lane, one a lane took between the scan and the poll included,
+//! whose answer to that lane turned its socket readable. A retirement naming
+//! a worker still in service is refused, a
+//! removal that leaves its pool wanting a worker asks for a launch, and a
+//! failed launch's leftovers are torn down like a worker, the console lines
+//! its child logged drained once it is dead, under its definition with no
+//! worker id and no request. Each worker the reaper retires gets one line in
+//! `workers.jsonl` saying how it ended, even when the stream is full, and a
+//! worker the launcher retired for its egress session gets the death it met
+//! first when one came before the retirement; the
+//! shutdown's lines are `supervisor.zig`'s. The reaper's queue, idle pass and
+//! watch run on the test thread here (`drainRetirements`,
+//! `retireIdleWorkers`, `pollWatchedWorkers`, or its two halves
+//! `scanWatchedWorkers` and `pollScannedWorkers`), with the lanes and the
+//! launcher replaced by a double that records what the reaper asks of them.
+//! The reaper thread's loop, with its waits and its readings of the node's
+//! memory, runs only in a whole server (`local-e2e`). Lane
 //! `server-supervisor-test`.
 
 const std = @import("std");
 const host = @import("collo_host");
 const ipc = @import("collo_ipc");
+const analytics = @import("collo_server_analytics");
 const config = @import("collo_server_config");
 const lifecycle = @import("collo_server_lifecycle");
 const process = @import("collo_os").process;
@@ -209,14 +217,12 @@ fn reap(pid: std.posix.pid_t) void {
 var inert_payload_bytes: [0]u8 align(std.heap.page_size_min) = .{};
 var inert_payload_header: ipc.ingress_channel.SharedPayloadHeader = std.mem.zeroes(ipc.ingress_channel.SharedPayloadHeader);
 
-var path_sequence: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
-
 /// A worker handle for `child` that `WorkerHandle.deinit` takes apart end to
-/// end, taking over `child.pidfd`: a cgroup path that is never created, so
-/// the teardown never reaches the delegated cgroup subtree and leaves nothing
-/// on disk, a control socket whose peer is closed, eventfds, the payload
-/// memfd and a real shared page. The reaper's watch takes the closed peer for
-/// the worker's death.
+/// end, taking over `child.pidfd`: a cgroup leaf that names nothing
+/// (`fixture.inertLeaf`), so the teardown never reaches the delegated cgroup
+/// subtree and leaves nothing on disk, a control socket whose peer is
+/// closed, eventfds and a real shared page. The reaper's watch takes the
+/// closed peer for the worker's death.
 fn handleFor(allocator: std.mem.Allocator, child: *const ParkedChild) !host.WorkerHandle {
     var peer: os_fd.OwnedFd = .{};
     defer peer.deinit();
@@ -228,12 +234,7 @@ fn handleFor(allocator: std.mem.Allocator, child: *const ParkedChild) !host.Work
 /// is open inherits it, and its copy keeps the socket from hanging up, so a
 /// test spawns its children first.
 fn handleWithPeer(allocator: std.mem.Allocator, child: *const ParkedChild, peer: *os_fd.OwnedFd) !host.WorkerHandle {
-    const cgroup_dir = try std.fmt.allocPrint(allocator, "/tmp/collo-test-retire-{d}-{d}/cgroup", .{
-        std.os.linux.getpid(),
-        path_sequence.fetchAdd(1, .monotonic),
-    });
-    defer allocator.free(cgroup_dir);
-
+    const leaf = try fixture.inertLeaf(allocator);
     const pair = try os_fd.socketPairType(std.posix.SOCK.SEQPACKET);
     errdefer std.posix.close(pair[0]);
     var worker_end = os_fd.OwnedFd.fromRaw(pair[1]);
@@ -242,31 +243,40 @@ fn handleWithPeer(allocator: std.mem.Allocator, child: *const ParkedChild, peer:
     errdefer std.posix.close(completion_eventfd);
     const credit_eventfd = try std.posix.eventfd(0, 0);
     errdefer std.posix.close(credit_eventfd);
-    const payload_fd = try worker_shared_page.createMemfd("collo-test-retire-payload");
-    errdefer std.posix.close(payload_fd);
+    // Mapped, then closed, as a launch does once the child holds its copy.
     const metrics_fd = try worker_shared_page.createMemfd("collo-test-retire-metrics");
-    errdefer std.posix.close(metrics_fd);
-    var metrics = try worker_shared_page.mapReadWrite(metrics_fd);
+    defer std.posix.close(metrics_fd);
+    var metrics = try worker_shared_page.mapHostReader(metrics_fd);
     errdefer metrics.deinit();
-    metrics.initializeCrashDefault();
 
-    const handle = try host.WorkerHandle.init(
-        allocator,
-        @intCast(child.pid),
-        child.pidfd,
-        pair[0],
-        cgroup_dir,
-        64 * 1024 * 1024,
-        1,
-        metrics_fd,
-        completion_eventfd,
-        payload_fd,
-        credit_eventfd,
-        .{ .bytes = &inert_payload_bytes, .header = &inert_payload_header, .side = .server },
-        metrics,
-        -1,
-    );
     peer.* = worker_end;
+    return .{
+        .pid = @intCast(child.pid),
+        .pidfd = child.pidfd,
+        .control_fd = pair[0],
+        .leaf = leaf,
+        .completion_eventfd = completion_eventfd,
+        .ingress_payload_credit_eventfd = credit_eventfd,
+        .ingress_payload = .{ .bytes = &inert_payload_bytes, .header = &inert_payload_header, .side = .server },
+        .metrics = metrics,
+    };
+}
+
+/// `handleFor` whose page carries the sentinel's memory stamp, as a worker
+/// its sentinel stopped past `memory.high` leaves it.
+fn handleStampedMemory(allocator: std.mem.Allocator, child: *const ParkedChild) !host.WorkerHandle {
+    var handle = try handleFor(allocator, child);
+    errdefer handle.deinit();
+    const page_fd = try worker_shared_page.createMemfd("collo-test-retire-memory");
+    defer std.posix.close(page_fd);
+    var worker_page = try worker_shared_page.mapWorkerWriter(page_fd);
+    defer worker_page.deinit();
+    @atomicStore(u32, &worker_page.header.termination_reason, @intFromEnum(worker_shared_page.TerminationReason.memory), .release);
+    var stamped = try worker_shared_page.mapHostReader(page_fd);
+    errdefer stamped.deinit();
+    if (handle.metrics) |*unstamped|
+        unstamped.deinit();
+    handle.metrics = stamped;
     return handle;
 }
 
@@ -297,7 +307,7 @@ fn expectTornDown(supervisor: *Supervisor, worker: *WorkerRecord) !void {
     try testing.expect(supervisor.poolFor(worker.definition_index).inspect(worker) == null);
 }
 
-test "a lane's deadline floor settles its request and leaves the worker alive in its pool (#39)" {
+test "a lane that ends a request at its deadline takes its floor and leaves the worker alive in its pool (#39)" {
     var harness: Harness = undefined;
     try harness.init(.{});
     defer harness.deinit();
@@ -308,17 +318,18 @@ test "a lane's deadline floor settles its request and leaves the worker alive in
     const demo_pool = supervisor.poolFor(demo);
     const key = worker.key();
 
-    // Lane 0's request reached its deadline with no completion, and the lane
-    // writes its floor while it still holds the slot.
+    // Lane 0's request reached its deadline with no `request_done`, and the
+    // lane takes its floor and ends its entry while it still holds the slot.
     const served = try expectAcquired(demo_pool, 0, 1);
-    try worker.requests.record(fixture.dispatchedRequest(1));
-    supervisor.settleRequest(worker, 1, .{ .floor = .{ .status = .deadline } }, fixture.request_ended_ns);
-    // With no analytics directory the sink counts the floor and drops it.
-    try testing.expectEqual(@as(u64, 1), supervisor.analytics.stats(.usage).discarded);
-    // The floor's entry stays parked, for a late record of the request.
-    try testing.expect(worker.requests.verdict(1) == .skip);
+    const dispatched = fixture.dispatchedRequest(1);
+    try worker.requests.record(dispatched);
+    _ = worker.usageFloor(served.slot, .{
+        .request_id = dispatched.request_id,
+        .request_generation = dispatched.request_key.generation,
+    }, .deadline);
+    worker.requests.end(dispatched.request_id);
 
-    // The settle killed nothing and emptied nothing: the process runs, the
+    // The finish killed nothing and emptied nothing: the process runs, the
     // record holds the same worker with its page drainable, and the slot is
     // still the lane's to give back.
     try testing.expect(child.alive());
@@ -499,19 +510,24 @@ test "a failed launch's leftovers are torn down on the reaper, the child killed 
     defer harness.deinit();
     var child = try ParkedChild.spawn();
     defer child.deinit();
-    var leaf_path: []u8 = undefined;
-    const leaf = try fixture.openScratchDir(testing.allocator, &leaf_path);
+    // A plain directory stands in for the workers directory, with the leaf
+    // the launch created in it.
+    var workers_path: []u8 = undefined;
+    var workers_dir = try fixture.openScratchDir(testing.allocator, &workers_path);
     defer {
-        std.fs.deleteTreeAbsolute(leaf_path) catch {};
-        testing.allocator.free(leaf_path);
+        workers_dir.close();
+        std.fs.deleteTreeAbsolute(workers_path) catch {};
+        testing.allocator.free(workers_path);
     }
+    const job_id: u64 = 7;
+    try workers_dir.makeDir("worker-7");
 
     // The launcher hands over what the child left, and never kills, waits or
     // removes anything itself.
-    harness.reaper.queueLeftovers(.{ .child = .{
+    harness.reaper.queueLeftovers(.{ .definition = demo, .child = .{
         .pid = @intCast(child.pid),
         .pidfd = os_fd.OwnedFd.fromRaw(child.pidfd),
-        .cgroup_dir = os_fd.OwnedFd.fromRaw(leaf.fd),
+        .leaf = .{ .workers_dir_fd = workers_dir.fd, .job_id = job_id },
     } });
     try testing.expect(child.alive());
 
@@ -519,8 +535,94 @@ test "a failed launch's leftovers are torn down on the reaper, the child killed 
     // table they held.
     try testing.expectEqual(@as(usize, 1), harness.reaper.drainRetirements());
     try testing.expect(!child.alive());
-    try testing.expectError(error.FileNotFound, std.fs.accessAbsolute(leaf_path, .{}));
+    try testing.expectError(error.FileNotFound, workers_dir.access("worker-7", .{}));
     try testing.expectEqual(@as(usize, 1), harness.recording.leftovers_reaped);
+}
+
+/// One line of `logs.jsonl`, field for field.
+const LogLine = struct {
+    ts: u64,
+    worker: []const u8,
+    route: []const u8,
+    worker_id: u64,
+    worker_generation: u64,
+    request_id: u64,
+    level: []const u8,
+    message: []const u8,
+    truncated: bool,
+    exception: bool,
+};
+
+test "a failed launch's console lines are drained once its child is dead, under its definition with no worker id and no request" {
+    var analytics_dir = try fixture.AnalyticsDir.init(testing.allocator);
+    defer analytics_dir.deinit(testing.allocator);
+    var harness: Harness = undefined;
+    try harness.init(.{});
+    defer harness.deinit();
+    var child = try ParkedChild.spawn();
+    defer child.deinit();
+
+    // A sink of the test's own, whose console stream goes to a pipe the test
+    // reads, stands in for the fixture's for the length of the test.
+    const console = try std.posix.pipe2(.{ .CLOEXEC = true });
+    defer std.posix.close(console[0]);
+    defer std.posix.close(console[1]);
+    try os_fd.setNonblocking(console[0], true);
+    var sink: analytics.Sink = undefined;
+    try sink.open(testing.allocator, .{ .directory = analytics_dir.path, .console_fd = console[1] });
+    defer sink.close();
+    const fixture_sink = harness.supervisor.analytics;
+    harness.supervisor.analytics = &sink;
+    defer harness.supervisor.analytics = fixture_sink;
+
+    // The test plays the child through a mapping of its own: a tenant line
+    // from the boot's evaluation, one that claims a request the child was
+    // never dispatched, and the runtime's report of the failed boot.
+    const page_fd = try worker_shared_page.createMemfd("collo-test-failed-launch-page");
+    defer std.posix.close(page_fd);
+    var child_page = try worker_shared_page.mapWorkerWriter(page_fd);
+    defer child_page.deinit();
+    child_page.publishLogLine(.info, 0, 0, 1, "top-level code ran");
+    child_page.publishLogLine(.info, 0, 77, 1, "claims a request");
+    child_page.publishLogLine(.err, worker_shared_page.LogLineFlags.runtime, 0, 1, "worker boot failed: InitDeadlineExceeded");
+
+    harness.reaper.queueLeftovers(.{ .definition = beta, .child = .{
+        .pid = @intCast(child.pid),
+        .pidfd = os_fd.OwnedFd.fromRaw(child.pidfd),
+        .page = try worker_shared_page.mapHostReader(page_fd),
+    } });
+    try testing.expectEqual(@as(usize, 1), harness.reaper.drainRetirements());
+    try testing.expect(!child.alive());
+    try testing.expectEqual(@as(usize, 1), harness.recording.leftovers_reaped);
+
+    // Every line reaches stderr under the definition's name, the runtime's
+    // under its label.
+    sink.flushConsole();
+    var console_buffer: [4096]u8 = undefined;
+    const console_text = console_buffer[0..try std.posix.read(console[0], &console_buffer)];
+    try testing.expect(std.mem.indexOf(u8, console_text, "[beta] top-level code ran\n") != null);
+    try testing.expect(std.mem.indexOf(u8, console_text, "[beta] claims a request\n") != null);
+    try testing.expect(std.mem.indexOf(u8, console_text, "[beta runtime] worker boot failed: InitDeadlineExceeded\n") != null);
+
+    // The tenant's lines enter its log with worker id 0, which no worker
+    // has, and request id 0; the runtime's line does not.
+    sink.flush(process.monotonicNowNsOrZero());
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const records = try analytics_dir.tmp.dir.readFileAlloc(arena.allocator(), analytics.sink.fileName(.logs).?, 64 * 1024);
+    var lines = std.mem.splitScalar(u8, records, '\n');
+    const expected = [_][]const u8{ "top-level code ran", "claims a request" };
+    for (expected) |message| {
+        const line = try std.json.parseFromSliceLeaky(LogLine, arena.allocator(), lines.next() orelse "", .{});
+        try testing.expectEqualStrings("beta", line.worker);
+        try testing.expectEqualStrings("", line.route);
+        try testing.expectEqual(@as(u64, 0), line.worker_id);
+        try testing.expectEqual(@as(u64, 0), line.worker_generation);
+        try testing.expectEqual(@as(u64, 0), line.request_id);
+        try testing.expectEqualStrings(message, line.message);
+    }
+    try testing.expectEqualStrings("", lines.next() orelse "");
+    try testing.expectEqual(@as(?[]const u8, null), lines.next());
 }
 
 test "an idle worker no lane reads that sends its retiring notice is retired by the watch as recycled, with no death" {
@@ -626,6 +728,58 @@ test "the watch leaves a worker a lane reads to that lane, its notice included" 
     try testing.expect(child.alive());
     try testing.expectEqual(pool_mod.EntryState.live, (demo_pool.inspect(worker) orelse return error.TestExpectedWorker).state);
     try testing.expectEqual(@as(u64, 0), harness.reaper.countersSnapshot().notices_seen);
+}
+
+test "the watch keeps in service a worker a lane took after the scan, whose answer turned its control socket readable, and retires it on a notice once a scan sees it unread again (#156)" {
+    var harness: Harness = undefined;
+    try harness.init(.{});
+    defer harness.deinit();
+    var child = try ParkedChild.spawn();
+    defer child.deinit();
+    var peer: os_fd.OwnedFd = .{};
+    defer peer.deinit();
+    const supervisor = &harness.supervisor;
+    const worker = try fixture.publishWorker(supervisor, try handleWithPeer(testing.allocator, &child, &peer), .{});
+    const demo_pool = supervisor.poolFor(demo);
+
+    // The scan lists the worker, published idle with no reader. Before the
+    // poll, lane 0 takes a slot through the pool, which tells the reaper
+    // nothing, and the worker's answer to it turns the socket readable.
+    try testing.expectEqual(@as(usize, 1), harness.reaper.scanWatchedWorkers());
+    const served = try expectAcquired(demo_pool, 0, 1);
+    const epoch = try expectNewReader(served);
+    _ = try std.posix.write(peer.fd(), "answer");
+    try testing.expectEqual(@as(usize, 1), harness.reaper.pollScannedWorkers());
+    try testing.expect(child.alive());
+    var view = demo_pool.inspect(worker) orelse return error.TestExpectedWorker;
+    try testing.expectEqual(pool_mod.EntryState.live, view.state);
+    try testing.expectEqual(@as(u8, 1), view.slots_held);
+    try testing.expectEqual(@as(?pool_mod.ReaderTenure, .{ .lane = 0, .epoch = epoch }), view.reader);
+
+    // Lane 0 reads the answer, ends its request and gives the role up, and
+    // the worker then asks to be retired. A poll over the old scan still
+    // refuses, since lane 0's tenure moved the epoch the scan saw.
+    var answer: [16]u8 = undefined;
+    _ = try std.posix.read(worker.handle.control_fd, &answer);
+    try testing.expect((try demo_pool.release(worker, served.slot, 10)) == .idle);
+    try testing.expectEqual(pool_mod.Transfer.vacated, demo_pool.transferReader(worker, .{ .lane = 0, .epoch = epoch }, .nothing));
+    try ipc.worker_retiring.send(peer.fd(), .routes_failed);
+    try testing.expectEqual(@as(usize, 1), harness.reaper.pollScannedWorkers());
+    try testing.expect(child.alive());
+    view = demo_pool.inspect(worker) orelse return error.TestExpectedWorker;
+    try testing.expectEqual(pool_mod.EntryState.live, view.state);
+
+    // The next scan sees the worker unread under its new epoch, and the
+    // notice retires it as recycled.
+    try testing.expectEqual(@as(usize, 1), harness.reaper.pollWatchedWorkers());
+    try testing.expect(!child.alive());
+    try expectTornDown(supervisor, worker);
+    const counters = harness.reaper.countersSnapshot();
+    try testing.expectEqual(@as(u64, 3), counters.notices_seen);
+    try testing.expectEqual(@as(u64, 2), counters.notices_stale);
+    try testing.expectEqual(@as(u64, 1), counters.retired_recycled);
+    try testing.expectEqual(@as(u64, 0), counters.deaths_seen);
+    try testing.expectEqual(@as(u64, 1), demo_pool.snapshot().counters.notice_retirements);
 }
 
 test "the idle pass asks again the reader that holds up a worker retiring on its notice, and the retirement then finishes as recycled" {
@@ -744,6 +898,69 @@ test "each worker the reaper retires gets one line in workers.jsonl that says ho
     try testing.expectEqual(@as(u64, 0), supervisor.analytics.stats(.workers).dropped);
 }
 
+test "an egress retirement records the death its worker met first: memory from the page, a crash from an exit, and its own ending only for a worker still running" {
+    var analytics_dir = try fixture.AnalyticsDir.init(testing.allocator);
+    defer analytics_dir.deinit(testing.allocator);
+    var harness: Harness = undefined;
+    try harness.init(.{ .analytics_directory = analytics_dir.path });
+    defer harness.deinit();
+    var running_child = try ParkedChild.spawn();
+    defer running_child.deinit();
+    var crashed_child = try ParkedChild.spawn();
+    defer crashed_child.deinit();
+    var memory_child = try ParkedChild.spawn();
+    defer memory_child.deinit();
+    var removed_child = try ParkedChild.spawn();
+    defer removed_child.deinit();
+    const supervisor = &harness.supervisor;
+    const Case = struct {
+        child: *const ParkedChild,
+        definition: config.DefinitionIndex,
+        memory_stamped: bool = false,
+        departure: pool_mod.Departure,
+        ending: []const u8,
+    };
+    const cases = [_]Case{
+        .{ .child = &running_child, .definition = demo, .departure = .egress, .ending = "egress_reattach" },
+        .{ .child = &crashed_child, .definition = beta, .departure = .egress, .ending = "crash" },
+        .{ .child = &memory_child, .definition = gamma, .memory_stamped = true, .departure = .egress, .ending = "memory_high" },
+        // A session its gateway removed for the worker's doing, still running; the pool takes
+        // one worker at a time, and the first case's is gone by then.
+        .{ .child = &removed_child, .definition = demo, .departure = .egress_removed, .ending = "egress_session_removed" },
+    };
+    var worker_ids: [cases.len]u64 = undefined;
+
+    // Two workers died before the launcher's retirement reached the reaper, as when the gateway
+    // reported their session gone ahead of their own pidfd.
+    try crashed_child.kill();
+    try memory_child.kill();
+    for (cases, &worker_ids) |case, *worker_id| {
+        const handle = if (case.memory_stamped)
+            try handleStampedMemory(testing.allocator, case.child)
+        else
+            try handleFor(testing.allocator, case.child);
+        const worker = try fixture.publishWorker(supervisor, handle, .{ .definition_index = case.definition });
+        worker_id.* = worker.id;
+        const death = supervisor.poolFor(worker.definition_index).retireForEgress(worker, worker.key(), case.departure) orelse
+            return error.TestExpectedRetirement;
+        try testing.expect(death.retire);
+        harness.reaper.queueRetirement(worker, supervision.reaper.RetireReason.fromDeparture(case.departure));
+        try testing.expectEqual(@as(usize, 1), harness.reaper.drainRetirements());
+        try expectTornDown(supervisor, worker);
+    }
+
+    var lines = try analytics_dir.readWorkers(testing.allocator, supervisor.analytics);
+    defer lines.deinit();
+    try testing.expectEqual(cases.len, lines.items.len);
+    for (cases, worker_ids, lines.items) |case, worker_id, line| {
+        try testing.expectEqual(worker_id, line.worker_id);
+        try testing.expectEqualStrings(case.ending, line.ending);
+    }
+    const counters = harness.reaper.countersSnapshot();
+    try testing.expectEqual(@as(u64, 3), counters.retired_egress_reattach);
+    try testing.expectEqual(@as(u64, 1), counters.retired_egress_session_removed);
+}
+
 test "a worker line that finds its stream full is written out with the stream, not dropped" {
     var analytics_dir = try fixture.AnalyticsDir.init(testing.allocator);
     defer analytics_dir.deinit(testing.allocator);
@@ -764,9 +981,7 @@ test "a worker line that finds its stream full is written out with the stream, n
     harness.reaper.queueRetirement(worker, .died);
     try testing.expectEqual(@as(usize, 1), harness.reaper.drainRetirements());
 
-    const stats = supervisor.analytics.stats(.workers);
-    try testing.expectEqual(@as(u64, 0), stats.dropped);
-    try testing.expectEqual(@as(u64, 0), stats.refused);
+    try testing.expectEqual(@as(u64, 0), supervisor.analytics.stats(.workers).dropped);
     var lines = try analytics_dir.readWorkers(testing.allocator, supervisor.analytics);
     defer lines.deinit();
     try testing.expectEqual(@as(usize, 1), lines.items.len);

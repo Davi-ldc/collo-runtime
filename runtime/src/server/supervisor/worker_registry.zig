@@ -2,7 +2,8 @@
 //! A pool says which table entry a launch holds and when a worker is finished
 //! (`pool.zig`); this file fills the entry's record for the launch's publish
 //! and empties it again in the teardown that ends a finished worker, which
-//! writes the worker's line in `workers.jsonl`.
+//! drains the worker's last console lines and writes its line in
+//! `workers.jsonl`.
 //!
 //! The worker line is the record of what no request owns: the CPU of the
 //! worker's whole life, boot, collection, compilation and JavaScript no
@@ -14,9 +15,9 @@
 //!
 //! `buildRecord` runs on the launcher thread, which alone touches a launching
 //! entry's record and the supervisor's worker counters. `teardown` blocks on
-//! the worker's exit, its final drains and its cgroup removal, so it runs on
-//! the reaper thread for a retirement, and on the exiting thread for the
-//! workers `Supervisor.deinit` finds still held; never on a lane.
+//! the worker's exit, its last console drain and its cgroup removal, so it
+//! runs on the reaper thread for a retirement, and on the exiting thread for
+//! the workers `Supervisor.deinit` finds still held; never on a lane.
 
 const std = @import("std");
 const ipc = @import("collo_ipc");
@@ -28,12 +29,12 @@ const analytics = @import("collo_server_analytics");
 
 const launcher = @import("launcher.zig");
 const pool = @import("pool.zig");
+const request_table = @import("request_table.zig");
 const worker_table = @import("worker_table.zig");
-const usage_drain = @import("usage_drain.zig");
-const reaper_memory = @import("reaper/memory.zig");
 
 const Supervisor = @import("supervisor.zig").Supervisor;
 const WorkerRecord = worker_table.Record;
+const ConsoleRequests = analytics.logs.WorkerRequests(request_table.RequestTable, config.Route);
 
 /// How a worker's life ended, as its line in `workers.jsonl` says it.
 pub const Ending = analytics.workers.Ending;
@@ -74,9 +75,9 @@ pub fn buildRecord(
 }
 
 /// Ends the life of the worker `worker` holds and leaves the record vacant:
-/// SIGKILL, the exit wait, the final drains of its usage and console rings
-/// (`usage_drain.drainFinal`), its line in `workers.jsonl`, which says it
-/// ended as `ending`, then its handle and send scratch released
+/// SIGKILL, the exit wait, the last drain of its console ring
+/// (`drainDyingConsole`), its line in `workers.jsonl`, which says it ended
+/// as `ending`, then its handle and send scratch released
 /// (`Record.vacate`), which removes its cgroup leaf. The server keeps no
 /// record of the worker's egress session: the gateway drops the session
 /// when the exit hangs up its liveness descriptor. The worker must be
@@ -87,13 +88,48 @@ pub fn buildRecord(
 pub fn teardown(supervisor: *Supervisor, worker: *WorkerRecord, ending: Ending) void {
     worker.signalKill();
     if (!worker.awaitExit())
-        std.log.warn("worker pid={d} worker_id={d} did not exit after SIGKILL; its final drains may miss its last records", .{
+        std.log.warn("worker pid={d} worker_id={d} did not exit after SIGKILL; its last console lines may be lost", .{
             worker.handle.pid,
             worker.id,
         });
-    usage_drain.drainFinal(supervisor.usageDrain(), worker);
+    drainDyingConsole(supervisor, worker);
     writeWorkerRecord(supervisor, worker, ending);
     worker.vacate(supervisor.allocator);
+}
+
+/// The last drain of `worker`'s console ring and the end of every drain:
+/// under one hold of `worker.metrics_mutex`, the ring drains into the sink
+/// (`analytics.logs.drainDyingRing`) and the page is marked unmapped, so the
+/// metrics thread never reads it again and `Record.vacate` may unmap it.
+/// The worker has exited, or the exit wait gave up, so the ring holds its
+/// last lines. A line keeps its request id only when the worker's request
+/// table confirms the request, as the metrics thread's drain does; the
+/// table is left as it is, and the record's next worker starts with a table
+/// of its own (`Record.occupy`).
+fn drainDyingConsole(supervisor: *Supervisor, worker: *WorkerRecord) void {
+    worker.metrics_mutex.lock();
+    defer worker.metrics_mutex.unlock();
+    if (!worker.page_mapped)
+        return;
+    defer worker.page_mapped = false;
+    // A ring that already failed is never read again
+    // (`Record.log_ring_failed`).
+    if (worker.log_ring_failed)
+        return;
+    const view = if (worker.handle.metrics) |*mapped| mapped else return;
+    var requests: ConsoleRequests = .{
+        .table = &worker.requests,
+        .routes = supervisor.routes.definition(worker.definition_index).routes,
+    };
+    // A line whose request id the table refuses prints under request id 0,
+    // which is all a refusal costs.
+    _ = analytics.logs.drainDyingRing(
+        view,
+        &requests,
+        analytics.Identity.ofWorker(worker),
+        &worker.log_drops_reported,
+        supervisor.analytics,
+    );
 }
 
 /// Appends `worker`'s line to `workers.jsonl` (`analytics.workers`). A
@@ -116,8 +152,8 @@ fn writeWorkerRecord(supervisor: *Supervisor, worker: *WorkerRecord, ending: End
         .started_ts_ms = clock.wallMs(worker.created_mono_ns),
         .ts_ms = clock.wall_now_ms,
         .life_ns = clock.mono_now_ns -| worker.created_mono_ns,
-        .worker_cpu_ns = readWorkerCpuNs(supervisor.allocator, worker),
-        .memory_peak_bytes = readWorkerMemoryPeak(supervisor.allocator, worker),
+        .worker_cpu_ns = readWorkerCpuNs(worker),
+        .memory_peak_bytes = readWorkerMemoryPeak(worker),
         .ending = ending,
     };
     var buffer: [analytics.workers.json_record_bytes_max]u8 = undefined;
@@ -125,27 +161,25 @@ fn writeWorkerRecord(supervisor: *Supervisor, worker: *WorkerRecord, ending: End
     // The buffer holds the largest record, so the writer cannot run out.
     analytics.workers.writeRecordJson(&writer, &record) catch unreachable;
     const line = writer.buffered();
-    if (sink.tryAppendKeepingFree(.workers, line, 0)) return;
+    if (sink.tryAppend(.workers, line)) return;
     sink.flush(process.monotonicNowNsOrZero());
-    sink.append(.workers, line) catch |err| switch (err) {
-        error.SinkBufferFull => sink.noteDropped(.workers, 1),
-    };
+    sink.appendLossy(.workers, line);
 }
 
-/// The CPU every thread of the worker used over its life, from its cgroup;
-/// null when the cgroup cannot say.
-fn readWorkerCpuNs(allocator: std.mem.Allocator, worker: *const WorkerRecord) ?u64 {
-    const usage_usec = cgroup.cpu.readStatUsageUsec(allocator, worker.handle.cgroup_dir) catch |err| {
+/// The CPU every thread of the worker used over its life, from its cgroup
+/// leaf (`cpu.stat` `usage_usec`); null when the leaf cannot say.
+fn readWorkerCpuNs(worker: *const WorkerRecord) ?u64 {
+    const usage_usec = cgroup.readLeafFigure(worker.handle.leaf, .cpu_usage_usec) catch |err| {
         std.log.debug("worker line: cpu.stat read failed for worker_id={d}: {s}", .{ worker.id, @errorName(err) });
         return null;
     };
     return usage_usec *| std.time.ns_per_us;
 }
 
-/// The worker's peak memory from its cgroup; null on a kernel without
-/// `memory.peak` (before Linux 5.19) or when the cgroup cannot say.
-fn readWorkerMemoryPeak(allocator: std.mem.Allocator, worker: *const WorkerRecord) ?u64 {
-    return reaper_memory.readWorkerMemoryPeak(allocator, worker.handle.cgroup_dir) catch |err| {
+/// The worker's peak memory from its cgroup leaf; null on a kernel without
+/// `memory.peak` (before Linux 5.19) or when the leaf cannot say.
+fn readWorkerMemoryPeak(worker: *const WorkerRecord) ?u64 {
+    return cgroup.readLeafFigure(worker.handle.leaf, .memory_peak) catch |err| {
         std.log.debug("worker line: memory.peak read failed for worker_id={d}: {s}", .{ worker.id, @errorName(err) });
         return null;
     };

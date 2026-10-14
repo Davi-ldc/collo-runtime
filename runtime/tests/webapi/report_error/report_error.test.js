@@ -57,27 +57,73 @@ test("reportError without an argument reports undefined", () => {
   assert.equal(seen.cancelable, true);
 });
 
-test("reportError dispatches a cancelable ErrorEvent at the global target", () => {
+// HTML's report an exception: a trusted, cancelable ErrorEvent, which the global onerror receives as (message,
+// filename, lineno, colno, error).
+test("reportError dispatches a trusted cancelable ErrorEvent at the global target", () => {
   const error = new Error("boom");
   const calls = [];
 
   function listener(event) {
-    calls.push(`listener:${event.message}:${event.error === error}:${event.cancelable}`);
+    calls.push(`listener:${event.message}:${event.error === error}:${event.cancelable}:${event.isTrusted}`);
     event.preventDefault();
   }
 
   try {
-    globalThis.onerror = event => {
-      calls.push(`handler:${event.message}:${event.error === error}:${event.cancelable}`);
+    globalThis.onerror = (message, filename, lineno, colno, reported) => {
+      calls.push(`handler:${message}:${filename}:${lineno}:${colno}:${reported === error}`);
     };
     addEventListener("error", listener);
 
     const result = reportError.call(null, error, "ignored");
     assert.equal(result, undefined);
     assert.deepEqual(calls, [
-      "handler:boom:true:true",
-      "listener:boom:true:true",
+      "handler:boom::0:0:true",
+      "listener:boom:true:true:true",
     ]);
+  } finally {
+    cleanup(listener);
+  }
+});
+
+test("a global onerror that returns true cancels the reported error, and false does not", () => {
+  let reported;
+  function listener(event) {
+    reported = event;
+  }
+
+  try {
+    // The listener was added before onerror, so it runs first; each event is checked after its dispatch.
+    addEventListener("error", listener);
+    globalThis.onerror = () => true;
+    reportError(new Error("cancel"));
+    assert.equal(reported.defaultPrevented, true);
+    globalThis.onerror = () => false;
+    reportError(new Error("keep"));
+    assert.equal(reported.defaultPrevented, false);
+  } finally {
+    cleanup(listener);
+  }
+});
+
+// HTML's error reporting mode: while the global reports one exception, reporting another fires nothing, so an error
+// listener that reports or throws cannot recurse.
+test("reportError inside an error listener fires no second event, and a throwing listener is not rethrown", () => {
+  const calls = [];
+  function listener(event) {
+    calls.push(event.message);
+    reportError(new Error("nested"));
+    throw new Error("listener failure");
+  }
+
+  try {
+    addEventListener("error", listener);
+    globalThis.onerror = () => {
+      throw new Error("handler failure");
+    };
+    assert.doesNotThrow(() => reportError(new Error("outer")));
+    assert.deepEqual(calls, ["outer"]);
+    reportError(new Error("again"));
+    assert.deepEqual(calls, ["outer", "again"]);
   } finally {
     cleanup(listener);
   }

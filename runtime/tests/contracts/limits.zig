@@ -18,8 +18,7 @@ const ipc = @import("collo_ipc");
 const h2_protocol = @import("collo_http").http2;
 const network = @import("collo_network");
 const gateway_policy = @import("collo_egress_gateway").policy;
-const gateway_sessions = @import("collo_egress_gateway").sessions;
-const transport_config = @import("collo_egress_transport").config;
+const transport_config = @import("collo_egress_client").transport.config;
 const server_config = @import("collo_server_config");
 const server_main = @import("collo_server_main");
 const worker_shared_page = @import("collo_worker_state").page;
@@ -27,9 +26,8 @@ const worker_shared_page = @import("collo_worker_state").page;
 // The gateway's `Policy` defaults against the shared budgets and the IPC
 // caps. Each default that equals a budget cites it in its declaration, and
 // its assert fails once the two stop being equal, as a literal left behind
-// by a later budget change would. `Engine.init` in
-// `egress/gateway/engine.zig` runs `policy.validate`, so a default that
-// fails it stops every gateway from starting.
+// by a later budget change would. `egress/gateway/policy.zig` asserts at
+// comptime that `production` holds the IPC bounds.
 comptime {
     const default_policy = gateway_policy.Policy{};
     // Both response caps equal the size a worker holds a body whole in.
@@ -46,51 +44,24 @@ comptime {
     // where that pacing is documented.
     std.debug.assert(default_policy.max_body_chunk_bytes ==
         limits.http_body.EGRESS_BODY_CHUNK_BYTES);
-    // A policy may lower the pooled upload ceiling but never raise it, and
-    // the default sits exactly at it: above, `validate` fails; below, the
-    // gateway refuses uploads the IPC can carry.
+    // The pooled upload default sits exactly at the IPC's ceiling: above, the
+    // IPC could not carry what the gateway admits; below, the gateway refuses
+    // uploads the IPC can carry.
     std.debug.assert(default_policy.max_request_body_bytes ==
         ipc.fetch_limits.request_body_pooled_bytes_max);
-    // `validate` bounds the request header bytes by the fetch IPC's header
-    // cap and the response header bytes by the room a fetch head message
-    // leaves.
+    // The request header bytes stay within the fetch IPC's header cap and
+    // the response header bytes within the room a fetch head message leaves.
     std.debug.assert(default_policy.max_request_header_bytes <=
         ipc.fetch_limits.request_headers_bytes_max);
     std.debug.assert(default_policy.max_response_header_bytes <=
         gateway_policy.maxResponseHeaderBytesForIpc());
-    // The header count defaults sit at the IPC's header count cap: above,
-    // `validate` fails; below, the gateway refuses headers the IPC can carry.
+    // The header count defaults sit at the IPC's header count cap: above, the
+    // IPC could not carry them; below, the gateway refuses headers the IPC
+    // can carry.
     std.debug.assert(default_policy.max_request_headers ==
         ipc.max_request_header_count);
     std.debug.assert(default_policy.max_response_headers ==
         ipc.max_request_header_count);
-}
-
-// The fetches a worker lets start under one token against the fetch budget
-// the server stamps into a request's egress token and into the boot token.
-// The worker refuses a fetch past that count itself, counting a request's
-// fetches alone and every evaluation's together under the one boot token
-// (`fetch_runtime.schedule` in `worker/egress/`), and the gateway counts a
-// start past the token's budget as an invalid command, so a count above
-// either budget would have an honest worker struck.
-comptime {
-    const boot_options = ipc.WorkerRuntimeBootOptions{};
-    std.debug.assert(boot_options.max_fetches_per_request <=
-        gateway_policy.production.max_fetches_per_request);
-    std.debug.assert(boot_options.max_fetches_per_request <=
-        gateway_policy.production.max_fetches_per_boot);
-}
-
-// The largest `concurrency` against the gateway's strike window. Across a
-// gateway replacement a worker keeps the tokens of every request it holds,
-// and each fetch they start fails the new gateway's key as an invalid
-// command, so an honest worker at full concurrency, every request at its
-// fetch budget, must stay under the window
-// (`max_invalid_commands_per_window` in `egress/gateway/sessions.zig`).
-comptime {
-    const in_flight_fetches = @as(usize, limits.server.worker_concurrency_max) *
-        gateway_policy.production.max_fetches_per_request;
-    std.debug.assert(in_flight_fetches < gateway_sessions.max_invalid_commands_per_window);
 }
 
 // The transport's `Config` defaults match the gateway policy's. The gateway
@@ -171,32 +142,6 @@ comptime {
         limits.h2.INGRESS_CONNECTION_RECV_WINDOW_BYTES);
 }
 
-// The fs fault budgets against the worker tmpfs they protect. The C++ copy
-// of the fault file ceiling is kept equal by hand, and
-// `COLLO_FS_FAULT_MAX_FILE_BYTES` in `bindings/include/collo/abi.h` says
-// why; these asserts relate only the Zig constants.
-comptime {
-    // The budget is a percentage of the tmpfs: zero would reject every
-    // fault, and above 100 materialized files could fill more than the
-    // tmpfs they share with the worker's own writes.
-    std.debug.assert(limits.fs_fault.materialize_budget_percent > 0 and
-        limits.fs_fault.materialize_budget_percent <= 100);
-    // The ceiling equals the default tmpfs size; `max_fault_file_bytes` says
-    // why. The limits module imports nothing, so the equality is asserted
-    // here instead of derived. On a default-sized worker the budget admits
-    // only `materialize_budget_percent` of the ceiling, and that gap is
-    // intended, so nothing ties the budget to one ceiling-sized file.
-    std.debug.assert(limits.fs_fault.max_fault_file_bytes ==
-        ipc.messages.WorkerInit.default_tmpfs_size_bytes);
-    // The sweep runs when a request finishes and walks the ledger at most
-    // once per interval (`sweepIdleMaterialized` in `worker/fs/copies.zig`),
-    // so even on a busy worker an idle copy can outlive the threshold by one
-    // interval. An interval above the threshold would make that lag longer
-    // than the threshold it enforces.
-    std.debug.assert(limits.fs_fault.materialized_sweep_interval_ns <=
-        limits.fs_fault.materialized_idle_eviction_ns);
-}
-
 // The CPU quota every launch gives its worker against the quota
 // `common/cgroup.zig` gives a leaf configured or checked without one
 // (`worker.Limits`). The cgroup module imports nothing, so it keeps its own
@@ -208,17 +153,15 @@ comptime {
 
 // The server's configuration bounds (`common/limits/server.zig`) against the
 // IPC messages a configured route travels through and the host-name bound of
-// `common/dns_name.zig`. The state page's live slots derive from
-// `worker_concurrency_max` directly (`LIVE_SLOT_COUNT`), so no assert ties
-// them.
+// `common/dns_name.zig`.
 comptime {
-    // A route's text bindings reach the worker as its section of the route
-    // table; a larger per-route bound would accept bindings no worker can
-    // receive.
+    // A route's text bindings reach the worker as its bindings section in
+    // the definition artifact; a larger per-route bound would accept
+    // bindings no worker can receive.
     std.debug.assert(limits.server.binding_bytes_per_route_max ==
         ipc.route_bindings.bytes_max);
-    // Every route of a definition travels in one route table, and a dispatch
-    // names a route by a u16 index into it.
+    // Every route of a definition travels in its one artifact, and a
+    // dispatch names a route by a u16 index into it.
     std.debug.assert(limits.server.routes_per_definition_max ==
         ipc.route_table.routes_max);
     std.debug.assert(ipc.route_table.routes_max <= std.math.maxInt(u16) + 1);
@@ -276,16 +219,20 @@ comptime {
         limits.headers.INGRESS_H2_REQUEST_HEADER_BLOCK_BYTES);
 }
 
-// The completion ring's status bound against the statuses a worker publishes.
-// The drain (`validateWorkerCompletionRecord` in
-// `common/worker_state/page/completion_ring.zig`) refuses a status above the
-// bound as a worker fault, so a tag added to `RequestDoneStatus` without
-// raising the bound would fault every worker that publishes it.
+// One request per pool slot, on both ends: the pool hands a worker at most
+// `worker_concurrency_max` requests at once and takes a slot back only at its
+// request's `request_done` or the worker's death (`server/supervisor/pool.zig`),
+// a dispatch names the pool slot its request holds (`DispatchWork.worker_slot`,
+// a u8 the decoder bounds by `worker_concurrency_max`), the worker writes that
+// request's live slot at that index of its page (`LIVE_SLOT_COUNT` slots), and
+// it keeps one task per request (`request_task_capacity`). A table smaller
+// than the pool's bound would refuse a request the server may send; a larger
+// one would size every worker's tables for requests that never come.
 comptime {
-    var status_max: u32 = 0;
-    for (std.enums.values(ipc.RequestDoneStatus)) |status|
-        status_max = @max(status_max, @intFromEnum(status));
-    std.debug.assert(worker_shared_page.worker_completion_status_max == status_max);
+    std.debug.assert(worker_shared_page.LIVE_SLOT_COUNT == limits.server.worker_concurrency_max);
+    std.debug.assert(limits.worker.request_task_capacity == worker_shared_page.LIVE_SLOT_COUNT);
+    std.debug.assert(worker_shared_page.LIVE_SLOT_COUNT <= std.math.maxInt(u8) + 1);
+    std.debug.assert(worker_shared_page.LIVE_SLOT_COUNT <= worker_shared_page.live_slot_count_page_zero_max);
 }
 
 // Relations deliberately left unasserted:

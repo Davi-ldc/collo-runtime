@@ -104,8 +104,7 @@ test "accepted fd is closed on connection slab exhaustion" {
     _ = slab.acquire() orelse return error.SlabRefusedItsFirstEntry;
     try std.testing.expect(slab.acquire() == null);
     var lane = try ingress.lane.IngressLane.init(std.testing.allocator, .{
-        .definition_count = 0,
-        .slots_per_worker_total = 0,
+        .served = .{ .count = 0, .slots_per_worker_total = 0 },
         .max_requests = 1,
     }, 0);
     defer lane.deinit();

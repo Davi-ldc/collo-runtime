@@ -350,7 +350,6 @@ pub const Slot = struct {
     pub const h2ValidateWorkerResponseBodyDescriptor = stream_table.h2ValidateWorkerResponseBodyDescriptor;
     pub const h2MarkWorkerResponseHeadQueued = stream_table.h2MarkWorkerResponseHeadQueued;
     pub const h2MarkWorkerResponseBodyQueued = stream_table.h2MarkWorkerResponseBodyQueued;
-    pub const h2WorkerResponseEnded = stream_table.h2WorkerResponseEnded;
     pub const responseHeadQueued = stream_table.responseHeadQueued;
     pub const h2NoteResponseEndQueued = stream_table.h2NoteResponseEndQueued;
     pub const h2CloseStreamIfDone = stream_table.h2CloseStreamIfDone;

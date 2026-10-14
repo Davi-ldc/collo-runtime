@@ -33,7 +33,7 @@ comptime {
     _ = @import("collo_server_supervisor").launcher;
     _ = @import("collo_server_supervisor").reaper;
     _ = @import("collo_server_supervisor").worker_table;
-    _ = @import("collo_server_supervisor").accounting.usage;
+    _ = @import("collo_server_supervisor").request_table;
     _ = @import("src/worker/tests/all.zig");
     _ = @import("src/egress/tests/all.zig");
     _ = @import("src/zygote/tests/all.zig");

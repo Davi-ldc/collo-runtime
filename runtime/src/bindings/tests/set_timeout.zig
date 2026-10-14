@@ -36,11 +36,12 @@ test "setTimeout schedules a callback through the Zig runtime" {
     defer runtime.deinit();
     try runtime.attachHostRuntime();
 
-    const module_specifier = "/__collo_route/test/timers.js";
+    const module_specifier = "/var/task/timers.js";
     const request_headers = [_]ipc.RequestHeader{.{ .name = "host", .value = "demo.test" }};
     var dispatch = try ipc.DispatchWork.initOwned(std.testing.allocator, .{
         .request_id = 41,
         .request_generation = 1,
+        .worker_slot = 0,
         .authority = "demo.test",
         .deadline_monotonic_ns = 10_000,
         .method = "GET",
@@ -60,7 +61,6 @@ test "setTimeout schedules a callback through the Zig runtime" {
         std.testing.allocator,
         1,
         dispatch,
-        .{ .index = 0, .generation = 0 },
         now_mono_ns,
     );
     dispatch_owned = false;
@@ -276,7 +276,7 @@ test "setTimeout and setInterval called outside a request turn each name themsel
 
     // A module evaluated directly runs with no owner: no turn is open and no evaluation is the turnless context, so
     // the host runtime is attached but no request can own a timer.
-    const module_specifier = "/__collo_route/test/timers_outside_turn.js";
+    const module_specifier = "/var/task/timers_outside_turn.js";
     const source =
         \\function messageOf(schedule) {
         \\    try {

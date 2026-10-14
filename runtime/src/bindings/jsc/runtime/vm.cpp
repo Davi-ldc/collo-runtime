@@ -174,7 +174,6 @@ ColloStatus initializeVm(ColloVm* vm, uint32_t flags)
     vm->vm->deferredWorkTimer->addTimerSetNotification(vm->deferred_work_wakeup_gate);
 
     vm->web_apis_installed = !(flags & COLLO_VM_CREATE_DISABLE_WEB_APIS);
-    vm->hardware_concurrency = Collo::HostFunctions::readHardwareConcurrency();
     // JSC's built-in console object is on every global. The client that routes it to the ColloConsoleSink is created
     // now but attached to the globals only while a sink is registered. Without a client every console method returns
     // before touching its arguments, so a VM with no sink, such as the zygote's, never coerces user values.
@@ -278,7 +277,6 @@ void destroyVmContents(ColloVm* vm)
         vm->microtask_delay_scope.reset();
         for (auto& realm : vm->realms) {
             realm->webapi_cache.clear();
-            realm->blob_object_urls.clear();
             if (realm->global_object_protected) {
                 bool protect_count_is_zero = owned_vm->heap.unprotect(realm->global_object);
                 if (protect_count_is_zero)
@@ -286,9 +284,6 @@ void destroyVmContents(ColloVm* vm)
                 realm->global_object_protected = false;
             }
         }
-        // Includes the holders with owner 0, which no request end claims. Their roots must go while the VM is still
-        // alive: a JSC::Strong left for a later destructor would touch a HandleSet that is already gone.
-        vm->request_scoped_roots.clear();
         for (auto& realm : vm->realms)
             realm->module_namespaces.clear();
         vm->module_sources.clear();
@@ -584,8 +579,7 @@ extern "C" ColloStatus collo_vm_create(uint32_t flags, ColloVm** out_vm)
     if (U_FAILURE(restrictIcuDataToBinary()))
         return COLLO_STATUS_ERROR;
 
-    // Both run their bodies once per process, so the options below apply to every VM the process creates, unless
-    // tooling_bytecode.cpp ran them first with its own options.
+    // Both run their bodies once per process, so the options below apply to every VM the process creates.
     WTF::initializeMainThread();
     JSC::initialize([] {
         JSC::Options::useSharedArrayBuffer() = true;
@@ -750,6 +744,8 @@ extern "C" ColloStatus collo_vm_enable_node_fs_for_worker(ColloVm* vm)
         return COLLO_STATUS_INVALID_ARGUMENT;
 
     JSC::JSLockHolder locker(*vm->vm);
+    // Opened before anything is installed, so no realm of a worker ever holds a binding that is still closed.
+    Collo::HostFunctions::openNodeFsForProcess();
     vm->node_fs_enabled = true;
     for (auto& realm : vm->realms)
         applyWorkerInstalls(vm, *realm);
@@ -879,7 +875,8 @@ struct ColloRestoredTurnScope {
             if (!warned) {
                 warned = true;
                 std::fprintf(stderr,
-                    "collo: cross-task token allocation failed; work enqueued by a restored continuation loses its owner\n");
+                    "collo: cross-task token allocation failed; work enqueued by a restored continuation loses its "
+                    "owner\n");
             }
         }
         m_jsc_vm.setCrossTaskToken(WTF::move(token));
@@ -1146,8 +1143,8 @@ void ColloDeferredWorkWakeupGate::run()
     // Then no eventfd drain on the loop thread has consumed this write, because a drain that had would follow the
     // store and the write, and the exchange runs after the drain on the same thread, so it would have seen true. The
     // write is therefore still coming or still undrained. Either way the eventfd counter is or becomes nonzero, the
-    // level-triggered ring wait cannot sleep through it, and the tick it wakes runs its exchange after its drain and
-    // sees true. A wake with no work left costs one doWork that does nothing.
+    // loop's level-triggered `ppoll` cannot sleep through it, and the tick it wakes runs its exchange after its drain
+    // and sees true. A wake with no work left costs one doWork that does nothing.
     pending.store(true, std::memory_order_release);
     int fd = wakeup_fd.load(std::memory_order_acquire);
     if (fd < 0)

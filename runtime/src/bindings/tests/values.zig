@@ -1,9 +1,11 @@
-//! Values and exceptions across the ABI. An exception thrown by an invoked function comes back
-//! as a value `Vm.exceptionFormat` can format; one thrown by a property getter or setter or by
-//! a string conversion comes back through `out_exception` with nothing left pending, so the
-//! enclosing turn still exits cleanly. An empty string is a valid property key. A TypeError
-//! made outside any turn is a TypeError to JavaScript and keeps its message, an empty one
-//! included, and a message that is not UTF-8 is refused. Lane: `bindings-test`.
+//! Values and exceptions across the ABI. A value's kind names its type as `typeof` does, with
+//! null apart and every callable object a function, and reading it runs no proxy trap. An
+//! exception thrown by an invoked function comes back as a value `Vm.exceptionFormat` can
+//! format; one thrown by a property getter or setter or by a string conversion comes back
+//! through `out_exception` with nothing left pending, so the enclosing turn still exits cleanly.
+//! An empty string is a valid property key. A TypeError made outside any turn is a TypeError to
+//! JavaScript and keeps its message, an empty one included, and a message that is not UTF-8 is
+//! refused. Lane: `bindings-test`.
 
 const std = @import("std");
 const support = @import("bindings_support");
@@ -18,6 +20,70 @@ fn expectCleanTurnExit(vm: *support.bindings.Vm) !void {
             return error.UnexpectedJsException;
         },
     }
+}
+
+test "a value's kind names its type as typeof does, with null apart and every callable object a function" {
+    var vm = try support.createVm();
+    defer vm.deinit();
+
+    const source =
+        \\export let trapCalls = 0;
+        \\const countingTraps = {
+        \\    get() { trapCalls += 1; },
+        \\    getPrototypeOf() { trapCalls += 1; return null; },
+        \\    getOwnPropertyDescriptor() { trapCalls += 1; },
+        \\    has() { trapCalls += 1; return false; },
+        \\    apply() { trapCalls += 1; },
+        \\};
+        \\export const undefinedValue = undefined;
+        \\export const nullValue = null;
+        \\export const booleanValue = false;
+        \\export const integerValue = 7;
+        \\export const doubleValue = 1.5;
+        \\export const smallBigint = 1n;
+        \\export const largeBigint = 2n ** 80n;
+        \\export const stringValue = "text";
+        \\export const symbolValue = Symbol("symbol");
+        \\export const objectValue = {};
+        \\export const arrayValue = [];
+        \\export const arrowValue = () => {};
+        \\export const classValue = class {};
+        \\export const boundValue = function () {}.bind(null);
+        \\export const objectProxy = new Proxy({}, countingTraps);
+        \\export const callableProxy = new Proxy(function () {}, countingTraps);
+    ;
+    try support.registerModule(&vm, "/kinds.js", source);
+    try support.evaluateOk(&vm, "/kinds.js");
+
+    const Kind = support.bindings.ValueKind;
+    const expected = [_]struct { name: []const u8, kind: Kind }{
+        .{ .name = "undefinedValue", .kind = .undefined },
+        .{ .name = "nullValue", .kind = .null },
+        .{ .name = "booleanValue", .kind = .boolean },
+        .{ .name = "integerValue", .kind = .number },
+        .{ .name = "doubleValue", .kind = .number },
+        .{ .name = "smallBigint", .kind = .bigint },
+        .{ .name = "largeBigint", .kind = .bigint },
+        .{ .name = "stringValue", .kind = .string },
+        .{ .name = "symbolValue", .kind = .symbol },
+        .{ .name = "objectValue", .kind = .object },
+        .{ .name = "arrayValue", .kind = .object },
+        .{ .name = "arrowValue", .kind = .function },
+        .{ .name = "classValue", .kind = .function },
+        .{ .name = "boundValue", .kind = .function },
+        .{ .name = "objectProxy", .kind = .object },
+        .{ .name = "callableProxy", .kind = .function },
+    };
+    for (expected) |entry| {
+        var value = try support.getExportOk(&vm, "/kinds.js", entry.name);
+        defer value.deinit();
+        try std.testing.expectEqual(entry.kind, try vm.valueKind(&value));
+        try std.testing.expectEqual(entry.kind == .function, try vm.isCallable(&value));
+    }
+
+    var trap_calls = try support.getExportOk(&vm, "/kinds.js", "trapCalls");
+    defer trap_calls.deinit();
+    try support.expectValueString(&vm, &trap_calls, "0");
 }
 
 test "formatted js exception is exposed through root wrapper" {

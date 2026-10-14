@@ -31,7 +31,7 @@
 //! lane cannot be pinned to its CPU, and on nothing else.
 //!
 //! The service a lane runs under provides `allocator`, `supervisor`,
-//! `routes`, `analytics`, `tls_context`, `hard_timeout_grace_ns`,
+//! `routes`, `tls_context`, `hard_timeout_grace_ns`,
 //! `ingress_tcp_notsent_lowat_bytes`, `lanes`, `launcher` (`submit`),
 //! `reaper` (`wakeForPidfdScan`), `egress_gateways` (`currentGeneration`,
 //! `renewLease`), `shouldStop`, `requestStopSignal`, `allocateRequestId`,
@@ -59,16 +59,16 @@
 //!   pool, the launch or the 503 that follows when the pool cannot serve its
 //!   waiters, and the answers the lane writes alone; `dispatch.zig`: dispatch
 //!   to a worker slot, the begin and reset sends and every send that waits
-//!   for room; `request_body.zig`: request bodies and client resets;
-//!   `request_slot.zig`: the lane's slot of each request it admitted;
-//!   `h2_worker_ipc.zig`: worker response descriptors, read or forwarded,
-//!   and the forwarding window.
-//! - `worker_completions.zig`: worker completions; `request_finish.zig`: the
-//!   end of a request and the worker slot it gives back; `worker_fault.zig`:
-//!   a worker's death path; `worker_registration.zig`: the lane's
-//!   registration of each worker it sends to or reads, with the reader
-//!   tenure; `worker_control.zig` and `fs_fault_control.zig`: a worker's
-//!   control and fs-fault channels.
+//!   for room; `request_body.zig`: request bodies, the wake of a worker's
+//!   payload ring credit, and client resets; `request_slot.zig`: the lane's
+//!   slot of each request it admitted; `h2_worker_ipc.zig`: worker
+//!   descriptors, read or forwarded, and the forwarding window.
+//! - `request_done.zig`: a worker's `request_done`;
+//!   `request_finish.zig`: the end of a request, its access record and the
+//!   worker slot it gives back; `worker_fault.zig`: a worker's death path;
+//!   `worker_registration.zig`: the lane's registration of each worker it
+//!   sends to or reads, with the reader tenure; `worker_control.zig`: a
+//!   worker's control socket.
 //! - `deadline_driver.zig`: request deadlines and each connection's one
 //!   deadline (pre-request, idle or stall).
 //! - `command_flow.zig`: the lane's commands and the reader role it gives
@@ -88,10 +88,11 @@ const completions = @import("../completions.zig");
 const fault = @import("../fault.zig");
 const lane_mod = @import("../lane.zig");
 const lane_plan = @import("../../net/lane_plan.zig");
+const routes_mod = @import("collo_server_routes");
 const timer_wheel = @import("../timer_wheel.zig");
 const http2_lane = @import("../http2/lane_resources.zig");
 pub const event_sources = @import("event_sources.zig");
-pub const worker_completions = @import("worker_completions.zig");
+pub const request_done = @import("request_done.zig");
 pub const connection_slot = @import("connection_slot.zig");
 pub const stream_table = @import("stream_table.zig");
 pub const flow_control = @import("flow_control.zig");
@@ -110,7 +111,6 @@ pub const dispatch = @import("dispatch.zig");
 pub const request_body = @import("request_body.zig");
 pub const h2_worker_ipc = @import("h2_worker_ipc.zig");
 pub const worker_control = @import("worker_control.zig");
-pub const fs_fault_control = @import("fs_fault_control.zig");
 pub const request_slot = @import("request_slot.zig");
 pub const tls_handshake = @import("tls_handshake.zig");
 
@@ -121,7 +121,7 @@ pub const LaneRuntimeState = event_sources.LaneRuntimeState;
 
 /// Registrations one lane can hold: every worker the node can have, so a
 /// lane never runs out while each worker holds one registration per lane.
-pub const max_completion_registrations: u32 =
+pub const max_worker_registrations: u32 =
     @intCast(limits.server.worker_definitions_max * limits.pool.pool_workers_max);
 
 /// The capacities of a lane's tables. A serving lane keeps the limits; a
@@ -157,11 +157,19 @@ pub const wake = struct {
     pub const window_reopened: u32 = 1 << 1;
 };
 
+/// The worker definitions `routes` holds, as a lane's command reserve
+/// counts them (`lane.zig:obligationReserve`).
+pub fn servedDefinitions(routes: *const routes_mod.Routes) lane_mod.ServedDefinitions {
+    var slots_per_worker_total: usize = 0;
+    for (0..routes.definitionCount()) |index|
+        slots_per_worker_total += routes.definition(@intCast(index)).settings.limits.concurrency;
+    return .{ .count = routes.definitionCount(), .slots_per_worker_total = slots_per_worker_total };
+}
+
 /// A lane's resident memory with every table full and every buffer used,
-/// term by term, for a configuration of `definition_count` worker
-/// definitions whose `concurrency` adds up to `slots_per_worker_total`
-/// (`laneMemoryTerms`). The tables fault in, so a lane holds this only at its
-/// busiest; at start it holds almost none of it.
+/// term by term, for a configuration serving `served` (`laneMemoryTerms`).
+/// The tables fault in, so a lane holds this only at its busiest; at start
+/// it holds almost none of it.
 pub const LaneMemoryTerms = struct {
     /// The connection slab and the connection deadline heap.
     connections: usize,
@@ -187,10 +195,10 @@ pub const LaneMemoryTerms = struct {
     }
 };
 
-pub fn laneMemoryTerms(definition_count: usize, slots_per_worker_total: usize) LaneMemoryTerms {
-    const registrations = definition_count * limits.pool.pool_workers_max;
+pub fn laneMemoryTerms(served: lane_mod.ServedDefinitions) LaneMemoryTerms {
+    const registrations = served.count * limits.pool.pool_workers_max;
     const command_places = limits.ingress.commands_per_lane_max +
-        lane_mod.obligationReserve(definition_count, slots_per_worker_total);
+        lane_mod.obligationReserve(served);
     return .{
         .connections = limits.ingress.connections_per_lane_max * (@sizeOf(ConnectionSlot) + @sizeOf(*ConnectionSlot)),
         .requests = limits.ingress.requests_per_lane_max * (@sizeOf(RequestSlot) + timer_wheel.entrySizeBytes()),
@@ -205,8 +213,8 @@ pub fn laneMemoryTerms(definition_count: usize, slots_per_worker_total: usize) L
 
 /// The cost the lane plan's memory cap charges per lane: the sum of
 /// `laneMemoryTerms`.
-pub fn laneMemoryShape(definition_count: usize, slots_per_worker_total: usize) lane_plan.MemoryShape {
-    return .{ .resident_cap_bytes = laneMemoryTerms(definition_count, slots_per_worker_total).total() };
+pub fn laneMemoryShape(served: lane_mod.ServedDefinitions) lane_plan.MemoryShape {
+    return .{ .resident_cap_bytes = laneMemoryTerms(served).total() };
 }
 
 const ConnectionSlot = connection_slot.Slot;
@@ -289,10 +297,9 @@ pub fn LaneWorker(comptime Service: type) type {
         ipc_send_scratch: []u8 = &.{},
         ipc_recv_scratch: []u8 = &.{},
         tcp_notsent_lowat_warning_logged: bool = false,
-        /// The key this lane mints egress tokens with and its own descriptor
-        /// for `request_ended`, renewed at the start of a loop pass when the
-        /// gateway generation moved (`ring_driver.zig`). Only the lane thread
-        /// touches it.
+        /// The key this lane mints egress tokens with, renewed at the start
+        /// of a loop pass when the gateway generation moved
+        /// (`ring_driver.zig`). Only the lane thread touches it.
         egress_lease: gateway.lease.Lease = .{},
 
         comptime {
@@ -344,10 +351,6 @@ pub fn LaneWorker(comptime Service: type) type {
             var snapshot = self.retained_counters;
             if (self.lane_initialized)
                 snapshot.add(self.lane.countersSnapshot());
-            // The lease outlives the lane's state; its teardown moves these
-            // into `retained_counters` under the same mutex.
-            snapshot.egress_ended_batches_dropped_full += self.egress_lease.ended_batches_dropped_full;
-            snapshot.egress_ended_batches_dropped_closed += self.egress_lease.ended_batches_dropped_closed;
             return snapshot;
         }
 
@@ -423,8 +426,7 @@ pub fn LaneWorker(comptime Service: type) type {
         pub const handleCommands = command_flow.Methods(Self).handleCommands;
         pub const handleWorkerControlReadable = ring_driver.Methods(Self).handleWorkerControlReadable;
         pub const handleWorkerControlWritable = ring_driver.Methods(Self).handleWorkerControlWritable;
-        pub const handleWorkerCompletions = worker_completions.Methods(Self).handleWorkerCompletions;
-        pub const handleWorkerFsFault = ring_driver.Methods(Self).handleWorkerFsFault;
+        pub const handleWorkerRingCredit = request_body.Methods(Self).handleWorkerRingCredit;
         pub const handleStop = ring_driver.Methods(Self).handleStop;
         pub const handleWorkerPidfd = ring_driver.Methods(Self).handleWorkerPidfd;
 

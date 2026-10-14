@@ -11,8 +11,6 @@
 
 #include "jsc/runtime/state.h"
 
-#include "host_functions/webapi/platform/navigator.h"
-
 #include <JavaScriptCore/InitializeThreading.h>
 
 #include <bmalloc/BPlatform.h>
@@ -204,15 +202,6 @@ extern "C" ColloStatus collo_vm_post_fork_child(ColloVm* vm)
     vm->current_exec_ctx = nullptr;
     vm->entered_count = 0;
     vm->microtask_delay_scope.reset();
-    // Read again here, the last point before the worker's seccomp filter denies the call, so the value describes the
-    // worker's CPUs rather than the zygote's.
-    vm->hardware_concurrency = Collo::HostFunctions::readHardwareConcurrency();
-    // Web API objects are refreshed only when they were installed: on a VM created without them the navigator slot
-    // holds an uninitialized cell that passes isCell() but crashes dynamicDowncast in refreshWebApiNavigator.
-    if (vm->web_apis_installed) {
-        for (auto& realm : vm->realms)
-            Collo::HostFunctions::refreshWebApiNavigator(realm->global_object, *vm->vm);
-    }
     vm->vm->finalizeSynchronousJSExecution();
     return COLLO_STATUS_OK;
 }

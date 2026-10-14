@@ -1,21 +1,20 @@
 //! Request deadlines on an ingress lane. A request has one deadline, fixed
 //! at admission and counted from the socket read that brought its head. A
-//! request that still waits for a worker slot then is
-//! answered 503 and leaves its pool's waiters, and one whose begin still
-//! waits for room in its worker's socket is answered 504 with the worker left
-//! in service. Once the begin reached the worker, the request's wheel entry
-//! sits at the deadline plus `hard_timeout_grace_ns`, the backstop that,
-//! once it read everything the worker wrote, faults a worker that never
-//! ended the request and queues its retirement, leaving the kill to the
-//! reaper. A completion parks only behind a response
-//! head the lane queued, with that entry still armed, and a worker that
-//! answers a deadline itself stays in service. A trailer block that a
+//! request that still waits for a worker slot then is answered 503 and
+//! leaves its pool's waiters, and one whose begin still waits for room in
+//! its worker's socket is answered 504 with the worker left in service. Once
+//! the begin reached the worker, the request's wheel entry sits at the
+//! deadline plus `hard_timeout_grace_ns`, the backstop that, once it read
+//! what the worker wrote and found no `request_done` for the request there,
+//! faults the worker and queues its retirement, leaving the kill to the
+//! reaper; the request's record carries the server's floor. A worker that
+//! answers a deadline itself, or whose `request_done` waits in its socket
+//! when the backstop fires, stays in service. A trailer block that a
 //! deadline's answer overtakes between two reads is dropped with its stream,
-//! and the connection goes on. Lane `server-ingress-test`,
-//! through `lane_harness.zig`; the wheel itself is pinned in
-//! `deadline_wheel.zig`, the reaper's teardown in
-//! `server/tests/supervisor/reaper/`, and a real worker's own 504 in
-//! `local-e2e`.
+//! and the connection goes on. Lane `server-ingress-test`, through
+//! `lane_harness.zig`; the wheel itself is pinned in `deadline_wheel.zig`,
+//! the reaper's teardown in `server/tests/supervisor/reaper/`, and a real
+//! worker's own 504 in `local-e2e`.
 
 const std = @import("std");
 const h2 = @import("collo_http").http2;
@@ -26,81 +25,25 @@ const Harness = lane_harness.Harness;
 const OneWorker = lane_harness.OneWorker;
 const TwoLanes = lane_harness.TwoLanes;
 
-test "a completion parked behind an unfinished response keeps the deadline armed, and the deadline still ends the request (#37)" {
+test "a request_done the worker sent before the backstop fired wins over the deadline fault" {
     var scene: OneWorker = undefined;
     try scene.init(.{});
     defer scene.deinit();
     const harness = &scene.harness;
     const request = try scene.get(1);
-    const backstop_ns = request.deadline_monotonic_ns + harness.service.hard_timeout_grace_ns;
 
-    // The head and part of the body go out before the completion, and the
-    // response's end never comes.
-    try scene.stub.sendHead(request, 200, false);
-    try scene.stub.sendChunk(request, "partial", false);
-    try scene.stub.publishCompletion(request, .{});
-    try harness.serveWorker(0, scene.stub);
-    try scene.expectStatus(1, 200);
-    try std.testing.expect(!(try scene.client.stream(1)).ended);
-    try std.testing.expect(harness.requestKeyOf(scene.client, 1) != null);
-    try std.testing.expectEqual(@as(?u64, backstop_ns), try harness.deadlineArmedFor(0, request.requestKey()));
-    try std.testing.expectEqual(@as(u8, 1), harness.workerView(scene.stub).?.slots_held);
-
+    // The whole response and its `request_done` are out, and the lane has
+    // read none of it when the backstop fires.
+    try scene.stub.answer(request, 200, "in time");
     try harness.expireDeadlines(0, harness.pastEveryDeadline());
-    // The worker did answer, so the request ends with its completion and the
-    // worker stays in service; the stream got a head and no end, so it is
-    // reset.
-    try scene.expectReset(1);
-    try std.testing.expect(harness.requestKeyOf(scene.client, 1) == null);
-    try std.testing.expectEqual(@as(?u16, 200), harness.takeAccessStatus(0));
-    try std.testing.expectEqual(@as(u8, 0), harness.workerView(scene.stub).?.slots_held);
+
     try harness.expectLanesRunning();
     try harness.expectServing(scene.stub);
-}
-
-test "a completion for a request whose response head the lane never queued ends it at once instead of parking (#37)" {
-    var scene: OneWorker = undefined;
-    try scene.init(.{});
-    defer scene.deinit();
-    const harness = &scene.harness;
-    const request = try scene.get(1);
-
-    // The worker publishes its completion without having sent a head.
-    try scene.stub.publishCompletion(request, .{});
-    try harness.serveWorker(0, scene.stub);
-    try scene.expectStatus(1, 502);
-    try std.testing.expectEqual(@as(?u16, 502), harness.takeAccessStatus(0));
-    try std.testing.expect(harness.requestKeyOf(scene.client, 1) == null);
-    try std.testing.expectEqual(@as(?u64, null), try harness.deadlineArmedFor(0, request.requestKey()));
-    try std.testing.expectEqual(@as(u8, 0), harness.workerView(scene.stub).?.slots_held);
-    try harness.expectLanesRunning();
-    try harness.expectServing(scene.stub);
-}
-
-test "a parked completion ends its request once the response's end arrives" {
-    var scene: OneWorker = undefined;
-    try scene.init(.{});
-    defer scene.deinit();
-    const harness = &scene.harness;
-    const request = try scene.get(1);
-    try scene.stub.sendHead(request, 200, false);
-    try scene.stub.sendChunk(request, "partial", false);
-    try scene.stub.publishCompletion(request, .{});
-    try harness.serveWorker(0, scene.stub);
-    try std.testing.expect(harness.requestKeyOf(scene.client, 1) != null);
-
-    try scene.stub.sendChunk(request, ", then the rest", true);
-    try harness.handleControl(0, scene.stub);
     try scene.expectStatus(1, 200);
-    const received = try scene.client.stream(1);
-    try std.testing.expect(received.ended);
-    try std.testing.expectEqual(@as(usize, "partial, then the rest".len), received.body_len);
     try std.testing.expectEqual(@as(?u16, 200), harness.takeAccessStatus(0));
-    try std.testing.expect(harness.requestKeyOf(scene.client, 1) == null);
-    try std.testing.expectEqual(@as(?u64, null), try harness.deadlineArmedFor(0, request.requestKey()));
-    try std.testing.expectEqual(@as(u8, 0), harness.workerView(scene.stub).?.slots_held);
-    try harness.expectLanesRunning();
-    try harness.expectServing(scene.stub);
+    const counters = harness.lane(0).lane.counters;
+    try std.testing.expectEqual(@as(u64, 1), counters.request_done_at_backstop);
+    try std.testing.expectEqual(@as(u64, 0), counters.deadline_grace_faults);
 }
 
 test "the grace backstop faults a worker that never ended its request and leaves the kill to the reaper (#39)" {
@@ -122,8 +65,11 @@ test "the grace backstop faults a worker that never ended its request and leaves
     try scene.expectStatus(1, 504);
     const record = harness.takeAccessRecord(0) orelse return error.AccessRecordMissing;
     try std.testing.expectEqual(@as(u16, 504), record.status);
-    try std.testing.expectEqual(lane_harness.page.CompletedStatus.deadline, record.facts.error_code);
+    try std.testing.expectEqual(lane_harness.access.ErrorCode.deadline, record.facts.error_code);
     try std.testing.expectEqualStrings("deadline_grace_expired", record.facts.worker_fault);
+    // No `request_done` came, so the record's usage is the server's.
+    const usage = record.usage orelse return error.UsageMissing;
+    try std.testing.expectEqual(lane_harness.access.Origin.server, usage.origin);
 }
 
 test "a worker that answers one of its two requests 504 stays in service and finishes the other (#44)" {
@@ -136,8 +82,8 @@ test "a worker that answers one of its two requests 504 stays in service and fin
 
     // The worker ends the first request at that request's deadline itself.
     try scene.stub.sendHead(late, 504, true);
-    try scene.stub.publishCompletion(late, .{ .http_status = 504, .done = .deadline_timeout });
-    try harness.serveWorker(0, scene.stub);
+    try scene.stub.sendDone(late, .{ .http_status = 504, .done = .deadline_timeout });
+    try harness.handleControl(0, scene.stub);
     try scene.expectStatus(1, 504);
     try std.testing.expectEqual(@as(?u16, 504), harness.takeAccessStatus(0));
     try harness.expectLanesRunning();
@@ -145,7 +91,7 @@ test "a worker that answers one of its two requests 504 stays in service and fin
     try std.testing.expectEqual(@as(u8, 1), harness.workerView(scene.stub).?.slots_held);
 
     try scene.stub.answer(sibling, 200, "sibling");
-    try harness.serveWorker(0, scene.stub);
+    try harness.handleControl(0, scene.stub);
     try scene.expectStatus(3, 200);
     try std.testing.expect((try scene.client.stream(3)).ended);
     try std.testing.expectEqual(@as(?u16, 200), harness.takeAccessStatus(0));
@@ -154,7 +100,7 @@ test "a worker that answers one of its two requests 504 stays in service and fin
     try harness.expectServing(scene.stub);
 }
 
-test "the grace backstop reads the worker's output through a slow connection's backlog, so completions published in time win (#44)" {
+test "the grace backstop reads the worker's output through a slow connection's backlog, so request_dones sent in time win (#44)" {
     var scene: OneWorker = undefined;
     // A 16-byte stream window keeps stream 1's body in the lane, so every
     // packet of it leaves the connection with bytes to write, which stops a
@@ -170,10 +116,10 @@ test "the grace backstop reads the worker's output through a slow connection's b
     const chunk_count = limits.http_body.INGRESS_RESPONSE_CHUNKS_IN_FLIGHT_MAX;
     for (0..chunk_count) |index|
         try scene.stub.sendChunk(slow, &chunk, index + 1 == chunk_count);
-    try scene.stub.publishCompletion(slow, .{ .http_status = 200 });
+    try scene.stub.sendDone(slow, .{ .http_status = 200 });
     // Behind all of that, the worker answered stream 3's deadline itself.
     try scene.stub.sendHead(late, 504, true);
-    try scene.stub.publishCompletion(late, .{ .http_status = 504, .done = .deadline_timeout });
+    try scene.stub.sendDone(late, .{ .http_status = 504, .done = .deadline_timeout });
 
     try harness.expireDeadlines(0, harness.pastEveryDeadline());
     try harness.expectLanesRunning();
@@ -249,7 +195,7 @@ test "a request whose deadline passes while it waits for a slot is answered 503 
     // The holder's finish finds no waiter: the slot goes back to the free
     // list, and lane 1 gets no `dispatch_ready`.
     try scene.stub.answer(holder, 200, "first");
-    try harness.serveWorker(0, scene.stub);
+    try harness.handleControl(0, scene.stub);
     try scene.first.expectStatus(1, 200);
     try harness.expectQueued(1, &.{});
     try std.testing.expect(!try scene.stub.controlReadable());
@@ -322,7 +268,7 @@ test "trailers split across reads on a stream the lane answered at its request's
     try std.testing.expectEqualStrings("probe/1", record.facts.userAgentSlice());
 
     try stub.answer(holder, 200, "first");
-    try harness.serveWorker(0, stub);
+    try harness.handleControl(0, stub);
     try first.expectStatus(1, 200);
     try harness.expectLanesRunning();
     try harness.expectServing(stub);

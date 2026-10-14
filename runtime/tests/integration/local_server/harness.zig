@@ -1,8 +1,8 @@
 //! The production stack the local-e2e suites of this directory drive, and
 //! what they drive it with. `Harness` is one stack per test: TLS material, a
-//! zygote that forks fully sandboxed workers, the delegated cgroup root and
-//! the directory its workers mount their tmpfs over, an analytics directory,
-//! and a server on a thread of the test process serving the routes of
+//! zygote that forks fully sandboxed workers, the delegated cgroup root, an
+//! analytics directory, and a server on a thread of the test process serving
+//! the routes of
 //! `fixtures/local_e2e/collo.json`, or of a configuration a test writes, on
 //! one lane or two. The gateway enforces exactly the
 //! configuration's `network` grants, as under `collo serve`. Requests
@@ -83,15 +83,12 @@ pub const Harness = struct {
     tls_material: tls_shim.TlsMaterial,
     spawned: zygote_support.zygote.host_client.SpawnedZygote,
     cgroup_environment: CgroupEnvironment,
-    /// The analytics directory the server appends `usage.jsonl`,
-    /// `access.jsonl`, `logs.jsonl` and `workers.jsonl` to.
+    /// The analytics directory the server appends `access.jsonl`,
+    /// `logs.jsonl` and `workers.jsonl` to.
     analytics_root: []const u8,
     /// Every worker is born inside a leaf of this subtree. The server borrows
     /// it, as it does under `collo serve`.
     worker_cgroup_root: host.WorkerCgroupRoot,
-    /// The directory every worker mounts its private tmpfs over, which the
-    /// server borrows beside the cgroup root.
-    tmp_mount_point: host.TmpMountPoint,
     /// Owns the routes built from the configuration (`Server.routes`).
     runtime_server: server_main.Server,
     server_thread: std.Thread,
@@ -133,8 +130,6 @@ pub const Harness = struct {
             else => return err,
         };
         errdefer self.worker_cgroup_root.deinit(std.testing.allocator);
-        try self.tmp_mount_point.init(host.tmp_mount.default_parent_dir);
-        errdefer self.tmp_mount_point.deinit();
 
         var diagnostic: config.Diagnostic = .{};
         const loaded = loadConfiguration(options, &diagnostic) catch |err| {
@@ -149,10 +144,7 @@ pub const Harness = struct {
 
         // `Server.init` owns the routes from here on, failure included.
         self.runtime_server = server_main.Server.init(std.testing.allocator, &self.spawned, .{
-            .worker_host = .{
-                .cgroup_root = &self.worker_cgroup_root,
-                .tmp_mount_point = &self.tmp_mount_point,
-            },
+            .worker_host = .{ .cgroup_root = &self.worker_cgroup_root },
             .routes = routes,
             .analytics_directory = self.analytics_root,
             // The lanes the test asks for, whatever the host, so the
@@ -193,8 +185,7 @@ pub const Harness = struct {
         if (!self.server_thread_joined)
             stopServerThread(&self.runtime_server, self.server_thread);
         self.runtime_server.deinit();
-        // After the server, which borrows both.
-        self.tmp_mount_point.deinit();
+        // After the server, which borrows it.
         self.worker_cgroup_root.deinit(std.testing.allocator);
         self.cgroup_environment.deinit(std.testing.allocator);
         self.spawned.deinit();
@@ -471,7 +462,8 @@ pub fn h2Get(
 pub fn decodeResponseHeaders(block: []const u8) !hpack.DecodedBlock {
     var decoder = try hpack.Decoder.init();
     defer decoder.deinit();
-    return decoder.decodeBlock(std.testing.allocator, block, 64, 16 * 1024);
+    var scratch: [hpack.max_single_header_decode_bytes]u8 = undefined;
+    return decoder.decodeBlock(std.testing.allocator, &scratch, block, 64, 16 * 1024);
 }
 
 pub fn headerValue(decoded: *const hpack.DecodedBlock, name: []const u8) ?[]const u8 {
@@ -822,11 +814,27 @@ pub fn waitForSlotsHeld(harness: *Harness, definition: config.DefinitionIndex, s
 /// Ends `worker`'s process with SIGKILL through the server's own pidfd of
 /// it: the server runs in this process, and the pidfd cannot name a reused
 /// pid. The kernel counts no `oom_kill` for a signal sent from outside, so
-/// the server classifies the death as `crash` (`classifyWorkerDeath` in
-/// `server/supervisor/usage_drain.zig`), where a kernel OOM kill reads as
+/// the server classifies the death as `crash` (`Record.classifyDeath` in
+/// `server/supervisor/worker_table.zig`), where a kernel OOM kill reads as
 /// `memory`.
 pub fn killWorker(worker: LiveWorker) !void {
     try process.pidFdSendSignal(worker.record.handle.pidfd, std.posix.SIG.KILL);
+}
+
+/// The longest leaf file name `leafFilePath` takes; every cgroup v2
+/// interface file is far shorter.
+const leaf_file_name_bytes_max: usize = 64;
+
+/// The path of `worker`'s leaf file `file_name` relative to the workers
+/// directory that holds every leaf (`WorkerLeaf.workers_dir_fd`).
+fn leafFilePath(
+    worker: LiveWorker,
+    file_name: []const u8,
+    buffer: *[host.WorkerLeaf.name_bytes_max + 1 + leaf_file_name_bytes_max]u8,
+) ![]const u8 {
+    var name_buffer: [host.WorkerLeaf.name_bytes_max]u8 = undefined;
+    const leaf_name = worker.record.handle.leaf.name(&name_buffer);
+    return std.fmt.bufPrint(buffer, "{s}/{s}", .{ leaf_name, file_name });
 }
 
 /// Writes `max` to `worker`'s `memory.high`, which lifts the mark its
@@ -835,9 +843,13 @@ pub fn killWorker(worker: LiveWorker) !void {
 /// in the delegated subtree this process owns, and the worker checks its
 /// limits only at boot, so it keeps serving.
 pub fn liftMemoryHigh(worker: LiveWorker) !void {
-    var leaf = try std.fs.openDirAbsolute(worker.record.handle.cgroup_dir, .{});
-    defer leaf.close();
-    const memory_high = try leaf.openFile("memory.high", .{ .mode = .write_only });
+    var path_buffer: [host.WorkerLeaf.name_bytes_max + 1 + leaf_file_name_bytes_max]u8 = undefined;
+    const path = try leafFilePath(worker, "memory.high", &path_buffer);
+    const fd = try std.posix.openat(worker.record.handle.leaf.workers_dir_fd, path, .{
+        .ACCMODE = .WRONLY,
+        .CLOEXEC = true,
+    }, 0);
+    const memory_high: std.fs.File = .{ .handle = fd };
     defer memory_high.close();
     try memory_high.writeAll("max");
 }
@@ -846,9 +858,9 @@ pub fn liftMemoryHigh(worker: LiveWorker) !void {
 /// `file_name`, which depends on the kernel's version and the leaf's
 /// controllers.
 pub fn leafHasFile(worker: LiveWorker, file_name: []const u8) bool {
-    var leaf = std.fs.openDirAbsolute(worker.record.handle.cgroup_dir, .{}) catch return false;
-    defer leaf.close();
-    leaf.access(file_name, .{}) catch return false;
+    var path_buffer: [host.WorkerLeaf.name_bytes_max + 1 + leaf_file_name_bytes_max]u8 = undefined;
+    const path = leafFilePath(worker, file_name, &path_buffer) catch return false;
+    std.posix.faccessat(worker.record.handle.leaf.workers_dir_fd, path, std.posix.F_OK, 0) catch return false;
     return true;
 }
 
@@ -1042,22 +1054,13 @@ fn firstArgumentIs(pid: u32, name: []const u8) bool {
     return std.mem.eql(u8, std.fs.path.basename(buffer[0..first_end]), name);
 }
 
-/// The fields of a `usage.jsonl` record the suites check.
-pub const UsageLine = struct {
-    worker: []const u8,
-    worker_id: u64,
-    worker_generation: u64,
-    origin: []const u8,
-    request_id: u64,
-    error_code: []const u8,
-    wall_ns: u64,
-    cpu_ns: u64,
-    worker_fault: []const u8,
-};
-
-/// The fields of an `access.jsonl` record the suites check.
+/// The fields of an `access.jsonl` record the suites check. The usage fields
+/// appear only on the record of a request the server dispatched to a worker
+/// (`server/analytics/access.zig`), so each is null on a record of a request
+/// the server answered alone.
 pub const AccessLine = struct {
     request_id: u64,
+    worker: []const u8,
     route: []const u8,
     worker_id: u64,
     worker_generation: u64,
@@ -1066,6 +1069,10 @@ pub const AccessLine = struct {
     worker_fault: []const u8,
     client_ip: []const u8,
     duration_ms: u64,
+    origin: ?[]const u8 = null,
+    wall_ns: ?u64 = null,
+    cpu_ns: ?u64 = null,
+    client_served_bytes: ?u64 = null,
 };
 
 /// A `workers.jsonl` line, which the server writes for each worker it tears

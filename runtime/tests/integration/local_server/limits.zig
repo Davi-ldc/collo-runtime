@@ -6,8 +6,10 @@
 //! is replaced. A definition at the largest `concurrency` serves that many
 //! slow requests at once from one worker. A worker that grows past its
 //! `memoryMiB` dies, ended by its sentinel at `memory.high` or by the
-//! kernel's OOM kill at `memory.max`, and either death is recorded as
-//! `memory`. Each test writes its configuration with `network.zig:configText`
+//! kernel's OOM kill at `memory.max`: its request's access record says
+//! `memory` either way, and the worker's line in `workers.jsonl` says which
+//! (`memory_high` or `memory_max`), so each memory test proves the stop it
+//! names. Each test writes its configuration with `network.zig:configText`
 //! around handlers in `fixtures/local_e2e/api/`. Lane `local-e2e`; the
 //! parser's bounds run in `server/tests/config/`, the sentinel's two clocks
 //! in `worker/tests/sentinel.zig`, the worker's own answers in
@@ -18,7 +20,6 @@ const std = @import("std");
 const limits = @import("collo_limits");
 const process = @import("collo_os").process;
 const server_main = @import("collo_server_main");
-const zygote_support = @import("zygote_support");
 const harness_mod = @import("harness.zig");
 const network_mod = @import("network.zig");
 
@@ -26,7 +27,7 @@ const Harness = harness_mod.Harness;
 const Client = harness_mod.Client;
 const LaunchTrace = harness_mod.LaunchTrace;
 const AccessLine = harness_mod.AccessLine;
-const UsageLine = harness_mod.UsageLine;
+const WorkerLine = harness_mod.WorkerLine;
 const Token = harness_mod.Token;
 const tokenOf = harness_mod.tokenOf;
 const expectStatus = harness_mod.expectStatus;
@@ -62,8 +63,8 @@ const wide_clients: usize = @divExact(@as(usize, wide_concurrency), client_strea
 /// The memory limit of the growing route's definition.
 const memory_limit_mib: u32 = 32;
 
-/// Polls `expectUsageRecord` makes, `record_poll_interval_ns` apart; the
-/// metrics thread drains usage rings every tick.
+/// Polls `expectMemoryEndings` makes, `record_poll_interval_ns` apart; the
+/// reaper writes a worker's line once it tore the worker down.
 const record_polls_max: usize = 500;
 const record_poll_interval_ns: u64 = 10 * std.time.ns_per_ms;
 
@@ -111,16 +112,15 @@ test "a handler that spins past its definition's cpuMs is answered 503 cpu, and 
     try std.testing.expectEqual(@as(usize, 2), launches.published);
     try std.testing.expectEqual(@as(usize, 0), launches.failed);
 
-    // The access record says why the request ended, and the worker's usage
-    // record holds at least the budget's CPU.
+    // The access record says why the request ended, and the worker's own
+    // measure on it holds at least the budget's CPU.
     var access = try waitForRecordLines(AccessLine, &harness, "access.jsonl", 3);
     defer access.deinit();
     const stopped = try soleAccessRecordWithStatus(access.items, 503);
     try std.testing.expectEqualStrings("/cpu/spin", stopped.route);
     try std.testing.expectEqualStrings("cpu", stopped.error_code);
-    try expectUsageRecord(&harness, stopped.request_id, .{
+    try expectUsage(stopped, .{
         .origin = "worker",
-        .error_code = "cpu",
         .cpu_ns_min = @as(u64, cpu_budget_ms) * std.time.ns_per_ms,
     });
 }
@@ -251,9 +251,9 @@ test "a worker past memory.high is ended by its sentinel and its request is reco
     try expectStatus(&grown, 502);
     _ = try expectServedAfterMemoryDeath(&client);
     try expectMemoryDeathRecords(&harness, 3);
-
-    // The sentinel's exit is what ended the worker.
-    try expectSentinelMemoryExits(&harness, 1);
+    // A sentinel that missed the event would leave the worker to the
+    // kernel's OOM kill at `memory.max`, whose line says `memory_max`.
+    try expectMemoryEndings(&harness, .{ .memory_high = 1 });
 }
 
 test "a worker past memory.max is killed by the kernel and classified by its leaf's oom_kill" {
@@ -280,7 +280,7 @@ test "a worker past memory.max is killed by the kernel and classified by its lea
     try expectStatus(&grown, 502);
     try std.testing.expect(!token.eql(try expectServedAfterMemoryDeath(&client)));
     try expectMemoryDeathRecords(&harness, 4);
-    try expectSentinelMemoryExits(&harness, 0);
+    try expectMemoryEndings(&harness, .{ .memory_max = 1 });
 }
 
 /// The configuration of the memory tests: the growing route's definition at
@@ -310,11 +310,11 @@ fn expectServedAfterMemoryDeath(client: *Client) !Token {
     return token;
 }
 
-/// Checks the records of the one request a memory death ended, among the
-/// `requests` records the test's requests left: its access record answers
-/// 502 with error code `memory` and the fault the lane saw the death by, the
-/// worker's exit or its hang-up, and its usage record is the floor the server
-/// wrote, with the same error code.
+/// Checks the record of the one request a memory death ended, among the
+/// `requests` records the test's requests left: it answers 502 with error
+/// code `memory` and the fault the lane saw the death by, the worker's exit
+/// or its hang-up, and its usage is the floor the server read off the dead
+/// worker's page.
 fn expectMemoryDeathRecords(harness: *Harness, requests: usize) !void {
     var access = try waitForRecordLines(AccessLine, harness, "access.jsonl", requests);
     defer access.deinit();
@@ -326,24 +326,44 @@ fn expectMemoryDeathRecords(harness: *Harness, requests: usize) !void {
         std.debug.print("the death's access record names the worker fault {s}\n", .{died.worker_fault});
         return error.UnexpectedWorkerFault;
     }
-    try expectUsageRecord(harness, died.request_id, .{ .origin = "server", .error_code = "memory" });
+    try expectUsage(died, .{ .origin = "server" });
 }
 
-/// Drains the zygote's trace and fails with `error.UnexpectedMemoryExitTrace`
-/// unless it holds exactly `expected` lines `child.memory_exit`, which a
-/// worker's sentinel writes as it exits past `memory.high`
-/// (`handleMemoryEvents` in `worker/runtime/sentinel.zig`). The drain empties
-/// the pipe that the test's `dumpZygoteTrace` reads, so a mismatch prints the
-/// drained lines here.
-fn expectSentinelMemoryExits(harness: *Harness, expected: usize) !void {
-    const memory_exit_line = "child.memory_exit";
-    var trace = try zygote_support.drainTrace(&harness.spawned, std.testing.allocator);
-    defer trace.deinit();
-    const exits = trace.countEq(memory_exit_line);
-    if (exits == expected) return;
-    std.debug.print("the zygote trace holds {d} {s} lines, not {d}:\n", .{ exits, memory_exit_line, expected });
-    for (trace.messages) |message| std.debug.print("  {s}\n", .{message});
-    return error.UnexpectedMemoryExitTrace;
+/// The lines of `workers.jsonl` of workers that ended for memory, by who
+/// stopped them.
+const MemoryEndings = struct {
+    /// `memory_high`: the worker's sentinel, past `memory.high`.
+    memory_high: usize = 0,
+    /// `memory_max`: the kernel's OOM kill at `memory.max`.
+    memory_max: usize = 0,
+};
+
+/// Waits until `workers.jsonl` holds as many memory endings as `expected`
+/// counts, which the reaper writes once it tore each worker down, and fails
+/// with `error.UnexpectedMemoryEndings` when it holds others then.
+fn expectMemoryEndings(harness: *Harness, expected: MemoryEndings) !void {
+    var found: MemoryEndings = .{};
+    for (0..record_polls_max) |_| {
+        var lines = try waitForRecordLines(WorkerLine, harness, "workers.jsonl", 0);
+        defer lines.deinit();
+        found = .{};
+        for (lines.items) |line| {
+            if (std.mem.eql(u8, line.ending, "memory_high"))
+                found.memory_high += 1;
+            if (std.mem.eql(u8, line.ending, "memory_max"))
+                found.memory_max += 1;
+        }
+        if (found.memory_high + found.memory_max >= expected.memory_high + expected.memory_max) break;
+        std.Thread.sleep(record_poll_interval_ns);
+    }
+    if (std.meta.eql(found, expected)) return;
+    std.debug.print("workers.jsonl holds {d} memory_high and {d} memory_max endings, not {d} and {d}\n", .{
+        found.memory_high,
+        found.memory_max,
+        expected.memory_high,
+        expected.memory_max,
+    });
+    return error.UnexpectedMemoryEndings;
 }
 
 /// Whether `label` names a fault by which a lane sees a worker die on its
@@ -367,32 +387,18 @@ fn soleAccessRecordWithStatus(records: []const AccessLine, status: u16) !AccessL
 }
 
 const ExpectedUsage = struct {
-    /// `worker` for a record the worker wrote, `server` for a floor.
+    /// `worker` for the worker's own measures, `server` for a floor.
     origin: []const u8,
-    error_code: []const u8,
     cpu_ns_min: u64 = 0,
 };
 
-/// Waits for the usage record of `request_id` and checks who wrote it, how
-/// it says the request ended and the CPU it holds.
-fn expectUsageRecord(harness: *Harness, request_id: u64, expected: ExpectedUsage) !void {
-    for (0..record_polls_max) |_| {
-        var usage = try waitForRecordLines(UsageLine, harness, "usage.jsonl", 0);
-        defer usage.deinit();
-        for (usage.items) |record| {
-            if (record.request_id != request_id) continue;
-            try std.testing.expectEqualStrings(expected.origin, record.origin);
-            try std.testing.expectEqualStrings(expected.error_code, record.error_code);
-            if (record.cpu_ns < expected.cpu_ns_min) {
-                std.debug.print("the usage record holds {d} ns of CPU, less than {d}\n", .{
-                    record.cpu_ns,
-                    expected.cpu_ns_min,
-                });
-                return error.UsageRecordCpuTooLow;
-            }
-            return;
-        }
-        std.Thread.sleep(record_poll_interval_ns);
+/// Checks the usage on `record`, the access record of a request the server
+/// dispatched: who measured it and the CPU it holds.
+fn expectUsage(record: AccessLine, expected: ExpectedUsage) !void {
+    try std.testing.expectEqualStrings(expected.origin, record.origin orelse return error.UsageNotRecorded);
+    const cpu_ns = record.cpu_ns orelse return error.UsageNotRecorded;
+    if (cpu_ns < expected.cpu_ns_min) {
+        std.debug.print("the access record holds {d} ns of CPU, less than {d}\n", .{ cpu_ns, expected.cpu_ns_min });
+        return error.UsageCpuTooLow;
     }
-    return error.UsageRecordNotObserved;
 }

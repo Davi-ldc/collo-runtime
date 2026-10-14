@@ -44,7 +44,7 @@ pub const USER_AGENT_BYTES_MAX: usize = 256;
 /// lane asserts that bound against this cap.
 pub const CLIENT_IP_BYTES_MAX: usize = 39;
 
-/// Byte cap on the worker fault label an access or usage record carries
+/// Byte cap on the worker fault label an access record carries
 /// (`WorkerFaultReason.label` in `server/ingress/fault.zig`, which asserts
 /// that every label fits). The record points at the static label, so the cap
 /// sizes only the encoded record.

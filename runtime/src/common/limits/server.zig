@@ -77,9 +77,9 @@ pub const worker_concurrency_max: u8 = 16;
 pub const request_timeout_ms_max: u32 = 15 * 60 * 1000;
 
 /// Largest `cpuMs`, the CPU time one request may use: the VM thread's while
-/// the request owns it, plus the crypto pool's on the request's jobs. Crypto
-/// jobs run beside the VM thread, so a request's CPU can grow faster than its
-/// wall time, and `cpuMs` is not capped at the definition's `timeoutMs`.
+/// the request owns it. A request's CPU cannot outgrow its wall time on that
+/// one thread, so a `cpuMs` above the definition's `timeoutMs` never binds;
+/// it is accepted, not refused.
 pub const request_cpu_ms_max: u32 = request_timeout_ms_max;
 
 /// Most entries one `network.allow` list may hold. Every gateway holds every

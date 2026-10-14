@@ -10,7 +10,7 @@
 //! the shared entry `entry_file_name`. Pools are keyed by definition, so
 //! every route gets a pool and a pack of its own while all packs hold the
 //! same source under different specifiers. The limits and the `network`
-//! grant sit in `globalSettings` and cascade to every definition.
+//! grant sit in the top-level `settings` and cascade to every definition.
 
 const std = @import("std");
 const protocol = @import("protocol.zig");
@@ -139,7 +139,7 @@ pub fn writeConfig(
     if (options.origin != null and options.network == .none) return error.OriginNeedsGrant;
 
     try output.print(
-        "{{\"globalSettings\":{{\"limits\":{{\"memoryMiB\":{d},\"timeoutMs\":{d},\"concurrency\":{d}}}",
+        "{{\"settings\":{{\"limits\":{{\"memoryMiB\":{d},\"timeoutMs\":{d},\"concurrency\":{d}}}",
         .{ worker_memory_mib, request_timeout_ms, options.concurrency },
     );
     switch (options.network) {

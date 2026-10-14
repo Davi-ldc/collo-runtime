@@ -1,35 +1,35 @@
 //! The worker supervisor: one pool of worker processes per worker definition
-//! of the server configuration, the records of those workers, their usage
-//! records and the hooks into the egress gateway manager. One instance lives
-//! in the server process, and the ingress lanes, the launcher, the reaper,
-//! the metrics thread and the exiting thread all call into it.
+//! of the server configuration, the records of those workers and the hooks
+//! into the egress gateway manager. One instance lives in the server
+//! process, and the ingress lanes, the launcher, the reaper, the metrics
+//! thread and the exiting thread all call into it.
 //!
 //! - `routes` is borrowed: the server builds it at boot and frees it only
 //!   after every thread that reads the supervisor has stopped
 //!   (`server/routes/root.zig`). Worker records borrow their definition's
-//!   name from it, and usage records borrow route patterns.
+//!   name from it, and console lines borrow route patterns.
 //! - `pools[d]` is definition `d`'s pool, built at `init` and kept until
 //!   `deinit`. Each pool locks itself (`pool.zig` states its lock order), and
 //!   the supervisor has no lock of its own: a lane's dispatch and finish take
-//!   only their pool's mutex, the worker's request table lock and, when they
-//!   drain or write a floor, the worker's `metrics_mutex`.
+//!   only their pool's mutex and the worker's request table lock.
 //! - `records` holds every worker record, entry `e` of pool `d` at
 //!   `d * pool_workers_max + e`, the entry a `LaunchTicket` names. Allocated
 //!   at `init` and freed at `deinit`, so a record pointer stays
 //!   dereferenceable for the server's life; `worker_table.zig` says who may
 //!   read a record when.
 //! - `next_worker_id` and `next_worker_generation` belong to the launcher
-//!   thread, which alone builds records (`worker_registry.buildRecord`).
-//! - Usage records take no lock of this struct. `usage` locks itself,
-//!   `analytics` locks its own streams, each
-//!   worker record's request table has its own leaf lock, and
-//!   `usage_counters` are atomics.
+//!   thread, which alone builds records (`worker_registry.buildRecord`), and
+//!   so does `scale_out`, the readings of its scale-out samples
+//!   (`sampleScaleOut`).
+//! - `analytics` locks its own streams; a worker's teardown appends to it
+//!   from the reaper or the exiting thread.
 //! - `egress_gateway` is set once by the server before the launcher starts
 //!   and read without a lock after that.
 //! - A live worker's egress session changes when the launcher attaches it to
-//!   a new gateway (`setWorkerEgress`) or takes it off a session its gateway
-//!   removed (`dropEgressSession`), and is read by the lanes that mint its
-//!   tokens (`workerEgress`), all under its pool's mutex.
+//!   a new gateway (`setWorkerEgress`), and is read by the lanes that mint its
+//!   tokens (`workerEgress`), both under its pool's mutex. A worker whose
+//!   session its gateway removed for a protocol violation leaves service
+//!   (`retireEgressSession`).
 
 const std = @import("std");
 const fd_mod = @import("collo_os").fd;
@@ -39,7 +39,6 @@ const config = @import("collo_server_config");
 const routes_mod = @import("collo_server_routes");
 const server_lifecycle = @import("collo_server_lifecycle");
 const pool_limits = @import("collo_limits").pool;
-const worker_shared_page = @import("collo_worker_state").page;
 const cgroup_root = @import("collo_host").cgroup_root;
 /// The analytics module `Supervisor.init` takes a sink from.
 pub const analytics = @import("collo_server_analytics");
@@ -48,10 +47,10 @@ const launcher = @import("launcher.zig");
 const pool = @import("pool.zig");
 const reaping = @import("reaper/reaping.zig");
 const reaper_memory = @import("reaper/memory.zig");
+const scale_out = @import("scale_out.zig");
 const scheduler_limits = @import("scheduler_limits.zig");
+const server_limits = @import("collo_limits").server;
 const worker_table = @import("worker_table.zig");
-const usage_drain = @import("usage_drain.zig");
-const usage_log = @import("usage_log.zig");
 const worker_factory = @import("worker_factory.zig");
 const worker_registry = @import("worker_registry.zig");
 
@@ -60,7 +59,6 @@ const Routes = routes_mod.Routes;
 const WorkerCgroupRoot = cgroup_root.WorkerCgroupRoot;
 
 pub const WorkerPool = pool.Pool(WorkerRecord);
-pub const SettleOutcome = usage_drain.SettleOutcome;
 
 const pool_workers_max = pool_limits.pool_workers_max;
 
@@ -118,6 +116,14 @@ pub const WorkerEgress = struct {
     session_id: u64,
 };
 
+/// A worker `Supervisor.retireEgressSession` took out of service, with the
+/// death its caller announces to the lanes.
+pub const RetiredEgressWorker = struct {
+    record: *WorkerRecord,
+    worker_key: server_lifecycle.WorkerKey,
+    death: WorkerPool.Death,
+};
+
 /// The settings `Supervisor.init` copies into the supervisor.
 pub const Config = struct {
     hard_timeout_grace_ns: u64 = default_hard_timeout_grace_ns,
@@ -156,15 +162,9 @@ pub const Supervisor = struct {
     /// value. -1 means unwired, and the nudge then does nothing.
     demand_reclaim_eventfd: std.atomic.Value(std.posix.fd_t) = .init(-1),
     /// Borrowed: the server opens the sink before the supervisor and closes it
-    /// after `deinit` (`server/main.zig`). A worker's final drain writes its
-    /// last console lines into it, its teardown its line in `workers.jsonl`,
-    /// and the usage log appends usage records to it.
+    /// after `deinit` (`server/main.zig`). A worker's teardown writes its last
+    /// console lines and its line in `workers.jsonl` into it.
     analytics: *analytics.Sink,
-    /// The usage log: the producer side of `usage.jsonl`. Self contained and
-    /// self locked; the supervisor hands it records and owns none of its
-    /// state.
-    usage: usage_log.UsageLog,
-    usage_counters: usage_drain.Counters = .{},
     hard_timeout_grace_ns: u64,
     worker_idle_ttl_ns: u64 = default_worker_idle_ttl_ns,
     reaper_interval_ns: u64 = reaping.default_interval_ns,
@@ -173,6 +173,9 @@ pub const Supervisor = struct {
     /// cgroups of the workers and of the server; the reaper thread alone
     /// reads them (`Reaper.readPressure`).
     memory_domains: reaper_memory.MemoryDomains,
+    /// What the scale-out verdict reads, and the readings it keeps between
+    /// samples; the launcher thread alone uses it (`sampleScaleOut`).
+    scale_out: scale_out.Sampler,
     /// Set by `setEgressGatewayHooks`; null in fixtures without a gateway.
     egress_gateway: ?EgressGatewayHooks = null,
     /// Borrowed; the caller of `init` owns both parts and keeps them alive
@@ -218,10 +221,14 @@ pub const Supervisor = struct {
             record.* = WorkerRecord.vacant(definition, routes.definition(definition).name);
         }
 
-        var usage = try usage_log.UsageLog.init(allocator, analytics_sink);
-        errdefer usage.deinit();
         var memory_domains: reaper_memory.MemoryDomains = undefined;
         try initMemoryDomains(&memory_domains, allocator, if (worker_host) |placement| placement.cgroup_root else null);
+        errdefer memory_domains.deinit();
+        var scale_out_sampler: scale_out.Sampler = undefined;
+        try scale_out_sampler.init(allocator, .{
+            .definition_count = definition_count,
+            .workers_dir_path = if (worker_host) |placement| placement.cgroup_root.workers_dir_path else null,
+        });
         return .{
             .allocator = allocator,
             .zygote_process = zygote_process,
@@ -231,11 +238,11 @@ pub const Supervisor = struct {
             .next_worker_id = 1,
             .next_worker_generation = 1,
             .analytics = analytics_sink,
-            .usage = usage,
             .hard_timeout_grace_ns = supervisor_config.hard_timeout_grace_ns,
             .worker_idle_ttl_ns = supervisor_config.worker_idle_ttl_ns,
             .reaper_interval_ns = supervisor_config.reaper_interval_ns,
             .memory_domains = memory_domains,
+            .scale_out = scale_out_sampler,
             .worker_host = worker_host,
         };
     }
@@ -273,8 +280,8 @@ pub const Supervisor = struct {
     /// (`worker_registry.teardown`), then frees the pools and the records.
     /// The caller is the server's teardown, after every thread that calls
     /// into the supervisor has stopped and the reaper's retire queue was
-    /// drained, with the analytics sink still open: each teardown drains the
-    /// worker's last usage records and console lines into it.
+    /// drained, with the analytics sink still open: each teardown writes the
+    /// worker's last console lines and its worker line into it.
     pub fn deinit(self: *Supervisor) void {
         for (self.records) |*record| {
             if (record.id != 0)
@@ -286,8 +293,8 @@ pub const Supervisor = struct {
         self.allocator.free(self.pools);
         // The sink stays open: the server closes it after this returns, and
         // that close writes and syncs what the teardowns above appended.
-        self.usage.deinit();
         self.memory_domains.deinit();
+        self.scale_out.deinit();
         self.* = undefined;
     }
 
@@ -320,68 +327,67 @@ pub const Supervisor = struct {
     }
 
     /// Claims a launch for `definition` when its pool wants one under the
-    /// memory gate (`Pool.launchStarted`), and returns its ticket, or null.
-    /// At or above `autoscale_high_water_percent` a launch still proceeds,
-    /// since the room up to the deny level exists to absorb load while more
-    /// nodes come up, but it wakes demand reclaim so idle workers give memory
-    /// back at the speed of demand; a claim the gate refuses wakes it too.
-    /// The launcher thread calls it (`Deps.claim` in `launcher.zig`).
-    pub fn claimLaunch(self: *Supervisor, definition: config.DefinitionIndex) ?pool.LaunchTicket {
+    /// memory gate (`Pool.launchStarted`), a worker more beside live ones
+    /// only with `allow_scale_out`, the scale-out verdict. At or above
+    /// `autoscale_high_water_percent` a launch still proceeds, since the room
+    /// up to the deny level exists to absorb load while more nodes come up,
+    /// but it wakes demand reclaim so idle workers give memory back at the
+    /// speed of demand; a claim the gate refuses wakes it too. The launcher
+    /// thread calls it (`Deps.claim` in `launcher.zig`).
+    pub fn claimLaunch(self: *Supervisor, definition: config.DefinitionIndex, allow_scale_out: bool) pool.LaunchStart {
         const used_percent = self.cached_used_percent.load(.monotonic);
         const gate_allows = used_percent < scheduler_limits.memory.fork_deny_percent;
-        const ticket = self.poolFor(definition).launchStarted(gate_allows);
+        const start = self.poolFor(definition).launchStarted(gate_allows, allow_scale_out);
         if (!gate_allows) {
             self.nudgeDemandReclaim();
-        } else if (ticket != null and used_percent >= scheduler_limits.memory.autoscale_high_water_percent) {
+        } else if (start == .started and used_percent >= scheduler_limits.memory.autoscale_high_water_percent) {
             self.nudgeDemandReclaim();
         }
-        return ticket;
+        return start;
     }
 
-    /// Settles the usage of the request `request_id` that ended on `worker`
-    /// at `ended_mono_ns`, as `outcome` says, and frees or parks its entry in
-    /// the worker's request table (`usage_drain.settleRequest`). The lane
-    /// that finishes the request calls it first in its finish, with the
-    /// CLOCK_MONOTONIC instant its access record ends at, before it gives the
-    /// request's slot back (`Pool.release`); the request's usage record then
-    /// ends at that instant too. It takes only the worker's own locks, and
-    /// never fails.
-    pub fn settleRequest(
+    /// One scale-out sample at `now_ns` over the definitions `watch` holds
+    /// (`scale_out.zig`): a definition whose pool no longer wants a
+    /// scale-out leaves `watch`, its pool's watch ended
+    /// (`Pool.keepScaleOutWatch`); the others are weighed, and `granted` is
+    /// set to those the verdict grants one launch each. Launcher thread only
+    /// (`Deps.scaleOut` in `launcher.zig`).
+    pub fn sampleScaleOut(
         self: *Supervisor,
-        worker: *WorkerRecord,
-        request_id: u64,
-        outcome: SettleOutcome,
-        ended_mono_ns: u64,
+        watch: *launcher.DefinitionSet,
+        granted: *launcher.DefinitionSet,
+        now_ns: u64,
     ) void {
-        usage_drain.settleRequest(self.usageDrain(), worker, request_id, outcome, ended_mono_ns);
-    }
-
-    /// The status the floors of a dead worker's requests carry: `.memory`
-    /// when its sentinel or the kernel ended it for memory, `.crash`
-    /// otherwise (`usage_drain.classifyWorkerDeath`). It reads a cgroup file,
-    /// so a lane that runs a worker's death calls it once for the worker.
-    pub fn classifyWorkerDeath(self: *Supervisor, worker: *WorkerRecord) worker_shared_page.CompletedStatus {
-        return usage_drain.classifyWorkerDeath(self.usageDrain(), worker);
-    }
-
-    /// Drains every worker's usage ring into the usage log, writing the
-    /// usage stream out only when a batch finds it full
-    /// (`usage_drain.drainAll`). The exiting thread calls it once the lanes,
-    /// the launcher and the metrics thread joined; the server's close of the
-    /// sink writes and syncs the rest.
-    pub fn drainAllWorkerUsage(self: *Supervisor) void {
-        usage_drain.drainAll(self.usageDrain(), self.records);
-    }
-
-    /// What the usage drain reaches (`usage_drain.UsageDrain`), all of it
-    /// borrowed from this supervisor.
-    pub fn usageDrain(self: *Supervisor) usage_drain.UsageDrain {
-        return .{
-            .allocator = self.allocator,
-            .usage = &self.usage,
-            .routes = self.routes,
-            .counters = &self.usage_counters,
-        };
+        granted.* = .initEmpty();
+        const gate_allows = self.memoryGate();
+        self.scale_out.begin(now_ns);
+        var candidates: [server_limits.worker_definitions_max]scale_out.Candidate = undefined;
+        var count: usize = 0;
+        const watched = watch.*;
+        var iterator = watched.iterator(.{});
+        while (iterator.next()) |index| {
+            const definition: config.DefinitionIndex = @intCast(index);
+            const definition_pool = self.poolFor(definition);
+            if (!definition_pool.keepScaleOutWatch(gate_allows)) {
+                watch.unset(index);
+                continue;
+            }
+            var lister: LiveWorkerLister = .{};
+            _ = definition_pool.findLive(&lister);
+            candidates[count] = .{
+                .definition = definition,
+                .figures = self.scale_out.readDefinition(definition, lister.slice()),
+            };
+            count += 1;
+        }
+        // Read every sample, so the next one has the node's reading before
+        // it whether or not a definition is weighed now.
+        const node_idle_permille = self.scale_out.readNodeIdle();
+        var grants: [server_limits.worker_definitions_max]bool = undefined;
+        scale_out.decide(candidates[0..count], node_idle_permille, self.scale_out.nextStart(), .{}, grants[0..count]);
+        for (candidates[0..count], grants[0..count]) |candidate, grant| {
+            if (grant) granted.set(candidate.definition);
+        }
     }
 
     /// Wakes the reaper for demand reclaim: a launch met the memory ladder at
@@ -492,25 +498,30 @@ pub const Supervisor = struct {
     /// the worker left service or its record holds another worker. Launcher
     /// thread only (`Deps.retireForEgress`).
     pub fn retireForEgress(self: *Supervisor, target: *const launcher.ReattachTarget) ?WorkerPool.Death {
-        return self.poolFor(target.definition).retireForEgress(target.record, target.worker_key);
+        return self.poolFor(target.definition).retireForEgress(target.record, target.worker_key, .egress);
     }
 
     /// Takes the live worker whose session is `session_id` of gateway
-    /// `generation`, which that gateway removed, off the session under its
-    /// pool's mutex: its record names no session from then on, so the lanes
-    /// mint it no token and the next reattach pass, which takes every live
-    /// worker off the current gateway, gives it a new one. Returns whether a
-    /// live worker held that session; generations never repeat, so the pair
-    /// names one session for the server's life. Launcher thread only
-    /// (`Deps.dropEgressSession`).
-    pub fn dropEgressSession(self: *Supervisor, generation: u64, session_id: u64) bool {
+    /// `generation`, which that gateway removed for what the worker sent or
+    /// left unread (`control.SessionRemovedCause.protocol_violation` in
+    /// `egress/gateway/control.zig`), out of service with departure
+    /// `.egress_removed`, and returns it with its death, which the caller
+    /// announces to the lanes that hold or read the worker. The worker gets
+    /// no new session. null, changing nothing, when no live worker holds
+    /// that session; generations never repeat, so the pair names one session
+    /// for the server's life. Launcher thread only
+    /// (`Deps.retireEgressSession`).
+    pub fn retireEgressSession(self: *Supervisor, generation: u64, session_id: u64) ?RetiredEgressWorker {
         std.debug.assert(generation != 0);
         for (self.pools) |*definition_pool| {
-            var dropper: EgressSessionDropper = .{ .generation = generation, .session_id = session_id };
-            if (definition_pool.findLive(&dropper) != null)
-                return true;
+            var finder: EgressSessionFinder = .{ .generation = generation, .session_id = session_id };
+            const record = definition_pool.findLive(&finder) orelse continue;
+            // The worker may leave service between the find and the retire,
+            // and `retireForEgress` then changes nothing.
+            const death = definition_pool.retireForEgress(record, finder.worker_key, .egress_removed) orelse return null;
+            return .{ .record = record, .worker_key = finder.worker_key, .death = death };
         }
-        return false;
+        return null;
     }
 
     /// Copies the token key of gateway `generation` into `out` for a launch's
@@ -542,8 +553,9 @@ pub const Supervisor = struct {
 };
 
 // The visitors that run under a pool's mutex (`Pool.findLive`,
-// `Pool.visitWorker`): each reads or writes only a record's egress session
-// and duplicates its descriptors.
+// `Pool.visitWorker`): each reads or writes only a record's egress session,
+// duplicates its descriptors, or copies its key and leaf, which stay fixed
+// while the worker is live.
 
 /// Picks the first worker whose session is not of gateway `generation` and
 /// takes its key and dups of its control socket and wake set.
@@ -567,19 +579,38 @@ const StaleEgressFinder = struct {
 };
 
 /// Picks the worker whose session is `session_id` of gateway `generation`
-/// and leaves its record with no session.
-const EgressSessionDropper = struct {
+/// and keeps its key.
+const EgressSessionFinder = struct {
     generation: u64,
     session_id: u64,
+    worker_key: server_lifecycle.WorkerKey = undefined,
 
-    pub fn visit(self: *EgressSessionDropper, worker: *WorkerRecord) bool {
+    pub fn visit(self: *EgressSessionFinder, worker: *WorkerRecord) bool {
         if (worker.egress_gateway_generation != self.generation)
             return false;
         if (worker.egress_gateway_session_id != self.session_id)
             return false;
-        worker.egress_gateway_generation = 0;
-        worker.egress_gateway_session_id = 0;
+        self.worker_key = worker.key();
         return true;
+    }
+};
+
+/// Lists every live worker of a pool with its key and its cgroup leaf, which
+/// names the leaf by the workers directory's descriptor and the job id, so
+/// the leaf's files stay readable by name after the visit, and a leaf torn
+/// down since fails its read.
+const LiveWorkerLister = struct {
+    items: [pool_workers_max]scale_out.LiveWorker = undefined,
+    len: usize = 0,
+
+    pub fn visit(self: *LiveWorkerLister, worker: *WorkerRecord) bool {
+        self.items[self.len] = .{ .key = worker.key(), .leaf = worker.handle.leaf };
+        self.len += 1;
+        return false;
+    }
+
+    fn slice(self: *const LiveWorkerLister) []const scale_out.LiveWorker {
+        return self.items[0..self.len];
     }
 };
 

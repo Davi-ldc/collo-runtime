@@ -78,6 +78,14 @@ pub fn parse(b: *std.Build) Options {
     };
 }
 
+/// The sysroot a build for `target` compiles and links against: COLLO_CXX_SYSROOT for a cross
+/// build, none for the architecture running the build, as deps.zig and the build tool decide. One
+/// environment then configures every step, so a sysroot exported for the aarch64 steps never
+/// reaches the host's toolchain, engine or stamps.
+pub fn cxxSysrootFor(b: *std.Build, opts: *const Options, target: std.Build.ResolvedTarget) []const u8 {
+    return if (target.result.cpu.arch == b.graph.host.result.cpu.arch) "" else opts.cxx_sysroot;
+}
+
 pub const EngineDirs = struct {
     jsc: []const u8,
     webkit_src: []const u8,

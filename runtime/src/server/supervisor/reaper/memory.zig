@@ -15,6 +15,8 @@
 //! that share, defined in `scheduler_limits.zig` with the reasons for each.
 
 const std = @import("std");
+const cgroup = @import("collo_cgroup");
+const host = @import("collo_host");
 
 const limits = @import("../scheduler_limits.zig");
 
@@ -153,21 +155,11 @@ pub fn idleWeightScaled(idle_ns: u64, worker_idle_ttl_ns: u64) u128 {
     return std.math.clamp(raw, 50, 1000);
 }
 
-pub fn readWorkerMemoryCurrent(allocator: std.mem.Allocator, cgroup_dir: []const u8) !u64 {
-    const path = try std.fmt.allocPrint(allocator, "{s}/memory.current", .{cgroup_dir});
-    defer allocator.free(path);
-    return readUnsignedFile(allocator, path);
-}
-
-/// The highest `memory.current` the worker's cgroup reached since its
-/// creation, or null on a kernel without `memory.peak` (before Linux 5.19).
-pub fn readWorkerMemoryPeak(allocator: std.mem.Allocator, cgroup_dir: []const u8) !?u64 {
-    const path = try std.fmt.allocPrint(allocator, "{s}/memory.peak", .{cgroup_dir});
-    defer allocator.free(path);
-    return readUnsignedFile(allocator, path) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => |other| return other,
-    };
+/// The worker's `memory.current`, read through its leaf with one read into a
+/// stack buffer (`common/cgroup.zig:readLeafFigure`); fails once the leaf is
+/// gone.
+pub fn readWorkerMemoryCurrent(leaf: host.WorkerLeaf) !u64 {
+    return cgroup.readLeafFigure(leaf, .memory_current);
 }
 
 /// The worker's private resident bytes from `/proc/<pid>/smaps_rollup`: the
@@ -402,13 +394,6 @@ fn usedPercent(used: u64, limit: u64) u8 {
         return 100;
     const percent = (@as(u128, used) * 100) / limit;
     return @intCast(@min(percent, 100));
-}
-
-fn readUnsignedFile(allocator: std.mem.Allocator, path: []const u8) !u64 {
-    const bytes = try readSmallFileAbsolute(allocator, path, 128);
-    defer allocator.free(bytes);
-    const trimmed = std.mem.trim(u8, bytes, " \t\r\n");
-    return std.fmt.parseInt(u64, trimmed, 10);
 }
 
 fn readSmallFileAbsolute(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {

@@ -1,18 +1,35 @@
-//! The worker's sandbox, applied by the forked child in three steps: user,
-//! mount and network namespaces first, while the child is single-threaded;
-//! then resource limits, no-new-privileges, a private tmpfs root and
-//! capability drop; and last, after every thread exists, a seccomp allowlist
-//! installed on all threads. A syscall outside the allowlist fails with EPERM,
-//! and a syscall from a foreign architecture kills the process. The child
-//! keeps no route to the network, the machine's filesystem or new threads.
+//! The worker's sandbox, which the forked child applies in three steps on its
+//! one thread (`child_boot.zig` orders them): user, mount and network
+//! namespaces first, while the child is single-threaded; then resource
+//! limits, no-new-privileges, the root and the capability drop; and last,
+//! once every thread exists, the seccomp allowlist on all threads. A syscall
+//! outside the allowlist fails with EPERM, and a syscall from a foreign
+//! architecture kills the process. The child keeps no route to the network,
+//! the machine's filesystem or new threads.
+//!
+//! The root is a tmpfs of `WorkerInit`'s size, mounted over `/tmp` in the
+//! child's private mount namespace, so the host never sees it. Inside it,
+//! `tmp/` is bound onto itself and stays writable, while the rest of the
+//! root, `var/task/` (`task_root`, the working directory) included, is
+//! read-only, because the root's mount carries `MS_RDONLY` and the bind does
+//! not. The kernel enforces both for every caller, `node:fs` and code that
+//! escapes the engine alike, and nothing in the worker can lift them: the
+//! capabilities a remount needs go with the drop, and the filter denies
+//! `mount`, `umount2`, `chroot`, `pivot_root`, `unshare` and `setns`, so the
+//! worker can neither remount nor reach a namespace where it would hold them.
 
 const std = @import("std");
 const builtin = @import("builtin");
+const ipc = @import("collo_ipc");
 const linux_helpers = @import("collo_os").linux;
 const linux = std.os.linux;
 
+/// The worker's working directory, read-only and empty: the directory the
+/// keys of a definition's modules name (`module_pack.zig:task_root`), where a
+/// route's files would sit.
+pub const task_root = ipc.module_pack.task_root;
+
 pub const Config = struct {
-    tmp_root_fd: std.posix.fd_t,
     tmpfs_size_bytes: u64,
     max_open_files: u64 = limits.DEFAULT_MAX_OPEN_FILES,
 };
@@ -25,40 +42,20 @@ pub fn applyPostForkNamespaces() !void {
 }
 
 /// Runs inside the namespaces entered at birth, whose capabilities allow the
-/// tmpfs mount and the chroot; dropCapabilities then gives them up.
+/// tmpfs mount, the bind, the read-only remount and the chroot;
+/// dropCapabilities then gives them up.
 pub fn applyPreThread(config: Config) !void {
-    try tmp_root.validateFd(config.tmp_root_fd);
     try limits.apply(config);
     try privileges.disableNewPrivs();
     try mounts.makePrivate();
-    try rootfs.mountTmpfsAndChrootIntoFd(config);
+    try rootfs.build(config.tmpfs_size_bytes);
     try privileges.dropCapabilities();
 }
 
-pub fn applySeccomp(config: security.Config) !void {
-    try security.apply(config);
+/// Installs the worker's filter (`security.instructions`) on every thread.
+pub fn applySeccomp() !void {
+    try security.apply();
 }
-
-pub const tmp_root = struct {
-    pub const required_mode: u32 = 0o700;
-
-    pub fn validateFd(fd: std.posix.fd_t) !void {
-        if (fd < 0)
-            return error.InvalidWorkerTmpRoot;
-        var stat: linux.Stat = undefined;
-        switch (linux_helpers.syscallErrno(linux.fstat(fd, &stat))) {
-            .SUCCESS => {},
-            .BADF => return error.InvalidWorkerTmpRoot,
-            else => return error.InvalidWorkerTmpRoot,
-        }
-        if ((stat.mode & linux.S.IFMT) != linux.S.IFDIR)
-            return error.InvalidWorkerTmpRoot;
-        if ((stat.mode & 0o7777) != required_mode)
-            return error.PermissionDenied;
-        if (stat.uid != linux.getuid())
-            return error.PermissionDenied;
-    }
-};
 
 pub const limits = struct {
     pub const DEFAULT_MAX_OPEN_FILES: u64 = 1024;
@@ -104,8 +101,7 @@ pub const privileges = struct {
 
 pub const namespaces = struct {
     /// Every worker gets a private network namespace with no devices or
-    /// routes. `validateWorkerInit` only admits isolated-network workers, so
-    /// there is no host-network mode.
+    /// routes; there is no host-network mode.
     fn enterWorker() !void {
         const uid: u32 = @intCast(linux.getuid());
         const gid: u32 = @intCast(linux.getgid());
@@ -154,22 +150,12 @@ pub const namespaces = struct {
     }
 };
 
+/// The worker's one seccomp filter: `allowed_syscalls` plus the calls the
+/// argument policies of `buildTemplate` admit, everything else failing with
+/// EPERM, so worker code cannot gain new authority. The program is built at
+/// compile time, and each argument policy fails the build on a target that
+/// lacks its syscall, so every policy is in the program on every target.
 pub const security = struct {
-    pub const Mode = enum {
-        disabled,
-        /// The worker's policy after boot: `allowed_syscalls` plus the
-        /// argument-filtered calls in `buildDenyDirectEgressTemplate`. Every
-        /// other syscall fails with EPERM, so worker code cannot gain new
-        /// authority.
-        deny_direct_egress,
-    };
-
-    pub const Config = struct {
-        mode: Mode,
-        allowed_io_uring_enter_fd: ?std.posix.fd_t = null,
-        allowed_timer_fd: ?std.posix.fd_t = null,
-    };
-
     pub const FilterInstruction = extern struct {
         code: u16,
         jt: u8,
@@ -198,7 +184,9 @@ pub const security = struct {
     };
 
     const allowed_syscalls = [_][]const u8{
-        // Descriptor I/O on fds handed in before seccomp.
+        // Descriptor I/O on fds handed in before seccomp. The engine reads
+        // its leaf's `memory.current` with pread64
+        // (`bindings/root.zig:setMemoryStatusOverride`).
         "read",
         "write",
         "close",
@@ -212,15 +200,17 @@ pub const security = struct {
         "pread64",
         "lseek",
 
-        // Filesystem operations inside the chrooted tmpfs. The chroot and the
-        // mount namespace confine paths; the open and create calls are also
-        // filtered by argument before this list is checked.
+        // Filesystem operations inside the worker's root, which the chroot
+        // confines and whose read-only mount refuses every write outside
+        // `/tmp`; the open and create calls are also filtered by argument
+        // before this list is checked. Nothing in a worker resizes a file
+        // after the filter (`node:fs` truncates with O_TRUNC), so ftruncate
+        // stays out.
         "openat",
         "getdents64",
         "mkdirat",
         "unlinkat",
         "renameat2",
-        "ftruncate",
         "fsync",
         "fdatasync",
 
@@ -245,8 +235,6 @@ pub const security = struct {
         "nanosleep",
         "clock_nanosleep",
         "clock_nanosleep_time64",
-        "timerfd_settime",
-        "timerfd_settime64",
 
         // Signals. Every thread exists before this filter is installed, so
         // clone and fork are denied.
@@ -265,8 +253,8 @@ pub const security = struct {
         "rseq",
         "set_robust_list",
 
-        // Bounded blocking waits outside the worker event loop. The sentinel
-        // uses ppoll, and tests may still use poll around inherited control fds.
+        // Waits. The event loop and the sentinel wait in ppoll, whose timeout
+        // is their earliest deadline; `std.posix.poll` issues poll on x86-64.
         "poll",
         "ppoll",
         "ppoll_time64",
@@ -279,125 +267,21 @@ pub const security = struct {
         "exit_group",
     };
 
-    pub fn denyDirectEgressDeniesUnexpectedSyscall(comptime name: []const u8) bool {
-        if (std.mem.eql(u8, name, "io_uring_enter"))
-            return true;
-        return !denyDirectEgressAllowsSyscall(name);
+    /// The worker's filter program, which `apply` hands the kernel as it is;
+    /// tests evaluate it instruction by instruction.
+    pub const instructions: []const FilterInstruction = template.program[0..template.len];
+
+    comptime {
+        // The kernel's BPF_MAXINSNS, and `sock_fprog.len` is a u16.
+        std.debug.assert(instructions.len <= 4096);
     }
 
-    pub fn denyDirectEgressAllowsSyscall(comptime name: []const u8) bool {
-        inline for (allowed_syscalls) |allowed| {
-            if (std.mem.eql(u8, allowed, name))
-                return true;
-        }
-        return false;
-    }
-
-    pub fn denyDirectEgressUsesLearningMode() bool {
-        return false;
-    }
-
-    pub fn denyDirectEgressFiltersIoUringEnterByFd(config: security.Config) bool {
-        return config.mode == .deny_direct_egress and
-            config.allowed_io_uring_enter_fd != null and
-            config.allowed_io_uring_enter_fd.? >= 0;
-    }
-
-    pub fn denyDirectEgressFiltersCloseRingFds() bool {
-        return false;
-    }
-
-    pub fn denyDirectEgressFiltersFcntlDup() bool {
-        return hasSyscall("fcntl");
-    }
-
-    pub fn denyDirectEgressFiltersFcntlCommands() bool {
-        return hasSyscall("fcntl");
-    }
-
-    pub fn denyDirectEgressFiltersOpenAtFlags() bool {
-        return deny_direct_egress_template.openat_flags_filter;
-    }
-
-    pub fn denyDirectEgressFiltersNewFstatAtArgs() bool {
-        return deny_direct_egress_template.newfstatat_flags_filter;
-    }
-
-    pub fn denyDirectEgressFiltersStatxArgs() bool {
-        return deny_direct_egress_template.statx_flags_filter;
-    }
-
-    pub fn denyDirectEgressFiltersMkdirAtArgs() bool {
-        return deny_direct_egress_template.mkdirat_args_filter;
-    }
-
-    pub fn denyDirectEgressFiltersUnlinkAtArgs() bool {
-        return deny_direct_egress_template.unlinkat_args_filter;
-    }
-
-    pub fn denyDirectEgressFiltersRenameAt2Args() bool {
-        return deny_direct_egress_template.renameat2_args_filter;
-    }
-
-    pub fn denyDirectEgressFiltersPrctlName() bool {
-        return deny_direct_egress_template.prctl_name_filter;
-    }
-
-    pub fn denyDirectEgressFilterInstructions() []const FilterInstruction {
-        return deny_direct_egress_template.program[0..deny_direct_egress_template.len];
-    }
-
-    pub fn denyDirectEgressUsesPrecomputedTemplate() bool {
-        return deny_direct_egress_template.len > 0;
-    }
-
-    pub fn denyDirectEgressTemplateHasFdPatch() bool {
-        return deny_direct_egress_template.io_uring_fd_patch_index != null and
-            deny_direct_egress_template.timer_fd_patch_count > 0 and
-            deny_direct_egress_template.openat_flags_filter;
-    }
-
-    fn apply(config: security.Config) !void {
-        switch (config.mode) {
-            .disabled => {},
-            .deny_direct_egress => {
-                const fd = config.allowed_io_uring_enter_fd orelse return error.InvalidWorkerRingFd;
-                if (fd < 0)
-                    return error.InvalidWorkerRingFd;
-                const timer_fd = config.allowed_timer_fd orelse fd;
-                if (timer_fd < 0)
-                    return error.InvalidWorkerRingFd;
-                try installDenyDirectEgress(fd, timer_fd);
-            },
-        }
-    }
-
-    fn installDenyDirectEgress(
-        allowed_io_uring_enter_fd: std.posix.fd_t,
-        allowed_timer_fd: std.posix.fd_t,
-    ) !void {
-        const template = deny_direct_egress_template;
-        var program = template.program;
-        if (template.io_uring_fd_patch_index == null or
-            template.timer_fd_patch_count == 0 or
-            !template.openat_flags_filter or
-            !template.newfstatat_flags_filter or
-            !template.statx_flags_filter or
-            !template.mkdirat_args_filter or
-            !template.unlinkat_args_filter or
-            !template.renameat2_args_filter or
-            !template.prctl_name_filter)
-        {
-            return error.UnsupportedKernel;
-        }
-        program[template.io_uring_fd_patch_index.?].k = @intCast(allowed_io_uring_enter_fd);
-        for (template.timer_fd_patch_indices[0..template.timer_fd_patch_count]) |patch_index| {
-            program[patch_index].k = @intCast(allowed_timer_fd);
-        }
-
+    /// Installs `instructions` on every thread of the process (`TSYNC`). The
+    /// process must have set no-new-privileges, or hold CAP_SYS_ADMIN.
+    fn apply() !void {
         const filter = sock_fprog{
-            .len = @intCast(template.len),
-            .filter = &program,
+            .len = @intCast(instructions.len),
+            .filter = instructions.ptr,
         };
         const rc = linux.seccomp(linux.SECCOMP.SET_MODE_FILTER, linux.SECCOMP.FILTER_FLAG.TSYNC, &filter);
         const seccomp_errno = linux_helpers.syscallErrno(rc);
@@ -418,215 +302,112 @@ pub const security = struct {
     // time, so a program that outgrows it fails the build.
     const template_capacity = 200 + allowed_syscalls.len * 2;
 
-    const SeccompTemplate = struct {
+    const Template = struct {
         program: [template_capacity]sock_filter,
         len: usize,
-        io_uring_fd_patch_index: ?usize = null,
-        timer_fd_patch_indices: [2]usize = undefined,
-        timer_fd_patch_count: usize = 0,
-        openat_flags_filter: bool = false,
-        newfstatat_flags_filter: bool = false,
-        statx_flags_filter: bool = false,
-        mkdirat_args_filter: bool = false,
-        unlinkat_args_filter: bool = false,
-        renameat2_args_filter: bool = false,
-        prctl_name_filter: bool = false,
     };
 
-    const deny_direct_egress_template = buildDenyDirectEgressTemplate();
+    const template: Template = buildTemplate();
 
-    fn buildDenyDirectEgressTemplate() SeccompTemplate {
-        var template = SeccompTemplate{
-            .program = undefined,
-            .len = 0,
-            .io_uring_fd_patch_index = null,
-            .timer_fd_patch_indices = undefined,
-            .timer_fd_patch_count = 0,
-            .openat_flags_filter = false,
-            .newfstatat_flags_filter = false,
-            .statx_flags_filter = false,
-            .mkdirat_args_filter = false,
-            .unlinkat_args_filter = false,
-            .renameat2_args_filter = false,
-            .prctl_name_filter = false,
-        };
-        append(&template.program, &template.len, stmt(bpf.LD | bpf.W | bpf.ABS, @intCast(@offsetOf(linux.SECCOMP.data, "arch"))));
-        append(&template.program, &template.len, jump(bpf.JMP | bpf.JEQ | bpf.K, auditArchCurrent(), 1, 0));
-        append(&template.program, &template.len, stmt(bpf.RET | bpf.K, linux.SECCOMP.RET.KILL_PROCESS));
-        append(&template.program, &template.len, stmt(bpf.LD | bpf.W | bpf.ABS, @intCast(@offsetOf(linux.SECCOMP.data, "nr"))));
-        appendX86_64CompatGuards(&template.program, &template.len);
-        appendIoUringEnterPolicy(&template);
-        appendTimerFdSetTimePolicy(&template);
-        appendNewFstatAtPolicy(&template);
-        appendStatxPolicy(&template);
-        appendOpenAtPolicy(&template);
-        appendMkdirAtPolicy(&template);
-        appendUnlinkAtPolicy(&template);
-        appendRenameAt2Policy(&template);
-        appendFcntlPolicy(&template.program, &template.len);
-        appendPrctlPolicy(&template);
+    fn buildTemplate() Template {
+        var built = Template{ .program = undefined, .len = 0 };
+        append(&built.program, &built.len, stmt(bpf.LD | bpf.W | bpf.ABS, @intCast(@offsetOf(linux.SECCOMP.data, "arch"))));
+        append(&built.program, &built.len, jump(bpf.JMP | bpf.JEQ | bpf.K, auditArchCurrent(), 1, 0));
+        append(&built.program, &built.len, stmt(bpf.RET | bpf.K, linux.SECCOMP.RET.KILL_PROCESS));
+        append(&built.program, &built.len, stmt(bpf.LD | bpf.W | bpf.ABS, @intCast(@offsetOf(linux.SECCOMP.data, "nr"))));
+        appendX86_64CompatGuards(&built.program, &built.len);
+        appendNewFstatAtPolicy(&built.program, &built.len);
+        appendStatxPolicy(&built.program, &built.len);
+        appendOpenAtPolicy(&built.program, &built.len);
+        appendMkdirAtPolicy(&built.program, &built.len);
+        appendUnlinkAtPolicy(&built.program, &built.len);
+        appendRenameAt2Policy(&built.program, &built.len);
+        appendFcntlPolicy(&built.program, &built.len);
+        appendPrctlPolicy(&built.program, &built.len);
 
+        // A name the target does not have, such as `poll` on aarch64 or the
+        // `*_time64` calls on a 64-bit target, has no number to allow.
         inline for (allowed_syscalls) |name| {
             if (comptime hasSyscall(name)) {
-                append(&template.program, &template.len, jump(bpf.JMP | bpf.JEQ | bpf.K, syscallNumber(name), 0, 1));
-                append(&template.program, &template.len, stmt(bpf.RET | bpf.K, linux.SECCOMP.RET.ALLOW));
+                append(&built.program, &built.len, jump(bpf.JMP | bpf.JEQ | bpf.K, syscallNumber(name), 0, 1));
+                append(&built.program, &built.len, stmt(bpf.RET | bpf.K, linux.SECCOMP.RET.ALLOW));
             }
         }
 
-        append(&template.program, &template.len, denyPerm());
-        return template;
+        append(&built.program, &built.len, denyPerm());
+        return built;
     }
 
-    // io_uring_enter may target only the worker's own ring, whose opcodes are
-    // restricted when it is created (`restricted_uring`); an unrestricted ring
-    // could run operations this filter denies, such as connect. The ring fd is
-    // patched into the template at install time. BPF compares 32-bit words,
-    // so this and every argument check below require a zero high word: the
-    // filter then sees exactly the value the kernel uses.
-    fn appendIoUringEnterPolicy(template: *SeccompTemplate) void {
-        const jump_index = beginSyscallPolicy(
-            &template.program,
-            &template.len,
-            "io_uring_enter",
-        ) orelse return;
-        append(&template.program, &template.len, stmt(bpf.LD | bpf.W | bpf.ABS, arg0HighOffset()));
-        append(&template.program, &template.len, jump(bpf.JMP | bpf.JEQ | bpf.K, 0, 1, 0));
-        append(&template.program, &template.len, denyPerm());
-        append(&template.program, &template.len, stmt(bpf.LD | bpf.W | bpf.ABS, arg0LowOffset()));
-        template.io_uring_fd_patch_index = template.len;
-        append(&template.program, &template.len, jump(bpf.JMP | bpf.JEQ | bpf.K, 0, 1, 0));
-        append(&template.program, &template.len, denyPerm());
-        append(&template.program, &template.len, stmt(bpf.RET | bpf.K, linux.SECCOMP.RET.ALLOW));
-        endSyscallPolicy(&template.program, template.len, jump_index);
+    // BPF compares 32-bit words, so every argument policy below that compares
+    // a value requires its high word to be zero: the filter then sees exactly
+    // the value the kernel uses. A dirfd is the exception, matched on its low
+    // word alone as the kernel reads it (`appendAtFdcwdPolicy`).
+
+    fn appendOpenAtPolicy(program: []sock_filter, len: *usize) void {
+        const jump_index = beginSyscallPolicy(program, len, "openat");
+        appendAtFdcwdPolicy(program, len, arg0LowOffset());
+        append(program, len, stmt(bpf.LD | bpf.W | bpf.ABS, arg2HighOffset()));
+        append(program, len, jump(bpf.JMP | bpf.JEQ | bpf.K, 0, 1, 0));
+        append(program, len, denyPerm());
+        append(program, len, stmt(bpf.LD | bpf.W | bpf.ABS, arg2LowOffset()));
+        append(program, len, jump(bpf.JMP | bpf.JSET | bpf.K, openat_forbidden_flags, 0, 1));
+        append(program, len, denyPerm());
+        append(program, len, stmt(bpf.RET | bpf.K, linux.SECCOMP.RET.ALLOW));
+        endSyscallPolicy(program, len.*, jump_index);
     }
 
-    fn appendTimerFdSetTimePolicy(template: *SeccompTemplate) void {
-        appendTimerFdSetTimePolicyForSyscall(template, "timerfd_settime");
-        appendTimerFdSetTimePolicyForSyscall(template, "timerfd_settime64");
+    fn appendNewFstatAtPolicy(program: []sock_filter, len: *usize) void {
+        const jump_index = beginSyscallNumberPolicy(program, len, newFstatAtSyscallNumber());
+        appendFstatOnFdPolicy(program, len);
+        appendAtFdcwdPolicy(program, len, arg0LowOffset());
+        appendFlagsAllowMaskPolicy(program, len, arg3LowOffset(), arg3HighOffset(), newfstatat_allowed_flags);
+        append(program, len, stmt(bpf.RET | bpf.K, linux.SECCOMP.RET.ALLOW));
+        endSyscallPolicy(program, len.*, jump_index);
     }
 
-    fn appendTimerFdSetTimePolicyForSyscall(
-        template: *SeccompTemplate,
-        comptime name: []const u8,
-    ) void {
-        const jump_index = beginSyscallPolicy(
-            &template.program,
-            &template.len,
-            name,
-        ) orelse return;
-        append(&template.program, &template.len, stmt(bpf.LD | bpf.W | bpf.ABS, arg0HighOffset()));
-        append(&template.program, &template.len, jump(bpf.JMP | bpf.JEQ | bpf.K, 0, 1, 0));
-        append(&template.program, &template.len, denyPerm());
-        append(&template.program, &template.len, stmt(bpf.LD | bpf.W | bpf.ABS, arg0LowOffset()));
-        std.debug.assert(template.timer_fd_patch_count < template.timer_fd_patch_indices.len);
-        template.timer_fd_patch_indices[template.timer_fd_patch_count] = template.len;
-        template.timer_fd_patch_count += 1;
-        append(&template.program, &template.len, jump(bpf.JMP | bpf.JEQ | bpf.K, 0, 1, 0));
-        append(&template.program, &template.len, denyPerm());
-        append(&template.program, &template.len, stmt(bpf.RET | bpf.K, linux.SECCOMP.RET.ALLOW));
-        endSyscallPolicy(&template.program, template.len, jump_index);
+    fn appendStatxPolicy(program: []sock_filter, len: *usize) void {
+        const jump_index = beginSyscallPolicy(program, len, "statx");
+        appendAtFdcwdPolicy(program, len, arg0LowOffset());
+        appendFlagsAllowMaskPolicy(program, len, arg2LowOffset(), arg2HighOffset(), statx_allowed_flags);
+        append(program, len, stmt(bpf.RET | bpf.K, linux.SECCOMP.RET.ALLOW));
+        endSyscallPolicy(program, len.*, jump_index);
     }
 
-    fn appendOpenAtPolicy(template: *SeccompTemplate) void {
-        const jump_index = beginSyscallPolicy(
-            &template.program,
-            &template.len,
-            "openat",
-        ) orelse return;
-        appendAtFdcwdPolicy(&template.program, &template.len, arg0LowOffset());
-        append(&template.program, &template.len, stmt(bpf.LD | bpf.W | bpf.ABS, arg2HighOffset()));
-        append(&template.program, &template.len, jump(bpf.JMP | bpf.JEQ | bpf.K, 0, 1, 0));
-        append(&template.program, &template.len, denyPerm());
-        append(&template.program, &template.len, stmt(bpf.LD | bpf.W | bpf.ABS, arg2LowOffset()));
-        append(
-            &template.program,
-            &template.len,
-            jump(bpf.JMP | bpf.JSET | bpf.K, openat_forbidden_flags, 0, 1),
-        );
-        append(&template.program, &template.len, denyPerm());
-        append(&template.program, &template.len, stmt(bpf.RET | bpf.K, linux.SECCOMP.RET.ALLOW));
-        template.openat_flags_filter = true;
-        endSyscallPolicy(&template.program, template.len, jump_index);
-    }
-
-    fn appendNewFstatAtPolicy(template: *SeccompTemplate) void {
-        const syscall_number = newFstatAtSyscallNumber() orelse return;
-        const jump_index = beginSyscallNumberPolicy(
-            &template.program,
-            &template.len,
-            syscall_number,
-        );
-        appendFstatOnFdPolicy(&template.program, &template.len);
-        appendAtFdcwdPolicy(&template.program, &template.len, arg0LowOffset());
-        appendFlagsAllowMaskPolicy(
-            &template.program,
-            &template.len,
-            arg3LowOffset(),
-            arg3HighOffset(),
-            newfstatat_allowed_flags,
-        );
-        append(&template.program, &template.len, stmt(bpf.RET | bpf.K, linux.SECCOMP.RET.ALLOW));
-        template.newfstatat_flags_filter = true;
-        endSyscallPolicy(&template.program, template.len, jump_index);
-    }
-
-    fn appendStatxPolicy(template: *SeccompTemplate) void {
-        const jump_index = beginSyscallPolicy(
-            &template.program,
-            &template.len,
-            "statx",
-        ) orelse return;
-        appendAtFdcwdPolicy(&template.program, &template.len, arg0LowOffset());
-        appendFlagsAllowMaskPolicy(
-            &template.program,
-            &template.len,
-            arg2LowOffset(),
-            arg2HighOffset(),
-            statx_allowed_flags,
-        );
-        append(&template.program, &template.len, stmt(bpf.RET | bpf.K, linux.SECCOMP.RET.ALLOW));
-        template.statx_flags_filter = true;
-        endSyscallPolicy(&template.program, template.len, jump_index);
-    }
-
-    fn appendMkdirAtPolicy(template: *SeccompTemplate) void {
-        const jump_index = beginSyscallPolicy(&template.program, &template.len, "mkdirat") orelse return;
-        appendAtFdcwdPolicy(&template.program, &template.len, arg0LowOffset());
-        append(&template.program, &template.len, stmt(bpf.RET | bpf.K, linux.SECCOMP.RET.ALLOW));
-        template.mkdirat_args_filter = true;
-        endSyscallPolicy(&template.program, template.len, jump_index);
+    fn appendMkdirAtPolicy(program: []sock_filter, len: *usize) void {
+        const jump_index = beginSyscallPolicy(program, len, "mkdirat");
+        appendAtFdcwdPolicy(program, len, arg0LowOffset());
+        append(program, len, stmt(bpf.RET | bpf.K, linux.SECCOMP.RET.ALLOW));
+        endSyscallPolicy(program, len.*, jump_index);
     }
 
     // The runtime calls unlinkat and renameat2 only with flags 0
-    // (`node/fs.cpp`, `worker/fs/copies.zig`), so any other flag, such as
+    // (`bindings/host_functions/node/fs.cpp`), so any other flag, such as
     // AT_REMOVEDIR or RENAME_EXCHANGE, is denied.
-    fn appendUnlinkAtPolicy(template: *SeccompTemplate) void {
-        const jump_index = beginSyscallPolicy(&template.program, &template.len, "unlinkat") orelse return;
-        appendAtFdcwdPolicy(&template.program, &template.len, arg0LowOffset());
-        append(&template.program, &template.len, stmt(bpf.LD | bpf.W | bpf.ABS, arg2HighOffset()));
-        append(&template.program, &template.len, jump(bpf.JMP | bpf.JEQ | bpf.K, 0, 1, 0));
-        append(&template.program, &template.len, denyPerm());
-        append(&template.program, &template.len, stmt(bpf.LD | bpf.W | bpf.ABS, arg2LowOffset()));
-        append(&template.program, &template.len, jump(bpf.JMP | bpf.JEQ | bpf.K, 0, 1, 0));
-        append(&template.program, &template.len, denyPerm());
-        append(&template.program, &template.len, stmt(bpf.RET | bpf.K, linux.SECCOMP.RET.ALLOW));
-        template.unlinkat_args_filter = true;
-        endSyscallPolicy(&template.program, template.len, jump_index);
+    fn appendUnlinkAtPolicy(program: []sock_filter, len: *usize) void {
+        const jump_index = beginSyscallPolicy(program, len, "unlinkat");
+        appendAtFdcwdPolicy(program, len, arg0LowOffset());
+        append(program, len, stmt(bpf.LD | bpf.W | bpf.ABS, arg2HighOffset()));
+        append(program, len, jump(bpf.JMP | bpf.JEQ | bpf.K, 0, 1, 0));
+        append(program, len, denyPerm());
+        append(program, len, stmt(bpf.LD | bpf.W | bpf.ABS, arg2LowOffset()));
+        append(program, len, jump(bpf.JMP | bpf.JEQ | bpf.K, 0, 1, 0));
+        append(program, len, denyPerm());
+        append(program, len, stmt(bpf.RET | bpf.K, linux.SECCOMP.RET.ALLOW));
+        endSyscallPolicy(program, len.*, jump_index);
     }
 
-    fn appendRenameAt2Policy(template: *SeccompTemplate) void {
-        const jump_index = beginSyscallPolicy(&template.program, &template.len, "renameat2") orelse return;
-        appendAtFdcwdPolicy(&template.program, &template.len, arg0LowOffset());
-        appendAtFdcwdPolicy(&template.program, &template.len, arg2LowOffset());
-        append(&template.program, &template.len, stmt(bpf.LD | bpf.W | bpf.ABS, arg4HighOffset()));
-        append(&template.program, &template.len, jump(bpf.JMP | bpf.JEQ | bpf.K, 0, 1, 0));
-        append(&template.program, &template.len, denyPerm());
-        append(&template.program, &template.len, stmt(bpf.LD | bpf.W | bpf.ABS, arg4LowOffset()));
-        append(&template.program, &template.len, jump(bpf.JMP | bpf.JEQ | bpf.K, 0, 1, 0));
-        append(&template.program, &template.len, denyPerm());
-        append(&template.program, &template.len, stmt(bpf.RET | bpf.K, linux.SECCOMP.RET.ALLOW));
-        template.renameat2_args_filter = true;
-        endSyscallPolicy(&template.program, template.len, jump_index);
+    fn appendRenameAt2Policy(program: []sock_filter, len: *usize) void {
+        const jump_index = beginSyscallPolicy(program, len, "renameat2");
+        appendAtFdcwdPolicy(program, len, arg0LowOffset());
+        appendAtFdcwdPolicy(program, len, arg2LowOffset());
+        append(program, len, stmt(bpf.LD | bpf.W | bpf.ABS, arg4HighOffset()));
+        append(program, len, jump(bpf.JMP | bpf.JEQ | bpf.K, 0, 1, 0));
+        append(program, len, denyPerm());
+        append(program, len, stmt(bpf.LD | bpf.W | bpf.ABS, arg4LowOffset()));
+        append(program, len, jump(bpf.JMP | bpf.JEQ | bpf.K, 0, 1, 0));
+        append(program, len, denyPerm());
+        append(program, len, stmt(bpf.RET | bpf.K, linux.SECCOMP.RET.ALLOW));
+        endSyscallPolicy(program, len.*, jump_index);
     }
 
     /// x86_64 has an `fstat` syscall, allowed without argument checks, but
@@ -692,7 +473,7 @@ pub const security = struct {
     const openat_forbidden_flags: u32 = ~openat_allowed_flags;
 
     fn appendFcntlPolicy(program: []sock_filter, len: *usize) void {
-        const jump_index = beginSyscallPolicy(program, len, "fcntl") orelse return;
+        const jump_index = beginSyscallPolicy(program, len, "fcntl");
         append(program, len, stmt(bpf.LD | bpf.W | bpf.ABS, arg1HighOffset()));
         append(program, len, jump(bpf.JMP | bpf.JEQ | bpf.K, 0, 1, 0));
         append(program, len, denyPerm());
@@ -716,17 +497,16 @@ pub const security = struct {
     // rename its own threads. Every other option stays denied, among them
     // PR_GET_NAME, PR_SET_DUMPABLE, PR_SET_SECCOMP, PR_SET_MM, PR_SET_PTRACER
     // and PR_CAP_AMBIENT.
-    fn appendPrctlPolicy(template: *SeccompTemplate) void {
-        const jump_index = beginSyscallPolicy(&template.program, &template.len, "prctl") orelse return;
-        append(&template.program, &template.len, stmt(bpf.LD | bpf.W | bpf.ABS, arg0HighOffset()));
-        append(&template.program, &template.len, jump(bpf.JMP | bpf.JEQ | bpf.K, 0, 1, 0));
-        append(&template.program, &template.len, denyPerm());
-        append(&template.program, &template.len, stmt(bpf.LD | bpf.W | bpf.ABS, arg0LowOffset()));
-        append(&template.program, &template.len, jump(bpf.JMP | bpf.JEQ | bpf.K, pr_set_name, 1, 0));
-        append(&template.program, &template.len, denyPerm());
-        append(&template.program, &template.len, stmt(bpf.RET | bpf.K, linux.SECCOMP.RET.ALLOW));
-        template.prctl_name_filter = true;
-        endSyscallPolicy(&template.program, template.len, jump_index);
+    fn appendPrctlPolicy(program: []sock_filter, len: *usize) void {
+        const jump_index = beginSyscallPolicy(program, len, "prctl");
+        append(program, len, stmt(bpf.LD | bpf.W | bpf.ABS, arg0HighOffset()));
+        append(program, len, jump(bpf.JMP | bpf.JEQ | bpf.K, 0, 1, 0));
+        append(program, len, denyPerm());
+        append(program, len, stmt(bpf.LD | bpf.W | bpf.ABS, arg0LowOffset()));
+        append(program, len, jump(bpf.JMP | bpf.JEQ | bpf.K, pr_set_name, 1, 0));
+        append(program, len, denyPerm());
+        append(program, len, stmt(bpf.RET | bpf.K, linux.SECCOMP.RET.ALLOW));
+        endSyscallPolicy(program, len.*, jump_index);
     }
 
     const pr_set_name: u32 = @intCast(@intFromEnum(linux.PR.SET_NAME));
@@ -765,13 +545,15 @@ pub const security = struct {
         len.* += 1;
     }
 
+    /// Opens the block of an argument policy. A target without the syscall
+    /// fails the build, so no policy is ever left out of the program.
     fn beginSyscallPolicy(
         program: []sock_filter,
         len: *usize,
         comptime name: []const u8,
-    ) ?usize {
+    ) usize {
         if (comptime !hasSyscall(name))
-            return null;
+            @compileError("the worker filter's argument policy needs syscall " ++ name ++ " on this target");
         return beginSyscallNumberPolicy(program, len, syscallNumber(name));
     }
 
@@ -840,14 +622,16 @@ pub const security = struct {
         return @intCast(@offsetOf(linux.SECCOMP.data, "arg4") + @sizeOf(u32));
     }
 
-    fn newFstatAtSyscallNumber() ?u32 {
+    /// The number of `newfstatat`, which each target's table names its own
+    /// way.
+    fn newFstatAtSyscallNumber() u32 {
         if (comptime @hasField(linux.SYS, "newfstatat"))
             return @intFromEnum(@field(linux.SYS, "newfstatat"));
         if (comptime @hasField(linux.SYS, "fstatat"))
             return @intFromEnum(@field(linux.SYS, "fstatat"));
         if (comptime @hasField(linux.SYS, "fstatat64"))
             return @intFromEnum(@field(linux.SYS, "fstatat64"));
-        return null;
+        @compileError("the worker filter's stat policy needs newfstatat on this target");
     }
 };
 
@@ -864,108 +648,133 @@ pub const mounts = struct {
     }
 };
 
+/// The worker's root, as the file header describes it.
 pub const rootfs = struct {
-    const proc_fd_path_buffer_bytes: usize = 64;
+    /// Where the tmpfs is mounted before the chroot. The mount lives in the
+    /// child's private mount namespace and the host never sees it, so any
+    /// directory every host has will do.
+    const mount_point = "/tmp";
+    /// The root's only writable directory.
+    const writable_dir = "tmp";
+    /// `task_root` relative to the root, and its parent.
+    const task_dir = task_root[1..];
+    const task_parent_dir = std.fmt.comptimePrint("{s}", .{std.fs.path.dirname(task_dir).?});
+    const root_mode: u32 = 0o700;
+    const writable_dir_mode: u32 = 0o700;
+    const read_only_dir_mode: u32 = 0o755;
+    /// The tmpfs mount's flags. The read-only remount repeats them, since a
+    /// remount replaces every flag of the mount.
+    const mount_flags: u32 = linux.MS.NOSUID | linux.MS.NODEV | linux.MS.NOEXEC;
     const tmpfs_mount_data_buffer_bytes: usize = 128;
 
-    fn mountTmpfsAndChrootIntoFd(config: Config) !void {
-        if (config.tmpfs_size_bytes == 0)
-            return error.InvalidWorkerTmpRoot;
+    comptime {
+        // `layout` creates `task_root` as two directories under the root.
+        std.debug.assert(task_root[0] == '/');
+        std.debug.assert(std.mem.indexOfScalar(u8, task_parent_dir, '/') == null);
+    }
 
-        var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const target_path = try tmpRootPathFromFd(config.tmp_root_fd, &path_buffer);
+    /// Mounts the tmpfs, lays the root out, makes all of it but `tmp/`
+    /// read-only, chroots into it and enters `task_root`. Every step after
+    /// the mount names paths relative to the root, which it makes the working
+    /// directory first.
+    fn build(size_bytes: u64) !void {
+        if (size_bytes == 0)
+            return error.InvalidTmpfsSize;
         const owner_uid: u32 = @intCast(linux.getuid());
         const owner_gid: u32 = @intCast(linux.getgid());
+        try mountTmpfs(size_bytes, owner_uid, owner_gid);
 
-        try mountTmpfsAt(target_path, config.tmpfs_size_bytes, owner_uid, owner_gid);
-
-        var mounted_root = try std.fs.openDirAbsolute(target_path, .{ .no_follow = true });
-        defer mounted_root.close();
-        try validateMountedRootFd(mounted_root.fd, owner_uid, owner_gid);
-        try chrootIntoFd(mounted_root.fd);
+        const root_fd = try openMountedRoot(owner_uid, owner_gid);
+        defer std.posix.close(root_fd);
+        try std.posix.fchdir(root_fd);
+        try layout(root_fd);
+        // The bind gives `tmp/` a mount of its own, on the same tmpfs and so
+        // under the same size, which keeps write access when the root's mount
+        // turns read-only: `MS_REMOUNT | MS_BIND` changes one mount's flags,
+        // never the superblock's.
+        try mountRelative(writable_dir, writable_dir, linux.MS.BIND);
+        try mountRelative(null, ".", linux.MS.REMOUNT | linux.MS.BIND | linux.MS.RDONLY | mount_flags);
+        try chrootIntoWorkingDirectory();
+        try std.posix.chdir(task_root);
     }
 
-    fn tmpRootPathFromFd(tmp_root_fd: std.posix.fd_t, out_buffer: []u8) ![]const u8 {
-        var proc_fd_path_buffer: [proc_fd_path_buffer_bytes]u8 = undefined;
-        const proc_fd_path = std.fmt.bufPrintZ(
-            &proc_fd_path_buffer,
-            "/proc/self/fd/{d}",
-            .{tmp_root_fd},
-        ) catch return error.InvalidWorkerTmpRoot;
-        const target_path = std.posix.readlinkZ(proc_fd_path.ptr, out_buffer) catch |err| switch (err) {
-            error.AccessDenied => return error.PermissionDenied,
-            error.FileNotFound => return error.InvalidWorkerTmpRoot,
-            error.NameTooLong => return error.InvalidWorkerTmpRoot,
-            else => return error.WorkerSandboxOperationFailed,
-        };
-        if (target_path.len == 0)
-            return error.InvalidWorkerTmpRoot;
-        if (target_path[0] != '/')
-            return error.InvalidWorkerTmpRoot;
-        return target_path;
-    }
-
-    fn mountTmpfsAt(target_path: []const u8, size_bytes: u64, owner_uid: u32, owner_gid: u32) !void {
-        const target_path_z = std.posix.toPosixPath(target_path) catch return error.InvalidWorkerTmpRoot;
+    fn mountTmpfs(size_bytes: u64, owner_uid: u32, owner_gid: u32) !void {
         var mount_data_buffer: [tmpfs_mount_data_buffer_bytes]u8 = undefined;
         const mount_data = std.fmt.bufPrintZ(
             &mount_data_buffer,
-            "size={d},mode=0700,uid={d},gid={d}",
-            .{ size_bytes, owner_uid, owner_gid },
-        ) catch return error.InvalidWorkerTmpRoot;
-
-        const flags = linux.MS.NOSUID | linux.MS.NODEV | linux.MS.NOEXEC;
-        const rc = linux.mount(
-            "tmpfs",
-            &target_path_z,
-            "tmpfs",
-            flags,
-            @intFromPtr(mount_data.ptr),
-        );
+            "size={d},mode={o},uid={d},gid={d}",
+            .{ size_bytes, root_mode, owner_uid, owner_gid },
+        ) catch return error.InvalidTmpfsSize;
+        const rc = linux.mount("tmpfs", mount_point, "tmpfs", mount_flags, @intFromPtr(mount_data.ptr));
         return switch (linux_helpers.syscallErrno(rc)) {
             .SUCCESS => {},
-            .ACCES => error.PermissionDenied,
-            .BUSY => error.WorkerSandboxOperationFailed,
+            .ACCES, .PERM => error.PermissionDenied,
             .INVAL => error.UnsupportedKernel,
             .NOMEM => error.SystemResources,
-            .NOTDIR => error.InvalidWorkerTmpRoot,
-            .PERM => error.PermissionDenied,
             else => error.WorkerSandboxOperationFailed,
         };
     }
 
-    fn validateMountedRootFd(fd: std.posix.fd_t, owner_uid: u32, owner_gid: u32) !void {
+    /// Opens the root of the tmpfs just mounted over `mount_point` and checks
+    /// it carries the mode and owner the mount set. The mount's own return
+    /// code is what proves the tmpfs is there; this check only catches a
+    /// directory that plainly is not it, since a machine's own `/tmp` of mode
+    /// 0700 owned by the zygote's user and group reads the same inside the
+    /// child's user namespace.
+    fn openMountedRoot(owner_uid: u32, owner_gid: u32) !std.posix.fd_t {
+        const fd = try std.posix.openZ(mount_point, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
+        errdefer std.posix.close(fd);
         var stat: linux.Stat = undefined;
         switch (linux_helpers.syscallErrno(linux.fstat(fd, &stat))) {
             .SUCCESS => {},
-            .BADF => return error.InvalidWorkerTmpRoot,
-            else => return error.InvalidWorkerTmpRoot,
+            else => return error.InvalidWorkerRoot,
         }
         if ((stat.mode & linux.S.IFMT) != linux.S.IFDIR)
-            return error.InvalidWorkerTmpRoot;
-        if ((stat.mode & 0o7777) != tmp_root.required_mode)
-            return error.PermissionDenied;
+            return error.InvalidWorkerRoot;
+        if ((stat.mode & 0o7777) != root_mode)
+            return error.InvalidWorkerRoot;
         if (stat.uid != owner_uid)
-            return error.PermissionDenied;
+            return error.InvalidWorkerRoot;
         if (stat.gid != owner_gid)
-            return error.PermissionDenied;
+            return error.InvalidWorkerRoot;
+        return fd;
     }
 
-    fn chrootIntoFd(tmp_root_fd: std.posix.fd_t) !void {
-        try std.posix.fchdir(tmp_root_fd);
-        const rc = linux.chroot(".");
-        switch (linux_helpers.syscallErrno(rc)) {
+    /// Creates `tmp/` and `task_root` under the root with their exact modes,
+    /// whatever umask the zygote inherited; the umask is restored after, so
+    /// files the worker creates later keep the process's.
+    fn layout(root_fd: std.posix.fd_t) !void {
+        const inherited_umask = std.c.umask(0);
+        defer _ = std.c.umask(inherited_umask);
+        try makeDir(root_fd, writable_dir, writable_dir_mode);
+        try makeDir(root_fd, task_parent_dir, read_only_dir_mode);
+        try makeDir(root_fd, task_dir, read_only_dir_mode);
+    }
+
+    fn makeDir(root_fd: std.posix.fd_t, path: [*:0]const u8, mode: u32) !void {
+        return switch (linux_helpers.syscallErrno(linux.mkdirat(root_fd, path, mode))) {
             .SUCCESS => {},
-            .ACCES => return error.PermissionDenied,
-            .FAULT => return error.InvalidWorkerTmpRoot,
-            .IO => return error.InputOutput,
-            .NOENT => return error.FileNotFound,
-            .NOMEM => return error.SystemResources,
-            .NOTDIR => return error.NotDir,
-            .PERM => return error.PermissionDenied,
-            .BADF => return error.InvalidWorkerTmpRoot,
-            else => return error.WorkerSandboxOperationFailed,
-        }
-        try std.posix.chdir("/");
+            .NOSPC, .NOMEM => error.SystemResources,
+            else => error.WorkerSandboxOperationFailed,
+        };
+    }
+
+    fn mountRelative(source: ?[*:0]const u8, target: [*:0]const u8, flags: u32) !void {
+        return switch (linux_helpers.syscallErrno(linux.mount(source, target, null, flags, 0))) {
+            .SUCCESS => {},
+            .ACCES, .PERM => error.PermissionDenied,
+            .INVAL => error.UnsupportedKernel,
+            .NOMEM => error.SystemResources,
+            else => error.WorkerSandboxOperationFailed,
+        };
+    }
+
+    fn chrootIntoWorkingDirectory() !void {
+        return switch (linux_helpers.syscallErrno(linux.chroot("."))) {
+            .SUCCESS => {},
+            .ACCES, .PERM => error.PermissionDenied,
+            .NOMEM => error.SystemResources,
+            else => error.WorkerSandboxOperationFailed,
+        };
     }
 };

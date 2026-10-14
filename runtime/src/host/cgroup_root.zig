@@ -19,6 +19,16 @@
 //! several roots held by one process, which the test harness does when it
 //! claims one root per launched worker. A `worker-*` sitting directly under
 //! the parent has no owner the host can identify and is left alone.
+//!
+//! A worker's leaf is `worker-<fork job id>` in the root's workers directory,
+//! and once the launch has sent its WorkerInit the host names it only that
+//! way (`WorkerLeaf`): through the root's descriptor and the job id, never by
+//! a path or a descriptor of its own, and it opens a leaf's file only beneath
+//! that descriptor with no link followed (`openBeneath`). The launch writes
+//! the leaf's limits before the child is born in it and never reads them
+//! back; the zygote refuses a leaf that is not an empty cgroup2 directory,
+//! and the child checks its own membership and limits once
+//! (`zygote/worker_boot/cgroup.zig`).
 
 const std = @import("std");
 const common = @import("collo_cgroup");
@@ -26,8 +36,11 @@ const fd_mod = @import("collo_os").fd;
 const host_identity = @import("host_identity.zig");
 
 const worker_dir_prefix = "worker-";
-// "worker-" + u64 in decimal (max 20 digits) + null margin.
+/// "worker-" and a u64 in decimal, at most 20 digits.
 const worker_dir_name_max = worker_dir_prefix.len + 20;
+/// The longest file name `WorkerLeaf.openFile` takes; every cgroup v2
+/// interface file is far shorter.
+const leaf_file_name_bytes_max: usize = 64;
 const host_dir_prefix = "host-";
 const controller_enable = "+memory +cpu +pids";
 const rmdir_max_attempts: u32 = 50;
@@ -144,9 +157,9 @@ pub const WorkerCgroupRoot = struct {
 
         const workers_dir_fd = try openDirAt(parent_fd, name);
         errdefer std.posix.close(workers_dir_fd);
-        // The path comes from the fd, canonical, so it agrees with the leaf
-        // paths the launch resolves the same way even when the env root was
-        // named with a trailing slash or through a symlink.
+        // The path comes from the fd, canonical, so it names the directory
+        // the descriptor does even when the env root was named with a
+        // trailing slash or through a symlink.
         var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
         const workers_dir_path = try allocator.dupe(
             u8,
@@ -159,6 +172,13 @@ pub const WorkerCgroupRoot = struct {
         };
     }
 
+    /// Closes the workers directory, and for an env root removes the host
+    /// directory with any leaf still in it. Call it only once every leaf
+    /// named under this root is retired: every handle torn down, every
+    /// failed launch's leftovers reaped, no launch in flight. A `WorkerLeaf`
+    /// holds `workers_dir_fd` as a bare number, so a leaf used after this
+    /// call would remove, read or kill through whatever descriptor reuses
+    /// that number.
     pub fn deinit(self: *WorkerCgroupRoot, allocator: std.mem.Allocator) void {
         switch (self.mode) {
             .delegated => std.posix.close(self.workers_dir_fd),
@@ -176,9 +196,10 @@ pub const WorkerCgroupRoot = struct {
         self.* = undefined;
     }
 
-    /// Creates and configures `worker-<fork_job_id>/` under the subtree and
-    /// returns an owned O_DIRECTORY fd. The fd is later passed to the fork
-    /// request (CLONE_INTO_CGROUP) and reused for the limit rewrite at adoption.
+    /// Creates `worker-<fork_job_id>/` under the subtree, writes `limits`
+    /// into it and returns an owned O_DIRECTORY fd, which the fork request
+    /// (CLONE_INTO_CGROUP) and the WorkerInit carry; afterwards the leaf is
+    /// `leaf(fork_job_id)`.
     pub fn createWorkerDir(
         self: *WorkerCgroupRoot,
         fork_job_id: u64,
@@ -207,10 +228,59 @@ pub const WorkerCgroupRoot = struct {
         return dir_fd;
     }
 
-    pub fn removeWorkerDir(self: *WorkerCgroupRoot, fork_job_id: u64) void {
-        var name_buffer: [worker_dir_name_max + 1]u8 = undefined;
-        const name = workerDirName(&name_buffer, fork_job_id);
-        removeWorkerDirAt(self.workers_dir_fd, name);
+    /// The leaf of fork job `fork_job_id`, valid while this root is.
+    pub fn leaf(self: *const WorkerCgroupRoot, fork_job_id: u64) WorkerLeaf {
+        return .{ .workers_dir_fd = self.workers_dir_fd, .job_id = fork_job_id };
+    }
+};
+
+/// A worker's cgroup leaf, `worker-<job_id>` in the directory that holds
+/// every leaf of its host (`WorkerCgroupRoot.workers_dir_fd`), which is
+/// borrowed and outlives every leaf named under it. A copy names the same
+/// leaf, and no method allocates or resolves a path.
+pub const WorkerLeaf = struct {
+    workers_dir_fd: std.posix.fd_t,
+    job_id: u64,
+
+    pub const name_bytes_max: usize = worker_dir_name_max;
+
+    pub fn name(self: WorkerLeaf, buffer: *[name_bytes_max]u8) []const u8 {
+        return workerDirName(buffer, self.job_id);
+    }
+
+    /// Opens the leaf's file `file_name` read-only, beneath the workers
+    /// directory with no link followed (`openBeneath`); the caller owns the
+    /// descriptor. Fails with `error.FileNotFound` once the leaf is gone,
+    /// with `error.SymLinkLoop` when its name is a link, and with
+    /// `error.NameTooLong` past `leaf_file_name_bytes_max`.
+    pub fn openFile(self: WorkerLeaf, file_name: []const u8) !std.posix.fd_t {
+        var path_buffer: [worker_dir_name_max + 1 + leaf_file_name_bytes_max + 1]u8 = undefined;
+        const path = std.fmt.bufPrintZ(&path_buffer, worker_dir_prefix ++ "{d}/{s}", .{
+            self.job_id,
+            file_name,
+        }) catch return error.NameTooLong;
+        return openBeneath(self.workers_dir_fd, path, .RDONLY);
+    }
+
+    /// Reads the leaf's file `file_name` into `buffer` with one read, which
+    /// the kernel fills whole for a cgroup file, and returns the bytes read.
+    /// A read that fills `buffer` fails with `error.CgroupFileTooLarge`.
+    pub fn readFile(self: WorkerLeaf, file_name: []const u8, buffer: []u8) ![]const u8 {
+        const fd = try self.openFile(file_name);
+        defer std.posix.close(fd);
+        const read_len = try std.posix.read(fd, buffer);
+        if (read_len == buffer.len)
+            return error.CgroupFileTooLarge;
+        return buffer[0..read_len];
+    }
+
+    /// Kills every member through the leaf's `cgroup.kill`, then removes the
+    /// leaf, retrying while a member that just died is still listed
+    /// (`removeDirWithRetry`). Blocks, so only a thread that may wait calls
+    /// it; a leaf already gone is no error.
+    pub fn remove(self: WorkerLeaf) void {
+        var name_buffer: [name_bytes_max]u8 = undefined;
+        removeWorkerDirAt(self.workers_dir_fd, self.name(&name_buffer));
     }
 };
 
@@ -263,7 +333,8 @@ fn removeWorkerDirAt(parent_fd: std.posix.fd_t, name: []const u8) void {
 }
 
 /// A directory to remove, named relative to an open parent (the sweeps and
-/// the leaf helpers) or by absolute path (a handle that only kept the path).
+/// every leaf) or by absolute path (an env-root host directory at `deinit`,
+/// whose parent's descriptor the claim did not keep).
 const DirTarget = union(enum) {
     at: struct { parent_fd: std.posix.fd_t, name: []const u8 },
     path: []const u8,
@@ -321,68 +392,40 @@ fn removeDirWithRetry(target: DirTarget) void {
     });
 }
 
-/// Kill plus a single rmdir for a leaf the host holds only as an fd: `.busy`
-/// sends a non-blocking caller to its own retry timer instead of the
-/// `rmdir_max_attempts` loop below. The fd stays the caller's to close.
-pub fn reapWorkerCgroupOnceByFd(dir_fd: std.posix.fd_t) enum { done, busy } {
-    killWorkerCgroupByFd(dir_fd);
-    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    var link_buffer: [64]u8 = undefined;
-    const link = std.fmt.bufPrint(&link_buffer, "/proc/self/fd/{d}", .{dir_fd}) catch return .done;
-    const dir_path = std.posix.readlink(link, &path_buffer) catch return .done;
-    std.posix.rmdir(dir_path) catch |err| switch (err) {
-        error.FileNotFound => return .done,
-        error.DirNotEmpty, error.FileBusy => return .busy,
-        else => {
-            std.log.warn("failed to remove worker cgroup {s}: {s}", .{ dir_path, @errorName(err) });
-            return .done;
-        },
-    };
-    return .done;
-}
-
-/// Blocking cleanup for a leaf the host holds only as an fd (a fork that
-/// never reached WorkerInit): kills residents, resolves the path from the
-/// fd, removes the directory with bounded retry. The fd stays the caller's
-/// to close.
-pub fn reapWorkerCgroupByFd(dir_fd: std.posix.fd_t) void {
-    killWorkerCgroupByFd(dir_fd);
-    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    var link_buffer: [64]u8 = undefined;
-    const link = std.fmt.bufPrint(&link_buffer, "/proc/self/fd/{d}", .{dir_fd}) catch return;
-    const dir_path = std.posix.readlink(link, &path_buffer) catch return;
-    removeDirWithRetry(.{ .path = dir_path });
-}
-
-/// Blocking cleanup for a leaf the host holds as a path (a live worker's
-/// handle): kills residents, then removes the directory with bounded retry.
-pub fn reapWorkerCgroupByPath(dir_path: []const u8) void {
-    killWorkerCgroupByPath(dir_path);
-    removeDirWithRetry(.{ .path = dir_path });
-}
-
-fn killWorkerCgroupByFd(dir_fd: std.posix.fd_t) void {
-    const fd = common.openWriteOnlyAt(dir_fd, cgroup_kill_file) catch return;
-    defer std.posix.close(fd);
-    // Best-effort: the rmdir retry still reclaims the dir once the worker
-    // exits on its own, so a failed kill only slows cleanup, never corrupts it.
-    writeAll(fd, "1") catch |err|
-        std.log.debug("cgroup.kill write failed: {s}", .{@errorName(err)});
-}
-
-fn killWorkerCgroupByPath(dir_path: []const u8) void {
-    var name_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const kill_path = std.fmt.bufPrint(&name_buffer, "{s}/{s}", .{ dir_path, cgroup_kill_file }) catch return;
-    const fd = std.posix.open(kill_path, .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0) catch return;
-    defer std.posix.close(fd);
-    writeAll(fd, "1") catch |err|
-        std.log.debug("cgroup.kill write failed: {s}", .{@errorName(err)});
-}
-
+/// Writes `cgroup.kill` of the leaf `name` under `parent_dir_fd`, opened
+/// beneath it with no link followed (`openBeneath`). Best-effort: a leaf
+/// already gone, a name that is a link, or a plain directory that has no
+/// such file has no member to kill, and the rmdir retry still reclaims a
+/// leaf whose member exits on its own, so a failed kill only slows the
+/// cleanup.
 fn killWorkerCgroupAt(parent_dir_fd: std.posix.fd_t, name: []const u8) void {
-    const dir_fd = openDirAt(parent_dir_fd, name) catch return;
-    defer std.posix.close(dir_fd);
-    killWorkerCgroupByFd(dir_fd);
+    var path_buffer: [std.fs.max_name_bytes + 1 + cgroup_kill_file.len + 1]u8 = undefined;
+    const kill_path = std.fmt.bufPrintZ(&path_buffer, "{s}/" ++ cgroup_kill_file, .{name}) catch return;
+    const fd = openBeneath(parent_dir_fd, kill_path, .WRONLY) catch return;
+    defer std.posix.close(fd);
+    writeAll(fd, "1") catch |err|
+        std.log.debug("cgroup.kill write failed: {s}", .{@errorName(err)});
+}
+
+/// Opens `path` relative to `dir_fd` with one openat2(2) that resolves every
+/// component beneath `dir_fd` and follows no link, magic links included
+/// (`collo_os.fd.openat2`). O_NOFOLLOW covers only the last component, so a
+/// link planted as `worker-<id>` would otherwise carry a read, or the write
+/// of `1` to `cgroup.kill`, to a directory outside the leaves, such as the
+/// server's own cgroup. cgroupfs creates no links, so on the delegated
+/// subtree this only pins what the kernel already guarantees; a root over a
+/// plain directory has no such guarantee. openat2 needs Linux 5.6, below the
+/// 5.7 that `CLONE_INTO_CGROUP` needs. Fails with `error.SymLinkLoop` on a
+/// link and `error.PathEscapesDirectory` on a path that leaves `dir_fd`; the
+/// caller owns the descriptor.
+fn openBeneath(dir_fd: std.posix.fd_t, path: [:0]const u8, access: std.posix.ACCMODE) fd_mod.OpenAt2Error!std.posix.fd_t {
+    var opened = try fd_mod.openat2(
+        dir_fd,
+        path,
+        .{ .ACCMODE = access, .CLOEXEC = true },
+        fd_mod.resolve_beneath | fd_mod.resolve_no_symlinks | fd_mod.resolve_no_magiclinks,
+    );
+    return opened.release();
 }
 
 /// A directory fd that `std.fs.Dir.iterate` accepts. The caller's fd may be

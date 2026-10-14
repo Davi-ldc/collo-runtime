@@ -11,18 +11,21 @@
 //!      "memory_peak_bytes":N,"ending":"idle"}
 //!
 //! `worker`, `worker_id` and `worker_generation` name the process as the
-//! server's worker table does, the identity its usage records carry, without
-//! a route, since any route of its definition runs on it. `started_ts` is
-//! when the server published the worker and `ts` when its teardown wrote the
-//! line, both on the wall clock, and `life_ns` the monotonic time between
-//! them. `worker_cpu_ns` is the CPU of every thread of the process over its
-//! life, boot, collection, compilation and JavaScript no request owned
-//! included, as the kernel counted it in the leaf's `cpu.stat`, so the
-//! worker cannot forge it; `memory_peak_bytes` is the leaf's `memory.peak`.
-//! Either is null when the leaf cannot say, as on a kernel without
-//! `memory.peak`. `ending` says how the life ended (`Ending`). A consumer
-//! joins the line to the worker's usage records on `worker_id` and
-//! `worker_generation`; the CPU here less theirs is what no request owned.
+//! server's worker table does, the identity its requests' access records
+//! carry, without a route, since any route of its definition runs on it.
+//! `started_ts` is when the server published the worker and `ts` when its
+//! teardown wrote the line, both on the wall clock, and `life_ns` the
+//! monotonic time between them. `worker_cpu_ns` is the CPU of every thread
+//! of the process over its life, boot, collection, compilation and
+//! JavaScript no request owned included, as the kernel counted it in the
+//! leaf's `cpu.stat`, so the worker cannot forge it; `memory_peak_bytes` is
+//! the leaf's `memory.peak`. Either is null when the leaf cannot say, as on
+//! a kernel without `memory.peak`. `ending` says how the life ended
+//! (`Ending`), a memory death split by who stopped the worker, while its
+//! requests' access records say `memory` either way. A consumer joins the
+//! line to its requests' access records on `worker_id` and
+//! `worker_generation`; the CPU here less their `cpu_ns` is what no request
+//! owned.
 //!
 //! Plain values and pure functions, callable from any thread.
 
@@ -34,17 +37,23 @@ const record = @import("record.zig");
 pub const Ending = enum {
     /// Its idle TTL or memory pressure retired it while it held no request.
     idle,
-    /// It announced `worker_retiring`, its routes having failed or its VM
-    /// having been terminated, and was retired once its requests finished.
+    /// It announced `worker_retiring`, its routes having failed, its VM
+    /// having been terminated or its egress session having broken on the
+    /// gateway's side, and was retired once its requests finished.
     recycled,
-    /// It died of memory: its sentinel stopped it past `memory.high`, or the
-    /// kernel's OOM killer did (`classifyWorkerDeath` in
-    /// `server/supervisor/usage_drain.zig`).
-    memory,
+    /// Its sentinel stopped it past `memory.high`, its memory limit
+    /// (`Death.memory_high` in `server/supervisor/worker_table.zig`).
+    memory_high,
+    /// The kernel's OOM killer ended it at `memory.max`, above its limit,
+    /// which a worker reaches when its sentinel did not stop it first
+    /// (`Death.memory_max`).
+    memory_max,
     /// It died otherwise: a fault, its own exit or its deadline's grace.
     crash,
     /// Its gateway was lost and no other one could give it a session.
     egress_reattach,
+    /// Its gateway removed its session for what it sent or left unread.
+    egress_session_removed,
     /// The server's shutdown stopped it.
     shutdown,
 };

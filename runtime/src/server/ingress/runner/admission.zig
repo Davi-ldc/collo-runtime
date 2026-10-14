@@ -67,7 +67,6 @@ const request_slot_mod = @import("request_slot.zig");
 const worker_registration = @import("worker_registration.zig");
 
 const access_log = @import("collo_server_analytics").access;
-const Sink = @import("collo_server_analytics").Sink;
 const http_body_limits = @import("collo_limits").http_body;
 const pool_limits = @import("collo_limits").pool;
 const record_limits = @import("collo_limits").runtime_logs;
@@ -186,17 +185,15 @@ pub fn streamTarget(table: *const routes_mod.Table, path: []const u8, captures: 
 }
 
 /// The server's state as the health answer reports it: `stopping` as the
-/// service says, the zygote alive while `zygote_pidfd` reports no exit, a
-/// lane running only while the state it published is `active`, and the
-/// usage stream's full flag. Each read is one atomic load or one
-/// zero-timeout poll, so it takes no lock. `lanes` is a slice of lanes, each
-/// with `state()`, and holds at most `maxInt(u16)` of them, the bound
-/// `Service.init` keeps.
+/// service says, the zygote alive while `zygote_pidfd` reports no exit, and
+/// a lane running only while the state it published is `active`. Each read
+/// is one atomic load or one zero-timeout poll, so it takes no lock. `lanes`
+/// is a slice of lanes, each with `state()`, and holds at most
+/// `maxInt(u16)` of them, the bound `Service.init` keeps.
 pub fn healthState(
     stopping: bool,
     zygote_pidfd: std.posix.fd_t,
     lanes: anytype,
-    analytics: *const Sink,
 ) server_responses.HealthState {
     std.debug.assert(lanes.len <= std.math.maxInt(u16));
     var lanes_running: u16 = 0;
@@ -209,7 +206,6 @@ pub fn healthState(
         .zygote_alive = !process.pidFdHasExited(zygote_pidfd),
         .lanes_running = lanes_running,
         .lanes_total = @intCast(lanes.len),
-        .usage_stream_full = analytics.full(.usage),
     };
 }
 
@@ -414,9 +410,12 @@ pub fn Methods(comptime Self: type) type {
         pub fn growOrStrand(self: *Self, definition: server_config.DefinitionIndex, reason: GrowthReason) LaneFault!void {
             const supervisor = self.service.supervisor;
             const definition_pool = supervisor.poolFor(definition);
-            if (definition_pool.growthWanted(supervisor.memoryGate())) {
-                self.service.launcher.submit(definition, reason);
-                return;
+            switch (definition_pool.growthWanted(supervisor.memoryGate())) {
+                .launch, .watch => {
+                    self.service.launcher.submit(definition, reason);
+                    return;
+                },
+                .none => {},
             }
             var stranded_buffer: [stranded_batch_len]pool.Waiter = undefined;
             var batches: usize = 0;
@@ -526,7 +525,6 @@ pub fn Methods(comptime Self: type) type {
                         self.service.shouldStop(),
                         self.service.supervisor.zygote_process.pidfd,
                         self.service.lanes,
-                        self.service.analytics,
                     ), &body_buffer);
                     _ = try http2_writing.answerStreamAlone(Self, self, runtime, stream.stream_id, response, stream.request_ended);
                 },

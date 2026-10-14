@@ -1,5 +1,6 @@
-// Declares the HTML timer globals (setTimeout, setInterval, clearTimeout, clearInterval) and Node's setImmediate and
-// clearImmediate, which the host function registry (`globals.def`) defines on the VM thread.
+// Declares the HTML timer globals (setTimeout, setInterval, clearTimeout, clearInterval) and setImmediate and
+// clearImmediate, which the host function registry (`globals.def`) defines on the VM thread. setImmediate returns a
+// numeric id, as setTimeout does.
 
 #pragma once
 

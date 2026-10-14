@@ -1,26 +1,20 @@
 //! The lookups and ready-queue helpers the fetch body files share, on the
-//! worker's event loop thread; `root.zig` states the invariants they keep.
+//! worker's VM thread; `root.zig` states the invariants they keep.
 
+const std = @import("std");
 const bindings = @import("collo_bindings");
-const egress_core = @import("collo_egress_core");
 const request_context = @import("collo_worker_request").context;
-const egress_context = @import("../context.zig");
+const Runtime = @import("../../runtime/root.zig").Runtime;
+const body_mod = @import("body.zig");
 
-pub const FetchBody = egress_core.fetch_body.Body;
-pub const FetchBodyReadKind = egress_core.fetch_body.ReadKind;
-pub const FetchBodyWaiter = egress_core.fetch_body.Waiter;
-pub const FetchBodyPullWaiter = egress_core.fetch_body.PullWaiter;
-pub const ResponseStreamDrain = FetchBody.PullDrain;
+pub const Body = body_mod.Body;
 
 /// The request whose JavaScript may start a read, pull or clone of the view
 /// `identity` names: active under the view's generation and accepting work
 /// (`RequestContext.acceptsWork`). Fails with
 /// `error.FetchBodyOutsideActiveRequest` otherwise.
-pub fn acceptingRequest(
-    runtime: *egress_context.Context,
-    identity: bindings.FetchBodyIdentity,
-) !*request_context.RequestContext {
-    const request = runtime.requests.get(identity.request_id) orelse return error.FetchBodyOutsideActiveRequest;
+pub fn acceptingRequest(runtime: *Runtime, identity: bindings.FetchBodyIdentity) !*request_context.RequestContext {
+    const request = runtime.requests.active.get(identity.request_id) orelse return error.FetchBodyOutsideActiveRequest;
     if (request.request_generation != identity.request_generation)
         return error.FetchBodyOutsideActiveRequest;
     if (!request.acceptsWork())
@@ -28,23 +22,12 @@ pub fn acceptingRequest(
     return request;
 }
 
-/// The identity of a new body of `fetch_id`, under `request`'s id and
-/// generation.
-pub fn nextIdentity(
-    runtime: *egress_context.Context,
-    request: *const request_context.RequestContext,
-    fetch_id: u64,
-) bindings.FetchBodyIdentity {
-    return runtime.egress_state.nextBodyIdentity(request, fetch_id);
-}
-
 /// The body `identity` names, or null when no body has its id or the stored
 /// identity differs in any field, as for a handle from an earlier request
 /// generation. The table keeps its reference, so the pointer is valid until
 /// the body leaves the table.
-pub fn ptr(runtime: *egress_context.Context, identity: bindings.FetchBodyIdentity) ?*FetchBody {
-    const body_ptr = runtime.egress_state.bodies.getPtr(identity.body_id) orelse return null;
-    const body = body_ptr.*;
+pub fn ptr(runtime: *Runtime, identity: bindings.FetchBodyIdentity) ?*Body {
+    const body = runtime.egress.state.bodies.get(identity.body_id) orelse return null;
     if (body.identity.request_id != identity.request_id or
         body.identity.request_generation != identity.request_generation or
         body.identity.fetch_id != identity.fetch_id or
@@ -55,38 +38,32 @@ pub fn ptr(runtime: *egress_context.Context, identity: bindings.FetchBodyIdentit
     return body;
 }
 
-/// Adds the growth of the body's meters since the last call to its request's
-/// fetch byte totals. The growth is taken even when the request is gone or its
-/// generation moved on, so those bytes are dropped rather than charged to
-/// another request.
-pub fn accountEgress(runtime: *egress_context.Context, body: *FetchBody) void {
-    const meters = body.takeUnaccountedEgressMeters();
-    if (meters.billed_sent == 0 and meters.billed_received == 0 and meters.cost == 0)
-        return;
-    if (runtime.requests.get(body.identity.request_id)) |request| {
-        if (request.request_generation == body.identity.request_generation) {
-            request.fetch_billed_sent_bytes += meters.billed_sent;
-            request.fetch_billed_received_bytes += meters.billed_received;
-            request.fetch_cost_bytes += meters.cost;
-        }
-    }
+/// Queues every view of `body`, a body in the table, whose reader is ready
+/// and that has no item queued: the body itself and, for a root, each
+/// branch, since one packet that feeds a root can ready all of them. A
+/// root's branches are in the table, since a body leaves it with its links
+/// (`cleanup.zig:removeFromTable`).
+pub fn queueReadyViews(runtime: *Runtime, body: *Body) void {
+    queueIfReady(runtime, body);
+    for (body.tee_branches.items) |branch|
+        queueIfReady(runtime, branch);
 }
 
-/// Queues the body for settlement when it is ready and not already queued.
-pub fn queueReady(runtime: *egress_context.Context, body: *FetchBody) !void {
-    if (!body.claimReadyForQueue())
-        return;
-    try pushClaimedReady(runtime, body);
+/// Queues `body`, a body in the table, when its reader is ready and it has
+/// no item queued.
+pub fn queueIfReady(runtime: *Runtime, body: *Body) void {
+    if (body.claimReadyForQueue())
+        queueClaimed(runtime, body);
 }
 
-/// Queues a body whose ready slot the caller claimed. When the ready queue and
-/// its backlog are both full, the claim is dropped and the body rescan flag is
-/// set, so `ready.collectReady` queues the body later.
-pub fn pushClaimedReady(runtime: *egress_context.Context, body: *FetchBody) !void {
-    if (runtime.tryQueueReadyReadySince(
-        .{ .fetch_body_ready = body.identity.body_id },
-        body.ready_at_mono_ns,
-    ))
-        return;
-    body.clearReadyQueued();
+/// Queues the item of a body in the table whose place in the ready queue the
+/// caller claimed (`Body.claimReadyForQueue`). Only bodies in the table queue
+/// items, one at a time each, so the queue's room for them is the table's
+/// slots (`register.zig`), and the push never fails.
+pub fn queueClaimed(runtime: *Runtime, body: *Body) void {
+    std.debug.assert(body.ready_queued);
+    const listed = runtime.egress.state.bodies.get(body.identity.body_id);
+    std.debug.assert(listed != null);
+    std.debug.assert(listed.? == body);
+    runtime.queueReadyWork(.{ .fetch_body_ready = body.identity.body_id }, body.ready_at_mono_ns);
 }

@@ -1,25 +1,31 @@
-//! Per-fetch transport configuration: the network policy every hop is
-//! checked against, body and protocol limits, timeouts and pool isolation
-//! identities.
+//! Per-fetch transport configuration and the egress clock: the network policy
+//! every hop is checked against, body and protocol limits, timeouts and pool
+//! isolation identities, and the monotonic clock every egress deadline is
+//! read on.
 //!
 //! The defaults serve standalone use and tests, except `network`, which has
 //! none, so every caller names what its fetches may reach. The gateway
 //! builds one `Config` per fetch from its limits, the policy its token
 //! names, the fetch's request deadline and its isolation identities.
-//! Deadlines are absolute monotonic nanoseconds, and zero means none.
+//! Deadlines are absolute nanoseconds on `monotonicNowNs`, and zero means
+//! none.
+//!
+//! HTTP/2 connection limits come from the config of the fetch that opened
+//! the connection and are not part of any pool key: the gateway sets the same
+//! limits on every fetch, and a later fetch's own response cap still applies
+//! per stream.
 
 const std = @import("std");
 const core = @import("collo_egress_core");
-const egress_tls = @import("collo_egress_tls");
-const http2 = @import("collo_egress_http2");
+const egress_tls = @import("../tls.zig");
+const http2 = @import("h2/codec/root.zig");
 const limits = @import("collo_limits");
 const network = @import("collo_network");
 
-const decompress = core.decompress;
 const stream_pump = core.stream_pump;
 
 pub const default_http2_max_outgoing_buffer_bytes: usize = 1024 * 1024;
-pub const default_tls_ciphertext_buffer_bytes: usize = default_http2_max_outgoing_buffer_bytes;
+pub const default_wire_buffer_bytes: usize = default_http2_max_outgoing_buffer_bytes;
 pub const PoolIsolationId = [16]u8;
 pub const SecurityCellId = PoolIsolationId;
 pub const zero_pool_isolation_id: PoolIsolationId = [_]u8{0} ** 16;
@@ -40,6 +46,20 @@ pub const Protocol = enum {
     }
 };
 
+/// Reads CLOCK_BOOTTIME, the clock the data driver's absolute io_uring
+/// timeouts (`IORING_TIMEOUT_BOOTTIME`) compare against, so a deadline the
+/// engine computes and the timeout the ring arms for it agree.
+pub fn monotonicNowNs() !u64 {
+    const ts = try std.posix.clock_gettime(std.posix.CLOCK.BOOTTIME);
+    const sec: u64 = @intCast(ts.sec);
+    const nsec: u64 = @intCast(ts.nsec);
+    return sec * std.time.ns_per_s + nsec;
+}
+
+pub fn deadlineAfterMs(timeout_ms: u32) !u64 {
+    return (try monotonicNowNs()) +| @as(u64, timeout_ms) * std.time.ns_per_ms;
+}
+
 pub const Config = struct {
     /// What the fetch may reach, checked on every hop, redirects included:
     /// the scheme, host and port before DNS and every resolved address after
@@ -54,6 +74,9 @@ pub const Config = struct {
     max_encoded_response_bytes: usize = limits.http_body.MATERIALIZED_BODY_BYTES_MAX,
     max_pending_decoded_body_bytes: usize = stream_pump.default_max_pending_decoded_bytes,
     max_decoded_to_encoded_ratio: u64 = stream_pump.default_max_decoded_to_encoded_ratio,
+    /// How long the fetch may wait on the network without progress: each dial
+    /// phase (DNS, TCP connect, TLS handshake) and each wait on the origin
+    /// once connected.
     socket_timeout_ms: u32 = 5_000,
     /// Deadline of the whole fetch: in the gateway, the deadline of the
     /// egress token that admitted it. Zero leaves only the per-stage socket
@@ -63,6 +86,8 @@ pub const Config = struct {
     /// never come from a worker message or a tenant request option; the
     /// gateway never sets it and asserts so for every fetch.
     insecure_tls: bool = false,
+    /// False keeps the fetch on HTTP/1: its dials offer only http/1.1 and it
+    /// never opens an HTTP/2 stream.
     enable_http2: bool = true,
     http2_max_active_streams: usize = http2.default_limits.max_active_streams,
     http2_stream_receive_window: u32 = http2.default_limits.stream_receive_window,
@@ -71,7 +96,10 @@ pub const Config = struct {
     http2_max_pending_body_credit_per_stream: usize = http2.default_limits.max_pending_body_credit_per_stream,
     http2_max_pending_body_credit_per_connection: usize = http2.default_limits.max_pending_body_credit_per_connection,
     http2_max_outgoing_buffer_bytes: usize = default_http2_max_outgoing_buffer_bytes,
-    tls_ciphertext_buffer_bytes: usize = default_tls_ciphertext_buffer_bytes,
+    /// Bytes a connection's wire may hold on this side, plain or TLS alike:
+    /// its queued sends plus TLS ciphertext the read BIO has not taken
+    /// (`wire.zig:Wire.max_buffered_bytes`).
+    wire_buffer_bytes: usize = default_wire_buffer_bytes,
     http1_pool_max_entries: usize = 16,
     /// Reuse saves the DNS, connect and TLS cost, but an idle connection must
     /// be dropped before typical server and middlebox windows close it
@@ -86,10 +114,10 @@ pub const Config = struct {
     /// drain has its own cap and a redirect chain cannot spend the response
     /// body budget on every hop.
     max_redirect_drain_bytes: usize = 64 * 1024,
-    /// Pool isolation identities, part of every pool and TLS session key. The
-    /// gateway fills them with the fetch's security cell and policy so one
-    /// gateway never shares connections or sessions across tenants; zero
-    /// serves standalone use and tests.
+    /// Pool isolation identities, part of every origin key and TLS session
+    /// key. The gateway fills them with the fetch's security cell and policy
+    /// so one gateway never shares connections or sessions across tenants;
+    /// zero serves standalone use and tests.
     pool_security_cell_id: PoolIsolationId = zero_pool_isolation_id,
     pool_policy_id: PoolIsolationId = zero_pool_isolation_id,
 
@@ -132,15 +160,6 @@ pub const Config = struct {
         };
     }
 
-    pub fn streamPumpLimitsForEncoding(self: Config, encoding: decompress.Encoding) stream_pump.Limits {
-        _ = encoding;
-        return self.streamPumpLimits();
-    }
-
-    pub fn http1StreamPumpLimits(self: Config) stream_pump.Limits {
-        return self.streamPumpLimits();
-    }
-
     pub fn capDeadlineMonoNs(self: Config, deadline_mono_ns: u64) u64 {
         if (self.request_deadline_mono_ns == 0)
             return deadline_mono_ns;
@@ -148,11 +167,11 @@ pub const Config = struct {
     }
 
     /// The stall deadline: `socket_timeout_ms` after `now_mono_ns`, capped by
-    /// the request deadline. The socket timeout measures origin silence, so
-    /// the engine recomputes this on every sign of origin progress. A long
-    /// transfer that keeps progressing pushes the deadline forward, a silent
-    /// origin lets it fire, and `request_deadline_mono_ns` still bounds the
-    /// whole fetch.
+    /// the request deadline. The socket timeout measures network silence, so
+    /// the engine recomputes this at every dial phase and on every sign of
+    /// origin progress. A long transfer that keeps progressing pushes the
+    /// deadline forward, a silent origin lets it fire, and
+    /// `request_deadline_mono_ns` still bounds the whole fetch.
     pub fn stallDeadlineFromNow(self: Config, now_mono_ns: u64) u64 {
         const raw = now_mono_ns +| @as(u64, self.socket_timeout_ms) * std.time.ns_per_ms;
         return self.capDeadlineMonoNs(raw);
@@ -160,5 +179,13 @@ pub const Config = struct {
 
     pub fn requestDeadlineExpiredAt(self: Config, now_mono_ns: u64) bool {
         return self.request_deadline_mono_ns != 0 and now_mono_ns >= self.request_deadline_mono_ns;
+    }
+
+    /// The deadline that bounds the whole fetch, or the largest instant when
+    /// it has none.
+    pub fn requestDeadlineOrUnbounded(self: Config) u64 {
+        if (self.request_deadline_mono_ns != 0)
+            return self.request_deadline_mono_ns;
+        return std.math.maxInt(u64);
     }
 };

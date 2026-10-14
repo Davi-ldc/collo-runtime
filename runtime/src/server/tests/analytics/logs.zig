@@ -182,18 +182,23 @@ test "stderr text escapes terminal controls and invalid UTF-8 and keeps the rest
     );
 }
 
+/// A worker's console ring: the worker's writer, which the tests publish
+/// through, and the host's reader, which the drains read.
 const RingHarness = struct {
     fd: std.posix.fd_t,
     view: page.WorkerWriterView,
+    reader: page.HostReaderView,
 
     fn init(target: *RingHarness, name: []const u8) !void {
         const fd = try page.createMemfd(name);
         errdefer std.posix.close(fd);
-        target.* = .{ .fd = fd, .view = try page.mapReadWrite(fd) };
-        target.view.initializeCrashDefault();
+        var view = try page.mapWorkerWriter(fd);
+        errdefer view.deinit();
+        target.* = .{ .fd = fd, .view = view, .reader = try page.mapHostReader(fd) };
     }
 
     fn deinit(self: *RingHarness) void {
+        self.reader.deinit();
         self.view.deinit();
         std.posix.close(self.fd);
     }
@@ -246,13 +251,13 @@ test "a ring drain writes each line to logs.jsonl and stderr and reports drops o
 
     var drop_reported: u64 = 0;
     var requests = KnownRequests{ .known = &.{.{ .request_id = 11, .route = "/users/:id" }} };
-    const drained = try logs.drainRing(&ring.view, &requests, worker_identity, &drop_reported, &output.sink, clock, 100);
+    const drained = try logs.drainRing(&ring.reader, &requests, worker_identity, &drop_reported, &output.sink, clock, 100);
     try std.testing.expectEqual(@as(usize, 3), drained.lines);
     try std.testing.expectEqual(@as(u64, 0), drained.ids_refused);
     try std.testing.expectEqual(@as(u64, 2), drop_reported);
 
     // A drain with nothing new writes nothing, not even a marker.
-    const again = try logs.drainRing(&ring.view, &requests, worker_identity, &drop_reported, &output.sink, clock, 100);
+    const again = try logs.drainRing(&ring.reader, &requests, worker_identity, &drop_reported, &output.sink, clock, 100);
     try std.testing.expectEqual(@as(usize, 0), again.lines);
 
     const records = try output.readLines("logs.jsonl");
@@ -303,7 +308,7 @@ test "a line keeps its request id only when the worker's requests confirm it, an
 
     var drop_reported: u64 = 0;
     var requests = KnownRequests{ .known = &.{.{ .request_id = 11, .route = "/users/:id" }} };
-    const drained = try logs.drainRing(&ring.view, &requests, worker_identity, &drop_reported, &output.sink, clock, 100);
+    const drained = try logs.drainRing(&ring.reader, &requests, worker_identity, &drop_reported, &output.sink, clock, 100);
     try std.testing.expectEqual(@as(usize, 3), drained.lines);
     // A line under no request asks nothing and counts as nothing.
     try std.testing.expectEqual(@as(u64, 1), drained.ids_refused);
@@ -350,7 +355,7 @@ test "a runtime line reaches stderr under the worker's runtime prefix and never 
 
     var drop_reported: u64 = 0;
     var requests = KnownRequests{};
-    const drained = try logs.drainRing(&ring.view, &requests, worker_identity, &drop_reported, &output.sink, clock, 100);
+    const drained = try logs.drainRing(&ring.reader, &requests, worker_identity, &drop_reported, &output.sink, clock, 100);
     try std.testing.expectEqual(@as(usize, 2), drained.lines);
     try std.testing.expectEqual(@as(u64, 1), output.sink.stats(.logs).appended);
 
@@ -399,9 +404,9 @@ test "a ring drain stops at its line budget and leaves the rest for the next one
 
     var drop_reported: u64 = 0;
     var requests = KnownRequests{};
-    const first = try logs.drainRing(&ring.view, &requests, worker_identity, &drop_reported, &output.sink, clock, 2);
+    const first = try logs.drainRing(&ring.reader, &requests, worker_identity, &drop_reported, &output.sink, clock, 2);
     try std.testing.expectEqual(@as(usize, 2), first.lines);
-    const rest = try logs.drainRing(&ring.view, &requests, worker_identity, &drop_reported, &output.sink, clock, 100);
+    const rest = try logs.drainRing(&ring.reader, &requests, worker_identity, &drop_reported, &output.sink, clock, 100);
     try std.testing.expectEqual(@as(usize, 3), rest.lines);
     try std.testing.expectEqual(@as(u64, 5), output.sink.stats(.logs).appended);
     try std.testing.expectEqual(@as(u64, 5), output.sink.stats(.console).appended);
@@ -423,7 +428,7 @@ test "a faulted ring fails the drain and gets no drop marker" {
     var requests = KnownRequests{};
     try std.testing.expectError(
         error.LogRingFatal,
-        logs.drainRing(&ring.view, &requests, worker_identity, &drop_reported, &output.sink, clock, 100),
+        logs.drainRing(&ring.reader, &requests, worker_identity, &drop_reported, &output.sink, clock, 100),
     );
     try std.testing.expectEqual(@as(u64, 0), drop_reported);
     try std.testing.expectEqual(@as(u64, 0), output.sink.stats(.logs).appended);
@@ -431,7 +436,7 @@ test "a faulted ring fails the drain and gets no drop marker" {
 
     // Teardown's drain of the same ring writes none of its lines to the sink;
     // `drainDyingRing` only logs that they are lost.
-    try std.testing.expectEqual(@as(u64, 0), logs.drainDyingRing(&ring.view, &requests, worker_identity, &drop_reported, &output.sink));
+    try std.testing.expectEqual(@as(u64, 0), logs.drainDyingRing(&ring.reader, &requests, worker_identity, &drop_reported, &output.sink));
     try std.testing.expectEqual(@as(u64, 0), output.sink.stats(.console).appended);
 }
 
@@ -446,7 +451,7 @@ test "without a directory console lines still reach stderr and their records are
     ring.view.publishLogLine(.info, 0, 1, 4_000_000_000, "only stderr");
     var drop_reported: u64 = 0;
     var requests = KnownRequests{ .known = &.{.{ .request_id = 1, .route = "/users/:id" }} };
-    try std.testing.expectEqual(@as(u64, 0), logs.drainDyingRing(&ring.view, &requests, worker_identity, &drop_reported, &output.sink));
+    try std.testing.expectEqual(@as(u64, 0), logs.drainDyingRing(&ring.reader, &requests, worker_identity, &drop_reported, &output.sink));
 
     try std.testing.expectEqual(@as(u64, 1), output.sink.stats(.logs).discarded);
     const console = try output.readLines("console.txt");

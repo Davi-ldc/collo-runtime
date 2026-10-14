@@ -4,7 +4,8 @@
 //!
 //! - `command_line.zig`: the arguments of `collo serve`.
 //! - `signals.zig`: SIGHUP, SIGINT and SIGTERM through a signalfd monitor.
-//! - `trace_drain.zig`: the reader of the zygote's boot trace pipe.
+//! - `trace_drain.zig`: the reader of the zygote's boot trace pipe, which
+//!   exists only when the boot trace is logged.
 //! - `report.zig`: the lines written to stderr for the operator.
 //!
 //! `serve` runs on the main thread, in this order:
@@ -33,15 +34,16 @@
 //! 4. Require a kernel TLS cipher, which the server cannot serve without.
 //!    Nothing here depends on the steps after it, so a missing `tls` module
 //!    fails the boot before any child process exists.
-//! 5. Create the worker cgroup root, then claim the one directory every
-//!    worker mounts its tmpfs over (`host/tmp_mount.zig`). The root must
-//!    exist before the zygote: a delegated placement moves only the calling
-//!    process into `<own>/main`, and a zygote left in `<own>` would keep its
-//!    controllers from being enabled (`prepareDelegatedSubtree` in
-//!    `host/cgroup_root.zig`). Both sweep what dead hosts left before this
-//!    server's first worker.
-//! 6. Spawn the zygote with the warmup corpus, then drain its trace pipe,
-//!    which holds the zygote's boot events until the drain starts.
+//! 5. Create the worker cgroup root, which sweeps what dead hosts left
+//!    before this server's first worker. The root must exist before the
+//!    zygote: a delegated placement moves only the calling process into
+//!    `<own>/main`, and a zygote left in `<own>` would keep its controllers
+//!    from being enabled (`prepareDelegatedSubtree` in
+//!    `host/cgroup_root.zig`).
+//! 6. Spawn the zygote, with a boot trace pipe only when the trace is logged
+//!    (`trace_drain.loggingRequested`), and then drain that pipe, which holds
+//!    the zygote's boot events until the drain starts. Without the trace no
+//!    pipe exists and no drain thread starts.
 //! 7. Choose the certificate: the configured one, or a generated self-signed
 //!    one with a warning.
 //! 8. Build the `Server` from the routes, attach it to the signal monitor and
@@ -54,8 +56,8 @@
 //! definition with a `network` grant attaches, so a configuration that
 //! grants no route any network access never starts a gateway.
 //! Teardown runs in reverse: the monitor detaches from the `Server`, the
-//! `Server` stops its workers, the drain stops, then the zygote, the tmpfs
-//! mount point and the cgroup root go. The monitor joins last, so a second stop signal during the
+//! `Server` stops its workers, the drain stops, then the zygote and the
+//! cgroup root go. The monitor joins last, so a second stop signal during the
 //! teardown still ends the process at once instead of taking its default
 //! action halfway through it.
 //!
@@ -95,9 +97,9 @@ pub const ExitStatus = enum(u8) {
 /// cgroup, which must then be delegated to it.
 pub const worker_cgroup_root_env = "COLLO_WORKER_CGROUP_ROOT";
 
-/// Every definition's sealed module pack and route table, plus the
-/// filesystem index they share and the network policy image.
-pub const artifact_descriptors_max: usize = 2 * server_limits.worker_definitions_max + 2;
+/// Every definition's sealed artifact, its module pack with its routes, plus
+/// the network policy image.
+pub const artifact_descriptors_max: usize = server_limits.worker_definitions_max + 1;
 
 /// Prints why `command_line.parse` refused the arguments, then the usage
 /// line.
@@ -215,29 +217,18 @@ pub fn serve(gpa: std.mem.Allocator, invocation: command_line.Invocation) ExitSt
     };
     defer cgroup_root.deinit(gpa);
 
-    var tmp_mount_point: host.TmpMountPoint = undefined;
-    tmp_mount_point.init(host.tmp_mount.default_parent_dir) catch |err| {
-        report.line("cannot create the workers' tmpfs mount point under " ++ host.tmp_mount.default_parent_dir ++ ": {s}", .{@errorName(err)});
-        return .failure;
-    };
-    defer tmp_mount_point.deinit();
-
-    var spawned = zygote.host_client.spawnZygote(.{ .warmup_corpus = true }) catch |err| {
+    var spawned = zygote.host_client.spawnZygote(.{ .trace = trace_drain.loggingRequested() }) catch |err| {
         report.line("cannot start the zygote: {s}", .{@errorName(err)});
         return .failure;
     };
     defer spawned.deinit();
 
     var drain: trace_drain.TraceDrain = undefined;
-    var drain_running = false;
-    if (spawned.trace_read_fd) |trace_fd| {
-        drain.init(trace_fd, trace_drain.loggingRequested()) catch |err| {
-            report.line("cannot start the boot trace drain: {s}", .{@errorName(err)});
-            return .failure;
-        };
-        drain_running = true;
-    }
-    defer if (drain_running) drain.deinit();
+    drain.init(spawned.trace_read_fd) catch |err| {
+        report.line("cannot start the boot trace drain: {s}", .{@errorName(err)});
+        return .failure;
+    };
+    defer drain.deinit();
 
     const listen = routes.config.listen;
     const configured_tls = routes.config.tls;
@@ -268,7 +259,7 @@ pub fn serve(gpa: std.mem.Allocator, invocation: command_line.Invocation) ExitSt
             .analytics_directory = if (routes.config.analytics) |analytics| analytics.directory_path else null,
             .listen = listen,
             .tls_certificate = certificate,
-            .worker_host = .{ .cgroup_root = &cgroup_root, .tmp_mount_point = &tmp_mount_point },
+            .worker_host = .{ .cgroup_root = &cgroup_root },
             .on_serving = &announceListening,
         }) catch |err| return serverInitFailure(err, .{
             .listen = listen,
@@ -319,19 +310,19 @@ fn loadConfiguration(
 fn checkConfiguredPaths(loaded: *const config.Config, diagnostic: *config.Diagnostic) error{InvalidConfig}!void {
     if (loaded.tls) |paths| {
         try checkPemFile(loaded.path, .{
-            .key = "globalSettings.tls.certificate",
+            .key = "settings.tls.certificate",
             .path = paths.certificate_path,
             .bytes_max = tls.max_cert_chain_pem_bytes,
         }, diagnostic);
         try checkPemFile(loaded.path, .{
-            .key = "globalSettings.tls.privateKey",
+            .key = "settings.tls.privateKey",
             .path = paths.private_key_path,
             .bytes_max = tls.max_private_key_pem_bytes,
         }, diagnostic);
     }
     if (loaded.analytics) |analytics| {
         var directory = std.fs.openDirAbsolute(analytics.directory_path, .{}) catch |err| {
-            diagnostic.set("{s}: globalSettings.analytics.directory: cannot open the directory {s}: {s}", .{
+            diagnostic.set("{s}: settings.analytics.directory: cannot open the directory {s}: {s}", .{
                 loaded.path,
                 analytics.directory_path,
                 @errorName(err),
@@ -341,7 +332,7 @@ fn checkConfiguredPaths(loaded: *const config.Config, diagnostic: *config.Diagno
         defer directory.close();
         // The analytics sink creates and appends its record files in it.
         std.posix.faccessat(directory.fd, ".", std.posix.W_OK | std.posix.X_OK, 0) catch |err| {
-            diagnostic.set("{s}: globalSettings.analytics.directory: cannot write to the directory {s}: {s}", .{
+            diagnostic.set("{s}: settings.analytics.directory: cannot write to the directory {s}: {s}", .{
                 loaded.path,
                 analytics.directory_path,
                 @errorName(err),
@@ -434,7 +425,7 @@ fn serverInitFailure(err: anyerror, context: ServerInitContext) ExitStatus {
         },
         error.BoringSslInitFailed, error.EmptyPemMaterial, error.PemMaterialTooLarge => {
             if (context.tls_configured) {
-                report.line("{s}: globalSettings.tls: the certificate or private key is not usable: {s}", .{
+                report.line("{s}: settings.tls: the certificate or private key is not usable: {s}", .{
                     context.config_path,
                     @errorName(err),
                 });

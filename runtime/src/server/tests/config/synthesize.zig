@@ -1,6 +1,6 @@
 //! The configuration synthesized for an entry module
 //! (`server/config/synthesize.zig`): one worker named after the file's stem
-//! with one catch-all route, every other global default and a grant of any
+//! with one catch-all route, every other built-in default and a grant of any
 //! public host, the same configuration as its equivalent `collo.json`, the
 //! worker name derivation, and relative entry paths. The routes built from
 //! it are covered in `tests/routes/artifacts.zig`.
@@ -70,7 +70,7 @@ test "the synthesized configuration is the parse of its equivalent file" {
     var synthesized = try config.synthesize(allocator, "/srv/app/app.js", &diagnostic);
     defer synthesized.deinit();
     var parsed = try config.parse(allocator,
-        \\{"globalSettings": {"network": {"allow": ["*"]}},
+        \\{"settings": {"network": {"allow": ["*"]}},
         \\ "workers": {"app": {"routes": {"/*": {"entry": "app.js"}}}}}
     , "/srv/app/collo.json", &diagnostic);
     defer parsed.deinit();

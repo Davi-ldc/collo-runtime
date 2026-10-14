@@ -15,11 +15,11 @@
 //! its `timeoutMs` on the wall clock and at its `cpuMs` on the CPU it is
 //! charged (`worker/runtime/owner.zig`, `worker/runtime/sentinel.zig`).
 //!
-//! `network` cascades unlike the other settings. Global settings, a worker's
-//! settings and a route may each name it, and a level that does replaces the
-//! inherited value whole instead of merging allow lists. Each route's
-//! effective value is resolved here, once, into `Route.network`. A file that
-//! names `network` nowhere grants no route any outbound access.
+//! `network` cascades unlike the other settings. The top-level `settings`, a
+//! worker's `settings` and a route may each name it, and a level that does
+//! replaces the inherited value whole instead of merging allow lists. Each
+//! route's effective value is resolved here, once, into `Route.network`. A
+//! file that names `network` nowhere grants no route any outbound access.
 //!
 //! Relative paths resolve against the configuration file's directory. The
 //! JSON tree and the comment-free copy of the text live in a scratch arena
@@ -335,34 +335,34 @@ const Parser = struct {
 
     fn readRoot(self: *Parser, root: Value) Error!Config {
         const object = try self.expectObject(root);
-        try self.rejectUnknownKeys(object, &.{ "globalSettings", "workers" });
+        try self.rejectUnknownKeys(object, &.{ "settings", "workers" });
 
         var listen = parseListen(model.default_listen) catch unreachable;
         var tls: ?model.Tls = null;
         var analytics: ?model.Analytics = null;
         var defaults = model.default_settings;
-        if (object.get("globalSettings")) |global_value| {
-            self.path.push("globalSettings");
-            const global = try self.expectObject(global_value);
-            try self.rejectUnknownKeys(global, &.{ "listen", "tls", "analytics", "isolateRealm", "limits", "network" });
-            if (global.get("listen")) |listen_value| {
+        if (object.get("settings")) |settings_value| {
+            self.path.push("settings");
+            const settings_object = try self.expectObject(settings_value);
+            try self.rejectUnknownKeys(settings_object, &.{ "listen", "tls", "analytics", "isolateRealm", "limits", "network" });
+            if (settings_object.get("listen")) |listen_value| {
                 self.path.push("listen");
                 const text = try self.expectString(listen_value);
                 listen = parseListen(text) catch
                     return self.fail("'{s}' is not an address such as 127.0.0.1:8443 or [::1]:8443", .{text});
                 self.path.pop();
             }
-            if (global.get("tls")) |tls_value| {
+            if (settings_object.get("tls")) |tls_value| {
                 self.path.push("tls");
                 tls = try self.readTls(tls_value);
                 self.path.pop();
             }
-            if (global.get("analytics")) |analytics_value| {
+            if (settings_object.get("analytics")) |analytics_value| {
                 self.path.push("analytics");
                 analytics = try self.readAnalytics(analytics_value);
                 self.path.pop();
             }
-            defaults = try self.readSettings(global, defaults);
+            defaults = try self.readSettings(settings_object, defaults);
             self.path.pop();
         }
 
@@ -459,8 +459,6 @@ const Parser = struct {
             limits.timeout_ms = @intCast(try self.expectInteger(timeout_value, 1, server_limits.request_timeout_ms_max));
             self.path.pop();
         }
-        // Not capped at `timeoutMs`: crypto jobs run beside the VM thread,
-        // so a request's CPU can grow faster than its wall time.
         if (object.get("cpuMs")) |cpu_value| {
             self.path.push("cpuMs");
             limits.cpu_ms = try self.expectInteger(cpu_value, 1, server_limits.request_cpu_ms_max);

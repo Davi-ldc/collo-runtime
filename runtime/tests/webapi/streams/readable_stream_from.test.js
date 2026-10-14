@@ -214,6 +214,24 @@ describe("ReadableStream.from", () => {
     assert.deepEqual(nextArgs, []);
   });
 
+  test("waits for its start before the first next, even when a read comes at once", async () => {
+    let nextCalls = 0;
+    const iterable = {
+      next() {
+        nextCalls += 1;
+        return { value: "a", done: false };
+      },
+      [Symbol.iterator]: () => iterable,
+    };
+
+    // ReadableStreamFromIterable sets up its controller with a start algorithm, so the read's pull waits for start's
+    // promise instead of calling next inside read().
+    const read = ReadableStream.from(iterable).getReader().read();
+    assert.equal(nextCalls, 0);
+    assert.deepEqual(await read, { value: "a", done: false });
+    assert.equal(nextCalls, 1);
+  });
+
   test("errors when next rejects, throws, or returns malformed results", async () => {
     const rejected = new Error("rejected next");
     const rejecting = {

@@ -1,101 +1,83 @@
 //! The WorkerInit handoff as a machine: from a forked child to a ready
 //! worker, or to a typed failure that hands the child back to its caller.
 //!
-//! The local steps (route table dup, cgroup adopt, shared pages, the
-//! WorkerInit sendmsg) are microsecond syscalls and run inline in `start`.
-//! The wait for the child's answer belongs to the host: an evented host (the
-//! server's launcher, `server/supervisor/launcher.zig`) polls the init socket
-//! and the pidfd among its own descriptors and feeds `onEvent`, and the
-//! synchronous driver `runToReady` drives the same transition table with
-//! poll(2). The definition's route table and pack, the host's tmpfs mount
-//! point (`tmp_mount.zig`) and the worker's egress descriptors ride
-//! WorkerInit itself (`LaunchEgress`): a launch for a definition without a
-//! network grant sends no egress descriptor, every other launch sends the
-//! worker's wake descriptors, and a launch with an egress session, which the
-//! host attaches before it starts the launch, sends the session's regions
-//! too. The boot token for the session is minted here, when WorkerInit is
-//! sent, because its deadline derives from the child window this file fixes.
-//! A granted launch without a session boots its child detached.
+//! A launch runs in three calls. `init` takes the cgroup leaf the host made
+//! for the fork. `prepare` runs the local steps, the state page, the payload
+//! ring and their eventfds, which need no child, so the host runs them while
+//! the zygote clones. `start` takes the forked child and sends WorkerInit,
+//! and the machine then waits for the child's answer. The wait belongs to the
+//! host: an evented host (the server's launcher,
+//! `server/supervisor/launcher.zig`) polls the init socket and the pidfd
+//! among its own descriptors and feeds `onEvent`, and the synchronous driver
+//! `runToReady` drives the same machine with poll(2).
+//!
+//! The definition's artifact and the worker's egress descriptors ride
+//! WorkerInit itself: a launch for a definition without a network grant sends
+//! no egress descriptor, every other launch sends the worker's wake
+//! descriptors, and a launch with an egress session, which the host attaches
+//! before it starts the launch, sends the session's regions too
+//! (`LaunchEgress`). The boot token for the session is minted here, when
+//! WorkerInit is sent, because its deadline derives from the child window
+//! this file fixes. A granted launch without a session boots its child
+//! detached.
+//!
+//! The leaf is named by the root's workers directory and the fork job id
+//! (`cgroup_root.WorkerLeaf`). Its descriptor lives only until WorkerInit
+//! carries it, and the launch never reads the leaf's limits back: the host
+//! wrote them, the zygote refused anything but an empty cgroup2 directory,
+//! and the child checks its own membership and limits. The one file the
+//! launch reads is `memory.events.local`, by name, for a child that ended
+//! without a report (`Machine.endedCause`).
 //!
 //! A launch that fails neither kills, waits nor removes a cgroup on the
 //! host's thread: `abandon` releases what the machine holds and hands the
-//! child's pidfd and cgroup leaf back as an `AbandonedChild`, whose `reap`
-//! does the blocking part on whichever thread may block.
+//! child's pidfd, its cgroup leaf and its state page back as an
+//! `AbandonedChild`, whose `kill` and `release` do the blocking part on
+//! whichever thread may block. The page goes with them because a child that
+//! got WorkerInit logs into its console ring from its sink's install on, its
+//! boot failure included, and the ring holds all of it only once the child
+//! is dead.
 //!
-//! Clock contract: `owner_deadline_abs_ns` bounds the whole machine;
-//! `child_init_deadline_abs_ns = min(send_time + WORKER_INIT_TIMEOUT_MS,
-//! owner_deadline_abs_ns)` is fixed when WorkerInit is sent and travels in it
-//! as the init deadline; the boot token's deadline adds
-//! `MODULE_EVAL_BUDGET_NS` to it (`bootEgressDeadline`). Neither changes
-//! after. The phases before the send spend the owner's budget, never the
-//! child's.
+//! Clock contract: the child window ends `WORKER_INIT_TIMEOUT_MS` after the
+//! send, fixed when WorkerInit is sent and carried in it as the init
+//! deadline; the boot token's deadline adds `MODULE_EVAL_BUDGET_NS` to it
+//! (`bootEgressDeadline`). Neither changes after, and the local steps before
+//! the send never spend the child's window.
+//!
+//! One thread drives a machine: the launcher's, or the thread of a harness
+//! or benchmark that owns it.
 
 const std = @import("std");
 const ipc = @import("collo_ipc");
+const cgroup = @import("collo_cgroup");
 const fd_mod = @import("collo_os").fd;
 const process = @import("collo_os").process;
 const process_limits = @import("collo_limits").process;
-const limits = @import("collo_limits");
 const worker_shared_page = @import("collo_worker_state").page;
 const zygote = @import("collo_zygote");
 
-const cgroup = @import("cgroup.zig");
 const cgroup_root = @import("cgroup_root.zig");
 const handle_mod = @import("handle.zig");
 
-const route_table = ipc.route_table;
-
-/// Per-call packet cap of a boot-window fault drain. The deadline stays the
-/// primary bound; this bounds one drain call so a flooding worker yields the
-/// thread back to the poll loop, which re-arms on the still-readable fd.
-pub const max_faults_per_drain: usize = 64;
-
-/// Grace for the post-ready drain: async faults the worker sent before it
-/// reported ready are answered by the launch inside this budget, quiescing
-/// the channel before the fd hands over to the host's reader. A legitimate
-/// worker has a handful of pending faults and hits are answered in
-/// microseconds, so only cold misses spend real time here.
-pub const post_ready_drain_grace_ns: u64 = 3 * std.time.ns_per_s;
-
-pub const DrainOutcome = enum {
-    /// The channel quiesced (recv hit WouldBlock) or the per-drain cap was
-    /// reached; every received fault was answered. The caller re-arms on
-    /// the fd and re-checks its deadline.
-    idle,
-    /// Worker end closed; nothing further can be served. The init fd and
-    /// pidfd legs resolve the worker's fate.
-    peer_closed,
-    /// The deadline passed while packets kept arriving. Pre-ready this
-    /// resolves to WorkerInitTimeout; in the post-ready grace any leftover
-    /// packets reach the host's reader and are refused there.
-    deadline_exhausted,
-};
-
-/// Host-side cold-start spans, recorded from phase-entry timestamps.
-pub const LaunchSpans = struct {
-    route_table_ns: u64 = 0,
-    cgroup_adopt_ns: u64 = 0,
-    /// The inside of `cgroup_adopt_ns`: probe, rewrite, path resolution.
-    cgroup_adopt: cgroup.AdoptSpans = .{},
-    shared_resources_ns: u64 = 0,
-    init_send_ns: u64 = 0,
-    ready_wait_ns: u64 = 0,
-    total_ns: u64 = 0,
-};
-
 pub const LaunchError = error{
-    WorkerCgroupNotPrepared,
-    InvalidBootOptions,
+    /// The host could not create or map what it shares with the worker (the
+    /// state page, the payload ring and their eventfds), or `runToReady`
+    /// could not poll for the child's answer, for want of memory or
+    /// descriptors.
+    LaunchResourcesUnavailable,
     /// A detached launch could not open the worker's wake descriptors from
     /// its wake set (`ipc.egress_shared.WakeSet.openWorkerWake`), for want of
     /// descriptors.
     EgressWakeUnavailable,
     WorkerInitTimeout,
-    /// The child reported an init failure or ended before `WorkerReady`;
-    /// `Machine.init_failure` says which.
+    /// The child reported an init failure, or ended before `WorkerReady`,
+    /// which the WorkerInit send finds too when the child's end of the init
+    /// socket is already closed; `Machine.init_failure` says which.
     WorkerInitFailed,
+    /// The fork reply came without the child's descriptors, WorkerInit could
+    /// not be sent for any reason but the child's end, or the child's answer
+    /// broke the protocol.
     ZygoteProtocol,
-    OutOfMemory,
 };
 
 /// What failed a child's init, which `error.WorkerInitFailed` does not say.
@@ -119,40 +101,14 @@ pub const InitFailure = union(enum) {
     }
 };
 
-/// What a fault-serve callback answers for one request.
-pub const FaultAnswer = union(enum) {
-    /// Owned: the drain sends it and closes it.
-    ok: std.posix.fd_t,
-    refused,
-    not_found,
-    fetch_failed,
-};
-
-/// The boot-window fault service. The drain (decode, no-fd containment,
-/// exactly-one-fd responses, deadline and packet cap) is machine-owned;
-/// only the answer is the host's.
-pub const FaultServe = union(enum) {
-    /// No serving context: the fault leg stays dark and the worker's faults
-    /// wait for the host's post-ready reader.
-    none,
-    serve: Serve,
-
-    pub const Serve = struct {
-        ctx: ?*anyopaque = null,
-        /// `deadline_ns` is the drain's absolute bound: an answer that has to
-        /// fetch must not outlive it.
-        serve: *const fn (ctx: ?*anyopaque, request: *const ipc.FsFaultRequest, deadline_ns: u64) FaultAnswer,
-    };
-};
-
-/// What the boot token of a launch with an egress grant carries besides its deadline, which
-/// `bootEgressDeadline` derives from the child window this launch fixes when it sends WorkerInit.
-/// The machine scrubs its copy of the key once the token is minted.
+/// What the boot token of a launch with an egress grant carries besides its
+/// deadline, which `bootEgressDeadline` derives from the child window this
+/// launch fixes when it sends WorkerInit. The machine mints the token from
+/// the caller's copy and keeps none, so the caller scrubs the key.
 pub const BootEgress = struct {
     key: ipc.egress_token.Key,
     session_id: u64,
     policy_id: u16,
-    budget: u32,
 };
 
 /// The egress descriptors a launch sends with WorkerInit: none for a
@@ -182,44 +138,31 @@ pub const LaunchEgress = union(enum) {
     };
 };
 
-/// The routes a worker serves: its definition's route table and module
-/// pack, both sealed memfds the server builds once per definition
-/// (`server/routes/artifacts.zig`) and borrowed for the length of `start`.
+/// The routes a worker serves: its definition's sealed artifact
+/// (`ipc.module_pack`), which holds every route with its bindings and every
+/// module they reach, built once per definition (`server/routes/artifacts.zig`)
+/// and borrowed for the length of `start`. The child evaluates every route's
+/// entry before it reports ready, and builds each route's `env` from the
+/// route's own bindings, never from `process.env`.
 pub const LaunchRoutes = struct {
-    /// Every route's entry and bindings (`ipc.route_table`); the machine
-    /// dups it and owns the copy. The worker builds each route's `env` from
-    /// the route's own bindings and never `process.env`.
-    table: route_table.Sealed,
-    /// The pack holding every route's entry and every module they reach.
     module_pack_fd: std.posix.fd_t,
-    /// Each route but the first runs in a realm of its own
-    /// (`WorkerInit.flag_isolate_realm`).
+    /// Each route runs in a realm of its own (`WorkerInit.flag_isolate_realm`).
     isolate_realm: bool,
 };
 
 pub const LaunchOptions = struct {
+    /// The memory limit the leaf was created with, which WorkerInit carries
+    /// for the child's check of its own leaf.
+    memory_limit_bytes: u64,
     /// What the worker gets to reach the egress gateway with.
     egress: LaunchEgress,
-    /// The host's tmpfs mount point (`tmp_mount.zig:TmpMountPoint.fd`),
-    /// borrowed for the length of `start`; every worker of the host mounts
-    /// its own tmpfs over it.
-    tmp_mount_point_fd: std.posix.fd_t,
-    /// The routes the worker launches with. A launch with routes sets
-    /// `flag_serves_routes`, and the child evaluates every route's entry
-    /// before it reports ready, with timers for module top-level code and,
-    /// when the child is attached, fetch under the boot token. null launches
-    /// a worker with the empty table and no pack, which serves no route,
-    /// since no dispatch can name one.
-    routes: ?LaunchRoutes = null,
+    routes: LaunchRoutes,
     /// null = `WorkerInit.defaultTmpfsSizeBytes(memory_limit_bytes)`; any
     /// other value is clamped to the memory limit.
     tmpfs_size_bytes: ?u64 = null,
-    /// The worker cgroup's `cpu.max` quota, in cores. The default is the
-    /// quota every worker of the server gets (`limits.worker.cpu_max_cores`).
-    cpu_max_cores: u32 = limits.worker.cpu_max_cores,
-    /// Runtime limits and diagnostic flags the child boots with; validated
-    /// before WorkerInit is sent.
-    boot: ipc.WorkerRuntimeBootOptions = ipc.WorkerRuntimeBootOptions.default(),
+    /// The worker stamps its first handler call on its page for the
+    /// cold-start benchmark (`WorkerInit.flag_bench_handler`).
+    bench_handler: bool = false,
     /// The CPU each request of the worker may spend, 0 for no budget
     /// (`WorkerInit.request_cpu_budget_ns`).
     request_cpu_budget_ns: u64 = 0,
@@ -227,191 +170,207 @@ pub const LaunchOptions = struct {
     /// worker (`WorkerInit.unowned_time_limit_ns`); a server passes its
     /// definition's request timeout.
     unowned_time_limit_ns: u64 = ipc.WorkerInit.default_unowned_time_limit_ns,
-    /// The sealed fs index, borrowed; null sends the placeholder index of a
-    /// tree with no files.
-    fs_index_memfd: ?std.posix.fd_t = null,
-    fault_serve: FaultServe = .none,
-    /// Whole-machine budget. 0 means no owner bound, and the child window is
-    /// exactly WORKER_INIT_TIMEOUT_MS from the send.
-    owner_deadline_abs_ns: u64 = 0,
-    /// Overrides the child window entirely; a test seam for the
-    /// deadline-shrink cases.
-    init_deadline_override_abs_ns: ?u64 = null,
 };
 
 pub const LaunchPhase = enum(u8) {
-    idle,
-    /// WorkerInit sent; consuming init_fd/pidfd/fault_fd events.
+    /// From `init` until WorkerInit is sent: the machine holds the leaf, and
+    /// after `prepare` what it shares with the worker.
+    preparing,
+    /// WorkerInit sent; `onEvent` consumes the init socket's and the pidfd's
+    /// events until the child window closes.
     awaiting_ready,
-    /// Ready received; grace-draining the fault channel (timer-bounded).
-    grace_drain,
     ready,
     failed,
 };
 
-/// Events a host feeds to the machine. The sync driver synthesizes the same
-/// events from poll(2) revents.
-pub const LaunchEvent = union(enum) {
+/// The events of the ready wait a host feeds `onEvent`. `runToReady`
+/// synthesizes the same events from poll(2) revents.
+pub const LaunchEvent = enum {
     init_readable,
     init_hup,
     pidfd_event,
-    fault_readable,
-    /// A fault drain (a job in evented mode) finished.
-    fault_drain_done: DrainOutcome,
-    grace_expired,
     child_deadline_expired,
 };
 
-/// Effects the machine asks of its host.
-pub const LaunchEffect = union(enum) {
-    none,
-    arm_init_poll,
-    arm_pidfd_poll,
-    arm_fault_poll,
-    start_fault_drain_job,
-    arm_grace_timer: u64,
-    report_ready,
-    report_failed: LaunchError,
+/// How the ready wait ended.
+pub const Outcome = union(enum) {
+    ready,
+    failed: LaunchError,
 };
 
-pub const StepResult = struct {
-    effects: [4]LaunchEffect = @splat(.none),
-    count: usize = 0,
-
-    fn push(self: *StepResult, effect: LaunchEffect) void {
-        std.debug.assert(self.count < self.effects.len);
-        self.effects[self.count] = effect;
-        self.count += 1;
-    }
-};
-
-/// What a launch that gave up leaves of its child: the pidfd, and the cgroup
-/// leaf the child was born into. Each is owned by the holder and unset when
-/// the launch never had it; `reap` releases both.
+/// What a launch that gave up leaves of its child: the pidfd, owned and unset
+/// when no child was forked; the cgroup leaf it was born in, null when the
+/// launch never had one; and the state page the launch mapped, null when it
+/// mapped none. `reap`, or `kill` then `release`, releases all three.
 pub const AbandonedChild = struct {
     pid: u32 = 0,
     pidfd: fd_mod.OwnedFd = .{},
-    cgroup_dir: fd_mod.OwnedFd = .{},
+    leaf: ?cgroup_root.WorkerLeaf = null,
+    /// Holds the console ring of a child that got WorkerInit, into which it
+    /// logs from its sink's install on, its `worker boot failed` line
+    /// included. Tenant code may have run by then, so every line is hostile:
+    /// a host that drains the ring does it through the ring's checked reads,
+    /// and only after `kill`, once nothing writes the ring.
+    page: ?worker_shared_page.HostReaderView = null,
 
-    /// Kills the child, waits for its exit up to `PROCESS_EXIT_WAIT_MS`,
-    /// removes its cgroup leaf with the bounded retries of
-    /// `host/cgroup_root.zig` and closes both descriptors. The kill comes
-    /// first because a leaf with a member refuses rmdir. Blocks, so only a
-    /// thread that may wait calls it.
-    pub fn reap(self: *AbandonedChild) void {
-        if (self.pidfd.isValid()) {
-            process.pidFdSendSignal(self.pidfd.fd(), std.posix.SIG.KILL) catch |err| switch (err) {
-                error.ProcessNotFound => {},
-                else => std.log.warn("failed to SIGKILL an abandoned worker pid={d}: {s}", .{ self.pid, @errorName(err) }),
-            };
-            const exited = process.waitForPidFdExit(self.pidfd.fd(), process_limits.PROCESS_EXIT_WAIT_MS) catch |err| blk: {
-                std.log.warn("failed to wait for an abandoned worker pid={d}: {s}", .{ self.pid, @errorName(err) });
-                break :blk false;
-            };
-            // The cgroup removal below kills any member again and retries.
-            if (!exited)
-                std.log.warn("abandoned worker pid={d} did not report its exit; removing its cgroup leaf anyway", .{self.pid});
-        }
-        if (self.cgroup_dir.isValid())
-            cgroup_root.reapWorkerCgroupByFd(self.cgroup_dir.fd());
-        self.cgroup_dir.deinit();
+    /// Kills the child through its pidfd and waits for its exit up to
+    /// `PROCESS_EXIT_WAIT_MS`. Returns false when the exit went unseen, and
+    /// the child may then still write its page. A launch that forked no
+    /// child has nothing to kill. Blocks, so only a thread that may wait
+    /// calls it.
+    pub fn kill(self: *AbandonedChild) bool {
+        if (!self.pidfd.isValid())
+            return true;
+        process.pidFdSendSignal(self.pidfd.fd(), std.posix.SIG.KILL) catch |err| switch (err) {
+            error.ProcessNotFound => {},
+            else => std.log.warn("failed to SIGKILL an abandoned worker pid={d}: {s}", .{ self.pid, @errorName(err) }),
+        };
+        const exited = process.waitForPidFdExit(self.pidfd.fd(), process_limits.PROCESS_EXIT_WAIT_MS) catch |err| blk: {
+            std.log.warn("failed to wait for an abandoned worker pid={d}: {s}", .{ self.pid, @errorName(err) });
+            break :blk false;
+        };
+        // `release` removes the leaf all the same, killing any member again.
+        if (!exited)
+            std.log.warn("abandoned worker pid={d} did not report its exit; removing its cgroup leaf anyway", .{self.pid});
+        return exited;
+    }
+
+    /// Unmaps the page, removes the cgroup leaf by name (`WorkerLeaf.remove`)
+    /// and closes the pidfd. A leaf with a member refuses rmdir, so `kill`
+    /// runs first. Blocks on the leaf's removal.
+    pub fn release(self: *AbandonedChild) void {
+        if (self.page) |*page|
+            page.deinit();
+        self.page = null;
+        if (self.leaf) |leaf|
+            leaf.remove();
+        self.leaf = null;
         self.pidfd.deinit();
+    }
+
+    /// `kill`, then `release`, for a host that keeps nothing the child
+    /// logged into its page.
+    pub fn reap(self: *AbandonedChild) void {
+        _ = self.kill();
+        self.release();
     }
 };
 
 pub const Machine = struct {
-    allocator: std.mem.Allocator,
-    zygote_process: *zygote.host_client.SpawnedZygote,
-    memory_limit_bytes: u64,
-    options: LaunchOptions,
+    /// The zygote's trace write end, borrowed for the machine's life; null
+    /// without tracing (`zygote/trace.zig`).
+    trace_fd: ?std.posix.fd_t,
+    /// The leaf the child is born in; null once `takeHandle` or `abandon`
+    /// handed it on.
+    leaf: ?cgroup_root.WorkerLeaf,
+    /// The leaf's directory, owned from `init` until WorkerInit carries it.
+    /// The host borrows it for the fork request (CLONE_INTO_CGROUP).
+    leaf_fd: std.posix.fd_t,
 
-    phase: LaunchPhase = .idle,
-    spans: LaunchSpans = .{},
-    launch_started_ns: u64 = 0,
-    phase_entered_ns: u64 = 0,
+    phase: LaunchPhase = .preparing,
     child_init_deadline_abs_ns: u64 = 0,
     /// The boot token's deadline, fixed with the child window; 0 for a
     /// launch that mints no token.
     boot_egress_deadline_abs_ns: u64 = 0,
-    /// Host CLOCK_MONOTONIC immediately after consuming WorkerReady, before
-    /// the post-ready fault drain and handle construction.
+    /// CLOCK_MONOTONIC right after WorkerReady was read.
     ready_received_ns: u64 = 0,
 
-    // Child identity, taken from the ForkedWorker on start.
+    // The child, taken from the fork reply by `start`.
     pid: u32 = 0,
     pidfd: std.posix.fd_t = -1,
     worker_init_fd: std.posix.fd_t = -1,
 
-    // Local resources, owned until handle assembly or `abandon`.
-    route_table_memfd: std.posix.fd_t = -1,
-    route_table_len: u64 = 0,
-    cgroup_dir: ?[]u8 = null,
-    cgroup_dir_fd: std.posix.fd_t = -1,
+    // What the worker shares with the host, made by `prepare`. The two
+    // memfds live until WorkerInit carries them, since the mappings keep what
+    // the host needs; the mappings and eventfds until the handle takes them.
     metrics_fd: std.posix.fd_t = -1,
     completion_eventfd: std.posix.fd_t = -1,
     ingress_payload_fd: std.posix.fd_t = -1,
     ingress_payload_credit_eventfd: std.posix.fd_t = -1,
-    metrics: ?worker_shared_page.WorkerWriterView = null,
+    metrics: ?worker_shared_page.HostReaderView = null,
     ingress_payload: ?ipc.ingress_channel.SharedPayloadView = null,
-    placeholder_fs_index_fd: std.posix.fd_t = -1,
-    fs_fault_server_fd: std.posix.fd_t = -1,
-    fs_fault_worker_fd: std.posix.fd_t = -1,
 
-    serve_faults: bool = false,
-    /// One drain in flight at a time (evented mode): the job is the channel's
-    /// only reader while it runs.
-    fault_drain_inflight: bool = false,
-    /// Receive scratch for the boot-window fault channel, allocated on the
-    /// first fault this boot serves: a boot with no faults never pays for it,
-    /// and one that serves many pays once instead of a megabyte per wake.
-    fault_scratch: ?[]u8 = null,
-    boot_faults_served: u32 = 0,
     fail_reason: ?LaunchError = null,
     /// Set when the launch failed with `error.WorkerInitFailed`.
     init_failure: ?InitFailure = null,
 
-    pub fn init(
-        allocator: std.mem.Allocator,
-        zygote_process: *zygote.host_client.SpawnedZygote,
-        memory_limit_bytes: u64,
-        options: LaunchOptions,
-    ) Machine {
+    /// A launch whose child is born in `leaf`. The machine owns `leaf_fd`,
+    /// that leaf's directory, from here on, whatever the outcome.
+    pub fn init(leaf: cgroup_root.WorkerLeaf, leaf_fd: std.posix.fd_t, trace_fd: ?std.posix.fd_t) Machine {
+        std.debug.assert(leaf_fd >= 0);
         return .{
-            .allocator = allocator,
-            .zygote_process = zygote_process,
-            .memory_limit_bytes = memory_limit_bytes,
-            .options = options,
+            .trace_fd = trace_fd,
+            .leaf = leaf,
+            .leaf_fd = leaf_fd,
         };
+    }
+
+    /// Creates and maps what the worker shares with the host: the state
+    /// page, the payload ring and their two eventfds. Call once, before
+    /// `start`. A failure fails the machine and `start` reports it, since a
+    /// fork request already sent must still have its reply read and its
+    /// child handed back.
+    pub fn prepare(self: *Machine) void {
+        std.debug.assert(self.phase == .preparing);
+        std.debug.assert(self.metrics == null);
+        self.createShared() catch |err| return self.fail(err);
+        self.trace("host.metrics.created");
+    }
+
+    /// The page's memfd comes with its header written, state `forked` and
+    /// reason `crash` (`worker_shared_page.createMemfd`), so a child that
+    /// dies before it stores a state of its own reads as crashed.
+    fn createShared(self: *Machine) LaunchError!void {
+        const eventfd_flags = std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK;
+        self.metrics_fd = worker_shared_page.createMemfd("collo-shared-metrics") catch
+            return error.LaunchResourcesUnavailable;
+        self.completion_eventfd = std.posix.eventfd(0, eventfd_flags) catch
+            return error.LaunchResourcesUnavailable;
+        self.ingress_payload_fd = ipc.ingress_channel.createSharedPayloadMemfd() catch
+            return error.LaunchResourcesUnavailable;
+        self.ingress_payload_credit_eventfd = std.posix.eventfd(0, eventfd_flags) catch
+            return error.LaunchResourcesUnavailable;
+        self.metrics = worker_shared_page.mapHostReader(self.metrics_fd) catch
+            return error.LaunchResourcesUnavailable;
+        self.ingress_payload = ipc.ingress_channel.mapSharedPayloadReadWrite(self.ingress_payload_fd, .server) catch
+            return error.LaunchResourcesUnavailable;
     }
 
     /// Takes every descriptor `forked` holds, so `forked` is empty whatever
-    /// the outcome, runs the local steps (route table, cgroup adopt, shared
-    /// resources) and sends WorkerInit. The result asks the
-    /// host to poll the init socket and the pidfd, or reports the failure;
-    /// after a failure the host calls `abandon`.
-    pub fn start(self: *Machine, forked: *zygote.host_client.ForkedWorker) StepResult {
-        var result: StepResult = .{};
+    /// the outcome, and sends WorkerInit; the machine then waits for the
+    /// child's answer (`onEvent`). Fails with the failure `prepare` kept or
+    /// with its own, and the host then calls `abandon`. The key in
+    /// `options.egress` stays the caller's to scrub.
+    pub fn start(
+        self: *Machine,
+        forked: *zygote.host_client.ForkedWorker,
+        options: *const LaunchOptions,
+    ) LaunchError!void {
         self.takeChild(forked);
-        self.prepare() catch |err| {
-            self.fail(err, &result);
-            return result;
+        if (self.fail_reason) |err|
+            return err;
+        std.debug.assert(self.phase == .preparing);
+        std.debug.assert(self.metrics != null);
+        if (self.worker_init_fd < 0)
+            return self.failWithError(error.ZygoteProtocol);
+        if (self.pidfd < 0)
+            return self.failWithError(error.ZygoteProtocol);
+        self.sendWorkerInit(options) catch |err| switch (err) {
+            // The zygote closed its copy of the child's end after the clone,
+            // and the child holds that end until it exits, so a send that
+            // finds it closed meets the child's exit, as a receive does
+            // (`finishInitOutcome`).
+            error.PeerClosed => return self.failChildEnded(),
+            else => |launch_err| return self.failWithError(launch_err),
         };
-        self.sendInitAndAwait(&result);
-        return result;
-    }
-
-    /// Sends WorkerInit and enters the ready wait, for a machine whose local
-    /// steps are done; `start` ends with it.
-    pub fn sendInit(self: *Machine) StepResult {
-        var result: StepResult = .{};
-        self.sendInitAndAwait(&result);
-        return result;
+        self.phase = .awaiting_ready;
     }
 
     fn takeChild(self: *Machine, forked: *zygote.host_client.ForkedWorker) void {
         self.pid = forked.pid;
-        // The pidfd was created atomically by the clone (CLONE_PIDFD) and
-        // travelled via SCM_RIGHTS; it is never re-derived from the pid.
+        // The pidfd is the kernel's handle on this child, from the clone
+        // itself (CLONE_PIDFD) and passed over SCM_RIGHTS; it is never
+        // derived from the pid, which the kernel reuses.
         if (forked.pidfd) |fd| {
             self.pidfd = fd;
             forked.pidfd = null;
@@ -420,182 +379,74 @@ pub const Machine = struct {
             self.worker_init_fd = fd;
             forked.worker_init_fd = null;
         }
-        if (forked.cgroup_dir_fd) |fd| {
-            self.cgroup_dir_fd = fd;
-            forked.cgroup_dir_fd = null;
-        }
     }
 
-    fn prepare(self: *Machine) LaunchError!void {
-        const started = process.monotonicNowNs() catch return error.ZygoteProtocol;
-        self.launch_started_ns = started;
-        self.phase_entered_ns = started;
-
-        if (self.worker_init_fd < 0)
-            return error.ZygoteProtocol;
-        if (self.pidfd < 0)
-            return error.ZygoteProtocol;
-        // A worker is born inside a pre-created cgroup (CLONE_INTO_CGROUP)
-        // and is its only member by construction. Without the leaf there is
-        // no memory bound, so there is no launch.
-        if (self.cgroup_dir_fd < 0)
-            return error.WorkerCgroupNotPrepared;
-
-        var span_cursor_ns = started;
-
-        const table = if (self.options.routes) |routes|
-            routes.table.dupCloexec() catch |err| return mapResourceError(err)
-        else
-            route_table.createEmptySealed() catch |err| return mapResourceError(err);
-        self.route_table_memfd = table.fd;
-        self.route_table_len = table.blob_len;
-        self.spans.route_table_ns = spanDelta(&span_cursor_ns);
-
-        self.cgroup_dir = cgroup.adoptPreparedWorkerDir(
-            self.allocator,
-            self.cgroup_dir_fd,
-            self.memory_limit_bytes,
-            self.options.cpu_max_cores,
-            &self.spans.cgroup_adopt,
-        ) catch return error.WorkerCgroupNotPrepared;
-        self.spans.cgroup_adopt_ns = spanDelta(&span_cursor_ns);
-        self.traceFmt("host.cgroup.dir={s}", .{self.cgroup_dir.?});
-        self.traceFmt("host.cgroup.limits={d}/{d}", .{ self.memory_limit_bytes, self.options.cpu_max_cores });
-
-        self.metrics_fd = worker_shared_page.createMemfd("collo-shared-metrics") catch
-            return error.ZygoteProtocol;
-        self.completion_eventfd = std.posix.eventfd(
-            0,
-            std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK,
-        ) catch return error.ZygoteProtocol;
-        self.ingress_payload_fd = ipc.ingress_channel.createSharedPayloadMemfd() catch
-            return error.ZygoteProtocol;
-        self.ingress_payload_credit_eventfd = std.posix.eventfd(
-            0,
-            std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK,
-        ) catch return error.ZygoteProtocol;
-        self.trace("host.metrics.created");
-
-        var metrics = worker_shared_page.mapReadWrite(self.metrics_fd) catch
-            return error.ZygoteProtocol;
-        metrics.initializeCrashDefault();
-        self.metrics = metrics;
-        self.ingress_payload = ipc.ingress_channel.mapSharedPayloadReadWrite(self.ingress_payload_fd, .server) catch
-            return error.ZygoteProtocol;
-
-        if (self.options.fs_index_memfd == null) {
-            self.placeholder_fs_index_fd = ipc.zygote_worker.createPlaceholderFsIndexMemfd() catch
-                return error.ZygoteProtocol;
-        }
-        const fs_fault_pair = fd_mod.socketPairType(
-            std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC,
-        ) catch return error.ZygoteProtocol;
-        self.fs_fault_server_fd = fs_fault_pair[0];
-        self.fs_fault_worker_fd = fs_fault_pair[1];
-        // Nonblocking from birth: boot-window drains read until WouldBlock.
-        // The worker end is a separate open file description and keeps
-        // blocking reads.
-        fd_mod.setNonblocking(self.fs_fault_server_fd, true) catch
-            return error.ZygoteProtocol;
-        self.spans.shared_resources_ns = spanDelta(&span_cursor_ns);
-
-        self.serve_faults = self.options.fault_serve != .none;
-    }
-
-    fn sendInitAndAwait(self: *Machine, result: *StepResult) void {
-        self.sendWorkerInit() catch |err| {
-            self.fail(err, result);
-            return;
-        };
-        self.enter(.awaiting_ready);
-        result.push(.arm_init_poll);
-        result.push(.arm_pidfd_poll);
-        if (self.serve_faults)
-            result.push(.arm_fault_poll);
-    }
-
-    /// Sends WorkerInit with its descriptors. The child window is fixed here:
-    /// the wire value is min(now + WORKER_INIT_TIMEOUT_MS, owner_deadline), so
-    /// the phases before the send spent the owner's budget and the child gets
-    /// its whole window. The boot token is minted here too, with the deadline
-    /// `bootEgressDeadline` derives from that window, after which the machine
-    /// keeps no copy of its key. A detached launch's wake descriptors are
-    /// opened and, once the child holds its copies, closed here.
-    fn sendWorkerInit(self: *Machine) LaunchError!void {
-        var span_cursor_ns = process.monotonicNowNsOrZero();
-
-        const send_now_ns = process.monotonicNowNs() catch return error.ZygoteProtocol;
-        const default_deadline = send_now_ns +
+    /// Sends WorkerInit with its descriptors and fixes the child window at
+    /// the send, so the steps before it never spend the child's window. The
+    /// boot token is minted here too, with the deadline `bootEgressDeadline`
+    /// derives from that window. Once the child holds its own copies, the
+    /// leaf's descriptor and the two memfds close, and a detached launch's
+    /// wake descriptors with them. `error.PeerClosed` is a send that found
+    /// the child's end of the init socket closed; any other failure of the
+    /// send is `error.ZygoteProtocol`.
+    fn sendWorkerInit(self: *Machine, options: *const LaunchOptions) (LaunchError || error{PeerClosed})!void {
+        const send_ns = process.monotonicNowNsOrZero();
+        self.child_init_deadline_abs_ns = send_ns +
             @as(u64, @intCast(process_limits.WORKER_INIT_TIMEOUT_MS)) * std.time.ns_per_ms;
-        self.child_init_deadline_abs_ns = self.options.init_deadline_override_abs_ns orelse
-            if (self.options.owner_deadline_abs_ns != 0)
-                @min(default_deadline, self.options.owner_deadline_abs_ns)
-            else
-                default_deadline;
-        self.boot_egress_deadline_abs_ns = if (self.options.egress == .attached)
-            bootEgressDeadline(self.child_init_deadline_abs_ns, self.options.owner_deadline_abs_ns)
-        else
-            0;
 
-        self.options.boot.validate() catch return error.InvalidBootOptions;
         var detached_wake: ipc.egress_shared.WakeFds = .{};
         defer detached_wake.close();
+        // This is the one switch on `options.egress`, and it captures by
+        // pointer: a switch that loads the union by value copies an attached
+        // payload, key included, into this frame in an unoptimized build.
+        var attached: ?*const LaunchEgress.Attached = null;
         // The sender sets `flag_egress` exactly when the set holds the wake
         // descriptors, so an empty set leaves the child without any.
-        const egress_fds: ipc.egress_shared.RawFds = switch (self.options.egress) {
+        const egress_fds: ipc.egress_shared.RawFds = switch (options.egress) {
             .none => .{},
-            .detached => |wake_set| blk: {
-                detached_wake = wake_set.openWorkerWake() catch return error.EgressWakeUnavailable;
+            .detached => |*wake_set| blk: {
+                detached_wake = wake_set.*.openWorkerWake() catch return error.EgressWakeUnavailable;
                 break :blk ipc.egress_shared.RawFds.wakeOnly(detached_wake);
             },
-            .attached => |attached| attached.shared_fds,
-        };
-        var message = ipc.WorkerInit.init(self.memory_limit_bytes, self.options.boot) catch
-            return error.ZygoteProtocol;
-        // The child checks its own cgroup against both limits.
-        message.cpu_max_cores = self.options.cpu_max_cores;
-        message.tmpfs_size_bytes = resolveTmpfsSizeBytes(self.memory_limit_bytes, self.options.tmpfs_size_bytes);
-        message.route_table_len = self.route_table_len;
-        message.init_deadline_mono_ns = self.child_init_deadline_abs_ns;
-        message.request_cpu_budget_ns = self.options.request_cpu_budget_ns;
-        message.unowned_time_limit_ns = self.options.unowned_time_limit_ns;
-        message.boot_egress_token = switch (self.options.egress) {
-            .none, .detached => ipc.egress_token.none,
-            .attached => |*attached| token: {
-                defer std.crypto.secureZero(u8, &attached.boot.key.bytes);
-                break :token mintBootToken(&attached.boot, self.boot_egress_deadline_abs_ns);
+            .attached => |*payload| blk: {
+                attached = payload;
+                break :blk payload.shared_fds;
             },
         };
-        message.enableEgressGatewaySandbox();
-        if (self.options.routes) |routes| {
-            message.flags |= ipc.WorkerInit.flag_serves_routes;
-            if (routes.isolate_realm)
-                message.flags |= ipc.WorkerInit.flag_isolate_realm;
-        }
-        ipc.sendWorkerInitWithRouteTableAndEgressShared(
-            self.worker_init_fd,
-            &message,
-            self.metrics_fd,
-            self.completion_eventfd,
-            self.ingress_payload_fd,
-            self.ingress_payload_credit_eventfd,
-            self.options.tmp_mount_point_fd,
-            self.cgroup_dir_fd,
-            self.route_table_memfd,
-            egress_fds,
-            self.options.fs_index_memfd orelse self.placeholder_fs_index_fd,
-            self.fs_fault_worker_fd,
-            if (self.options.routes) |routes| routes.module_pack_fd else null,
-        ) catch |err| return zygoteProtocolError(err);
+        self.boot_egress_deadline_abs_ns = if (attached != null)
+            bootEgressDeadline(self.child_init_deadline_abs_ns)
+        else
+            0;
+        var message = ipc.WorkerInit.init(options.memory_limit_bytes);
+        message.tmpfs_size_bytes = resolveTmpfsSizeBytes(options.memory_limit_bytes, options.tmpfs_size_bytes);
+        message.init_deadline_mono_ns = self.child_init_deadline_abs_ns;
+        message.request_cpu_budget_ns = options.request_cpu_budget_ns;
+        message.unowned_time_limit_ns = options.unowned_time_limit_ns;
+        message.boot_egress_token = if (attached) |payload|
+            mintBootToken(&payload.boot, self.boot_egress_deadline_abs_ns)
+        else
+            ipc.egress_token.none;
+        if (options.routes.isolate_realm)
+            message.flags |= ipc.WorkerInit.flag_isolate_realm;
+        if (options.bench_handler)
+            message.flags |= ipc.WorkerInit.flag_bench_handler;
+        ipc.zygote_worker.sendWorkerInit(self.worker_init_fd, &message, .{
+            .metrics_fd = self.metrics_fd,
+            .completion_eventfd = self.completion_eventfd,
+            .ingress_payload_fd = self.ingress_payload_fd,
+            .ingress_payload_credit_eventfd = self.ingress_payload_credit_eventfd,
+            .cgroup_dir_fd = self.leaf_fd,
+            .egress_shared_fds = egress_fds,
+            .module_pack_fd = options.routes.module_pack_fd,
+        }) catch |err| switch (err) {
+            error.PeerClosed => return error.PeerClosed,
+            else => return error.ZygoteProtocol,
+        };
         self.trace("host.worker_init.sent");
-        self.spans.init_send_ns = spanDelta(&span_cursor_ns);
 
-        // The worker end only had to survive the SCM_RIGHTS dup; the route
-        // table's dup likewise (the child holds its own reference now).
-        std.posix.close(self.fs_fault_worker_fd);
-        self.fs_fault_worker_fd = -1;
-        std.posix.close(self.route_table_memfd);
-        self.route_table_memfd = -1;
+        self.leaf_fd = closeIfHeld(self.leaf_fd);
+        self.metrics_fd = closeIfHeld(self.metrics_fd);
+        self.ingress_payload_fd = closeIfHeld(self.ingress_payload_fd);
     }
 
     /// The boot token for `boot`'s session, admitting nothing from
@@ -604,7 +455,6 @@ pub const Machine = struct {
         const token = ipc.egress_token.mint(&boot.key, .{
             .kind = .boot,
             .policy_id = boot.policy_id,
-            .budget = boot.budget,
             .session_id = boot.session_id,
             .request_id = 0,
             .request_generation = 0,
@@ -613,102 +463,62 @@ pub const Machine = struct {
         return ipc.egress_token.asBytes(&token).*;
     }
 
-    /// The await-ready transition table, one event at a time. The caller
-    /// (loop or sync driver) enforces the priority order when several fds
-    /// are simultaneously ready: init POLLIN > pidfd > init HUP > fault.
-    pub fn onEvent(self: *Machine, event: LaunchEvent) StepResult {
-        var result: StepResult = .{};
-        switch (event) {
-            .init_readable, .init_hup => switch (self.phase) {
-                // HUP without a queued outcome still tries the typed read.
-                .awaiting_ready => self.finishInitOutcome(&result),
-                else => {},
+    /// The ready wait, one event at a time. Every event of the wait ends it,
+    /// so the result is null only outside the wait, where an event belongs to
+    /// whoever holds the worker and changes nothing. When several descriptors
+    /// are ready the host feeds init POLLIN first, then the pidfd, then init
+    /// HUP or ERR: a child's exit hangs its init socket up no later than its
+    /// pidfd turns readable, and a queued outcome names the failure.
+    pub fn onEvent(self: *Machine, event: LaunchEvent) ?Outcome {
+        if (self.phase != .awaiting_ready)
+            return null;
+        return switch (event) {
+            // A socket that hung up still has its queued outcome read.
+            .init_readable, .init_hup => self.finishInitOutcome(),
+            .pidfd_event => .{ .failed = self.failChildEnded() },
+            .child_deadline_expired => blk: {
+                self.trace("host.worker_init.timeout");
+                break :blk self.failWait(error.WorkerInitTimeout);
             },
-            .pidfd_event => switch (self.phase) {
-                .awaiting_ready => self.failChildEnded(&result),
-                // A death after ready belongs to whoever holds the worker.
-                else => {},
-            },
-            .fault_readable => switch (self.phase) {
-                .awaiting_ready, .grace_drain => {
-                    if (self.serve_faults and !self.fault_drain_inflight) {
-                        self.fault_drain_inflight = true;
-                        result.push(.start_fault_drain_job);
-                    }
-                },
-                else => {},
-            },
-            .fault_drain_done => |outcome| {
-                self.fault_drain_inflight = false;
-                switch (outcome) {
-                    .idle => if (self.serve_faults and self.phase == .awaiting_ready)
-                        result.push(.arm_fault_poll),
-                    .peer_closed, .deadline_exhausted => self.serve_faults = false,
-                }
-                if (self.phase == .grace_drain and !self.fault_drain_inflight)
-                    self.completeReady(&result);
-            },
-            .grace_expired => if (self.phase == .grace_drain)
-                self.completeReady(&result),
-            .child_deadline_expired => switch (self.phase) {
-                .awaiting_ready => {
-                    self.trace("host.worker_init.timeout");
-                    self.fail(error.WorkerInitTimeout, &result);
-                },
-                else => {},
-            },
-        }
-        return result;
+        };
     }
 
-    fn finishInitOutcome(self: *Machine, result: *StepResult) void {
+    fn finishInitOutcome(self: *Machine) Outcome {
         const outcome = zygote.host_client.receiveWorkerInitOutcome(self.worker_init_fd) catch |err| switch (err) {
             // The child holds its end of the init socket until it exits, so
             // a socket that ends without an outcome is the child's exit.
-            error.PeerClosed => return self.failChildEnded(result),
-            else => return self.fail(zygoteProtocolError(err), result),
+            error.PeerClosed => return .{ .failed = self.failChildEnded() },
+            else => return self.failWait(error.ZygoteProtocol),
         };
         switch (outcome) {
             .ready => {
                 self.ready_received_ns = process.monotonicNowNsOrZero();
-                self.spans.ready_wait_ns = self.ready_received_ns -| self.phase_entered_ns;
-                if (self.serve_faults) {
-                    // Async boot faults sent before ready are answered here,
-                    // never by the host's reader: grace-drain before the fd
-                    // escapes into the handle.
-                    self.enter(.grace_drain);
-                    result.push(.{ .arm_grace_timer = process.monotonicNowNsOrZero() +| post_ready_drain_grace_ns });
-                    if (!self.fault_drain_inflight) {
-                        self.fault_drain_inflight = true;
-                        result.push(.start_fault_drain_job);
-                    }
-                    return;
-                }
-                self.completeReady(result);
+                self.phase = .ready;
+                return .ready;
             },
             .failed => |reason| {
                 self.traceFmt("host.worker_init.failed={s}", .{@tagName(reason)});
-                self.failInit(.{ .reported = reason }, result);
+                return .{ .failed = self.failInit(.{ .reported = reason }) };
             },
         }
     }
 
     /// Fails the launch of a child that ended before `WorkerReady` without a
     /// report, for the cause its page and its leaf name.
-    fn failChildEnded(self: *Machine, result: *StepResult) void {
+    fn failChildEnded(self: *Machine) LaunchError {
         const cause = self.endedCause();
         self.traceFmt("host.worker_init.worker_exited={s}", .{@tagName(cause)});
-        self.failInit(cause, result);
+        return self.failInit(cause);
     }
 
-    fn failInit(self: *Machine, cause: InitFailure, result: *StepResult) void {
+    fn failInit(self: *Machine, cause: InitFailure) LaunchError {
         self.init_failure = cause;
-        self.fail(error.WorkerInitFailed, result);
+        return self.failWithError(error.WorkerInitFailed);
     }
 
     /// Why a child that ended without a report ended, by the rule the server
-    /// applies to a published worker's death (`classifyWorkerDeath` in
-    /// `server/supervisor/usage_drain.zig`): for memory when its page says
+    /// applies to a published worker's death (`Record.classifyDeath` in
+    /// `server/supervisor/worker_table.zig`): for memory when its page says
     /// its sentinel ended it for memory or its leaf counted a kernel OOM
     /// kill, which both land before the child's exit hangs its init socket
     /// up, and a crash otherwise. A page or a leaf it cannot read names no
@@ -716,14 +526,20 @@ pub const Machine = struct {
     fn endedCause(self: *const Machine) InitFailure {
         if (self.metrics) |*metrics| {
             // A reason outside `TerminationReason` names no memory.
-            const snapshot = worker_shared_page.LifecycleSnapshot.load(metrics.header);
-            if (snapshot.knownTerminationReason()) |reason| {
+            if (metrics.loadLifecycle().knownTerminationReason()) |reason| {
                 if (reason == .memory)
                     return .memory;
             }
         }
-        const cgroup_dir = self.cgroup_dir orelse return .crash;
-        const events = cgroup.memory.readEventsLocal(self.allocator, cgroup_dir) catch |err| {
+        const leaf = self.leaf orelse return .crash;
+        const events_fd = leaf.openFile("memory.events.local") catch |err| {
+            std.log.warn("worker launch: memory.events.local of a child that ended could not be opened: {s}", .{
+                @errorName(err),
+            });
+            return .crash;
+        };
+        defer std.posix.close(events_fd);
+        const events = cgroup.memory.readEvents(events_fd) catch |err| {
             std.log.warn("worker launch: memory.events.local of a child that ended could not be read: {s}", .{
                 @errorName(err),
             });
@@ -734,198 +550,114 @@ pub const Machine = struct {
         return .crash;
     }
 
-    fn completeReady(self: *Machine, result: *StepResult) void {
-        self.spans.total_ns = process.monotonicNowNsOrZero() -| self.launch_started_ns;
-        if (self.boot_faults_served != 0)
-            self.traceFmt("host.worker_init.fs_faults_served={d}", .{self.boot_faults_served});
-        self.enter(.ready);
-        result.push(.report_ready);
-    }
-
-    /// Assembles the handle; the machine relinquishes every resource it still
-    /// owns. Call only in `.ready`. On `error.OutOfMemory` the machine still
-    /// owns everything, and the host calls `abandon`.
-    pub fn takeHandle(self: *Machine) LaunchError!handle_mod.WorkerHandle {
+    /// Hands the ready worker over: the handle owns every descriptor and
+    /// mapping the machine still held, the leaf included, and the machine is
+    /// spent. Call only in `.ready`.
+    pub fn takeHandle(self: *Machine) handle_mod.WorkerHandle {
         std.debug.assert(self.phase == .ready);
-        // The boot window is over: its fault scratch dies with it.
-        if (self.fault_scratch) |scratch| {
-            self.allocator.free(scratch);
-            self.fault_scratch = null;
-        }
-        const handle = handle_mod.WorkerHandle.init(
-            self.allocator,
-            self.pid,
-            self.pidfd,
-            self.worker_init_fd,
-            self.cgroup_dir.?,
-            self.memory_limit_bytes,
-            self.options.cpu_max_cores,
-            self.metrics_fd,
-            self.completion_eventfd,
-            self.ingress_payload_fd,
-            self.ingress_payload_credit_eventfd,
-            self.ingress_payload.?,
-            self.metrics.?,
-            self.fs_fault_server_fd,
-        ) catch return error.OutOfMemory;
-        // The prepared fd rode the WorkerInit; the handle cleans by path.
-        std.posix.close(self.cgroup_dir_fd);
-        self.cgroup_dir_fd = -1;
-        self.allocator.free(self.cgroup_dir.?);
-        self.cgroup_dir = null;
-        self.placeholder_fs_index_fd = closeIfHeld(self.placeholder_fs_index_fd);
+        // WorkerInit carried these, and the send closed the host's copies.
+        std.debug.assert(self.leaf_fd == -1);
+        std.debug.assert(self.metrics_fd == -1);
+        std.debug.assert(self.ingress_payload_fd == -1);
+        const handle: handle_mod.WorkerHandle = .{
+            .pid = self.pid,
+            .pidfd = self.pidfd,
+            .control_fd = self.worker_init_fd,
+            .leaf = self.leaf.?,
+            .completion_eventfd = self.completion_eventfd,
+            .ingress_payload_credit_eventfd = self.ingress_payload_credit_eventfd,
+            .ingress_payload = self.ingress_payload.?,
+            .metrics = self.metrics.?,
+        };
+        self.leaf = null;
         self.pidfd = -1;
         self.worker_init_fd = -1;
-        self.metrics_fd = -1;
         self.completion_eventfd = -1;
-        self.ingress_payload_fd = -1;
         self.ingress_payload_credit_eventfd = -1;
         self.metrics = null;
         self.ingress_payload = null;
-        self.fs_fault_server_fd = -1;
-        self.phase = .idle;
         return handle;
     }
 
-    fn fail(self: *Machine, err: LaunchError, result: *StepResult) void {
-        // The single funnel for every launch failure: without the phase and
-        // the typed error here, a host only sees a dead worker with no story.
-        std.log.warn("worker launch failed in phase={s}: {s}", .{ @tagName(self.phase), @errorName(err) });
-        self.fail_reason = err;
-        self.enter(.failed);
-        result.push(.{ .report_failed = err });
-    }
-
-    fn faultScratch(self: *Machine) ![]u8 {
-        if (self.fault_scratch) |scratch|
-            return scratch;
-        const scratch = try self.allocator.alloc(u8, ipc.max_message_bytes);
-        self.fault_scratch = scratch;
-        return scratch;
-    }
-
-    /// Releases everything the machine owns except the child's pidfd and its
-    /// cgroup leaf, which the result hands to the caller: the init socket,
-    /// the descriptors and mappings shared with the child, the bindings
-    /// memfd and the fault scratch. Never signals, waits or retries, so an
-    /// evented host calls it on its loop and leaves `AbandonedChild.reap` to
-    /// a thread that may block. The machine is spent afterwards.
+    /// Releases everything the machine owns except the child's pidfd, its
+    /// cgroup leaf and the state page, which the result hands to the caller:
+    /// the init socket, the leaf's descriptor, the payload ring and the
+    /// eventfds. Never signals, waits or retries, so an evented host calls it
+    /// on its loop and leaves the result to a thread that may block. The
+    /// machine is spent afterwards.
     pub fn abandon(self: *Machine) AbandonedChild {
-        var child: AbandonedChild = .{ .pid = self.pid };
+        var child: AbandonedChild = .{ .pid = self.pid, .leaf = self.leaf, .page = self.metrics };
+        self.leaf = null;
+        self.metrics = null;
         if (self.pidfd >= 0) {
             child.pidfd = fd_mod.OwnedFd.fromRaw(self.pidfd);
             self.pidfd = -1;
         }
-        if (self.cgroup_dir_fd >= 0) {
-            child.cgroup_dir = fd_mod.OwnedFd.fromRaw(self.cgroup_dir_fd);
-            self.cgroup_dir_fd = -1;
-        }
-        if (self.fault_scratch) |scratch| {
-            self.allocator.free(scratch);
-            self.fault_scratch = null;
-        }
-        if (self.metrics) |*metrics| metrics.deinit();
-        self.metrics = null;
         if (self.ingress_payload) |*payload| payload.deinit();
         self.ingress_payload = null;
         self.worker_init_fd = closeIfHeld(self.worker_init_fd);
-        self.route_table_memfd = closeIfHeld(self.route_table_memfd);
+        self.leaf_fd = closeIfHeld(self.leaf_fd);
         self.metrics_fd = closeIfHeld(self.metrics_fd);
         self.completion_eventfd = closeIfHeld(self.completion_eventfd);
         self.ingress_payload_fd = closeIfHeld(self.ingress_payload_fd);
         self.ingress_payload_credit_eventfd = closeIfHeld(self.ingress_payload_credit_eventfd);
-        self.placeholder_fs_index_fd = closeIfHeld(self.placeholder_fs_index_fd);
-        self.fs_fault_server_fd = closeIfHeld(self.fs_fault_server_fd);
-        self.fs_fault_worker_fd = closeIfHeld(self.fs_fault_worker_fd);
-        if (self.cgroup_dir) |dir| {
-            self.allocator.free(dir);
-            self.cgroup_dir = null;
-        }
         return child;
     }
 
-    /// Runs one bounded fault drain against the serve seam. Blocking on
-    /// misses: evented mode calls this from its job, the sync driver inline.
-    pub fn runFaultDrain(self: *Machine, deadline_ns: u64) !DrainOutcome {
-        return switch (self.options.fault_serve) {
-            .none => .peer_closed,
-            .serve => |serve| drainFaultChannel(
-                self.allocator,
-                self.fs_fault_server_fd,
-                deadline_ns,
-                serve,
-                &self.boot_faults_served,
-                try self.faultScratch(),
-            ),
-        };
+    /// The single funnel for every launch failure: without the phase and the
+    /// typed error here, a host only sees a dead worker with no story.
+    fn fail(self: *Machine, err: LaunchError) void {
+        std.log.warn("worker launch failed in phase={s}: {s}", .{ @tagName(self.phase), @errorName(err) });
+        self.fail_reason = err;
+        self.phase = .failed;
     }
 
-    fn enter(self: *Machine, phase: LaunchPhase) void {
-        self.phase = phase;
-        self.phase_entered_ns = process.monotonicNowNsOrZero();
+    fn failWithError(self: *Machine, err: LaunchError) LaunchError {
+        self.fail(err);
+        return err;
+    }
+
+    fn failWait(self: *Machine, err: LaunchError) Outcome {
+        self.fail(err);
+        return .{ .failed = err };
     }
 
     fn trace(self: *const Machine, event: []const u8) void {
-        zygote.trace.traceEvent(self.zygote_process.trace_write_fd, event);
+        zygote.trace.traceEvent(self.trace_fd, event);
     }
 
     fn traceFmt(self: *const Machine, comptime fmt: []const u8, args: anytype) void {
-        zygote.trace.traceEventFmt(self.zygote_process.trace_write_fd, fmt, args);
+        zygote.trace.traceEventFmt(self.trace_fd, fmt, args);
     }
 };
 
-/// Synchronous driver: the machine driven with poll(2) and direct calls, the
-/// grace timer synthesized from the poll deadline. It blocks, so the caller
-/// must own its thread, and a failure reaps the child before it returns.
+/// Synchronous driver for a host that owns its thread: the local steps,
+/// WorkerInit and the ready wait, driven with poll(2) for a child already
+/// forked into `machine`'s leaf. It blocks, and a failure reaps the child,
+/// unmaps its page with whatever the child logged there and removes the leaf
+/// before it returns; the machine is spent either way.
 pub fn runToReady(
-    allocator: std.mem.Allocator,
-    zygote_process: *zygote.host_client.SpawnedZygote,
+    machine: *Machine,
     forked: *zygote.host_client.ForkedWorker,
-    memory_limit_bytes: u64,
-    options: LaunchOptions,
+    options: *const LaunchOptions,
 ) LaunchError!handle_mod.WorkerHandle {
-    var machine = Machine.init(allocator, zygote_process, memory_limit_bytes, options);
-    var grace_deadline_ns: u64 = 0;
-    var result = machine.start(forked);
-    // Each turn consumes one step's effects. The ready wait ends by the
-    // child window and the grace drain by its timer, so the loop is bounded
-    // by those two deadlines and by the per-call cap of each fault drain.
+    machine.prepare();
+    machine.start(forked, options) catch |err| return abandonFailed(machine, err);
+    // Every event of the wait ends it, and `pollNextEvent` returns by the
+    // child window at the latest, so this runs once.
     while (true) {
-        const step = result;
-        var drain_requested = false;
-        for (step.effects[0..step.count]) |effect| switch (effect) {
-            .report_ready => return takeReadyHandle(&machine),
-            .report_failed => |err| return abandonFailed(&machine, err),
-            .arm_grace_timer => |deadline_ns| grace_deadline_ns = deadline_ns,
-            .start_fault_drain_job => drain_requested = true,
-            // Polls are implicit in `pollNextEvent`.
-            .none, .arm_init_poll, .arm_pidfd_poll, .arm_fault_poll => {},
-        };
-        const deadline_ns = switch (machine.phase) {
-            .awaiting_ready => machine.child_init_deadline_abs_ns,
-            .grace_drain => grace_deadline_ns,
-            // Only the two waiting phases leave a step without a report.
-            .idle, .ready, .failed => unreachable,
-        };
-        if (drain_requested) {
-            const outcome = machine.runFaultDrain(deadline_ns) catch
-                return abandonFailed(&machine, error.ZygoteProtocol);
-            result = machine.onEvent(.{ .fault_drain_done = outcome });
-            continue;
+        const event = pollNextEvent(machine) catch |err| return abandonFailed(machine, err);
+        const outcome = machine.onEvent(event) orelse continue;
+        switch (outcome) {
+            .ready => return machine.takeHandle(),
+            .failed => |err| return abandonFailed(machine, err),
         }
-        const event = pollNextEvent(&machine, deadline_ns) catch |err|
-            return abandonFailed(&machine, err);
-        result = machine.onEvent(event);
     }
 }
 
-fn takeReadyHandle(machine: *Machine) LaunchError!handle_mod.WorkerHandle {
-    return machine.takeHandle() catch |err| return abandonFailed(machine, err);
-}
-
 fn abandonFailed(machine: *Machine, err: LaunchError) LaunchError {
-    // A typed child failure announces its own exit: wait for the clean death
-    // so the SIGKILL in `reap` finds nothing to kill.
+    // A child that reported its failure exits on its own: waiting for that
+    // clean death leaves the SIGKILL in `reap` nothing to kill.
     if (err == error.WorkerInitFailed and machine.pidfd >= 0)
         _ = process.waitForPidFdExit(machine.pidfd, process_limits.PROCESS_EXIT_WAIT_MS) catch false;
     var child = machine.abandon();
@@ -933,147 +665,49 @@ fn abandonFailed(machine: *Machine, err: LaunchError) LaunchError {
     return err;
 }
 
-/// poll(2) leg of the sync driver: same fds, same priority (init POLLIN >
-/// pidfd > init HUP > fault), same timeout mapping as the evented loop.
-fn pollNextEvent(machine: *Machine, deadline_ns: u64) LaunchError!LaunchEvent {
+/// The poll(2) leg of `runToReady`: the same descriptors and priority as the
+/// launcher's poll set (init POLLIN, then the pidfd, then init HUP or ERR),
+/// waiting no later than the child window. Each turn returns or waits, and a
+/// turn whose revents name none of the three waits again, so the loop ends by
+/// the window at the latest.
+fn pollNextEvent(machine: *const Machine) LaunchError!LaunchEvent {
+    const ready_events = std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR;
     while (true) {
         const now_ns = process.monotonicNowNsOrZero();
-        if (now_ns >= deadline_ns)
-            return switch (machine.phase) {
-                .grace_drain => .grace_expired,
-                else => .child_deadline_expired,
-            };
-        var pollfds = [3]std.posix.pollfd{
-            .{ .fd = machine.worker_init_fd, .events = std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR, .revents = 0 },
-            .{ .fd = machine.pidfd, .events = std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR, .revents = 0 },
-            .{ .fd = if (machine.serve_faults) machine.fs_fault_server_fd else -1, .events = std.posix.POLL.IN, .revents = 0 },
+        if (now_ns >= machine.child_init_deadline_abs_ns)
+            return .child_deadline_expired;
+        var pollfds = [2]std.posix.pollfd{
+            .{ .fd = machine.worker_init_fd, .events = ready_events, .revents = 0 },
+            .{ .fd = machine.pidfd, .events = ready_events, .revents = 0 },
         };
-        const remaining_ns = deadline_ns - now_ns;
-        const remaining_ms: i32 = @intCast(@min(
-            (remaining_ns + std.time.ns_per_ms - 1) / std.time.ns_per_ms,
-            @as(u64, std.math.maxInt(i32)),
-        ));
-        const ready = std.posix.poll(&pollfds, remaining_ms) catch
-            return error.ZygoteProtocol;
+        const remaining_ns = machine.child_init_deadline_abs_ns - now_ns;
+        // The divisor is a nonzero constant.
+        const remaining_ms = std.math.divCeil(u64, remaining_ns, std.time.ns_per_ms) catch unreachable;
+        const ready = std.posix.poll(&pollfds, @intCast(@min(remaining_ms, std.math.maxInt(i32)))) catch
+            return error.LaunchResourcesUnavailable;
         if (ready == 0)
-            return switch (machine.phase) {
-                .grace_drain => .grace_expired,
-                else => .child_deadline_expired,
-            };
-        if (machine.phase == .grace_drain) {
-            // Post-ready only the fault leg matters; init/pidfd noise belongs
-            // to the host once the handle escapes.
-            if ((pollfds[2].revents & std.posix.POLL.IN) != 0)
-                return .fault_readable;
-            return .grace_expired;
-        }
+            return .child_deadline_expired;
         if ((pollfds[0].revents & std.posix.POLL.IN) != 0)
             return .init_readable;
-        if ((pollfds[1].revents & (std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR)) != 0)
+        if ((pollfds[1].revents & ready_events) != 0)
             return .pidfd_event;
         if ((pollfds[0].revents & (std.posix.POLL.HUP | std.posix.POLL.ERR)) != 0)
             return .init_hup;
-        if (machine.serve_faults and (pollfds[2].revents &
-            (std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR)) != 0)
-            return .fault_readable;
     }
 }
 
-/// Bounded drain of the boot-window fault channel: serves queued faults
-/// until WouldBlock, the per-drain cap, the peer closing, or the deadline
-/// passing. A fault request never carries fds, and a response carries
-/// exactly one iff it is `.ok`. `served_faults` accumulates every request
-/// answered across the whole boot window. Structural corruption errors out:
-/// the launch fails this worker's init.
-fn drainFaultChannel(
-    allocator: std.mem.Allocator,
-    fault_fd: std.posix.fd_t,
-    deadline_ns: u64,
-    serve: FaultServe.Serve,
-    served_faults: *u32,
-    scratch: []u8,
-) !DrainOutcome {
-    var drained_packets: usize = 0;
-    while (true) {
-        if (process.monotonicNowNsOrZero() >= deadline_ns)
-            return .deadline_exhausted;
-        if (drained_packets >= max_faults_per_drain)
-            return .idle;
-        var packet = ipc.recvPacketWithFdsScratch(allocator, fault_fd, scratch) catch |err| switch (err) {
-            error.WouldBlock => return .idle,
-            error.PeerClosed => return .peer_closed,
-            else => return err,
-        };
-        defer packet.deinit();
-        drained_packets += 1;
-        if (packet.fd_count != 0)
-            return error.UnexpectedFsFaultFd;
-        var request = try ipc.fs_fault.decodeRequest(allocator, packet.bytes);
-        defer request.deinit();
-        const answer = serve.serve(serve.ctx, &request, deadline_ns);
-        const status: ipc.FsFaultResponseStatus = switch (answer) {
-            .ok => .ok,
-            .refused => .refused,
-            .not_found => .not_found,
-            .fetch_failed => .fetch_failed,
-        };
-        var owned_file: fd_mod.OwnedFd = .{};
-        defer owned_file.deinit();
-        const file_ref: ?fd_mod.FdRef = switch (answer) {
-            .ok => |fd| blk: {
-                owned_file = fd_mod.OwnedFd.fromRaw(fd);
-                break :blk owned_file.borrow();
-            },
-            else => null,
-        };
-        // Best-effort like every send to a worker: a dead peer surfaces on
-        // the init and pidfd legs of the poll, not here.
-        ipc.fs_fault.sendResponse(
-            fault_fd,
-            .{ .fault_id = request.fault_id, .status = status },
-            file_ref,
-        ) catch |err| {
-            std.log.warn("boot fault response failed fault_id={d}: {s}", .{ request.fault_id, @errorName(err) });
-        };
-        served_faults.* +|= 1;
-    }
-}
-
-/// The boot token's deadline: the init deadline plus `MODULE_EVAL_BUDGET_NS`,
-/// capped by a nonzero owner deadline. Every route the boot evaluates ends
-/// its synchronous part before the init deadline and its pending budget runs
-/// from there, so the token outlives every startup evaluation; workers share
-/// the host's CLOCK_MONOTONIC.
-pub fn bootEgressDeadline(init_deadline_abs_ns: u64, owner_deadline_abs_ns: u64) u64 {
-    const deadline = init_deadline_abs_ns +| process_limits.MODULE_EVAL_BUDGET_NS;
-    return if (owner_deadline_abs_ns == 0) deadline else @min(deadline, owner_deadline_abs_ns);
+/// The boot token's deadline: the init deadline plus `MODULE_EVAL_BUDGET_NS`.
+/// Every route the boot evaluates ends its synchronous part before the init
+/// deadline and its pending budget runs from there, so the token outlives
+/// every startup evaluation; workers share the host's CLOCK_MONOTONIC.
+pub fn bootEgressDeadline(init_deadline_abs_ns: u64) u64 {
+    return init_deadline_abs_ns +| process_limits.MODULE_EVAL_BUDGET_NS;
 }
 
 fn closeIfHeld(fd: std.posix.fd_t) std.posix.fd_t {
     if (fd >= 0)
         std.posix.close(fd);
     return -1;
-}
-
-fn mapResourceError(err: anyerror) LaunchError {
-    return switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        else => error.ZygoteProtocol,
-    };
-}
-
-fn spanDelta(cursor_ns: *u64) u64 {
-    const now_ns = process.monotonicNowNsOrZero();
-    const delta = now_ns -| cursor_ns.*;
-    cursor_ns.* = now_ns;
-    return delta;
-}
-
-fn zygoteProtocolError(err: anyerror) LaunchError {
-    return switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        else => error.ZygoteProtocol,
-    };
 }
 
 fn resolveTmpfsSizeBytes(memory_limit_bytes: u64, configured_bytes: ?u64) u64 {

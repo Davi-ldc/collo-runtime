@@ -363,79 +363,130 @@ test "the socket option gate refuses a raw option call in production source, wha
     }
 }
 
-test "fetch body release paths stay callback-only" {
+test "response queue release paths stay callback-only" {
     var failures: FailureList = .empty;
     defer deinitFailures(&failures);
 
-    const path = "runtime/src/egress/core/fetch_body.zig";
+    const path = "runtime/src/egress/core/response_queue.zig";
     const bytes = try readFile(path, 512 * 1024);
     defer std.testing.allocator.free(bytes);
 
-    try checkFetchBodyReleaseSource(path, bytes, &failures);
+    try checkQueuedReleaseSource(path, bytes, &failures);
 
-    try expectNoFailures(&failures, error.FetchBodyReleaseConventionViolation);
+    try expectNoFailures(&failures, error.QueuedReleaseConventionViolation);
 }
 
-test "server code reads a worker's page only through its snapshots and drains" {
-    var failures: FailureList = .empty;
-    defer deinitFailures(&failures);
-
-    try scanRequiredTree("runtime/src/server", &failures, checkWorkerPageReads);
-
-    try expectNoFailures(&failures, error.WorkerPageReadConventionViolation);
-}
-
-test "the worker page gate catches a loop over the live slots and a load of the page, and passes the snapshot reads" {
-    const path = "runtime/src/server/supervisor/page_reader.zig";
+test "the queued release gate catches a release that returns credits or takes no callback" {
+    const path = "runtime/src/egress/core/response_queue.zig";
     const bypasses = [_][]const u8{
-        \\for (metrics.live_slots) |*slot| {
-        \\    if (@atomicLoad(u32, &slot.state, .acquire) == 1) return true;
-        \\}
+        \\pub fn releaseQueued(self: *ResponseQueue, allocator: std.mem.Allocator) ![]Credit {
         ,
-        \\for (metrics.live_slots) |slot| {
-        \\    if (slot.state == 1) return true;
-        \\}
+        \\pub fn releaseQueued(self: *ResponseQueue, allocator: std.mem.Allocator) void {
         ,
-        \\const raw = @atomicLoad(u32, &view.header.state, .acquire);
+        \\pub fn releaseQueuedChunks(
+        \\    self: *ResponseQueue,
+        \\    context: anytype,
+        \\    comptime callback: fn (@TypeOf(context), Credit) void,
+        \\) []Credit {
         ,
-        \\const state = view.header.state;
-        ,
-        \\const ended = view.header.startup_evaluations_ended;
-        ,
-        \\const fatal = view.log_header.fatal;
-        ,
-        \\const record = metrics.completed_records[0];
+        \\pub fn release(self: *ResponseQueue) void {
     };
     for (bypasses) |source| {
         var failures: FailureList = .empty;
         defer deinitFailures(&failures);
-        try checkWorkerPageReads(path, source, &failures);
+        try checkQueuedReleaseSource(path, source, &failures);
         if (failures.items.len == 0) {
-            std.debug.print("the gate passed a read past the snapshots:\n{s}\n", .{source});
+            std.debug.print("the gate passed a queued release that is not callback-only:\n{s}\n", .{source});
             return error.TestUnexpectedResult;
         }
     }
 
-    const reads = [_][]const u8{
-        \\if (worker_shared_page.LiveSlotSnapshot.find(metrics.live_slots, identity)) |snapshot| {}
-        ,
-        \\if (worker_shared_page.LiveSlotSnapshot.find(
-        \\    worker.handle.metrics.?.live_slots,
-        \\    identity,
-        \\)) |snapshot| {}
-        ,
-        \\const count = peeked.copy(metrics.completed_records, 0, records[0..limit]);
-        ,
-        \\const snapshot = worker_shared_page.LifecycleSnapshot.load(metrics.header);
-        ,
-        \\// `metrics.live_slots` and `view.log_header` named in a comment.
+    var failures: FailureList = .empty;
+    defer deinitFailures(&failures);
+    try checkQueuedReleaseSource(path,
+        \\pub fn releaseQueued(
+        \\    self: *ResponseQueue,
+        \\    allocator: std.mem.Allocator,
+        \\    context: anytype,
+        \\    comptime callback: fn (@TypeOf(context), Credit) void,
+        \\) void {
+    , &failures);
+    try expectNoFailures(&failures, error.TestUnexpectedResult);
+}
+
+test "server and host code hold a worker's page only as its read-only host view" {
+    var failures: FailureList = .empty;
+    defer deinitFailures(&failures);
+
+    try scanRequiredTree("runtime/src/server", &failures, checkHostPageViews);
+    try scanRequiredTree("runtime/src/host", &failures, checkHostPageViews);
+
+    try expectNoFailures(&failures, error.HostPageViewConventionViolation);
+}
+
+test "the host page gate catches the worker's writer view named or mapped, and passes the host view's reads" {
+    const paths = [_][]const u8{
+        "runtime/src/server/supervisor/page_reader.zig",
+        "runtime/src/host/page_reader.zig",
     };
-    for (reads) |source| {
-        var failures: FailureList = .empty;
-        defer deinitFailures(&failures);
-        try checkWorkerPageReads(path, source, &failures);
-        try expectNoFailures(&failures, error.WorkerPageReadConventionViolation);
+    const bypasses = [_][]const u8{
+        \\metrics: ?worker_shared_page.WorkerWriterView = null,
+        ,
+        \\var view = try page.mapWorkerWriter(metrics_fd);
+        ,
+        \\const View = page.WorkerWriterView;
+        ,
+        \\fn pageOf(worker: *WorkerRecord) *page.WorkerWriterView {
+        ,
+        \\const writer = worker_state.page.mapWorkerWriter;
+    };
+    const reads = [_][]const u8{
+        \\metrics: ?worker_shared_page.HostReaderView = null,
+        ,
+        \\var view = try worker_shared_page.mapHostReader(metrics_fd);
+        ,
+        \\const live = view.loadLiveSlot(slot.worker_slot);
+        \\if (live.matches(request_id, request_generation)) usage.cpu_ns = live.cpu_ns;
+        ,
+        \\if (view.loadRunningOwner()) |running| {
+        \\    if (running.owner_id == request.request_id) cpu_ns = @max(cpu_ns, running.cpu_ns);
+        \\}
+        ,
+        \\const snapshot = metrics.loadLifecycle();
+        ,
+        \\const copied = try view.drainLogLinesChecked(scratch, lines[0..]);
+        ,
+        \\const stamp = metrics.loadBootPhaseStampNs(.ready);
+        ,
+        \\// The worker maps its page as a `WorkerWriterView` (`mapWorkerWriter`).
+        ,
+        \\const name = "MyWorkerWriterViewish";
+        ,
+        \\fn remapWorkerWriterViews() void {}
+    };
+    for (paths) |path| {
+        for (bypasses) |source| {
+            var failures: FailureList = .empty;
+            defer deinitFailures(&failures);
+            try checkHostPageViews(path, source, &failures);
+            if (failures.items.len == 0) {
+                std.debug.print("the gate passed the worker's writer view in {s}:\n{s}\n", .{ path, source });
+                return error.TestUnexpectedResult;
+            }
+        }
+        for (reads) |source| {
+            var failures: FailureList = .empty;
+            defer deinitFailures(&failures);
+            try checkHostPageViews(path, source, &failures);
+            try expectNoFailures(&failures, error.HostPageViewConventionViolation);
+        }
     }
+
+    // A test that plays the worker maps the writer.
+    var failures: FailureList = .empty;
+    defer deinitFailures(&failures);
+    try checkHostPageViews("runtime/src/server/tests/ingress/lane_harness.zig", bypasses[1], &failures);
+    try expectNoFailures(&failures, error.HostPageViewConventionViolation);
 }
 
 test "zygote fork loop stays VM-free and allocation-free after prepare" {
@@ -446,28 +497,58 @@ test "zygote fork loop stays VM-free and allocation-free after prepare" {
     const bytes = try readFile(path, 512 * 1024);
     defer std.testing.allocator.free(bytes);
 
-    const body = try extractFunctionBody(bytes, "fn serveForkRequests(");
-    try expectContains(body, "assertPreparedForkBaseline(zygote)");
-    try expectContains(body, "process.assertSingleThreadedSelf()");
-
-    const forbidden = [_][]const u8{
-        ".vm.",
-        "prepareForFork",
-        "postForkChild",
-        "boot_allocator",
-        "std.heap",
-        ".alloc(",
-        ".free(",
-        "allocPrint",
-        "ArrayList",
-        "HashMap",
-    };
-    for (forbidden) |needle| {
-        if (std.mem.indexOf(u8, body, needle) != null)
-            try appendFailure(&failures, path, "zygote fork loop must not touch VM/JSC or allocator after prepare");
-    }
+    try checkForkLoopSource(path, bytes, &failures);
 
     try expectNoFailures(&failures, error.ZygoteForkLoopConventionViolation);
+}
+
+test "the fork loop gate fails a loop without the prepared value, one that touches the VM or allocates, and passes the prepared shape" {
+    const path = "runtime/src/zygote/fork_loop.zig";
+    const sound =
+        \\fn serveForkRequests(prepared: Prepared, control_fd: std.posix.fd_t) !void {
+        \\    while (true) {
+        \\        var request = try ipc.recvForkRequest(control_fd);
+        \\        process.assertSingleThreadedSelf() catch |err| return err;
+        \\        _ = prepared.thread_id_word;
+        \\    }
+        \\}
+    ;
+    const unsound = [_][]const u8{
+        // No `Prepared`: nothing proves the zygote was prepared exactly once.
+        \\fn serveForkRequests(zygote: *state.Zygote, control_fd: std.posix.fd_t) !void {
+        \\    process.assertSingleThreadedSelf() catch |err| return err;
+        \\}
+        ,
+        \\fn serveForkRequests(prepared: Prepared, control_fd: std.posix.fd_t) !void {
+        \\    process.assertSingleThreadedSelf() catch |err| return err;
+        \\    try prepared.zygote.vm.collectFullGCAndTrim();
+        \\}
+        ,
+        \\fn serveForkRequests(prepared: Prepared, control_fd: std.posix.fd_t) !void {
+        \\    process.assertSingleThreadedSelf() catch |err| return err;
+        \\    const scratch = try std.heap.page_allocator.alloc(u8, 64);
+        \\}
+        ,
+        \\fn serveForkRequests(prepared: Prepared, control_fd: std.posix.fd_t) !void {
+        \\    _ = prepared;
+        \\}
+    };
+
+    {
+        var failures: FailureList = .empty;
+        defer deinitFailures(&failures);
+        try checkForkLoopSource(path, sound, &failures);
+        try expectNoFailures(&failures, error.ZygoteForkLoopConventionViolation);
+    }
+    for (unsound) |source| {
+        var failures: FailureList = .empty;
+        defer deinitFailures(&failures);
+        try checkForkLoopSource(path, source, &failures);
+        if (failures.items.len == 0) {
+            std.debug.print("the fork loop gate passed:\n{s}\n", .{source});
+            return error.TestUnexpectedResult;
+        }
+    }
 }
 
 test "C ABI surface stays POD-shaped" {
@@ -688,13 +769,10 @@ test "the bridge's cell and secret gates catch each pattern they forbid and pass
         // Decoding or zeroing secret bytes outside SecretBytes anywhere in
         // WebCrypto; a comment, a string and the SecretBytes decoders pass.
         .{ .check = checkCryptoSecretBuffers, .path = "runtime/src/bindings/host_functions/webapi/crypto/key_io/jwk.cpp", .refused = true, .source = "auto bytes = WTF::base64URLDecode(*member);" },
-        .{ .check = checkCryptoSecretBuffers, .path = "runtime/src/bindings/host_functions/webapi/crypto/jobs.h", .refused = true, .source = "secureZeroVector(m_key);" },
-        .{ .check = checkCryptoSecretBuffers, .path = "runtime/src/bindings/host_functions/webapi/crypto/key_io/raw.cpp", .refused = true, .source = "auto decoded = base64Decode(text);" },
-        .{ .check = checkCryptoSecretBuffers, .path = "runtime/src/bindings/host_functions/webapi/crypto/crypto.cpp", .refused = true, .source = "SecureBytes secret;" },
-        .{ .check = checkCryptoSecretBuffers, .path = "runtime/src/bindings/host_functions/webapi/crypto/jobs.cpp", .refused = true, .source = "SecureVectorGuard guard { bytes };" },
+        .{ .check = checkCryptoSecretBuffers, .path = "runtime/src/bindings/host_functions/webapi/crypto/key_io/import.cpp", .refused = true, .source = "auto decoded = base64Decode(text);" },
         .{ .check = checkCryptoSecretBuffers, .path = "runtime/src/bindings/host_functions/webapi/crypto/key_io/jwk.cpp", .refused = false, .source = "// base64URLDecode leaves bytes past the size it shrinks to." },
         .{ .check = checkCryptoSecretBuffers, .path = "runtime/src/bindings/host_functions/webapi/crypto/key_io/jwk.cpp", .refused = false, .source = "throwTypeError(\"base64Decode failed\");" },
-        .{ .check = checkCryptoSecretBuffers, .path = "runtime/src/bindings/host_functions/webapi/crypto/key_io/jwk.cpp", .refused = false, .source = "auto secret = decodeSecretBase64Url(member);" },
+        .{ .check = checkCryptoSecretBuffers, .path = "runtime/src/bindings/host_functions/webapi/crypto/key_io/jwk.cpp", .refused = false, .source = "auto secret = decodeBase64UrlMember(member);" },
     };
     inline for (cases) |case| {
         var failures: FailureList = .empty;
@@ -1909,16 +1987,6 @@ fn checkBindingSource(path: []const u8, bytes: []const u8, failures: *FailureLis
         {
             try appendLineFailure(failures, path, runtime_line_no, "JSC runtime reserves must be checked");
         }
-        if (is_jsc_runtime and
-            (std.mem.indexOf(u8, line, "module_sources.set(") != null or
-                std.mem.indexOf(u8, line, "module_sources.add(") != null or
-                std.mem.indexOf(u8, line, "module_sources.insert(") != null or
-                std.mem.indexOf(u8, line, "module_sources.append(") != null or
-                std.mem.indexOf(u8, line, "module_sources.tryAppend(") != null or
-                std.mem.indexOf(u8, line, "module_sources.reserve") != null))
-        {
-            try appendLineFailure(failures, path, runtime_line_no, "module source registry insertion must be checked");
-        }
     }
     if (is_jsc_runtime) {
         var exception_search_start: usize = 0;
@@ -2165,11 +2233,10 @@ fn isUnrootedCellArgument(argument: []const CToken) bool {
 /// every buffer it frees over its whole capacity, so no path, an early
 /// return included, frees a secret unzeroed. These names keep bytes outside
 /// it: WTF's base64 decoders leave decoded bytes past the size of the
-/// buffer they shrink, and the other three are zeroing helpers that stop at
-/// a buffer's size and leave its spare capacity.
+/// buffer they shrink.
 fn checkCryptoSecretBuffers(path: []const u8, bytes: []const u8, failures: *FailureList) !void {
     if (!isColloBridgeCpp(path)) return;
-    const forbidden = [_][]const u8{ "base64URLDecode", "base64Decode", "secureZeroVector", "SecureVectorGuard", "SecureBytes" };
+    const forbidden = [_][]const u8{ "base64URLDecode", "base64Decode" };
     var lexer: CLexer = .{ .source = bytes };
     while (lexer.next()) |token| {
         if (token.kind != .identifier) continue;
@@ -2260,62 +2327,45 @@ fn checkServerReadsOnlyGatewayContract(path: []const u8, bytes: []const u8, fail
     }
 }
 
-fn checkFetchBodyReleaseSource(path: []const u8, bytes: []const u8, failures: *FailureList) !void {
-    const forbidden_old_drain = "drainQueued" ++ "CreditsForRelease";
-    if (std.mem.indexOf(u8, bytes, forbidden_old_drain) != null) {
-        try appendFailure(failures, path, "queued-credit release must not return allocated slices");
+/// A response queue hands the credit of each chunk it frees to a callback
+/// and returns nothing, so a release never allocates and cannot fail on the
+/// paths that tear a fetch down: every `pub fn releaseQueued*` signature
+/// takes a `callback` and returns `void`. A source with no such function
+/// fails too, since the gate would then read the wrong file.
+fn checkQueuedReleaseSource(path: []const u8, bytes: []const u8, failures: *FailureList) !void {
+    const marker = "pub fn releaseQueued";
+    var found = false;
+    var cursor: usize = 0;
+    while (std.mem.indexOfPos(u8, bytes, cursor, marker)) |start| {
+        found = true;
+        const line_no = std.mem.count(u8, bytes[0..start], "\n") + 1;
+        const body = std.mem.indexOfScalarPos(u8, bytes, start, '{') orelse bytes.len;
+        const signature = std.mem.trimRight(u8, bytes[start..body], " \t\r\n");
+        if (std.mem.indexOf(u8, signature, "callback") == null)
+            try appendLineFailure(failures, path, line_no, "queued release must hand each credit to a callback");
+        if (!std.mem.endsWith(u8, signature, ") void"))
+            try appendLineFailure(failures, path, line_no, "queued release must return void, never credits or a slice");
+        cursor = body;
     }
-
-    const forbidden_release_chunks = "pub fn releaseQueued" ++ "Chunks(";
-    if (std.mem.indexOf(u8, bytes, forbidden_release_chunks) != null) {
-        try appendFailure(failures, path, "releaseQueuedChunks must use a Callback suffix");
-    }
-    const forbidden_release_preserving = "pub fn releaseQueued" ++ "ChunksPreservingWaiters(";
-    if (std.mem.indexOf(u8, bytes, forbidden_release_preserving) != null) {
-        try appendFailure(failures, path, "preserving-waiters release must use a Callback suffix");
-    }
-
-    var lines = std.mem.splitScalar(u8, bytes, '\n');
-    var line_no: usize = 1;
-    while (lines.next()) |line| : (line_no += 1) {
-        if (std.mem.indexOf(u8, line, "pub fn releaseQueued") == null)
-            continue;
-        if (std.mem.indexOf(u8, line, "Callback") == null) {
-            try appendLineFailure(failures, path, line_no, "queued release API must be callback-only");
-        }
-        if (std.mem.indexOf(u8, line, "[]Credit") != null) {
-            try appendLineFailure(failures, path, line_no, "queued release API must not return credit slices");
-        }
-    }
+    if (!found)
+        try appendFailure(failures, path, "no queued release function; the gate reads the wrong file");
 }
 
-/// Server code reaches a worker's page only through
-/// `common/worker_state/page/snapshots.zig` and the page's ring drains, which
-/// load each field once. It loads no shared memory itself, so it holds no
-/// `@atomicLoad`; it lends the page view's live slots only to
-/// `LiveSlotSnapshot.find` and its usage records only to
-/// `RecordCursor.Peeked.copy`, and it never names the page's other parts.
-/// Comment lines are not read.
-fn checkWorkerPageReads(path: []const u8, bytes: []const u8, failures: *FailureList) !void {
+/// Server and host code hold a worker's page only as a `HostReaderView`
+/// (`common/worker_state/page/mapping.zig`), whose mapping is an opaque
+/// handle and whose every read loads each field once into a copy, so the
+/// compiler keeps them from loading a page field themselves. The one way
+/// around that is the worker's own view, which exposes the page, so outside
+/// test directories neither tree names `WorkerWriterView` or
+/// `mapWorkerWriter` as a whole identifier. Comment lines are not read.
+fn checkHostPageViews(path: []const u8, bytes: []const u8, failures: *FailureList) !void {
     if (!std.mem.endsWith(u8, path, ".zig"))
         return;
     if (std.mem.indexOf(u8, path, "/tests/") != null)
         return;
     const forbidden = [_][]const u8{
-        "@atomicLoad(",
-        "records_head",
-        "records_tail",
-        ".termination_reason",
-        ".header.state",
-        ".startup_evaluations_ended",
-        ".completion_header",
-        ".completion_records",
-        ".log_header",
-        ".log_bytes",
-    };
-    const lent = [_]LentPageSlice{
-        .{ .field = ".live_slots", .reader = "LiveSlotSnapshot.find(" },
-        .{ .field = ".completed_records", .reader = ".copy(" },
+        "WorkerWriterView",
+        "mapWorkerWriter",
     };
     var lines = std.mem.splitScalar(u8, bytes, '\n');
     var line_no: usize = 0;
@@ -2324,55 +2374,63 @@ fn checkWorkerPageReads(path: []const u8, bytes: []const u8, failures: *FailureL
         if (std.mem.startsWith(u8, std.mem.trimLeft(u8, line, " \t"), "//"))
             continue;
         for (forbidden) |token| {
-            if (std.mem.indexOf(u8, line, token) != null)
-                try appendWorkerPageReadFailure(failures, path, line_no, token);
-        }
-        const line_offset = @intFromPtr(line.ptr) - @intFromPtr(bytes.ptr);
-        for (lent) |slice| {
-            var search: usize = 0;
-            while (std.mem.indexOfPos(u8, line, search, slice.field)) |at| : (search = at + slice.field.len) {
-                const after = at + slice.field.len;
-                if (after < line.len and isIdentifierByte(line[after]))
-                    continue;
-                if (!lentOnlyTo(bytes[0 .. line_offset + at], slice.reader))
-                    try appendWorkerPageReadFailure(failures, path, line_no, slice.field);
-            }
+            if (containsIdentifier(line, token))
+                try appendHostPageViewFailure(failures, path, line_no, token);
         }
     }
 }
 
-/// A slice of the page view that server code may name only as the argument
-/// of `reader`.
-const LentPageSlice = struct {
-    field: []const u8,
-    reader: []const u8,
-};
+/// The zygote's fork loop takes the `Prepared` value its preparation returns
+/// (`zygote/fork_loop.zig`), the proof that the VM was prepared for fork
+/// exactly once, checks the zygote is single-threaded before each clone, and
+/// touches neither the VM nor an allocator, so every worker inherits the same
+/// pages.
+fn checkForkLoopSource(path: []const u8, bytes: []const u8, failures: *FailureList) !void {
+    const signature = "fn serveForkRequests(";
+    const signature_start = std.mem.indexOf(u8, bytes, signature) orelse {
+        try appendFailure(failures, path, "the zygote fork loop `serveForkRequests` is missing");
+        return;
+    };
+    const parameters_end = std.mem.indexOfScalarPos(u8, bytes, signature_start, '{') orelse {
+        try appendFailure(failures, path, "the zygote fork loop has no body");
+        return;
+    };
+    if (std.mem.indexOf(u8, bytes[signature_start..parameters_end], "Prepared") == null)
+        try appendFailure(failures, path, "the zygote fork loop must take the `Prepared` value its preparation returns");
 
-/// Whether the text before a field access ends in `reader` once the access's
-/// receiver and the whitespace before it are stripped, as in
-/// `LiveSlotSnapshot.find(metrics.live_slots` or the same call `zig fmt`
-/// wrapped onto several lines.
-fn lentOnlyTo(before_field: []const u8, reader: []const u8) bool {
-    var end = before_field.len;
-    while (end > 0 and isReceiverByte(before_field[end - 1]))
-        end -= 1;
-    while (end > 0 and std.ascii.isWhitespace(before_field[end - 1]))
-        end -= 1;
-    return std.mem.endsWith(u8, before_field[0..end], reader);
+    const body = extractFunctionBody(bytes[signature_start..], signature) catch {
+        try appendFailure(failures, path, "the zygote fork loop's body does not close");
+        return;
+    };
+    if (std.mem.indexOf(u8, body, "process.assertSingleThreadedSelf()") == null)
+        try appendFailure(failures, path, "the zygote fork loop must check it is single-threaded before each clone");
+
+    const forbidden = [_][]const u8{
+        ".vm.",
+        "prepareForFork",
+        "postForkChild",
+        "boot_allocator",
+        "std.heap",
+        ".alloc(",
+        ".free(",
+        "allocPrint",
+        "ArrayList",
+        "HashMap",
+    };
+    for (forbidden) |needle| {
+        if (std.mem.indexOf(u8, body, needle) != null)
+            try appendFailure(failures, path, "zygote fork loop must not touch VM/JSC or allocator after prepare");
+    }
 }
 
 fn isIdentifierByte(byte: u8) bool {
     return std.ascii.isAlphanumeric(byte) or byte == '_';
 }
 
-fn isReceiverByte(byte: u8) bool {
-    return isIdentifierByte(byte) or byte == '.' or byte == '?';
-}
-
-fn appendWorkerPageReadFailure(failures: *FailureList, path: []const u8, line_no: usize, token: []const u8) !void {
+fn appendHostPageViewFailure(failures: *FailureList, path: []const u8, line_no: usize, token: []const u8) !void {
     try appendFailureMessage(
         failures,
-        "{s}:{d}: `{s}`: server code reads a worker's page only through page/snapshots.zig and the ring drains",
+        "{s}:{d}: `{s}`: server and host code hold a worker's page only as a `HostReaderView` (`mapHostReader`)",
         .{ path, line_no, token },
     );
 }

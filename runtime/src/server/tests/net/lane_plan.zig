@@ -10,9 +10,9 @@
 
 const std = @import("std");
 const ipc = @import("collo_ipc");
-const config = @import("collo_server_config");
 const ingress_limits = @import("collo_limits").ingress;
 const pool_limits = @import("collo_limits").pool;
+const server_limits = @import("collo_limits").server;
 const server_main = @import("collo_server_main");
 const supervision = @import("collo_server_supervisor");
 const analytics = @import("collo_server_analytics");
@@ -28,16 +28,11 @@ test "static lane count follows RX queues within CPU and memory caps" {
     try std.testing.expectError(error.NoRxQueues, lane_plan.resolveStaticLaneCount(0, 4, 32, 0));
 }
 
-/// Every definition's `concurrency` added up, at the default for each.
-fn defaultSlotsTotal(definition_count: usize) usize {
-    return definition_count * config.default_settings.limits.concurrency;
-}
-
 test "each term of a lane's memory shape covers what its structure reserves at a serving lane's caps" {
     for ([_]usize{ 1, 16 }) |definition_count| {
-        const slots_total = defaultSlotsTotal(definition_count);
-        const terms = runner.laneMemoryTerms(definition_count, slots_total);
-        try std.testing.expectEqual(terms.total(), runner.laneMemoryShape(definition_count, slots_total).resident_cap_bytes);
+        const served = everyDefinitionAtLargestConcurrency(definition_count);
+        const terms = runner.laneMemoryTerms(served);
+        try std.testing.expectEqual(terms.total(), runner.laneMemoryShape(served).resident_cap_bytes);
 
         // The connection deadline heap keeps one pointer per connection.
         var connections = try runner.connection_slot.ConnectionSlab.init(ingress_limits.connections_per_lane_max);
@@ -58,7 +53,7 @@ test "each term of a lane's memory shape covers what its structure reserves at a
 
         var queue = try ingress.commands.Queue.init(
             ingress_limits.commands_per_lane_max,
-            ingress.lane.obligationReserve(definition_count, slots_total),
+            ingress.lane.obligationReserve(served),
         );
         defer queue.deinit();
         try std.testing.expect(terms.commands >= reservedBytes(queue.nodes.entries));
@@ -87,10 +82,20 @@ test "a node with 10 GiB available runs a lane on each of 4 CPUs, with one worke
     const available_bytes: usize = 10 * 1024 * 1024 * 1024;
     const cpu_count = 4;
     for ([_]usize{ 1, 16 }) |definition_count| {
-        const shape = runner.laneMemoryShape(definition_count, defaultSlotsTotal(definition_count));
+        const shape = runner.laneMemoryShape(everyDefinitionAtLargestConcurrency(definition_count));
         const capacity = (available_bytes / lane_plan.lane_memory_share_divisor) / shape.estimatedHeavyLaneBytes();
         try std.testing.expectEqual(@as(usize, cpu_count), try lane_plan.resolveStaticLaneCount(cpu_count, cpu_count, capacity, 0));
     }
+}
+
+/// `definition_count` definitions, each at the largest `concurrency`: the
+/// worst case for a lane's command reserve, which the memory cap must still
+/// pay for.
+fn everyDefinitionAtLargestConcurrency(definition_count: usize) ingress.lane.ServedDefinitions {
+    return .{
+        .count = definition_count,
+        .slots_per_worker_total = definition_count * server_limits.worker_concurrency_max,
+    };
 }
 
 /// The bytes of a table's entries, all of which a lane at its caps may make

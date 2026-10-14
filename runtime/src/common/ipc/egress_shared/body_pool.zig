@@ -221,22 +221,6 @@ pub const BodyPoolView = struct {
         return reservation.handle;
     }
 
-    /// Checks, without reserving, that a contiguous free run holds
-    /// `bytes_len`; fails as `reserveChunk` does, but never for want of a slot.
-    pub fn ensureWriteCapacity(self: *BodyPoolView, bytes_len: usize) !void {
-        if (!self.access.write_chunks)
-            return error.EgressSharedWrongSide;
-        if (bytes_len == 0 or bytes_len > self.capacity())
-            return error.EgressSharedPacketTooLarge;
-        if (self.fatalState() != .none)
-            return error.EgressSharedRingFatal;
-        const block_count = blockCountForLen(bytes_len);
-        _ = self.findFreeBlockRun(block_count) orelse {
-            _ = @atomicRmw(u64, &self.producer.dropped_packets, .Add, 1, .monotonic);
-            return error.EgressSharedRingFull;
-        };
-    }
-
     /// Starts a transaction whose extents become visible together; fails
     /// with `error.EgressSharedRingFatal` once the pool is fatal.
     pub fn beginWriteTransaction(self: *BodyPoolView) !BodyPoolWriteTransaction {

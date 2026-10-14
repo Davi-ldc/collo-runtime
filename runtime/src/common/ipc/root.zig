@@ -11,7 +11,8 @@
 //!   outcome.
 //! - `dispatch.zig`: the DispatchWork payload of one request.
 //! - `ingress_channel.zig`: request and response streams between the host
-//!   and a worker, with their shared payload rings.
+//!   and a worker, each request's `request_done`, and the shared payload
+//!   rings.
 //! - `egress.zig`, `egress_shared.zig`, `fetch_limits.zig`: the worker and
 //!   gateway fetch contract and its shared rings.
 //! - `egress_token.zig`: the token the server mints for a request or a boot
@@ -21,11 +22,10 @@
 //! - `worker_retiring.zig`: a worker's request to be retired.
 //! - `response_credit.zig`: the credit window of a response's body chunks
 //!   and the server's cumulative grants.
-//! - `module_pack.zig`: the module pack format.
-//! - `fs_index.zig`, `fs_fault.zig`: a worker's file index and its file
-//!   requests.
-//! - `route_table.zig`: the routes of a worker's definition, each with its
-//!   entry and its bindings (`route_bindings.zig`).
+//! - `module_pack.zig`: the definition artifact, one sealed memfd per worker
+//!   definition with its modules and routes.
+//! - `route_table.zig`: the artifact's routes section, each route's entry
+//!   module and its bindings (`route_bindings.zig`).
 //! - `packet.zig`, `outbound_queue.zig`: SEQPACKET framing with SCM_RIGHTS,
 //!   and the owned packet queues of nonblocking writers, bounded by the
 //!   limits their callers pass.
@@ -34,8 +34,6 @@ pub const module_pack = @import("module_pack.zig");
 pub const ingress_channel = @import("ingress_channel.zig");
 
 pub const messages = @import("messages.zig");
-pub const fs_fault = @import("fs_fault.zig");
-pub const fs_index = @import("fs_index.zig");
 pub const route_bindings = @import("route_bindings.zig");
 pub const route_table = @import("route_table.zig");
 pub const outbound_queue = @import("outbound_queue.zig");
@@ -59,6 +57,7 @@ pub const MessageKind = messages.MessageKind;
 pub const WorkerInitFailedReason = messages.WorkerInitFailedReason;
 pub const WorkerRetiringReason = messages.WorkerRetiringReason;
 pub const RequestDoneStatus = messages.RequestDoneStatus;
+pub const RequestDone = ingress_channel.RequestDone;
 pub const RouteCapture = messages.RouteCapture;
 pub const RequestHeader = messages.RequestHeader;
 pub const DispatchWorkView = messages.DispatchWorkView;
@@ -66,19 +65,14 @@ pub const RequestBodyFraming = messages.RequestBodyFraming;
 pub const ZygoteReady = messages.ZygoteReady;
 pub const ForkRequest = messages.ForkRequest;
 pub const ForkReply = messages.ForkReply;
-pub const WorkerRuntimeBootOptions = messages.WorkerRuntimeBootOptions;
 pub const WorkerInit = messages.WorkerInit;
 pub const WorkerReady = messages.WorkerReady;
 pub const WorkerInitFailed = messages.WorkerInitFailed;
 pub const WorkerRetiring = messages.WorkerRetiring;
 pub const ResponseCredit = messages.ResponseCredit;
 pub const DispatchPacketHeader = messages.DispatchPacketHeader;
-pub const FsFaultResponseStatus = messages.FsFaultResponseStatus;
-pub const FsFaultRequestHeader = messages.FsFaultRequestHeader;
-pub const FsFaultResponseHeader = messages.FsFaultResponseHeader;
 pub const EgressFetchStartHeader = messages.EgressFetchStartHeader;
-pub const EgressCancel = messages.EgressCancel;
-pub const EgressReleaseBody = messages.EgressReleaseBody;
+pub const EgressStop = messages.EgressStop;
 pub const EgressFetchHeadHeader = messages.EgressFetchHeadHeader;
 pub const BodyEncoding = messages.BodyEncoding;
 pub const EgressBodyChunkBatchHeader = messages.EgressBodyChunkBatchHeader;
@@ -100,27 +94,24 @@ pub const decodeRequestBodyFraming = messages.decodeRequestBodyFraming;
 pub const decodeMessageKind = messages.decodeMessageKind;
 pub const decodeWorkerInitFailedReason = messages.decodeWorkerInitFailedReason;
 pub const decodeWorkerRetiringReason = messages.decodeWorkerRetiringReason;
-pub const decodeFsFaultResponseStatus = messages.decodeFsFaultResponseStatus;
 
 pub const ReceivedPacket = packet.ReceivedPacket;
 pub const recvPacketWithFdsScratch = packet.recvPacketWithFdsScratch;
 pub const collectReceivedControlFds = packet.collectReceivedControlFds;
 
 pub const ForkReplyWithFds = zygote_worker.ForkReplyWithFds;
+pub const WorkerInitPart = zygote_worker.WorkerInitPart;
+pub const WorkerInitFds = zygote_worker.WorkerInitFds;
 pub const WorkerInitWithFds = zygote_worker.WorkerInitWithFds;
 pub const sendZygoteReady = zygote_worker.sendZygoteReady;
 pub const recvZygoteReady = zygote_worker.recvZygoteReady;
 pub const sendForkRequest = zygote_worker.sendForkRequest;
 pub const recvForkRequest = zygote_worker.recvForkRequest;
 pub const ForkRequestWithFd = zygote_worker.ForkRequestWithFd;
-pub const sendForkRequestWithCgroupFd = zygote_worker.sendForkRequestWithCgroupFd;
-pub const recvForkRequestWithFd = zygote_worker.recvForkRequestWithFd;
 pub const sendForkReply = zygote_worker.sendForkReply;
 pub const sendForkFailed = zygote_worker.sendForkFailed;
 pub const recvForkReply = zygote_worker.recvForkReply;
-pub const sendWorkerInitWithEgressShared = zygote_worker.sendWorkerInitWithEgressShared;
-pub const sendWorkerInitWithRouteTableAndEgressShared =
-    zygote_worker.sendWorkerInitWithRouteTableAndEgressShared;
+pub const sendWorkerInit = zygote_worker.sendWorkerInit;
 pub const recvWorkerInit = zygote_worker.recvWorkerInit;
 pub const sendWorkerReady = zygote_worker.sendWorkerReady;
 pub const recvWorkerReady = zygote_worker.recvWorkerReady;
@@ -132,15 +123,6 @@ pub const DispatchWork = dispatch.DispatchWork;
 pub const encodeDispatchWorkInto = dispatch.encodeDispatchWorkInto;
 pub const decodeDispatchWork = dispatch.decodeDispatchWork;
 
-pub const FsFaultRequest = fs_fault.Request;
-pub const FsFaultRequestView = fs_fault.RequestView;
-pub const FsFaultResponse = fs_fault.Response;
-pub const FsFaultResponseWithFd = fs_fault.ResponseWithFd;
-pub const sendFsFaultRequest = fs_fault.sendRequest;
-pub const sendFsFaultResponse = fs_fault.sendResponse;
-pub const decodeFsFaultRequest = fs_fault.decodeRequest;
-pub const decodeFsFaultResponseFromPacket = fs_fault.decodeResponseFromPacket;
-
 pub const EgressFetchStartView = egress.FetchStartView;
 pub const EgressFetchHeadView = egress.FetchHeadView;
 pub const EgressBodyChunkView = egress.BodyChunkView;
@@ -151,8 +133,7 @@ pub const encodeEgressFetchStartInto = egress.encodeFetchStartInto;
 pub const decodeEgressFetchStart = egress.decodeFetchStart;
 pub const WorkerEgressDecodeScratch = egress.WorkerDecodeScratch;
 pub const GatewayEgressDecodeScratch = egress.GatewayDecodeScratch;
-pub const decodeEgressCancel = egress.decodeCancel;
-pub const decodeEgressReleaseBody = egress.decodeReleaseBody;
+pub const decodeEgressStop = egress.decodeStop;
 pub const encodeEgressFetchHeadInto = egress.encodeFetchHeadInto;
 pub const decodeEgressFetchHead = egress.decodeFetchHead;
 pub const encodeEgressBodyChunkBatchInto = egress.encodeBodyChunkBatchInto;

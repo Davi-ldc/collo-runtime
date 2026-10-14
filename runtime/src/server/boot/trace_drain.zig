@@ -1,10 +1,12 @@
 //! The reader of the boot trace pipe (`SpawnedZygote.trace_read_fd` in
-//! `zygote/host_client.zig`) for the zygote's whole life. The host's launch
-//! path, the zygote and every worker child write event lines into the pipe
+//! `zygote/host_client.zig`) for the zygote's whole life. The pipe exists
+//! only when the boot trace is logged (`loggingRequested`), because the
+//! server then spawns the zygote with tracing; without it there is nothing to
+//! drain and no drain thread. The host's launch path, the zygote and every
+//! worker child during its boot write event lines into the pipe
 //! (`zygote/trace.zig`), and both ends are nonblocking, so a pipe nobody reads
-//! fills and every later event is dropped. The drain keeps it empty, logging
-//! each event line when `loggingRequested` says so and discarding it
-//! otherwise.
+//! fills and every later event is dropped. The drain keeps it empty and logs
+//! each event line.
 //!
 //! A writer puts each line into the pipe whole, with one write of at most
 //! `line_bytes_max` bytes, but a read ends wherever the bytes it takes run
@@ -30,37 +32,40 @@ const read_chunk_bytes: usize = 4096;
 pub const line_bytes_max: usize = process_limits.TRACE_EVENT_BUFFER_BYTES;
 
 pub const TraceDrain = struct {
-    /// Borrowed from `SpawnedZygote`.
+    /// Borrowed from `SpawnedZygote`; -1 without a pipe.
     trace_fd: posix.fd_t,
-    /// Wakes the drain so `deinit` can join it.
+    /// Wakes the drain so `deinit` can join it; unset without a pipe.
     wake_fd: fd_mod.OwnedFd,
-    log_lines: bool,
     lines: LineAssembler,
-    thread: std.Thread,
+    /// Null for a zygote spawned without tracing, which has no pipe.
+    thread: ?std.Thread,
 
     /// Starts draining `trace_fd`, which must stay open until `deinit`
-    /// returns.
-    pub fn init(target: *TraceDrain, trace_fd: posix.fd_t, log_lines: bool) !void {
-        var wake_fd = fd_mod.OwnedFd.fromRaw(try posix.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK));
-        errdefer wake_fd.deinit();
+    /// returns. A null `trace_fd`, a zygote spawned without tracing, starts
+    /// nothing, and `deinit` then has nothing to stop.
+    pub fn init(target: *TraceDrain, trace_fd: ?posix.fd_t) !void {
         target.* = .{
-            .trace_fd = trace_fd,
-            .wake_fd = wake_fd,
-            .log_lines = log_lines,
+            .trace_fd = -1,
+            .wake_fd = .{},
             .lines = .{},
-            .thread = undefined,
+            .thread = null,
         };
+        target.trace_fd = trace_fd orelse return;
+        target.wake_fd = fd_mod.OwnedFd.fromRaw(try posix.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK));
+        errdefer target.wake_fd.deinit();
         target.thread = try std.Thread.spawn(.{}, drain, .{target});
     }
 
     pub fn deinit(self: *TraceDrain) void {
-        const one: u64 = 1;
-        // Writing 1 to an eventfd fails only on a counter near its maximum
-        // or a closed descriptor. Without the wake the join below never
-        // returns, so the process ends here instead of hanging.
-        fd_mod.writeAllRaw(self.wake_fd.fd(), std.mem.asBytes(&one)) catch |err|
-            std.debug.panic("cannot wake the boot trace drain: {s}", .{@errorName(err)});
-        self.thread.join();
+        if (self.thread) |thread| {
+            const one: u64 = 1;
+            // Writing 1 to an eventfd fails only on a counter near its
+            // maximum or a closed descriptor. Without the wake the join below
+            // never returns, so the process ends here instead of hanging.
+            fd_mod.writeAllRaw(self.wake_fd.fd(), std.mem.asBytes(&one)) catch |err|
+                std.debug.panic("cannot wake the boot trace drain: {s}", .{@errorName(err)});
+            thread.join();
+        }
         self.wake_fd.deinit();
         self.* = undefined;
     }
@@ -102,8 +107,7 @@ pub const TraceDrain = struct {
             };
             if (length == 0)
                 return true;
-            if (self.log_lines)
-                self.lines.feed(buffer[0..length], LogSink{});
+            self.lines.feed(buffer[0..length], LogSink{});
         }
     }
 };
@@ -180,15 +184,36 @@ const LogSink = struct {
     }
 };
 
-/// `COLLO_BOOT_TRACE=1` or `COLLO_DEBUG=1` logs the trace; a Debug build
-/// always does.
+/// Whether this server logs the boot trace (`traceLogged` over its build
+/// mode and environment). The server spawns its zygote with a trace pipe
+/// exactly then.
 pub fn loggingRequested() bool {
-    if (builtin.mode == .Debug)
-        return true;
-    return environmentFlag("COLLO_BOOT_TRACE") or environmentFlag("COLLO_DEBUG");
+    return traceLogged(.{
+        .mode = builtin.mode,
+        .boot_trace = posix.getenv("COLLO_BOOT_TRACE"),
+        .debug = posix.getenv("COLLO_DEBUG"),
+    });
 }
 
-fn environmentFlag(name: [:0]const u8) bool {
-    const value = posix.getenv(name) orelse return false;
-    return std.mem.eql(u8, std.mem.trim(u8, value, " \t\r\n"), "1");
+/// What decides whether the boot trace is logged.
+pub const TraceInputs = struct {
+    mode: std.builtin.OptimizeMode,
+    /// `COLLO_BOOT_TRACE`, null when unset.
+    boot_trace: ?[]const u8,
+    /// `COLLO_DEBUG`, null when unset.
+    debug: ?[]const u8,
+};
+
+/// A Debug build always logs the trace; any other logs it when either
+/// variable is `1`, so a ReleaseFast server without them spawns no pipe and
+/// starts no drain thread.
+pub fn traceLogged(inputs: TraceInputs) bool {
+    if (inputs.mode == .Debug)
+        return true;
+    return flagSet(inputs.boot_trace) or flagSet(inputs.debug);
+}
+
+fn flagSet(value: ?[]const u8) bool {
+    const text = value orelse return false;
+    return std.mem.eql(u8, std.mem.trim(u8, text, " \t\r\n"), "1");
 }

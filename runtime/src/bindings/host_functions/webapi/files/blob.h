@@ -10,7 +10,6 @@
 #pragma once
 
 #include "host_functions/support.h"
-#include "host_functions/webapi/files/blob_backing_store.h"
 
 #include <JavaScriptCore/JSDestructibleObject.h>
 #include <wtf/Ref.h>
@@ -34,8 +33,8 @@ public:
 
     std::span<const uint8_t> span() const LIFETIME_BOUND;
     size_t size() const { return m_bytes.size(); }
-    // The object plus the vector's capacity, as the object URL registry and memoryCost() charge it.
-    size_t objectURLMemoryCost() const;
+    // The object plus the vector's capacity, as BlobStorage::memoryCost() charges it.
+    size_t memoryCost() const;
 
 private:
     explicit BlobBytes(WTF::Vector<uint8_t>&&);
@@ -66,8 +65,8 @@ public:
     static WTF::RefPtr<BlobStorage> create(WTF::Vector<uint8_t>&&);
 
     size_t size() const { return m_size; }
-    // This object and its vectors, plus the full objectURLMemoryCost() of every distinct BlobBytes it references,
-    // even one it views only in part. Fixed at creation.
+    // This object and its segment vector, plus the full memoryCost() of every distinct BlobBytes it references, even
+    // one it views only in part. Fixed at creation.
     size_t memoryCost() const;
     // Appends `size` bytes from `offset`. Returns false when the range is out of bounds or the append cannot
     // allocate, leaving a partial copy in the vector.
@@ -77,9 +76,6 @@ public:
     // segment would exceed the cap, so a caller that flattens fragmented storage never builds the over-cap vector
     // first. Also returns false on an out-of-bounds range or allocation failure.
     bool appendSegmentsTo(WTF::Vector<BlobSegment>&, size_t offset, size_t size, size_t max_segments = 0) const;
-    // Appends what the object URL registry charges for this storage: the storage itself, then each distinct
-    // BlobBytes. Returns false on allocation failure.
-    bool appendObjectURLBackingStores(WTF::Vector<BlobObjectURLBackingStore>&) const;
     // The caller guarantees that the range lies within the storage and that the span holds `size` bytes; only debug
     // builds check.
     void copyTo(std::span<uint8_t>, size_t offset, size_t size) const;
@@ -102,13 +98,10 @@ public:
     }
 
 private:
-    BlobStorage(WTF::Vector<BlobSegment>&&, WTF::Vector<BlobObjectURLBackingStore>&&, size_t size,
-        size_t object_url_metadata_cost, size_t memory_cost);
+    BlobStorage(WTF::Vector<BlobSegment>&&, size_t size, size_t memory_cost);
 
     WTF::Vector<BlobSegment> m_segments;
-    WTF::Vector<BlobObjectURLBackingStore> m_object_url_byte_stores;
     size_t m_size { 0 };
-    size_t m_object_url_metadata_cost { 0 };
     size_t m_memory_cost { 0 };
     std::atomic<uint32_t> m_extra_memory_claim_version { 0 };
 };
@@ -144,7 +137,6 @@ public:
     // The span must hold size() bytes.
     void copyBytesTo(std::span<uint8_t>) const;
     bool appendStorageSegments(WTF::Vector<BlobSegment>&) const;
-    bool appendObjectURLBackingStores(WTF::Vector<BlobObjectURLBackingStore>&) const;
     WTF::Ref<BlobStorage> storageRef() const { return m_storage.copyRef(); }
     size_t byteOffset() const { return m_offset; }
     // A new Blob over `length` bytes from `start`. The caller keeps the range within size(): only a range past the
@@ -176,8 +168,11 @@ public:
     }
 
     static JSC::Structure* createStructure(JSC::VM&, JSC::JSGlobalObject*, JSC::JSValue prototype);
-    static JSColloFile* create(
-        JSC::VM&, JSC::Structure*, WTF::Vector<uint8_t>&&, WTF::String type, WTF::String name, double last_modified);
+    // As JSColloBlob::create over a storage range: the range must lie within the storage, which only debug builds
+    // check, and the call never returns null.
+    static JSColloFile* create(JSC::VM&, JSC::Structure*, WTF::Ref<BlobStorage>&&, size_t offset, size_t size,
+        WTF::String type, WTF::String name, double last_modified);
+    // Builds a new storage over the segments first; returns null when that fails.
     static JSColloFile* create(JSC::VM&, JSC::Structure*, WTF::Vector<BlobSegment>&&, size_t size, WTF::String type,
         WTF::String name, double last_modified);
     // A File over the same storage and range as the Blob, with the Blob's type. Never returns null.

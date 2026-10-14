@@ -8,27 +8,27 @@
 //! struct; they do not keep older peers working, and nothing else does.
 //! The codecs that add variable data or descriptors to these headers live
 //! beside this file: `dispatch.zig` (DispatchWork), `zygote_worker.zig` (fork
-//! and WorkerInit), `egress.zig`, `egress_attach.zig`, `worker_retiring.zig`
-//! and `fs_fault.zig`. An
-//! egress token rides in these headers as `egress_token.Bytes`, whose layout
-//! `egress_token.zig` owns and pins. The file holds only types and pure
-//! functions, callable from any thread.
+//! and WorkerInit), `egress.zig`, `egress_attach.zig` and
+//! `worker_retiring.zig`. A request's completion, `request_done`, is an
+//! operation of the ingress channel (`ingress_channel/framing.zig`) and
+//! carries a `RequestDoneStatus`. An egress token rides in these headers as
+//! `egress_token.Bytes`, whose layout `egress_token.zig` owns and pins. The
+//! file holds only types and pure functions, callable from any thread.
 
 const std = @import("std");
 const limits = @import("collo_limits");
-const route_table = @import("route_table.zig");
 const egress_token = @import("egress_token.zig");
 
 pub const max_message_bytes: usize = 1024 * 1024;
 pub const max_route_capture_count: usize = 64;
 pub const max_request_header_count: usize = 256;
-/// Sized by the packet with the most descriptors, a WorkerInit of a worker
-/// that serves routes, whose descriptor table `zygote_worker.zig` defines and
-/// checks against this bound at compile time.
-pub const max_fds_per_message: usize = 30;
+/// Sized by the packet with the most descriptors, a WorkerInit with an
+/// egress session, whose descriptor table `zygote_worker.zig` defines and
+/// holds equal to this bound at compile time.
+pub const max_fds_per_message: usize = 26;
 
-/// Values 8, 9, 10, 13, 21 and 22 name no message, and `decodeMessageKind`
-/// refuses them.
+/// Values 8, 9, 10, 13, 15, 21, 22, 24 and 25 name no message, and
+/// `decodeMessageKind` refuses them.
 pub const MessageKind = enum(u32) {
     zygote_ready = 1,
     fork_request = 2,
@@ -39,18 +39,13 @@ pub const MessageKind = enum(u32) {
     dispatch_work = 7,
     ingress_channel = 11,
     egress_fetch_start = 12,
-    egress_cancel = 14,
-    egress_release_body = 15,
+    egress_stop = 14,
     egress_fetch_head = 16,
     egress_body_chunk_batch = 17,
     egress_body_end = 18,
     egress_fetch_error = 19,
     egress_abort_ack = 20,
     egress_upload_chunk_batch = 23,
-    /// A file request and its answer travel on the fs fault SEQPACKET pair
-    /// WorkerInit hands the child, never on the worker control channel.
-    fs_fault_request = 24,
-    fs_fault_response = 25,
     /// Server to worker on the worker's control socket, after the gateway the worker was attached
     /// to was replaced: the worker half of its new egress session (`EgressAttach`,
     /// `egress_attach.zig`).
@@ -63,8 +58,8 @@ pub const MessageKind = enum(u32) {
     response_credit = 28,
 };
 
-/// Why a worker asks to be retired. A worker never exits on its own for
-/// either reason: it sends `worker_retiring` once and keeps answering every
+/// Why a worker asks to be retired. A worker never exits on its own for any
+/// of them: it sends `worker_retiring` once and keeps answering every
 /// request that reaches it until the server, which alone knows whether a
 /// request is still on its way, retires it.
 pub const WorkerRetiringReason = enum(u32) {
@@ -74,8 +69,14 @@ pub const WorkerRetiringReason = enum(u32) {
     /// A termination poisoned the worker's VM, which runs no JavaScript
     /// again.
     vm_terminated = 2,
+    /// The worker detached from its egress session on its own, on a packet
+    /// or a pool state only a gateway defect produces, and no session will
+    /// replace it, so a fresh worker can fetch where this one cannot
+    /// (`worker/egress/gateway_runtime.zig`).
+    egress_detached = 3,
 };
 
+/// Value 7 names no reason, and `decodeWorkerInitFailedReason` refuses it.
 pub const WorkerInitFailedReason = enum(u32) {
     invalid_worker_init = 1,
     missing_metrics_fd = 2,
@@ -83,9 +84,6 @@ pub const WorkerInitFailedReason = enum(u32) {
     missing_ingress_payload_fd = 4,
     missing_egress_shared_fd = 5,
     missing_ingress_payload_credit_fd = 6,
-    /// The fs index memfd failed to map or parse in the child. The worker has
-    /// no fallback index, so the init fails.
-    invalid_fs_index = 7,
     /// The child's evaluation watchdog, armed at
     /// `WorkerInit.init_deadline_mono_ns` less
     /// `limits.process.WORKER_INIT_CLEANUP_RESERVE_NS`, stopped the VM while
@@ -97,27 +95,11 @@ pub const WorkerInitFailedReason = enum(u32) {
     init_deadline_exceeded = 8,
 };
 
-/// Status of an fs fault response. An `ok` response carries exactly one file
-/// descriptor as SCM_RIGHTS ancillary data, and its packet body is the fixed
-/// header alone; every other status carries none. `fs_fault.zig` enforces
-/// this on send and on decode.
-pub const FsFaultResponseStatus = enum(u32) {
-    ok = 0,
-    /// The path is not in the worker's fs index.
-    not_found = 1,
-    /// The identity matches no request the host has in flight on this worker
-    /// and no boot permit, such as a request-less fault after ready.
-    refused = 2,
-    /// The host could not produce the file.
-    fetch_failed = 3,
-};
-
-/// How a worker ended a request, as it publishes the request's completion.
-/// The completion ring refuses a value above its bound
-/// (`worker_completion_status_max` in
-/// `common/worker_state/page/completion_ring.zig`), which
-/// `runtime/tests/contracts/limits.zig` holds equal to the last tag.
-pub const RequestDoneStatus = enum(u32) {
+/// How a worker ended a request, as its `request_done` names it
+/// (`ingress_channel/framing.zig:RequestDone.status`); the decoder refuses a
+/// value this enum does not name. The only vocabulary of a request's end that
+/// crosses from a worker to the server.
+pub const RequestDoneStatus = enum(u8) {
     ok = 0,
     bad_request = 1,
     js_exception = 2,
@@ -178,13 +160,20 @@ pub const DispatchWorkView = struct {
     request_lane_id: u16 = 0,
     request_slot: u32 = 0,
     request_generation: u64 = 0,
+    /// The worker's pool slot the request holds (`server/supervisor/pool.zig`),
+    /// the index of the live slot the worker writes for it on its page
+    /// (`common/worker_state/page/live_slots.zig`). Below
+    /// `limits.server.worker_concurrency_max`; the decoder refuses any other
+    /// value. The server dispatches another request on the slot only after
+    /// the worker's `request_done` for this one, so no two requests a worker
+    /// runs name one slot.
+    worker_slot: u8,
     /// The request's egress token (`egress_token.zig`), which the worker copies into every
     /// fetch the request makes and never reads; `egress_token.none` when the worker has no
     /// egress session.
     egress_token: egress_token.Bytes = egress_token.none,
     worker_id: u64 = 0,
     worker_generation: u64 = 0,
-    accounting_flags: u32 = 0,
     /// The request's authority, which the worker uses as the host of
     /// `request.url`. The decoder refuses an empty one.
     authority: []const u8,
@@ -195,8 +184,9 @@ pub const DispatchWorkView = struct {
     request_headers: []const RequestHeader,
     body_framing: RequestBodyFraming,
     route_captures: []const RouteCapture,
-    /// The request's route: its position in the route table of the worker's
-    /// definition (`route_table.zig`), which WorkerInit delivered.
+    /// The request's route: its position in the routes section of the
+    /// worker's definition artifact (`module_pack.zig`), which WorkerInit
+    /// delivered.
     route_index: u16,
 };
 
@@ -208,23 +198,20 @@ pub const ZygoteReady = extern struct {
     }
 };
 
+/// Host to zygote: fork one worker. The packet is this struct with exactly
+/// one descriptor, the worker's cgroup leaf, which the launch created with
+/// its limits and the zygote clones the child into (CLONE_INTO_CGROUP), so
+/// no worker runs a moment outside its leaf. The job id is the caller's, and
+/// the reply repeats it. The reserved field names the struct's padding, and
+/// the decoder refuses it nonzero.
 pub const ForkRequest = extern struct {
     kind: u32,
-    flags: u32,
+    _reserved0: u32 = 0,
     fork_job_id: u64,
 
-    pub const Flags = struct {
-        /// The request carries the worker's pre-created cgroup directory fd as
-        /// SCM_RIGHTS ancillary data; the zygote clones the child directly into
-        /// that cgroup (CLONE_INTO_CGROUP).
-        pub const cgroup_fd: u32 = 1 << 0;
-        pub const valid_mask: u32 = cgroup_fd;
-    };
-
-    pub fn init(fork_job_id: u64, flags: u32) ForkRequest {
+    pub fn init(fork_job_id: u64) ForkRequest {
         return .{
             .kind = @intFromEnum(MessageKind.fork_request),
-            .flags = flags,
             .fork_job_id = fork_job_id,
         };
     }
@@ -244,87 +231,20 @@ pub const ForkReply = extern struct {
     }
 };
 
-pub const WorkerRuntimeBootOptions = extern struct {
-    runtime_flags: u32 = 0,
-    _reserved0: u32 = 0,
-    max_fetches_per_request: u64 = 16,
-    max_fetches_per_worker: u64 = 64,
-    max_timers_per_worker: u64 = 256,
-    ready_queue_capacity: u64 = 256,
-    /// Requests the worker keeps a task for at once. The server may send a
-    /// worker `worker_concurrency_max` requests at a time
-    /// (`common/limits/server.zig`), so `validate` refuses less.
-    request_task_capacity: u64 = 64,
-    crypto_thread_count: u64 = default_crypto_thread_count,
-    crypto_max_in_flight_per_request: u64 = default_crypto_max_in_flight_per_request,
-    crypto_max_in_flight_per_worker: u64 = default_crypto_max_in_flight_per_worker,
-
-    pub const max_crypto_thread_count: u64 = 2;
-    pub const default_crypto_thread_count: u64 = 2;
-    pub const default_crypto_max_in_flight_per_request: u64 = 6;
-    pub const default_crypto_max_in_flight_per_worker: u64 =
-        64 * default_crypto_max_in_flight_per_request;
-    pub const flag_trace_requests: u32 = 1 << 0;
-    pub const flag_trace_all_requests: u32 = 1 << 1;
-    pub const flag_log_full_js_exceptions: u32 = 1 << 2;
-    /// Records the first handler call's timestamp, independent of request
-    /// tracing.
-    pub const flag_bench_handler: u32 = 1 << 3;
-    pub const valid_flags: u32 =
-        flag_trace_requests |
-        flag_trace_all_requests |
-        flag_log_full_js_exceptions |
-        flag_bench_handler;
-
-    pub fn default() WorkerRuntimeBootOptions {
-        return .{};
-    }
-
-    pub fn deriveCryptoMaxInFlightPerWorker(self: *const WorkerRuntimeBootOptions) u64 {
-        return std.math.mul(
-            u64,
-            self.request_task_capacity,
-            self.crypto_max_in_flight_per_request,
-        ) catch std.math.maxInt(u64);
-    }
-
-    pub fn validate(self: *const WorkerRuntimeBootOptions) !void {
-        if ((self.runtime_flags & ~valid_flags) != 0)
-            return error.InvalidWorkerRuntimeOptions;
-        if (self.max_fetches_per_request == 0 or
-            self.max_fetches_per_worker == 0 or
-            self.max_timers_per_worker == 0 or
-            self.ready_queue_capacity == 0 or
-            self.crypto_thread_count == 0 or
-            self.crypto_thread_count > max_crypto_thread_count or
-            self.crypto_max_in_flight_per_request == 0 or
-            self.crypto_max_in_flight_per_worker == 0)
-        {
-            return error.InvalidWorkerRuntimeOptions;
-        }
-        if (self.request_task_capacity < limits.server.worker_concurrency_max)
-            return error.InvalidWorkerRuntimeOptions;
-    }
-};
-
-/// Host to child, once, on the init socket of a fresh fork: the limits and
-/// descriptors the child boots with. The packet is this struct alone, with
-/// the descriptor table `zygote_worker.zig` defines. The reserved field names
-/// the struct's padding, and `validate` refuses it nonzero.
+/// Host to child, once, on the init socket of a fresh fork: what varies
+/// between the workers one binary launches. The packet is this struct alone,
+/// with the descriptor table `zygote_worker.zig` defines; every limit that
+/// does not vary is a constant of `common/limits/worker.zig`, which both ends
+/// compile.
 pub const WorkerInit = extern struct {
     kind: u32,
     flags: u32 = 0,
+    /// The memory limit the launch wrote to the worker's leaf, which the
+    /// child reads back from it.
     memory_limit_bytes: u64,
+    /// The size of the tmpfs the child mounts over its `/tmp`; nonzero and at
+    /// most `memory_limit_bytes`.
     tmpfs_size_bytes: u64,
-    /// Length of the route table of the worker's definition
-    /// (`route_table.zig`), the sealed memfd in the descriptor table; at least
-    /// the empty table and at most `route_table.bytes_max`.
-    route_table_len: u64,
-    /// The `cpu.max` quota, in cores over the cgroup period, the child must
-    /// find on its own cgroup. It travels beside the memory limit so the child
-    /// checks the limits it was actually given.
-    cpu_max_cores: u32 = limits.worker.cpu_max_cores,
-    _reserved0: u32 = 0,
     /// The boot token (`egress_token.zig`, kind boot) that fetches made while
     /// route modules evaluate present, with the deadline
     /// `host/launch.zig:bootEgressDeadline` gives it. `egress_token.none`
@@ -339,9 +259,8 @@ pub const WorkerInit = extern struct {
     /// Required nonzero; senders set it explicitly.
     init_deadline_mono_ns: u64 = 0,
     /// The CPU budget of each request the worker serves, its definition's
-    /// `cpuMs` in nanoseconds: the VM thread's CPU while the request owns it
-    /// plus the crypto pool's on the request's jobs. 0 for a definition that
-    /// sets none; at most `request_cpu_budget_ns_max`.
+    /// `cpuMs` in nanoseconds: the VM thread's CPU while the request owns it.
+    /// 0 for a definition that sets none; at most `request_cpu_budget_ns_max`.
     request_cpu_budget_ns: u64 = 0,
     /// The wall-clock limit of each stretch of JavaScript that no request and
     /// no module evaluation owns, which the worker runs as its own owner: its
@@ -351,36 +270,23 @@ pub const WorkerInit = extern struct {
     /// `default_unowned_time_limit_ns`, which a launch for a definition
     /// replaces.
     unowned_time_limit_ns: u64 = default_unowned_time_limit_ns,
-    runtime: WorkerRuntimeBootOptions,
 
-    pub const flag_isolated_network: u32 = 1 << 0;
-    pub const flag_deny_direct_egress: u32 = 1 << 1;
-    /// The child serves the routes of its route table: the packet's last
-    /// descriptor is the definition's module pack, the child registers it and
-    /// evaluates every route's entry before it reports ready, and module
-    /// top-level code gets timers, and fetch when `boot_egress_token` is not
-    /// `egress_token.none`. Set exactly when the route table holds a route
-    /// (`validate`): the host sets it on every launch that carries routes,
-    /// and a harness that wants a VM without them sends the empty table.
-    pub const flag_serves_routes: u32 = 1 << 2;
-    /// Each route of the table runs in a realm of its own, with its own
+    /// Each route of the definition runs in a realm of its own, with its own
     /// globals, intrinsics and module registry; clear, every route shares the
-    /// VM's main realm. Fixed for the worker's life, and set only beside
-    /// `flag_serves_routes` (`validate`).
-    pub const flag_isolate_realm: u32 = 1 << 3;
+    /// VM's main realm. Fixed for the worker's life.
+    pub const flag_isolate_realm: u32 = 1 << 0;
     /// The packet carries the worker's egress wake descriptors, so the worker
     /// can be attached to a gateway and fetch through it. Without the flag it
     /// carries no egress descriptor at all. A boot token needs the flag
     /// (`validate`). The sender in `zygote_worker.zig` owns the bit: it sets
     /// it exactly when the wake descriptors travel, whatever the caller's
     /// message says.
-    pub const flag_egress: u32 = 1 << 4;
-    pub const valid_flags: u32 = flag_isolated_network | flag_deny_direct_egress | flag_serves_routes |
-        flag_isolate_realm | flag_egress;
+    pub const flag_egress: u32 = 1 << 1;
+    /// The worker records its first handler call on its page
+    /// (`WorkerWriterView.publishBenchHandler`), for the cold-start bench.
+    pub const flag_bench_handler: u32 = 1 << 2;
+    pub const valid_flags: u32 = flag_isolate_realm | flag_egress | flag_bench_handler;
     pub const default_tmpfs_size_bytes: u64 = 256 * 1024 * 1024;
-    /// Keeps a corrupt value from becoming a cgroup quota; far above the
-    /// core count of any machine Collo runs on.
-    pub const max_cpu_max_cores: u32 = 256;
     pub const request_cpu_budget_ns_max: u64 =
         @as(u64, limits.server.request_cpu_ms_max) * std.time.ns_per_ms;
     pub const unowned_time_limit_ns_max: u64 =
@@ -391,38 +297,19 @@ pub const WorkerInit = extern struct {
     /// `runtime/tests/contracts/limits.zig` holds equal.
     pub const default_unowned_time_limit_ns: u64 = 30 * std.time.ns_per_s;
 
-    pub fn init(memory_limit_bytes: u64, runtime: WorkerRuntimeBootOptions) !WorkerInit {
-        var message = std.mem.zeroes(WorkerInit);
-        message.kind = @intFromEnum(MessageKind.worker_init);
-        message.memory_limit_bytes = memory_limit_bytes;
-        // `zeroes` cleared the field defaults; a caller with another CPU
-        // limit or another unowned limit overwrites them.
-        message.cpu_max_cores = limits.worker.cpu_max_cores;
-        message.unowned_time_limit_ns = default_unowned_time_limit_ns;
-        message.tmpfs_size_bytes = defaultTmpfsSizeBytes(memory_limit_bytes);
-        message.route_table_len = route_table.empty_blob.len;
-        message.runtime = runtime;
-        return message;
+    /// A message with no flag, no boot token and no init deadline, the
+    /// default tmpfs size and the default unowned limit; the launch sets the
+    /// rest before it sends.
+    pub fn init(memory_limit_bytes: u64) WorkerInit {
+        return .{
+            .kind = @intFromEnum(MessageKind.worker_init),
+            .memory_limit_bytes = memory_limit_bytes,
+            .tmpfs_size_bytes = defaultTmpfsSizeBytes(memory_limit_bytes),
+        };
     }
 
     pub fn defaultTmpfsSizeBytes(memory_limit_bytes: u64) u64 {
         return @min(default_tmpfs_size_bytes, memory_limit_bytes);
-    }
-
-    pub fn enableEgressGatewaySandbox(self: *WorkerInit) void {
-        self.flags |= flag_isolated_network | flag_deny_direct_egress;
-    }
-
-    pub fn wantsIsolatedNetwork(self: *const WorkerInit) bool {
-        return (self.flags & flag_isolated_network) != 0;
-    }
-
-    pub fn wantsDenyDirectEgress(self: *const WorkerInit) bool {
-        return (self.flags & flag_deny_direct_egress) != 0;
-    }
-
-    pub fn servesRoutes(self: *const WorkerInit) bool {
-        return (self.flags & flag_serves_routes) != 0;
     }
 
     pub fn isolatesRealms(self: *const WorkerInit) bool {
@@ -433,12 +320,16 @@ pub const WorkerInit = extern struct {
         return (self.flags & flag_egress) != 0;
     }
 
+    pub fn recordsBenchHandler(self: *const WorkerInit) bool {
+        return (self.flags & flag_bench_handler) != 0;
+    }
+
+    /// The child's check of the fields, before it uses any of them
+    /// (`zygote_worker.recvWorkerInit` checked the kind and the descriptor
+    /// table). Every value is the host's, so a failure is a host bug the
+    /// child reports, not an attack it repels.
     pub fn validate(self: *const WorkerInit) !void {
         if ((self.flags & ~valid_flags) != 0)
-            return error.InvalidWorkerInitFlags;
-        if (self._reserved0 != 0)
-            return error.InvalidWorkerInitFlags;
-        if (self.wantsDenyDirectEgress() and !self.wantsIsolatedNetwork())
             return error.InvalidWorkerInitFlags;
         // A boot token is spent through the session's descriptors, which a
         // packet without the wake descriptors never carries.
@@ -446,33 +337,14 @@ pub const WorkerInit = extern struct {
             return error.InvalidWorkerInitFlags;
         if (self.memory_limit_bytes == 0)
             return error.ZeroMemoryLimit;
-        if (self.tmpfs_size_bytes == 0)
-            return error.InvalidWorkerInitFlags;
-        if (self.tmpfs_size_bytes > self.memory_limit_bytes)
-            return error.InvalidWorkerInitFlags;
-        if (self.route_table_len < route_table.empty_blob.len)
-            return error.InvalidWorkerInitFlags;
-        if (self.route_table_len > route_table.bytes_max)
-            return error.InvalidWorkerInitFlags;
-        // A valid table that holds a route is longer than the empty one, and
-        // a worker serves routes exactly when its table holds some.
-        if (self.servesRoutes() != (self.route_table_len != route_table.empty_blob.len))
-            return error.InvalidWorkerInitFlags;
-        if (self.isolatesRealms() and !self.servesRoutes())
-            return error.InvalidWorkerInitFlags;
-        if (self.cpu_max_cores == 0 or self.cpu_max_cores > max_cpu_max_cores)
-            return error.InvalidWorkerInitCpuQuota;
+        if (self.tmpfs_size_bytes == 0 or self.tmpfs_size_bytes > self.memory_limit_bytes)
+            return error.InvalidWorkerInitTmpfsSize;
         if (self.request_cpu_budget_ns > request_cpu_budget_ns_max)
             return error.InvalidWorkerInitTimeLimit;
-        if (self.unowned_time_limit_ns == 0)
+        if (self.unowned_time_limit_ns == 0 or self.unowned_time_limit_ns > unowned_time_limit_ns_max)
             return error.InvalidWorkerInitTimeLimit;
-        if (self.unowned_time_limit_ns > unowned_time_limit_ns_max)
-            return error.InvalidWorkerInitTimeLimit;
-        try self.runtime.validate();
-        // Checked last so a probe of any other field fails on that field,
-        // not on a missing deadline.
         if (self.init_deadline_mono_ns == 0)
-            return error.InvalidWorkerInitFlags;
+            return error.InvalidWorkerInitDeadline;
     }
 };
 
@@ -530,8 +402,8 @@ pub const ResponseCredit = extern struct {
 
 /// Fixed head of a DispatchWork packet. `dispatch.zig` owns the variable
 /// sections after it, their order and the bounds the decoder checks. The
-/// reserved field names the struct's padding, and the decoder refuses a
-/// header where it is nonzero.
+/// reserved fields name the struct's padding, and the decoder refuses a
+/// header where one is nonzero.
 pub const DispatchPacketHeader = extern struct {
     kind: u32,
     request_slot: u32,
@@ -541,7 +413,7 @@ pub const DispatchPacketHeader = extern struct {
     worker_id: u64,
     worker_generation: u64,
     deadline_monotonic_ns: u64,
-    accounting_flags: u32,
+    _reserved0: u32,
     request_lane_id: u16,
     route_index: u16,
     authority_len: u32,
@@ -550,7 +422,10 @@ pub const DispatchPacketHeader = extern struct {
     raw_query_len: u32,
     route_capture_count: u32,
     route_captures_bytes_len: u32,
-    _reserved0: u32,
+    /// `DispatchWorkView.worker_slot`.
+    worker_slot: u8,
+    _reserved1: u8,
+    _reserved2: u16,
     request_header_count: u32,
     request_headers_bytes_len: u32,
     body_framing: u32,
@@ -567,41 +442,15 @@ pub const EgressAttach = extern struct {
     }
 };
 
-/// Request header on the fs fault channel. `path_len` bytes of tree-relative
-/// path follow it: the bytes of an fs index entry, at most
-/// `fs_fault.max_path_bytes`. `fs_fault.zig` owns the identity shapes the
-/// decoder accepts.
-pub const FsFaultRequestHeader = extern struct {
-    kind: u32,
-    _reserved0: u32,
-    fault_id: u64,
-    request_id: u64,
-    request_generation: u64,
-    worker_id: u64,
-    worker_generation: u64,
-    path_len: u32,
-    _reserved1: u32,
-};
-
-/// Response header on the fs fault channel, which is the whole packet body.
-/// The file descriptor of an `ok` response travels as SCM_RIGHTS ancillary
-/// data (`FsFaultResponseStatus`).
-pub const FsFaultResponseHeader = extern struct {
-    kind: u32,
-    status: u32,
-    fault_id: u64,
-};
-
 /// Fixed head of a fetch's start packet; `egress.zig` owns the sections after it. The token is
 /// the only identity a fetch carries: the gateway takes the request id, generation, session,
 /// policy and deadline from it once it verifies the tag, and nothing else in the packet names a
-/// request.
+/// request. The gateway resolves the response's byte limit from its own policy.
 pub const EgressFetchStartHeader = extern struct {
     kind: u32,
     flags: u32,
     fetch_id: u64,
     body_id: u64,
-    max_body_bytes: u64,
     method_len: u32,
     url_len: u32,
     request_header_count: u32,
@@ -611,31 +460,18 @@ pub const EgressFetchStartHeader = extern struct {
     egress_token: egress_token.Bytes,
 };
 
-pub const EgressCancel = extern struct {
-    kind: u32,
-    reason_len: u32,
-    fetch_id: u64,
-
-    pub fn init(fetch_id: u64, reason_len: u32) EgressCancel {
-        return .{
-            .kind = @intFromEnum(MessageKind.egress_cancel),
-            .reason_len = reason_len,
-            .fetch_id = fetch_id,
-        };
-    }
-};
-
-pub const EgressReleaseBody = extern struct {
+/// Worker to gateway: stop fetch `fetch_id`, whatever it is doing. The gateway answers it once
+/// with `egress_abort_ack` and ignores a stop for a fetch it no longer holds, which a worker
+/// cannot see; the worker sends at most one per fetch (`worker/egress/task_runtime.zig:stopFetch`).
+pub const EgressStop = extern struct {
     kind: u32,
     _reserved0: u32 = 0,
     fetch_id: u64,
-    body_id: u64,
 
-    pub fn init(fetch_id: u64, body_id: u64) EgressReleaseBody {
+    pub fn init(fetch_id: u64) EgressStop {
         return .{
-            .kind = @intFromEnum(MessageKind.egress_release_body),
+            .kind = @intFromEnum(MessageKind.egress_stop),
             .fetch_id = fetch_id,
-            .body_id = body_id,
         };
     }
 };
@@ -721,15 +557,10 @@ pub const EgressBodyChunkBatchDescriptor = extern struct {
     fetch_id: u64,
     body_id: u64,
     /// Bytes as placed in the pool, in the coding the head's `body_encoding`
-    /// names.
+    /// names; the worker counts them as the fetch's received bytes.
     len: u32,
     _reserved0: u32 = 0,
     body_pool_offset: u64,
-    /// The fetch's byte meters, cumulative; the worker keeps the largest
-    /// value of each (`fetch_body.EgressMeters`).
-    billed_sent_total: u64 = 0,
-    billed_received_total: u64 = 0,
-    cost_total: u64 = 0,
 };
 
 pub const EgressBodyEnd = extern struct {
@@ -737,10 +568,6 @@ pub const EgressBodyEnd = extern struct {
     _reserved0: u32 = 0,
     fetch_id: u64,
     body_id: u64,
-    /// The fetch's byte meters, cumulative.
-    billed_sent_total: u64 = 0,
-    billed_received_total: u64 = 0,
-    cost_total: u64 = 0,
     /// Readiness stamp, as `EgressFetchHeadHeader.ready_at_mono_ns`.
     ready_at_mono_ns: u64 = 0,
 
@@ -769,10 +596,6 @@ pub const EgressFetchErrorHeader = extern struct {
     message_len: u32,
     fetch_id: u64,
     body_id: u64,
-    /// The fetch's byte meters, cumulative.
-    billed_sent_total: u64 = 0,
-    billed_received_total: u64 = 0,
-    cost_total: u64 = 0,
     /// Readiness stamp, as `EgressFetchHeadHeader.ready_at_mono_ns`.
     ready_at_mono_ns: u64 = 0,
     /// `EgressFetchErrorCause`, validated on decode.
@@ -820,16 +643,13 @@ pub fn decodeMessageKind(raw: u32) !MessageKind {
         7 => .dispatch_work,
         11 => .ingress_channel,
         12 => .egress_fetch_start,
-        14 => .egress_cancel,
-        15 => .egress_release_body,
+        14 => .egress_stop,
         16 => .egress_fetch_head,
         17 => .egress_body_chunk_batch,
         18 => .egress_body_end,
         19 => .egress_fetch_error,
         20 => .egress_abort_ack,
         23 => .egress_upload_chunk_batch,
-        24 => .fs_fault_request,
-        25 => .fs_fault_response,
         26 => .egress_attach,
         27 => .worker_retiring,
         28 => .response_credit,
@@ -841,17 +661,8 @@ pub fn decodeWorkerRetiringReason(raw: u32) !WorkerRetiringReason {
     return switch (raw) {
         1 => .routes_failed,
         2 => .vm_terminated,
+        3 => .egress_detached,
         else => error.InvalidWorkerRetiringReason,
-    };
-}
-
-pub fn decodeFsFaultResponseStatus(raw: u32) !FsFaultResponseStatus {
-    return switch (raw) {
-        0 => .ok,
-        1 => .not_found,
-        2 => .refused,
-        3 => .fetch_failed,
-        else => error.InvalidFsFaultResponseStatus,
     };
 }
 
@@ -863,7 +674,6 @@ pub fn decodeWorkerInitFailedReason(raw: u32) !WorkerInitFailedReason {
         4 => .missing_ingress_payload_fd,
         5 => .missing_egress_shared_fd,
         6 => .missing_ingress_payload_credit_fd,
-        7 => .invalid_fs_index,
         8 => .init_deadline_exceeded,
         else => error.InvalidWorkerInitFailedReason,
     };
@@ -876,28 +686,14 @@ comptime {
         @compileError("ipc.ForkRequest size mismatch");
     if (@sizeOf(ForkReply) != 16)
         @compileError("ipc.ForkReply size mismatch");
-    if (@sizeOf(WorkerRuntimeBootOptions) != 72)
-        @compileError("ipc.WorkerRuntimeBootOptions size mismatch");
-    if ((WorkerRuntimeBootOptions{}).request_task_capacity < limits.server.worker_concurrency_max)
-        @compileError("ipc.WorkerRuntimeBootOptions default must hold every request a worker may get");
-    if (@sizeOf(WorkerInit) != 192)
+    if (@sizeOf(WorkerInit) != 104)
         @compileError("ipc.WorkerInit size mismatch");
-    if (@offsetOf(WorkerInit, "route_table_len") != 24)
-        @compileError("ipc.WorkerInit route_table_len offset mismatch");
-    if (@offsetOf(WorkerInit, "cpu_max_cores") != 32)
-        @compileError("ipc.WorkerInit cpu_max_cores offset mismatch");
-    if (@offsetOf(WorkerInit, "_reserved0") != 36)
-        @compileError("ipc.WorkerInit _reserved0 offset mismatch");
-    if (@offsetOf(WorkerInit, "boot_egress_token") != 40)
+    if (@offsetOf(WorkerInit, "boot_egress_token") != 24)
         @compileError("ipc.WorkerInit boot_egress_token offset mismatch");
-    if (@offsetOf(WorkerInit, "init_deadline_mono_ns") != 96)
+    if (@offsetOf(WorkerInit, "init_deadline_mono_ns") != 80)
         @compileError("ipc.WorkerInit init_deadline_mono_ns offset mismatch");
-    if (@offsetOf(WorkerInit, "request_cpu_budget_ns") != 104)
-        @compileError("ipc.WorkerInit request_cpu_budget_ns offset mismatch");
-    if (@offsetOf(WorkerInit, "unowned_time_limit_ns") != 112)
+    if (@offsetOf(WorkerInit, "unowned_time_limit_ns") != 96)
         @compileError("ipc.WorkerInit unowned_time_limit_ns offset mismatch");
-    if (@offsetOf(WorkerInit, "runtime") != 120)
-        @compileError("ipc.WorkerInit runtime offset mismatch");
     if (WorkerInit.default_unowned_time_limit_ns > WorkerInit.unowned_time_limit_ns_max)
         @compileError("ipc.WorkerInit default unowned limit must pass validate");
     if (@sizeOf(WorkerRetiring) != 8)
@@ -921,11 +717,7 @@ comptime {
         @compileError("ipc.DispatchPacketHeader size mismatch");
     if (@sizeOf(EgressAttach) != 4)
         @compileError("ipc.EgressAttach size mismatch");
-    if (@sizeOf(FsFaultRequestHeader) != 56)
-        @compileError("ipc.FsFaultRequestHeader size mismatch");
-    if (@sizeOf(FsFaultResponseHeader) != 16)
-        @compileError("ipc.FsFaultResponseHeader size mismatch");
-    if (@sizeOf(EgressFetchStartHeader) != 112)
+    if (@sizeOf(EgressFetchStartHeader) != 104)
         @compileError("ipc.EgressFetchStartHeader size mismatch");
     if (@offsetOf(EgressFetchStartHeader, "kind") != 0)
         @compileError("ipc.EgressFetchStartHeader.kind offset mismatch");
@@ -935,39 +727,35 @@ comptime {
         @compileError("ipc.EgressFetchStartHeader.fetch_id offset mismatch");
     if (@offsetOf(EgressFetchStartHeader, "body_id") != 16)
         @compileError("ipc.EgressFetchStartHeader.body_id offset mismatch");
-    if (@offsetOf(EgressFetchStartHeader, "max_body_bytes") != 24)
-        @compileError("ipc.EgressFetchStartHeader.max_body_bytes offset mismatch");
-    if (@offsetOf(EgressFetchStartHeader, "method_len") != 32)
+    if (@offsetOf(EgressFetchStartHeader, "method_len") != 24)
         @compileError("ipc.EgressFetchStartHeader.method_len offset mismatch");
-    if (@offsetOf(EgressFetchStartHeader, "url_len") != 36)
+    if (@offsetOf(EgressFetchStartHeader, "url_len") != 28)
         @compileError("ipc.EgressFetchStartHeader.url_len offset mismatch");
-    if (@offsetOf(EgressFetchStartHeader, "request_header_count") != 40)
+    if (@offsetOf(EgressFetchStartHeader, "request_header_count") != 32)
         @compileError("ipc.EgressFetchStartHeader.request_header_count offset mismatch");
-    if (@offsetOf(EgressFetchStartHeader, "request_headers_bytes_len") != 44)
+    if (@offsetOf(EgressFetchStartHeader, "request_headers_bytes_len") != 36)
         @compileError("ipc.EgressFetchStartHeader.request_headers_bytes_len offset mismatch");
-    if (@offsetOf(EgressFetchStartHeader, "body_len") != 48)
+    if (@offsetOf(EgressFetchStartHeader, "body_len") != 40)
         @compileError("ipc.EgressFetchStartHeader.body_len offset mismatch");
-    if (@offsetOf(EgressFetchStartHeader, "egress_token") != 56)
+    if (@offsetOf(EgressFetchStartHeader, "egress_token") != 48)
         @compileError("ipc.EgressFetchStartHeader.egress_token offset mismatch");
-    if (@sizeOf(EgressCancel) != 16)
-        @compileError("ipc.EgressCancel size mismatch");
-    if (@sizeOf(EgressReleaseBody) != 24)
-        @compileError("ipc.EgressReleaseBody size mismatch");
+    if (@sizeOf(EgressStop) != 16)
+        @compileError("ipc.EgressStop size mismatch");
     if (@sizeOf(EgressFetchHeadHeader) != 80)
         @compileError("ipc.EgressFetchHeadHeader size mismatch");
     if (@sizeOf(EgressBodyChunkBatchHeader) != 16)
         @compileError("ipc.EgressBodyChunkBatchHeader size mismatch");
-    if (@sizeOf(EgressBodyChunkBatchDescriptor) != 56)
+    if (@sizeOf(EgressBodyChunkBatchDescriptor) != 32)
         @compileError("ipc.EgressBodyChunkBatchDescriptor size mismatch");
     if (@sizeOf(EgressUploadChunkBatchHeader) != 8)
         @compileError("ipc.EgressUploadChunkBatchHeader size mismatch");
     if (@sizeOf(EgressUploadChunkBatchDescriptor) != 32)
         @compileError("ipc.EgressUploadChunkBatchDescriptor size mismatch");
-    if (@sizeOf(EgressBodyEnd) != 56)
+    if (@sizeOf(EgressBodyEnd) != 32)
         @compileError("ipc.EgressBodyEnd size mismatch");
-    if (@sizeOf(EgressFetchErrorHeader) != 64)
+    if (@sizeOf(EgressFetchErrorHeader) != 40)
         @compileError("ipc.EgressFetchErrorHeader size mismatch");
-    if (@offsetOf(EgressFetchErrorHeader, "cause") != 56)
+    if (@offsetOf(EgressFetchErrorHeader, "cause") != 32)
         @compileError("ipc.EgressFetchErrorHeader.cause offset mismatch");
     if (@sizeOf(EgressAbortAck) != 24)
         @compileError("ipc.EgressAbortAck size mismatch");
@@ -987,8 +775,8 @@ comptime {
         @compileError("ipc.DispatchPacketHeader.worker_generation offset mismatch");
     if (@offsetOf(DispatchPacketHeader, "deadline_monotonic_ns") != 96)
         @compileError("ipc.DispatchPacketHeader.deadline_monotonic_ns offset mismatch");
-    if (@offsetOf(DispatchPacketHeader, "accounting_flags") != 104)
-        @compileError("ipc.DispatchPacketHeader.accounting_flags offset mismatch");
+    if (@offsetOf(DispatchPacketHeader, "_reserved0") != 104)
+        @compileError("ipc.DispatchPacketHeader._reserved0 offset mismatch");
     if (@offsetOf(DispatchPacketHeader, "request_lane_id") != 108)
         @compileError("ipc.DispatchPacketHeader.request_lane_id offset mismatch");
     if (@offsetOf(DispatchPacketHeader, "route_index") != 110)
@@ -1005,8 +793,12 @@ comptime {
         @compileError("ipc.DispatchPacketHeader.route_capture_count offset mismatch");
     if (@offsetOf(DispatchPacketHeader, "route_captures_bytes_len") != 132)
         @compileError("ipc.DispatchPacketHeader.route_captures_bytes_len offset mismatch");
-    if (@offsetOf(DispatchPacketHeader, "_reserved0") != 136)
-        @compileError("ipc.DispatchPacketHeader._reserved0 offset mismatch");
+    if (@offsetOf(DispatchPacketHeader, "worker_slot") != 136 or
+        @offsetOf(DispatchPacketHeader, "_reserved1") != 137 or
+        @offsetOf(DispatchPacketHeader, "_reserved2") != 138)
+        @compileError("ipc.DispatchPacketHeader worker slot offset mismatch");
+    if (limits.server.worker_concurrency_max > std.math.maxInt(u8) + 1)
+        @compileError("ipc.DispatchPacketHeader.worker_slot must name every pool slot");
     if (@offsetOf(DispatchPacketHeader, "request_header_count") != 140)
         @compileError("ipc.DispatchPacketHeader.request_header_count offset mismatch");
     if (@offsetOf(DispatchPacketHeader, "request_headers_bytes_len") != 144)

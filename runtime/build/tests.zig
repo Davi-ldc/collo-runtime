@@ -468,13 +468,13 @@ fn addMainSuite(
     all_tests.root_module.addImport("supervisor_fixture", fixtures.supervisor_fixture_jsc);
     all_tests.root_module.addImport("collo_test_tls_shim", fixtures.tls_test_shim);
     ctx.jsc_set.importInto(all_tests.root_module, &.{
-        .bindings,          .ipc,              .dns_name,      .network,
-        .os,                .cgroup,           .ktls,          .http,
-        .hpack,             .common_io,        .io_uring_tags, .worker_state,
-        .worker,            .worker_request,   .egress_client, .egress_transport,
-        .egress_gateway,    .boringssl,        .server_main,   .server_gateway,
-        .server_supervisor, .server_lifecycle, .zygote,        .limits,
-        .host,              .server_analytics, .server_config, .server_routes,
+        .bindings,         .ipc,            .dns_name,       .network,
+        .os,               .cgroup,         .ktls,           .http,
+        .hpack,            .common_io,      .io_uring_tags,  .worker_state,
+        .worker,           .worker_request, .egress_client,  .egress_gateway,
+        .boringssl,        .server_main,    .server_gateway, .server_supervisor,
+        .server_lifecycle, .zygote,         .limits,         .host,
+        .server_analytics, .server_config,  .server_routes,
     });
 
     const linked_all = link_mod.addJscLink(b, ctx.link_ctx, .{
@@ -1017,7 +1017,7 @@ const stub_suites = [_]StubSuite{
         .name = "egress-http2",
         .domain = .egress,
         .root = "runtime/src/egress/tests/client/http2/all.zig",
-        .imports = &.{ .egress_client, .egress_http2, .http, .hpack },
+        .imports = &.{ .egress_client, .http, .hpack },
         .hpack = true,
     },
     .{
@@ -1025,7 +1025,7 @@ const stub_suites = [_]StubSuite{
         .domain = .egress,
         .root = "runtime/src/egress/tests/client/tls.zig",
         .libcpp = true,
-        .imports = &.{ .egress_client, .egress_tls, .boringssl },
+        .imports = &.{ .egress_client, .boringssl },
         .boringssl_shim = true,
         .tls_test_shim = true,
         .boringssl_archives = true,
@@ -1037,9 +1037,10 @@ const stub_suites = [_]StubSuite{
         .domain = .egress,
         .root = "runtime/src/egress/tests/client/http1.zig",
         .libcpp = true,
-        .imports = &.{ .egress_client, .egress_transport },
+        .imports = &.{.egress_client},
         .hpack = true,
         .boringssl_shim = true,
+        .tls_test_shim = true,
         .boringssl_archives = true,
     },
     .{
@@ -1047,7 +1048,7 @@ const stub_suites = [_]StubSuite{
         .domain = .egress,
         .root = "runtime/src/egress/tests/core/all.zig",
         .libcpp = true,
-        .imports = &.{ .egress_client, .bindings, .egress_core, .egress_transport, .limits },
+        .imports = &.{.egress_client},
         .hpack = true,
         .boringssl_shim = true,
         .boringssl_archives = true,
@@ -1057,11 +1058,7 @@ const stub_suites = [_]StubSuite{
         .domain = .egress,
         .root = "runtime/src/egress/tests/client/data_io.zig",
         .libcpp = true,
-        .imports = &.{
-            .egress_client, .egress_data_io, .egress_accounting, .common_io,
-            .egress_io,     .io_uring_tags,  .os,                .http,
-            .hpack,         .boringssl,
-        },
+        .imports = &.{.egress_client},
         .hpack = true,
         .boringssl_shim = true,
         .boringssl_archives = true,
@@ -1073,7 +1070,7 @@ const stub_suites = [_]StubSuite{
         .domain = .egress,
         .root = "runtime/src/egress/tests/client/pool.zig",
         .libcpp = true,
-        .imports = &.{ .egress_client, .egress_pool },
+        .imports = &.{.egress_client},
         .hpack = true,
         .boringssl_shim = true,
         .tls_test_shim = true,

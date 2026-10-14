@@ -1,8 +1,15 @@
 //! A ready worker as the host holds it: the process, its channels, and the
-//! resources the host must release when the worker goes away. Its tmpfs
-//! lives in its own mount namespace over the host's shared mount point
-//! (`tmp_mount.zig`), so it ends with the worker and leaves the host nothing
-//! to remove.
+//! resources the host must release when the worker goes away. The launch
+//! (`launch.zig`) builds it at `WorkerReady` and hands its fields over
+//! whole; the server keeps it in the worker's record and tears it down on
+//! the reaper's thread.
+//!
+//! The handle keeps only what the host still uses after ready. The state
+//! page and the payload ring are mapped, so their memfds were closed once the
+//! child held its own copies, and the cgroup leaf is named by the root's
+//! workers directory and the fork job id (`cgroup_root.WorkerLeaf`), never by
+//! a path. The worker's tmpfs lives in the worker's own mount namespace and
+//! ends with it, so it leaves the host nothing to remove.
 
 const std = @import("std");
 const ipc = @import("collo_ipc");
@@ -10,82 +17,38 @@ const process = @import("collo_os").process;
 const process_limits = @import("collo_limits").process;
 const worker_shared_page = @import("collo_worker_state").page;
 
-const cgroup = @import("cgroup.zig");
+const cgroup_root = @import("cgroup_root.zig");
 const dispatch = @import("dispatch.zig");
 
 pub const WorkerHandle = struct {
-    allocator: std.mem.Allocator,
     pid: u32,
+    /// From the clone itself (CLONE_PIDFD); every kill and wait goes through
+    /// it, never through `pid`, which the kernel reuses once the worker is
+    /// reaped.
     pidfd: std.posix.fd_t,
     /// The per-worker control socket: WorkerInit went over it, and after
-    /// ready it carries dispatch descriptors in and response frames out.
+    /// ready it carries dispatch descriptors in and response frames and
+    /// `request_done` out.
     control_fd: std.posix.fd_t,
-    cgroup_dir: []u8,
-    memory_limit_bytes: u64,
-    /// The cgroup's CPU limit in cores (`cpu.max`). It travels with the
-    /// memory limit, so whoever decides whether this worker may serve a route
-    /// sees both limits its cgroup has.
-    cpu_max_cores: u32,
-    metrics_fd: std.posix.fd_t,
+    /// The leaf the worker was born in; `deinit` kills its members and
+    /// removes it.
+    leaf: cgroup_root.WorkerLeaf,
+    /// The payload rings' wakes: the worker signals `completion_eventfd`,
+    /// which the server's reader polls, and the server signals
+    /// `ingress_payload_credit_eventfd` for the worker.
     completion_eventfd: std.posix.fd_t,
-    ingress_payload_fd: std.posix.fd_t,
     ingress_payload_credit_eventfd: std.posix.fd_t,
     ingress_payload: ipc.ingress_channel.SharedPayloadView,
-    /// The shared page the launch mapped; every handle `init` builds holds
-    /// one until `deinit`, as does every handle `host/launch.zig` hands over.
-    /// Null only for a handle that never had a page, which has nothing to
-    /// drain.
-    metrics: ?worker_shared_page.WorkerWriterView,
-    /// Host end of the per-worker fs-fault SEQPACKET pair. Exactly one reader
-    /// at a time across the worker's life: the launch serves module-eval
-    /// faults and quiesces the channel before this handle exists; from then
-    /// on whoever the host registers as the reader owns it.
-    fs_fault_fd: std.posix.fd_t,
+    /// The host's mapping of the state page, which the launch made. Every
+    /// handle the launch hands over holds one until `deinit`; null only for a
+    /// test fixture's handle that never had a page.
+    metrics: ?worker_shared_page.HostReaderView,
 
-    pub fn init(
-        allocator: std.mem.Allocator,
-        pid: u32,
-        pidfd: std.posix.fd_t,
-        control_fd: std.posix.fd_t,
-        cgroup_dir: []const u8,
-        memory_limit_bytes: u64,
-        cpu_max_cores: u32,
-        metrics_fd: std.posix.fd_t,
-        completion_eventfd: std.posix.fd_t,
-        ingress_payload_fd: std.posix.fd_t,
-        ingress_payload_credit_eventfd: std.posix.fd_t,
-        ingress_payload: ipc.ingress_channel.SharedPayloadView,
-        metrics: worker_shared_page.WorkerWriterView,
-        fs_fault_fd: std.posix.fd_t,
-    ) !WorkerHandle {
-        const owned_cgroup_dir = try allocator.dupe(u8, cgroup_dir);
-        errdefer allocator.free(owned_cgroup_dir);
-
-        return .{
-            .allocator = allocator,
-            .pid = pid,
-            .pidfd = pidfd,
-            .control_fd = control_fd,
-            .cgroup_dir = owned_cgroup_dir,
-            .memory_limit_bytes = memory_limit_bytes,
-            .cpu_max_cores = cpu_max_cores,
-            .metrics_fd = metrics_fd,
-            .completion_eventfd = completion_eventfd,
-            .ingress_payload_fd = ingress_payload_fd,
-            .ingress_payload_credit_eventfd = ingress_payload_credit_eventfd,
-            .ingress_payload = ingress_payload,
-            .metrics = metrics,
-            .fs_fault_fd = fs_fault_fd,
-        };
-    }
-
-    /// The two channels a response comes back on. Requires the metrics page
-    /// to still be mapped.
-    pub fn completionChannels(self: *WorkerHandle) dispatch.CompletionChannels {
+    /// The channels a host reads a response of this worker on
+    /// (`dispatch.readResponse`).
+    pub fn responseChannels(self: *WorkerHandle) dispatch.ResponseChannels {
         return .{
             .control_fd = self.control_fd,
-            .completion_eventfd = self.completion_eventfd,
-            .metrics = &self.metrics.?,
             .ingress_payload = &self.ingress_payload,
         };
     }
@@ -93,6 +56,7 @@ pub const WorkerHandle = struct {
     /// Closes the control socket, waits for the worker to exit (SIGKILL
     /// after the exit-wait bound), then releases every resource in the order
     /// the kernel needs: the cgroup leaf last, once its member is gone.
+    /// Blocks, so only a thread that may wait calls it.
     pub fn deinit(self: *WorkerHandle) void {
         std.posix.close(self.control_fd);
         var exited = process.waitForPidFdExit(self.pidfd, process_limits.PROCESS_EXIT_WAIT_MS) catch process.pidFdHasExited(self.pidfd);
@@ -108,17 +72,10 @@ pub const WorkerHandle = struct {
         if (self.metrics) |*metrics|
             metrics.deinit();
         self.ingress_payload.deinit();
-        if (self.fs_fault_fd >= 0)
-            std.posix.close(self.fs_fault_fd);
         std.posix.close(self.ingress_payload_credit_eventfd);
-        std.posix.close(self.ingress_payload_fd);
         std.posix.close(self.completion_eventfd);
-        // -1 only for a handle that never had a shared page (`metrics`).
-        if (self.metrics_fd >= 0)
-            std.posix.close(self.metrics_fd);
-        cgroup.cleanupWorker(self.cgroup_dir);
+        self.leaf.remove();
         std.posix.close(self.pidfd);
-        self.allocator.free(self.cgroup_dir);
         self.* = undefined;
     }
 };

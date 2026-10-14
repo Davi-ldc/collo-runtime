@@ -20,7 +20,6 @@
 const std = @import("std");
 const ipc = @import("collo_ipc");
 const lifecycle = @import("collo_server_lifecycle");
-const egress_policy = @import("collo_egress_gateway").policy;
 const supervision = @import("collo_server_supervisor");
 const fixture = @import("supervisor_fixture");
 
@@ -54,7 +53,6 @@ test "a launch's egress pairs a new session on the worker's wake set with a boot
     const boot_policy = supervisor.routes.network.bootPolicy(fixture.default_definition);
     try testing.expect(boot_policy != 0);
     try testing.expectEqual(boot_policy, boot.policy_id);
-    try testing.expectEqual(@as(u32, egress_policy.production.max_fetches_per_boot), boot.budget);
 
     // The attach named the worker's definition and built on its wake set.
     try testing.expectEqual(@as(u32, 1), gateway.attaches);
@@ -137,14 +135,16 @@ test "the startup-end flag ends the boot token once, and readiness alone does no
     var supervisor = try fixture.minimalSupervisor(testing.allocator);
     defer fixture.deinitMinimal(&supervisor);
     const worker = try fixture.publishInertWorker(&supervisor, .{});
+    var worker_page = try fixture.WorkerPage.attach(worker);
+    defer worker_page.deinit();
     worker.boot_egress = boot_token;
     var gateway: FakeGateway = .{};
     gateway.wire(&supervisor);
-    worker.handle.metrics.?.setState(.ready, .none);
+    worker_page.writer.setState(.ready, .none);
     supervisor.progressBootEgress(worker, 1);
     try testing.expectEqual(@as(usize, 0), gateway.end_attempts);
 
-    worker.handle.metrics.?.publishStartupEvaluationsEnded();
+    worker_page.writer.publishStartupEvaluationsEnded();
     supervisor.progressBootEgress(worker, 2);
     try testing.expectEqual(@as(usize, 1), gateway.end_attempts);
     try testing.expect(worker.boot_egress == null);
@@ -156,10 +156,12 @@ test "a failed boot end is retried even if the worker clears its startup flag" {
     var supervisor = try fixture.minimalSupervisor(testing.allocator);
     defer fixture.deinitMinimal(&supervisor);
     const worker = try fixture.publishInertWorker(&supervisor, .{});
+    var worker_page = try fixture.WorkerPage.attach(worker);
+    defer worker_page.deinit();
     worker.boot_egress = boot_token;
     var gateway: FakeGateway = .{ .end_sent = false };
     gateway.wire(&supervisor);
-    const view = &worker.handle.metrics.?;
+    const view = &worker_page.writer;
     view.publishStartupEvaluationsEnded();
     supervisor.progressBootEgress(worker, 1);
     try testing.expectEqual(@as(usize, 1), gateway.end_attempts);
@@ -174,12 +176,14 @@ test "a worker on a replacement session has the boot token of its launch session
     var supervisor = try fixture.minimalSupervisor(testing.allocator);
     defer fixture.deinitMinimal(&supervisor);
     const worker = try fixture.publishInertWorker(&supervisor, .{});
+    var worker_page = try fixture.WorkerPage.attach(worker);
+    defer worker_page.deinit();
     worker.boot_egress = boot_token;
     var gateway: FakeGateway = .{};
     gateway.wire(&supervisor);
     worker.egress_gateway_generation = gateway_generation + 1;
     worker.egress_gateway_session_id = first_session_id + 1;
-    worker.handle.metrics.?.publishStartupEvaluationsEnded();
+    worker_page.writer.publishStartupEvaluationsEnded();
     supervisor.progressBootEgress(worker, 1);
     try testing.expectEqual(gateway_generation, gateway.ended_generation);
     try testing.expectEqual(first_session_id, gateway.ended_session);
@@ -189,10 +193,12 @@ test "a startup-end flag other than 1 ends nothing, and a token past its deadlin
     var supervisor = try fixture.minimalSupervisor(testing.allocator);
     defer fixture.deinitMinimal(&supervisor);
     const worker = try fixture.publishInertWorker(&supervisor, .{});
+    var worker_page = try fixture.WorkerPage.attach(worker);
+    defer worker_page.deinit();
     worker.boot_egress = boot_token;
     var gateway: FakeGateway = .{};
     gateway.wire(&supervisor);
-    const view = &worker.handle.metrics.?;
+    const view = &worker_page.writer;
     for ([_]u32{ 0, 2, std.math.maxInt(u32) }) |flag| {
         @atomicStore(u32, &view.header.startup_evaluations_ended, flag, .release);
         supervisor.progressBootEgress(worker, 1);
@@ -209,8 +215,10 @@ test "an end sent for one worker leaves the boot token of the record's next work
     var supervisor = try fixture.minimalSupervisor(testing.allocator);
     defer fixture.deinitMinimal(&supervisor);
     const worker = try fixture.publishInertWorker(&supervisor, .{});
+    var worker_page = try fixture.WorkerPage.attach(worker);
+    defer worker_page.deinit();
     worker.boot_egress = boot_token;
-    worker.handle.metrics.?.publishStartupEvaluationsEnded();
+    worker_page.writer.publishStartupEvaluationsEnded();
     const old = worker.bootEndAttempt(1).?;
     // The record now holds another worker, whose end is not owed yet.
     worker.generation += 1;

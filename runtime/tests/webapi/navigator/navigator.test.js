@@ -49,10 +49,9 @@ test("navigator exposes own mutable runtime identity fields", () => {
   assert(navigator.userAgent.includes("Collo"));
   assert.equal(typeof navigator.platform, "string");
   assert(navigator.platform.length > 0);
-  assert.equal(typeof navigator.hardwareConcurrency, "number");
-  assert(Number.isInteger(navigator.hardwareConcurrency));
-  assert(navigator.hardwareConcurrency >= 1);
-  assert(navigator.hardwareConcurrency <= 8);
+  // A VM runs one turn at a time and a worker scales through more processes, so script can use one thread whatever
+  // the node's CPU count.
+  assert.equal(navigator.hardwareConcurrency, 1);
 
   assertDataDescriptor(userAgent, navigator.userAgent, true, true, true, "navigator.userAgent");
   assertDataDescriptor(platform, navigator.platform, true, true, true, "navigator.platform");

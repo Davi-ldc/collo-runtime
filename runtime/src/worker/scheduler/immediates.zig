@@ -18,8 +18,8 @@ pub const ImmediateEntry = struct {
     /// queue, so the request's io interval closes at scheduling time.
     scheduled_at_mono_ns: u64 = 0,
     callback: js_value.JsFunctionOwned,
-    /// The Immediate object setImmediate returned, passed as `this` and
-    /// marked destroyed when the callback runs or is cancelled.
+    /// The callback's receiver: the globalThis of the realm whose
+    /// setImmediate scheduled it.
     this_arg: ?js_value.JsValueOwned = null,
     args: ?[]js_value.JsValueOwned = null,
 
@@ -143,8 +143,8 @@ pub const ImmediateQueue = struct {
         return self.removeNode(slot);
     }
 
-    /// Frees the entry `immediate_id` if `request_id` scheduled it, without
-    /// marking its Immediate object destroyed. Returns whether it was found.
+    /// Frees the entry `immediate_id` if `request_id` scheduled it. Returns
+    /// whether it was found.
     pub fn cancelByIdForRequest(
         self: *ImmediateQueue,
         immediate_id: u64,
@@ -176,8 +176,8 @@ pub const ImmediateQueue = struct {
         return null;
     }
 
-    /// Frees every entry `request_id` scheduled, without marking their
-    /// Immediate objects destroyed, and returns how many there were.
+    /// Frees every entry `request_id` scheduled and returns how many there
+    /// were.
     pub fn cancelForRequest(self: *ImmediateQueue, request_id: u64) usize {
         var canceled: usize = 0;
         while (self.takeForRequest(request_id)) |entry| {
@@ -242,15 +242,14 @@ pub const ImmediateQueue = struct {
 };
 
 /// Runs the `.immediate_callback` work item: takes the entry out of the
-/// ready map, marks its Immediate object destroyed, and calls the callback
-/// in a turn of its request. An immediate cancelled after it was queued is
-/// no longer in the map, and the item does nothing.
+/// ready map and calls the callback in a turn of its request. An immediate
+/// cancelled after it was queued is no longer in the map, and the item does
+/// nothing.
 pub fn executeCallback(runtime: anytype, immediate_id: u64) !void {
     const removed = runtime.scheduler.ready_immediate_callbacks.fetchRemove(immediate_id) orelse return;
     var immediate = removed.value;
     defer immediate.deinit(runtime.core.allocator);
 
-    markDestroyed(runtime, &immediate);
     try callbacks.invokeDiscard(
         runtime,
         immediate.request_id,
@@ -258,16 +257,4 @@ pub fn executeCallback(runtime: anytype, immediate_id: u64) !void {
         if (immediate.this_arg) |*this_arg| this_arg.ptr() else null,
         immediate.args,
     );
-}
-
-/// Sets `_destroyed` on the entry's Immediate object, if it has one. A
-/// failure only logs, because the entry is gone either way.
-pub fn markDestroyed(runtime: anytype, immediate: *const ImmediateEntry) void {
-    const this_arg = if (immediate.this_arg) |*value| value else return;
-    runtime.core.vm.markImmediateDestroyed(this_arg.ptr()) catch |err| {
-        std.log.warn("failed to mark immediate destroyed immediate_id={d}: {s}", .{
-            immediate.id,
-            @errorName(err),
-        });
-    };
 }

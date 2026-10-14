@@ -269,7 +269,7 @@ test "local e2e loads a module named by a string-literal import() from the route
     }
 }
 
-test "local e2e usage and access records land in the analytics directory" {
+test "local e2e writes one access record per request, a dispatched request's carrying its usage, and no usage file" {
     var harness: Harness = undefined;
     try harness.init(.{});
     defer harness.deinit();
@@ -285,37 +285,35 @@ test "local e2e usage and access records land in the analytics directory" {
     try std.testing.expectEqualStrings("{\"message\":\"hello usage\",\"x\":\"9\"}", reply.body);
     try waitForCompletedRequests(&harness.runtime_server, before.completed_requests + 1);
 
-    // The metrics thread drains the worker's completion ring and the lane's
-    // access ring every tick, then flushes the sink. This is the harness's
-    // only request, so each file holds exactly one record for it.
-    var usage = try waitForRecordLines(harness_mod.UsageLine, &harness, "usage.jsonl", 1);
-    defer usage.deinit();
+    // The metrics thread drains the lane's access ring every tick, then
+    // flushes the sink. This is the harness's only request, so the file holds
+    // exactly one record for it.
     var access = try waitForRecordLines(harness_mod.AccessLine, &harness, "access.jsonl", 1);
     defer access.deinit();
-    try std.testing.expectEqual(@as(usize, 1), usage.items.len);
     try std.testing.expectEqual(@as(usize, 1), access.items.len);
-    const usage_record = usage.items[0];
     const access_record = access.items[0];
 
-    // Both records name the same request and the same worker, the usage
-    // record names the worker definition that served it, and it is the
-    // worker's own report of a request that finished.
-    try std.testing.expectEqual(access_record.request_id, usage_record.request_id);
-    try std.testing.expectEqual(access_record.worker_id, usage_record.worker_id);
-    try std.testing.expectEqual(access_record.worker_generation, usage_record.worker_generation);
-    try std.testing.expectEqualStrings("hello", usage_record.worker);
-    try std.testing.expectEqualStrings("worker", usage_record.origin);
-    try std.testing.expectEqualStrings("done", usage_record.error_code);
-    // The server's own clock gives the usage record's wall time, from the
-    // dispatch to the lane's end of the request, which lies inside the
-    // access record's span from arrival to end; `duration_ms` is whole
-    // milliseconds, so one more covers its rounding.
-    try std.testing.expect(usage_record.wall_ns > 0);
-    try std.testing.expect(usage_record.wall_ns <= (access_record.duration_ms + 1) * std.time.ns_per_ms);
+    // The record names the worker definition that served the request, and
+    // carries the worker's own report of a request that finished.
+    try std.testing.expectEqualStrings("hello", access_record.worker);
+    try std.testing.expectEqualStrings("worker", access_record.origin orelse return error.TestExpectedUsage);
+    try std.testing.expectEqualStrings("done", access_record.error_code);
+    // The server's own clock gives the wall time, from the dispatch to the
+    // lane's end of the request, which lies inside the record's span from
+    // arrival to end; `duration_ms` is whole milliseconds, so one more covers
+    // its rounding.
+    const wall_ns = access_record.wall_ns orelse return error.TestExpectedUsage;
+    try std.testing.expect(wall_ns > 0);
+    try std.testing.expect(wall_ns <= (access_record.duration_ms + 1) * std.time.ns_per_ms);
 
     // The client address is the TCP peer the lane accepted.
     try std.testing.expectEqual(@as(u16, 200), access_record.status);
     try std.testing.expectEqualStrings("127.0.0.1", access_record.client_ip);
+
+    // What the request used went nowhere else.
+    var analytics_dir = try std.fs.openDirAbsolute(harness.analytics_root, .{});
+    defer analytics_dir.close();
+    try std.testing.expectError(error.FileNotFound, analytics_dir.access("usage.jsonl", .{}));
 }
 
 test "local e2e answers the health path and unmatched paths itself and records each 404" {
@@ -325,8 +323,7 @@ test "local e2e answers the health path and unmatched paths itself and records e
     errdefer dumpZygoteTrace(&harness.spawned);
 
     // The health path is the server's own and never reaches a worker. The
-    // harness serves on one lane, with the zygote up and room in the usage
-    // stream.
+    // harness serves on one lane, with the zygote up.
     var health_body: [server_main.ingress.server_responses.health_body_bytes_max]u8 = undefined;
     var health_header_block: [1024]u8 = undefined;
     const health = try h2Get(&harness, config.pattern.health_path, &health_body, &health_header_block);
@@ -335,7 +332,7 @@ test "local e2e answers the health path and unmatched paths itself and records e
     try std.testing.expectEqual(@as(u16, 200), try responseStatus(&health_headers));
     try std.testing.expectEqualStrings("application/json", headerValue(&health_headers, "content-type").?);
     try std.testing.expectEqualStrings(
-        "{\"status\":\"ok\",\"zygote\":\"alive\",\"lanes\":{\"running\":1,\"total\":1},\"usage_stream\":\"ok\"}",
+        "{\"status\":\"ok\",\"zygote\":\"alive\",\"lanes\":{\"running\":1,\"total\":1}}",
         health.body,
     );
 

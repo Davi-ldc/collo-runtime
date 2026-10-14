@@ -8,8 +8,10 @@
 //! A Collo contract fixture is appended to `support/harness.js` and runs as one
 //! route module. An exact Bun or WPT port keeps its own module: its `bun:test`,
 //! `collo:test` and `harness` imports are rewritten to the specifiers of
-//! `support/collo_test.js` and `support/compat_harness.js`, and all of them are
-//! registered as permanent modules of one pack. A leak fixture runs as a count
+//! `support/collo_test.js` and `support/compat_harness.js`, and all of them
+//! travel in one artifact whose one route imports the suite. Either way the
+//! runtime boots once, which evaluates the suite's top-level code, and then
+//! serves the suite's requests. A leak fixture runs as a count
 //! request, then, for each test, a setup request, full collections and a check
 //! request. Except in `runLeakSuite`, `COLLO_WEBAPI_TEST_FILTER` keeps only the
 //! tests whose names contain its value, and only a filtered suite may end up
@@ -33,15 +35,13 @@ const harness_source = @embedFile("support/harness.js");
 const leak_harness_source = @embedFile("support/leak_harness.js");
 const collo_test_source = @embedFile("support/collo_test.js");
 const compat_harness_source = @embedFile("support/compat_harness.js");
-// The hash segment after the `/__collo_route/` prefix. The bridge's
-// `registerModulePackLocked` (`runtime/src/bindings/jsc/runtime/module_loader.cpp`)
-// refuses a pack whose specifiers carry two different hashes, and a VM
-// refuses any hash but the first it registered, so every prefixed specifier
-// built here shares this one.
-const deploy_hash = "test";
-const collo_test_specifier = "/__collo_route/" ++ deploy_hash ++ "/collo-test.js";
-const compat_harness_specifier = "/__collo_route/" ++ deploy_hash ++ "/harness.js";
-const collo_test_entry_specifier = "/__collo_route/" ++ deploy_hash ++ "/webapi-compat-entry.js";
+// A worker refuses an artifact with a module outside `task_root`
+// (`module_pack.validateDefinition` in `common/ipc/module_pack.zig`), so every
+// specifier built here lies below it.
+const task_root = ipc.module_pack.task_root;
+const collo_test_specifier = task_root ++ "/collo-test.js";
+const compat_harness_specifier = task_root ++ "/harness.js";
+const collo_test_entry_specifier = task_root ++ "/webapi-compat-entry.js";
 const collo_test_import = "collo" ++ ":test";
 const bun_test_import = "bun" ++ ":test";
 const compat_harness_import = "harness";
@@ -243,44 +243,20 @@ pub fn runCompatSuiteWithPrelude(prelude: []const u8, source: []const u8, specif
     const entry_source = try compatEntrySource(std.testing.allocator, test_specifier);
     defer std.testing.allocator.free(entry_source);
 
-    const runner_deps = [_]ipc.module_pack.Dependency{};
-    const test_deps = [_]ipc.module_pack.Dependency{
-        .{ .specifier = collo_test_specifier },
-        .{ .specifier = compat_harness_specifier },
-    };
-    const entry_deps = [_]ipc.module_pack.Dependency{
-        .{ .specifier = test_specifier },
-        .{ .specifier = collo_test_specifier },
-    };
+    // One route, whose entry imports the suite module and the runner.
     const modules = [_]ipc.module_pack.Module{
-        .{
-            .specifier = collo_test_specifier,
-            .source = collo_test_source,
-            .dependencies = &runner_deps,
-        },
-        .{
-            .specifier = compat_harness_specifier,
-            .source = compat_harness_source,
-            .dependencies = &runner_deps,
-        },
-        .{
-            .specifier = test_specifier,
-            .source = rewritten_source,
-            .dependencies = &test_deps,
-        },
-        .{
-            .specifier = collo_test_entry_specifier,
-            .source = entry_source,
-            .dependencies = &entry_deps,
-        },
+        .{ .specifier = collo_test_specifier, .source = collo_test_source },
+        .{ .specifier = compat_harness_specifier, .source = compat_harness_source },
+        .{ .specifier = test_specifier, .source = rewritten_source },
+        .{ .specifier = collo_test_entry_specifier, .source = entry_source },
     };
-    const route_fd = try rt.createModulePackGraphFd(&modules, 3);
+    const route_fd = try rt.createDefinitionFd(&modules, &.{.{ .entry_module = 3 }});
     defer std.posix.close(route_fd);
-    const route_index = try rt.registerRoutePack(&runtime, route_fd, collo_test_entry_specifier);
+    try rt.bootDefinition(&runtime, route_fd);
 
     const response = try runSuiteRequest(&runtime, control_pair[1], &now_mono_ns, .{
         .specifier = specifier,
-        .route_index = route_index,
+        .route_index = 0,
         .request_id = requestIdForSpecifier(specifier),
     });
     defer std.testing.allocator.free(response);
@@ -288,8 +264,9 @@ pub fn runCompatSuiteWithPrelude(prelude: []const u8, source: []const u8, specif
     try expectSuiteResult(specifier, response, .filterable);
 }
 
-/// Registers `source` as the suite's route at `specifier` (`rt.routeSpecifier`)
-/// unless the runtime already holds it, and returns its index.
+/// Boots the runtime with `source` as its one route, at `specifier` under
+/// `/var/task` (`rt.routeSpecifier`), and returns the route's index; the
+/// boot evaluates the suite's top-level code.
 fn registerSuiteRoute(runtime: *worker.Runtime, specifier: []const u8, source: []const u8) !u16 {
     const route_specifier = try rt.routeSpecifier(std.testing.allocator, specifier);
     defer std.testing.allocator.free(route_specifier);
@@ -436,7 +413,7 @@ fn normalizedCompatSpecifier(allocator: std.mem.Allocator, specifier: []const u8
     const trimmed = std.mem.trimLeft(u8, specifier, "/");
     if (trimmed.len == 0)
         return error.InvalidWebApiCompatSpecifier;
-    return std.fmt.allocPrint(allocator, "/__collo_route/" ++ deploy_hash ++ "/{s}", .{trimmed});
+    return std.fmt.allocPrint(allocator, task_root ++ "/{s}", .{trimmed});
 }
 
 fn compatEntrySource(allocator: std.mem.Allocator, test_specifier: []const u8) ![]u8 {

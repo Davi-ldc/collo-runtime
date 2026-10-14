@@ -1,9 +1,9 @@
 //! Runs one web API compat suite inside a worker forked from a real zygote
 //! and booted through its sandbox. The suite's module, `support/collo_test.js`
-//! and an entry route that runs the suite and answers with its JSON result
-//! travel as one module pack in WorkerInit, with a one-route table naming
-//! that entry, and the response to one request must report `ok` with at least
-//! one test. The worker launches attached to an
+//! and an entry that runs the suite and answers with its JSON result travel
+//! as one artifact in WorkerInit, whose one route names that entry, and the
+//! response to one request must report `ok` with at least one test. The
+//! worker launches attached to an
 //! in-process egress gateway (`rt.LocalEgressGateway`) with a boot token, as
 //! a launch with an egress grant does, and the suite's fetches run under
 //! `rt.local_origin_network`, plain HTTP to private addresses; the test thread
@@ -21,17 +21,17 @@ const rt = @import("collo_test_harness");
 const webapi = @import("support.zig");
 
 const worker_memory_limit_bytes: u64 = 1024 * 1024 * 1024;
-// Every prefixed specifier in the pack shares this hash segment, because the
-// bridge refuses a pack whose specifiers carry two
-// (`registerModulePackLocked` in `bindings/jsc/runtime/module_loader.cpp`).
-const deploy_hash = "test";
+// A worker refuses an artifact with a module outside `task_root`
+// (`module_pack.validateDefinition` in `common/ipc/module_pack.zig`), so every
+// specifier built here lies below it.
+const task_root = ipc.module_pack.task_root;
 const collo_test_source = @embedFile("support/collo_test.js");
-const collo_test_specifier = "/__collo_route/" ++ deploy_hash ++ "/collo-test.js";
-const collo_test_entry_specifier = "/__collo_route/" ++ deploy_hash ++ "/webapi-fork-entry.js";
+const collo_test_specifier = task_root ++ "/collo-test.js";
+const collo_test_entry_specifier = task_root ++ "/webapi-fork-entry.js";
 const collo_test_import = "collo" ++ ":test";
 
-/// Runs the suite module `source`, registered at `specifier` below the pack's
-/// hash segment. Fails as `support.zig`'s `expectSuiteResult` does, after
+/// Runs the suite module `source`, keyed at `specifier` below `task_root`.
+/// Fails as `support.zig`'s `expectSuiteResult` does, after
 /// printing the response body, unless the suite reports `ok` with at least one
 /// test, and skips when this environment cannot place workers.
 pub fn runCompatSuite(source: []const u8, specifier: []const u8) !void {
@@ -45,41 +45,20 @@ pub fn runCompatSuite(source: []const u8, specifier: []const u8) !void {
     var egress_shared_fds = gateway.takeWorkerSharedFds();
     defer egress_shared_fds.close();
 
-    const test_specifier = try normalizedDeployTestSpecifier(std.testing.allocator, specifier);
+    const test_specifier = try normalizedTestSpecifier(std.testing.allocator, specifier);
     defer std.testing.allocator.free(test_specifier);
     const rewritten_source = try rewriteColloTestImports(std.testing.allocator, source);
     defer std.testing.allocator.free(rewritten_source);
     const entry_source = try compatEntrySource(std.testing.allocator, test_specifier);
     defer std.testing.allocator.free(entry_source);
 
-    const runner_deps = [_]ipc.module_pack.Dependency{};
-    const test_deps = [_]ipc.module_pack.Dependency{.{ .specifier = collo_test_specifier }};
-    const entry_deps = [_]ipc.module_pack.Dependency{
-        .{ .specifier = test_specifier },
-        .{ .specifier = collo_test_specifier },
-    };
     const modules = [_]ipc.module_pack.Module{
-        .{
-            .specifier = collo_test_specifier,
-            .source = collo_test_source,
-            .dependencies = &runner_deps,
-        },
-        .{
-            .specifier = test_specifier,
-            .source = rewritten_source,
-            .dependencies = &test_deps,
-        },
-        .{
-            .specifier = collo_test_entry_specifier,
-            .source = entry_source,
-            .dependencies = &entry_deps,
-        },
+        .{ .specifier = collo_test_specifier, .source = collo_test_source },
+        .{ .specifier = test_specifier, .source = rewritten_source },
+        .{ .specifier = collo_test_entry_specifier, .source = entry_source },
     };
-
-    const route_fd = try rt.createModulePackGraphFd(&modules, 2);
+    const route_fd = try rt.createDefinitionFd(&modules, &.{.{ .entry_module = 2 }});
     defer std.posix.close(route_fd);
-    var route = try rt.SingleRoute.init(route_fd, collo_test_entry_specifier);
-    defer route.deinit();
 
     const request_id = requestIdForSpecifier(specifier);
     var launched = zygote_support.launchWorker(
@@ -92,7 +71,7 @@ pub fn runCompatSuite(source: []const u8, specifier: []const u8) !void {
                 .shared_fds = egress_shared_fds,
                 .boot = rt.localBootEgress(),
             } },
-            .routes = route.launchRoutes(),
+            .routes = .{ .module_pack_fd = route_fd, .isolate_realm = false },
         },
     ) catch |err| switch (err) {
         error.WorkerCgroupDelegationUnavailable => return error.SkipZigTest,
@@ -117,7 +96,7 @@ pub fn runCompatSuite(source: []const u8, specifier: []const u8) !void {
 
     var response = try host.dispatch.readResponse(
         std.testing.allocator,
-        handle.completionChannels(),
+        handle.responseChannels(),
         request_id,
         .{
             .wall_ms = request_budget_ms,
@@ -126,7 +105,7 @@ pub fn runCompatSuite(source: []const u8, specifier: []const u8) !void {
         },
     );
     defer response.deinit();
-    // The forked pack carries no filter, so every test registers.
+    // The forked artifact carries no filter, so every test registers.
     try webapi.expectSuiteResult(specifier, response.body, .complete);
 }
 
@@ -137,11 +116,11 @@ fn requestIdForSpecifier(specifier: []const u8) u64 {
     return if (hash == 0) 1 else hash;
 }
 
-fn normalizedDeployTestSpecifier(allocator: std.mem.Allocator, specifier: []const u8) ![]u8 {
+fn normalizedTestSpecifier(allocator: std.mem.Allocator, specifier: []const u8) ![]u8 {
     const trimmed = std.mem.trimLeft(u8, specifier, "/");
     if (trimmed.len == 0)
         return error.InvalidWebApiCompatSpecifier;
-    return std.fmt.allocPrint(allocator, "/__collo_route/" ++ deploy_hash ++ "/{s}", .{trimmed});
+    return std.fmt.allocPrint(allocator, task_root ++ "/{s}", .{trimmed});
 }
 
 fn compatEntrySource(allocator: std.mem.Allocator, test_specifier: []const u8) ![]u8 {

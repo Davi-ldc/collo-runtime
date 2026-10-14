@@ -1,6 +1,7 @@
-// Shared vocabulary of the WebCrypto bridge: the algorithm, hash, curve, key type and usage enumerations, the hash
-// table, the bounds Collo puts on WebCrypto inputs, and `SecretBytes`, the container every secret byte lives in
-// (secret_bytes.h). Nothing here touches JSC, so crypto pool threads use these types as freely as the VM thread.
+// Shared vocabulary of the WebCrypto bridge: the algorithm, hash, curve, key type, usage and key format enumerations,
+// the hash table, the bounds Collo puts on keys and derived bytes, and `SecretBytes`, the container every secret byte
+// lives in (secret_bytes.h). Nothing here touches JSC. Bounds that are worst-case times rather than sizes live in
+// budget.h.
 
 #pragma once
 
@@ -9,33 +10,39 @@
 #include <openssl/digest.h>
 #include <wtf/FastMalloc.h>
 #include <wtf/Forward.h>
-#include <wtf/Vector.h>
 #include <wtf/text/ASCIILiteral.h>
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <span>
+#include <optional>
 
 namespace Collo::HostFunctions::WebCrypto {
 
-// Largest PBKDF2 iteration count; a larger count, or zero, rejects with OperationError.
-constexpr uint32_t maxWebCryptoPbkdf2Iterations = 1'000'000;
-// Bounds on an RSA modulus. generateKey rejects a length outside them with OperationError, and `createRsaKey`
-// refuses any key outside them.
-constexpr uint32_t minWebCryptoRsaModulusLengthBits = 1024;
-constexpr uint32_t maxWebCryptoRsaModulusLengthBits = 8192;
-// Largest output of one key derivation, in bytes.
-constexpr size_t maxWebCryptoDerivedBytes = 1024 * 1024;
-// Largest HMAC key that generateKey or deriveKey creates, in bytes.
-constexpr size_t maxWebCryptoGeneratedSecretBytes = 64 * 1024;
-// A digest of at most this many input bytes runs inline on the VM thread instead of on the crypto pool.
-constexpr size_t inlineDigestByteLimit = 64;
-
-// Where `enqueueCryptoJobPromise` runs a job: inline on the VM thread, or on the crypto pool.
-enum class CryptoJobCost : uint8_t {
-    InlinePreferred,
-    Heavy,
-};
+// The modulus of any RSA key a CryptoKey holds, imported or generated, lies within these bounds; `createAsymmetricKey`
+// refuses any other.
+constexpr uint32_t rsa_modulus_bits_min = 1024;
+constexpr uint32_t rsa_modulus_bits_max = 8192;
+// The largest modulus generateKey creates. Key generation searches for random primes, so its time grows fast with the
+// modulus and has a long tail: about a second at 4096 bits on the reference machine and tens of seconds at 8192. It
+// checks the clock as it goes (budget.h); this bound is the outer limit, so no call holds the VM thread for tens of
+// seconds even when the time left would allow it.
+constexpr uint32_t rsa_generate_modulus_bits_max = 4096;
+// The largest output of one key derivation.
+constexpr size_t derived_bytes_max = 1024 * 1024;
+// The largest input BoringSSL processes in one call nothing can interrupt: an Ed25519 message, an RSA-OAEP label, an
+// AES-GCM IV that is not 12 bytes long, and the data of AES key wrap. On the reference machine the slowest of them at
+// this size, key wrap, takes about 24 ms, below a private-key operation of an 8192-bit RSA key (budget.cpp).
+constexpr size_t single_call_input_bytes_max = 1024 * 1024;
+// The largest JWK text unwrapKey parses. It holds every key Collo exports, the largest an RSA private key of
+// `rsa_modulus_bits_max` bits or an HMAC key of `generated_secret_bytes_max` bytes, well under 128 KiB, and keeps the
+// text far from the engine's string length limit.
+constexpr size_t jwk_text_bytes_max = 1024 * 1024;
+// The largest HMAC key generateKey or deriveKey creates.
+constexpr size_t generated_secret_bytes_max = 64 * 1024;
+// The most entries a key usages list or a JWK `key_ops` list may have. Eight usages exist; the bound refuses a list
+// long enough to cost the VM thread a measurable time to read.
+constexpr uint64_t key_usages_length_max = 64;
 
 enum class WebCryptoHash : uint8_t {
     SHA1,
@@ -49,6 +56,7 @@ enum class WebCryptoHash : uint8_t {
     SHA3_512,
 };
 
+// The order is the `algorithmSpec` table's (algorithms.cpp), which indexes by this value.
 enum class CryptoKeyAlgorithm : uint8_t {
     Hmac,
     AesCtr,
@@ -84,7 +92,7 @@ enum class CryptoKeyNamedCurve : uint8_t {
 };
 
 // Usage bits of a CryptoKey. The bit values are internal; the order in which usages appear to JavaScript is
-// `orderedCryptoKeyUsages` in `normalize.h`.
+// `orderedCryptoKeyUsages` in normalize.h.
 enum CryptoKeyUsage : uint8_t {
     CryptoKeyUsageEncrypt = 1 << 0,
     CryptoKeyUsageDecrypt = 1 << 1,
@@ -96,14 +104,24 @@ enum CryptoKeyUsage : uint8_t {
     CryptoKeyUsageDeriveKey = 1 << 7,
 };
 
-// One entry of the static hash table. Pointers to entries stay valid for the life of the process.
+// The KeyFormat enumeration of the Web Cryptography API.
+enum class KeyFormat : uint8_t {
+    Raw,
+    Spki,
+    Pkcs8,
+    Jwk,
+};
+
+// One entry of the static hash table. References to entries stay valid for the life of the process.
 struct HashSpec {
     WebCryptoHash id;
     WTF::ASCIILiteral name;
+    // BoringSSL's digest; every entry has one, the SHA-3 hashes through the patch series in
+    // `runtime/patches/boringssl/`.
     const EVP_MD* (*evp)();
     size_t digest_bytes;
     // The hash's block size in bits: the HMAC key length when an HMAC algorithm gives no `length`.
-    size_t default_hmac_bits;
+    size_t block_bits;
     // The JWK `alg` of an HMAC key with this hash; empty for the SHA-3 hashes, which have none.
     WTF::ASCIILiteral jwk_alg;
 };
@@ -123,18 +141,26 @@ struct FastMallocSecretAllocator {
 
 using SecretBytes = BasicSecretBytes<FastMallocSecretAllocator>;
 
-// True when `number` is a finite integer within [min, max]. The typed variants store the value in `out` only then.
-bool checkedIntegerInRange(double, double min, double max);
-bool checkedSizeFromNumber(double, size_t min, size_t max, size_t& out);
-bool checkedUInt32FromNumber(double, uint32_t min, uint32_t max, uint32_t& out);
-bool checkedUInt8FromNumber(double, uint8_t min, uint8_t max, uint8_t& out);
+// Empties `out`, zeroing its buffer, and returns false: how a primitive that fills a SecretBytes fails, so its output
+// is empty on every failure.
+inline bool clearAndFail(SecretBytes& out)
+{
+    out.clear();
+    return false;
+}
+
+// The value of `number` as a T when it is a finite integer within [min, max]; no value otherwise.
+template <typename T> std::optional<T> integerInRange(double number, T min, T max)
+{
+    if (!std::isfinite(number) || std::floor(number) != number)
+        return std::nullopt;
+    if (number < static_cast<double>(min) || number > static_cast<double>(max))
+        return std::nullopt;
+    return static_cast<T>(number);
+}
 
 const HashSpec& hashSpec(WebCryptoHash);
 // Matches the name without regard to ASCII case; null for a hash the table does not have.
 const HashSpec* hashSpecFromName(const WTF::String&);
-// Null when BoringSSL has no EVP digest for the hash. Every table entry has one, since the BoringSSL patch series in
-// `runtime/patches/boringssl/` exposes the SHA-3 digests.
-const EVP_MD* hashEvp(const HashSpec&);
-bool hashHasOpenSslEvp(const HashSpec&);
 
 }

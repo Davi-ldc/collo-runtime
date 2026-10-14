@@ -1,7 +1,7 @@
-// How the rest of the bridge creates events and dispatches them on the runtime's event targets: the global object,
-// EventTarget instances, AbortSignal, MessagePort and Performance. VM thread only. Every JSGlobalObject parameter must
-// be a Collo::GlobalObject, which these functions downcast without checking. The cell classes are in
-// event_private.h.
+// How the rest of the bridge creates events, dispatches them on the runtime's event targets (the global object,
+// EventTarget instances, AbortSignal and MessagePort), keeps their event handler attributes and reports exceptions.
+// VM thread only. Every JSGlobalObject parameter must be a Collo::GlobalObject, which these functions downcast without
+// checking. The cell classes are in event_private.h.
 
 #pragma once
 
@@ -13,50 +13,52 @@
 
 namespace Collo::HostFunctions {
 
-// An attribute order that runs the attribute handler before every listener, since listener orders start at 1.
-static constexpr uint64_t WebApiEventAttributeHandlerBeforeListeners = 0;
-
 // Fills `handle` when the value is one of the runtime's event targets; returns false for any other value.
 bool webApiEventTargetHandle(JSC::JSValue, WebApiEventTargetHandle&);
 // An Event of `type`. Events the runtime fires are trusted, hence the default. None of the create functions returns
 // null: a failed cell allocation crashes the process.
 JSC::JSObject* createWebApiEvent(JSC::JSGlobalObject*, WTF::String type, bool bubbles = false, bool cancelable = false,
     bool composed = false, bool trusted = true);
-// A "message" MessageEvent carrying `data`, with an empty origin and lastEventId and a null source. `ports` becomes
-// the ports attribute; null leaves it to the getter, which creates an empty frozen array on first read.
-// FIXME: the event is created untrusted, though the HTML standard fires MessagePort's message events with isTrusted
-// set to true.
+// A trusted "message" MessageEvent carrying `data`, with an empty origin and lastEventId and a null source, as a
+// MessagePort fires it. `ports` becomes the ports attribute; null leaves it to the getter, which creates an empty
+// frozen array on first read.
 JSC::JSObject* createWebApiMessageEvent(JSC::JSGlobalObject*, JSC::JSValue data, JSC::JSObject* ports);
-// A cancelable "error" ErrorEvent, as reportError fires it.
-// FIXME: the event is created untrusted, though the HTML standard's report an exception steps fire it with isTrusted
-// set to true.
-JSC::JSObject* createWebApiErrorEvent(JSC::JSGlobalObject*, WTF::String message, WTF::String filename, uint32_t lineno,
-    uint32_t colno, JSC::JSValue error);
-// Dispatches `event_value` at `target`, with the handle's attribute handler if it has one, and returns what
-// dispatchEvent() returns: false when a listener canceled the event. Throws a TypeError for a value that is not an
-// Event and an InvalidStateError DOMException for an event already being dispatched. A listener's exception is
-// cleared and does not reach the caller, except one from the global object's onerror or onmessage handler, which
-// propagates. A termination stays pending and ends the dispatch; one already pending when the call begins makes it
-// return an empty value without running any listener.
+// Dispatches `event_value` at `target` and returns what dispatchEvent() returns: false when a listener or event
+// handler canceled the event. Throws a TypeError for a value that is not an Event and an InvalidStateError
+// DOMException for an event already being dispatched. A listener's or handler's exception does not reach the caller:
+// it is cleared and reported (reportWebApiException) to the global object of the callback's realm. A termination stays
+// pending and ends the dispatch; one already pending when the call begins makes it return an empty value without
+// running any listener.
 JSC::EncodedJSValue dispatchWebApiEvent(
     JSC::JSGlobalObject*, JSC::ThrowScope&, WebApiEventTargetHandle, JSC::JSValue event_value);
-// dispatchWebApiEvent with an explicit attribute handler in place of the handle's. `attribute_handler` runs at
-// `attribute_order`, and only for events of `attribute_event_type` when that is not null.
-JSC::EncodedJSValue dispatchWebApiEventWithAttributeHandler(JSC::JSGlobalObject*, JSC::ThrowScope&,
-    WebApiEventTargetHandle, JSC::JSValue event_value, JSC::JSValue attribute_handler,
-    uint64_t attribute_order = WebApiEventAttributeHandlerBeforeListeners,
-    WTF::String attribute_event_type = WTF::String());
 // Removes the listener matching (type, callback, capture) as removeEventListener() does, together with its abort
-// signal's cleanup record. No match, or a value that is not an event target, is a no-op.
+// signal's cleanup record. No match, or a value that is not an event target, is a no-op. Event handler records never
+// match.
 void removeWebApiEventTargetListener(
     WebApiEventTargetHandle, const WTF::String& type, JSC::JSValue callback, bool capture);
 void removeWebApiEventTargetListener(
     JSC::JSValue target_value, const WTF::String& type, JSC::JSValue callback, bool capture);
-// Removes every listener of the target and their abort signals' cleanup records, as a MessagePort does when it closes
-// or is transferred. During a dispatch on the target the removal is deferred (WebApiEventTargetData::clearListeners).
+// Removes every listener and event handler of the target and their abort signals' cleanup records, as a MessagePort
+// does when it closes or is transferred. During a dispatch on the target the removal is deferred
+// (WebApiEventTargetData::clearListeners).
 void clearWebApiEventTargetListeners(WebApiEventTargetHandle);
 
-// Installs Event and its subclasses, EventTarget, and the global object's event methods and handlers. The host
+// The value of the target's event handler attribute for `type`, or null.
+JSC::JSValue webApiEventHandler(WebApiEventTargetHandle, const WTF::String& type);
+// Sets the event handler attribute for `type` as HTML's event handler IDL attributes do. Web IDL's
+// [LegacyTreatNonObjectAsNull] EventHandler keeps any object, callable or not, and turns every other value into null.
+// Returns the stored value, an object or null. Returns an empty value, with a QuotaExceededError DOMException or an
+// OutOfMemoryError thrown into `scope`, when the handler's record cannot be stored; the attribute is then null.
+JSC::JSValue setWebApiEventHandler(
+    JSC::JSGlobalObject*, JSC::ThrowScope&, WebApiEventTargetHandle, const WTF::String& type, JSC::JSValue value);
+
+// HTML's report an exception: fires a trusted, cancelable "error" ErrorEvent carrying `exception` at the global
+// object, unless that global is already reporting one (its error reporting mode), in which case nothing fires.
+// Exceptions thrown by the event's listeners are cleared; a termination stays pending for the caller to check.
+// `global_object` may be any JSGlobalObject: one that is not a Collo::GlobalObject reports nothing.
+void reportWebApiException(JSC::JSGlobalObject*, JSC::JSValue exception);
+
+// Installs Event and its subclasses, EventTarget, and the global object's event methods and onerror handler. The host
 // function registry (globals.def) calls it at most once per realm.
 void installWebApiEvent(Collo::GlobalObject*, JSC::VM&);
 

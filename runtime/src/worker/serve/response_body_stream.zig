@@ -59,6 +59,8 @@ pub fn start(
             try request_ctx.response_outbox.park(.{ .stream_head = head });
             return;
         },
+        // A streamed response's head never ends its stream.
+        .last => unreachable,
     }
     try startRead(runtime, request_ctx);
 }
@@ -217,9 +219,11 @@ fn writeChunk(
     } else {
         body_stream.chunk_len = bytes.len;
     }
-    switch (try payload_writer.writeStreamBytes(runtime, request_ctx, bytes, &body_stream.offset, false)) {
+    switch (try payload_writer.writeStreamBytes(runtime, request_ctx, bytes, &body_stream.offset, false, .hold)) {
         .sent => {},
         .credit_empty, .ring_full, .socket_full => return,
+        // A chunk the stream's end follows never ends the response.
+        .last => unreachable,
     }
     body_stream.result.deinit();
     body_stream.offset = 0;
@@ -245,13 +249,11 @@ fn rejectChunk(
     try response_flow.failResponse(runtime, request_ctx, .js_exception, request_ctx.response_http_status);
 }
 
-/// The stream closed: its end goes out, now or from a later advance, and
-/// then the request finishes with the response's statuses.
+/// The stream closed: the request finishes with the response's statuses,
+/// and its end goes out as the request's last packet, now or from a later
+/// advance.
 fn endStream(runtime: *state.Runtime, request_ctx: *request_context.RequestContext) !void {
-    switch (try payload_writer.writeStreamEnd(runtime, request_ctx)) {
-        .sent => try response_flow.finishResponseStream(runtime, request_ctx),
-        .blocked => try request_ctx.response_outbox.park(.stream_end),
-    }
+    try response_flow.finishResponseStream(runtime, request_ctx, .stream_end);
 }
 
 /// The stream errored after the head went out. Its reason goes to the

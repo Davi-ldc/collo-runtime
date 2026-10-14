@@ -1,69 +1,83 @@
 //! Tests of the gateway's fetch task: it owns copies of the request it was
-//! given, a body it took as an `OwnedBody` goes back to the allocator that
-//! came with it, at the end and at a redirect that drops it, a redirect that
-//! keeps it leaves it where it is, `replaceRequest` keeps the previous
-//! request when any allocation fails, and the meter totals add billed and
-//! cost bytes per attempt. The failure the engine publishes on a task
-//! (`engine/result.zig:publishFailure`) is tested here too: a network
-//! denial names the origin of the task's current URL and what to change,
-//! with the `network_denied` cause, and any other error stays
-//! `fetch failed: <error name>`. Lane `egress-test`.
+//! given and holds a reference to its response queue, a body it took as an
+//! `OwnedBody` goes back to the allocator that came with it, at the end and
+//! at a redirect that drops it, a redirect that keeps it leaves it where it
+//! is, `replaceRequest` keeps the previous request when any allocation
+//! fails, and `copyResponseHeaders` copies a head into the result arena. The
+//! failure the engine publishes on a task (`engine/result.zig:publishFailure`)
+//! is tested here too: a network denial names the origin of the task's
+//! current URL and what to change, with the `network_denied` cause, and any
+//! other error stays `fetch failed: <error name>`. Lane `egress-test`.
 
 const std = @import("std");
-const bindings = @import("collo_bindings");
 const http = @import("collo_http");
 const egress_client = @import("collo_egress_client");
 
-const fetch_body = egress_client.fetch_body;
+const core = egress_client.core;
 const task_model = egress_client.task;
 const network = egress_client.network;
 const publishFailure = egress_client.engine.result.publishFailure;
 
 test "egress task owns request metadata without worker promise state" {
-    const identity = bindings.FetchBodyIdentity{
+    const identity = core.FetchBodyIdentity{
         .request_id = 11,
         .request_generation = 12,
         .fetch_id = 13,
         .body_id = 14,
     };
-    const body = try std.testing.allocator.create(fetch_body.Body);
-    var body_owned = true;
-    errdefer if (body_owned) {
-        body.deinitAfterQueuedResourcesReleased(std.testing.allocator);
-        std.testing.allocator.destroy(body);
-    };
-    body.* = fetch_body.Body.initOpen(std.testing.allocator, identity, 4096);
+    const queue = try newQueue(std.testing.allocator, identity);
+    var queue_owned = true;
+    errdefer if (queue_owned) queue.release(std.testing.allocator);
 
-    const header_name = "accept";
-    const header_value = "application/json";
-    const header = bindings.NameValuePair{
-        .name = .{ .ptr = header_name.ptr, .len = header_name.len },
-        .value = .{ .ptr = header_value.ptr, .len = header_value.len },
-    };
+    var header_name = "accept".*;
+    var header_value = "application/json".*;
+    const headers = [_]http.Header{.{ .name = &header_name, .value = &header_value }};
     var task = try task_model.Task.init(
         std.testing.allocator,
         identity.fetch_id,
-        identity.request_id,
         "https://example.test/api",
         "GET",
         "",
-        &.{header},
+        &headers,
         0,
-        identity,
-        body,
+        queue,
     );
-    body_owned = false;
+    queue_owned = false;
     defer task.deinit();
 
+    // The task keeps copies, so the caller's buffers may change.
+    @memset(&header_name, 'x');
+    @memset(&header_value, 'y');
     try std.testing.expectEqual(identity.fetch_id, task.id);
-    try std.testing.expectEqual(identity.request_id, task.request_id);
+    try std.testing.expectEqual(queue, task.response_body);
+    try std.testing.expectEqual(identity, task.response_body.identity);
     try std.testing.expectEqual(@as(usize, 1), task.headers.len);
     try std.testing.expectEqualStrings("accept", task.headers[0].name);
     try std.testing.expectEqualStrings("application/json", task.headers[0].value);
-    try std.testing.expect(!task.isCanceled());
+}
 
-    task.markCanceled();
-    try std.testing.expect(task.isCanceled());
+test "a task copies a response head into its result arena in one place" {
+    var task = try getTask("https://example.test/head");
+    defer task.deinit();
+
+    var name = "content-type".*;
+    var value = "text/plain".*;
+    const head = [_]http.Header{
+        .{ .name = &name, .value = &value },
+        .{ .name = "x-empty", .value = "" },
+    };
+    const copied = try task.copyResponseHeaders(&head);
+    @memset(&name, 'x');
+    @memset(&value, 'y');
+
+    try std.testing.expectEqual(@as(usize, 2), copied.len);
+    try std.testing.expectEqualStrings("content-type", copied[0].name);
+    try std.testing.expectEqualStrings("text/plain", copied[0].value);
+    try std.testing.expectEqualStrings("x-empty", copied[1].name);
+    try std.testing.expectEqualStrings("", copied[1].value);
+    // Every name and value sits in one run of bytes, in order.
+    try std.testing.expectEqual(copied[0].name.ptr + copied[0].name.len, copied[0].value.ptr);
+    try std.testing.expectEqual(copied[0].value.ptr + copied[0].value.len, copied[1].name.ptr);
 }
 
 test "egress task frees an owned body with the allocator that came with it" {
@@ -116,37 +130,28 @@ test "egress task replace request allocation failures preserve previous request"
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
         const allocator = failing.allocator();
 
-        const identity = bindings.FetchBodyIdentity{
+        const identity = core.FetchBodyIdentity{
             .request_id = 21,
             .request_generation = 22,
             .fetch_id = 23 + fail_index,
             .body_id = 24 + fail_index,
         };
-        const body = try allocator.create(fetch_body.Body);
-        var body_owned = true;
-        errdefer if (body_owned) {
-            body.deinitAfterQueuedResourcesReleased(allocator);
-            allocator.destroy(body);
-        };
-        body.* = fetch_body.Body.initOpen(allocator, identity, 4096);
+        const queue = try newQueue(allocator, identity);
+        var queue_owned = true;
+        errdefer if (queue_owned) queue.release(allocator);
 
-        const header = bindings.NameValuePair{
-            .name = .{ .ptr = "accept".ptr, .len = "accept".len },
-            .value = .{ .ptr = "application/json".ptr, .len = "application/json".len },
-        };
+        const headers = [_]http.Header{.{ .name = "accept", .value = "application/json" }};
         var task = try task_model.Task.init(
             allocator,
             identity.fetch_id,
-            identity.request_id,
             "https://example.test/old",
             "POST",
             "old-body",
-            &.{header},
+            &headers,
             0,
-            identity,
-            body,
+            queue,
         );
-        body_owned = false;
+        queue_owned = false;
         defer task.deinit();
 
         const next_headers = [_]http.Header{
@@ -178,40 +183,6 @@ test "egress task replace request allocation failures preserve previous request"
             else => return err,
         }
     }
-}
-
-test "egress task cross-hop egress base sums billed and cost" {
-    var body = fetch_body.Body.initOpen(std.testing.allocator, .{
-        .request_id = 1,
-        .request_generation = 1,
-        .fetch_id = 1,
-        .body_id = 1,
-    }, null);
-    defer body.deinitAfterQueuedResourcesReleased(std.testing.allocator);
-
-    var task = try task_model.Task.init(
-        std.testing.allocator,
-        1,
-        1,
-        "https://example.test/hop",
-        "GET",
-        "",
-        &.{},
-        0,
-        body.identity,
-        &body,
-    );
-    body.retain();
-    defer task.deinit();
-
-    // A redirect hop adds billed and cost bytes.
-    task.addEgressBase(100, 200, 400);
-    // A retried attempt adds cost only and leaves billed untouched.
-    task.addEgressBase(0, 0, 50);
-    const base = task.egressBase();
-    try std.testing.expectEqual(@as(u64, 100), base.billed_sent);
-    try std.testing.expectEqual(@as(u64, 200), base.billed_received);
-    try std.testing.expectEqual(@as(u64, 450), base.cost);
 }
 
 test "a denied hop fails with the network_denied cause and the denial's text for the origin of the task's URL" {
@@ -304,7 +275,6 @@ fn expectFailure(task: *task_model.Task, cause: task_model.FailureCause, message
         .success => return error.TestUnexpectedSuccess,
         .failure => |failure| {
             try std.testing.expectEqual(cause, failure.cause);
-            try std.testing.expect(failure.owned);
             try std.testing.expectEqualStrings(message, failure.message);
         },
     }
@@ -315,35 +285,38 @@ fn ignoreWake(context: ?*anyopaque, event: egress_client.WakeEvent) void {
     _ = event;
 }
 
-/// A GET task to `url` without a request body. The task owns its response
-/// body, which `deinit` releases.
+/// An open response queue on the heap holding one reference, which the task
+/// built with it takes over.
+fn newQueue(allocator: std.mem.Allocator, identity: core.FetchBodyIdentity) !*core.ResponseQueue {
+    const queue = try allocator.create(core.ResponseQueue);
+    queue.* = core.ResponseQueue.init(identity, 4096);
+    return queue;
+}
+
+/// A GET task to `url` without a request body.
 fn getTask(url: []const u8) !task_model.Task {
-    const identity = bindings.FetchBodyIdentity{
+    const identity = core.FetchBodyIdentity{
         .request_id = 41,
         .request_generation = 42,
         .fetch_id = 43,
         .body_id = 44,
     };
-    const response_body = try std.testing.allocator.create(fetch_body.Body);
-    errdefer std.testing.allocator.destroy(response_body);
-    response_body.* = fetch_body.Body.initOpen(std.testing.allocator, identity, 4096);
-    errdefer response_body.deinitAfterQueuedResourcesReleased(std.testing.allocator);
+    const queue = try newQueue(std.testing.allocator, identity);
+    errdefer queue.release(std.testing.allocator);
     return task_model.Task.init(
         std.testing.allocator,
         identity.fetch_id,
-        identity.request_id,
         url,
         "GET",
         "",
         &.{},
         0,
-        identity,
-        response_body,
+        queue,
     );
 }
 
 /// A task on `task_counter` whose body is a copy of `bytes` from `body_counter`, handed over as
-/// an `OwnedBody`. The task owns its response body, which `deinit` releases.
+/// an `OwnedBody`.
 fn ownedBodyTask(
     task_counter: *std.testing.FailingAllocator,
     body_counter: *std.testing.FailingAllocator,
@@ -351,28 +324,24 @@ fn ownedBodyTask(
 ) !task_model.Task {
     const task_allocator = task_counter.allocator();
     const body_allocator = body_counter.allocator();
-    const identity = bindings.FetchBodyIdentity{
+    const identity = core.FetchBodyIdentity{
         .request_id = 31,
         .request_generation = 32,
         .fetch_id = 33,
         .body_id = 34,
     };
-    const response_body = try task_allocator.create(fetch_body.Body);
-    errdefer task_allocator.destroy(response_body);
-    response_body.* = fetch_body.Body.initOpen(task_allocator, identity, 4096);
-    errdefer response_body.deinitAfterQueuedResourcesReleased(task_allocator);
+    const queue = try newQueue(task_allocator, identity);
+    errdefer queue.release(task_allocator);
     const request_body = try body_allocator.dupe(u8, bytes);
     errdefer body_allocator.free(request_body);
     return task_model.Task.initOwnedBody(
         task_allocator,
         identity.fetch_id,
-        identity.request_id,
         "https://example.test/upload",
         "POST",
         .{ .bytes = request_body, .allocator = body_allocator },
         &.{},
         0,
-        identity,
-        response_body,
+        queue,
     );
 }

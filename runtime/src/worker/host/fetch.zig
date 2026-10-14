@@ -9,7 +9,7 @@
 //! cancel reason passed in is Zig's on every path, failures included.
 
 const bindings = @import("collo_bindings");
-const fetch_body = @import("collo_egress_core").fetch_body;
+const fetch_body = @import("../egress/body/root.zig");
 const promise_deferred = @import("collo_worker_js").deferred;
 const egress_fetch = @import("../egress/fetch_runtime.zig");
 const host_adapter = @import("adapter.zig");
@@ -44,10 +44,9 @@ pub export fn collo_runtime_fetch(
     const body = bufferSlice(init.body) orelse return bindings.status_invalid_argument;
     const headers = headerSlice(init.headers, init.headers_len) orelse return bindings.status_invalid_argument;
 
-    var egress_ctx = runtime.egressContext();
-    if (egress_fetch.refusal(&egress_ctx, init.request_id)) |refused| {
+    if (egress_fetch.refusal(runtime, init.request_id)) |refused| {
         var message_buffer: [egress_fetch.Refusal.message_bytes_max]u8 = undefined;
-        const message = egress_fetch.refuse(&egress_ctx, init.request_id, refused, url, &message_buffer);
+        const message = egress_fetch.refuse(runtime, init.request_id, refused, url, &message_buffer);
         rejectRefusedFetch(runtime.core.vm, &deferred.?, message) catch
             return bindings.status_error;
         out_fetch_id.?.* = 0;
@@ -57,7 +56,13 @@ pub export fn collo_runtime_fetch(
     const owned_deferred = deferred.?;
     deferred = null;
     owns_deferred = false;
-    const fetch_id = runtime.scheduleFetch(init.request_id, url, method, body, headers, init.flags, owned_deferred) catch
+    const fetch_id = runtime.scheduleFetch(init.request_id, .{
+        .url = url,
+        .method = method,
+        .body = body,
+        .headers = headers,
+        .flags = init.flags,
+    }, owned_deferred) catch
         return bindings.status_error;
     out_fetch_id.?.* = fetch_id;
     return bindings.status_ok;

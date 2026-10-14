@@ -1,76 +1,51 @@
 //! The field contracts of `common/ipc/messages.zig` that other files carry:
-//! the request done statuses through the completion ring and the bound past
-//! the last, the runtime boot options' layout and their refusal of a request
-//! task capacity below the largest concurrency, the fetch error's cause
-//! through its codec and the causes and reserved bytes the decoder refuses,
-//! and the pooled upload bytes a session may have in flight. WorkerInit's
-//! fields cross the init socket in `../ipc.zig`, beside its descriptor table.
+//! the request done statuses through a request's `request_done` and the
+//! value past the last, the fetch error's cause through its codec and the
+//! causes and reserved bytes the decoder refuses, and the pooled upload bytes
+//! a session may have in flight. WorkerInit's fields cross the init socket in
+//! `zygote_worker.zig`, beside its descriptor table.
 
 const std = @import("std");
 const ipc = @import("collo_ipc");
-const page = @import("collo_worker_state").page;
+const fd_mod = @import("collo_os").fd;
 
-test "the request done statuses 7 to 9 name the endings no request's own code chose" {
-    try std.testing.expectEqual(@as(u32, 7), @intFromEnum(ipc.RequestDoneStatus.cpu_exceeded));
-    try std.testing.expectEqual(@as(u32, 8), @intFromEnum(ipc.RequestDoneStatus.worker_retiring));
-    try std.testing.expectEqual(@as(u32, 9), @intFromEnum(ipc.RequestDoneStatus.worker_stopped));
-    try std.testing.expectEqual(@as(u32, 9), page.worker_completion_status_max);
+test "the request done statuses 7 to 9 name the endings no request's own code chose, and fit a byte" {
+    try std.testing.expectEqual(@as(u8, 7), @intFromEnum(ipc.RequestDoneStatus.cpu_exceeded));
+    try std.testing.expectEqual(@as(u8, 8), @intFromEnum(ipc.RequestDoneStatus.worker_retiring));
+    try std.testing.expectEqual(@as(u8, 9), @intFromEnum(ipc.RequestDoneStatus.worker_stopped));
+    try std.testing.expectEqual(u8, @typeInfo(ipc.RequestDoneStatus).@"enum".tag_type);
 }
 
-test "each new done status crosses the completion ring, and the value past the last is refused at both ends" {
-    const fd = try page.createMemfd("ipc-done-statuses");
-    defer std.posix.close(fd);
-    var view = try page.mapReadWrite(fd);
-    defer view.deinit();
-    view.initializeCrashDefault();
+test "each new done status crosses a request_done, and the value past the last is refused at both ends" {
+    const pair = try fd_mod.socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
+    defer std.posix.close(pair[0]);
+    defer std.posix.close(pair[1]);
+    const identity = ipc.ingress_channel.RequestIdentity{
+        .request_id = 1,
+        .request_generation = 1,
+        .request_lane_id = 1,
+        .request_slot = 1,
+    };
 
+    var scratch: [256]u8 = undefined;
     const statuses = [_]ipc.RequestDoneStatus{ .cpu_exceeded, .worker_retiring, .worker_stopped };
-    for (statuses, 1..) |status, request_id| {
-        try view.publishWorkerCompletion(.{
-            .external_request_id = request_id,
-            .request_lane_id = 1,
-            .request_slot = 1,
-            .request_generation = 1,
-            .worker_id = 1,
-            .worker_generation = 1,
-            .status = @intFromEnum(status),
-            .http_status = 503,
-        });
-    }
-    var out: [statuses.len]page.WorkerCompletionRecord = undefined;
-    try std.testing.expectEqual(statuses.len, try view.drainWorkerCompletions(&out));
-    for (statuses, out) |status, record| {
-        try std.testing.expectEqual(status, std.enums.fromInt(ipc.RequestDoneStatus, record.status).?);
-        try std.testing.expectEqual(@as(u16, 503), record.http_status);
+    for (statuses) |status| {
+        const done = ipc.RequestDone{ .status = status, .http_status = 503 };
+        try ipc.ingress_channel.sendRequestDone(pair[0], identity, 1, done, &scratch);
+        var recv_scratch: [256]u8 = undefined;
+        var packet = try ipc.recvPacketWithFdsScratch(std.testing.allocator, pair[1], &recv_scratch);
+        var received = try ipc.ingress_channel.decodeReceivedPacket(std.testing.allocator, &packet);
+        defer received.deinit();
+        const read = try ipc.ingress_channel.decodeRequestDone(received.payload);
+        try std.testing.expectEqual(status, read.status);
+        try std.testing.expectEqual(@as(u16, 503), read.http_status);
     }
 
-    // The worker refuses to publish it, and the drain refuses it written by
-    // hand and turns the ring fatal.
-    var past = std.mem.zeroes(page.WorkerCompletionPublish);
-    past.external_request_id = 9;
-    past.status = page.worker_completion_status_max + 1;
-    past.http_status = 503;
-    try std.testing.expectError(error.InvalidWorkerCompletionStatus, view.publishWorkerCompletion(past));
-    past.status = @intFromEnum(ipc.RequestDoneStatus.worker_stopped);
-    try view.publishWorkerCompletion(past);
-    view.completion_records[statuses.len].status = page.worker_completion_status_max + 1;
-    try std.testing.expectError(error.InvalidWorkerCompletionStatus, view.drainWorkerCompletions(out[0..1]));
-}
-
-test "the runtime boot options keep no crypto stack size and refuse fewer request tasks than a worker's slots" {
-    try std.testing.expectEqual(@as(usize, 72), @sizeOf(ipc.WorkerRuntimeBootOptions));
-    try std.testing.expect(!@hasField(ipc.WorkerRuntimeBootOptions, "crypto_thread_stack_bytes"));
-
-    var options = ipc.WorkerRuntimeBootOptions.default();
-    try options.validate();
-    try std.testing.expect(options.request_task_capacity >= page.LIVE_SLOT_COUNT);
-
-    options.request_task_capacity = page.LIVE_SLOT_COUNT;
-    try options.validate();
-    options.request_task_capacity = page.LIVE_SLOT_COUNT - 1;
-    try std.testing.expectError(error.InvalidWorkerRuntimeOptions, options.validate());
-    options.request_task_capacity = 0;
-    try std.testing.expectError(error.InvalidWorkerRuntimeOptions, options.validate());
+    // A worker cannot build the value past the last, and the server's
+    // decoder refuses a payload that carries it.
+    var past = ipc.ingress_channel.encodeRequestDone(.{ .status = .worker_stopped, .http_status = 503 });
+    past.status = @intFromEnum(ipc.RequestDoneStatus.worker_stopped) + 1;
+    try std.testing.expectError(error.InvalidPacket, ipc.ingress_channel.decodeRequestDone(std.mem.asBytes(&past)));
 }
 
 test "a fetch error carries its cause through the codec, failed by default" {
@@ -88,18 +63,45 @@ test "a fetch error carries its cause through the codec, failed by default" {
         .body_id = 6,
         .message = "fetch to https://a.test denied by the network setting",
         .cause = .network_denied,
-        .billed_sent_total = 7,
         .ready_at_mono_ns = 8,
     }));
     try std.testing.expectEqual(ipc.EgressFetchErrorCause.network_denied, denied.cause);
     try std.testing.expectEqual(@as(u64, 5), denied.fetch_id);
-    try std.testing.expectEqual(@as(u64, 7), denied.billed_sent_total);
     try std.testing.expectEqual(@as(u64, 8), denied.ready_at_mono_ns);
 }
 
+test "a fetch error message past its cap is refused by the encoder and the decoder alike" {
+    const cap = ipc.fetch_limits.response_error_message_bytes_max;
+    var scratch: [@sizeOf(ipc.EgressFetchErrorHeader) + cap + 1]u8 = undefined;
+    const longest = [_]u8{'m'} ** cap;
+    const at_cap = try ipc.decodeEgressFetchError(try ipc.encodeEgressFetchErrorInto(&scratch, .{
+        .fetch_id = 1,
+        .body_id = 2,
+        .message = &longest,
+    }));
+    try std.testing.expectEqual(cap, at_cap.message.len);
+
+    const past = [_]u8{'m'} ** (cap + 1);
+    try std.testing.expectError(error.InvalidEgressPacket, ipc.encodeEgressFetchErrorInto(&scratch, .{
+        .fetch_id = 1,
+        .body_id = 2,
+        .message = &past,
+    }));
+    // The same packet written by hand, as a broken gateway could.
+    const header = ipc.EgressFetchErrorHeader{
+        .kind = @intFromEnum(ipc.MessageKind.egress_fetch_error),
+        .message_len = cap + 1,
+        .fetch_id = 1,
+        .body_id = 2,
+    };
+    @memcpy(scratch[0..@sizeOf(ipc.EgressFetchErrorHeader)], std.mem.asBytes(&header));
+    @memcpy(scratch[@sizeOf(ipc.EgressFetchErrorHeader)..], &past);
+    try std.testing.expectError(error.InvalidEgressPacket, ipc.decodeEgressFetchError(&scratch));
+}
+
 test "the fetch error decoder refuses a cause it does not name and a nonzero reserved field" {
-    try std.testing.expectEqual(@as(usize, 64), @sizeOf(ipc.EgressFetchErrorHeader));
-    try std.testing.expectEqual(@as(usize, 56), @offsetOf(ipc.EgressFetchErrorHeader, "cause"));
+    try std.testing.expectEqual(@as(usize, 40), @sizeOf(ipc.EgressFetchErrorHeader));
+    try std.testing.expectEqual(@as(usize, 32), @offsetOf(ipc.EgressFetchErrorHeader, "cause"));
     try std.testing.expectEqual(@as(u32, 0), @intFromEnum(ipc.EgressFetchErrorCause.failed));
     try std.testing.expectEqual(@as(u32, 1), @intFromEnum(ipc.EgressFetchErrorCause.network_denied));
 
@@ -126,7 +128,7 @@ test "the fetch error decoder refuses a cause it does not name and a nonzero res
     try std.testing.expectError(error.InvalidEgressPacket, ipc.decodeEgressFetchError(encoded));
 }
 
-test "a session may have two pooled request bodies at their ceiling in flight" {
+test "a session's pooled bytes in flight are twice the largest pooled body" {
     const fetch_limits = ipc.fetch_limits;
     try std.testing.expectEqual(
         2 * fetch_limits.request_body_pooled_bytes_max,

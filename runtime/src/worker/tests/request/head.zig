@@ -10,6 +10,7 @@ const request_head = @import("collo_worker_request").head;
 fn dispatchWork(headers: []const ipc.RequestHeader, body_framing: ipc.RequestBodyFraming) !ipc.DispatchWork {
     return ipc.DispatchWork.initOwned(std.testing.allocator, .{
         .request_id = 1,
+        .worker_slot = 0,
         .authority = "demo.example.test",
         .deadline_monotonic_ns = 0,
         .method = "POST",

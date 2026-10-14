@@ -670,44 +670,54 @@ describe("global event target", () => {
       assertFunctionShape(desc.value, name, length, false, `global ${name}`);
     }
 
-    for (const name of ["onerror", "onmessage"]) {
-      const desc = descriptor(globalThis, name);
-      assert.equal(typeof desc.get, "function", `${name} getter`);
-      assert.equal(typeof desc.set, "function", `${name} setter`);
-      assert.equal(desc.enumerable, true, `${name} enumerable`);
-      assert.equal(desc.configurable, true, `${name} configurable`);
-    }
+    const desc = descriptor(globalThis, "onerror");
+    assert.equal(typeof desc.get, "function", "onerror getter");
+    assert.equal(typeof desc.set, "function", "onerror setter");
+    assert.equal(desc.enumerable, true, "onerror enumerable");
+    assert.equal(desc.configurable, true, "onerror configurable");
+    // No runtime path fires a message event at the global, so it has no onmessage handler.
+    assert.equal("onmessage" in globalThis, false);
   });
 
-  test("onerror and onmessage properties receive dispatched events before listeners", () => {
+  // HTML: an event handler takes a listener slot at its first non-null value and keeps it when replaced; the global
+  // onerror receives an ErrorEvent's message, filename, lineno, colno and error.
+  test("onerror runs at the position it was set and receives HTML's five arguments", () => {
     const order = [];
-    function errorListener(event) {
-      order.push(`listener:${event.error}`);
+    function before(event) {
+      order.push(`before:${event.error}`);
     }
-    function messageListener(event) {
-      order.push(`listener:${event.data}`);
+    function after(event) {
+      order.push(`after:${event.error}`);
     }
 
     try {
-      globalThis.onerror = event => {
-        order.push(`handler:${event.error}`);
+      addEventListener("error", before);
+      globalThis.onerror = (message, filename, lineno, colno, error) => {
+        order.push(`handler:${message}:${filename}:${lineno}:${colno}:${error}`);
       };
-      addEventListener("error", errorListener);
-      assert.equal(dispatchEvent(new ErrorEvent("error", { error: "hello" })), true);
-      assert.deepEqual(order, ["handler:hello", "listener:hello"]);
+      addEventListener("error", after);
+      const event = new ErrorEvent("error", { message: "m", filename: "f.js", lineno: 3, colno: 4, error: "hello" });
+      assert.equal(dispatchEvent(event), true);
+      assert.deepEqual(order, ["before:hello", "handler:m:f.js:3:4:hello", "after:hello"]);
 
       order.length = 0;
-      globalThis.onmessage = event => {
-        order.push(`handler:${event.data}`);
+      globalThis.onerror = message => {
+        order.push(`replaced:${message}`);
       };
-      addEventListener("message", messageListener);
-      assert.equal(dispatchEvent(new MessageEvent("message", { data: "world" })), true);
-      assert.deepEqual(order, ["handler:world", "listener:world"]);
+      dispatchEvent(new ErrorEvent("error", { message: "again", error: "hello" }));
+      assert.deepEqual(order, ["before:hello", "replaced:again", "after:hello"]);
+
+      // A non-ErrorEvent of type "error" passes the event itself.
+      order.length = 0;
+      globalThis.onerror = value => {
+        order.push(`plain:${value instanceof Event}`);
+      };
+      dispatchEvent(new Event("error"));
+      assert.deepEqual(order, ["before:undefined", "plain:true", "after:undefined"]);
     } finally {
       globalThis.onerror = null;
-      globalThis.onmessage = null;
-      removeEventListener("error", errorListener);
-      removeEventListener("message", messageListener);
+      removeEventListener("error", before);
+      removeEventListener("error", after);
     }
   });
 
@@ -779,7 +789,9 @@ describe("global event target", () => {
     }
   });
 
-  test("global handler assignment follows Bun non-callable and return-false behavior", () => {
+  // The global onerror's special error event handling cancels an ErrorEvent when it returns true; for any other event
+  // a handler cancels by returning false.
+  test("global onerror keeps non-callable objects, and cancels an ErrorEvent by returning true", () => {
     try {
       globalThis.onerror = undefined;
       assert.equal(globalThis.onerror, null);
@@ -791,9 +803,19 @@ describe("global event target", () => {
       assert.equal(dispatchEvent(new ErrorEvent("error", { error: "ignored" })), true);
 
       globalThis.onerror = () => false;
-      const event = new ErrorEvent("error", { cancelable: true });
-      assert.equal(dispatchEvent(event), false);
-      assert.equal(event.defaultPrevented, true);
+      const kept = new ErrorEvent("error", { cancelable: true });
+      assert.equal(dispatchEvent(kept), true);
+      assert.equal(kept.defaultPrevented, false);
+
+      globalThis.onerror = () => true;
+      const canceled = new ErrorEvent("error", { cancelable: true });
+      assert.equal(dispatchEvent(canceled), false);
+      assert.equal(canceled.defaultPrevented, true);
+
+      globalThis.onerror = () => false;
+      const plainEvent = new Event("error", { cancelable: true });
+      assert.equal(dispatchEvent(plainEvent), false);
+      assert.equal(plainEvent.defaultPrevented, true);
     } finally {
       globalThis.onerror = null;
     }
@@ -1174,6 +1196,36 @@ describe("listener exception isolation, signal option validation and isTrusted",
     target.addEventListener("boom", () => order.push("second"));
     assert.equal(target.dispatchEvent(new Event("boom")), true, "dispatchEvent must not rethrow listener exceptions");
     assert.deepEqual(order, ["first", "second"]);
+  });
+
+  // DOM inner invoke reports a listener's exception: HTML fires a trusted, cancelable ErrorEvent carrying it at the
+  // global object of the listener's realm.
+  test("a listener's exception is reported as an ErrorEvent at the global", () => {
+    const thrown = new Error("listener failure");
+    const reported = [];
+    function onError(event) {
+      reported.push([event.message, event.error === thrown, event.isTrusted, event.cancelable]);
+    }
+
+    try {
+      addEventListener("error", onError);
+      const target = new EventTarget();
+      target.addEventListener("boom", () => {
+        throw thrown;
+      });
+      const controller = new AbortController();
+      controller.signal.onabort = () => {
+        throw thrown;
+      };
+      assert.equal(target.dispatchEvent(new Event("boom")), true);
+      controller.abort();
+    } finally {
+      removeEventListener("error", onError);
+    }
+    assert.deepEqual(reported, [
+      ["listener failure", true, true, true],
+      ["listener failure", true, true, true],
+    ]);
   });
 
   test("a throwing global listener does not stop later global listeners", () => {

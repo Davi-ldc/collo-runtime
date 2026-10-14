@@ -100,6 +100,28 @@ ColloStatus typeError(ColloRealm& realm, JSC::JSValue value, const WTF::String& 
     return Collo::statusOr(setTypeError(realm, value, message, out_exception), COLLO_STATUS_JS_EXCEPTION);
 }
 
+// Every predicate reads the value's tag or its cell's type and call data, so no getter or proxy trap runs.
+ColloValueKind valueKind(JSC::JSValue value)
+{
+    if (value.isUndefined())
+        return COLLO_VALUE_KIND_UNDEFINED;
+    if (value.isNull())
+        return COLLO_VALUE_KIND_NULL;
+    if (value.isBoolean())
+        return COLLO_VALUE_KIND_BOOLEAN;
+    if (value.isNumber())
+        return COLLO_VALUE_KIND_NUMBER;
+    if (value.isBigInt())
+        return COLLO_VALUE_KIND_BIGINT;
+    if (value.isString())
+        return COLLO_VALUE_KIND_STRING;
+    if (value.isSymbol())
+        return COLLO_VALUE_KIND_SYMBOL;
+    if (JSC::getCallData(value).type != JSC::CallData::Type::None)
+        return COLLO_VALUE_KIND_FUNCTION;
+    return COLLO_VALUE_KIND_OBJECT;
+}
+
 } // namespace
 
 namespace Collo {
@@ -199,17 +221,16 @@ extern "C" ColloStatus collo_value_retain(ColloValue* value, ColloValue** out_va
 
 extern "C" void collo_value_release(ColloValue* value) { Collo::releaseValueHandle(value); }
 
-extern "C" ColloStatus collo_value_is_callable(ColloVm* vm, const ColloValue* value, uint8_t* out_is_callable)
+extern "C" ColloStatus collo_value_kind(ColloVm* vm, const ColloValue* value, ColloValueKind* out_kind)
 {
-    if (out_is_callable)
-        *out_is_callable = 0;
+    if (out_kind)
+        *out_kind = COLLO_VALUE_KIND_UNDEFINED;
 
-    if (!vm || !vm->isReady() || !Collo::valueBelongsToVm(vm, value) || !out_is_callable)
+    if (!vm || !vm->isReady() || !Collo::valueBelongsToVm(vm, value) || !out_kind)
         return COLLO_STATUS_INVALID_ARGUMENT;
 
     JSC::JSLockHolder locker(*vm->vm);
-    JSC::CallData call_data = JSC::getCallData(Collo::toJSValue(value));
-    *out_is_callable = call_data.type != JSC::CallData::Type::None;
+    *out_kind = valueKind(Collo::toJSValue(value));
     return COLLO_STATUS_OK;
 }
 

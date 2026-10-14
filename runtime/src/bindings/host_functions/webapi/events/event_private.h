@@ -1,5 +1,6 @@
 // The JSC cell classes behind Event, CustomEvent, MessageEvent, ErrorEvent, CloseEvent and EventTarget, private to
-// the events module (event_types.cpp and event_target.cpp). VM thread only.
+// the events module: event_types.cpp holds the event interfaces and installs every event interface, event_target.cpp
+// holds EventTarget, listener dispatch and the global object's event members. VM thread only.
 //
 // No target has a parent, so a dispatch runs only the AT_TARGET phase: `bubbles` and `composed` are kept for their
 // getters and route nothing. Every field that holds a JavaScript value is a WriteBarrier that the class's
@@ -17,21 +18,12 @@
 #include <JavaScriptCore/JSFunction.h>
 #include <JavaScriptCore/JSObject.h>
 #include <JavaScriptCore/SlotVisitorMacros.h>
-#include <JavaScriptCore/Strong.h>
-#include <JavaScriptCore/StrongInlines.h>
 #include <wtf/MonotonicTime.h>
-#include <wtf/Vector.h>
 #include <wtf/text/WTFString.h>
 
 #include <cstdint>
 
 namespace Collo::HostFunctions {
-
-using JSC::EncodedJSValue;
-using JSC::JSValue;
-using JSC::JSObject;
-using WTF::String;
-using namespace JSC;
 
 JSC_DECLARE_CUSTOM_GETTER(eventIsTrustedCustomGetter);
 
@@ -51,15 +43,15 @@ public:
         return &vm.destructibleObjectSpace();
     }
 
-    static JSC::Structure* createStructure(JSC::VM& vm, JSC::JSGlobalObject* global_object, JSValue prototype)
+    static JSC::Structure* createStructure(JSC::VM& vm, JSC::JSGlobalObject* global_object, JSC::JSValue prototype)
     {
         return JSC::Structure::create(
             vm, global_object, prototype, JSC::TypeInfo(JSC::ObjectType, StructureFlags), info());
     }
 
     // `trusted` stays false for events script constructs; createWebApiEvent passes true for events the runtime fires.
-    static JSColloEvent* create(JSC::VM& vm, Collo::GlobalObject* global_object, JSC::Structure* structure, String type,
-        bool bubbles, bool cancelable, bool composed, bool trusted = false)
+    static JSColloEvent* create(JSC::VM& vm, Collo::GlobalObject* global_object, JSC::Structure* structure,
+        WTF::String type, bool bubbles, bool cancelable, bool composed, bool trusted = false)
     {
         auto* object = new (NotNull, JSC::allocateCell<JSColloEvent>(vm))
             JSColloEvent(vm, structure, WTF::move(type), bubbles, cancelable, composed, trusted);
@@ -72,7 +64,7 @@ public:
     DECLARE_INFO;
     DECLARE_VISIT_CHILDREN;
 
-    const String& type() const { return m_type; }
+    const WTF::String& type() const { return m_type; }
     JSC::JSObject* target() const { return m_target.get(); }
     JSC::JSObject* currentTarget() const { return m_current_target.get(); }
     EventPhase phase() const { return m_phase; }
@@ -117,7 +109,7 @@ public:
     // Set around a passive listener's call, during which preventDefault() has no effect.
     void setPassive(bool passive) { m_in_passive_listener = passive; }
 
-    void initEvent(String type, bool bubbles, bool cancelable)
+    void initEvent(WTF::String type, bool bubbles, bool cancelable)
     {
         if (m_dispatching)
             return;
@@ -156,7 +148,7 @@ public:
     }
 
 protected:
-    JSColloEvent(JSC::VM& vm, JSC::Structure* structure, String type, bool bubbles, bool cancelable, bool composed,
+    JSColloEvent(JSC::VM& vm, JSC::Structure* structure, WTF::String type, bool bubbles, bool cancelable, bool composed,
         bool trusted = false)
         : Base(vm, structure)
         , m_type(WTF::move(type))
@@ -182,7 +174,7 @@ protected:
                 | JSC::PropertyAttribute::ReadOnly));
     }
 
-    String m_type;
+    WTF::String m_type;
     WTF::MonotonicTime m_created;
     JSC::WriteBarrier<JSC::JSObject> m_target;
     JSC::WriteBarrier<JSC::JSObject> m_current_target;
@@ -207,14 +199,14 @@ public:
         return &vm.destructibleObjectSpace();
     }
 
-    static JSC::Structure* createStructure(JSC::VM& vm, JSC::JSGlobalObject* global_object, JSValue prototype)
+    static JSC::Structure* createStructure(JSC::VM& vm, JSC::JSGlobalObject* global_object, JSC::JSValue prototype)
     {
         return JSC::Structure::create(
             vm, global_object, prototype, JSC::TypeInfo(JSC::ObjectType, StructureFlags), info());
     }
 
     static JSColloCustomEvent* create(JSC::VM& vm, Collo::GlobalObject* global_object, JSC::Structure* structure,
-        String type, bool bubbles, bool cancelable, bool composed, JSValue detail)
+        WTF::String type, bool bubbles, bool cancelable, bool composed, JSC::JSValue detail)
     {
         auto* object = new (NotNull, JSC::allocateCell<JSColloCustomEvent>(vm))
             JSColloCustomEvent(vm, structure, WTF::move(type), bubbles, cancelable, composed);
@@ -227,9 +219,9 @@ public:
     DECLARE_INFO;
     DECLARE_VISIT_CHILDREN;
 
-    JSValue detail() const { return m_detail.get(); }
+    JSC::JSValue detail() const { return m_detail.get(); }
 
-    void initCustomEvent(JSC::VM& vm, String type, bool bubbles, bool cancelable, JSValue detail)
+    void initCustomEvent(JSC::VM& vm, WTF::String type, bool bubbles, bool cancelable, JSC::JSValue detail)
     {
         if (dispatching())
             return;
@@ -239,14 +231,14 @@ public:
 
 private:
     JSColloCustomEvent(
-        JSC::VM& vm, JSC::Structure* structure, String type, bool bubbles, bool cancelable, bool composed)
+        JSC::VM& vm, JSC::Structure* structure, WTF::String type, bool bubbles, bool cancelable, bool composed)
         : Base(vm, structure, WTF::move(type), bubbles, cancelable, composed)
     {
     }
 
     ~JSColloCustomEvent() = default;
 
-    void finishCreation(JSC::VM& vm, Collo::GlobalObject* global_object, JSValue detail)
+    void finishCreation(JSC::VM& vm, Collo::GlobalObject* global_object, JSC::JSValue detail)
     {
         Base::finishCreation(vm, global_object);
         ASSERT(inherits(info()));
@@ -265,18 +257,19 @@ public:
         return &vm.destructibleObjectSpace();
     }
 
-    static JSC::Structure* createStructure(JSC::VM& vm, JSC::JSGlobalObject* global_object, JSValue prototype)
+    static JSC::Structure* createStructure(JSC::VM& vm, JSC::JSGlobalObject* global_object, JSC::JSValue prototype)
     {
         return JSC::Structure::create(
             vm, global_object, prototype, JSC::TypeInfo(JSC::ObjectType, StructureFlags), info());
     }
 
+    // `trusted` stays false for events script constructs; createWebApiMessageEvent passes true.
     static JSColloMessageEvent* create(JSC::VM& vm, Collo::GlobalObject* global_object, JSC::Structure* structure,
-        String type, bool bubbles, bool cancelable, bool composed, JSValue data, String origin, String last_event_id,
-        JSValue source, JSObject* ports)
+        WTF::String type, bool bubbles, bool cancelable, bool composed, JSC::JSValue data, WTF::String origin,
+        WTF::String last_event_id, JSC::JSValue source, JSC::JSObject* ports, bool trusted = false)
     {
-        auto* object = new (NotNull, JSC::allocateCell<JSColloMessageEvent>(vm)) JSColloMessageEvent(
-            vm, structure, WTF::move(type), bubbles, cancelable, composed, WTF::move(origin), WTF::move(last_event_id));
+        auto* object = new (NotNull, JSC::allocateCell<JSColloMessageEvent>(vm)) JSColloMessageEvent(vm, structure,
+            WTF::move(type), bubbles, cancelable, composed, WTF::move(origin), WTF::move(last_event_id), trusted);
         object->finishCreation(vm, global_object, data, source, ports);
         return object;
     }
@@ -286,16 +279,16 @@ public:
     DECLARE_INFO;
     DECLARE_VISIT_CHILDREN;
 
-    JSValue data() const { return m_data.get(); }
-    const String& origin() const { return m_origin; }
-    const String& lastEventId() const { return m_last_event_id; }
-    JSValue source() const { return m_source.get(); }
+    JSC::JSValue data() const { return m_data.get(); }
+    const WTF::String& origin() const { return m_origin; }
+    const WTF::String& lastEventId() const { return m_last_event_id; }
+    JSC::JSValue source() const { return m_source.get(); }
     // The ports attribute: the stored array, or an empty frozen one created and kept on first read. Returns null
     // with an exception thrown into `scope` when that allocation fails.
-    JSObject* ensurePorts(JSC::JSGlobalObject*, JSC::ThrowScope&);
+    JSC::JSObject* ensurePorts(JSC::JSGlobalObject*, JSC::ThrowScope&);
 
-    void initMessageEvent(JSC::VM& vm, String type, bool bubbles, bool cancelable, JSValue data, String origin,
-        String last_event_id, JSValue source, JSObject* ports)
+    void initMessageEvent(JSC::VM& vm, WTF::String type, bool bubbles, bool cancelable, JSC::JSValue data,
+        WTF::String origin, WTF::String last_event_id, JSC::JSValue source, JSC::JSObject* ports)
     {
         if (dispatching())
             return;
@@ -311,9 +304,9 @@ public:
     }
 
 private:
-    JSColloMessageEvent(JSC::VM& vm, JSC::Structure* structure, String type, bool bubbles, bool cancelable,
-        bool composed, String origin, String last_event_id)
-        : Base(vm, structure, WTF::move(type), bubbles, cancelable, composed)
+    JSColloMessageEvent(JSC::VM& vm, JSC::Structure* structure, WTF::String type, bool bubbles, bool cancelable,
+        bool composed, WTF::String origin, WTF::String last_event_id, bool trusted)
+        : Base(vm, structure, WTF::move(type), bubbles, cancelable, composed, trusted)
         , m_origin(WTF::move(origin))
         , m_last_event_id(WTF::move(last_event_id))
     {
@@ -321,7 +314,8 @@ private:
 
     ~JSColloMessageEvent() = default;
 
-    void finishCreation(JSC::VM& vm, Collo::GlobalObject* global_object, JSValue data, JSValue source, JSObject* ports)
+    void finishCreation(
+        JSC::VM& vm, Collo::GlobalObject* global_object, JSC::JSValue data, JSC::JSValue source, JSC::JSObject* ports)
     {
         Base::finishCreation(vm, global_object);
         ASSERT(inherits(info()));
@@ -332,8 +326,8 @@ private:
     }
 
     JSC::WriteBarrier<JSC::Unknown> m_data;
-    String m_origin;
-    String m_last_event_id;
+    WTF::String m_origin;
+    WTF::String m_last_event_id;
     JSC::WriteBarrier<JSC::Unknown> m_source;
     JSC::WriteBarrier<JSC::JSObject> m_ports;
 };
@@ -347,18 +341,20 @@ public:
         return &vm.destructibleObjectSpace();
     }
 
-    static JSC::Structure* createStructure(JSC::VM& vm, JSC::JSGlobalObject* global_object, JSValue prototype)
+    static JSC::Structure* createStructure(JSC::VM& vm, JSC::JSGlobalObject* global_object, JSC::JSValue prototype)
     {
         return JSC::Structure::create(
             vm, global_object, prototype, JSC::TypeInfo(JSC::ObjectType, StructureFlags), info());
     }
 
+    // `trusted` stays false for events script constructs; reportWebApiException passes true.
     static JSColloErrorEvent* create(JSC::VM& vm, Collo::GlobalObject* global_object, JSC::Structure* structure,
-        String type, bool bubbles, bool cancelable, bool composed, String message, String filename, uint32_t lineno,
-        uint32_t colno, JSValue error)
+        WTF::String type, bool bubbles, bool cancelable, bool composed, WTF::String message, WTF::String filename,
+        uint32_t lineno, uint32_t colno, JSC::JSValue error, bool trusted = false)
     {
-        auto* object = new (NotNull, JSC::allocateCell<JSColloErrorEvent>(vm)) JSColloErrorEvent(vm, structure,
-            WTF::move(type), bubbles, cancelable, composed, WTF::move(message), WTF::move(filename), lineno, colno);
+        auto* object
+            = new (NotNull, JSC::allocateCell<JSColloErrorEvent>(vm)) JSColloErrorEvent(vm, structure, WTF::move(type),
+                bubbles, cancelable, composed, WTF::move(message), WTF::move(filename), lineno, colno, trusted);
         object->finishCreation(vm, global_object, error);
         return object;
     }
@@ -368,16 +364,16 @@ public:
     DECLARE_INFO;
     DECLARE_VISIT_CHILDREN;
 
-    const String& message() const { return m_message; }
-    const String& filename() const { return m_filename; }
+    const WTF::String& message() const { return m_message; }
+    const WTF::String& filename() const { return m_filename; }
     uint32_t lineno() const { return m_lineno; }
     uint32_t colno() const { return m_colno; }
-    JSValue error() const { return m_error.get(); }
+    JSC::JSValue error() const { return m_error.get(); }
 
 private:
-    JSColloErrorEvent(JSC::VM& vm, JSC::Structure* structure, String type, bool bubbles, bool cancelable, bool composed,
-        String message, String filename, uint32_t lineno, uint32_t colno)
-        : Base(vm, structure, WTF::move(type), bubbles, cancelable, composed)
+    JSColloErrorEvent(JSC::VM& vm, JSC::Structure* structure, WTF::String type, bool bubbles, bool cancelable,
+        bool composed, WTF::String message, WTF::String filename, uint32_t lineno, uint32_t colno, bool trusted)
+        : Base(vm, structure, WTF::move(type), bubbles, cancelable, composed, trusted)
         , m_message(WTF::move(message))
         , m_filename(WTF::move(filename))
         , m_lineno(lineno)
@@ -387,15 +383,15 @@ private:
 
     ~JSColloErrorEvent() = default;
 
-    void finishCreation(JSC::VM& vm, Collo::GlobalObject* global_object, JSValue error)
+    void finishCreation(JSC::VM& vm, Collo::GlobalObject* global_object, JSC::JSValue error)
     {
         Base::finishCreation(vm, global_object);
         ASSERT(inherits(info()));
         m_error.set(vm, this, error);
     }
 
-    String m_message;
-    String m_filename;
+    WTF::String m_message;
+    WTF::String m_filename;
     uint32_t m_lineno { 0 };
     uint32_t m_colno { 0 };
     JSC::WriteBarrier<JSC::Unknown> m_error;
@@ -410,14 +406,15 @@ public:
         return &vm.destructibleObjectSpace();
     }
 
-    static JSC::Structure* createStructure(JSC::VM& vm, JSC::JSGlobalObject* global_object, JSValue prototype)
+    static JSC::Structure* createStructure(JSC::VM& vm, JSC::JSGlobalObject* global_object, JSC::JSValue prototype)
     {
         return JSC::Structure::create(
             vm, global_object, prototype, JSC::TypeInfo(JSC::ObjectType, StructureFlags), info());
     }
 
     static JSColloCloseEvent* create(JSC::VM& vm, Collo::GlobalObject* global_object, JSC::Structure* structure,
-        String type, bool bubbles, bool cancelable, bool composed, bool was_clean, uint16_t code, String reason)
+        WTF::String type, bool bubbles, bool cancelable, bool composed, bool was_clean, uint16_t code,
+        WTF::String reason)
     {
         auto* object = new (NotNull, JSC::allocateCell<JSColloCloseEvent>(vm)) JSColloCloseEvent(
             vm, structure, WTF::move(type), bubbles, cancelable, composed, was_clean, code, WTF::move(reason));
@@ -432,11 +429,11 @@ public:
 
     bool wasClean() const { return m_was_clean; }
     uint16_t code() const { return m_code; }
-    const String& reason() const { return m_reason; }
+    const WTF::String& reason() const { return m_reason; }
 
 private:
-    JSColloCloseEvent(JSC::VM& vm, JSC::Structure* structure, String type, bool bubbles, bool cancelable, bool composed,
-        bool was_clean, uint16_t code, String reason)
+    JSColloCloseEvent(JSC::VM& vm, JSC::Structure* structure, WTF::String type, bool bubbles, bool cancelable,
+        bool composed, bool was_clean, uint16_t code, WTF::String reason)
         : Base(vm, structure, WTF::move(type), bubbles, cancelable, composed)
         , m_reason(WTF::move(reason))
         , m_code(code)
@@ -446,12 +443,13 @@ private:
 
     ~JSColloCloseEvent() = default;
 
-    String m_reason;
+    WTF::String m_reason;
     uint16_t m_code { 0 };
     bool m_was_clean { false };
 };
 
-// An EventTarget script constructs, and the cell that holds the global object's listeners.
+// An EventTarget script constructs, and the cell that holds the global object's listeners. Its listener storage owns
+// heap memory, so the cell is destructible.
 class JSColloEventTarget final : public JSC::JSDestructibleObject {
     using Base = JSC::JSDestructibleObject;
 
@@ -461,7 +459,7 @@ public:
         return &vm.destructibleObjectSpace();
     }
 
-    static JSC::Structure* createStructure(JSC::VM& vm, JSC::JSGlobalObject* global_object, JSValue prototype)
+    static JSC::Structure* createStructure(JSC::VM& vm, JSC::JSGlobalObject* global_object, JSC::JSValue prototype)
     {
         return JSC::Structure::create(
             vm, global_object, prototype, JSC::TypeInfo(JSC::ObjectType, StructureFlags), info());
@@ -498,17 +496,16 @@ private:
     WebApiEventTargetData m_event_target;
 };
 
-JSC_DECLARE_HOST_FUNCTION(eventTargetConstructorCall);
-JSC_DECLARE_HOST_FUNCTION(eventTargetConstructorConstruct);
-JSC_DECLARE_HOST_FUNCTION(eventTargetAddEventListener);
-JSC_DECLARE_HOST_FUNCTION(eventTargetRemoveEventListener);
-JSC_DECLARE_HOST_FUNCTION(eventTargetDispatchEvent);
-JSC_DECLARE_HOST_FUNCTION(globalAddEventListener);
-JSC_DECLARE_HOST_FUNCTION(globalRemoveEventListener);
-JSC_DECLARE_HOST_FUNCTION(globalDispatchEvent);
-JSC_DECLARE_HOST_FUNCTION(globalGetOnError);
-JSC_DECLARE_HOST_FUNCTION(globalSetOnError);
-JSC_DECLARE_HOST_FUNCTION(globalGetOnMessage);
-JSC_DECLARE_HOST_FUNCTION(globalSetOnMessage);
+// EventTarget's interface objects, for the realm cache that installWebApiEvent fills.
+struct EventTargetInterface {
+    JSC::JSObject* constructor { nullptr };
+    JSC::JSObject* prototype { nullptr };
+    JSC::Structure* structure { nullptr };
+};
+
+// Defines EventTarget and the global object's addEventListener, removeEventListener, dispatchEvent and onerror, and
+// stores in the realm cache the EventTarget cell that holds the global object's listeners (event_target.cpp).
+// installWebApiEvent calls it once per realm.
+EventTargetInterface installEventTargetInterface(Collo::GlobalObject*, JSC::VM&);
 
 } // namespace Collo::HostFunctions

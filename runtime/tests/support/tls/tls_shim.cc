@@ -1232,6 +1232,260 @@ extern "C" const char* collo_test_tls_resumption_origin_last_error(struct collo_
     return server->error;
 }
 
+// A TLS origin that serves HTTP/1.1 on keep-alive connections, one connection at a time, for the egress client's
+// HTTP/1 tests over TLS wires. It selects http/1.1 whatever the client offers and answers the first request of each
+// connection with `kept ok`, keeping the connection. On a connection's second request it closes without answering and
+// without a close_notify: with a FIN under COLLO_TEST_TLS_HTTP1_ORIGIN_CLOSE_SECOND, with a reset under
+// COLLO_TEST_TLS_HTTP1_ORIGIN_RESET_SECOND. Requests carry no body. Its thread writes `accepted`, only through the
+// __atomic builtins, client_fd and error.
+struct collo_test_tls_http1_origin {
+    TempFiles files;
+    pthread_t thread;
+    int thread_started;
+    int listen_fd;
+    // Guards client_fd and stopping, as in collo_test_h2_origin_server.
+    pthread_mutex_t client_fd_mutex;
+    int client_fd;
+    int stopping;
+    uint16_t port;
+    int mode;
+    uint32_t accepted;
+    char error[512];
+};
+
+enum {
+    COLLO_TEST_TLS_HTTP1_ORIGIN_CLOSE_SECOND = 0,
+    COLLO_TEST_TLS_HTTP1_ORIGIN_RESET_SECOND = 1,
+};
+
+// Connections the origin serves before its thread ends, and requests it reads on one connection.
+static constexpr uint32_t tls_http1_origin_connections_max = 8;
+static constexpr uint32_t tls_http1_origin_requests_max = 2;
+
+static void tls_http1_origin_set_error(struct collo_test_tls_http1_origin* server, const char* message)
+{
+    uint32_t err = ERR_peek_last_error();
+    if (err != 0) {
+        char detail[256];
+        ERR_error_string_n(err, detail, sizeof(detail));
+        snprintf(server->error, sizeof(server->error), "%s: %s", message, detail);
+    } else {
+        snprintf(server->error, sizeof(server->error), "%s", message);
+    }
+}
+
+// Reads one request head: 1 once it ended, 0 when the client closed or the read failed first.
+static int tls_http1_origin_read_head(SSL* ssl)
+{
+    char head[4096];
+    size_t head_len = 0;
+    while (head_len < sizeof(head)) {
+        int read_len = SSL_read(ssl, head + head_len, 1);
+        if (read_len <= 0) {
+            int err = SSL_ERROR_NONE;
+            if (ssl_io_interrupted(ssl, read_len, &err)) {
+                continue;
+            }
+            return 0;
+        }
+        head_len += static_cast<size_t>(read_len);
+        if (head_len >= 4 && memcmp(head + head_len - 4, "\r\n\r\n", 4) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Serves one handshaken connection. The caller frees `ssl` without SSL_shutdown and closes `client_fd`, so every way
+// out of here ends the connection without a close_notify.
+static void tls_http1_origin_serve(struct collo_test_tls_http1_origin* server, SSL* ssl, int client_fd)
+{
+    static const char response[] = "HTTP/1.1 200 OK\r\n"
+                                   "content-length: 7\r\n"
+                                   "connection: keep-alive\r\n"
+                                   "\r\n"
+                                   "kept ok";
+    for (uint32_t request = 0; request < tls_http1_origin_requests_max; request++) {
+        if (tls_http1_origin_read_head(ssl) != 1) {
+            return;
+        }
+        if (request == 0) {
+            if (ssl_write_all(ssl, response, sizeof(response) - 1) != 0) {
+                tls_http1_origin_set_error(server, "write local TLS HTTP/1 origin response");
+                return;
+            }
+            continue;
+        }
+        if (server->mode == COLLO_TEST_TLS_HTTP1_ORIGIN_RESET_SECOND) {
+            // A zero linger makes the close that follows reset the connection instead of ending it with a FIN.
+            struct linger reset_on_close;
+            reset_on_close.l_onoff = 1;
+            reset_on_close.l_linger = 0;
+            if (setsockopt(client_fd, SOL_SOCKET, SO_LINGER, &reset_on_close, sizeof(reset_on_close)) != 0) {
+                tls_http1_origin_set_error(server, "set local TLS HTTP/1 origin linger");
+            }
+        }
+        return;
+    }
+}
+
+static void* tls_http1_origin_thread_main(void* arg)
+{
+    struct collo_test_tls_http1_origin* server = static_cast<struct collo_test_tls_http1_origin*>(arg);
+    static int alpn_http11 = COLLO_TEST_H2_ORIGIN_ALPN_HTTP11;
+    ERR_clear_error();
+
+    SSL_CTX* ctx = SSL_CTX_new(TLS_server_method());
+    if (ctx == NULL || SSL_CTX_use_certificate_chain_file(ctx, server->files.server_cert) != 1
+        || SSL_CTX_use_PrivateKey_file(ctx, server->files.server_key, SSL_FILETYPE_PEM) != 1
+        || SSL_CTX_check_private_key(ctx) != 1) {
+        tls_http1_origin_set_error(server, "create local TLS HTTP/1 origin context");
+        if (ctx != NULL) {
+            SSL_CTX_free(ctx);
+        }
+        return NULL;
+    }
+    SSL_CTX_set_alpn_select_cb(ctx, h2_origin_select_alpn, &alpn_http11);
+
+    for (uint32_t i = 0; i < tls_http1_origin_connections_max; i++) {
+        // Fails once stop shuts the listener down.
+        int client_fd = accept(server->listen_fd, NULL, NULL);
+        if (client_fd < 0) {
+            break;
+        }
+        pthread_mutex_lock(&server->client_fd_mutex);
+        const int stopping = server->stopping;
+        server->client_fd = client_fd;
+        pthread_mutex_unlock(&server->client_fd_mutex);
+        if (!stopping) {
+            __atomic_add_fetch(&server->accepted, 1, __ATOMIC_ACQ_REL);
+            struct timeval timeout;
+            timeout.tv_sec = 15;
+            timeout.tv_usec = 0;
+            setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+            setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+            SSL* ssl = SSL_new(ctx);
+            if (ssl != NULL && SSL_set_fd(ssl, client_fd) == 1 && SSL_accept(ssl) == 1) {
+                tls_http1_origin_serve(server, ssl, client_fd);
+            } else {
+                tls_http1_origin_set_error(server, "local TLS HTTP/1 origin accept");
+            }
+            if (ssl != NULL) {
+                SSL_free(ssl);
+            }
+        }
+        pthread_mutex_lock(&server->client_fd_mutex);
+        server->client_fd = -1;
+        close(client_fd);
+        pthread_mutex_unlock(&server->client_fd_mutex);
+        if (stopping) {
+            break;
+        }
+    }
+
+    SSL_CTX_free(ctx);
+    return NULL;
+}
+
+extern "C" int collo_test_tls_http1_origin_start(int mode, struct collo_test_tls_http1_origin** out, uint16_t* out_port)
+{
+    if (out == NULL || out_port == NULL
+        || (mode != COLLO_TEST_TLS_HTTP1_ORIGIN_CLOSE_SECOND && mode != COLLO_TEST_TLS_HTTP1_ORIGIN_RESET_SECOND)) {
+        return fail("invalid local TLS HTTP/1 origin arguments");
+    }
+    tls_test_error[0] = '\0';
+    ERR_clear_error();
+    struct collo_test_tls_http1_origin* server
+        = static_cast<struct collo_test_tls_http1_origin*>(calloc(1, sizeof(*server)));
+    if (server == NULL) {
+        return fail("allocate local TLS HTTP/1 origin");
+    }
+    server->listen_fd = -1;
+    server->client_fd = -1;
+    server->mode = mode;
+    pthread_mutex_init(&server->client_fd_mutex, NULL);
+    if (init_temp_files(&server->files) != 0) {
+        pthread_mutex_destroy(&server->client_fd_mutex);
+        free(server);
+        return -1;
+    }
+
+    server->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server->listen_fd < 0) {
+        pthread_mutex_destroy(&server->client_fd_mutex);
+        cleanup_temp_files(&server->files);
+        free(server);
+        return fail_errno("create local TLS HTTP/1 origin listener");
+    }
+    int one = 1;
+    setsockopt(server->listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = 0;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    socklen_t addr_len = sizeof(addr);
+    if (bind(server->listen_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0
+        || listen(server->listen_fd, 4) != 0
+        || getsockname(server->listen_fd, reinterpret_cast<sockaddr*>(&addr), &addr_len) != 0) {
+        close(server->listen_fd);
+        pthread_mutex_destroy(&server->client_fd_mutex);
+        cleanup_temp_files(&server->files);
+        free(server);
+        return fail_errno("bind local TLS HTTP/1 origin listener");
+    }
+    server->port = ntohs(addr.sin_port);
+    if (pthread_create(&server->thread, NULL, tls_http1_origin_thread_main, server) != 0) {
+        close(server->listen_fd);
+        pthread_mutex_destroy(&server->client_fd_mutex);
+        cleanup_temp_files(&server->files);
+        free(server);
+        return fail("start local TLS HTTP/1 origin thread");
+    }
+    server->thread_started = 1;
+    *out = server;
+    *out_port = server->port;
+    return 0;
+}
+
+extern "C" void collo_test_tls_http1_origin_stop(struct collo_test_tls_http1_origin* server)
+{
+    if (server == NULL) {
+        return;
+    }
+    pthread_mutex_lock(&server->client_fd_mutex);
+    server->stopping = 1;
+    if (server->client_fd >= 0) {
+        shutdown(server->client_fd, SHUT_RDWR);
+    }
+    pthread_mutex_unlock(&server->client_fd_mutex);
+    if (server->listen_fd >= 0) {
+        shutdown(server->listen_fd, SHUT_RDWR);
+    }
+    if (server->thread_started) {
+        pthread_join(server->thread, NULL);
+    }
+    if (server->listen_fd >= 0) {
+        close(server->listen_fd);
+    }
+    pthread_mutex_destroy(&server->client_fd_mutex);
+    cleanup_temp_files(&server->files);
+    free(server);
+}
+
+extern "C" uint32_t collo_test_tls_http1_origin_accepted(struct collo_test_tls_http1_origin* server)
+{
+    return server == NULL ? 0 : __atomic_load_n(&server->accepted, __ATOMIC_ACQUIRE);
+}
+
+extern "C" const char* collo_test_tls_http1_origin_last_error(struct collo_test_tls_http1_origin* server)
+{
+    if (server == NULL || server->error[0] == '\0') {
+        return "";
+    }
+    return server->error;
+}
+
 // The h2 client that drives a Collo server. A call opens one TLS connection
 // to 127.0.0.1, negotiates h2 through ALPN, sends the client preface and
 // SETTINGS, issues its requests and reads the responses frame by frame. Each

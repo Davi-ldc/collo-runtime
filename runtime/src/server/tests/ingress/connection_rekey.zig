@@ -34,7 +34,7 @@ test "a connection keeps its kTLS rekey state byte for byte across a request its
 
     const request = try scene.get(1);
     try scene.stub.answer(request, 200, "ok");
-    try harness.serveWorker(0, scene.stub);
+    try harness.handleControl(0, scene.stub);
     try scene.expectStatus(1, 200);
     try std.testing.expect(harness.requestKeyOf(scene.client, 1) == null);
 

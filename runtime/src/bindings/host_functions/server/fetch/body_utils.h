@@ -27,7 +27,6 @@ enum class BodyByteConsumer : uint8_t {
     Blob,
 };
 
-bool bodyValueIsCallable(JSC::JSValue);
 // Releases the lock of a default or BYOB reader and ignores null or any other object.
 void releaseReadableStreamReader(JSC::JSGlobalObject*, JSC::JSObject*);
 // The TypeError a used body produces, carrying the caller's message, as a value, a rejected promise or a throw.
@@ -44,8 +43,8 @@ bool stringUtf8ByteLength(const WTF::String&, size_t& out);
 bool stringUtf8LengthWithinLimit(const WTF::String&, size_t limit);
 // An empty span for a null buffer.
 std::span<const uint8_t> sharedBytesSpan(const WTF::RefPtr<ColloSharedBytes>&);
-// decodeUtf8Bytes accepts at most WTF::String::MaxLength bytes, so a longer body throws an OutOfMemoryError here
-// instead of reaching WTF's RELEASE_ASSERT.
+// Throws an OutOfMemoryError for a body longer than WTF::String::MaxLength bytes, which no decode can turn into a
+// string, so a caller can refuse it before copying the body out.
 bool ensureDecodedStringSize(JSC::JSGlobalObject*, JSC::ThrowScope&, size_t byte_size);
 // Parses the text as JSON after dropping a leading U+FEFF, as json() parses bytes after a UTF-8 decode that drops the
 // BOM. A parse error rejects the promise. A termination stays pending, and the result is then empty, with no promise.

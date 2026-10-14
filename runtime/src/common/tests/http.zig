@@ -2,9 +2,10 @@
 //! Host header and request-target validation, HTTP/1 body framing, header
 //! and status checks, the connection-specific fields HTTP/2 refuses in each
 //! direction, HTTP/2 frame headers, SETTINGS, WINDOW_UPDATE and the
-//! connection preface, and HPACK encoding and decoding with prepared headers,
-//! scratch reuse, encoder poisoning, dynamic table size updates and the skip
-//! that keeps the dynamic table in step past the header caps. Expected
+//! connection preface, and HPACK encoding and decoding into the caller's
+//! scratch, one scratch shared by several coders, encoder poisoning, dynamic
+//! table size updates and the skip that keeps the dynamic table in step past
+//! the header caps. Expected
 //! HPACK bytes follow RFC 7541: the high bits of a field's first byte select
 //! its representation (section 6), and indexes 1 to 61 name the static table
 //! (Appendix A). Besides `common-test`, the file runs alone, without JSC, as
@@ -247,22 +248,47 @@ test "http2 rejects malformed settings and bad prefaces" {
     try h2.validatePreface(h2.client_connection_preface);
 }
 
+/// The two buffers a coding thread keeps for every connection it serves: one
+/// for the field being decoded and one for the block being encoded.
+const Scratch = struct {
+    decode: []u8,
+    encode: []u8,
+
+    const encode_bytes: usize = 128 * 1024;
+
+    fn init() !Scratch {
+        const decode = try std.testing.allocator.alloc(u8, hpack.max_single_header_decode_bytes);
+        errdefer std.testing.allocator.free(decode);
+        return .{
+            .decode = decode,
+            .encode = try std.testing.allocator.alloc(u8, encode_bytes),
+        };
+    }
+
+    fn deinit(self: *Scratch) void {
+        std.testing.allocator.free(self.decode);
+        std.testing.allocator.free(self.encode);
+        self.* = undefined;
+    }
+};
+
 test "hpack round-trips http2 request pseudo headers" {
+    var scratch = try Scratch.init();
+    defer scratch.deinit();
     var encoder = try hpack.Encoder.init();
     defer encoder.deinit();
     var decoder = try hpack.Decoder.init();
     defer decoder.deinit();
 
-    var encoded = try encoder.encodeHeaders(std.testing.allocator, &.{
+    const encoded = try encoder.encodeHeaders(scratch.encode, &.{
         .{ .name = ":method", .value = "GET" },
         .{ .name = ":scheme", .value = "https" },
         .{ .name = ":authority", .value = "demo.example.test" },
         .{ .name = ":path", .value = "/hello?x=1" },
         .{ .name = "accept", .value = "*/*" },
     }, 1024);
-    defer encoded.deinit(std.testing.allocator);
 
-    var decoded = try decoder.decodeBlock(std.testing.allocator, encoded.bytes(), 16, 4096);
+    var decoded = try decoder.decodeBlock(std.testing.allocator, scratch.decode, encoded, 16, 4096);
     defer decoded.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(usize, 5), decoded.headers.len);
@@ -274,219 +300,21 @@ test "hpack round-trips http2 request pseudo headers" {
     try std.testing.expectEqualStrings("*/*", decoded.headers[4].value);
 }
 
-test "hpack prepared headers own bytes and match raw encoding" {
-    const allocator = std.testing.allocator;
-    var method = [_]u8{ 'P', 'O', 'S', 'T' };
-    var custom_name = [_]u8{ 'x', '-', 'p', 'l', 'a', 'n' };
-    var custom_value = [_]u8{ 'r', 'e', 'u', 's', 'e', 'd' };
-    const headers = [_]hpack.Header{
-        .{ .name = ":method", .value = method[0..] },
-        .{ .name = custom_name[0..], .value = custom_value[0..] },
-    };
-
-    var raw_encoder = try hpack.Encoder.init();
-    defer raw_encoder.deinit();
-    var expected = try raw_encoder.encodeHeaders(allocator, &headers, 1024);
-    defer expected.deinit(allocator);
-
-    var prepared = try hpack.PreparedHeaders.init(allocator, &headers);
-    defer prepared.deinit(allocator);
-    @memset(method[0..], 'X');
-    @memset(custom_name[0..], 'y');
-    @memset(custom_value[0..], 'z');
-
-    var prepared_encoder = try hpack.Encoder.init();
-    defer prepared_encoder.deinit();
-    var actual = try prepared_encoder.encodePreparedHeaders(
-        allocator,
-        &prepared,
-        1024,
-    );
-    defer actual.deinit(allocator);
-    try std.testing.expectEqualSlices(u8, expected.bytes(), actual.bytes());
-
-    var decoder = try hpack.Decoder.init();
-    defer decoder.deinit();
-    var decoded = try decoder.decodeBlock(allocator, actual.bytes(), 8, 1024);
-    defer decoded.deinit(allocator);
-    try std.testing.expectEqualStrings("POST", decoded.headers[0].value);
-    try std.testing.expectEqualStrings("x-plan", decoded.headers[1].name);
-    try std.testing.expectEqualStrings("reused", decoded.headers[1].value);
-}
-
-test "hpack prepared headers match raw blocks as dynamic state evolves" {
-    const allocator = std.testing.allocator;
-    var large_value: [640]u8 = undefined;
-    @memset(large_value[0..], 'a');
-    const headers = [_]hpack.Header{
-        .{ .name = ":method", .value = "POST" },
-        .{ .name = "x-large-plan", .value = large_value[0..] },
-        .{ .name = "authorization", .value = "Bearer prepared-secret" },
-    };
-    var prepared = try hpack.PreparedHeaders.init(allocator, &headers);
-    defer prepared.deinit(allocator);
-
-    var raw_encoder = try hpack.Encoder.init();
-    defer raw_encoder.deinit();
-    var prepared_encoder = try hpack.Encoder.init();
-    defer prepared_encoder.deinit();
-    var decoder = try hpack.Decoder.init();
-    defer decoder.deinit();
-
-    for (0..2) |_| {
-        var expected = try raw_encoder.encodeHeaders(allocator, &headers, 4096);
-        defer expected.deinit(allocator);
-        var actual = try prepared_encoder.encodePreparedHeaders(
-            allocator,
-            &prepared,
-            4096,
-        );
-        defer actual.deinit(allocator);
-        try std.testing.expectEqualSlices(u8, expected.bytes(), actual.bytes());
-
-        var decoded = try decoder.decodeBlock(allocator, actual.bytes(), 8, 4096);
-        defer decoded.deinit(allocator);
-        try std.testing.expectEqual(@as(usize, 3), decoded.headers.len);
-        try std.testing.expectEqualStrings("x-large-plan", decoded.headers[1].name);
-        try std.testing.expectEqualSlices(u8, large_value[0..], decoded.headers[1].value);
-    }
-}
-
-test "hpack prepared sensitive headers stay literal never indexed" {
-    const allocator = std.testing.allocator;
-    const headers = [_]hpack.Header{
-        .{ .name = "set-cookie", .value = "sid=prepared; HttpOnly" },
-    };
-    var prepared = try hpack.PreparedHeaders.init(allocator, &headers);
-    defer prepared.deinit(allocator);
-    var encoder = try hpack.Encoder.init();
-    defer encoder.deinit();
-
-    var first = try encoder.encodePreparedHeaders(allocator, &prepared, 1024);
-    defer first.deinit(allocator);
-    try std.testing.expectEqual(@as(u8, 0x10), first.bytes()[0] & 0xf0);
-
-    var second = try encoder.encodePreparedHeaders(allocator, &prepared, 1024);
-    defer second.deinit(allocator);
-    try std.testing.expectEqual(@as(u8, 0x10), second.bytes()[0] & 0xf0);
-    try std.testing.expectEqual(@as(u8, 0), second.bytes()[0] & 0x80);
-}
-
-test "hpack prepared headers preserve exact static indexes" {
-    const allocator = std.testing.allocator;
-    var prepared = try hpack.PreparedHeaders.init(allocator, &.{
-        .{ .name = ":method", .value = "POST" },
-        .{ .name = ":path", .value = "/index.html" },
-        .{ .name = ":scheme", .value = "https" },
-        .{ .name = ":status", .value = "404" },
-    });
-    defer prepared.deinit(allocator);
-    var encoder = try hpack.Encoder.init();
-    defer encoder.deinit();
-
-    var encoded = try encoder.encodePreparedHeaders(allocator, &prepared, 64);
-    defer encoded.deinit(allocator);
-    try std.testing.expectEqualSlices(u8, &.{ 0x83, 0x85, 0x87, 0x8d }, encoded.bytes());
-}
-
-test "hpack prepared scratch preserves capacity updates and empty blocks" {
-    const allocator = std.testing.allocator;
-    var prepared = try hpack.PreparedHeaders.init(allocator, &.{
-        .{ .name = ":method", .value = "GET" },
-    });
-    defer prepared.deinit(allocator);
-    var encoder = try hpack.Encoder.init();
-    defer encoder.deinit();
-    try encoder.setMaxCapacity(0);
-    try encoder.setMaxCapacity(4096);
-
-    const first = try encoder.encodePreparedHeadersScratch(allocator, &prepared, 1024);
-    try std.testing.expectEqualSlices(u8, &.{ 0x20, 0x3f, 0xe1, 0x1f, 0x82 }, first);
-    const scratch_ptr = encoder.scratch.ptr;
-    const second = try encoder.encodePreparedHeadersScratch(allocator, &prepared, 1024);
-    try std.testing.expectEqualSlices(u8, &.{0x82}, second);
-    try std.testing.expectEqual(scratch_ptr, encoder.scratch.ptr);
-
-    var empty = try hpack.PreparedHeaders.init(allocator, &.{});
-    defer empty.deinit(allocator);
-    const empty_block = try encoder.encodePreparedHeadersScratch(allocator, &empty, 0);
-    try std.testing.expectEqual(@as(usize, 0), empty_block.len);
-}
-
-test "hpack prepared header allocation failures do not leak" {
-    const headers = [_]hpack.Header{
-        .{ .name = "x-plan", .value = "value" },
-    };
-    for (0..2) |fail_index| {
-        var failing = std.testing.FailingAllocator.init(
-            std.testing.allocator,
-            .{ .fail_index = fail_index },
-        );
-        try std.testing.expectError(
-            error.OutOfMemory,
-            hpack.PreparedHeaders.init(failing.allocator(), &headers),
-        );
-    }
-}
-
-test "hpack prepared headers reject oversized fields before touching encoders" {
-    const allocator = std.testing.allocator;
-    const huge_value = try allocator.alloc(u8, 64 * 1024);
-    defer allocator.free(huge_value);
-    @memset(huge_value, 'v');
-    try std.testing.expectError(
-        error.HpackHeaderListTooLarge,
-        hpack.PreparedHeaders.init(allocator, &.{
-            .{ .name = "x-huge", .value = huge_value },
-        }),
-    );
-
-    var encoder = try hpack.Encoder.init();
-    defer encoder.deinit();
-    var encoded = try encoder.encodeHeaders(allocator, &.{
-        .{ .name = ":method", .value = "GET" },
-    }, 1);
-    defer encoded.deinit(allocator);
-    try std.testing.expectEqualSlices(u8, &.{0x82}, encoded.bytes());
-}
-
-test "hpack prepared output failure poisons encoder state" {
-    const allocator = std.testing.allocator;
-    var large_value: [256]u8 = undefined;
-    @memset(large_value[0..], 'v');
-    var prepared = try hpack.PreparedHeaders.init(allocator, &.{
-        .{ .name = "x-poison", .value = "small" },
-        .{ .name = "x-large", .value = large_value[0..] },
-    });
-    defer prepared.deinit(allocator);
-    var encoder = try hpack.Encoder.init();
-    defer encoder.deinit();
-
-    try std.testing.expectError(
-        error.HpackEncoderPoisoned,
-        encoder.encodePreparedHeaders(allocator, &prepared, 64),
-    );
-    try std.testing.expectError(
-        error.HpackEncoderPoisoned,
-        encoder.encodePreparedHeaders(allocator, &prepared, 1024),
-    );
-    try std.testing.expectError(error.HpackEncoderPoisoned, encoder.setMaxCapacity(0));
-}
-
 test "hpack decode storage is sized to decoded bytes" {
+    var scratch = try Scratch.init();
+    defer scratch.deinit();
     var encoder = try hpack.Encoder.init();
     defer encoder.deinit();
     var decoder = try hpack.Decoder.init();
     defer decoder.deinit();
 
-    var encoded = try encoder.encodeHeaders(std.testing.allocator, &.{
+    const encoded = try encoder.encodeHeaders(scratch.encode, &.{
         .{ .name = ":method", .value = "GET" },
         .{ .name = ":path", .value = "/small" },
         .{ .name = "x-test", .value = "ok" },
     }, 1024);
-    defer encoded.deinit(std.testing.allocator);
 
-    var decoded = try decoder.decodeBlock(std.testing.allocator, encoded.bytes(), 16, 4096);
+    var decoded = try decoder.decodeBlock(std.testing.allocator, scratch.decode, encoded, 16, 4096);
     defer decoded.deinit(std.testing.allocator);
 
     var expected_storage_len: usize = 0;
@@ -507,28 +335,26 @@ test "an hpack skip keeps the dynamic table in step past the header caps" {
     // The two entries by their dynamic indexes: 62 is the newest, `x-second`.
     const references = [_]u8{ 0x80 | 63, 0x80 | 62 };
 
+    var scratch = try Scratch.init();
+    defer scratch.deinit();
+
     var capped = try hpack.Decoder.init();
     defer capped.deinit();
-    try std.testing.expectError(error.HpackHeaderListTooLarge, capped.decodeBlock(allocator, &block, 512, 4096));
+    try std.testing.expectError(error.HpackHeaderListTooLarge, capped.decodeBlock(allocator, scratch.decode, &block, 512, 4096));
 
     // A decoder that never saw the block has no entry the references name.
     var fresh = try hpack.Decoder.init();
     defer fresh.deinit();
-    try std.testing.expectError(error.HpackBadData, fresh.decodeBlock(allocator, &references, 16, 4096));
+    try std.testing.expectError(error.HpackBadData, fresh.decodeBlock(allocator, scratch.decode, &references, 16, 4096));
 
-    // The skip passes the block no cap would take, through the decoder's
-    // own scratch and through the caller's, and both tables stay in step.
+    // The skip passes the block no cap would take, and the table stays in
+    // step, as does the capped decoder's, which decoded the block whole.
     var skipping = try hpack.Decoder.init();
     defer skipping.deinit();
-    try skipping.skipBlock(allocator, &block);
-    var scratch_skipping = try hpack.Decoder.init();
-    defer scratch_skipping.deinit();
-    const scratch = try allocator.alloc(u8, hpack.max_single_header_decode_bytes);
-    defer allocator.free(scratch);
-    try scratch_skipping.skipBlockScratch(scratch, &block);
+    try skipping.skipBlock(scratch.decode, &block);
 
-    for ([_]*hpack.Decoder{ &skipping, &scratch_skipping }) |decoder| {
-        var decoded = try decoder.decodeBlock(allocator, &references, 16, 4096);
+    for ([_]*hpack.Decoder{ &skipping, &capped }) |decoder| {
+        var decoded = try decoder.decodeBlock(allocator, scratch.decode, &references, 16, 4096);
         defer decoded.deinit(allocator);
         try std.testing.expectEqual(@as(usize, 2), decoded.headers.len);
         try std.testing.expectEqualStrings("x-first", decoded.headers[0].name);
@@ -538,12 +364,64 @@ test "an hpack skip keeps the dynamic table in step past the header caps" {
     }
 }
 
+test "one hpack scratch serves several connections' decoders and encoders in turn" {
+    // A shard's two buffers carry nothing from one call to the next, so two
+    // connections that alternate on them each keep their own dynamic table.
+    var scratch = try Scratch.init();
+    defer scratch.deinit();
+    var first_encoder = try hpack.Encoder.init();
+    defer first_encoder.deinit();
+    var second_encoder = try hpack.Encoder.init();
+    defer second_encoder.deinit();
+    var first_decoder = try hpack.Decoder.init();
+    defer first_decoder.deinit();
+    var second_decoder = try hpack.Decoder.init();
+    defer second_decoder.deinit();
+
+    for ([_][]const u8{ "one", "two" }) |value| {
+        const fields = [_]hpack.Header{.{ .name = "x-connection", .value = value }};
+        for (0..2) |_| {
+            const first_block = try first_encoder.encodeHeaders(scratch.encode, &fields, 1024);
+            var first = try first_decoder.decodeBlock(std.testing.allocator, scratch.decode, first_block, 16, 4096);
+            defer first.deinit(std.testing.allocator);
+            try std.testing.expectEqualStrings(value, first.headers[0].value);
+
+            const second_block = try second_encoder.encodeHeaders(scratch.encode, &fields, 1024);
+            var second = try second_decoder.decodeBlock(std.testing.allocator, scratch.decode, second_block, 16, 4096);
+            defer second.deinit(std.testing.allocator);
+            try std.testing.expectEqualStrings(value, second.headers[0].value);
+        }
+    }
+}
+
+test "an hpack encode whose worst case exceeds the caller's scratch fails before touching the table" {
+    var scratch = try Scratch.init();
+    defer scratch.deinit();
+    var encoder = try hpack.Encoder.init();
+    defer encoder.deinit();
+    var decoder = try hpack.Decoder.init();
+    defer decoder.deinit();
+
+    var small: [4]u8 = undefined;
+    const fields = [_]hpack.Header{.{ .name = "x-long", .value = "a value longer than the scratch" }};
+    try std.testing.expectError(error.HpackOutputTooSmall, encoder.encodeHeaders(&small, &fields, 1024));
+
+    // The refusal came before the shim saw a field, so the encoder is not
+    // poisoned and its table matches a decoder that saw nothing.
+    const block = try encoder.encodeHeaders(scratch.encode, &fields, 1024);
+    var decoded = try decoder.decodeBlock(std.testing.allocator, scratch.decode, block, 16, 4096);
+    defer decoded.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("x-long", decoded.headers[0].name);
+}
+
 test "hpack dynamic table size update is only accepted at header block start" {
+    var scratch = try Scratch.init();
+    defer scratch.deinit();
     var decoder = try hpack.Decoder.init();
     defer decoder.deinit();
 
     const valid = [_]u8{ 0x20, 0x82 };
-    var decoded = try decoder.decodeBlock(std.testing.allocator, &valid, 16, 4096);
+    var decoded = try decoder.decodeBlock(std.testing.allocator, scratch.decode, &valid, 16, 4096);
     defer decoded.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), decoded.headers.len);
     try std.testing.expectEqualStrings(":method", decoded.headers[0].name);
@@ -552,33 +430,39 @@ test "hpack dynamic table size update is only accepted at header block start" {
     const invalid = [_]u8{ 0x82, 0x20, 0x84 };
     try std.testing.expectError(
         error.HpackBadData,
-        decoder.decodeBlock(std.testing.allocator, &invalid, 16, 4096),
+        decoder.decodeBlock(std.testing.allocator, scratch.decode, &invalid, 16, 4096),
     );
 }
 
 test "hpack rejects truncated literal value" {
+    var scratch = try Scratch.init();
+    defer scratch.deinit();
     var decoder = try hpack.Decoder.init();
     defer decoder.deinit();
 
     const truncated_literal_value = [_]u8{0x41};
     try std.testing.expectError(
         error.HpackBadData,
-        decoder.decodeBlock(std.testing.allocator, &truncated_literal_value, 16, 4096),
+        decoder.decodeBlock(std.testing.allocator, scratch.decode, &truncated_literal_value, 16, 4096),
     );
 }
 
 test "hpack rejects overflowing integer varint" {
+    var scratch = try Scratch.init();
+    defer scratch.deinit();
     var decoder = try hpack.Decoder.init();
     defer decoder.deinit();
 
     const overflowing_index = [_]u8{ 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f };
     try std.testing.expectError(
         error.HpackBadData,
-        decoder.decodeBlock(std.testing.allocator, &overflowing_index, 16, 4096),
+        decoder.decodeBlock(std.testing.allocator, scratch.decode, &overflowing_index, 16, 4096),
     );
 }
 
 test "hpack decoder preserves opaque literal header name bytes" {
+    var scratch = try Scratch.init();
+    defer scratch.deinit();
     var decoder = try hpack.Decoder.init();
     defer decoder.deinit();
 
@@ -589,7 +473,7 @@ test "hpack decoder preserves opaque literal header name bytes" {
         'd',  ' ',
         0x01, 'v',
     };
-    var decoded = try decoder.decodeBlock(std.testing.allocator, &literal, 16, 4096);
+    var decoded = try decoder.decodeBlock(std.testing.allocator, scratch.decode, &literal, 16, 4096);
     defer decoded.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(usize, 1), decoded.headers.len);
@@ -598,11 +482,13 @@ test "hpack decoder preserves opaque literal header name bytes" {
 }
 
 test "hpack decoder safely indexes an empty literal name" {
+    var scratch = try Scratch.init();
+    defer scratch.deinit();
     var decoder = try hpack.Decoder.init();
     defer decoder.deinit();
 
     const literal = [_]u8{ 0x40, 0x00, 0x01, 'v' };
-    var decoded = try decoder.decodeBlock(std.testing.allocator, &literal, 16, 4096);
+    var decoded = try decoder.decodeBlock(std.testing.allocator, scratch.decode, &literal, 16, 4096);
     defer decoded.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(usize, 1), decoded.headers.len);
@@ -610,7 +496,7 @@ test "hpack decoder safely indexes an empty literal name" {
     try std.testing.expectEqualStrings("v", decoded.headers[0].value);
 
     const indexed = [_]u8{0xbe};
-    var decoded_again = try decoder.decodeBlock(std.testing.allocator, &indexed, 16, 4096);
+    var decoded_again = try decoder.decodeBlock(std.testing.allocator, scratch.decode, &indexed, 16, 4096);
     defer decoded_again.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(usize, 1), decoded_again.headers.len);
@@ -619,86 +505,81 @@ test "hpack decoder safely indexes an empty literal name" {
 }
 
 test "hpack encoder emits pending dynamic table size updates before headers" {
+    var scratch = try Scratch.init();
+    defer scratch.deinit();
     var encoder = try hpack.Encoder.init();
     defer encoder.deinit();
     try encoder.setMaxCapacity(0);
 
-    var first = try encoder.encodeHeaders(std.testing.allocator, &.{
+    const first = try encoder.encodeHeaders(scratch.encode, &.{
         .{ .name = ":status", .value = "200" },
         .{ .name = "x-mode", .value = "h2" },
     }, 1024);
-    defer first.deinit(std.testing.allocator);
-    try std.testing.expect(first.bytes().len > 0);
-    try std.testing.expectEqual(@as(u8, 0x20), first.bytes()[0]);
+    try std.testing.expect(first.len > 0);
+    try std.testing.expectEqual(@as(u8, 0x20), first[0]);
 
     var decoder = try hpack.Decoder.init();
     defer decoder.deinit();
     try decoder.setMaxCapacity(0);
-    var decoded_first = try decoder.decodeBlock(std.testing.allocator, first.bytes(), 16, 4096);
+    var decoded_first = try decoder.decodeBlock(std.testing.allocator, scratch.decode, first, 16, 4096);
     defer decoded_first.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 2), decoded_first.headers.len);
 
-    var second = try encoder.encodeHeaders(std.testing.allocator, &.{
+    const second = try encoder.encodeHeaders(scratch.encode, &.{
         .{ .name = ":status", .value = "200" },
         .{ .name = "x-mode", .value = "h2" },
     }, 1024);
-    defer second.deinit(std.testing.allocator);
-    try std.testing.expect(second.bytes().len > 0);
-    try std.testing.expect(second.bytes()[0] != 0x20);
+    try std.testing.expect(second.len > 0);
+    try std.testing.expect(second[0] != 0x20);
 
-    var decoded_second = try decoder.decodeBlock(std.testing.allocator, second.bytes(), 16, 4096);
+    var decoded_second = try decoder.decodeBlock(std.testing.allocator, scratch.decode, second, 16, 4096);
     defer decoded_second.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 2), decoded_second.headers.len);
 }
 
 test "hpack encoder allows indexed blocks under tight output limits" {
-    const allocator = std.testing.allocator;
+    var scratch = try Scratch.init();
+    defer scratch.deinit();
     var encoder = try hpack.Encoder.init();
     defer encoder.deinit();
 
-    var encoded = try encoder.encodeHeaders(allocator, &.{
+    const encoded = try encoder.encodeHeaders(scratch.encode, &.{
         .{ .name = ":method", .value = "GET" },
     }, 1);
-    defer encoded.deinit(allocator);
 
-    try std.testing.expectEqualSlices(u8, &.{0x82}, encoded.bytes());
+    try std.testing.expectEqualSlices(u8, &.{0x82}, encoded);
 }
 
 test "hpack encoder promotes duplicate static names to exact indexed values" {
-    const allocator = std.testing.allocator;
+    var scratch = try Scratch.init();
+    defer scratch.deinit();
     var encoder = try hpack.Encoder.init();
     defer encoder.deinit();
 
-    var encoded = try encoder.encodeHeaders(allocator, &.{
+    const encoded = try encoder.encodeHeaders(scratch.encode, &.{
         .{ .name = ":method", .value = "POST" },
         .{ .name = ":path", .value = "/index.html" },
         .{ .name = ":scheme", .value = "https" },
         .{ .name = ":status", .value = "404" },
     }, 64);
-    defer encoded.deinit(allocator);
 
-    try std.testing.expectEqualSlices(u8, &.{ 0x83, 0x85, 0x87, 0x8d }, encoded.bytes());
+    try std.testing.expectEqualSlices(u8, &.{ 0x83, 0x85, 0x87, 0x8d }, encoded);
 }
 
 test "hpack encoder output failure poisons encoder state" {
-    const allocator = std.testing.allocator;
+    var scratch = try Scratch.init();
+    defer scratch.deinit();
     var encoder = try hpack.Encoder.init();
     defer encoder.deinit();
 
     var large_value: [256]u8 = undefined;
     @memset(large_value[0..], 'v');
-    if (encoder.encodeHeaders(allocator, &.{
+    try std.testing.expectError(error.HpackEncoderPoisoned, encoder.encodeHeaders(scratch.encode, &.{
         .{ .name = "x-poison", .value = "small" },
         .{ .name = "x-large", .value = large_value[0..] },
-    }, 64)) |block| {
-        var owned = block;
-        defer owned.deinit(allocator);
-        return error.ExpectedHpackOutputTooSmall;
-    } else |err| {
-        try std.testing.expectEqual(error.HpackEncoderPoisoned, err);
-    }
+    }, 64));
 
-    try std.testing.expectError(error.HpackEncoderPoisoned, encoder.encodeHeaders(allocator, &.{
+    try std.testing.expectError(error.HpackEncoderPoisoned, encoder.encodeHeaders(scratch.encode, &.{
         .{ .name = "x-poison", .value = "small" },
     }, 128));
     try std.testing.expectError(error.HpackEncoderPoisoned, encoder.setMaxCapacity(0));
@@ -706,6 +587,8 @@ test "hpack encoder output failure poisons encoder state" {
 
 test "hpack encoder oversized failure does not publish dynamic entries" {
     const allocator = std.testing.allocator;
+    var scratch = try Scratch.init();
+    defer scratch.deinit();
     var encoder = try hpack.Encoder.init();
     defer encoder.deinit();
 
@@ -713,25 +596,18 @@ test "hpack encoder oversized failure does not publish dynamic entries" {
     defer allocator.free(huge_value);
     @memset(huge_value, 'v');
 
-    if (encoder.encodeHeaders(allocator, &.{
+    try std.testing.expectError(error.HpackHeaderListTooLarge, encoder.encodeHeaders(scratch.encode, &.{
         .{ .name = "x-poison", .value = "small" },
         .{ .name = "x-huge", .value = huge_value },
-    }, 128 * 1024)) |block| {
-        var owned = block;
-        defer owned.deinit(allocator);
-        return error.ExpectedHpackHeaderListTooLarge;
-    } else |err| {
-        try std.testing.expectEqual(error.HpackHeaderListTooLarge, err);
-    }
+    }, 128 * 1024));
 
-    var next = try encoder.encodeHeaders(allocator, &.{
+    const next = try encoder.encodeHeaders(scratch.encode, &.{
         .{ .name = "x-poison", .value = "small" },
     }, 128);
-    defer next.deinit(allocator);
 
     var decoder = try hpack.Decoder.init();
     defer decoder.deinit();
-    var decoded = try decoder.decodeBlock(allocator, next.bytes(), 16, 4096);
+    var decoded = try decoder.decodeBlock(allocator, scratch.decode, next, 16, 4096);
     defer decoded.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 1), decoded.headers.len);
@@ -741,6 +617,8 @@ test "hpack encoder oversized failure does not publish dynamic entries" {
 
 test "hpack decoder consumes oversized header blocks before reporting limit" {
     const allocator = std.testing.allocator;
+    var scratch = try Scratch.init();
+    defer scratch.deinit();
     var encoder = try hpack.Encoder.init();
     defer encoder.deinit();
     var decoder = try hpack.Decoder.init();
@@ -749,25 +627,19 @@ test "hpack decoder consumes oversized header blocks before reporting limit" {
     var large_value: [128]u8 = undefined;
     @memset(large_value[0..], 'a');
 
-    var first = try encoder.encodeHeaders(allocator, &.{
+    const first = try encoder.encodeHeaders(scratch.encode, &.{
         .{ .name = "x-large", .value = large_value[0..] },
     }, 4096);
-    defer first.deinit(allocator);
+    try std.testing.expectError(
+        error.HpackHeaderListTooLarge,
+        decoder.decodeBlock(allocator, scratch.decode, first, 16, 32),
+    );
 
-    if (decoder.decodeBlock(allocator, first.bytes(), 16, 32)) |decoded_block| {
-        var owned = decoded_block;
-        defer owned.deinit(allocator);
-        return error.ExpectedHpackHeaderListTooLarge;
-    } else |err| {
-        try std.testing.expectEqual(error.HpackHeaderListTooLarge, err);
-    }
-
-    var second = try encoder.encodeHeaders(allocator, &.{
+    const second = try encoder.encodeHeaders(scratch.encode, &.{
         .{ .name = "x-large", .value = large_value[0..] },
     }, 4096);
-    defer second.deinit(allocator);
 
-    var decoded_second = try decoder.decodeBlock(allocator, second.bytes(), 16, 512);
+    var decoded_second = try decoder.decodeBlock(allocator, scratch.decode, second, 16, 512);
     defer decoded_second.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 1), decoded_second.headers.len);
     try std.testing.expectEqualStrings("x-large", decoded_second.headers[0].name);
@@ -775,6 +647,8 @@ test "hpack decoder consumes oversized header blocks before reporting limit" {
 }
 
 test "hpack dynamic table capacity is capped even after update requests" {
+    var scratch = try Scratch.init();
+    defer scratch.deinit();
     var decoder = try hpack.Decoder.init();
     defer decoder.deinit();
     try decoder.setMaxCapacity(hpack.max_dynamic_table_capacity + 1024);
@@ -784,7 +658,7 @@ test "hpack dynamic table capacity is capped even after update requests" {
     const over_limit_update = [_]u8{ 0x3f, 0xe2, 0x1f };
     try std.testing.expectError(
         error.HpackBadData,
-        decoder.decodeBlock(std.testing.allocator, &over_limit_update, 16, 4096),
+        decoder.decodeBlock(std.testing.allocator, scratch.decode, &over_limit_update, 16, 4096),
     );
 
     var encoder = try hpack.Encoder.init();
@@ -795,35 +669,12 @@ test "hpack dynamic table capacity is capped even after update requests" {
     // RFC 7541 section 4.2 requires the smallest capacity of the interval,
     // zero here, before the final one, which the encoder clamps to
     // `hpack.max_dynamic_table_capacity`.
-    var encoded = try encoder.encodeHeaders(std.testing.allocator, &.{
+    const encoded = try encoder.encodeHeaders(scratch.encode, &.{
         .{ .name = ":status", .value = "200" },
     }, 1024);
-    defer encoded.deinit(std.testing.allocator);
-    try std.testing.expect(encoded.bytes().len >= 4);
-    try std.testing.expectEqual(@as(u8, 0x20), encoded.bytes()[0]);
-    try std.testing.expectEqualSlices(u8, &.{ 0x3f, 0xe1, 0x1f }, encoded.bytes()[1..4]);
-}
-
-test "hpack decoder reuses decode scratch across blocks" {
-    // The scratch outlives every block, so the testing allocator's leak and
-    // double-free checks are what prove `deinit` frees it exactly once.
-    var decoder = try hpack.Decoder.init();
-    defer decoder.deinit();
-    try std.testing.expectEqual(@as(usize, 0), decoder.scratch.len);
-
-    const block = [_]u8{0x82};
-    var first = try decoder.decodeBlock(std.testing.allocator, &block, 16, 4096);
-    defer first.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 1), first.headers.len);
-    try std.testing.expect(decoder.scratch.len != 0);
-    const scratch_ptr = decoder.scratch.ptr;
-
-    var second = try decoder.decodeBlock(std.testing.allocator, &block, 16, 4096);
-    defer second.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 1), second.headers.len);
-    try std.testing.expectEqualStrings(":method", second.headers[0].name);
-    try std.testing.expectEqualStrings("GET", second.headers[0].value);
-    try std.testing.expectEqual(scratch_ptr, decoder.scratch.ptr);
+    try std.testing.expect(encoded.len >= 4);
+    try std.testing.expectEqual(@as(u8, 0x20), encoded[0]);
+    try std.testing.expectEqualSlices(u8, &.{ 0x3f, 0xe1, 0x1f }, encoded[1..4]);
 }
 
 test "hpack encoder signals minimum capacity before raised capacity" {
@@ -834,54 +685,35 @@ test "hpack encoder signals minimum capacity before raised capacity" {
     // 0x20 | 0x1f = 0x3f and the remainder 4096 - 31 = 4065 follows in 7-bit
     // groups, low group first: 4065 & 0x7f = 0x61 with the continuation bit
     // is 0xe1, and 4065 >> 7 = 31 is 0x1f.
+    var scratch = try Scratch.init();
+    defer scratch.deinit();
     var encoder = try hpack.Encoder.init();
     defer encoder.deinit();
     try encoder.setMaxCapacity(0);
     try encoder.setMaxCapacity(4096);
 
-    var encoded = try encoder.encodeHeaders(std.testing.allocator, &.{
+    const encoded = try encoder.encodeHeaders(scratch.encode, &.{
         .{ .name = ":method", .value = "GET" },
     }, 1024);
-    defer encoded.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(usize, 5), encoded.bytes().len);
-    try std.testing.expectEqual(@as(u8, 0x20), encoded.bytes()[0]);
-    try std.testing.expectEqualSlices(u8, &.{ 0x3f, 0xe1, 0x1f }, encoded.bytes()[1..4]);
-    try std.testing.expectEqual(@as(u8, 0x82), encoded.bytes()[4]);
+    try std.testing.expectEqual(@as(usize, 5), encoded.len);
+    try std.testing.expectEqual(@as(u8, 0x20), encoded[0]);
+    try std.testing.expectEqualSlices(u8, &.{ 0x3f, 0xe1, 0x1f }, encoded[1..4]);
+    try std.testing.expectEqual(@as(u8, 0x82), encoded[4]);
 
     var decoder = try hpack.Decoder.init();
     defer decoder.deinit();
-    var decoded = try decoder.decodeBlock(std.testing.allocator, encoded.bytes(), 16, 4096);
+    var decoded = try decoder.decodeBlock(std.testing.allocator, scratch.decode, encoded, 16, 4096);
     defer decoded.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), decoded.headers.len);
     try std.testing.expectEqualStrings(":method", decoded.headers[0].name);
     try std.testing.expectEqualStrings("GET", decoded.headers[0].value);
 
     // Both pending updates are cleared after a successful encode.
-    var next = try encoder.encodeHeaders(std.testing.allocator, &.{
+    const next = try encoder.encodeHeaders(scratch.encode, &.{
         .{ .name = ":method", .value = "GET" },
     }, 1024);
-    defer next.deinit(std.testing.allocator);
-    try std.testing.expectEqualSlices(u8, &.{0x82}, next.bytes());
-}
-
-test "hpack encoder reuses encode scratch across blocks" {
-    var encoder = try hpack.Encoder.init();
-    defer encoder.deinit();
-    try std.testing.expectEqual(@as(usize, 0), encoder.scratch.len);
-
-    const first = try encoder.encodeHeadersScratch(std.testing.allocator, &.{
-        .{ .name = ":method", .value = "GET" },
-    }, 1024);
-    try std.testing.expectEqualSlices(u8, &.{0x82}, first);
-    try std.testing.expect(encoder.scratch.len != 0);
-    const scratch_ptr = encoder.scratch.ptr;
-
-    const second = try encoder.encodeHeadersScratch(std.testing.allocator, &.{
-        .{ .name = ":method", .value = "GET" },
-    }, 1024);
-    try std.testing.expectEqualSlices(u8, &.{0x82}, second);
-    try std.testing.expectEqual(scratch_ptr, encoder.scratch.ptr);
+    try std.testing.expectEqualSlices(u8, &.{0x82}, next);
 }
 
 test "http2 settings clamp peer header table size" {
@@ -899,27 +731,27 @@ test "http2 settings clamp peer header table size" {
 }
 
 test "hpack encoder emits sensitive headers as literal never indexed" {
+    var scratch = try Scratch.init();
+    defer scratch.deinit();
     var encoder = try hpack.Encoder.init();
     defer encoder.deinit();
 
-    var first = try encoder.encodeHeaders(std.testing.allocator, &.{
+    const first = try encoder.encodeHeaders(scratch.encode, &.{
         .{ .name = "set-cookie", .value = "sid=abc; HttpOnly" },
     }, 1024);
-    defer first.deinit(std.testing.allocator);
-    try std.testing.expect(first.bytes().len > 0);
-    try std.testing.expectEqual(@as(u8, 0x10), first.bytes()[0] & 0xf0);
+    try std.testing.expect(first.len > 0);
+    try std.testing.expectEqual(@as(u8, 0x10), first[0] & 0xf0);
 
-    var second = try encoder.encodeHeaders(std.testing.allocator, &.{
+    const second = try encoder.encodeHeaders(scratch.encode, &.{
         .{ .name = "set-cookie", .value = "sid=abc; HttpOnly" },
     }, 1024);
-    defer second.deinit(std.testing.allocator);
-    try std.testing.expect(second.bytes().len > 0);
-    try std.testing.expectEqual(@as(u8, 0x10), second.bytes()[0] & 0xf0);
-    try std.testing.expectEqual(@as(u8, 0), second.bytes()[0] & 0x80);
+    try std.testing.expect(second.len > 0);
+    try std.testing.expectEqual(@as(u8, 0x10), second[0] & 0xf0);
+    try std.testing.expectEqual(@as(u8, 0), second[0] & 0x80);
 
     var decoder = try hpack.Decoder.init();
     defer decoder.deinit();
-    var decoded = try decoder.decodeBlock(std.testing.allocator, second.bytes(), 16, 4096);
+    var decoded = try decoder.decodeBlock(std.testing.allocator, scratch.decode, second, 16, 4096);
     defer decoded.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), decoded.headers.len);
     try std.testing.expectEqualStrings("set-cookie", decoded.headers[0].name);
@@ -927,24 +759,25 @@ test "hpack encoder emits sensitive headers as literal never indexed" {
 }
 
 test "hpack encoder huffman encodes never indexed values when smaller" {
+    var scratch = try Scratch.init();
+    defer scratch.deinit();
     var encoder = try hpack.Encoder.init();
     defer encoder.deinit();
 
     var value: [128]u8 = undefined;
     @memset(value[0..], 'a');
 
-    var encoded = try encoder.encodeHeaders(std.testing.allocator, &.{
+    const encoded = try encoder.encodeHeaders(scratch.encode, &.{
         .{ .name = "cookie", .value = value[0..] },
     }, 1024);
-    defer encoded.deinit(std.testing.allocator);
-    try std.testing.expect(encoded.bytes().len > 0);
-    try std.testing.expectEqual(@as(u8, 0x10), encoded.bytes()[0] & 0xf0);
-    try std.testing.expect(encoded.bytes().len < value.len + 4);
-    try std.testing.expect(std.mem.indexOf(u8, encoded.bytes(), value[0..]) == null);
+    try std.testing.expect(encoded.len > 0);
+    try std.testing.expectEqual(@as(u8, 0x10), encoded[0] & 0xf0);
+    try std.testing.expect(encoded.len < value.len + 4);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, value[0..]) == null);
 
     var decoder = try hpack.Decoder.init();
     defer decoder.deinit();
-    var decoded = try decoder.decodeBlock(std.testing.allocator, encoded.bytes(), 16, 4096);
+    var decoded = try decoder.decodeBlock(std.testing.allocator, scratch.decode, encoded, 16, 4096);
     defer decoded.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), decoded.headers.len);
     try std.testing.expectEqualStrings("cookie", decoded.headers[0].name);

@@ -289,9 +289,19 @@ pub fn queueResponseChunk(
     return true;
 }
 
-/// Queues one worker response descriptor on its stream and returns the body
-/// bytes it queued. The caller has already matched the descriptor to an
-/// active request of the sending worker (`resolveDescriptor` in
+/// What one worker response descriptor queued on its stream.
+pub const QueuedResponse = struct {
+    /// Body bytes the descriptor queued.
+    body_bytes: usize = 0,
+    /// The status of the response head the descriptor queued, which the
+    /// client receives as `:status`; null for every other descriptor and for
+    /// a head a closing connection dropped.
+    head_status: ?u16 = null,
+};
+
+/// Queues one worker response descriptor on its stream and says what it
+/// queued. The caller has already matched the descriptor to an active
+/// request of the sending worker (`resolveDescriptor` in
 /// `runner/h2_worker_ipc.zig`). A descriptor the stream's response state
 /// does not admit, an unknown op or a malformed payload fails, and the
 /// caller sorts the error with `fault.classifyResponseQueueError`. On a
@@ -301,9 +311,9 @@ pub fn queueWorkerResponseDescriptor(
     worker: *Worker,
     runtime: *Slot,
     received: *ipc.ingress_channel.Received,
-) !usize {
+) !QueuedResponse {
     if (!runtime.isOpen())
-        return 0;
+        return .{};
     const descriptor = received.descriptor;
     const end_stream = descriptor.hasFlag(ipc.ingress_channel.flags.end_stream);
     switch (descriptor.op) {
@@ -329,7 +339,7 @@ pub fn queueWorkerResponseDescriptor(
             );
             try runtime.h2MarkWorkerResponseHeadQueued(descriptor.stream_id, end_stream);
             _ = runtime.h2CloseStreamIfDone(worker.service.allocator, descriptor.stream_id);
-            return 0;
+            return .{ .head_status = head.status };
         },
         @intFromEnum(ipc.ingress_channel.Op.response_chunk) => {
             try runtime.h2ValidateWorkerResponseBodyDescriptor(descriptor);
@@ -340,7 +350,7 @@ pub fn queueWorkerResponseDescriptor(
             try runtime.h2MarkWorkerResponseBodyQueued(descriptor.stream_id, end_stream);
             _ = try flushPendingResponseData(Worker, worker, runtime, descriptor.stream_id);
             _ = runtime.h2CloseStreamIfDone(worker.service.allocator, descriptor.stream_id);
-            return body_bytes;
+            return .{ .body_bytes = body_bytes };
         },
         @intFromEnum(ipc.ingress_channel.Op.response_end) => {
             try runtime.h2ValidateWorkerResponseBodyDescriptor(descriptor);
@@ -356,7 +366,7 @@ pub fn queueWorkerResponseDescriptor(
                 true,
             );
             _ = runtime.h2CloseStreamIfDone(worker.service.allocator, descriptor.stream_id);
-            return 0;
+            return .{};
         },
         @intFromEnum(ipc.ingress_channel.Op.response_reset) => {
             try runtime.h2ValidateWorkerResponseBodyDescriptor(descriptor);
@@ -367,7 +377,7 @@ pub fn queueWorkerResponseDescriptor(
             // The worker ended its own response, so its request needs no
             // reset toward it.
             _ = try resetStream(Worker, worker, runtime, descriptor.stream_id, reset_code);
-            return 0;
+            return .{};
         },
         else => return error.InvalidH2WorkerOutboundDescriptor,
     }

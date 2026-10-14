@@ -23,12 +23,16 @@
 //!
 //! An encoder writes into the caller's `out` and returns the used prefix. It
 //! fails with `error.EgressIpcScratchTooSmall` when the message is larger than
-//! `out`, or a field or the whole packet exceeds its `fetch_limits` bound, and
-//! with `error.InvalidEgressPacket` when the view cannot be represented. A
-//! decoder fails with `error.ShortRead` when a fetch start, fetch head, chunk
-//! batch or fetch error is shorter than its header (a short cancel fails with
-//! `error.InvalidEgressPacket`), with `error.InvalidMessageKind` on another
-//! kind, and with `error.InvalidEgressPacket` on anything else malformed.
+//! `out`, with the bound errors of `checkFetchStart` for a fetch start past a
+//! `fetch_limits` bound, and with `error.InvalidEgressPacket` when the view
+//! cannot be represented. A decoder fails with `error.ShortRead` when a fetch
+//! start, fetch head, chunk batch or fetch error is shorter than its header,
+//! with `error.InvalidMessageKind` on another kind, and with
+//! `error.InvalidEgressPacket` on anything else malformed.
+//!
+//! The worker stops a fetch with one fixed-size `EgressStop` naming its fetch
+//! id, whatever the fetch is doing; the gateway answers it once with
+//! `egress_abort_ack` and ignores a stop for a fetch it no longer holds.
 
 const std = @import("std");
 const messages = @import("messages.zig");
@@ -46,7 +50,7 @@ const RequestHeader = messages.RequestHeader;
 // through a pointer because it is too large for a stack frame, and uses it
 // from one thread. It is never a thread-local: that would put it in static
 // TLS, which glibc creates for every thread the binary starts (the worker's
-// sentinel and crypto pool, the gateway's connector threads, the server's
+// sentinel, the gateway's connector threads, the server's
 // ingress lanes), none of which decode egress packets, and carves out of each
 // thread's stack, raising every thread's minimum stack size.
 
@@ -72,6 +76,54 @@ pub const GatewayDecodeScratch = struct {
 comptime {
     std.debug.assert(fetch_limits.request_packet_bytes_max == egress_shared.max_packet_bytes);
     std.debug.assert(fetch_limits.request_start_header_bytes == @sizeOf(messages.EgressFetchStartHeader));
+    // Every start `checkFetchStart` passes fits one packet with its body
+    // inline up to the preferred size, so the worker's encode of a checked
+    // start fails only on `out`.
+    std.debug.assert(fetch_limits.request_start_header_bytes + fetch_limits.request_method_bytes_max +
+        fetch_limits.request_url_bytes_max + fetch_limits.request_headers_bytes_max +
+        fetch_limits.request_body_inline_preferred_bytes_max <= fetch_limits.request_packet_bytes_max);
+    // A batch packet holds a descriptor for every slot of the body pool.
+    std.debug.assert(@sizeOf(messages.EgressBodyChunkBatchHeader) +
+        max_body_chunk_batch_count * @sizeOf(messages.EgressBodyChunkBatchDescriptor) <= messages.max_message_bytes);
+}
+
+/// The sizes of a fetch start, as `checkFetchStart` judges them.
+pub const FetchStartShape = struct {
+    method_len: usize,
+    url_len: usize,
+    header_count: usize,
+    /// The bytes of every header name and value, without framing.
+    header_bytes: usize,
+    /// The whole request body, inline or pooled.
+    body_len: usize,
+};
+
+pub const FetchStartError = error{
+    EgressGatewayRequestMethodLimitExceeded,
+    EgressGatewayRequestUrlLimitExceeded,
+    TooManyFetchHeaders,
+    EgressGatewayRequestHeaderLimitExceeded,
+    EgressGatewayRequestBodyLimitExceeded,
+};
+
+/// Checks a fetch start against the bounds of `fetch_limits`, each with its
+/// own error, so the worker refuses a start before it copies anything and
+/// the encoder refuses the same starts. The headers count with the framing
+/// the packet gives each.
+pub fn checkFetchStart(shape: FetchStartShape) FetchStartError!void {
+    if (shape.method_len > fetch_limits.request_method_bytes_max)
+        return error.EgressGatewayRequestMethodLimitExceeded;
+    if (shape.url_len > fetch_limits.request_url_bytes_max)
+        return error.EgressGatewayRequestUrlLimitExceeded;
+    if (shape.header_count > messages.max_request_header_count)
+        return error.TooManyFetchHeaders;
+    const framing = shape.header_count * @sizeOf(NameValuePacket);
+    const header_storage = std.math.add(usize, framing, shape.header_bytes) catch
+        return error.EgressGatewayRequestHeaderLimitExceeded;
+    if (header_storage > fetch_limits.request_headers_bytes_max)
+        return error.EgressGatewayRequestHeaderLimitExceeded;
+    if (shape.body_len > fetch_limits.request_body_pooled_bytes_max)
+        return error.EgressGatewayRequestBodyLimitExceeded;
 }
 
 /// The first command of a fetch, as `messages.EgressFetchStartHeader` and the
@@ -83,7 +135,6 @@ pub const FetchStartView = struct {
     egress_token: egress_token.Bytes,
     body_id: u64,
     flags: u32 = 0,
-    max_body_bytes: u64 = 0,
     method: []const u8,
     url: []const u8,
     headers: []const RequestHeader,
@@ -121,24 +172,18 @@ pub const BodyChunkView = struct {
     /// The extent's body-pool handle (`egress_shared.BodyPoolHandle`).
     body_pool_offset: u64,
     /// Bytes as placed in the pool, in the coding the head's `body_encoding`
-    /// names.
+    /// names; the worker counts them as the fetch's received bytes.
     len: usize,
-    /// The fetch's cumulative byte meters, as
-    /// `messages.EgressBodyChunkBatchDescriptor` describes them.
-    billed_sent_total: u64 = 0,
-    billed_received_total: u64 = 0,
-    cost_total: u64 = 0,
     /// The batch's publish stamp. It travels in the batch header, so the
     /// decoder copies it into every chunk and the encoder ignores this field
     /// in favor of `BodyChunkBatchView.ready_at_mono_ns`.
     ready_at_mono_ns: u64 = 0,
 };
 
-/// The most chunk descriptors a body chunk batch can hold: as many as fit in
-/// a `messages.max_message_bytes` packet after the batch header.
-pub const max_body_chunk_batch_count: usize =
-    (messages.max_message_bytes - @sizeOf(messages.EgressBodyChunkBatchHeader)) /
-    @sizeOf(messages.EgressBodyChunkBatchDescriptor);
+/// The most chunk descriptors a body chunk batch holds: one per slot of the
+/// body pool, since every published extent takes a slot until the worker
+/// returns it. A batch of more names an extent the pool cannot hold.
+pub const max_body_chunk_batch_count: usize = egress_shared.body_pool_slot_count;
 
 pub const BodyChunkBatchView = struct {
     chunks: []const BodyChunkView,
@@ -171,10 +216,6 @@ pub const UploadChunkBatchView = struct {
 pub const BodyEndView = struct {
     fetch_id: u64,
     body_id: u64,
-    /// The fetch's cumulative byte meters.
-    billed_sent_total: u64 = 0,
-    billed_received_total: u64 = 0,
-    cost_total: u64 = 0,
     /// The gateway's publish stamp, as `messages.EgressFetchHeadHeader.ready_at_mono_ns`
     /// defines it.
     ready_at_mono_ns: u64 = 0,
@@ -187,10 +228,6 @@ pub const FetchErrorView = struct {
     /// Why the fetch failed. A gateway-side failure that is no denial is
     /// `failed`.
     cause: messages.EgressFetchErrorCause = .failed,
-    /// The fetch's cumulative byte meters.
-    billed_sent_total: u64 = 0,
-    billed_received_total: u64 = 0,
-    cost_total: u64 = 0,
     /// The gateway's publish stamp, as `messages.EgressFetchHeadHeader.ready_at_mono_ns`
     /// defines it.
     ready_at_mono_ns: u64 = 0,
@@ -201,79 +238,68 @@ pub const AbortAckView = struct {
     body_id: u64,
 };
 
-pub fn decodeReleaseBody(bytes: []const u8) !messages.EgressReleaseBody {
-    if (bytes.len != @sizeOf(messages.EgressReleaseBody))
+/// Decodes a stop and returns the fetch id it names. Fails with
+/// `error.InvalidEgressPacket` for another length or a nonzero reserved
+/// field.
+pub fn decodeStop(bytes: []const u8) !u64 {
+    if (bytes.len != @sizeOf(messages.EgressStop))
         return error.InvalidEgressPacket;
-    const message = packet.readStruct(messages.EgressReleaseBody, bytes);
-    if (try messages.decodeMessageKind(message.kind) != .egress_release_body)
+    const message = packet.readStruct(messages.EgressStop, bytes);
+    if (try messages.decodeMessageKind(message.kind) != .egress_stop)
         return error.InvalidMessageKind;
     if (message._reserved0 != 0)
         return error.InvalidEgressPacket;
-    return message;
-}
-
-/// Checks a cancel and returns its header; the `reason_len` bytes of reason
-/// text follow it in `bytes`.
-pub fn decodeCancel(bytes: []const u8) !messages.EgressCancel {
-    if (bytes.len < @sizeOf(messages.EgressCancel))
-        return error.InvalidEgressPacket;
-    const message = packet.readStruct(messages.EgressCancel, bytes[0..@sizeOf(messages.EgressCancel)]);
-    if (try messages.decodeMessageKind(message.kind) != .egress_cancel)
-        return error.InvalidMessageKind;
-    const reason_len: usize = @intCast(message.reason_len);
-    const expected_len = try std.math.add(usize, @sizeOf(messages.EgressCancel), reason_len);
-    if (expected_len != bytes.len)
-        return error.InvalidEgressPacket;
-    return message;
+    return message.fetch_id;
 }
 
 /// Encodes a fetch start. A pooled start carries no inline body and sends
 /// `pooled_body_len`, the total the upload batches will deliver, as its
-/// `body_len`. A view whose token is `egress_token.none`, whose body fields
-/// disagree with its pooled flag, or whose pooled length exceeds
-/// `fetch_limits.request_body_pooled_bytes_max`, fails with
-/// `error.InvalidEgressPacket`.
+/// `body_len`. A start past a bound fails with that bound's error
+/// (`checkFetchStart`), an inline body past
+/// `fetch_limits.request_body_inline_bytes_max` with
+/// `error.EgressGatewayRequestBodyLimitExceeded`, and a view whose token is
+/// `egress_token.none` or whose body fields disagree with its pooled flag
+/// with `error.InvalidEgressPacket`.
 pub fn encodeFetchStartInto(out: []u8, view: FetchStartView) ![]u8 {
     if (egress_token.isNone(&view.egress_token))
         return error.InvalidEgressPacket;
     const body_pooled = (view.flags & messages.egress_fetch_start_flag_body_pooled) != 0;
     if (body_pooled) {
-        if (view.body.len != 0 or view.pooled_body_len == 0 or
-            view.pooled_body_len > fetch_limits.request_body_pooled_bytes_max)
+        if (view.body.len != 0 or view.pooled_body_len == 0)
             return error.InvalidEgressPacket;
     } else if (view.pooled_body_len != 0) {
         return error.InvalidEgressPacket;
     }
-    const header_bytes_len = try nameValueStorageLen(view.headers);
-    if (view.method.len > fetch_limits.request_method_bytes_max or
-        view.url.len > fetch_limits.request_url_bytes_max or
-        header_bytes_len > fetch_limits.request_headers_bytes_max or
-        view.body.len > fetch_limits.request_body_inline_bytes_max)
-    {
-        return error.EgressIpcScratchTooSmall;
+    var header_bytes: usize = 0;
+    for (view.headers) |header| {
+        if (header.name.len > std.math.maxInt(u32) or header.value.len > std.math.maxInt(u32))
+            return error.InvalidEgressPacket;
+        header_bytes = std.math.add(usize, header_bytes, header.name.len + header.value.len) catch
+            return error.EgressGatewayRequestHeaderLimitExceeded;
     }
-
-    const needed = try checkedAddMany(&.{
-        @sizeOf(messages.EgressFetchStartHeader),
-        view.method.len,
-        view.url.len,
-        header_bytes_len,
-        view.body.len,
+    try checkFetchStart(.{
+        .method_len = view.method.len,
+        .url_len = view.url.len,
+        .header_count = view.headers.len,
+        .header_bytes = header_bytes,
+        .body_len = if (body_pooled) @intCast(view.pooled_body_len) else view.body.len,
     });
-    if (needed > fetch_limits.request_packet_bytes_max)
-        return error.EgressIpcScratchTooSmall;
+    if (view.body.len > fetch_limits.request_body_inline_bytes_max)
+        return error.EgressGatewayRequestBodyLimitExceeded;
+    const header_bytes_len = try nameValueStorageLen(view.headers);
+
+    // The bounds above keep every length within the packet and within u32.
+    const needed = @sizeOf(messages.EgressFetchStartHeader) + view.method.len + view.url.len +
+        header_bytes_len + view.body.len;
+    std.debug.assert(needed <= fetch_limits.request_packet_bytes_max);
     if (needed > out.len)
         return error.EgressIpcScratchTooSmall;
-    if (view.method.len > std.math.maxInt(u32) or view.url.len > std.math.maxInt(u32) or
-        header_bytes_len > std.math.maxInt(u32) or view.headers.len > messages.max_request_header_count)
-        return error.InvalidEgressPacket;
 
     const header = messages.EgressFetchStartHeader{
         .kind = @intFromEnum(messages.MessageKind.egress_fetch_start),
         .flags = view.flags,
         .fetch_id = view.fetch_id,
         .body_id = view.body_id,
-        .max_body_bytes = view.max_body_bytes,
         .method_len = @intCast(view.method.len),
         .url_len = @intCast(view.url.len),
         .request_header_count = @intCast(view.headers.len),
@@ -346,7 +372,6 @@ pub fn decodeFetchStart(scratch: *GatewayDecodeScratch, bytes: []const u8) !Fetc
         .egress_token = header.egress_token,
         .body_id = header.body_id,
         .flags = header.flags,
-        .max_body_bytes = header.max_body_bytes,
         .method = method,
         .url = url,
         .headers = headers,
@@ -448,10 +473,10 @@ pub fn decodeFetchHead(scratch: *WorkerDecodeScratch, bytes: []const u8) !FetchH
     };
 }
 
-/// Encodes a batch of at least one chunk; an empty chunk fails with
-/// `error.InvalidEgressPacket`.
+/// Encodes a batch of one to `max_body_chunk_batch_count` chunks; any other
+/// count or an empty chunk fails with `error.InvalidEgressPacket`.
 pub fn encodeBodyChunkBatchInto(out: []u8, view: BodyChunkBatchView) ![]u8 {
-    if (view.chunks.len == 0 or view.chunks.len > std.math.maxInt(u32))
+    if (view.chunks.len == 0 or view.chunks.len > max_body_chunk_batch_count)
         return error.InvalidEgressPacket;
     const descriptors_len = try std.math.mul(usize, view.chunks.len, @sizeOf(messages.EgressBodyChunkBatchDescriptor));
     const needed = try std.math.add(usize, @sizeOf(messages.EgressBodyChunkBatchHeader), descriptors_len);
@@ -473,9 +498,6 @@ pub fn encodeBodyChunkBatchInto(out: []u8, view: BodyChunkBatchView) ![]u8 {
             .body_id = chunk.body_id,
             .len = @intCast(chunk.len),
             .body_pool_offset = chunk.body_pool_offset,
-            .billed_sent_total = chunk.billed_sent_total,
-            .billed_received_total = chunk.billed_received_total,
-            .cost_total = chunk.cost_total,
         });
     }
     std.debug.assert(cursor == needed);
@@ -493,15 +515,13 @@ pub fn decodeBodyEnd(bytes: []const u8) !BodyEndView {
     return .{
         .fetch_id = message.fetch_id,
         .body_id = message.body_id,
-        .billed_sent_total = message.billed_sent_total,
-        .billed_received_total = message.billed_received_total,
-        .cost_total = message.cost_total,
         .ready_at_mono_ns = message.ready_at_mono_ns,
     };
 }
 
-/// Decodes a body chunk batch into `scratch` and returns its chunks. The
-/// handles are not checked here; the worker checks each against its body
+/// Decodes a body chunk batch into `scratch` and returns its chunks; a count
+/// past `max_body_chunk_batch_count` fails with `error.InvalidEgressPacket`.
+/// The handles are not checked here; the worker checks each against its body
 /// pool before it reads the extent.
 pub fn decodeBodyChunkBatch(scratch: *WorkerDecodeScratch, bytes: []const u8) ![]const BodyChunkView {
     if (bytes.len < @sizeOf(messages.EgressBodyChunkBatchHeader))
@@ -533,9 +553,6 @@ pub fn decodeBodyChunkBatch(scratch: *WorkerDecodeScratch, bytes: []const u8) ![
             .body_id = descriptor.body_id,
             .body_pool_offset = descriptor.body_pool_offset,
             .len = @intCast(descriptor.len),
-            .billed_sent_total = descriptor.billed_sent_total,
-            .billed_received_total = descriptor.billed_received_total,
-            .cost_total = descriptor.cost_total,
             .ready_at_mono_ns = header.ready_at_mono_ns,
         };
     }
@@ -611,8 +628,11 @@ pub fn decodeUploadChunkBatch(scratch: *GatewayDecodeScratch, bytes: []const u8)
     return scratch.upload_chunks[0..count];
 }
 
+/// Encodes a fetch error into `out`. Fails with `error.InvalidEgressPacket` for a message past
+/// `fetch_limits.response_error_message_bytes_max`, and with `error.EgressIpcScratchTooSmall`
+/// when `out` cannot hold the packet.
 pub fn encodeFetchErrorInto(out: []u8, view: FetchErrorView) ![]u8 {
-    if (view.message.len > std.math.maxInt(u32))
+    if (view.message.len > fetch_limits.response_error_message_bytes_max)
         return error.InvalidEgressPacket;
     const needed = @sizeOf(messages.EgressFetchErrorHeader) + view.message.len;
     if (needed > out.len)
@@ -622,9 +642,6 @@ pub fn encodeFetchErrorInto(out: []u8, view: FetchErrorView) ![]u8 {
         .message_len = @intCast(view.message.len),
         .fetch_id = view.fetch_id,
         .body_id = view.body_id,
-        .billed_sent_total = view.billed_sent_total,
-        .billed_received_total = view.billed_received_total,
-        .cost_total = view.cost_total,
         .ready_at_mono_ns = view.ready_at_mono_ns,
         .cause = @intFromEnum(view.cause),
     };
@@ -635,14 +652,17 @@ pub fn encodeFetchErrorInto(out: []u8, view: FetchErrorView) ![]u8 {
 }
 
 /// Fails with `error.InvalidEgressPacket` for a length other than the header
-/// and its message, a cause `EgressFetchErrorCause` does not name or a
-/// nonzero reserved field.
+/// and its message, a message past
+/// `fetch_limits.response_error_message_bytes_max`, a cause
+/// `EgressFetchErrorCause` does not name or a nonzero reserved field.
 pub fn decodeFetchError(bytes: []const u8) !FetchErrorView {
     if (bytes.len < @sizeOf(messages.EgressFetchErrorHeader))
         return error.ShortRead;
     const header = packet.readStruct(messages.EgressFetchErrorHeader, bytes[0..@sizeOf(messages.EgressFetchErrorHeader)]);
     if (try messages.decodeMessageKind(header.kind) != .egress_fetch_error)
         return error.InvalidMessageKind;
+    if (header.message_len > fetch_limits.response_error_message_bytes_max)
+        return error.InvalidEgressPacket;
     if (@sizeOf(messages.EgressFetchErrorHeader) + @as(usize, @intCast(header.message_len)) != bytes.len)
         return error.InvalidEgressPacket;
     const cause = std.enums.fromInt(messages.EgressFetchErrorCause, header.cause) orelse
@@ -655,9 +675,6 @@ pub fn decodeFetchError(bytes: []const u8) !FetchErrorView {
         .body_id = header.body_id,
         .message = take(bytes, &cursor, @intCast(header.message_len)),
         .cause = cause,
-        .billed_sent_total = header.billed_sent_total,
-        .billed_received_total = header.billed_received_total,
-        .cost_total = header.cost_total,
         .ready_at_mono_ns = header.ready_at_mono_ns,
     };
 }

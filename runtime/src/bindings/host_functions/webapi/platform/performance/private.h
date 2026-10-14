@@ -1,12 +1,14 @@
 // The cells behind `performance`, shared by the files under `performance/`: Performance, PerformanceEntry with its
-// Mark and Measure subclasses, PerformanceTiming, PerformanceObserver and PerformanceObserverEntryList. They run on
-// the VM thread, except visitChildren, which the concurrent marker runs. Each realm has one Performance cell, which
-// installation stores in the realm's Web API cache (`realmPerformance`) and on its global `performance` property; it
-// holds the structures of the cells it creates, the entry buffer and the registered observers. That timeline belongs
-// to the realm rather than to a request: entries, observers, listeners and the time origin persist across requests,
-// and requests co-scheduled on that realm share them, so nothing may reset them when a request ends. Another realm of
-// the same VM has a timeline of its own. Resource timing is not implemented: no resource entry is ever recorded, and
-// the buffer size and buffer-full handler are only stored.
+// Mark and Measure subclasses, PerformanceObserver and PerformanceObserverEntryList. They run on the VM thread, except
+// visitChildren, which the concurrent marker runs. Each realm has one Performance cell, which installation stores in
+// the realm's Web API cache (`realmPerformance`) and on its global `performance` property; it holds the structures of
+// the cells it creates, the entry buffer and the registered observers. That timeline belongs to the realm rather than
+// to a request: entries, observers and the time origin persist across requests, and requests co-scheduled on that
+// realm share them, so nothing may reset them when a request ends. Another realm of the same VM has a timeline of its
+// own. The timeline records User Timing only: marks and measures.
+//
+// The time origin is fixed by the first reading of the clock (now(), timeOrigin, toJSON(), or a mark or measure), not
+// at installation: realms are installed in the zygote, and every worker forked from it must start its own timeline.
 //
 // The entry buffer, the observer list and each observer's pending entries are Collo::CellEdgeList, which owns the
 // lock and barrier protocol the concurrent marker needs (jsc/runtime/cell_edges.h). A list of entries collected to
@@ -23,8 +25,8 @@
 #include <JavaScriptCore/Error.h>
 #include <JavaScriptCore/IdentifierInlines.h>
 #include <JavaScriptCore/InternalFunction.h>
-#include <JavaScriptCore/JSCInlines.h>
 #include <JavaScriptCore/JSArray.h>
+#include <JavaScriptCore/JSCInlines.h>
 #include <JavaScriptCore/JSDestructibleObject.h>
 #include <JavaScriptCore/JSFunction.h>
 #include <JavaScriptCore/JSObject.h>
@@ -37,20 +39,14 @@
 #include <wtf/text/WTFString.h>
 
 #include <algorithm>
-#include <array>
 #include <cmath>
 #include <cstdint>
 #include <optional>
+#include <span>
 
 namespace Collo::HostFunctions {
 
-using JSC::EncodedJSValue;
-using JSC::JSValue;
-using WTF::String;
-using namespace JSC;
-
 class JSColloPerformanceObserver;
-class JSColloPerformanceTiming;
 
 enum class PerformanceEntryKind : uint8_t {
     Mark,
@@ -61,10 +57,8 @@ enum PerformanceObserverTypeMask : uint8_t {
     PerformanceObserverTypeNone = 0,
     PerformanceObserverTypeMark = 1 << 0,
     PerformanceObserverTypeMeasure = 1 << 1,
-    PerformanceObserverTypeResource = 1 << 2,
 };
 
-constexpr unsigned PerformanceMaxEntries = 10000;
 constexpr double PerformanceNowResolutionMs = 0.005;
 
 inline double coarsenPerformanceNow(double milliseconds)
@@ -99,10 +93,9 @@ inline bool requireArgumentCount(JSC::JSGlobalObject* global_object, JSC::ThrowS
 // Returns the Performance cell `value` holds, or throws a TypeError and returns null. It is defined after
 // JSColloPerformance because `dynamicDowncast` needs the complete type: with an incomplete one, the JSValue overloads
 // constrained on `T::info()` drop out and the call does not compile.
-inline JSColloPerformance* requirePerformance(JSC::JSGlobalObject*, JSC::ThrowScope&, JSValue);
+inline JSColloPerformance* requirePerformance(JSC::JSGlobalObject*, JSC::ThrowScope&, JSC::JSValue);
 
-JSC_DECLARE_HOST_FUNCTION(performanceConstructorCall);
-JSC_DECLARE_HOST_FUNCTION(performanceConstructorConstruct);
+// Host functions defined in entry.cpp and observer.cpp that performance.cpp's installer puts on the prototypes.
 JSC_DECLARE_HOST_FUNCTION(performanceEntryConstructorCall);
 JSC_DECLARE_HOST_FUNCTION(performanceEntryConstructorConstruct);
 JSC_DECLARE_HOST_FUNCTION(performanceMarkConstructorCall);
@@ -111,8 +104,6 @@ JSC_DECLARE_HOST_FUNCTION(performanceMeasureConstructorCall);
 JSC_DECLARE_HOST_FUNCTION(performanceMeasureConstructorConstruct);
 JSC_DECLARE_HOST_FUNCTION(performanceObserverConstructorCall);
 JSC_DECLARE_HOST_FUNCTION(performanceObserverConstructorConstruct);
-JSC_DECLARE_HOST_FUNCTION(performanceObserverScheduleMicrotask);
-JSC_DECLARE_HOST_FUNCTION(performanceObserverDeliverMicrotask);
 JSC_DECLARE_HOST_FUNCTION(performanceObserverObserve);
 JSC_DECLARE_HOST_FUNCTION(performanceObserverDisconnect);
 JSC_DECLARE_HOST_FUNCTION(performanceObserverTakeRecords);
@@ -128,24 +119,8 @@ JSC_DECLARE_HOST_FUNCTION(performanceEntryGetStartTime);
 JSC_DECLARE_HOST_FUNCTION(performanceEntryGetDuration);
 JSC_DECLARE_HOST_FUNCTION(performanceEntryGetDetail);
 JSC_DECLARE_HOST_FUNCTION(performanceEntryToJSON);
-JSC_DECLARE_HOST_FUNCTION(performanceTimingConstructorCall);
-JSC_DECLARE_HOST_FUNCTION(performanceTimingConstructorConstruct);
-JSC_DECLARE_HOST_FUNCTION(performanceTimingZero);
-JSC_DECLARE_HOST_FUNCTION(performanceTimingToJSON);
-JSC_DECLARE_HOST_FUNCTION(performanceNow);
-JSC_DECLARE_HOST_FUNCTION(performanceGetTimeOrigin);
-JSC_DECLARE_HOST_FUNCTION(performanceGetTiming);
-JSC_DECLARE_HOST_FUNCTION(performanceToJSON);
-JSC_DECLARE_HOST_FUNCTION(performanceGetOnResourceTimingBufferFull);
-JSC_DECLARE_HOST_FUNCTION(performanceSetOnResourceTimingBufferFull);
-JSC_DECLARE_HOST_FUNCTION(performanceClearResourceTimings);
-JSC_DECLARE_HOST_FUNCTION(performanceSetResourceTimingBufferSize);
-JSC_DECLARE_HOST_FUNCTION(performanceMarkResourceTiming);
 JSC_DECLARE_HOST_FUNCTION(performanceMark);
 JSC_DECLARE_HOST_FUNCTION(performanceMeasure);
-JSC_DECLARE_HOST_FUNCTION(performanceGetEntries);
-JSC_DECLARE_HOST_FUNCTION(performanceGetEntriesByName);
-JSC_DECLARE_HOST_FUNCTION(performanceGetEntriesByType);
 JSC_DECLARE_HOST_FUNCTION(performanceClearMarks);
 JSC_DECLARE_HOST_FUNCTION(performanceClearMeasures);
 
@@ -158,7 +133,7 @@ public:
         return &vm.destructibleObjectSpace();
     }
 
-    static JSC::Structure* createStructure(JSC::VM& vm, JSC::JSGlobalObject* global_object, JSValue prototype)
+    static JSC::Structure* createStructure(JSC::VM& vm, JSC::JSGlobalObject* global_object, JSC::JSValue prototype)
     {
         return JSC::Structure::create(
             vm, global_object, prototype, JSC::TypeInfo(JSC::ObjectType, StructureFlags), info());
@@ -169,16 +144,16 @@ public:
     DECLARE_INFO;
     DECLARE_VISIT_CHILDREN;
 
-    const String& name() const { return m_name; }
+    const WTF::String& name() const { return m_name; }
     PerformanceEntryKind kind() const { return m_kind; }
     double startTime() const { return m_start_time; }
     double duration() const { return m_duration; }
-    JSValue detail() const { return m_detail.get(); }
+    JSC::JSValue detail() const { return m_detail.get(); }
 
-    String entryType() const { return m_kind == PerformanceEntryKind::Mark ? "mark"_s : "measure"_s; }
+    WTF::String entryType() const { return m_kind == PerformanceEntryKind::Mark ? "mark"_s : "measure"_s; }
 
 protected:
-    JSColloPerformanceEntry(JSC::VM& vm, JSC::Structure* structure, String name, PerformanceEntryKind kind,
+    JSColloPerformanceEntry(JSC::VM& vm, JSC::Structure* structure, WTF::String name, PerformanceEntryKind kind,
         double start_time, double duration)
         : Base(vm, structure)
         , m_name(WTF::move(name))
@@ -190,7 +165,7 @@ protected:
 
     ~JSColloPerformanceEntry() = default;
 
-    void finishCreation(JSC::VM& vm, JSValue detail)
+    void finishCreation(JSC::VM& vm, JSC::JSValue detail)
     {
         Base::finishCreation(vm);
         ASSERT(inherits(info()));
@@ -198,7 +173,7 @@ protected:
     }
 
 private:
-    String m_name;
+    WTF::String m_name;
     JSC::WriteBarrier<JSC::Unknown> m_detail;
     PerformanceEntryKind m_kind;
     double m_start_time { 0 };
@@ -214,14 +189,14 @@ public:
         return &vm.destructibleObjectSpace();
     }
 
-    static JSC::Structure* createStructure(JSC::VM& vm, JSC::JSGlobalObject* global_object, JSValue prototype)
+    static JSC::Structure* createStructure(JSC::VM& vm, JSC::JSGlobalObject* global_object, JSC::JSValue prototype)
     {
         return JSC::Structure::create(
             vm, global_object, prototype, JSC::TypeInfo(JSC::ObjectType, StructureFlags), info());
     }
 
     static JSColloPerformanceMark* create(
-        JSC::VM& vm, JSC::Structure* structure, String name, double start_time, JSValue detail)
+        JSC::VM& vm, JSC::Structure* structure, WTF::String name, double start_time, JSC::JSValue detail)
     {
         auto* object = new (NotNull, JSC::allocateCell<JSColloPerformanceMark>(vm))
             JSColloPerformanceMark(vm, structure, WTF::move(name), start_time);
@@ -235,7 +210,7 @@ public:
     DECLARE_VISIT_CHILDREN;
 
 private:
-    JSColloPerformanceMark(JSC::VM& vm, JSC::Structure* structure, String name, double start_time)
+    JSColloPerformanceMark(JSC::VM& vm, JSC::Structure* structure, WTF::String name, double start_time)
         : Base(vm, structure, WTF::move(name), PerformanceEntryKind::Mark, start_time, 0)
     {
     }
@@ -252,14 +227,14 @@ public:
         return &vm.destructibleObjectSpace();
     }
 
-    static JSC::Structure* createStructure(JSC::VM& vm, JSC::JSGlobalObject* global_object, JSValue prototype)
+    static JSC::Structure* createStructure(JSC::VM& vm, JSC::JSGlobalObject* global_object, JSC::JSValue prototype)
     {
         return JSC::Structure::create(
             vm, global_object, prototype, JSC::TypeInfo(JSC::ObjectType, StructureFlags), info());
     }
 
-    static JSColloPerformanceMeasure* create(
-        JSC::VM& vm, JSC::Structure* structure, String name, double start_time, double duration, JSValue detail)
+    static JSColloPerformanceMeasure* create(JSC::VM& vm, JSC::Structure* structure, WTF::String name,
+        double start_time, double duration, JSC::JSValue detail)
     {
         auto* object = new (NotNull, JSC::allocateCell<JSColloPerformanceMeasure>(vm))
             JSColloPerformanceMeasure(vm, structure, WTF::move(name), start_time, duration);
@@ -276,58 +251,13 @@ public:
     DECLARE_VISIT_CHILDREN;
 
 private:
-    JSColloPerformanceMeasure(JSC::VM& vm, JSC::Structure* structure, String name, double start_time, double duration)
+    JSColloPerformanceMeasure(
+        JSC::VM& vm, JSC::Structure* structure, WTF::String name, double start_time, double duration)
         : Base(vm, structure, WTF::move(name), PerformanceEntryKind::Measure, start_time, duration)
     {
     }
 
     ~JSColloPerformanceMeasure() = default;
-};
-
-class JSColloPerformanceTiming final : public JSC::JSDestructibleObject {
-    using Base = JSC::JSDestructibleObject;
-
-public:
-    template <typename CellType, JSC::SubspaceAccess> static JSC::CompleteSubspace* subspaceFor(JSC::VM& vm)
-    {
-        return &vm.destructibleObjectSpace();
-    }
-
-    static JSC::Structure* createStructure(JSC::VM& vm, JSC::JSGlobalObject* global_object, JSValue prototype)
-    {
-        return JSC::Structure::create(
-            vm, global_object, prototype, JSC::TypeInfo(JSC::ObjectType, StructureFlags), info());
-    }
-
-    static JSColloPerformanceTiming* create(JSC::VM& vm, JSC::Structure* structure)
-    {
-        auto* object
-            = new (NotNull, JSC::allocateCell<JSColloPerformanceTiming>(vm)) JSColloPerformanceTiming(vm, structure);
-        object->finishCreation(vm);
-        return object;
-    }
-
-    static void destroy(JSC::JSCell* cell)
-    {
-        static_cast<JSColloPerformanceTiming*>(cell)->~JSColloPerformanceTiming();
-    }
-
-    DECLARE_INFO;
-    DECLARE_VISIT_CHILDREN;
-
-private:
-    JSColloPerformanceTiming(JSC::VM& vm, JSC::Structure* structure)
-        : Base(vm, structure)
-    {
-    }
-
-    ~JSColloPerformanceTiming() = default;
-
-    void finishCreation(JSC::VM& vm)
-    {
-        Base::finishCreation(vm);
-        ASSERT(inherits(info()));
-    }
 };
 
 // One entry in the buffer or in an observer's pending list.
@@ -359,7 +289,7 @@ public:
         return &vm.destructibleObjectSpace();
     }
 
-    static JSC::Structure* createStructure(JSC::VM& vm, JSC::JSGlobalObject* global_object, JSValue prototype)
+    static JSC::Structure* createStructure(JSC::VM& vm, JSC::JSGlobalObject* global_object, JSC::JSValue prototype)
     {
         return JSC::Structure::create(
             vm, global_object, prototype, JSC::TypeInfo(JSC::ObjectType, StructureFlags), info());
@@ -367,11 +297,11 @@ public:
 
     static JSColloPerformance* create(JSC::VM& vm, JSC::Structure* structure, JSC::Structure* mark_structure,
         JSC::Structure* measure_structure, JSC::Structure* observer_structure,
-        JSC::Structure* observer_entry_list_structure, JSColloPerformanceTiming* timing)
+        JSC::Structure* observer_entry_list_structure)
     {
         auto* object = new (NotNull, JSC::allocateCell<JSColloPerformance>(vm)) JSColloPerformance(vm, structure);
         object->finishCreation(
-            vm, mark_structure, measure_structure, observer_structure, observer_entry_list_structure, timing);
+            vm, mark_structure, measure_structure, observer_structure, observer_entry_list_structure);
         return object;
     }
 
@@ -380,20 +310,16 @@ public:
     DECLARE_INFO;
     DECLARE_VISIT_CHILDREN;
 
-    WebApiEventTargetData& eventTargetData() { return m_event_target; }
-
     // Coarsened milliseconds since the time origin.
-    double nowMs(JSC::JSGlobalObject* global_object)
+    double nowMs()
     {
-        ensureTimeOriginForAccess();
         ensureOrigin();
         return coarsenPerformanceNow((WTF::MonotonicTime::now() - m_origin_monotonic).milliseconds());
     }
 
     // The wall-clock time of the time origin, in milliseconds since the Unix epoch.
-    double timeOriginMs(JSC::JSGlobalObject* global_object)
+    double timeOriginMs()
     {
-        ensureTimeOriginForAccess();
         ensureOrigin();
         return m_origin_wall_ms;
     }
@@ -402,30 +328,14 @@ public:
     JSC::Structure* measureStructure() const { return m_measure_structure.get(); }
     JSC::Structure* observerStructure() const { return m_observer_structure.get(); }
     JSC::Structure* observerEntryListStructure() const { return m_observer_entry_list_structure.get(); }
-    JSColloPerformanceTiming* timing() const { return m_timing.get(); }
-    JSValue onResourceTimingBufferFull() const { return m_on_resource_timing_buffer_full.get(); }
 
-    // Stores a callable or other object and turns any other value into null, as an event handler attribute does.
-    // Nothing invokes it, since no resource entry is ever buffered.
-    void setOnResourceTimingBufferFull(JSC::VM& vm, JSValue value)
-    {
-        if (value.isUndefinedOrNull()) {
-            m_on_resource_timing_buffer_full.set(vm, this, JSC::jsNull());
-            return;
-        }
-        auto call_data = JSC::getCallData(value);
-        m_on_resource_timing_buffer_full.set(
-            vm, this, call_data.type == JSC::CallData::Type::None && !value.isObject() ? JSC::jsNull() : value);
-    }
-
-    // Buffers `entry`, dropping the oldest once PerformanceMaxEntries are held, and queues it for every observer
+    // Buffers `entry`, dropping the oldest once WebApiPerformanceEntriesMax are held, and queues it for every observer
     // that watches its type. Returns false, with an OutOfMemoryError thrown into the scope, when the buffer cannot
     // grow.
     bool appendEntry(
         JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSC::VM& vm, JSColloPerformanceEntry* entry)
     {
-        ensureTimeOriginForAccess();
-        if (m_entries.size() >= PerformanceMaxEntries)
+        if (m_entries.size() >= WebApiPerformanceEntriesMax)
             m_entries.takeFirst(this);
         PerformanceEntrySlot slot;
         slot.entry.setWithoutWriteBarrier(entry);
@@ -435,16 +345,6 @@ public:
         }
         notifyPerformanceObservers(global_object, vm, *this, entry);
         return true;
-    }
-
-    // Fixes the time origin at the first access. It resets nothing: the timeline is the realm's, and a reset keyed
-    // on the current request would wipe the entries, observers and listeners of a request co-scheduled on the same
-    // realm while it is still running.
-    void ensureTimeOriginForAccess() { ensureOrigin(); }
-
-    void setResourceTimingBufferSize(unsigned size)
-    {
-        m_resource_timing_buffer_size = std::min(size, PerformanceMaxEntries);
     }
 
     // Adds `observer` unless it is already registered. Returns false when the list cannot grow.
@@ -465,7 +365,7 @@ public:
     }
 
     // Removes the buffered entries that match both filters; a nullopt filter matches every entry.
-    void clearEntries(std::optional<String> name, std::optional<PerformanceEntryKind> kind)
+    void clearEntries(std::optional<WTF::String> name, std::optional<PerformanceEntryKind> kind)
     {
         m_entries.removeIf(this, [&](const PerformanceEntrySlot& slot) {
             auto* entry = slot.entry.get();
@@ -475,7 +375,7 @@ public:
 
     // The most recently buffered mark named `name`, or null. User Timing resolves a mark name in measure() to its
     // most recent occurrence.
-    JSColloPerformanceEntry* findLatestMark(const String& name)
+    JSColloPerformanceEntry* findLatestMark(const WTF::String& name)
     {
         for (auto index = m_entries.size(); index > 0; index--) {
             auto* entry = m_entries.at(index - 1).entry.get();
@@ -489,7 +389,6 @@ public:
     // Returns null with the exception pending when the array cannot be built.
     template <typename Predicate> JSC::JSObject* entriesArray(JSC::JSGlobalObject* global_object, Predicate predicate)
     {
-        ensureTimeOriginForAccess();
         PerformanceEntryRoots matches;
         forEachEntry([&](JSColloPerformanceEntry* entry) {
             if (predicate(*entry))
@@ -523,8 +422,7 @@ private:
     ~JSColloPerformance() = default;
 
     void finishCreation(JSC::VM& vm, JSC::Structure* mark_structure, JSC::Structure* measure_structure,
-        JSC::Structure* observer_structure, JSC::Structure* observer_entry_list_structure,
-        JSColloPerformanceTiming* timing)
+        JSC::Structure* observer_structure, JSC::Structure* observer_entry_list_structure)
     {
         Base::finishCreation(vm);
         ASSERT(inherits(info()));
@@ -532,39 +430,28 @@ private:
         m_measure_structure.set(vm, this, measure_structure);
         m_observer_structure.set(vm, this, observer_structure);
         m_observer_entry_list_structure.set(vm, this, observer_entry_list_structure);
-        m_timing.set(vm, this, timing);
-        m_on_resource_timing_buffer_full.set(vm, this, JSC::jsNull());
     }
 
     void ensureOrigin()
     {
         if (m_origin_monotonic)
             return;
-
-        resetOrigin();
-    }
-
-    void resetOrigin()
-    {
         m_origin_monotonic = WTF::MonotonicTime::now();
         m_origin_wall_ms = WTF::WallTime::now().secondsSinceEpoch().milliseconds();
     }
 
-    WebApiEventTargetData m_event_target;
     JSC::WriteBarrier<JSC::Structure> m_mark_structure;
     JSC::WriteBarrier<JSC::Structure> m_measure_structure;
     JSC::WriteBarrier<JSC::Structure> m_observer_structure;
     JSC::WriteBarrier<JSC::Structure> m_observer_entry_list_structure;
-    JSC::WriteBarrier<JSColloPerformanceTiming> m_timing;
-    JSC::WriteBarrier<JSC::Unknown> m_on_resource_timing_buffer_full;
     Collo::CellEdgeList<PerformanceEntrySlot> m_entries;
     Collo::CellEdgeList<ObserverSlot> m_observers;
     WTF::MonotonicTime m_origin_monotonic;
     double m_origin_wall_ms { 0 };
-    unsigned m_resource_timing_buffer_size { PerformanceMaxEntries };
 };
 
-inline JSColloPerformance* requirePerformance(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSValue value)
+inline JSColloPerformance* requirePerformance(
+    JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSC::JSValue value)
 {
     if (auto* performance = dynamicDowncast<JSColloPerformance>(value))
         return performance;
@@ -581,7 +468,7 @@ public:
         return &vm.destructibleObjectSpace();
     }
 
-    static JSC::Structure* createStructure(JSC::VM& vm, JSC::JSGlobalObject* global_object, JSValue prototype)
+    static JSC::Structure* createStructure(JSC::VM& vm, JSC::JSGlobalObject* global_object, JSC::JSValue prototype)
     {
         return JSC::Structure::create(
             vm, global_object, prototype, JSC::TypeInfo(JSC::ObjectType, StructureFlags), info());
@@ -660,7 +547,7 @@ public:
         return &vm.destructibleObjectSpace();
     }
 
-    static JSC::Structure* createStructure(JSC::VM& vm, JSC::JSGlobalObject* global_object, JSValue prototype)
+    static JSC::Structure* createStructure(JSC::VM& vm, JSC::JSGlobalObject* global_object, JSC::JSValue prototype)
     {
         return JSC::Structure::create(
             vm, global_object, prototype, JSC::TypeInfo(JSC::ObjectType, StructureFlags), info());
@@ -704,7 +591,7 @@ public:
         scheduleDeliveryIfNeeded(global_object, vm);
     }
 
-    void observe(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSValue options_value);
+    void observe(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSC::JSValue options_value);
     void disconnect();
     JSC::JSObject* takeRecordsArray(JSC::JSGlobalObject*);
     void queueDeliveryMicrotask(JSC::JSGlobalObject*, JSC::VM&);

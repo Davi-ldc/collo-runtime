@@ -11,7 +11,7 @@
 // `Allocator` supplies `static uint8_t* tryAllocate(size_t)`, which returns null on failure, and
 // `static void deallocate(uint8_t*, size_t capacity)`. The bridge's `SecretBytes` (types.h) allocates from fastMalloc;
 // a test can pass an allocator that checks every buffer it frees is all zeros. The header includes nothing from JSC
-// or WTF, so crypto pool threads and test shims use it freely.
+// or WTF, so a test shim compiled without the engine uses it as the bridge does.
 
 #pragma once
 

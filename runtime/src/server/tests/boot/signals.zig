@@ -139,17 +139,17 @@ fn hangupChild() u8 {
 
     // Sent before the target exists: whether the monitor reads it before or after `attach`, the
     // sink is asked to open the name again.
-    directory.rename("usage.jsonl", "usage.jsonl.1") catch return 51;
+    directory.rename("access.jsonl", "access.jsonl.1") catch return 51;
     sendToSelf(posix.SIG.HUP) catch return 52;
     var counter: TargetCounter = .{};
     signals.attach(counter.target(&sink));
     defer signals.detach();
-    if (!waitFor(&probe, reopenedUsageFile)) return 53;
+    if (!waitFor(&probe, reopenedAccessFile)) return 53;
 
     // Each signal is sent only after the monitor took the one before.
-    directory.rename("usage.jsonl", "usage.jsonl.2") catch return 54;
+    directory.rename("access.jsonl", "access.jsonl.2") catch return 54;
     sendToSelf(posix.SIG.HUP) catch return 55;
-    if (!waitFor(&probe, reopenedUsageFile)) return 56;
+    if (!waitFor(&probe, reopenedAccessFile)) return 56;
     if (counter.stops.load(.acquire) != 0) return 57;
     if (signals.stopRequested()) return 58;
 
@@ -157,9 +157,9 @@ fn hangupChild() u8 {
     if (!waitFor(&counter, stopWasCalled)) return 60;
     // After a stop, a hangup still only reopens: were it counted as a second stop signal, the
     // process would end here with 128 plus its number.
-    directory.rename("usage.jsonl", "usage.jsonl.3") catch return 61;
+    directory.rename("access.jsonl", "access.jsonl.3") catch return 61;
     sendToSelf(posix.SIG.HUP) catch return 62;
-    if (!waitFor(&probe, reopenedUsageFile)) return 63;
+    if (!waitFor(&probe, reopenedAccessFile)) return 63;
     if (counter.stops.load(.acquire) != 1) return 64;
     return child_ok;
 }
@@ -183,11 +183,11 @@ const ReopenProbe = struct {
     directory: std.fs.Dir,
 };
 
-/// Whether a flush has opened `usage.jsonl` under its name again since it was renamed away,
+/// Whether a flush has opened `access.jsonl` under its name again since it was renamed away,
 /// which a flush does only for a reopen that was asked for.
-fn reopenedUsageFile(probe: *ReopenProbe) bool {
+fn reopenedAccessFile(probe: *ReopenProbe) bool {
     probe.sink.flush(0);
-    probe.directory.access("usage.jsonl", .{}) catch return false;
+    probe.directory.access("access.jsonl", .{}) catch return false;
     return true;
 }
 

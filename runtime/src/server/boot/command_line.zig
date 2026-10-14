@@ -1,10 +1,9 @@
 //! The arguments of `collo serve <path> [--listen <host:port>]`. A path that
 //! ends in `.json` names a configuration file and any other path an entry
 //! module, from which the configuration is synthesized
-//! (`server/config/synthesize.zig`). `--listen` replaces
-//! `globalSettings.listen` in both forms, in the address grammar the
-//! configuration uses (`parseListen` in `server/config/parse.zig`), and port 0
-//! binds an ephemeral port.
+//! (`server/config/synthesize.zig`). `--listen` replaces `settings.listen` in
+//! both forms, in the address grammar the configuration uses (`parseListen`
+//! in `server/config/parse.zig`), and port 0 binds an ephemeral port.
 //!
 //! Parsing reads only its arguments and runs on the main thread before the
 //! boot starts. An `Invocation` borrows the argument strings, which live for

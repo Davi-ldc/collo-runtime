@@ -18,8 +18,8 @@
 //!   run until the service raises `observability_stop`, which it does only
 //!   once every lane has joined (`Service.stopAndDrainForExit`). The stop
 //!   flag, raised first, ends no consumer: the lanes keep finishing admitted
-//!   requests after it for up to their deadlines, and their access records,
-//!   console lines and usage records keep being drained meanwhile.
+//!   requests after it for up to their deadlines, and their access records
+//!   and console lines keep being drained meanwhile.
 //! - The analytics drain state (`Service.analytics_drain`) belongs to the
 //!   metrics thread; only the final fold, after that thread has joined,
 //!   touches it from another.
@@ -61,9 +61,8 @@ pub fn Methods(comptime Self: type) type {
 
         pub fn metricsThreadMain(self: *Self) void {
             while (!observabilityStopped(self)) {
-                // Console lines, usage records and access records, then the
-                // record files are flushed. A loss here is counted by the
-                // sink.
+                // Console lines and access records, then the record files
+                // are flushed. A loss here is counted by the sink.
                 analytics_drain.tick(self);
                 sleepUntilStop(self, metrics_drain_interval_ns);
             }
@@ -75,8 +74,8 @@ pub fn Methods(comptime Self: type) type {
 
         /// Writes console lines to stderr every tick. Kept off the metrics thread
         /// because stderr blocks for as long as its reader stops reading: a
-        /// stalled reader then holds only this thread, while usage, access and
-        /// log records keep flowing and console lines past the console buffer are
+        /// stalled reader then holds only this thread, while access and log
+        /// records keep flowing and console lines past the console buffer are
         /// dropped and counted. The lines left at stop are written when `Server`
         /// closes the sink.
         pub fn consoleThreadMain(self: *Self) void {

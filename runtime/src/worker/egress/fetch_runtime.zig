@@ -1,40 +1,43 @@
-//! Starts a fetch for JS: checks it, registers its response body and task, and
-//! sends its start to the gateway. Runs on the worker's event loop thread. The
-//! gateway is the egress security boundary; the checks here only reject early
-//! what it would refuse anyway. A scheduled task holds one reference on its
-//! response body, and `State.bodies` holds another until the view is released.
+//! Starts a fetch for JavaScript: checks it, counts it, registers its
+//! response body and task, and sends its start to the gateway. Runs on the
+//! worker's VM thread. The gateway is the egress security boundary; the
+//! checks here only reject early what it would refuse anyway, so that honest
+//! code fails with a precise TypeError before anything leaves. A scheduled
+//! task holds one reference on its response body, and `State.bodies` holds
+//! another until the view is released.
 //!
 //! A fetch leaves only from a worker whose definition grants some route
 //! network access, only while it is attached and only for a request that
-//! carries an egress token (`refusal`), and no more fetches start under one
-//! token than `RuntimeLimits.max_fetches_per_request`, which the token's
-//! budget covers: a request counts its own, and the evaluations count theirs
-//! together, since each presents a copy of the one boot token and the
-//! gateway keeps one budget for it. The gateway counts a start it cannot
-//! verify, or one past the budget, as an invalid command against the
-//! worker's session, so an honest worker sends neither, with one exception
-//! the gateway's window absorbs: a request dispatched before its worker was
-//! attached to a new gateway still carries the old gateway's token, and its
-//! fetches fail there as forged, at most `max_fetches_per_request` of them
-//! per request.
+//! carries an egress token (`refusal`). No more fetches start under one token
+//! than `fetches_per_request_max`: a request counts its own, and the
+//! evaluations count theirs together, since each presents a copy of the one
+//! boot token. No more than `fetches_per_worker_max` are counted at once
+//! (`State.fetches`), on the lifetime the gateway counts them, so an honest
+//! worker never meets the gateway's caps; and no more than that many tasks
+//! wait for their completion to run, counting the completions still queued
+//! for tasks already gone, which bounds the worker's ready queue
+//! (`common/limits/worker.zig:egress_ready_items_max`). A request dispatched
+//! before its worker was attached to a new gateway still carries the old
+//! gateway's token, and its fetches fail there as forged.
 //!
 //! A worker without a grant refuses every fetch as the network setting's
 //! denial, the text the gateway would send (`collo_network.writeDenial`),
 //! and writes it to the tenant's log as the gateway's denials are
 //! (`completion_runtime.deliver`). Each such denial counts against the
-//! token's budget as one the gateway makes does, which bounds the lines one
+//! token's fetches as one the gateway makes does, which bounds the lines one
 //! request writes.
 
 const std = @import("std");
 const bindings = @import("collo_bindings");
 const ipc = @import("collo_ipc");
+const limits = @import("collo_limits");
 const network = @import("collo_network");
-const egress_context = @import("context.zig");
 const request_context = @import("collo_worker_request").context;
 const promise_deferred = @import("collo_worker_js").deferred;
+const Runtime = @import("../runtime/root.zig").Runtime;
 const task_mod = @import("task.zig");
+const task_runtime = @import("task_runtime.zig");
 const fetch_body_runtime = @import("body/root.zig");
-const gateway_control = @import("gateway_control.zig");
 const upload_runtime = @import("upload_runtime.zig");
 
 const FetchTask = task_mod.Task;
@@ -89,18 +92,18 @@ pub const Refusal = enum {
 /// Whether a fetch of `request_id` would be refused before it leaves.
 /// Returns null for a request that is not live or accepts no work, which
 /// `schedule` refuses on its own, and in a worker without a grant for a
-/// request whose token's budget its denials spent, which `schedule` refuses
-/// as a fetch past that budget.
-pub fn refusal(runtime: *egress_context.Context, request_id: u64) ?Refusal {
-    const request = runtime.requests.get(request_id) orelse return null;
+/// request whose token's fetches its denials spent, which `schedule` refuses
+/// as a fetch past that limit.
+pub fn refusal(runtime: *Runtime, request_id: u64) ?Refusal {
+    const request = runtime.requests.active.get(request_id) orelse return null;
     if (!request.acceptsWork())
         return null;
-    if (runtime.egress_state.grant() == .none) {
-        if (tokenFetchesStarted(runtime, request_id, request).* >= runtime.limits.max_fetches_per_request)
+    if (runtime.egress.state.grant() == .none) {
+        if (tokenFetchesStarted(runtime, request_id, request).* >= limits.worker.fetches_per_request_max)
             return null;
         return .no_network_grant;
     }
-    if (runtime.egress_state.shared == null)
+    if (runtime.egress.state.shared == null)
         return .detached;
     if (ipc.egress_token.isNone(&request.dispatch_work.egress_token))
         return .no_egress_token;
@@ -110,10 +113,10 @@ pub fn refusal(runtime: *egress_context.Context, request_id: u64) ?Refusal {
 /// Refuses a fetch of `url` that `refusal` refused for the live request
 /// `request_id` and returns the TypeError message, written into `buffer` or
 /// static. A denial for want of a grant also counts against the token's
-/// budget and goes to the tenant's log as a warning; the other refusals
+/// fetches and goes to the tenant's log as a warning; the other refusals
 /// change nothing.
 pub fn refuse(
-    runtime: *egress_context.Context,
+    runtime: *Runtime,
     request_id: u64,
     refused: Refusal,
     url: []const u8,
@@ -122,7 +125,7 @@ pub fn refuse(
     const text = refused.message(url, buffer);
     switch (refused) {
         .no_network_grant => {
-            if (runtime.requests.get(request_id)) |request|
+            if (runtime.requests.active.get(request_id)) |request|
                 tokenFetchesStarted(runtime, request_id, request).* += 1;
             runtime.logNetworkDenial(request_id, text);
         },
@@ -157,109 +160,93 @@ fn urlOrigin(url: []const u8) ?network.Origin {
 /// it and `completion_runtime.execute` settles it. Fails with
 /// `error.FetchOutsideActiveRequest` for an owner that is not active or
 /// accepts no work (`RequestContext.acceptsWork`), with the error of its
-/// `refusal` (`error.FetchNotGranted`, `error.FetchEgressDetached`,
-/// `error.FetchWithoutEgressToken`), `error.FetchWorkerLimitExceeded` at
-/// `RuntimeLimits.max_fetches_per_worker` fetches in flight,
-/// `error.FetchRequestLimitExceeded` once the request has started
-/// `RuntimeLimits.max_fetches_per_request`, a URL or size error from the
-/// start checks, or an error sending the start. A full command ring, upload
-/// pool or upload reservation only parks the task.
+/// `refusal`, `error.FetchWorkerLimitExceeded` at `fetches_per_worker_max`
+/// counted fetches or tasks, `error.FetchRequestLimitExceeded` once the token's
+/// fetches reached `fetches_per_request_max`,
+/// `error.FetchBodyLimitExceeded` when the body table is full, a URL error,
+/// a bound error of `ipc.egress.checkFetchStart`, or an error sending the
+/// start. A full command ring, upload pool or upload reservation only parks
+/// the task.
 pub fn schedule(
-    runtime: *egress_context.Context,
+    runtime: *Runtime,
     request_id: u64,
-    url: []const u8,
-    method: []const u8,
-    body: []const u8,
-    headers: []const bindings.NameValuePair,
-    flags: u32,
+    request: FetchTask.Request,
     deferred: promise_deferred.DeferredOwned,
 ) !u64 {
     var owned_deferred = deferred;
     errdefer owned_deferred.deinit();
+    const state = &runtime.egress.state;
+    const allocator = runtime.core.allocator;
 
     if (request_id == 0)
         return error.FetchOutsideActiveRequest;
-    const request = runtime.requests.get(request_id) orelse return error.FetchOutsideActiveRequest;
+    const owner = runtime.requests.active.get(request_id) orelse return error.FetchOutsideActiveRequest;
     // Refused before anything leaves the worker: a start sent for a request
     // whose finish started would reach the gateway after its response was
     // decided.
-    if (!request.acceptsWork())
+    if (!owner.acceptsWork())
         return error.FetchOutsideActiveRequest;
     if (refusal(runtime, request_id)) |refused|
         return refused.asError();
-    if (runtime.egress_state.tasks.count() >= runtime.limits.max_fetches_per_worker)
+    if (state.fetches.count() >= limits.worker.fetches_per_worker_max)
         return error.FetchWorkerLimitExceeded;
-    // A finished fetch gives the token's budget nothing back, so the limit
-    // counts every fetch started under the token.
-    const token_fetches_started = tokenFetchesStarted(runtime, request_id, request);
-    if (token_fetches_started.* >= runtime.limits.max_fetches_per_request)
+    // Each task queues one completion, and a completion whose task went
+    // before it popped still holds its place in the ready queue, so this
+    // bounds the completion items there (`State.completion_ready_orphans`).
+    if (state.tasks.count() + state.completion_ready_orphans >= limits.worker.fetches_per_worker_max)
+        return error.FetchWorkerLimitExceeded;
+    // A finished fetch gives the token nothing back, so the limit counts
+    // every fetch started under the token.
+    const token_fetches_started = tokenFetchesStarted(runtime, request_id, owner);
+    if (token_fetches_started.* >= limits.worker.fetches_per_request_max)
         return error.FetchRequestLimitExceeded;
-    try validateUrlForGateway(url);
-    try validateStartShape(method, url, body, headers);
+    try validateUrlForGateway(request.url);
+    try ipc.egress.checkFetchStart(.{
+        .method_len = request.method.len,
+        .url_len = request.url.len,
+        .header_count = request.headers.len,
+        .header_bytes = try headerBytes(request.headers),
+        .body_len = request.body.len,
+    });
+    try state.fetches.ensureUnusedCapacity(allocator, 1);
+    try state.tasks.ensureUnusedCapacity(allocator, 1);
 
-    const fetch_id = runtime.egress_state.next_fetch_id;
-    runtime.egress_state.next_fetch_id += 1;
+    const fetch_id = state.next_fetch_id;
+    state.next_fetch_id += 1;
+    const response_body_identity = try fetch_body_runtime.registerOpen(runtime, owner, fetch_id);
+    errdefer _ = fetch_body_runtime.release(runtime, response_body_identity);
+    const response_body = fetch_body_runtime.ptr(runtime, response_body_identity).?;
 
-    const response_body_identity = try fetch_body_runtime.registerOpen(runtime, request, fetch_id, null);
-    var response_body_registered = true;
-    errdefer {
-        if (response_body_registered)
-            _ = fetch_body_runtime.release(runtime, response_body_identity);
-    }
-    const response_body = fetch_body_runtime.ptr(runtime, response_body_identity) orelse return error.FetchBodyNotFound;
-
-    const task = try runtime.allocator.create(FetchTask);
-    var task_initialized = false;
-    var task_owned_by_scope = true;
-    errdefer {
-        if (task_owned_by_scope) {
-            if (task_initialized)
-                task.deinit(runtime.allocator);
-            runtime.allocator.destroy(task);
-        }
-    }
+    const task = try allocator.create(FetchTask);
+    errdefer allocator.destroy(task);
     const task_deferred = owned_deferred;
     owned_deferred = .{};
     task.* = try FetchTask.init(
-        runtime.allocator,
+        allocator,
         fetch_id,
         request_id,
-        url,
-        method,
-        body,
-        headers,
-        flags,
+        request,
         response_body_identity,
         response_body,
         task_deferred,
     );
     response_body.retain();
-    task_initialized = true;
-
-    runtime.egress_state.tasks.putNoClobber(runtime.allocator, fetch_id, task) catch |err| {
-        task.deinit(runtime.allocator);
-        runtime.allocator.destroy(task);
-        task_owned_by_scope = false;
-        return err;
-    };
-    task_owned_by_scope = false;
-
+    state.tasks.putAssumeCapacityNoClobber(fetch_id, task);
+    state.beginFetch(fetch_id, owner);
     // Counted before the start can leave, so a start that the gateway took
     // before a later step failed is counted too.
     token_fetches_started.* += 1;
+
     // A full command ring or upload pool parks the task for the completion
-    // pump to resume, so only a hard failure unwinds here. When the start
-    // already reached the gateway, it is told to drop the fetch before the
-    // task is destroyed.
+    // pump to resume, so only a hard failure unwinds here.
     upload_runtime.ensureTaskUploadProgress(runtime, task) catch |err| {
-        if (task.start_sent)
-            gateway_control.sendCancel(runtime, fetch_id, "fetch schedule failed");
-        _ = runtime.egress_state.tasks.remove(fetch_id);
-        task.deinit(runtime.allocator);
-        runtime.allocator.destroy(task);
+        // Out of the table first, so stopping a start that never left ends
+        // the fetch without publishing to this task.
+        _ = state.tasks.remove(fetch_id);
+        task_runtime.stopFetch(runtime, fetch_id);
+        task.deinit(allocator);
         return err;
     };
-    response_body_registered = false;
     return fetch_id;
 }
 
@@ -268,12 +255,12 @@ pub fn schedule(
 /// one count every evaluation shares, since they all present a copy of the
 /// boot token.
 fn tokenFetchesStarted(
-    runtime: *egress_context.Context,
+    runtime: *Runtime,
     request_id: u64,
     request: *request_context.RequestContext,
 ) *u64 {
     if (request_context.isEvaluationId(request_id))
-        return runtime.boot_fetches_started;
+        return &runtime.evaluations.boot_fetches_started;
     return &request.egress_fetches_started;
 }
 
@@ -282,11 +269,7 @@ fn tokenFetchesStarted(
 /// egress security boundary and checks the token, policy, redirects, DNS
 /// results, ports and private or reserved address ranges itself.
 fn validateUrlForGateway(url: []const u8) !void {
-    const scheme_end = std.mem.indexOfScalar(
-        u8,
-        url,
-        ':',
-    ) orelse return error.InvalidFetchUrl;
+    const scheme_end = std.mem.indexOfScalar(u8, url, ':') orelse return error.InvalidFetchUrl;
     if (scheme_end == 0) return error.InvalidFetchUrl;
     if (url.len < scheme_end + 3) return error.InvalidFetchUrl;
     if (url[scheme_end + 1] != '/') return error.InvalidFetchUrl;
@@ -299,30 +282,15 @@ fn validateUrlForGateway(url: []const u8) !void {
     return error.UnsupportedFetchProtocol;
 }
 
-/// Checks the start against the gateway's packet limits (`ipc.fetch_limits`)
-/// before the fetch id, response body and task are created.
-fn validateStartShape(
-    method: []const u8,
-    url: []const u8,
-    body: []const u8,
-    headers: []const bindings.NameValuePair,
-) !void {
-    if (method.len > ipc.fetch_limits.request_method_bytes_max)
-        return error.EgressGatewayRequestMethodLimitExceeded;
-    if (url.len > ipc.fetch_limits.request_url_bytes_max)
-        return error.EgressGatewayRequestUrlLimitExceeded;
-    if (body.len > ipc.fetch_limits.request_body_pooled_bytes_max)
-        return error.EgressGatewayRequestBodyLimitExceeded;
-    if (headers.len > ipc.max_request_header_count)
-        return error.TooManyFetchHeaders;
-
-    var header_bytes: usize = 0;
+/// The name and value bytes of `headers`. Fails with
+/// `error.EgressGatewayRequestHeaderLimitExceeded` when they overflow.
+fn headerBytes(headers: []const bindings.NameValuePair) !usize {
+    var total: usize = 0;
     for (headers) |header| {
-        header_bytes = std.math.add(usize, header_bytes, header.name.len) catch
+        total = std.math.add(usize, total, header.name.len) catch
             return error.EgressGatewayRequestHeaderLimitExceeded;
-        header_bytes = std.math.add(usize, header_bytes, header.value.len) catch
-            return error.EgressGatewayRequestHeaderLimitExceeded;
-        if (header_bytes > ipc.fetch_limits.request_headers_bytes_max)
+        total = std.math.add(usize, total, header.value.len) catch
             return error.EgressGatewayRequestHeaderLimitExceeded;
     }
+    return total;
 }

@@ -1,7 +1,7 @@
 //! Responses whose body is a ReadableStream the handler builds, through the
 //! production stack: the head leaves before the body is complete and each
-//! chunk as the stream produces it, the request's usage and access records
-//! cover the whole stream, a client that stops reading stalls the stream
+//! chunk as the stream produces it, the request's access record and the
+//! usage on it cover the whole stream, a client that stops reading stalls the stream
 //! without losing a byte or its worker slot, a stream that errors after its
 //! head resets the client's stream while the worker keeps serving, and a
 //! client that resets its stream frees the worker's slot at once. The route
@@ -35,14 +35,6 @@ const stalled_body_bytes: u64 = 2 * (http_body.INGRESS_RESPONSE_CHUNKS_IN_FLIGHT
 const client_stream_window_bytes: usize = 1024 * 1024;
 /// How long the slow client reads nothing.
 const stall_ns: u64 = 2 * std.time.ns_per_s;
-
-/// The fields of a `usage.jsonl` record that show it covers a whole stream.
-const StreamUsageLine = struct {
-    request_id: u64,
-    error_code: []const u8,
-    wall_ns: u64,
-    client_served_bytes: u64,
-};
 
 /// The fields of a `logs.jsonl` record the stream tests check; a drop marker
 /// has no message.
@@ -103,25 +95,20 @@ test "a server-sent events response delivers each event as it is produced, befor
     try std.testing.expect(raw.last_data_ns - raw.first_data_ns >= 500 * std.time.ns_per_ms);
     try std.testing.expect(raw.end_ns - raw.head_ns >= 500 * std.time.ns_per_ms);
 
-    // This is the harness's only request, so each file holds one record,
-    // written once the request ended. The usage record's wall time runs from
-    // the dispatch past the last event, which the stream made 600 ms after
-    // the first, and it counts the bytes of every event.
-    var usage = try harness_mod.waitForRecordLines(StreamUsageLine, &harness, "usage.jsonl", 1);
-    defer usage.deinit();
+    // This is the harness's only request, so the file holds one record,
+    // written once the request ended. Its wall time runs from the dispatch
+    // past the last event, which the stream made 600 ms after the first, and
+    // it counts the bytes of every event.
     var access = try harness_mod.waitForRecordLines(AccessLine, &harness, "access.jsonl", 1);
     defer access.deinit();
-    try std.testing.expectEqual(@as(usize, 1), usage.items.len);
     try std.testing.expectEqual(@as(usize, 1), access.items.len);
-    const usage_record = usage.items[0];
     const access_record = access.items[0];
-    try std.testing.expectEqual(access_record.request_id, usage_record.request_id);
     try std.testing.expectEqualStrings("/stream", access_record.route);
     try std.testing.expectEqual(@as(u16, 200), access_record.status);
     try std.testing.expectEqualStrings("done", access_record.error_code);
-    try std.testing.expectEqualStrings("done", usage_record.error_code);
-    try std.testing.expect(usage_record.wall_ns >= 600 * std.time.ns_per_ms);
-    try std.testing.expectEqual(@as(u64, events.len), usage_record.client_served_bytes);
+    try std.testing.expectEqualStrings("worker", access_record.origin orelse return error.TestExpectedUsage);
+    try std.testing.expect((access_record.wall_ns orelse 0) >= 600 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(?u64, events.len), access_record.client_served_bytes);
 }
 
 test "a slow client stalls a streamed body without losing a byte or the worker's slot, and the stream finishes once it reads" {
@@ -251,8 +238,11 @@ fn isExceptionRecord(record: AccessLine) bool {
     return std.mem.eql(u8, record.error_code, "js_exception");
 }
 
+/// The client took the stream's 200 head before it reset the stream, so the
+/// record carries the status the client received and the error code says it
+/// left (`server/ingress/runner/request_finish.zig:workerDoneStatus`).
 fn isClientGoneRecord(record: AccessLine) bool {
-    return record.status == 499 and std.mem.eql(u8, record.error_code, "client_closed");
+    return record.status == 200 and std.mem.eql(u8, record.error_code, "client_closed");
 }
 
 fn namesStreamFailure(line: LogLine) bool {

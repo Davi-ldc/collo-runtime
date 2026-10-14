@@ -37,14 +37,10 @@ fn boot() !?u8 {
     var args = try std.process.argsWithAllocator(allocator);
     defer args.deinit();
     const arg0 = args.next() orelse "";
-    if (isGatewayProcessName(arg0)) {
-        try egress_gateway.runFromInheritedControlFd(allocator);
-        return null;
-    }
-    if (isZygoteProcessName(arg0)) {
-        try zygote.fork_loop.runFromInheritedFds();
-        return null;
-    }
+    if (isGatewayProcessName(arg0))
+        egress_gateway.runFromInheritedControlFd(allocator);
+    if (isZygoteProcessName(arg0))
+        zygote.fork_loop.runFromInheritedFds();
     const command = args.next() orelse return try printUsage();
     if (!std.mem.eql(u8, command, "serve"))
         return try printUsage();

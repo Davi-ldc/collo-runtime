@@ -1,21 +1,22 @@
 //! The observability domain of the worker runtime. `Observability` is its
-//! state: the writer view of the worker's shared state page, the sentinel,
-//! the trace settings and the handler counters. `Methods` holds the
-//! runtime's operations on it, which `Runtime` declares as its own
-//! (`root.zig`): trace events, the CPU each live request publishes to its
-//! slot on the page, and the network denials the runtime writes to the
-//! tenant's log. Every line of the tenant's log, these and the console and
-//! exception lines (`vm_hooks.zig`), carries the request id `ringRequestId`
-//! gives its owner. It belongs to the worker's VM thread. The sentinel's
-//! own thread reaches only the `Sentinel` state it guards, the VM's
-//! termination request, the trace fd and atomic stores to the page, and it
-//! exits the process on memory pressure (`sentinel.zig`).
+//! state: the writer view of the worker's shared state page, the sentinel
+//! and the benchmark marker switch. `Methods` holds the runtime's operation
+//! on it, which `Runtime` declares as its own (`root.zig`): the network
+//! denials the runtime writes to the tenant's log. Every line of the
+//! tenant's log, these and the console and exception lines (`vm_hooks.zig`),
+//! carries the request id `ringRequestId` gives its owner. After boot the
+//! runtime tells the operator anything only through `std.log`, whose lines
+//! reach the server's stderr through the page's console ring
+//! (`zygote/log_sink.zig`).
+//!
+//! It belongs to the worker's VM thread. The sentinel's own thread reaches
+//! only the `Sentinel` state it guards, the VM's termination request and
+//! atomic stores to the page, and it exits the process on memory pressure
+//! (`sentinel.zig`).
 
 const std = @import("std");
 const bindings = @import("collo_bindings");
-const process_limits = @import("collo_limits").process;
 const worker_shared_page = @import("collo_worker_state").page;
-const common_worker_metrics_state = @import("collo_worker_state").metrics;
 const request_context = @import("collo_worker_request").context;
 const runtime_types = @import("types.zig");
 const worker_sentinel = @import("sentinel.zig");
@@ -31,23 +32,15 @@ pub fn ringRequestId(request_id: u64) u64 {
 }
 
 pub const Observability = struct {
-    /// Required, since the page carries every request's completion record
-    /// (`Runtime.init`). Borrowed from the worker boot, which keeps the page
-    /// mapped until the runtime is gone.
+    /// Required: the page carries every live request's slot and the
+    /// sentinel's view of the running owner (`Runtime.init`). Borrowed from
+    /// the worker boot, which keeps the page mapped until the runtime is
+    /// gone.
     metrics_view: *worker_shared_page.WorkerWriterView,
-    worker_metrics_state: common_worker_metrics_state.WorkState,
     // Not optional: a turn whose JavaScript never yields holds the VM thread,
     // which cannot interrupt itself, so only another thread can stop it.
     sentinel: worker_sentinel.Sentinel,
-    trace_fd: ?std.posix.fd_t,
-    trace_requests: bool,
-    trace_all_requests: bool,
     bench_handler: bool,
-    traced_first_request: bool,
-    sync_handler_fast_path_count: u64,
-    thenable_handler_count: u64,
-    response_extraction_count: u64,
-    stale_task_completion_count: u64,
 
     pub fn init(
         vm: *bindings.Vm,
@@ -56,21 +49,11 @@ pub const Observability = struct {
     ) !Observability {
         return .{
             .metrics_view = metrics_view,
-            .worker_metrics_state = common_worker_metrics_state.WorkState.init(metrics_view),
             .sentinel = try worker_sentinel.Sentinel.init(vm, .{
                 .memory_events_fd = options.memory_events_fd,
                 .metrics = metrics_view,
-                .trace_fd = options.trace_fd,
             }),
-            .trace_fd = options.trace_fd,
-            .trace_requests = options.trace_requests,
-            .trace_all_requests = options.trace_all_requests,
             .bench_handler = options.bench_handler,
-            .traced_first_request = false,
-            .sync_handler_fast_path_count = 0,
-            .thenable_handler_count = 0,
-            .response_extraction_count = 0,
-            .stale_task_completion_count = 0,
         };
     }
 
@@ -82,10 +65,6 @@ pub const Observability = struct {
 
 pub fn Methods(comptime Runtime: type) type {
     return struct {
-        pub fn traceRuntimeEvent(self: *Runtime, comptime fmt: []const u8, args: anytype) void {
-            traceEventFmt(self.observability.trace_fd, fmt, args);
-        }
-
         /// Writes `message`, the network setting's denial of a fetch of
         /// `request_id`, as one `warn` line in the tenant's log. A denial is
         /// the tenant's event, so it never reaches the operator's stderr,
@@ -100,31 +79,5 @@ pub fn Methods(comptime Runtime: type) type {
                 message,
             );
         }
-
-        /// Publishes each live request's accumulated CPU to its live slot, so a
-        /// death record the host synthesizes after a crash, an out-of-memory
-        /// kill or a deadline reports the windows already closed. The value is
-        /// a floor: the window running at the death is missing. Called on the
-        /// VM thread between work items, where no owner window is open, so
-        /// `RequestContext.cpu_ns` holds every window the request ran.
-        pub fn flushLiveRequestCpuBestEffort(self: *Runtime) void {
-            var work_state = self.observability.worker_metrics_state;
-            var iterator = self.requests.active.valueIterator();
-            while (iterator.next()) |entry| {
-                const request_ctx = entry.*;
-                if (request_ctx.finish_started or request_ctx.live_slot_released)
-                    continue;
-                work_state.updateLiveSlotCpu(request_ctx.live_slot_index, request_ctx.cpu_ns) catch |err| switch (err) {
-                    error.InvalidLiveSlot, error.StaleLiveSlot => {},
-                };
-            }
-        }
     };
-}
-
-fn traceEventFmt(trace_fd: ?std.posix.fd_t, comptime fmt: []const u8, args: anytype) void {
-    const fd = trace_fd orelse return;
-    var buffer: [process_limits.TRACE_EVENT_BUFFER_BYTES]u8 = undefined;
-    const line = std.fmt.bufPrint(&buffer, fmt ++ "\n", args) catch return;
-    _ = std.posix.write(fd, line) catch return;
 }

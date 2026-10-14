@@ -1,6 +1,7 @@
 //! Tests of the gateway's sandbox (`egress/gateway/sandbox.zig`): the Landlock write mask
-//! for each kernel version, the private root a forked child builds and enters, the syscall
-//! filter's refusal of Unix sockets, and, in a real gateway spawned from the installed binary,
+//! for each kernel version, the private root a forked child builds and enters with the plan's
+//! open-file limit and its inherited address space, the syscall filter's refusal of Unix sockets,
+//! and, in a real gateway spawned from the installed binary,
 //! that no codec or ICU shared object is mapped, since the binary links them. The children apply
 //! the real sandbox. A host that lacks a CA bundle, or on which a separate probe child
 //! cannot enter unprivileged user and mount namespaces or install a seccomp filter, skips them,
@@ -44,7 +45,7 @@ test "egress gateway Landlock mask tracks supported write-deny rights" {
     try std.testing.expect((v3 & (@as(u64, 1) << 14)) != 0);
 }
 
-test "a sandboxed gateway sees a read-only root holding the host's trust store and nothing else" {
+test "a sandboxed gateway sees a read-only root holding the host's trust store and nothing else, under the plan's open-file limit and its inherited address space" {
     if (!hostHasTrustStore()) {
         std.debug.print("skipped: no CA bundle on this host\n", .{});
         return error.SkipZigTest;
@@ -67,6 +68,10 @@ test "a sandboxed gateway sees a read-only root holding the host's trust store a
             writeReport(pipe[1], .{ .failed = @intFromError(err) });
             childExit(0);
         };
+        const address_space_before = std.posix.getrlimit(.AS) catch |err| {
+            writeReport(pipe[1], .{ .failed = @intFromError(err) });
+            childExit(0);
+        };
         sandbox.applyProcessBaseline(plan) catch |err| {
             writeReport(pipe[1], .{ .failed = @intFromError(err) });
             childExit(0);
@@ -77,13 +82,17 @@ test "a sandboxed gateway sees a read-only root holding the host's trust store a
         if (writeRefused("/etc/ssl/cert.pem")) checks |= 1 << 2;
         if (absent("/proc/self")) checks |= 1 << 3;
         if (rootHoldsOnlyEtc()) checks |= 1 << 4;
+        if (limitIs(.NOFILE, plan.open_files, plan.open_files)) checks |= 1 << 5;
+        // The budgeted allocators bound the gateway's memory, so the sandbox leaves the address
+        // space it inherited as it was.
+        if (limitIs(.AS, address_space_before.cur, address_space_before.max)) checks |= 1 << 6;
         writeReport(pipe[1], .{ .checks = checks });
         childExit(0);
     }
     std.posix.close(pipe[1]);
 
     const checks = try readReport(pipe[0], pid);
-    try std.testing.expectEqual(@as(u16, 0b1_1111), checks);
+    try std.testing.expectEqual(@as(u16, 0b111_1111), checks);
 }
 
 test "a sandboxed gateway maps no zlib, brotli, zstd or ICU shared object" {
@@ -283,6 +292,12 @@ fn readReport(fd: std.posix.fd_t, pid: std.posix.pid_t) !u16 {
         },
         else => return error.UnexpectedChildReport,
     }
+}
+
+/// Whether the calling process's soft and hard limits of `resource` are `cur` and `max`.
+fn limitIs(resource: std.posix.rlimit_resource, cur: u64, max: u64) bool {
+    const limit = std.posix.getrlimit(resource) catch return false;
+    return limit.cur == cur and limit.max == max;
 }
 
 fn readableNonEmpty(path: [:0]const u8) bool {

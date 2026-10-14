@@ -27,4 +27,24 @@
         .name = "local_server.e2e.test.local e2e bench: private bytes per byte of module pack (env-gated)",
         .reason = "opt-in benchmark: runs only with COLLO_BENCH_PACK set",
     },
+    .{
+        .suite = "runtime/all_tests.zig",
+        .name = "src.egress.tests.client.engine.dial.test.egress engine fails a stalled TCP connect with FetchConnectTimeout and asks DNS again on the next dial",
+        .reason = "host capability: a TCP stack that drops SYNs to a listener whose accept queue is full, which keeps a local connect in progress",
+    },
+    .{
+        .suite = "runtime/all_tests.zig",
+        .name = "src.egress.tests.client.engine.dial.test.egress engine starts the next address after the attempt delay when a connect stalls, and closes the stalled attempt",
+        .reason = "host capability: a TCP stack that drops SYNs to a listener whose accept queue is full, which keeps a local connect in progress",
+    },
+    .{
+        .suite = "runtime/all_tests.zig",
+        .name = "src.egress.tests.client.engine.dial.test.egress engine cancel during a TCP connect closes the attempt's socket and settles each fetch once",
+        .reason = "host capability: a TCP stack that drops SYNs to a listener whose accept queue is full, which keeps a local connect in progress",
+    },
+    .{
+        .suite = "runtime/all_tests.zig",
+        .name = "src.egress.tests.client.engine.dial.test.egress engine stop closes connecting dials' sockets and settles every fetch exactly once",
+        .reason = "host capability: a TCP stack that drops SYNs to a listener whose accept queue is full, which keeps a local connect in progress",
+    },
 }

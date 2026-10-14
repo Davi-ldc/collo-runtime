@@ -310,28 +310,37 @@ test "request binary body methods preserve raw bytes" {
         .body = "\x00\xffA",
     };
 
-    const bytes_response = try runRouteAndReadBodyWithRequest(&runtime, control_pair[1],
+    const bytes_source =
         \\export default async function handle(req) {
         \\    return Response.json({ bytes: Array.from(await req.bytes()), bodyUsed: req.bodyUsed });
         \\}
-    , 306, "/binary-bytes.js", request);
-    defer std.testing.allocator.free(bytes_response);
-    try std.testing.expect(std.mem.containsAtLeast(u8, bytes_response, 1, "\"bytes\":[0,255,65]"));
-
-    const array_buffer_response = try runRouteAndReadBodyWithRequest(&runtime, control_pair[1],
+    ;
+    const array_buffer_source =
         \\export default async function handle(req) {
         \\    return Response.json({ bytes: Array.from(new Uint8Array(await req.arrayBuffer())) });
         \\}
-    , 307, "/binary-array-buffer.js", request);
-    defer std.testing.allocator.free(array_buffer_response);
-    try std.testing.expect(std.mem.containsAtLeast(u8, array_buffer_response, 1, "\"bytes\":[0,255,65]"));
-
-    const blob_response = try runRouteAndReadBodyWithRequest(&runtime, control_pair[1],
+    ;
+    const blob_source =
         \\export default async function handle(req) {
         \\    const blob = await req.blob();
         \\    return Response.json({ bytes: Array.from(await blob.bytes()), type: blob.type });
         \\}
-    , 308, "/binary-blob.js", request);
+    ;
+    try rt.bootRoutes(&runtime, &.{
+        .{ .specifier = "/binary-bytes.js", .source = bytes_source },
+        .{ .specifier = "/binary-array-buffer.js", .source = array_buffer_source },
+        .{ .specifier = "/binary-blob.js", .source = blob_source },
+    });
+
+    const bytes_response = try runRouteAndReadBodyWithRequest(&runtime, control_pair[1], bytes_source, 306, "/binary-bytes.js", request);
+    defer std.testing.allocator.free(bytes_response);
+    try std.testing.expect(std.mem.containsAtLeast(u8, bytes_response, 1, "\"bytes\":[0,255,65]"));
+
+    const array_buffer_response = try runRouteAndReadBodyWithRequest(&runtime, control_pair[1], array_buffer_source, 307, "/binary-array-buffer.js", request);
+    defer std.testing.allocator.free(array_buffer_response);
+    try std.testing.expect(std.mem.containsAtLeast(u8, array_buffer_response, 1, "\"bytes\":[0,255,65]"));
+
+    const blob_response = try runRouteAndReadBodyWithRequest(&runtime, control_pair[1], blob_source, 308, "/binary-blob.js", request);
     defer std.testing.allocator.free(blob_response);
     try std.testing.expect(std.mem.containsAtLeast(u8, blob_response, 1, "\"bytes\":[0,255,65]"));
     try std.testing.expect(std.mem.containsAtLeast(u8, blob_response, 1, "\"type\":\"application/octet-stream\""));

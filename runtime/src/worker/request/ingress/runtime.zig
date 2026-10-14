@@ -1,17 +1,17 @@
 //! Turns the host's ingress-channel packets into live requests: a request
-//! begin becomes a `RequestContext` with a live slot on the shared page, a
-//! body chunk feeds that request's body pipe, and a reset cancels it. The
+//! begin becomes a `RequestContext` and takes a live slot on the shared page,
+//! a body chunk feeds that request's body pipe, and a reset cancels it. The
 //! scheduler decides when packets are read; this file decides what they
 //! mean. It runs on the worker's VM thread.
 //!
 //! A request's identity is the dispatch's, all of it assigned by the host:
-//! the live slot is written from the dispatch's request id, generation, lane
-//! slot and worker, and every later packet must match the identity of the
-//! request it names.
+//! the request's live slot is the one at the pool slot it was dispatched on
+//! (`DispatchWork.worker_slot`), written with its request id and generation,
+//! and every later packet must match the identity of the request it names. A
+//! begin never takes the id or the pool slot of a request still in the
+//! active map, so each dispatched request there holds a pool slot of its own.
 
-const std = @import("std");
 const ipc = @import("collo_ipc");
-const common_worker_metrics_state = @import("collo_worker_state").metrics;
 const request_context = @import("../context.zig");
 const h2_ingress = @import("../http2/ingress.zig");
 const response_stream = @import("../response_stream.zig");
@@ -58,32 +58,34 @@ pub fn enqueueResponseCredit(runtime: anytype, credit: ipc.messages.ResponseCred
 }
 
 fn enqueueRequestBegin(runtime: anytype, received: *ipc.ingress_channel.Received) !void {
+    // The decode refuses a `worker_slot` the page has no live slot for
+    // (`common/ipc/dispatch.zig:validateWorkerSlot`), and
+    // `validateStreamBeginDescriptor` a zero request id, so the live slot
+    // write below holds whatever the server sent.
     var dispatch_work = try ipc.ingress_channel.decodeDispatchPayload(runtime.core.allocator, received);
     var dispatch_moved = false;
     defer if (!dispatch_moved)
         dispatch_work.deinit();
 
     try h2_ingress.validateStreamBeginDescriptor(received.descriptor, &dispatch_work);
+    try requireUnheld(runtime, dispatch_work.request_id, dispatch_work.worker_slot);
 
     const started = runtime.nowMonoNs();
-    const live_slot_index = try runtime.observability.worker_metrics_state.allocateLiveSlot(.{
-        .external_request_id = dispatch_work.request_id,
-        .request_lane_id = dispatch_work.request_lane_id,
-        .request_slot = dispatch_work.request_slot,
-        .request_generation = dispatch_work.request_generation,
-        .worker_id = dispatch_work.worker_id,
-        .worker_generation = dispatch_work.worker_generation,
-    });
-    errdefer freeLiveSlotBestEffort(&runtime.observability.worker_metrics_state, live_slot_index);
-
     const request_id = dispatch_work.request_id;
+    const worker_slot = dispatch_work.worker_slot;
+    // The live slot of the request's pool slot names it from here on, in
+    // place of the last request begun there
+    // (`common/worker_state/page/live_slots.zig`). A failure below ends the
+    // loop, and the slot keeps naming this request, with no CPU, for the
+    // server to end it from.
+    runtime.observability.metrics_view.beginLiveSlot(worker_slot, request_id, dispatch_work.request_generation);
+
     const request_ctx = try runtime.core.allocator.create(request_context.RequestContext);
     errdefer runtime.core.allocator.destroy(request_ctx);
     request_ctx.* = request_context.RequestContext.initOwnedDispatch(
         runtime.core.allocator,
         received.descriptor.stream_id,
         dispatch_work,
-        live_slot_index,
         started,
     );
     dispatch_moved = true;
@@ -98,14 +100,35 @@ fn enqueueRequestBegin(runtime: anytype, received: *ipc.ingress_channel.Received
         dispatch_work.body_framing,
         received.descriptor.hasFlag(ipc.ingress_channel.flags.end_stream),
     );
-    if (shouldTraceRequest(runtime)) {
-        request_ctx.trace_enabled = true;
-        request_ctx.trace.dispatch_enqueued_ns = started;
-    }
 
     try runtime.requests.active.putNoClobber(runtime.core.allocator, request_id, request_ctx);
     errdefer _ = runtime.requests.active.fetchRemove(request_id);
     _ = queueDispatch(runtime, request_ctx);
+}
+
+/// Refuses a begin that names what an unfinished request still holds: its
+/// id, which keys the active map, with `error.RequestIdInUse`, or its pool
+/// slot, whose live slot still carries that request's CPU for the server,
+/// with `error.WorkerSlotInUse`. A request is unfinished while it is in the
+/// active map, from its begin to its finish, which sends its `request_done`
+/// and drops it in one step (`serve/response_finish.zig:finishRequest`). The
+/// server dispatches on a pool slot only after that `request_done` arrived
+/// (`server/ingress/runner/request_slot.zig`) and never reuses a request id,
+/// so either refusal is the server's protocol error and ends the loop. The
+/// refusal makes the bound local: every dispatched request in the map holds
+/// a pool slot of its own, so the map holds at most `LIVE_SLOT_COUNT` of them
+/// (`serve/termination.zig`), whatever the server sends.
+fn requireUnheld(runtime: anytype, request_id: u64, worker_slot: u8) error{ RequestIdInUse, WorkerSlotInUse }!void {
+    if (runtime.requests.active.contains(request_id))
+        return error.RequestIdInUse;
+    var iterator = runtime.requests.active.iterator();
+    while (iterator.next()) |entry| {
+        // An evaluation holds no pool slot.
+        if (request_context.isReservedId(entry.key_ptr.*))
+            continue;
+        if (entry.value_ptr.*.dispatch_work.worker_slot == worker_slot)
+            return error.WorkerSlotInUse;
+    }
 }
 
 fn enqueueBodyChunk(runtime: anytype, received: *ipc.ingress_channel.Received) !void {
@@ -262,23 +285,4 @@ fn validateH2RequestDescriptor(
     {
         return error.InvalidH2StreamIdentity;
     }
-}
-
-fn shouldTraceRequest(runtime: anytype) bool {
-    if (!runtime.observability.trace_requests)
-        return false;
-    if (runtime.observability.trace_all_requests)
-        return true;
-    if (runtime.observability.traced_first_request)
-        return false;
-    runtime.observability.traced_first_request = true;
-    return true;
-}
-
-fn freeLiveSlotBestEffort(
-    state: *common_worker_metrics_state.WorkState,
-    live_slot_index: common_worker_metrics_state.LiveSlotHandle,
-) void {
-    state.freeLiveSlot(live_slot_index) catch |err|
-        std.log.warn("failed to release live slot during request enqueue rollback: {s}", .{@errorName(err)});
 }

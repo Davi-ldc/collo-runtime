@@ -1,326 +1,220 @@
-// `SubtleCrypto.deriveBits` and `deriveKey` for PBKDF2, HKDF, ECDH and X25519. Arguments are validated on the VM
-// thread; a base key's bytes are copied into `SecretBytes` and the two ECDH or X25519 keys are retained through
-// `retainSharedPkey`, so the derivation on the crypto pool never reads a CryptoKey cell. deriveKey builds the derived
-// AES or HMAC key when its job settles (`SecretKeyCryptoJob`).
+// `SubtleCrypto.deriveBits` and `deriveKey` for PBKDF2, HKDF, ECDH and X25519, on the VM thread, through one
+// derivation entry under a time guard (budget.h). deriveKey imports the derived bits as a raw AES, HMAC, PBKDF2 or HKDF
+// key through the import core (key_io.h). PBKDF2's work is capped (`pbkdf2WorkNsMax` in budget.h) whatever time is
+// left.
 
 #include "jsc/runtime/state.h"
 
 #include "host_functions/webapi/crypto/subtle/methods.h"
 
-#include "host_functions/support.h"
-#include "host_functions/webapi/crypto/jobs.h"
+#include "host_functions/webapi/crypto/budget.h"
 #include "host_functions/webapi/crypto/key_io/key_io.h"
 #include "host_functions/webapi/crypto/keys.h"
 #include "host_functions/webapi/crypto/normalize.h"
-#include "host_functions/webapi/crypto/objects.h"
 #include "host_functions/webapi/crypto/ops/asymmetric.h"
 #include "host_functions/webapi/crypto/ops/kdf.h"
-#include "host_functions/webapi/crypto/ops/symmetric.h"
-#include "host_functions/webapi/crypto/types.h"
+#include "host_functions/webapi/crypto/subtle/steps.h"
 #include "jsc/runtime/js_support.h"
 
-#include <JavaScriptCore/Error.h>
-#include <JavaScriptCore/IdentifierInlines.h>
 #include <JavaScriptCore/JSCInlines.h>
-#include <JavaScriptCore/JSArrayBufferView.h>
-#include <JavaScriptCore/JSObject.h>
-#include <openssl/bn.h>
-#include <openssl/crypto.h>
-#include <openssl/ec_key.h>
-#include <openssl/evp.h>
-#include <openssl/mem.h>
-#include <openssl/rand.h>
-#include <openssl/rsa.h>
-#include <wtf/Vector.h>
-#include <wtf/text/Base64.h>
-#include <wtf/text/WTFString.h>
 
-#include <array>
-#include <cmath>
-#include <cstring>
-#include <memory>
-#include <optional>
-#include <span>
+#include <limits>
 
 namespace Collo::HostFunctions {
 
-using JSC::EncodedJSValue;
-using JSC::JSValue;
-using WTF::String;
-using namespace JSC;
 using namespace Collo::HostFunctions::WebCrypto;
 using namespace Collo::JscSupport;
 
-static bool validatePeerDeriveKey(JSC::JSGlobalObject* global_object, CryptoKeyAlgorithm algorithm,
-    JSColloCryptoKey* private_key, JSColloCryptoKey* public_key, JSC::JSValue& out_error)
-{
-    if (!private_key || !public_key) {
-        out_error = domExceptionValue(global_object, DOMExceptionCode::OperationError);
-        return false;
+namespace {
+
+    // deriveBits' optional `length`, an unsigned long or null; undefined and a missing argument are null. Returns no
+    // value with no exception for null, which each algorithm's derive bits step reads (`deriveBitsWith`). A value that
+    // is not an integer within the unsigned long range is an OperationError.
+    std::optional<size_t> deriveBitsLength(
+        JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSC::JSValue value)
+    {
+        if (value.isUndefinedOrNull())
+            return std::nullopt;
+        double number = value.toNumber(global_object);
+        RETURN_IF_EXCEPTION(scope, std::nullopt);
+        auto bits = integerInRange<uint32_t>(number, 0, std::numeric_limits<uint32_t>::max());
+        if (!bits) {
+            throwDOMException(global_object, scope, DOMExceptionCode::OperationError);
+            return std::nullopt;
+        }
+        return *bits;
     }
-    if (private_key->type() != CryptoKeyType::Private || public_key->type() != CryptoKeyType::Public) {
-        out_error = domExceptionValue(global_object, DOMExceptionCode::InvalidAccessError);
-        return false;
+
+    // deriveKey's "get key length" step for the derived key, in bits. An AES or HMAC key has one; a PBKDF2 or HKDF key
+    // takes every bit the derivation gives, so the step returns null, here no value with no exception.
+    std::optional<size_t> derivedKeyBits(
+        JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, const NormalizedAlgorithm& derived)
+    {
+        if (derived.spec().family == AlgorithmFamily::Kdf)
+            return std::nullopt;
+        if (derived.spec().family == AlgorithmFamily::Aes) {
+            auto bits = integerInRange<size_t>(derived.paramsAs<AesLengthParams>().length, 128, 256);
+            if (bits && (*bits == 128 || *bits == 192 || *bits == 256))
+                return bits;
+            throwDOMException(
+                global_object, scope, DOMExceptionCode::OperationError, "Cannot get key length from derivedKeyType"_s);
+            return std::nullopt;
+        }
+        const auto& params = derived.paramsAs<HmacParams>();
+        const size_t bits = params.length_bits.value_or(params.hash->block_bits);
+        if (!bits || bits / 8 > generated_secret_bytes_max) {
+            JSC::throwTypeError(global_object, scope, "Cannot get key length from derivedKeyType"_s);
+            return std::nullopt;
+        }
+        if (bits % 8) {
+            throwDOMException(
+                global_object, scope, DOMExceptionCode::OperationError, "Cannot get key length from derivedKeyType"_s);
+            return std::nullopt;
+        }
+        return bits;
     }
-    if (private_key->algorithm() != algorithm || public_key->algorithm() != algorithm) {
-        out_error = domExceptionValue(global_object, DOMExceptionCode::InvalidAccessError);
-        return false;
+
+    // ECDH and X25519 agree with the `public` key of the parameters, which must be a public key of the same algorithm
+    // and, for ECDH, on the private key's curve; anything else is an InvalidAccessError.
+    void checkPeerKey(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, const NormalizedAlgorithm& algorithm,
+        JSColloCryptoKey* private_key)
+    {
+        auto* public_key = algorithm.paramsAs<EcdhKeyDeriveParams>().public_key;
+        if (public_key->type() != CryptoKeyType::Public || public_key->algorithm() != algorithm.id
+            || public_key->namedCurve() != private_key->namedCurve())
+            throwDOMException(global_object, scope, DOMExceptionCode::InvalidAccessError);
     }
-    if (algorithm == CryptoKeyAlgorithm::Ecdh && private_key->namedCurve() != public_key->namedCurve()) {
-        // The ECDH derive bits operation of the Web Cryptography API rejects keys on different named curves with
-        // InvalidAccessError.
-        out_error = domExceptionValue(global_object, DOMExceptionCode::InvalidAccessError);
-        return false;
+
+    // A KDF's length: a multiple of 8 of at most `derived_bytes_max` bytes, zero included; null is an OperationError,
+    // as the HKDF and PBKDF2 derive bits operations require.
+    bool kdfLengthFits(std::optional<size_t> length_bits)
+    {
+        return length_bits && !(*length_bits % 8) && *length_bits / 8 <= derived_bytes_max;
     }
-    return true;
-}
+
+    // The derive bits step of `algorithm` for `length_bits`, no value for null, under a time guard (budget.h). HKDF and
+    // PBKDF2 refuse a length `kdfLengthFits` refuses, and PBKDF2 zero iterations and work past `pbkdf2WorkNsMax`.
+    // ECDH and X25519 give the whole shared secret for null and its first bits otherwise, and refuse a length past the
+    // secret. Each refusal is an OperationError.
+    std::optional<SecretBytes> deriveBitsWith(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope,
+        const NormalizedAlgorithm& algorithm, JSColloCryptoKey* base_key, std::optional<size_t> length_bits)
+    {
+        TimeGuard guard(hostRuntimeOf(global_object));
+        SecretBytes out;
+        bool derived = false;
+        switch (algorithm.id) {
+        case CryptoKeyAlgorithm::Pbkdf2: {
+            const auto& params = algorithm.paramsAs<Pbkdf2Params>();
+            if (!kdfLengthFits(length_bits) || !params.iterations) {
+                throwDOMException(global_object, scope, DOMExceptionCode::OperationError);
+                return std::nullopt;
+            }
+            const double work_ns = pbkdf2WorkNs(
+                params.hash->id, base_key->material().size(), params.salt.size(), params.iterations, *length_bits / 8);
+            if (work_ns > pbkdf2WorkNsMax()) {
+                throwInputTooLarge(global_object, scope, "PBKDF2 work"_s);
+                return std::nullopt;
+            }
+            if (!requireStartFits(global_object, scope, guard, work_ns))
+                return std::nullopt;
+            derived = derivePbkdf2Bits(
+                base_key->material(), params.salt.span(), params.iterations, *params.hash, *length_bits, out, guard);
+            break;
+        }
+        case CryptoKeyAlgorithm::Hkdf: {
+            const auto& params = algorithm.paramsAs<HkdfParams>();
+            if (!kdfLengthFits(length_bits)) {
+                throwDOMException(global_object, scope, DOMExceptionCode::OperationError);
+                return std::nullopt;
+            }
+            const double expected_ns = hkdfWorstCaseNs(
+                params.hash->id, base_key->material().size(), params.salt.size(), params.info.size(), *length_bits / 8);
+            if (!requireStartFits(global_object, scope, guard, expected_ns))
+                return std::nullopt;
+            derived = deriveHkdfBits(
+                base_key->material(), params.salt.span(), params.info.span(), *params.hash, *length_bits, out, guard);
+            break;
+        }
+        case CryptoKeyAlgorithm::Ecdh:
+        case CryptoKeyAlgorithm::X25519: {
+            checkPeerKey(global_object, scope, algorithm, base_key);
+            RETURN_IF_EXCEPTION(scope, std::nullopt);
+            const size_t secret_bits = curveSpec(base_key->namedCurve()).coordinate_bytes * 8;
+            if (length_bits && *length_bits > secret_bits) {
+                throwDOMException(global_object, scope, DOMExceptionCode::OperationError);
+                return std::nullopt;
+            }
+            if (!requireUninterruptibleFits(
+                    global_object, scope, guard, keyAgreementWorstCaseNs(base_key->namedCurve())))
+                return std::nullopt;
+            auto* public_key = algorithm.paramsAs<EcdhKeyDeriveParams>().public_key;
+            derived = deriveSharedSecret(base_key->pkey(), public_key->pkey(), length_bits.value_or(secret_bits), out);
+            break;
+        }
+        default:
+            RELEASE_ASSERT_NOT_REACHED();
+        }
+        if (!derived) {
+            throwOperationFailed(global_object, scope, guard);
+            return std::nullopt;
+        }
+        return out;
+    }
+
+} // namespace
 
 JSC_DEFINE_HOST_FUNCTION(subtleDeriveBits, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
 {
-    auto& vm = global_object->vm();
-    auto scope = DECLARE_TOP_EXCEPTION_SCOPE(vm);
-
-    if (!dynamicDowncast<JSColloSubtleCrypto>(call_frame->thisValue()))
-        return rejectedTypeError(global_object, "Can only call SubtleCrypto.deriveBits on instances of SubtleCrypto"_s);
-    if (call_frame->argumentCount() < 3)
-        return rejectedTypeError(global_object, "Not enough arguments"_s);
-
-    JSC::JSValue error;
-    String algorithm_name;
-    if (!algorithmName(global_object, scope, call_frame->argument(0), algorithm_name, error))
-        return rejectedPromise(global_object, error);
-
-    auto* key = dynamicDowncast<JSColloCryptoKey>(call_frame->argument(1));
-    if (!key)
-        return rejectedPromise(global_object, typeErrorValue(global_object, "Expected a CryptoKey"_s));
-
-    Pbkdf2Params pbkdf2_params;
-    HkdfParams hkdf_params;
-    EcdhParams ecdh_params;
-    X25519Params x25519_params;
-    CryptoKeyAlgorithm expected_algorithm { CryptoKeyAlgorithm::Pbkdf2 };
-    if (WTF::equalIgnoringASCIICase(algorithm_name, "PBKDF2"_s)) {
-        expected_algorithm = CryptoKeyAlgorithm::Pbkdf2;
-        if (!parsePbkdf2ParamsAfterName(
-                global_object, scope, call_frame->argument(0), algorithm_name, pbkdf2_params, error))
-            return rejectedPromise(global_object, error);
-    } else if (WTF::equalIgnoringASCIICase(algorithm_name, "HKDF"_s)) {
-        expected_algorithm = CryptoKeyAlgorithm::Hkdf;
-        if (!parseHkdfParamsAfterName(
-                global_object, scope, call_frame->argument(0), algorithm_name, hkdf_params, error))
-            return rejectedPromise(global_object, error);
-    } else if (WTF::equalIgnoringASCIICase(algorithm_name, "ECDH"_s)) {
-        expected_algorithm = CryptoKeyAlgorithm::Ecdh;
-        if (!parseEcdhParamsAfterName(
-                global_object, scope, call_frame->argument(0), algorithm_name, ecdh_params, error))
-            return rejectedPromise(global_object, error);
-    } else if (WTF::equalIgnoringASCIICase(algorithm_name, "X25519"_s)) {
-        expected_algorithm = CryptoKeyAlgorithm::X25519;
-        if (!parseX25519ParamsAfterName(
-                global_object, scope, call_frame->argument(0), algorithm_name, x25519_params, error))
-            return rejectedPromise(global_object, error);
-    } else
-        return rejectedDOMException(global_object, DOMExceptionCode::NotSupportedError);
-
-    if (key->algorithm() != expected_algorithm)
-        return rejectedDOMException(
-            global_object, DOMExceptionCode::InvalidAccessError, "CryptoKey doesn't match AlgorithmIdentifier"_s);
-    if (!key->allows(CryptoKeyUsageDeriveBits))
-        return rejectedDOMException(
-            global_object, DOMExceptionCode::InvalidAccessError, "CryptoKey doesn't support bits derivation"_s);
-
-    size_t length_bits = 0;
-    if (expected_algorithm == CryptoKeyAlgorithm::Ecdh || expected_algorithm == CryptoKeyAlgorithm::X25519) {
-        auto full_length_bits = expected_algorithm == CryptoKeyAlgorithm::X25519
-            ? 256
-            : coordinateBytesForNamedCurve(key->namedCurve()) * 8;
-        if (!parseEcDeriveBitsLength(
-                global_object, scope, call_frame->argument(2), full_length_bits, length_bits, error))
-            return rejectedPromise(global_object, error);
-    } else if (expected_algorithm == CryptoKeyAlgorithm::Pbkdf2 || expected_algorithm == CryptoKeyAlgorithm::Hkdf) {
-        const auto& kdf_hash
-            = expected_algorithm == CryptoKeyAlgorithm::Pbkdf2 ? *pbkdf2_params.hash : *hkdf_params.hash;
-        if (!parseKdfDeriveBitsLength(
-                global_object, scope, call_frame->argument(2), kdf_hash.digest_bytes * 8, length_bits, error))
-            return rejectedPromise(global_object, error);
-    } else if (!parseDeriveBitsLength(global_object, scope, call_frame->argument(2), length_bits, error))
-        return rejectedPromise(global_object, error);
-
-    SecretBytes base_material;
-    WTF::Vector<uint8_t> salt;
-    WTF::Vector<uint8_t> info;
-    std::shared_ptr<EVP_PKEY> private_pkey;
-    std::shared_ptr<EVP_PKEY> public_pkey;
-    WebCryptoHash hash_id { WebCryptoHash::SHA256 };
-    uint32_t iterations = 0;
-
-    if (expected_algorithm == CryptoKeyAlgorithm::Pbkdf2) {
-        if (!base_material.tryAppend(key->material()))
-            return rejectedPromise(global_object, JSC::createOutOfMemoryError(global_object));
-        salt = WTF::move(pbkdf2_params.salt);
-        hash_id = pbkdf2_params.hash->id;
-        iterations = pbkdf2_params.iterations;
-    } else if (expected_algorithm == CryptoKeyAlgorithm::Hkdf) {
-        if (!base_material.tryAppend(key->material()))
-            return rejectedPromise(global_object, JSC::createOutOfMemoryError(global_object));
-        salt = WTF::move(hkdf_params.salt);
-        info = WTF::move(hkdf_params.info);
-        hash_id = hkdf_params.hash->id;
-    } else {
-        auto* peer = expected_algorithm == CryptoKeyAlgorithm::Ecdh ? ecdh_params.public_key : x25519_params.public_key;
-        if (!validatePeerDeriveKey(global_object, expected_algorithm, key, peer, error))
-            return rejectedPromise(global_object, error);
-        private_pkey = retainSharedPkey(key->asymmetricKey());
-        public_pkey = retainSharedPkey(peer ? peer->asymmetricKey() : nullptr);
-        if (!private_pkey || !public_pkey)
-            return rejectedDOMException(global_object, DOMExceptionCode::OperationError);
-    }
-
-    auto context = createCryptoAsyncContext(global_object, scope);
-    if (!context.ok)
-        return context.error;
-
-    auto job = std::unique_ptr<CryptoJob>(new (std::nothrow) BytesCryptoJob(context.value.owner, context.value.deferred,
-        [expected_algorithm, length_bits, hash_id, iterations, base_material = WTF::move(base_material),
-            salt = WTF::move(salt), info = WTF::move(info), private_pkey, public_pkey](SecretBytes& out) mutable {
-            if (expected_algorithm == CryptoKeyAlgorithm::Pbkdf2)
-                return derivePbkdf2BitsNative(base_material.span(), salt.span(), iterations, hash_id, length_bits, out);
-            if (expected_algorithm == CryptoKeyAlgorithm::Hkdf)
-                return deriveHkdfBitsNative(base_material.span(), salt.span(), info.span(), hash_id, length_bits, out);
-            if (expected_algorithm == CryptoKeyAlgorithm::Ecdh)
-                return ecdhDeriveBitsNative(private_pkey.get(), public_pkey.get(), length_bits, out);
-            return x25519DeriveBitsNative(private_pkey.get(), public_pkey.get(), length_bits, out);
-        }));
-    return enqueueCryptoJobPromise(global_object, context.value, WTF::move(job));
+    return promiseFromThrowingSteps(global_object, [&]() -> JSC::JSValue {
+        auto& vm = global_object->vm();
+        auto scope = DECLARE_THROW_SCOPE(vm);
+        checkSubtleCall(global_object, scope, call_frame, "deriveBits"_s, 2);
+        RETURN_IF_EXCEPTION(scope, {});
+        auto* key = requireCryptoKey(global_object, scope, call_frame->argument(1), "Expected a CryptoKey"_s);
+        RETURN_IF_EXCEPTION(scope, {});
+        auto length_bits = deriveBitsLength(global_object, scope, call_frame->argument(2));
+        RETURN_IF_EXCEPTION(scope, {});
+        auto algorithm = normalizeAlgorithm(global_object, scope, Operation::DeriveBits, call_frame->argument(0));
+        RETURN_IF_EXCEPTION(scope, {});
+        checkKey(global_object, scope, key, algorithm->id, CryptoKeyUsageDeriveBits);
+        RETURN_IF_EXCEPTION(scope, {});
+        auto bits = deriveBitsWith(global_object, scope, *algorithm, key, length_bits);
+        RETURN_IF_EXCEPTION(scope, {});
+        RELEASE_AND_RETURN(scope, createArrayBufferCopy(global_object, scope, bits->span()));
+    });
 }
 
 JSC_DEFINE_HOST_FUNCTION(subtleDeriveKey, (JSC::JSGlobalObject * global_object, JSC::CallFrame* call_frame))
 {
-    auto& vm = global_object->vm();
-    auto scope = DECLARE_TOP_EXCEPTION_SCOPE(vm);
+    return promiseFromThrowingSteps(global_object, [&]() -> JSC::JSValue {
+        auto& vm = global_object->vm();
+        auto scope = DECLARE_THROW_SCOPE(vm);
+        checkSubtleCall(global_object, scope, call_frame, "deriveKey"_s, 5);
+        RETURN_IF_EXCEPTION(scope, {});
+        auto* base_key = requireCryptoKey(global_object, scope, call_frame->argument(1), "Expected a CryptoKey"_s);
+        RETURN_IF_EXCEPTION(scope, {});
+        const bool extractable = call_frame->argument(3).toBoolean(global_object);
+        auto usages = parseKeyUsages(global_object, scope, call_frame->argument(4));
+        RETURN_IF_EXCEPTION(scope, {});
+        auto algorithm = normalizeAlgorithm(global_object, scope, Operation::DeriveBits, call_frame->argument(0));
+        RETURN_IF_EXCEPTION(scope, {});
+        auto derived = normalizeAlgorithm(global_object, scope, Operation::GetKeyLength, call_frame->argument(2));
+        RETURN_IF_EXCEPTION(scope, {});
+        checkKey(global_object, scope, base_key, algorithm->id, CryptoKeyUsageDeriveKey);
+        RETURN_IF_EXCEPTION(scope, {});
+        auto length_bits = derivedKeyBits(global_object, scope, *derived);
+        RETURN_IF_EXCEPTION(scope, {});
+        // The import below would refuse these usages too, but only after the derivation's work.
+        checkNewKeyUsages(global_object, scope, derived->spec(), CryptoKeyType::Secret, *usages);
+        RETURN_IF_EXCEPTION(scope, {});
 
-    if (!dynamicDowncast<JSColloSubtleCrypto>(call_frame->thisValue()))
-        return rejectedTypeError(global_object, "Can only call SubtleCrypto.deriveKey on instances of SubtleCrypto"_s);
-    if (call_frame->argumentCount() < 5)
-        return rejectedTypeError(global_object, "Not enough arguments"_s);
-
-    JSC::JSValue error;
-    String algorithm_name;
-    if (!algorithmName(global_object, scope, call_frame->argument(0), algorithm_name, error))
-        return rejectedPromise(global_object, error);
-
-    auto* base_key = dynamicDowncast<JSColloCryptoKey>(call_frame->argument(1));
-    if (!base_key)
-        return rejectedPromise(global_object, typeErrorValue(global_object, "Expected a CryptoKey"_s));
-
-    Pbkdf2Params pbkdf2_params;
-    HkdfParams hkdf_params;
-    EcdhParams ecdh_params;
-    X25519Params x25519_params;
-    CryptoKeyAlgorithm expected_algorithm { CryptoKeyAlgorithm::Pbkdf2 };
-    if (WTF::equalIgnoringASCIICase(algorithm_name, "PBKDF2"_s)) {
-        expected_algorithm = CryptoKeyAlgorithm::Pbkdf2;
-        if (!parsePbkdf2ParamsAfterName(
-                global_object, scope, call_frame->argument(0), algorithm_name, pbkdf2_params, error))
-            return rejectedPromise(global_object, error);
-    } else if (WTF::equalIgnoringASCIICase(algorithm_name, "HKDF"_s)) {
-        expected_algorithm = CryptoKeyAlgorithm::Hkdf;
-        if (!parseHkdfParamsAfterName(
-                global_object, scope, call_frame->argument(0), algorithm_name, hkdf_params, error))
-            return rejectedPromise(global_object, error);
-    } else if (WTF::equalIgnoringASCIICase(algorithm_name, "ECDH"_s)) {
-        expected_algorithm = CryptoKeyAlgorithm::Ecdh;
-        if (!parseEcdhParamsAfterName(
-                global_object, scope, call_frame->argument(0), algorithm_name, ecdh_params, error))
-            return rejectedPromise(global_object, error);
-    } else if (WTF::equalIgnoringASCIICase(algorithm_name, "X25519"_s)) {
-        expected_algorithm = CryptoKeyAlgorithm::X25519;
-        if (!parseX25519ParamsAfterName(
-                global_object, scope, call_frame->argument(0), algorithm_name, x25519_params, error))
-            return rejectedPromise(global_object, error);
-    } else
-        return rejectedDOMException(global_object, DOMExceptionCode::NotSupportedError);
-
-    DerivedKeySpec derived_spec;
-    if (!parseDerivedKeySpec(global_object, scope, call_frame->argument(2), derived_spec, error))
-        return rejectedPromise(global_object, error);
-
-    if (base_key->algorithm() != expected_algorithm)
-        return rejectedDOMException(
-            global_object, DOMExceptionCode::InvalidAccessError, "CryptoKey doesn't match AlgorithmIdentifier"_s);
-    if (!base_key->allows(CryptoKeyUsageDeriveKey))
-        return rejectedDOMException(
-            global_object, DOMExceptionCode::InvalidAccessError, "CryptoKey doesn't support CryptoKey derivation"_s);
-
-    uint8_t usages = 0;
-    if (!parseKeyUsages(global_object, scope, call_frame->argument(4), usages, error))
-        return rejectedPromise(global_object, error);
-    if (!validateRequestedUsages(usages,
-            isAesAlgorithm(derived_spec.algorithm) ? allowedUsagesForAes(derived_spec.algorithm)
-                                                   : CryptoKeyUsageSign | CryptoKeyUsageVerify,
-            error, global_object))
-        return rejectedPromise(global_object, error);
-    if (!validateRequiredUsages(usages, error, global_object))
-        return rejectedPromise(global_object, error);
-
-    SecretBytes base_material;
-    WTF::Vector<uint8_t> salt;
-    WTF::Vector<uint8_t> info;
-    std::shared_ptr<EVP_PKEY> private_pkey;
-    std::shared_ptr<EVP_PKEY> public_pkey;
-    WebCryptoHash hash_id { WebCryptoHash::SHA256 };
-    uint32_t iterations = 0;
-
-    if (expected_algorithm == CryptoKeyAlgorithm::Pbkdf2) {
-        if (!base_material.tryAppend(base_key->material()))
-            return rejectedPromise(global_object, JSC::createOutOfMemoryError(global_object));
-        salt = WTF::move(pbkdf2_params.salt);
-        hash_id = pbkdf2_params.hash->id;
-        iterations = pbkdf2_params.iterations;
-    } else if (expected_algorithm == CryptoKeyAlgorithm::Hkdf) {
-        if (!base_material.tryAppend(base_key->material()))
-            return rejectedPromise(global_object, JSC::createOutOfMemoryError(global_object));
-        salt = WTF::move(hkdf_params.salt);
-        info = WTF::move(hkdf_params.info);
-        hash_id = hkdf_params.hash->id;
-    } else {
-        auto* peer = expected_algorithm == CryptoKeyAlgorithm::Ecdh ? ecdh_params.public_key : x25519_params.public_key;
-        if (!validatePeerDeriveKey(global_object, expected_algorithm, base_key, peer, error))
-            return rejectedPromise(global_object, error);
-        private_pkey = retainSharedPkey(base_key->asymmetricKey());
-        public_pkey = retainSharedPkey(peer ? peer->asymmetricKey() : nullptr);
-        if (!private_pkey || !public_pkey)
-            return rejectedDOMException(global_object, DOMExceptionCode::OperationError);
-    }
-
-    auto context = createCryptoAsyncContext(global_object, scope);
-    if (!context.ok)
-        return context.error;
-
-    const bool extractable = call_frame->argument(3).toBoolean(global_object);
-    const auto output_algorithm = derived_spec.algorithm;
-    const auto output_hash = derived_spec.hash ? derived_spec.hash->id : WebCryptoHash::SHA256;
-    const size_t output_bits = derived_spec.length_bits;
-    auto job
-        = std::unique_ptr<CryptoJob>(new (std::nothrow) SecretKeyCryptoJob(context.value.owner, context.value.deferred,
-            [expected_algorithm, output_algorithm, output_hash, output_bits, extractable, usages, hash_id, iterations,
-                base_material = WTF::move(base_material), salt = WTF::move(salt), info = WTF::move(info), private_pkey,
-                public_pkey](SecretKeyResult& result) mutable {
-                result.algorithm = output_algorithm;
-                result.hash = output_hash;
-                result.extractable = extractable;
-                result.usages = usages;
-                if (expected_algorithm == CryptoKeyAlgorithm::Pbkdf2)
-                    return derivePbkdf2BitsNative(
-                        base_material.span(), salt.span(), iterations, hash_id, output_bits, result.material);
-                if (expected_algorithm == CryptoKeyAlgorithm::Hkdf)
-                    return deriveHkdfBitsNative(
-                        base_material.span(), salt.span(), info.span(), hash_id, output_bits, result.material);
-                if (expected_algorithm == CryptoKeyAlgorithm::Ecdh)
-                    return ecdhDeriveBitsNative(private_pkey.get(), public_pkey.get(), output_bits, result.material);
-                return x25519DeriveBitsNative(private_pkey.get(), public_pkey.get(), output_bits, result.material);
-            }));
-    return enqueueCryptoJobPromise(global_object, context.value, WTF::move(job));
+        auto bits = deriveBitsWith(global_object, scope, *algorithm, base_key, length_bits);
+        RETURN_IF_EXCEPTION(scope, {});
+        ImportRequest request { KeyFormat::Raw, *derived, extractable, *usages };
+        auto* key = importKeyFromBytes(global_object, scope, request, WTF::move(*bits));
+        RETURN_IF_EXCEPTION(scope, {});
+        return key;
+    });
 }
 
 } // namespace Collo::HostFunctions

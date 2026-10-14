@@ -110,22 +110,18 @@ pub const fd = struct {
         _ = try std.posix.fcntl(raw_fd, f_add_seals, seals);
     }
 
-    pub fn getSeals(raw_fd: std.posix.fd_t) !usize {
-        return try std.posix.fcntl(raw_fd, f_get_seals, 0);
-    }
-
     /// Fails with `error.MissingFdSeals` unless every seal in `expected` is
-    /// set; extra seals are fine.
-    pub fn requireSeals(raw_fd: std.posix.fd_t, expected: usize) !void {
-        const actual = try getSeals(raw_fd);
+    /// set; extra seals are fine. A file that cannot carry seals, which
+    /// F_GET_SEALS answers with EINVAL, has none.
+    pub fn requireSeals(raw_fd: std.posix.fd_t, expected: usize) error{ MissingFdSeals, Unexpected }!void {
+        const rc = std.os.linux.fcntl(raw_fd, f_get_seals, 0);
+        const actual: usize = switch (linux.syscallErrno(rc)) {
+            .SUCCESS => rc,
+            .INVAL => return error.MissingFdSeals,
+            else => |errno| return std.posix.unexpectedErrno(errno),
+        };
         if ((actual & expected) != expected)
             return error.MissingFdSeals;
-    }
-
-    /// Checks through the fd's /proc/self/fd link, so it needs /proc and
-    /// fails with `error.InvalidFdType` after the worker's chroot.
-    pub fn requireEventFd(raw_fd: std.posix.fd_t) !void {
-        try requireProcFdTarget(raw_fd, "anon_inode:[eventfd]");
     }
 
     pub fn procFdTarget(raw_fd: std.posix.fd_t, out: []u8) ![]const u8 {
@@ -137,11 +133,100 @@ pub const fd = struct {
         return std.posix.readlinkZ(proc_fd_path.ptr, out);
     }
 
-    fn requireProcFdTarget(raw_fd: std.posix.fd_t, expected: []const u8) !void {
-        var target_buffer: [128]u8 = undefined;
-        const target = procFdTarget(raw_fd, &target_buffer) catch return error.InvalidFdType;
-        if (!std.mem.eql(u8, target, expected))
-            return error.InvalidFdType;
+    /// The `resolve` bits of openat2(2) the runtime uses. `resolve_beneath`
+    /// keeps every component of the path beneath the directory descriptor,
+    /// `resolve_no_symlinks` refuses every symlink and `resolve_no_magiclinks`
+    /// refuses the links of `/proc/<pid>/fd` and their kind.
+    pub const resolve_no_magiclinks: u64 = 0x02;
+    pub const resolve_no_symlinks: u64 = 0x04;
+    pub const resolve_beneath: u64 = 0x08;
+
+    /// The failures of `openat2`, one per errno class. Which of them can
+    /// occur depends on the caller's flags and resolve bits, and a caller
+    /// renames the ones its readers see in its own terms.
+    pub const OpenAt2Error = error{
+        /// ENOENT.
+        FileNotFound,
+        /// ENOTDIR: a component of the path is not a directory.
+        NotDir,
+        /// EISDIR: a directory opened for writing.
+        IsDir,
+        /// ELOOP: a loop of symlinks, or a link the resolve bits refuse.
+        SymLinkLoop,
+        /// EXDEV: under `resolve_beneath`, the path leaves the directory.
+        PathEscapesDirectory,
+        NameTooLong,
+        AccessDenied,
+        PermissionDenied,
+        /// ENXIO, ENODEV or EOPNOTSUPP: a socket, or a device the open
+        /// refuses.
+        NoDevice,
+        /// EAGAIN: under `resolve_beneath`, the kernel could not prove that a
+        /// `..` stayed beneath the directory while another process renamed
+        /// one.
+        WouldBlock,
+        SystemResources,
+        ProcessFdQuotaExceeded,
+        SystemFdQuotaExceeded,
+        /// ENOSYS: the kernel has no openat2, which came in Linux 5.6.
+        SystemOutdated,
+        Unexpected,
+    };
+
+    /// `struct open_how` of openat2(2).
+    const OpenHow = extern struct {
+        flags: u64,
+        mode: u64,
+        resolve: u64,
+    };
+
+    /// openat2(2), which the standard library lacks: opens `sub_path_z`
+    /// relative to `dir_fd` with `flags`, which set `CLOEXEC` and never
+    /// `CREAT`, under the `resolve` bits above, and retries EINTR. One call
+    /// resolves and opens, so no check of the path made before it is needed,
+    /// and none could hold while another process changes the tree. The
+    /// caller owns the descriptor.
+    pub fn openat2(
+        dir_fd: std.posix.fd_t,
+        sub_path_z: [*:0]const u8,
+        flags: std.posix.O,
+        resolve: u64,
+    ) OpenAt2Error!OwnedFd {
+        std.debug.assert(flags.CLOEXEC);
+        std.debug.assert(!flags.CREAT);
+        const how: OpenHow = .{
+            .flags = @as(u32, @bitCast(flags)),
+            .mode = 0,
+            .resolve = resolve,
+        };
+        while (true) {
+            const rc = std.os.linux.syscall4(
+                .openat2,
+                @as(usize, @bitCast(@as(isize, dir_fd))),
+                @intFromPtr(sub_path_z),
+                @intFromPtr(&how),
+                @sizeOf(OpenHow),
+            );
+            switch (linux.syscallErrno(rc)) {
+                .SUCCESS => return OwnedFd.fromRaw(@intCast(rc)),
+                .INTR => continue,
+                .NOENT => return error.FileNotFound,
+                .NOTDIR => return error.NotDir,
+                .ISDIR => return error.IsDir,
+                .LOOP => return error.SymLinkLoop,
+                .XDEV => return error.PathEscapesDirectory,
+                .NAMETOOLONG => return error.NameTooLong,
+                .ACCES => return error.AccessDenied,
+                .PERM => return error.PermissionDenied,
+                .NXIO, .NODEV, .OPNOTSUPP => return error.NoDevice,
+                .AGAIN => return error.WouldBlock,
+                .NOMEM => return error.SystemResources,
+                .MFILE => return error.ProcessFdQuotaExceeded,
+                .NFILE => return error.SystemFdQuotaExceeded,
+                .NOSYS => return error.SystemOutdated,
+                else => |errno| return std.posix.unexpectedErrno(errno),
+            }
+        }
     }
 
     /// fsync for a directory handle. std.fs opens non-iterating directories

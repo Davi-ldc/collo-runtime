@@ -1,27 +1,31 @@
 //! HTTP/2 client connection: concurrent streams over one byte stream that the
-//! caller owns. Frames come in through `readNextEvent`, which reads from a
-//! blocking reader, or through `processEventFrame` when the caller has read
-//! the frame itself; such a caller calls `nextUnprocessedStreamFailure`
-//! before each read. Every frame the client sends goes to the caller's
-//! writer, and each call yields at most one `Event`.
+//! caller owns. The caller reads each frame itself (`FrameReader`), hands it
+//! to `processEventFrame`, and calls `nextUnprocessedStreamFailure` before
+//! each read. Every frame the client sends goes to the caller's writer, and
+//! each call yields at most one `Event`.
+//!
+//! The client preface comes before anything else the connection writes
+//! (RFC 9113 §3.4): `start` writes it, and `openRequest` and
+//! `processEventFrame` start the connection first, so a peer frame read
+//! before the first request is answered only after the preface.
 //!
 //! `Http2StreamNotProcessed` promises the peer never processed the stream, so
 //! a stream fails with it only when a peer GOAWAY excludes it. Closing for
 //! any other reason stops new streams and leaves the open ones to finish.
 //!
-//! Response bodies reach the consumer as `.body_chunk` events whose flow
-//! credit comes back through `ackReceivedData`. The receive windows reopen
-//! only then, so a slow consumer slows the peer, and the body bytes it holds
-//! stay under the per-stream and per-connection credit caps. A finished
-//! stream reports `.end` only after its last credit is acked, because an ack
-//! for a stream the connection no longer knows is a connection error.
+//! A final response head is decoded once, with the connection's allocator,
+//! and the `.head` event hands that block to the caller. Response bodies
+//! reach the consumer as `.body_chunk` events whose flow credit comes back
+//! through `ackReceivedData`. The receive windows reopen only then, so a slow
+//! consumer slows the peer, and the body bytes it holds stay under the
+//! per-stream and per-connection credit caps. A finished stream reports
+//! `.end` only after its last credit is acked, because an ack for a stream
+//! the connection no longer knows is a connection error.
 //!
 //! Malformed response content fails only its own stream; framing,
-//! flow-control and HPACK violations fail the connection. Each stream counts
-//! its plaintext frame bytes in `wire_bytes` and its HTTP payload in `billed`.
+//! flow-control and HPACK violations fail the connection.
 
 const std = @import("std");
-const accounting = @import("collo_egress_accounting");
 const h2 = @import("collo_http").http2;
 const hpack = @import("collo_hpack");
 const collo_limits = @import("collo_limits");
@@ -38,40 +42,28 @@ const session_mod = @import("session.zig");
 // already ended leaves no entry (`resetStreamAt`). This bounds that memory,
 // and `rememberLocalResetStream` states what happens at the bound.
 pub const max_local_reset_tombstones: usize = 1024;
-// Bounds the frames one read may consume without producing an event, so a
-// peer flooding PING, SETTINGS or unknown frames fails the connection
-// instead of holding the reader.
+// The most frames a caller that reads frames itself lets one read consume
+// without an event before it fails the connection
+// (`pool.zig:Pool.readEntryEvent`), so a peer flooding PING, SETTINGS or
+// unknown frames cannot hold the reader. The codec handles one frame per
+// call and counts nothing.
 pub const max_frames_without_event_per_read: usize = 256;
 // Empty CONTINUATION frames never grow the header block, so the byte cap
 // alone cannot stop a CONTINUATION flood.
 const max_header_block_frames: usize = 64;
 const default_max_active_streams: usize = 64;
 
-pub const HeadResult = struct {
-    allocator: std.mem.Allocator,
-    status_code: u16,
-    headers: []hpack.Header,
-    end_stream: bool,
-    wire_bytes: accounting.Bytes = .{},
-
-    pub fn deinit(self: *HeadResult) void {
-        for (self.headers) |header| {
-            self.allocator.free(header.name);
-            self.allocator.free(header.value);
-        }
-        self.allocator.free(self.headers);
-        self.* = undefined;
-    }
-};
-
 pub const Event = union(enum) {
+    /// The stream's final response head. `block` is the one decode of the
+    /// header block, allocated with `allocator` and owned by the event, so
+    /// `deinit` frees it; `headers` is its regular fields, without `:status`.
     head: struct {
+        allocator: std.mem.Allocator,
         stream_id: u32,
-        result: HeadResult,
-        /// HPACK length of the final response header block, which drivers
-        /// add to their billed-received meter. Interim (1xx) blocks are never
-        /// billed and never reported here.
-        billed_head_bytes: u64 = 0,
+        status_code: u16,
+        block: hpack.DecodedBlock,
+        headers: []const hpack.Header,
+        end_stream: bool,
     },
     /// An interim (1xx) header block arrived for the stream. The final head
     /// is still pending, but the origin is alive, so drivers restart their
@@ -79,7 +71,6 @@ pub const Event = union(enum) {
     /// would otherwise look like a silent origin.
     progress: struct {
         stream_id: u32,
-        wire_bytes: accounting.Bytes = .{},
     },
     /// The consumer returns `flow_credit` through `ackReceivedData` once it
     /// has taken `bytes`; the receive windows reopen only then.
@@ -92,30 +83,18 @@ pub const Event = union(enum) {
         end_stream: bool,
         flow_credit: usize,
         update_stream_window: bool,
-        wire_bytes: accounting.Bytes = .{},
     },
     end: struct {
         stream_id: u32,
-        wire_bytes: accounting.Bytes = .{},
-        /// The stream's cumulative billed bytes: the request header block
-        /// and upload DATA payload sent, the final head, trailers and DATA
-        /// payload received. Framing, padding, interim 1xx blocks and control
-        /// frames are excluded. The pool overwrites `wire_bytes` with the
-        /// connection's ciphertext delta and leaves this field alone.
-        billed_bytes: accounting.Bytes = .{},
     },
     failure: struct {
         stream_id: u32,
         err: anyerror,
-        wire_bytes: accounting.Bytes = .{},
-        /// The stream's billed bytes up to the failure, counted as in
-        /// `.end.billed_bytes`.
-        billed_bytes: accounting.Bytes = .{},
     },
 
     pub fn deinit(self: *Event) void {
         switch (self.*) {
-            .head => |*head| head.result.deinit(),
+            .head => |*head| head.block.deinit(head.allocator),
             .progress => {},
             .body_chunk => |*body| body.allocator.free(body.bytes),
             .end => {},
@@ -257,19 +236,20 @@ pub const Connection = struct {
     pending_header_stream_id: ?u32 = null,
     pending_headers_end_stream: bool = false,
     pending_header_frame_count: usize = 0,
-    /// Plaintext bytes of frames that belong to no active stream. While
-    /// streams are active those bytes go to the oldest one; otherwise they
-    /// wait here for the next stream to open.
-    pending_control_bytes: accounting.Bytes = .{},
     pending_body_credit_total: usize = 0,
 
-    pub fn init(allocator: std.mem.Allocator) !Connection {
-        return try initWithLimits(allocator, .{});
+    /// `scratch` is borrowed for the connection's life (`HpackScratch`).
+    pub fn init(allocator: std.mem.Allocator, scratch: *const session_mod.HpackScratch) !Connection {
+        return try initWithLimits(allocator, .{}, scratch);
     }
 
-    pub fn initWithLimits(allocator: std.mem.Allocator, limits: Limits) !Connection {
+    pub fn initWithLimits(
+        allocator: std.mem.Allocator,
+        limits: Limits,
+        scratch: *const session_mod.HpackScratch,
+    ) !Connection {
         const normalized_limits = try limits.normalized();
-        var session = try session_mod.Session.init(allocator);
+        var session = try session_mod.Session.init(allocator, scratch);
         errdefer session.deinit();
         session.local_settings.initial_window_size = normalized_limits.stream_receive_window;
         return .{
@@ -284,8 +264,6 @@ pub const Connection = struct {
     }
 
     pub fn deinit(self: *Connection) void {
-        for (self.active_streams.items) |*stream|
-            stream.deinit();
         self.active_streams.deinit(self.allocator);
         self.local_reset_streams.deinit(self.allocator);
         self.pending_header_block.deinit(self.allocator);
@@ -293,82 +271,75 @@ pub const Connection = struct {
         self.* = undefined;
     }
 
+    /// Writes the client preface, the local SETTINGS and the WINDOW_UPDATE
+    /// that raises the connection window to its target, once; later calls
+    /// write nothing.
     pub fn start(self: *Connection, writer: *std.Io.Writer) !void {
         if (self.started)
             return;
         const preface = try self.session.encodeConnectionPrefaceAndSettings(self.allocator);
         defer self.allocator.free(preface);
         try writer.writeAll(preface);
-        self.pending_control_bytes.addSent(preface.len);
-        if (self.recv_connection_window.initialIncrement()) |increment| {
-            var update: [h2.frame_header_len + 4]u8 = undefined;
-            try h2.encodeWindowUpdateFrame(&update, 0, increment);
-            try writer.writeAll(&update);
-            self.pending_control_bytes.addSent(update.len);
-        }
+        if (self.recv_connection_window.initialIncrement()) |increment|
+            try writeWindowUpdate(writer, 0, increment);
         self.started = true;
     }
 
-    /// The stream id and the billed request bytes already written at open:
-    /// the HPACK header block plus whatever upload DATA payload the initial
-    /// windows allowed, which is the whole body when it is small. Upload
-    /// bytes written later, as windows open, appear only in the cumulative
-    /// `billed_bytes` of the terminal `.end` or `.failure` event.
-    pub const OpenedRequest = struct {
-        stream_id: u32,
-        billed_sent: u64,
-    };
-
+    /// Opens a stream for `head` and returns its id, starting the connection
+    /// first when nothing has. The request body is borrowed until the stream
+    /// ends; as much of it as the windows allow goes out now, the rest as
+    /// WINDOW_UPDATEs arrive. A head `request.zig:validateRequestHead`
+    /// refuses fails before the encoder sees it, and the connection goes on
+    /// serving.
     pub fn openRequest(
         self: *Connection,
         writer: *std.Io.Writer,
         head: request_mod.RequestHead,
         max_response_body_bytes: usize,
     ) !u32 {
-        return try self.openRequestAlloc(writer, head, max_response_body_bytes, self.allocator);
-    }
-
-    pub fn openRequestAlloc(
-        self: *Connection,
-        writer: *std.Io.Writer,
-        head: request_mod.RequestHead,
-        max_response_body_bytes: usize,
-        result_allocator: std.mem.Allocator,
-    ) !u32 {
-        return (try self.openRequestAllocMetered(writer, head, max_response_body_bytes, result_allocator)).stream_id;
-    }
-
-    pub fn openRequestAllocMetered(
-        self: *Connection,
-        writer: *std.Io.Writer,
-        head: request_mod.RequestHead,
-        max_response_body_bytes: usize,
-        result_allocator: std.mem.Allocator,
-    ) !OpenedRequest {
         try self.start(writer);
-        return try self.openRequestWithMode(writer, head, max_response_body_bytes, result_allocator, true);
-    }
+        if (self.closing)
+            return error.Http2ConnectionClosed;
+        if (!self.canOpenStream())
+            return error.Http2MaxConcurrentStreamsExceeded;
 
-    pub fn readNextEvent(
-        self: *Connection,
-        reader: *std.Io.Reader,
-        writer: *std.Io.Writer,
-    ) !Event {
-        var frames_without_event: usize = 0;
-        while (self.active_streams.items.len != 0) {
-            if (self.firstReportedCompleteStream()) |index|
-                return try self.completeStreamAt(index);
-            if (self.nextUnprocessedStreamFailure()) |failure|
-                return failure;
-            var frame = try readFrame(self.allocator, reader, self.session.local_settings.max_frame_size);
-            defer frame.deinit();
-            if (try self.processEventFrame(writer, &frame)) |event|
-                return event;
-            frames_without_event += 1;
-            if (frames_without_event > max_frames_without_event_per_read)
-                return error.Http2FrameProgressLimitExceeded;
-        }
-        return error.Http2NoActiveStreams;
+        var state = response.ResponseState.init(max_response_body_bytes);
+        if (std.mem.eql(u8, head.method, "HEAD"))
+            state.body_forbidden = true;
+
+        const stream_id = try self.session.openStream();
+        var encoded = self.session.encodeRequest(stream_id, .{
+            .method = head.method,
+            .scheme = head.scheme,
+            .authority = head.authority,
+            .path = head.path,
+            .headers = head.headers,
+            .body = &.{},
+            .end_stream_after_headers = head.body.len == 0,
+            .declared_content_length = if (head.body.len != 0) head.body.len else null,
+        }) catch |err| {
+            // A poisoned encoder fails every later request, so the connection
+            // takes no new streams while the open ones finish.
+            if (isHpackEncoderFatal(err))
+                self.closeWithoutPeerGoaway();
+            return err;
+        };
+        defer encoded.deinit();
+        try writer.writeAll(encoded.wire);
+        var stream = ActiveStream{
+            .id = stream_id,
+            .response = state,
+            .upload = UploadState.init(self, head.body),
+            .recv_window = ReceiveWindow.initStream(
+                self.limits.stream_receive_window,
+                self.limits.receive_window_update_threshold,
+            ),
+            .pending_credit_cap = self.limits.max_pending_body_credit_per_stream,
+        };
+        try stream.upload.writeAvailable(writer, stream_id);
+        try writer.flush();
+        try self.active_streams.append(self.allocator, stream);
+        return stream_id;
     }
 
     pub fn processEventFrame(
@@ -376,11 +347,11 @@ pub const Connection = struct {
         writer: *std.Io.Writer,
         frame: *Frame,
     ) !?Event {
+        try self.start(writer);
         if (!self.session.received_peer_settings and frame.header.frame_type != .settings)
             return error.Http2MissingInitialSettings;
         if (self.pending_header_stream_id != null and frame.header.frame_type != .continuation)
             return error.Http2ProtocolError;
-        self.recordReceivedFrame(frame);
         if (self.active_streams.items.len == 0)
             return try self.processIdleFrame(writer, frame);
 
@@ -395,7 +366,6 @@ pub const Connection = struct {
                 if (try self.session.handleSettingsFrame(frame.header, frame.payload, self.allocator)) |ack| {
                     defer self.allocator.free(ack);
                     try writer.writeAll(ack);
-                    self.recordControlSent(ack.len);
                     try self.applyInitialWindowChange(previous_initial_window, self.session.peer_settings.initial_window_size);
                     try self.writeAvailableUploads(writer);
                     try writer.flush();
@@ -403,112 +373,8 @@ pub const Connection = struct {
             },
             .headers => return try self.receiveHeadersFrame(writer, frame),
             .continuation => return try self.receiveContinuationFrame(writer, frame),
-            .data => {
-                try frame.header.validateStream();
-                const data_payload = try dataPayload(frame);
-                const index = self.findStreamIndex(frame.header.stream_id) orelse {
-                    if (self.hasLocalResetStream(frame.header.stream_id)) {
-                        try self.discardResetData(writer, frame.header.stream_id, frame.payload, frame.header.flags.end_stream);
-                        return null;
-                    }
-                    return error.Http2ProtocolError;
-                };
-                try self.receiveDataFlowControl(index, frame.payload.len);
-                const emit_body = self.active_streams.items[index].head_reported;
-                if (emit_body) {
-                    self.active_streams.items[index].accumulator.receiveDataNoStore(data_payload, frame.header.flags.end_stream) catch |err| {
-                        if (isStreamResponseFailure(err)) {
-                            if (frame.payload.len != 0) {
-                                const update_bytes = try self.writeConnectionReceiveWindowUpdate(writer, frame.payload.len);
-                                self.active_streams.items[index].wire_bytes.addSent(update_bytes);
-                                if (update_bytes != 0)
-                                    try writer.flush();
-                            }
-                            return try self.cancelFailedStreamAt(writer, index, err, frame.header.flags.end_stream);
-                        }
-                        return err;
-                    };
-                    const flow_credit = frame.payload.len;
-                    const update_stream = !frame.header.flags.end_stream;
-                    // A padded frame copies its stripped payload before any
-                    // credit is registered, so a failed copy leaves none.
-                    const padded_copy: ?[]u8 = if (frame.header.flags.padded)
-                        try frame.allocator.dupe(u8, data_payload)
-                    else
-                        null;
-                    self.addPendingBodyCredit(index, flow_credit) catch |err| {
-                        if (padded_copy) |copy|
-                            frame.allocator.free(copy);
-                        if (flow_credit != 0) {
-                            const update_bytes = try self.writeConnectionReceiveWindowUpdate(writer, flow_credit);
-                            self.active_streams.items[index].wire_bytes.addSent(update_bytes);
-                            if (update_bytes != 0)
-                                try writer.flush();
-                        }
-                        return try self.cancelFailedStreamAt(writer, index, err, frame.header.flags.end_stream);
-                    };
-                    // Only the payload is billed; padding and the frame
-                    // header are transport cost.
-                    self.active_streams.items[index].billed.addReceived(data_payload.len);
-                    // Unpadded DATA hands the frame's payload buffer to the
-                    // event without a copy, leaving the frame nothing to free.
-                    const bytes = padded_copy orelse blk: {
-                        const owned = frame.payload;
-                        frame.payload = &.{};
-                        break :blk owned;
-                    };
-                    return .{ .body_chunk = .{
-                        .allocator = frame.allocator,
-                        .stream_id = frame.header.stream_id,
-                        .bytes = bytes,
-                        .end_stream = frame.header.flags.end_stream,
-                        .flow_credit = flow_credit,
-                        .update_stream_window = update_stream,
-                    } };
-                }
-                self.active_streams.items[index].accumulator.receiveData(data_payload, frame.header.flags.end_stream) catch |err| {
-                    if (isStreamResponseFailure(err)) {
-                        if (frame.payload.len != 0) {
-                            const update_bytes = try self.writeConnectionReceiveWindowUpdate(writer, frame.payload.len);
-                            self.active_streams.items[index].wire_bytes.addSent(update_bytes);
-                            if (update_bytes != 0)
-                                try writer.flush();
-                        }
-                        return try self.cancelFailedStreamAt(writer, index, err, frame.header.flags.end_stream);
-                    }
-                    return err;
-                };
-                self.active_streams.items[index].billed.addReceived(data_payload.len);
-                if (frame.payload.len != 0) {
-                    const update_stream = !frame.header.flags.end_stream;
-                    const update_bytes = try self.writeReceiveWindowUpdates(writer, index, frame.payload.len, update_stream);
-                    self.active_streams.items[index].wire_bytes.addSent(update_bytes);
-                    if (update_bytes != 0)
-                        try writer.flush();
-                }
-                if (self.active_streams.items[index].accumulator.complete)
-                    return try self.completeStreamAt(index);
-            },
-            .ping => {
-                try frame.header.validateControlStream();
-                if (frame.payload.len != 8)
-                    return error.Http2FrameSizeError;
-                if (!frame.header.flags.end_stream) {
-                    var ack: [h2.frame_header_len + 8]u8 = undefined;
-                    var ack_header = h2.FrameHeader{
-                        .length = 8,
-                        .frame_type_raw = @intFromEnum(h2.FrameType.ping),
-                        .frame_type = .ping,
-                        .flags = h2.Flags.fromByte(0x1),
-                        .stream_id = 0,
-                    };
-                    try ack_header.encode(ack[0..h2.frame_header_len]);
-                    @memcpy(ack[h2.frame_header_len..], frame.payload);
-                    try writer.writeAll(&ack);
-                    self.recordControlSent(ack.len);
-                    try writer.flush();
-                }
-            },
+            .data => return try self.receiveDataFrame(writer, frame),
+            .ping => try answerPing(writer, frame),
             .window_update => {
                 const increment = try h2.parseWindowUpdateIncrement(frame.payload);
                 if (frame.header.stream_id == 0) {
@@ -528,9 +394,9 @@ pub const Connection = struct {
                     // response. It must not fail a stream that has received
                     // everything and only waits for its body-credit acks to
                     // report `.end`.
-                    if (self.active_streams.items[index].accumulator.complete)
+                    if (self.active_streams.items[index].response.complete)
                         return null;
-                    try self.restorePendingConnectionCreditBeforeReset(writer, index);
+                    try self.restorePendingConnectionCredit(writer, index);
                     try writer.flush();
                     // REFUSED_STREAM guarantees the server did not process
                     // the request (RFC 9113 §8.7), so the engine may retry it
@@ -547,7 +413,7 @@ pub const Connection = struct {
             .goaway => {
                 try self.session.handleGoawayFrame(frame.header, frame.payload);
                 self.closing = true;
-                return self.nextUnprocessedStreamFailure();
+                return try self.nextUnprocessedStreamFailure(writer);
             },
             .push_promise => return error.Http2ServerPushDisabled,
             .priority => {
@@ -573,31 +439,11 @@ pub const Connection = struct {
                 if (try self.session.handleSettingsFrame(frame.header, frame.payload, self.allocator)) |ack| {
                     defer self.allocator.free(ack);
                     try writer.writeAll(ack);
-                    self.recordControlSent(ack.len);
                     try self.applyInitialWindowChange(previous_initial_window, self.session.peer_settings.initial_window_size);
                     try writer.flush();
                 }
             },
-            .ping => {
-                try frame.header.validateControlStream();
-                if (frame.payload.len != 8)
-                    return error.Http2FrameSizeError;
-                if (!frame.header.flags.end_stream) {
-                    var ack: [h2.frame_header_len + 8]u8 = undefined;
-                    var ack_header = h2.FrameHeader{
-                        .length = 8,
-                        .frame_type_raw = @intFromEnum(h2.FrameType.ping),
-                        .frame_type = .ping,
-                        .flags = h2.Flags.fromByte(0x1),
-                        .stream_id = 0,
-                    };
-                    try ack_header.encode(ack[0..h2.frame_header_len]);
-                    @memcpy(ack[h2.frame_header_len..], frame.payload);
-                    try writer.writeAll(&ack);
-                    self.recordControlSent(ack.len);
-                    try writer.flush();
-                }
-            },
+            .ping => try answerPing(writer, frame),
             .window_update => {
                 if (frame.header.stream_id != 0) {
                     // WINDOW_UPDATE may still arrive for a stream that has
@@ -652,8 +498,7 @@ pub const Connection = struct {
         try self.resetStreamAt(writer, index, false);
         // A header block this stream began stays pending, and
         // `endPendingHeaderBlock` decodes and drops it at END_HEADERS.
-        var stream = self.active_streams.orderedRemove(index);
-        stream.deinit();
+        _ = self.active_streams.orderedRemove(index);
     }
 
     /// Stops opening streams on a connection the peer has not ended with
@@ -673,16 +518,36 @@ pub const Connection = struct {
     /// The GOAWAY frame itself reports only one such stream. A caller that
     /// reads frames and passes them to `processEventFrame` calls this before
     /// each read, so the rest surface without waiting for a later frame,
-    /// which may never come.
-    pub fn nextUnprocessedStreamFailure(self: *Connection) ?Event {
+    /// which may never come. `writer` takes the WINDOW_UPDATE that returns
+    /// the body credit a failed stream's consumer still held.
+    pub fn nextUnprocessedStreamFailure(self: *Connection, writer: *std.Io.Writer) !?Event {
         const last_stream_id = self.session.goaway_last_stream_id orelse return null;
         for (self.active_streams.items, 0..) |stream, index| {
-            if (stream.id > last_stream_id)
+            if (stream.id > last_stream_id) {
+                // A peer may send DATA on a stream and then a GOAWAY that
+                // excludes it. The stream leaves the table here, and acks
+                // for it fail as acks for an unknown stream, so its credit
+                // comes back now or never.
+                try self.restorePendingConnectionCredit(writer, index);
                 return self.failStreamAt(index, error.Http2StreamNotProcessed);
+            }
         }
         return null;
     }
 
+    /// Returns `flow_credit` bytes of the stream's body credit, taken from
+    /// its `.body_chunk` events, and reopens the receive windows by that
+    /// much: the connection window always, the stream window when
+    /// `update_stream` is set. One ack may carry the summed credit of several
+    /// chunks: a consumer may sum a stream's chunks that have
+    /// `update_stream_window` set into one ack, and acks the last chunk,
+    /// which has it clear, on its own. Returns the stream's `.end` once its
+    /// last credit is back.
+    ///
+    /// Fails with `error.Http2AckExceedsPendingCredit` when `flow_credit` is
+    /// more than the stream holds, before any window moves, so the peer is
+    /// never granted room for bytes no consumer released and the connection
+    /// stays as it was.
     pub fn ackReceivedData(
         self: *Connection,
         writer: *std.Io.Writer,
@@ -691,10 +556,8 @@ pub const Connection = struct {
         update_stream: bool,
     ) !?Event {
         const index = self.findStreamIndex(stream_id) orelse return error.Http2UnknownStream;
-        const sent = try self.writeReceiveWindowUpdates(writer, index, flow_credit, update_stream);
-        self.active_streams.items[index].wire_bytes.addSent(sent);
-        if (flow_credit != 0)
-            try self.releasePendingBodyCredit(index, flow_credit);
+        try self.releasePendingBodyCredit(index, flow_credit);
+        try self.writeReceiveWindowUpdates(writer, index, flow_credit, update_stream);
         if (update_stream)
             try self.maybeGrowStreamReceiveWindow(writer, index);
         // The acked stream goes first when it is ready, so each stream's
@@ -702,7 +565,7 @@ pub const Connection = struct {
         // stream's end here would leave the acked one with no ack left to
         // complete it.
         const acked = &self.active_streams.items[index];
-        if (acked.head_reported and acked.accumulator.complete and acked.pending_body_credit == 0)
+        if (acked.head_reported and acked.response.complete and acked.pending_body_credit == 0)
             return try self.completeStreamAt(index);
         if (self.firstReportedCompleteStream()) |complete_index|
             return try self.completeStreamAt(complete_index);
@@ -718,7 +581,7 @@ pub const Connection = struct {
     /// the body-credit ack do not count: they finish from received data.
     pub fn hasIncompleteRemoteStreams(self: *const Connection) bool {
         for (self.active_streams.items) |*stream| {
-            if (!stream.accumulator.complete)
+            if (!stream.response.complete)
                 return true;
         }
         return false;
@@ -734,85 +597,14 @@ pub const Connection = struct {
         return true;
     }
 
-    fn openRequestWithMode(
-        self: *Connection,
-        writer: *std.Io.Writer,
-        head: request_mod.RequestHead,
-        max_response_body_bytes: usize,
-        result_allocator: std.mem.Allocator,
-        reusable: bool,
-    ) !OpenedRequest {
-        if (self.closing)
-            return error.Http2ConnectionClosed;
-        if (!self.canOpenStream())
-            return error.Http2MaxConcurrentStreamsExceeded;
-
-        var accumulator = response.ResponseAccumulator.init(result_allocator, max_response_body_bytes);
-        errdefer accumulator.deinit();
-        if (std.mem.eql(u8, head.method, "HEAD"))
-            accumulator.body_forbidden = true;
-
-        const stream_id = try self.session.openStream();
-        var encoded = self.session.encodeRequest(stream_id, .{
-            .method = head.method,
-            .scheme = head.scheme,
-            .authority = head.authority,
-            .path = head.path,
-            .headers = head.headers,
-            .body = &.{},
-            .end_stream_after_headers = head.body.len == 0,
-            .declared_content_length = if (head.body.len != 0) head.body.len else null,
-        }) catch |err| {
-            // A poisoned encoder fails every later request, so the connection
-            // takes no new streams while the open ones finish.
-            if (isHpackEncoderFatal(err))
-                self.closeWithoutPeerGoaway();
-            return err;
-        };
-        defer encoded.deinit();
-        try writer.writeAll(encoded.wire);
-        var stream = ActiveStream{
-            .id = stream_id,
-            .accumulator = accumulator,
-            .upload = UploadState.init(self, head.body),
-            .recv_window = ReceiveWindow.initStream(
-                self.limits.stream_receive_window,
-                self.limits.receive_window_update_threshold,
-            ),
-            .reusable = reusable,
-            .pending_credit_cap = self.limits.max_pending_body_credit_per_stream,
-        };
-        stream.wire_bytes.add(self.pending_control_bytes);
-        self.pending_control_bytes = .{};
-        stream.wire_bytes.addSent(encoded.wire.len);
-        // The request side bills the HPACK block as sent; the preface,
-        // SETTINGS and frame headers are transport cost.
-        stream.billed.addSent(encoded.header_block_len);
-        var stream_owned = true;
-        errdefer if (stream_owned)
-            stream.deinit();
-        const upload = try stream.upload.writeAvailable(writer, stream_id);
-        stream.wire_bytes.addSent(upload.wire);
-        stream.billed.addSent(upload.payload);
-        const billed_sent = stream.billed.sent;
-        try writer.flush();
-        try self.active_streams.append(self.allocator, stream);
-        stream_owned = false;
-        return .{ .stream_id = stream_id, .billed_sent = billed_sent };
-    }
-
     fn applyInitialWindowChange(self: *Connection, previous: u32, next: u32) !void {
         for (self.active_streams.items) |*stream|
             try stream.upload.applyInitialWindowChange(previous, next);
     }
 
     fn writeAvailableUploads(self: *Connection, writer: *std.Io.Writer) !void {
-        for (self.active_streams.items) |*stream| {
-            const written = try stream.upload.writeAvailable(writer, stream.id);
-            stream.wire_bytes.addSent(written.wire);
-            // Upload DATA payload is billed; its 9-byte frame headers are not.
-            stream.billed.addSent(written.payload);
-        }
+        for (self.active_streams.items) |*stream|
+            try stream.upload.writeAvailable(writer, stream.id);
     }
 
     fn addSendConnectionWindow(self: *Connection, increment: u32) !void {
@@ -861,6 +653,69 @@ pub const Connection = struct {
         return try self.endPendingHeaderBlock(writer);
     }
 
+    /// Hands an active stream's DATA payload to its consumer as a
+    /// `.body_chunk` that holds the payload's flow credit. DATA before the
+    /// stream's final head, past its size cap or past its content-length
+    /// fails the stream alone; its bytes still count against the connection
+    /// window, which is reopened at once. DATA for a stream the client reset
+    /// is counted and dropped.
+    fn receiveDataFrame(self: *Connection, writer: *std.Io.Writer, frame: *Frame) !?Event {
+        try frame.header.validateStream();
+        const data_payload = try dataPayload(frame);
+        const end_stream = frame.header.flags.end_stream;
+        const index = self.findStreamIndex(frame.header.stream_id) orelse {
+            if (self.hasLocalResetStream(frame.header.stream_id)) {
+                try self.discardResetData(writer, frame.header.stream_id, frame.payload, end_stream);
+                return null;
+            }
+            return error.Http2ProtocolError;
+        };
+        try self.receiveDataFlowControl(index, frame.payload.len);
+        self.active_streams.items[index].response.receiveData(data_payload.len, end_stream) catch |err| {
+            if (!isStreamResponseFailure(err))
+                return err;
+            try self.reopenConnectionWindow(writer, frame.payload.len);
+            return try self.cancelFailedStreamAt(writer, index, err, end_stream);
+        };
+        const flow_credit = frame.payload.len;
+        // A padded frame copies its stripped payload before any credit is
+        // registered, so a failed copy leaves none.
+        const padded_copy: ?[]u8 = if (frame.header.flags.padded)
+            try frame.allocator.dupe(u8, data_payload)
+        else
+            null;
+        self.addPendingBodyCredit(index, flow_credit) catch |err| {
+            if (padded_copy) |copy|
+                frame.allocator.free(copy);
+            try self.reopenConnectionWindow(writer, flow_credit);
+            return try self.cancelFailedStreamAt(writer, index, err, end_stream);
+        };
+        // Unpadded DATA hands the frame's payload buffer to the event without
+        // a copy, leaving the frame nothing to free.
+        const bytes = padded_copy orelse blk: {
+            const owned = frame.payload;
+            frame.payload = &.{};
+            break :blk owned;
+        };
+        return .{ .body_chunk = .{
+            .allocator = frame.allocator,
+            .stream_id = frame.header.stream_id,
+            .bytes = bytes,
+            .end_stream = end_stream,
+            .flow_credit = flow_credit,
+            .update_stream_window = !end_stream,
+        } };
+    }
+
+    /// Returns `payload_len` bytes of connection window to the peer for DATA
+    /// no consumer will hold.
+    fn reopenConnectionWindow(self: *Connection, writer: *std.Io.Writer, payload_len: usize) !void {
+        if (payload_len == 0)
+            return;
+        if (try self.writeConnectionReceiveWindowUpdate(writer, payload_len))
+            try writer.flush();
+    }
+
     /// Ends the pending block at END_HEADERS. A stream still active receives
     /// it. A stream that has left the active set, such as one reset before
     /// the block began or canceled while the block waited for CONTINUATION,
@@ -876,57 +731,97 @@ pub const Connection = struct {
         return null;
     }
 
-    fn finishPendingHeaderBlock(self: *Connection, index: usize) !void {
+    /// What one finished header block was for its stream.
+    const HeaderBlock = union(enum) {
+        /// An interim (1xx) head, decoded and dropped.
+        interim,
+        /// The final head; the caller owns `block`, which `head` slices.
+        final: struct {
+            block: hpack.DecodedBlock,
+            head: response.ResponseHead,
+        },
+        /// The trailer block, validated and dropped; it ended the stream.
+        trailers,
+    };
+
+    /// Decodes the pending block for the stream at `index` with the
+    /// connection's allocator and the shard's scratch, and clears it. Only a
+    /// final head's decode outlives the call.
+    fn finishPendingHeaderBlock(self: *Connection, index: usize) !HeaderBlock {
         defer self.clearPendingHeaderBlock();
-        try finishHeaderBlock(
+        const block = self.pending_header_block.items;
+        const end_stream = self.pending_headers_end_stream;
+        if (block.len > collo_limits.headers.EGRESS_RESPONSE_HEADER_BYTES_MAX)
+            return error.Http2HeaderBlockTooLarge;
+        var decoded = try self.session.decoder.decodeBlock(
             self.allocator,
-            &self.session,
-            &self.active_streams.items[index].accumulator,
-            self.pending_header_block.items,
-            self.pending_headers_end_stream,
+            self.session.scratch.decode,
+            block,
+            response.max_response_header_count,
+            collo_limits.headers.EGRESS_RESPONSE_HEADER_BYTES_MAX,
         );
+        var decoded_owned = true;
+        defer if (decoded_owned)
+            decoded.deinit(self.allocator);
+        const state = &self.active_streams.items[index].response;
+        if (state.status_code != null) {
+            if (!end_stream)
+                return error.Http2ProtocolError;
+            try response.validateTrailers(decoded.headers);
+            try state.finish();
+            return .trailers;
+        }
+        const head = try response.parseResponseHead(decoded.headers, end_stream);
+        switch (try state.receiveHead(head)) {
+            .interim => return .interim,
+            .final => {
+                decoded_owned = false;
+                return .{ .final = .{ .block = decoded, .head = head } };
+            },
+        }
     }
 
     fn finishHeadersOrFailStream(self: *Connection, writer: *std.Io.Writer, index: usize) !?Event {
         const remote_complete = self.pending_headers_end_stream;
-        // Read before finishing clears the pending block. The billed unit is
-        // the HPACK block across HEADERS and CONTINUATION, with padding and
-        // the priority section already stripped.
-        const block_len = self.pending_header_block.items.len;
-        self.finishPendingHeaderBlock(index) catch |err| {
+        const outcome = self.finishPendingHeaderBlock(index) catch |err| {
             if (isStreamResponseFailure(err))
                 return try self.cancelFailedStreamAt(writer, index, err, remote_complete);
             return err;
         };
-        if (self.active_streams.items[index].accumulator.status_code == null) {
-            // No status after a successful finish means an interim (1xx)
-            // block, which the accumulator drops; 101 and a 1xx with
-            // END_STREAM have already failed. It surfaces as progress so the
-            // driver sees the origin is alive, and it is not billed.
-            return .{ .progress = .{ .stream_id = self.active_streams.items[index].id } };
+        const stream = &self.active_streams.items[index];
+        switch (outcome) {
+            // An interim block surfaces as progress so the driver sees the
+            // origin is alive; 101 and a 1xx with END_STREAM have already
+            // failed.
+            .interim => return .{ .progress = .{ .stream_id = stream.id } },
+            .final => |final| {
+                stream.head_reported = true;
+                return .{ .head = .{
+                    .allocator = self.allocator,
+                    .stream_id = stream.id,
+                    .status_code = final.head.status_code,
+                    .block = final.block,
+                    .headers = final.head.regular_headers,
+                    .end_stream = remote_complete,
+                } };
+            },
+            .trailers => {
+                // Trailers can end a stream whose consumer still holds
+                // unacked flow credit. Removing the stream now would orphan
+                // those acks, which fail the connection as acks for an
+                // unknown stream, and would leak the connection's
+                // pending-credit budget. The `.end` waits for the last credit
+                // ack, as it does for a stream ending in DATA with
+                // END_STREAM.
+                if (stream.pending_body_credit == 0)
+                    return try self.completeStreamAt(index);
+                return null;
+            },
         }
-        if (!self.active_streams.items[index].head_reported) {
-            self.active_streams.items[index].billed.addReceived(block_len);
-            return try self.reportHeadAt(index, remote_complete, block_len);
-        }
-        // A block after the reported head is the trailer block, already
-        // validated inside finishPendingHeaderBlock.
-        self.active_streams.items[index].billed.addReceived(block_len);
-        if (self.active_streams.items[index].accumulator.complete) {
-            // Trailers can end a stream whose consumer still holds unacked
-            // flow credit. Removing the stream now would orphan those acks,
-            // which fail the connection as acks for an unknown stream, and
-            // would leak the connection's pending-credit budget. The `.end`
-            // waits for the last credit ack, as it does for a stream ending
-            // in DATA with END_STREAM.
-            if (self.active_streams.items[index].pending_body_credit == 0)
-                return try self.completeStreamAt(index);
-        }
-        return null;
     }
 
     /// `frame_ended_remote` is the END_STREAM flag of the frame that failed
-    /// the stream, which the accumulator may not have recorded.
+    /// the stream, which its response state may not have recorded.
     fn cancelFailedStreamAt(self: *Connection, writer: *std.Io.Writer, index: usize, err: anyerror, frame_ended_remote: bool) !Event {
         try self.resetStreamAt(writer, index, frame_ended_remote);
         return self.failStreamAt(index, err);
@@ -938,7 +833,7 @@ pub const Connection = struct {
     /// stream stays in the table after the peer's END_STREAM until its last
     /// credit is acked, so being in the table does not mean being open. The
     /// remote side has ended once END_STREAM arrived: on `frame_ended_remote`,
-    /// in the accumulator, or on the header block still pending for the
+    /// in the response state, or on the header block still pending for the
     /// stream. The local side has ended once the upload's last DATA, or the
     /// HEADERS of a request without a body, carried END_STREAM. RST_STREAM
     /// goes out while either side is open; reset tracking is kept only while
@@ -948,10 +843,10 @@ pub const Connection = struct {
     fn resetStreamAt(self: *Connection, writer: *std.Io.Writer, index: usize, frame_ended_remote: bool) !void {
         const stream = &self.active_streams.items[index];
         const stream_id = stream.id;
-        const remote_ended = frame_ended_remote or stream.accumulator.complete or
+        const remote_ended = frame_ended_remote or stream.response.complete or
             (self.pending_header_stream_id == stream_id and self.pending_headers_end_stream);
         const local_ended = stream.upload.offset == stream.upload.body.len;
-        try self.restorePendingConnectionCreditBeforeReset(writer, index);
+        try self.restorePendingConnectionCredit(writer, index);
         if (remote_ended) {
             if (local_ended) {
                 // Closed on both sides: nothing to tell the peer, and nothing
@@ -964,7 +859,6 @@ pub const Connection = struct {
             self.rememberLocalResetStream(stream_id);
         }
         try self.sendCancel(writer, stream_id);
-        self.active_streams.items[index].wire_bytes.addSent(h2.frame_header_len + 4);
     }
 
     /// Decodes a reset stream's header block only to keep the HPACK dynamic
@@ -976,19 +870,13 @@ pub const Connection = struct {
     fn discardPendingHeaderBlock(self: *Connection) !bool {
         defer self.clearPendingHeaderBlock();
         const end_stream = self.pending_headers_end_stream;
-        try self.session.decoder.skipBlock(self.allocator, self.pending_header_block.items);
+        try self.session.decoder.skipBlock(self.session.scratch.decode, self.pending_header_block.items);
         return end_stream;
     }
 
     fn discardResetData(self: *Connection, writer: *std.Io.Writer, stream_id: u32, payload: []const u8, end_stream: bool) !void {
         try self.recv_connection_window.receive(payload.len);
-        if (payload.len != 0) {
-            const update_bytes = try self.writeConnectionReceiveWindowUpdate(writer, payload.len);
-            if (update_bytes != 0) {
-                self.recordControlSent(update_bytes);
-                try writer.flush();
-            }
-        }
+        try self.reopenConnectionWindow(writer, payload.len);
         if (end_stream)
             _ = self.removeLocalResetStream(stream_id);
     }
@@ -999,33 +887,6 @@ pub const Connection = struct {
         try h2.encodeRstStreamFrame(&wire, stream_id, .cancel);
         try writer.writeAll(&wire);
         try writer.flush();
-    }
-
-    fn recordReceivedFrame(self: *Connection, frame: *const Frame) void {
-        const len = h2.frame_header_len + frame.payload.len;
-        if (frame.header.stream_id != 0) {
-            if (self.findStreamIndex(frame.header.stream_id)) |index| {
-                self.active_streams.items[index].wire_bytes.addReceived(len);
-                return;
-            }
-        }
-        self.recordControlReceived(len);
-    }
-
-    fn recordControlReceived(self: *Connection, len: usize) void {
-        if (self.active_streams.items.len != 0) {
-            self.active_streams.items[0].wire_bytes.addReceived(len);
-            return;
-        }
-        self.pending_control_bytes.addReceived(len);
-    }
-
-    fn recordControlSent(self: *Connection, len: usize) void {
-        if (self.active_streams.items.len != 0) {
-            self.active_streams.items[0].wire_bytes.addSent(len);
-            return;
-        }
-        self.pending_control_bytes.addSent(len);
     }
 
     fn recordPendingHeaderContinuationFrame(self: *Connection) !void {
@@ -1084,48 +945,19 @@ pub const Connection = struct {
     }
 
     fn completeStreamAt(self: *Connection, index: usize) !Event {
-        var stream = self.active_streams.orderedRemove(index);
-        defer stream.deinit();
-        const wire_bytes = stream.wire_bytes;
-        _ = stream.accumulator.status_code orelse return error.Http2ResponseIncomplete;
-        return .{ .end = .{
-            .stream_id = stream.id,
-            .wire_bytes = wire_bytes,
-            .billed_bytes = stream.billed,
-        } };
-    }
-
-    fn reportHeadAt(self: *Connection, index: usize, end_stream: bool, billed_head_bytes: usize) !Event {
-        const stream = &self.active_streams.items[index];
-        stream.head_reported = true;
-        const headers = try cloneHeaders(stream.accumulator.allocator, stream.accumulator.headers.items);
-        errdefer freeHeaders(stream.accumulator.allocator, headers);
-        return .{ .head = .{
-            .stream_id = stream.id,
-            .result = .{
-                .allocator = stream.accumulator.allocator,
-                .status_code = stream.accumulator.status_code orelse return error.Http2ResponseIncomplete,
-                .headers = headers,
-                .end_stream = end_stream,
-            },
-            .billed_head_bytes = billed_head_bytes,
-        } };
+        const stream = self.active_streams.orderedRemove(index);
+        _ = stream.response.status_code orelse return error.Http2ResponseIncomplete;
+        return .{ .end = .{ .stream_id = stream.id } };
     }
 
     fn failStreamAt(self: *Connection, index: usize, err: anyerror) Event {
-        var stream = self.active_streams.orderedRemove(index);
-        defer stream.deinit();
-        return .{ .failure = .{
-            .stream_id = stream.id,
-            .err = err,
-            .wire_bytes = stream.wire_bytes,
-            .billed_bytes = stream.billed,
-        } };
+        const stream = self.active_streams.orderedRemove(index);
+        return .{ .failure = .{ .stream_id = stream.id, .err = err } };
     }
 
     fn firstReportedCompleteStream(self: *Connection) ?usize {
         for (self.active_streams.items, 0..) |stream, index| {
-            if (stream.head_reported and stream.accumulator.complete and stream.pending_body_credit == 0)
+            if (stream.head_reported and stream.response.complete and stream.pending_body_credit == 0)
                 return index;
         }
         return null;
@@ -1138,12 +970,12 @@ pub const Connection = struct {
     /// connection window and credit caps remain the memory bounds.
     fn maybeGrowStreamReceiveWindow(self: *Connection, writer: *std.Io.Writer, stream_index: usize) !void {
         const stream = &self.active_streams.items[stream_index];
-        if (!stream.head_reported or stream.accumulator.complete)
+        if (!stream.head_reported or stream.response.complete)
             return;
         if (stream.pending_body_credit != 0)
             return;
         const target = stream.recv_window.target;
-        if (stream.accumulator.received_body_bytes < target)
+        if (stream.response.received_body_bytes < target)
             return;
         const fair_share: u32 = @intCast(@min(
             @as(usize, self.limits.connection_receive_window),
@@ -1157,8 +989,7 @@ pub const Connection = struct {
         const delta = @min(target, fair_share - target);
         if (delta == 0)
             return;
-        const sent = try writeWindowUpdate(writer, stream.id, delta);
-        stream.wire_bytes.addSent(sent);
+        try writeWindowUpdate(writer, stream.id, delta);
         try stream.recv_window.grow(delta);
         stream.pending_credit_cap += delta;
     }
@@ -1169,13 +1000,12 @@ pub const Connection = struct {
         stream_index: usize,
         payload_len: usize,
         update_stream: bool,
-    ) !usize {
-        var sent: usize = try self.writeConnectionReceiveWindowUpdate(writer, payload_len);
+    ) !void {
+        _ = try self.writeConnectionReceiveWindowUpdate(writer, payload_len);
         if (!update_stream)
-            return sent;
+            return;
         if (try self.active_streams.items[stream_index].recv_window.record(payload_len)) |increment|
-            sent += try writeWindowUpdate(writer, self.active_streams.items[stream_index].id, increment);
-        return sent;
+            try writeWindowUpdate(writer, self.active_streams.items[stream_index].id, increment);
     }
 
     fn receiveDataFlowControl(self: *Connection, stream_index: usize, payload_len: usize) !void {
@@ -1183,23 +1013,28 @@ pub const Connection = struct {
         try self.active_streams.items[stream_index].recv_window.receive(payload_len);
     }
 
+    /// Returns whether the connection's WINDOW_UPDATE went to the writer.
     fn writeConnectionReceiveWindowUpdate(
         self: *Connection,
         writer: *std.Io.Writer,
         payload_len: usize,
-    ) !usize {
-        if (try self.recv_connection_window.record(payload_len)) |increment|
-            return try writeWindowUpdate(writer, 0, increment);
-        return 0;
+    ) !bool {
+        if (try self.recv_connection_window.record(payload_len)) |increment| {
+            try writeWindowUpdate(writer, 0, increment);
+            return true;
+        }
+        return false;
     }
 
-    fn restorePendingConnectionCreditBeforeReset(self: *Connection, writer: *std.Io.Writer, stream_index: usize) !void {
+    /// Takes back all the body credit the stream's consumer still holds and
+    /// returns it to the connection window, for a stream about to leave the
+    /// table, whose acks will never come.
+    fn restorePendingConnectionCredit(self: *Connection, writer: *std.Io.Writer, stream_index: usize) !void {
         const pending = self.active_streams.items[stream_index].pending_body_credit;
         if (pending == 0)
             return;
-        const sent = try self.writeConnectionReceiveWindowUpdate(writer, pending);
-        self.active_streams.items[stream_index].wire_bytes.addSent(sent);
         try self.releasePendingBodyCredit(stream_index, pending);
+        _ = try self.writeConnectionReceiveWindowUpdate(writer, pending);
     }
 
     fn addPendingBodyCredit(self: *Connection, stream_index: usize, bytes: usize) !void {
@@ -1213,10 +1048,17 @@ pub const Connection = struct {
         self.pending_body_credit_total = next_total;
     }
 
+    /// Changes nothing when it fails with `error.Http2AckExceedsPendingCredit`.
     fn releasePendingBodyCredit(self: *Connection, stream_index: usize, bytes: usize) !void {
-        if (bytes > self.pending_body_credit_total)
-            return error.Http2FlowControlError;
-        try self.active_streams.items[stream_index].releasePendingBodyCredit(bytes);
+        const stream = &self.active_streams.items[stream_index];
+        if (bytes > stream.pending_body_credit)
+            return error.Http2AckExceedsPendingCredit;
+        // The total is the sum of what every active stream holds: credit
+        // enters it only with a stream's own, and every stream leaves the
+        // table holding none, by completing at zero or through
+        // `restorePendingConnectionCredit`.
+        std.debug.assert(stream.pending_body_credit <= self.pending_body_credit_total);
+        stream.pending_body_credit -= bytes;
         self.pending_body_credit_total -= bytes;
     }
 };
@@ -1226,7 +1068,6 @@ fn isStreamResponseFailure(err: anyerror) bool {
         error.FetchResponseTooLarge,
         error.Http2ResponseBodyForbidden,
         error.Http2ContentLengthMismatch,
-        error.UnsupportedCompressionMethod,
         error.UnsupportedFetchProtocolUpgrade,
         // Malformed response content (RFC 9113 §8.1.1) fails only its own
         // stream, and the connection keeps serving every other fetch on it.
@@ -1249,69 +1090,45 @@ fn isHpackEncoderFatal(err: anyerror) bool {
     };
 }
 
-fn cloneHeaders(allocator: std.mem.Allocator, input: []const hpack.Header) ![]hpack.Header {
-    const out = try allocator.alloc(hpack.Header, input.len);
-    errdefer allocator.free(out);
-    var initialized: usize = 0;
-    errdefer freeHeaderFields(allocator, out[0..initialized]);
-    for (input, 0..) |header, index| {
-        const name = try allocator.dupe(u8, header.name);
-        errdefer allocator.free(name);
-        const value = try allocator.dupe(u8, header.value);
-        errdefer allocator.free(value);
-        out[index] = .{ .name = name, .value = value };
-        initialized += 1;
-    }
-    return out;
-}
-
-fn freeHeaders(allocator: std.mem.Allocator, headers: []hpack.Header) void {
-    freeHeaderFields(allocator, headers);
-    allocator.free(headers);
-}
-
-fn freeHeaderFields(allocator: std.mem.Allocator, headers: []hpack.Header) void {
-    for (headers) |header| {
-        allocator.free(header.name);
-        allocator.free(header.value);
-    }
+/// Answers a PING that is not itself an acknowledgement.
+fn answerPing(writer: *std.Io.Writer, frame: *const Frame) !void {
+    try frame.header.validateControlStream();
+    if (frame.payload.len != 8)
+        return error.Http2FrameSizeError;
+    // `end_stream` is flag bit 0x1, the ACK flag on PING.
+    if (frame.header.flags.end_stream)
+        return;
+    var ack: [h2.frame_header_len + 8]u8 = undefined;
+    var ack_header = h2.FrameHeader{
+        .length = 8,
+        .frame_type_raw = @intFromEnum(h2.FrameType.ping),
+        .frame_type = .ping,
+        .flags = h2.Flags.fromByte(0x1),
+        .stream_id = 0,
+    };
+    try ack_header.encode(ack[0..h2.frame_header_len]);
+    @memcpy(ack[h2.frame_header_len..], frame.payload);
+    try writer.writeAll(&ack);
+    try writer.flush();
 }
 
 const ActiveStream = struct {
     id: u32,
-    accumulator: response.ResponseAccumulator,
+    response: response.ResponseState,
     upload: UploadState,
     recv_window: ReceiveWindow,
-    reusable: bool,
     head_reported: bool = false,
     pending_body_credit: usize = 0,
     /// Most body credit the consumer may hold unacked on this stream. It
     /// starts at the per-stream budget and grows with the stream's receive
     /// window; the connection-level cap stays the memory bound.
     pending_credit_cap: usize = 0,
-    wire_bytes: accounting.Bytes = .{},
-    /// The HTTP payload this stream moved, counted as `Event.end.billed_bytes`
-    /// describes. It stays apart from `wire_bytes` and from the connection's
-    /// ciphertext delta: both already include the payload, so adding it to
-    /// either would bill the payload twice.
-    billed: accounting.Bytes = .{},
-
-    fn deinit(self: *ActiveStream) void {
-        self.accumulator.deinit();
-        self.* = undefined;
-    }
 
     fn addPendingBodyCredit(self: *ActiveStream, bytes: usize, limit: usize) !void {
         const next = try std.math.add(usize, self.pending_body_credit, bytes);
         if (next > limit)
             return error.Http2BodyBackpressureExceeded;
         self.pending_body_credit = next;
-    }
-
-    fn releasePendingBodyCredit(self: *ActiveStream, bytes: usize) !void {
-        if (bytes > self.pending_body_credit)
-            return error.Http2FlowControlError;
-        self.pending_body_credit -= bytes;
     }
 };
 
@@ -1424,37 +1241,28 @@ const UploadState = struct {
         try addWindow(&self.stream_window, increment);
     }
 
-    /// Bytes one upload pass wrote: `wire` counts frame headers and payload
-    /// for the plaintext wire counter, `payload` counts the DATA payload
-    /// alone, which is billed.
-    const Written = struct {
-        wire: usize = 0,
-        payload: usize = 0,
-    };
-
+    /// Writes as much of the body as both send windows and the peer's frame
+    /// size allow, as DATA frames; the last carries END_STREAM.
     fn writeAvailable(
         self: *UploadState,
         writer: *std.Io.Writer,
         stream_id: u32,
-    ) !Written {
-        var written = Written{};
+    ) !void {
         while (self.offset < self.body.len and self.connection.send_connection_window > 0 and self.stream_window > 0) {
             const window_budget: usize = @intCast(@min(self.connection.send_connection_window, self.stream_window));
             const frame_budget: usize = @intCast(self.connection.session.peer_settings.max_frame_size);
             const chunk_len = @min(@min(window_budget, frame_budget), self.body.len - self.offset);
             const is_last = self.offset + chunk_len == self.body.len;
-            written.wire += try writeDataFrame(
+            try writeDataFrame(
                 writer,
                 stream_id,
                 self.body[self.offset..][0..chunk_len],
                 is_last,
             );
-            written.payload += chunk_len;
             self.offset += chunk_len;
             self.connection.send_connection_window -= @intCast(chunk_len);
             self.stream_window -= @intCast(chunk_len);
         }
-        return written;
     }
 };
 
@@ -1473,14 +1281,13 @@ fn receiveWindowThreshold(target: u32, configured: u32) u32 {
     return @min(configured, half);
 }
 
-fn writeWindowUpdate(writer: *std.Io.Writer, stream_id: u32, increment: u32) !usize {
+fn writeWindowUpdate(writer: *std.Io.Writer, stream_id: u32, increment: u32) !void {
     var update: [h2.frame_header_len + 4]u8 = undefined;
     try h2.encodeWindowUpdateFrame(&update, stream_id, increment);
     try writer.writeAll(&update);
-    return update.len;
 }
 
-fn writeDataFrame(writer: *std.Io.Writer, stream_id: u32, payload: []const u8, end_stream: bool) !usize {
+fn writeDataFrame(writer: *std.Io.Writer, stream_id: u32, payload: []const u8, end_stream: bool) !void {
     var header_wire: [h2.frame_header_len]u8 = undefined;
     var header = h2.FrameHeader{
         .length = @intCast(payload.len),
@@ -1493,7 +1300,6 @@ fn writeDataFrame(writer: *std.Io.Writer, stream_id: u32, payload: []const u8, e
     try writer.writeAll(&header_wire);
     if (payload.len != 0)
         try writer.writeAll(payload);
-    return h2.frame_header_len + payload.len;
 }
 
 pub const Frame = struct {
@@ -1542,43 +1348,4 @@ fn mapIoInterest(interest: anytype) IoInterest {
         .read => .read,
         .write => .write,
     };
-}
-
-fn readFrame(allocator: std.mem.Allocator, reader: *std.Io.Reader, max_frame_size: u32) !Frame {
-    var header_wire: [h2.frame_header_len]u8 = undefined;
-    try reader.readSliceAll(&header_wire);
-    const header = try h2.FrameHeader.parse(&header_wire);
-    if (header.length > max_frame_size)
-        return error.Http2FrameTooLarge;
-    const payload = try allocator.alloc(u8, header.length);
-    errdefer allocator.free(payload);
-    if (payload.len != 0)
-        try reader.readSliceAll(payload);
-    return .{ .allocator = allocator, .header = header, .payload = payload };
-}
-
-fn finishHeaderBlock(
-    allocator: std.mem.Allocator,
-    session: *session_mod.Session,
-    accumulator: *response.ResponseAccumulator,
-    block: []const u8,
-    end_stream: bool,
-) !void {
-    if (block.len > collo_limits.headers.EGRESS_RESPONSE_HEADER_BYTES_MAX)
-        return error.Http2HeaderBlockTooLarge;
-    var decoded = try session.decoder.decodeBlock(
-        allocator,
-        block,
-        response.max_response_header_count,
-        collo_limits.headers.EGRESS_RESPONSE_HEADER_BYTES_MAX,
-    );
-    defer decoded.deinit(allocator);
-    if (accumulator.status_code != null) {
-        if (!end_stream)
-            return error.Http2ProtocolError;
-        try response.validateTrailers(decoded.headers);
-        try accumulator.finish();
-        return;
-    }
-    try accumulator.receiveHead(try response.parseResponseHead(decoded.headers, end_stream));
 }

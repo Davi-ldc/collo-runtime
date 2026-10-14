@@ -52,7 +52,7 @@ const Variant = struct {
     name: []const u8,
     vm_options: bindings.VmOptions,
     /// Runs the zygote warmup corpus and a full GC before prepareForFork, as
-    /// the zygote does when `ZygoteOptions.warmup_corpus` is set.
+    /// the zygote always does (`zygote/fork_loop.zig:prepareZygoteAtBoot`).
     warmup: bool = false,
 };
 
@@ -231,10 +231,8 @@ fn runVariant(
     const parent_before_create = try readSnapshot(allocator, self_pid);
     printMetric(variant.name, "zygote", "parent_before_create", 0, self_pid, parent_before_create);
 
-    var zygote = try zygote_mod.state.Zygote.init(null, .{
-        .vm_options = variant.vm_options,
-    });
-    defer zygote.deinit();
+    var vm = try bindings.Vm.create(variant.vm_options);
+    defer vm.deinit();
 
     const parent_after_create = try readSnapshot(allocator, self_pid);
     printMetric(variant.name, "zygote", "parent_after_create", 0, self_pid, parent_after_create);
@@ -256,8 +254,8 @@ fn runVariant(
     );
 
     if (variant.warmup) {
-        try zygote_mod.warmup.runCorpus(&zygote.vm);
-        try zygote.vm.collectFullGCAndTrim();
+        try zygote_mod.warmup.runCorpus(&vm);
+        try vm.collectFullGCAndTrim();
         const parent_after_warmup = try readSnapshot(allocator, self_pid);
         printMetric(variant.name, "zygote", "parent_after_warmup", 0, self_pid, parent_after_warmup);
         printDelta(
@@ -278,15 +276,13 @@ fn runVariant(
         );
     }
 
-    try zygote.vm.prepareForFork();
+    try vm.prepareForFork();
     std.Thread.sleep(fork_helper_timeout_ns);
     try os.process.waitForSingleThreadedSelf(fork_drain_max_checks, fork_drain_check_interval_ns);
     // The engine reserves its heaps with MADV_DONTFORK, which the zygote
     // undoes before its first fork (`prepareZygoteAtBoot`); without this a
     // child faults on the first cell it touches.
     _ = try os.process.makeAddressSpaceForkInheritable();
-    zygote.prepared_for_fork = true;
-    zygote.prepare_count += 1;
 
     const parent_after_prepare = try readSnapshot(allocator, self_pid);
     printMetric(variant.name, "zygote", "parent_after_prepare", 0, self_pid, parent_after_prepare);
@@ -315,7 +311,7 @@ fn runVariant(
         for (call_counts) |call_count| {
             try runForkedCase(
                 allocator,
-                &zygote.vm,
+                &vm,
                 variant.name,
                 workload,
                 call_count,

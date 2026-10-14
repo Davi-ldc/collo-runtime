@@ -32,7 +32,6 @@ pub fn writeValueResponse(
     request: *request_context.RequestContext,
     value: *const bindings.Value,
 ) !void {
-    runtime.observability.response_extraction_count += 1;
     const extraction = extractNativeResponse(runtime, request, value) catch |err| switch (err) {
         // The request's boundary decides what running out of memory means
         // (`handleLocalFailure` in `serve/dispatch.zig`); it is no check
@@ -83,7 +82,7 @@ fn answerInvalidResponse(
     var line_buffer: [128]u8 = undefined;
     const line = std.fmt.bufPrint(&line_buffer, "invalid response: {s}", .{@errorName(err)}) catch
         "invalid response";
-    exception_log.logMessage(runtime.core.vm, request.exec.request_id, "response validation", line);
+    exception_log.logMessage(runtime.core.vm, request.exec.request_id, line);
     var error_response = response_model.Response{
         .status = 500,
         .body = .{ .bytes = "invalid response" },

@@ -73,12 +73,6 @@ pub const HealthState = struct {
     /// Lanes whose loop is serving, out of `lanes_total`.
     lanes_running: u16,
     lanes_total: u16,
-    /// The usage stream refused a record and has not had room since for the
-    /// largest one it refused (`Sink.full` in `server/analytics/sink.zig`):
-    /// usage records are being dropped. It is reported, but it leaves the
-    /// status alone: a full stream sheds no request, and a load balancer
-    /// acting on the status would shed every request the node gets.
-    usage_stream_full: bool,
 
     pub const Status = enum { ok, degraded, stopping };
 
@@ -95,7 +89,7 @@ pub const HealthState = struct {
     }
 };
 
-const health_format = "{{\"status\":\"{s}\",\"zygote\":\"{s}\",\"lanes\":{{\"running\":{d},\"total\":{d}}},\"usage_stream\":\"{s}\"}}";
+const health_format = "{{\"status\":\"{s}\",\"zygote\":\"{s}\",\"lanes\":{{\"running\":{d},\"total\":{d}}}}}";
 
 /// The longest status name the health body carries.
 const health_status_bytes_max: usize = blk: {
@@ -112,11 +106,10 @@ pub const health_body_bytes_max: usize = std.fmt.count(health_format, .{
     "exited",
     std.math.maxInt(u16),
     std.math.maxInt(u16),
-    "full",
 });
 
 /// The health answer for `state`, a JSON object such as
-/// `{"status":"ok","zygote":"alive","lanes":{"running":7,"total":7},"usage_stream":"ok"}`.
+/// `{"status":"ok","zygote":"alive","lanes":{"running":7,"total":7}}`.
 /// Status 200 says `"status":"ok"`; status 503 says `"status":"degraded"`
 /// once the zygote exited or a lane is not running, and `"status":"stopping"`
 /// while the server drains. The body is formatted into `buffer`, which the
@@ -131,7 +124,6 @@ pub fn health(state: HealthState, buffer: *[health_body_bytes_max]u8) Response {
         if (state.zygote_alive) "alive" else "exited",
         state.lanes_running,
         state.lanes_total,
-        if (state.usage_stream_full) "full" else "ok",
     }) catch unreachable;
     return switch (status) {
         .ok => .{

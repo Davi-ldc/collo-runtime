@@ -46,9 +46,10 @@ test "a continuation resumed by another request keeps its own identity" {
 
     const page_fd = try worker_shared_page.createMemfd("multiplexing-identity");
     defer std.posix.close(page_fd);
-    var view = try worker_shared_page.mapReadWrite(page_fd);
+    var view = try worker_shared_page.mapWorkerWriter(page_fd);
     defer view.deinit();
-    view.initializeCrashDefault();
+    var reader = try worker_shared_page.mapHostReader(page_fd);
+    defer reader.deinit();
 
     var now_mono_ns: u64 = 9_000;
     var runtime = try worker.Runtime.init(
@@ -62,7 +63,7 @@ test "a continuation resumed by another request keeps its own identity" {
     defer runtime.deinit();
     try runtime.attachHostRuntime();
 
-    const specifier = "/__collo_route/demo/multiplexing-identity.js";
+    const specifier = "/var/task/multiplexing-identity.js";
     const route_index = try rt.registerRoute(&runtime, specifier,
         \\let release;
         \\const shared = new Promise((resolve) => { release = resolve; });
@@ -114,7 +115,7 @@ test "a continuation resumed by another request keeps its own identity" {
     var out: [16]worker_shared_page.DrainedLogLine = undefined;
     var found_owner: ?u64 = null;
     while (true) {
-        const count = try view.drainLogLinesChecked(&scratch, &out);
+        const count = try reader.drainLogLinesChecked(&scratch, &out);
         if (count == 0) break;
         for (out[0..count]) |line| {
             if (std.mem.containsAtLeast(u8, line.payload, 1, "continuation-of-waiter"))
@@ -131,8 +132,9 @@ test "a continuation resumed by another request keeps its own identity" {
 // owner-transition hook). Request A parks on a module-scope promise, and its
 // continuation busy-waits; request B resolves the promise, so the
 // continuation runs inside B's drain. The witness here is CPU on purpose,
-// with a spin long enough that the comparison cannot flip: A's record must
-// hold the spin, and B's must not. The thread CPU clock is the real one.
+// with a spin long enough that the comparison cannot flip: A's
+// `request_done` must hold the spin, and B's must not. The thread CPU clock
+// is the real one.
 test "a reaction that another request's drain runs is charged to the request that registered it" {
     var vm = try support.createVm();
     defer vm.deinit();
@@ -155,7 +157,7 @@ test "a reaction that another request's drain runs is charged to the request tha
     defer runtime.deinit();
     try runtime.attachHostRuntime();
 
-    const specifier = "/__collo_route/demo/multiplexing-cpu.js";
+    const specifier = "/var/task/multiplexing-cpu.js";
     const route_index = try rt.registerRoute(&runtime, specifier,
         \\let release;
         \\const shared = new Promise((resolve) => { release = resolve; });
@@ -198,26 +200,14 @@ test "a reaction that another request's drain runs is charged to the request tha
     try rt.executeUntilRequestDone(&runtime, releaser_id);
     try rt.executeUntilRequestDone(&runtime, waiter_id);
 
-    var records: [2]worker_shared_page.CompletedRecord = undefined;
-    var cursor: worker_shared_page.RecordCursor = .{};
-    const count = cursor.drain(
-        completion_fixture.view.header,
-        completion_fixture.view.completed_records,
-        &records,
-    ) orelse return error.UsageRingCorrupt;
-    try std.testing.expectEqual(@as(usize, 2), count);
-    var waiter_cpu_ns: ?u64 = null;
-    var releaser_cpu_ns: ?u64 = null;
-    for (records[0..count]) |record| {
-        if (record.request_id == waiter_id) waiter_cpu_ns = record.cpu_ns;
-        if (record.request_id == releaser_id) releaser_cpu_ns = record.cpu_ns;
-    }
-    const waiter_cpu = waiter_cpu_ns orelse return error.WaiterRecordMissing;
-    const releaser_cpu = releaser_cpu_ns orelse return error.ReleaserRecordMissing;
+    var dones: [2]rt.ReadRequestDone = undefined;
+    try rt.readRequestDones(control_pair[1], &.{ waiter_id, releaser_id }, &dones);
+    const waiter_cpu = dones[0].done.cpu_ns;
+    const releaser_cpu = dones[1].done.cpu_ns;
 
     // The 50 ms spin is A's, however little of it a loaded machine schedules;
     // B ran a few microseconds of its own and drained the spin, which its
-    // record must not hold.
+    // `request_done` must not hold.
     try std.testing.expect(waiter_cpu >= 5 * std.time.ns_per_ms);
     try std.testing.expect(releaser_cpu < waiter_cpu);
 }
@@ -240,9 +230,10 @@ test "a stranded reaction that spins inside another request's drain is stopped b
 
     const page_fd = try worker_shared_page.createMemfd("multiplexing-stranded");
     defer std.posix.close(page_fd);
-    var view = try worker_shared_page.mapReadWrite(page_fd);
+    var view = try worker_shared_page.mapWorkerWriter(page_fd);
     defer view.deinit();
-    view.initializeCrashDefault();
+    var reader = try worker_shared_page.mapHostReader(page_fd);
+    defer reader.deinit();
 
     var now_mono_ns: u64 = 0;
     var runtime = try worker.Runtime.init(
@@ -260,7 +251,7 @@ test "a stranded reaction that spins inside another request's drain is stopped b
     try runtime.attachHostRuntime();
     try runtime.startSentinel();
 
-    const specifier = "/__collo_route/demo/multiplexing-stranded.js";
+    const specifier = "/var/task/multiplexing-stranded.js";
     const route_index = try rt.registerRoute(&runtime, specifier,
         \\let release;
         \\export default function handle(request) {
@@ -313,7 +304,7 @@ test "a stranded reaction that spins inside another request's drain is stopped b
     var scratch: [worker_shared_page.LOG_LINE_BYTES_MAX]u8 = undefined;
     var out: [16]worker_shared_page.DrainedLogLine = undefined;
     while (true) {
-        const count = try view.drainLogLinesChecked(&scratch, &out);
+        const count = try reader.drainLogLinesChecked(&scratch, &out);
         if (count == 0) break;
         for (out[0..count]) |line|
             try std.testing.expect(line.header.request_id != releaser_id);
@@ -333,9 +324,10 @@ test "every live slot serves a request at once, each with its own console line i
 
     const page_fd = try worker_shared_page.createMemfd("multiplexing-all-slots");
     defer std.posix.close(page_fd);
-    var view = try worker_shared_page.mapReadWrite(page_fd);
+    var view = try worker_shared_page.mapWorkerWriter(page_fd);
     defer view.deinit();
-    view.initializeCrashDefault();
+    var reader = try worker_shared_page.mapHostReader(page_fd);
+    defer reader.deinit();
 
     var now_mono_ns: u64 = 0;
     var runtime = try worker.Runtime.init(
@@ -349,7 +341,7 @@ test "every live slot serves a request at once, each with its own console line i
     defer runtime.deinit();
     try runtime.attachHostRuntime();
 
-    const route_index = try rt.registerRoute(&runtime, "/__collo_route/demo/multiplexing-all-slots.js",
+    const route_index = try rt.registerRoute(&runtime, "/var/task/multiplexing-all-slots.js",
         \\export default async function handle(request) {
         \\    const id = new URL(request.url).pathname.slice(1);
         \\    await new Promise((resolve) => setTimeout(resolve, 1));
@@ -385,7 +377,7 @@ test "every live slot serves a request at once, each with its own console line i
     var scratch: [worker_shared_page.LOG_LINE_BYTES_MAX]u8 = undefined;
     var out: [16]worker_shared_page.DrainedLogLine = undefined;
     while (true) {
-        const count = try view.drainLogLinesChecked(&scratch, &out);
+        const count = try reader.drainLogLinesChecked(&scratch, &out);
         if (count == 0) break;
         for (out[0..count]) |line| {
             const prefix = "line:";
@@ -397,11 +389,11 @@ test "every live slot serves a request at once, each with its own console line i
     }
     try std.testing.expectEqual(slot_count, lines_seen);
 
-    var records: [slot_count]worker_shared_page.CompletedRecord = undefined;
-    var cursor: worker_shared_page.RecordCursor = .{};
-    const record_count = cursor.drain(view.header, view.completed_records, &records) orelse
-        return error.UsageRingCorrupt;
-    try std.testing.expectEqual(slot_count, record_count);
-    for (records[0..record_count]) |record|
-        try std.testing.expectEqual(@intFromEnum(worker_shared_page.CompletedStatus.done), record.status);
+    var request_ids: [slot_count]u64 = undefined;
+    for (&request_ids, 0..) |*request_id, index|
+        request_id.* = 501 + index;
+    var dones: [slot_count]rt.ReadRequestDone = undefined;
+    try rt.readRequestDones(control_pair[1], &request_ids, &dones);
+    for (dones) |read|
+        try std.testing.expectEqual(ipc.RequestDoneStatus.ok, read.done.status);
 }

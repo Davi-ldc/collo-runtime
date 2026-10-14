@@ -2,11 +2,10 @@
 //! (`attachHostRuntime`): itself as the VM's host runtime, which every
 //! `collo_runtime_*` export receives back (`worker/host/adapter.zig`), the
 //! owner-transition hook and the console sink, whose callbacks live here,
-//! the exception-log sink, and the egress release callbacks
-//! (`installEgressCallbacks` in `egress.zig`). `Runtime` declares
-//! `attachHostRuntime` as its own. The VM and the exception log keep the
-//! runtime's address in the first four, so `Runtime.deinit` clears them, in
-//! the reverse order, before it frees anything their callbacks read.
+//! and the exception-log sink. `Runtime` declares `attachHostRuntime` as its
+//! own. The VM and the exception log keep the runtime's address in all four,
+//! so `Runtime.deinit` clears them, in the reverse order, before it frees
+//! anything their callbacks read.
 //!
 //! The callbacks run on the worker's VM thread. The engine calls the hook
 //! with the JS lock held and the console sink synchronously inside the turn
@@ -31,7 +30,6 @@ const ringRequestId = runtime_observability.ringRequestId;
 pub fn Methods(comptime Runtime: type) type {
     return struct {
         pub fn attachHostRuntime(self: *Runtime) !void {
-            self.installEgressCallbacks();
             try self.core.vm.setHostRuntime(self);
             // A restored promise continuation runs in a window of its own
             // owner, not of the one draining the queue (`owner.zig`).
@@ -58,8 +56,7 @@ pub fn Methods(comptime Runtime: type) type {
         /// continuation whose owner differs from the owner it interrupts:
         /// `(interrupted, restored)` before it, `(restored, interrupted)` after
         /// it (`collo_vm_set_owner_transition_hook` in `abi.h`). Each call
-        /// moves the VM thread to the `entering` side's owner, as the fs fault
-        /// and crypto settlements do around their sub-turns: its CPU is the
+        /// moves the VM thread to the `entering` side's owner: its CPU is the
         /// entering owner's from here, the sentinel can stop a hang inside the
         /// continuation only once that owner is published, and a request's
         /// timeline needs its turn closed and reopened, or the entering request

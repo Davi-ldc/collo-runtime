@@ -30,27 +30,6 @@ function assertFunctionShape(fn, name, length, hasPrototype, label = name) {
   assert.equal(Object.hasOwn(fn, "prototype"), hasPrototype, `${label} prototype presence`);
 }
 
-function assertThrowsTypeError(label, fn) {
-  try {
-    fn();
-  } catch (error) {
-    assert(error instanceof TypeError, `${label} should throw TypeError, got ${error?.constructor?.name}`);
-    return error;
-  }
-  throw new Error(`${label} did not throw`);
-}
-
-function assertThrowsQuota(label, fn) {
-  try {
-    fn();
-  } catch (error) {
-    assert(error instanceof DOMException, `${label} should throw DOMException, got ${error?.constructor?.name}`);
-    assert.equal(error.name, "QuotaExceededError", `${label} error name`);
-    return error;
-  }
-  throw new Error(`${label} did not throw`);
-}
-
 test("FormData globals descriptors and prototype shape", () => {
   assert.equal(typeof FormData, "function");
   assert.equal(FormData.length, 0);
@@ -68,7 +47,7 @@ test("FormData globals descriptors and prototype shape", () => {
   assert.equal(Object.prototype.toString.call(form), "[object FormData]");
   assert.equal(form.constructor, FormData);
   assert.equal(FormData.prototype[Symbol.iterator], FormData.prototype.entries);
-  assert.equal(Object.keys(FormData.prototype).join(","), "append,delete,get,getAll,has,set,entries,keys,values,forEach,toJSON");
+  assert.equal(Object.keys(FormData.prototype).join(","), "append,delete,get,getAll,has,set,entries,keys,values,forEach");
 
   for (const [name, length] of [
     ["append", 2],
@@ -90,24 +69,11 @@ test("FormData globals descriptors and prototype shape", () => {
     assertFunctionShape(property.value, name, length, false, `FormData.${name}`);
   }
 
-  const toJSON = descriptor(FormData.prototype, "toJSON");
-  assert.equal(toJSON.value.length, 0);
-  assert.equal(toJSON.enumerable, true);
-  assert.equal(toJSON.configurable, false);
-  assert.equal(toJSON.writable, false);
-  assertFunctionShape(toJSON.value, "toJSON", 0, false, "FormData.toJSON");
-
-  const length = descriptor(FormData.prototype, "length");
-  assert.equal(length.enumerable, false);
-  assert.equal(length.configurable, false);
-  assertFunctionShape(length.get, "get length", 0, false, "FormData.length getter");
-
-  const from = descriptor(FormData, "from");
-  assert.equal(from.value.length, 1);
-  assert.equal(from.enumerable, true);
-  assert.equal(from.configurable, false);
-  assert.equal(from.writable, false);
-  assertFunctionShape(from.value, "from", 1, false, "FormData.from");
+  // Bun's FormData.from, toJSON and length are not part of the standard and are not offered.
+  assert.equal(Object.hasOwn(FormData, "from"), false);
+  assert.equal("toJSON" in FormData.prototype, false);
+  assert.equal("length" in FormData.prototype, false);
+  assert.equal(form.length, undefined);
 
   assertDataDescriptor(descriptor(FormData.prototype, Symbol.iterator), FormData.prototype.entries, true, false, true, "FormData.prototype @@iterator");
   const iterator = form.entries();
@@ -154,56 +120,69 @@ test("FormData string entries append get getAll has delete and set", () => {
   assert.deepEqual(Array.from(setForm), [["key", "value4"], ["tail", "value3"], ["new", "value5"]]);
 });
 
-test("FormData Bun-compatible length and toJSON", () => {
-  const form = new FormData();
-  form.append(1, 1);
-  form.append("a", "1");
-  form.append("a", "2");
-  const file = new File(["hello"], "hello.txt", { type: "text/plain" });
-  form.append("file", file);
+// The form body parsers, reached through Response.formData(), which keeps the Content-Type as it was given; a Blob's
+// type is normalized to lowercase, boundary included.
+function parseForm(body, type) {
+  return new Response(body, { headers: { "content-type": type } }).formData();
+}
 
-  const json = form.toJSON();
-  assert.equal(form.length, 4);
-  assert.deepEqual(json["1"], "1");
-  assert.deepEqual(json.a, ["1", "2"]);
-  assert.equal(json.file instanceof File, true);
-  assert.equal(json.file.name, "hello.txt");
-  assert.equal(JSON.stringify(json), '{"1":"1","a":["1","2"],"file":{}}');
-  assert.throws(() => FormData.prototype.toJSON.call({}), TypeError);
-  assert.throws(() => Object.getOwnPropertyDescriptor(FormData.prototype, "length").get.call({}), TypeError);
-});
+function parseMultipart(body, boundary = "foo") {
+  return parseForm(body, `multipart/form-data; boundary=${boundary}`);
+}
 
-test("FormData.from parses urlencoded and multipart bytes", async () => {
-  assert.deepEqual(FormData.from("a=1&b=2&a=3").toJSON(), { a: ["1", "3"], b: "2" });
+async function assertRejectsTypeError(label, promise) {
+  try {
+    await promise;
+  } catch (error) {
+    assert(error instanceof TypeError, `${label} should reject with TypeError, got ${error?.constructor?.name}`);
+    return error;
+  }
+  throw new Error(`${label} did not reject`);
+}
 
-  const encoded = new TextEncoder().encode("x=1&x=2");
-  assert.deepEqual(FormData.from(encoded).toJSON(), { x: ["1", "2"] });
-  assert.deepEqual(FormData.from(encoded.buffer).toJSON(), { x: ["1", "2"] });
+async function assertRejectsQuota(label, promise) {
+  try {
+    await promise;
+  } catch (error) {
+    assert(error instanceof DOMException, `${label} should reject with DOMException, got ${error?.constructor?.name}`);
+    assert.equal(error.name, "QuotaExceededError", `${label} error name`);
+    return error;
+  }
+  throw new Error(`${label} did not reject`);
+}
+
+test("form body parsers read urlencoded and multipart bodies", async () => {
+  const urlencoded = await parseForm("a=1&b=2&a=3", "application/x-www-form-urlencoded");
+  assert.deepEqual(Array.from(urlencoded), [["a", "1"], ["b", "2"], ["a", "3"]]);
 
   const multipart = '--foo\r\nContent-Disposition: form-data; name="field"\r\n\r\nvalue\r\n--foo\r\nContent-Disposition: form-data; name="file"; filename="a.txt"\r\nContent-Type: text/plain\r\n\r\nhello\r\n--foo--\r\n';
-  const parsed = FormData.from(multipart, "foo");
+  const parsed = await parseMultipart(multipart);
   assert.equal(parsed.get("field"), "value");
   assert.equal(parsed.get("file") instanceof File, true);
   assert.equal(parsed.get("file").name, "a.txt");
   assert.equal(parsed.get("file").type, "text/plain");
   assert.equal(await parsed.get("file").text(), "hello");
 
-  const parsedBlob = FormData.from(new Blob([multipart], { type: "multipart/form-data; boundary=foo" }));
-  assert.equal(parsedBlob.get("field"), "value");
+  const fromBlob = await new Blob([multipart], { type: "multipart/form-data; boundary=foo" }).formData();
+  assert.equal(fromBlob.get("field"), "value");
+
+  // A boundary parameter's value keeps its case, as the body's delimiters do.
+  const mixedCase = '--FooBar\r\nContent-Disposition: form-data; name="field"\r\n\r\nvalue\r\n--FooBar--\r\n';
+  assert.equal((await parseMultipart(mixedCase, "FooBar")).get("field"), "value");
 
   const invalidFilenameStar = '--foo\r\nContent-Disposition: form-data; name="file"; filename="plain.txt"; filename*=iso-8859-1\'\'ignored.txt\r\n\r\nhello\r\n--foo--\r\n';
-  const fallback = FormData.from(invalidFilenameStar, "foo").get("file");
+  const fallback = (await parseMultipart(invalidFilenameStar)).get("file");
   assert(fallback instanceof File);
   assert.equal(fallback.name, "plain.txt");
   assert.equal(await fallback.text(), "hello");
 
   const invalidEscapedFilenameStar = '--foo\r\nContent-Disposition: form-data; name="file"; filename="plain.txt"; filename*=UTF-8\'\'bad%ZZ.txt\r\n\r\nhello\r\n--foo--\r\n';
-  const escapedFallback = FormData.from(invalidEscapedFilenameStar, "foo").get("file");
+  const escapedFallback = (await parseMultipart(invalidEscapedFilenameStar)).get("file");
   assert(escapedFallback instanceof File);
   assert.equal(escapedFallback.name, "plain.txt");
 
   const invalidUtf8FilenameStar = '--foo\r\nContent-Disposition: form-data; name="file"; filename="plain.txt"; filename*=UTF-8\'\'bad%FF.txt\r\n\r\nhello\r\n--foo--\r\n';
-  const utf8Fallback = FormData.from(invalidUtf8FilenameStar, "foo").get("file");
+  const utf8Fallback = (await parseMultipart(invalidUtf8FilenameStar)).get("file");
   assert(utf8Fallback instanceof File);
   assert.equal(utf8Fallback.name, "plain.txt");
 
@@ -214,116 +193,134 @@ test("FormData.from parses urlencoded and multipart bytes", async () => {
   rawInvalidFilenameStar.set(rawInvalidFilenameStarPrefix);
   rawInvalidFilenameStar[rawInvalidFilenameStarPrefix.length] = 0xff;
   rawInvalidFilenameStar.set(rawInvalidFilenameStarSuffix, rawInvalidFilenameStarPrefix.length + 1);
-  const rawInvalidFallback = FormData.from(rawInvalidFilenameStar, "foo").get("file");
+  const rawInvalidFallback = (await parseMultipart(rawInvalidFilenameStar)).get("file");
   assert(rawInvalidFallback instanceof File);
   assert.equal(rawInvalidFallback.name, "plain.txt");
 
   const emptyFilenameStar = '--foo\r\nContent-Disposition: form-data; name="file"; filename="plain.txt"; filename*=UTF-8\'\'\r\n\r\nhello\r\n--foo--\r\n';
-  const emptyStarFile = FormData.from(emptyFilenameStar, "foo").get("file");
+  const emptyStarFile = (await parseMultipart(emptyFilenameStar)).get("file");
   assert(emptyStarFile instanceof File);
   assert.equal(emptyStarFile.name, "");
   assert.equal(await emptyStarFile.text(), "hello");
 
   const onlyEmptyFilenameStar = '--foo\r\nContent-Disposition: form-data; name="file"; filename*=UTF-8\'\'\r\n\r\nhello\r\n--foo--\r\n';
-  const onlyEmptyStarFile = FormData.from(onlyEmptyFilenameStar, "foo").get("file");
+  const onlyEmptyStarFile = (await parseMultipart(onlyEmptyFilenameStar)).get("file");
   assert(onlyEmptyStarFile instanceof File);
   assert.equal(onlyEmptyStarFile.name, "");
 
   const quotedSemicolonFilename = '--foo\r\nContent-Disposition: form-data; name="file"; filename="a;b.txt"\r\n\r\nhello\r\n--foo--\r\n';
-  const semicolonFile = FormData.from(quotedSemicolonFilename, "foo").get("file");
+  const semicolonFile = (await parseMultipart(quotedSemicolonFilename)).get("file");
   assert(semicolonFile instanceof File);
   assert.equal(semicolonFile.name, "a;b.txt");
 
   const boundaryLikeData = '--foo\r\nContent-Disposition: form-data; name="field"\r\n\r\nbefore\r\n--foo-not-a-boundary\r\nafter\r\n--foo--\r\n';
-  assert.equal(FormData.from(boundaryLikeData, "foo").get("field"), "before\r\n--foo-not-a-boundary\r\nafter");
+  assert.equal((await parseMultipart(boundaryLikeData)).get("field"), "before\r\n--foo-not-a-boundary\r\nafter");
 
   const closeBoundaryLikeData = '--foo\r\nContent-Disposition: form-data; name="field"\r\n\r\nbefore\r\n--foo--not-a-boundary\r\nafter\r\n--foo--\r\n';
-  assert.equal(FormData.from(closeBoundaryLikeData, "foo").get("field"), "before\r\n--foo--not-a-boundary\r\nafter");
+  assert.equal((await parseMultipart(closeBoundaryLikeData)).get("field"), "before\r\n--foo--not-a-boundary\r\nafter");
 
   const internalSpaceBoundary = '--foo bar\r\nContent-Disposition: form-data; name="field"\r\n\r\nvalue\r\n--foo bar--\r\n';
-  assert.equal(FormData.from(internalSpaceBoundary, "foo bar").get("field"), "value");
+  assert.equal((await parseMultipart(internalSpaceBoundary, "foo bar")).get("field"), "value");
 
   const paddedDelimiterBody = '--foo \t\r\nContent-Disposition: form-data; name="a"\r\n\r\none\r\n--foo\t\r\nContent-Disposition: form-data; name="b"\r\n\r\ntwo\r\n--foo-- \t\r\n';
-  const paddedDelimiterForm = FormData.from(paddedDelimiterBody, "foo");
+  const paddedDelimiterForm = await parseMultipart(paddedDelimiterBody);
   assert.equal(paddedDelimiterForm.get("a"), "one");
   assert.equal(paddedDelimiterForm.get("b"), "two");
-
-  assert.throws(() => FormData.from(), TypeError);
-  assert.throws(() => FormData.from({}), TypeError);
 });
 
-test("FormData.from rejects malformed multipart boundaries and detached buffers", () => {
+test("form body parsers reject malformed multipart boundaries and framing", async () => {
   const validBody = '--foo\r\nContent-Disposition: form-data; name="field"\r\n\r\nvalue\r\n--foo--\r\n';
-  assertThrowsTypeError("quote boundary", () => FormData.from(validBody, '"'));
-  assertThrowsTypeError("trailing-space boundary", () => FormData.from(validBody, "foo "));
-  assertThrowsTypeError("line-break boundary", () => FormData.from(validBody, "foo\nbar"));
-  assertThrowsTypeError("non-ascii boundary", () => FormData.from(validBody, "f\u00f8\u00f8"));
-  assertThrowsTypeError("semicolon boundary", () => FormData.from(validBody, "foo;bar"));
-  assertThrowsTypeError("missing final boundary", () => FormData.from('--foo\r\nContent-Disposition: form-data; name="field"\r\n\r\nvalue\r\n', "foo"));
-  assertThrowsTypeError("unclosed quote boundary", () => FormData.from("body", "\"abc"));
-  assertThrowsTypeError("malformed filename-star", () => FormData.from('--foo\r\nContent-Disposition: form-data; name="file"; filename*UTF-8\'\'x.txt\r\n\r\nx\r\n--foo--\r\n', "foo"));
-  assertThrowsTypeError("raw newline in name", () => FormData.from('--foo\r\nContent-Disposition: form-data; name="bad\nname"\r\n\r\nx\r\n--foo--\r\n', "foo"));
-  assertThrowsTypeError("unterminated quoted name", () => FormData.from('--foo\r\nContent-Disposition: form-data; name="field\r\n\r\nx\r\n--foo--\r\n', "foo"));
-  assertThrowsTypeError("junk after quoted name", () => FormData.from('--foo\r\nContent-Disposition: form-data; name="field"junk\r\n\r\nx\r\n--foo--\r\n', "foo"));
-  assertThrowsTypeError("close-like opener", () => FormData.from("--foo--not-a-boundary\r\n", "foo"));
-  assertThrowsTypeError("junk before opener", () => FormData.from('junk--foo\r\nContent-Disposition: form-data; name="field"\r\n\r\nvalue\r\n--foo--\r\n', "foo"));
-
-  const buffer = new TextEncoder().encode("x=1").buffer;
-  assertThrowsTypeError("detached ArrayBuffer input", () => FormData.from(buffer, {
-    toString() {
-      structuredClone(buffer, { transfer: [buffer] });
-      return "foo";
-    },
-  }));
-
-  if (typeof ArrayBuffer.prototype.resize === "function")
-    assertThrowsTypeError("resizable ArrayBuffer input", () => FormData.from(new ArrayBuffer(8, { maxByteLength: 8 })));
-
-  if (typeof ArrayBuffer.prototype.resize === "function") {
-    const resizableInputBuffer = new ArrayBuffer(3, { maxByteLength: 3 });
-    const resizableInput = new Uint8Array(resizableInputBuffer);
-    resizableInput.set([120, 61, 49]);
-    assertThrowsTypeError("resizable ArrayBufferView input", () => FormData.from(resizableInput));
-
-    const resizableBoundaryBuffer = new ArrayBuffer(3, { maxByteLength: 3 });
-    const resizableBoundary = new Uint8Array(resizableBoundaryBuffer);
-    resizableBoundary.set([102, 111, 111]);
-    assertThrowsTypeError("resizable ArrayBufferView boundary", () => FormData.from(validBody, resizableBoundary));
-  }
-
-  const viewBacking = new TextEncoder().encode("x=1").buffer;
-  const view = new Uint8Array(viewBacking);
-  assertThrowsTypeError("detached ArrayBufferView input", () => FormData.from(view, {
-    toString() {
-      structuredClone(viewBacking, { transfer: [viewBacking] });
-      return "foo";
-    },
-  }));
+  await assertRejectsTypeError("quote boundary", parseMultipart(validBody, '"'));
+  await assertRejectsTypeError("trailing-space boundary", parseMultipart(validBody, '"foo "'));
+  await assertRejectsTypeError("semicolon boundary", parseMultipart(validBody, '"foo;bar"'));
+  await assertRejectsTypeError("over-long boundary", parseMultipart(validBody, "x".repeat(71)));
+  // A header value may hold Latin-1 characters, which no boundary may.
+  const nonAscii = await assertRejectsTypeError("non-ASCII boundary", parseMultipart(validBody, "føø"));
+  assert.equal(nonAscii.message, "invalid multipart boundary");
+  await assertRejectsTypeError("missing boundary", parseForm(validBody, "multipart/form-data"));
+  await assertRejectsTypeError("missing final boundary", parseMultipart('--foo\r\nContent-Disposition: form-data; name="field"\r\n\r\nvalue\r\n'));
+  await assertRejectsTypeError("unclosed quote boundary", parseMultipart("body", '"abc'));
+  await assertRejectsTypeError("malformed filename-star", parseMultipart('--foo\r\nContent-Disposition: form-data; name="file"; filename*UTF-8\'\'x.txt\r\n\r\nx\r\n--foo--\r\n'));
+  await assertRejectsTypeError("raw newline in name", parseMultipart('--foo\r\nContent-Disposition: form-data; name="bad\nname"\r\n\r\nx\r\n--foo--\r\n'));
+  await assertRejectsTypeError("unterminated quoted name", parseMultipart('--foo\r\nContent-Disposition: form-data; name="field\r\n\r\nx\r\n--foo--\r\n'));
+  await assertRejectsTypeError("junk after quoted name", parseMultipart('--foo\r\nContent-Disposition: form-data; name="field"junk\r\n\r\nx\r\n--foo--\r\n'));
+  await assertRejectsTypeError("close-like opener", parseMultipart("--foo--not-a-boundary\r\n"));
+  await assertRejectsTypeError("junk before opener", parseMultipart('junk--foo\r\nContent-Disposition: form-data; name="field"\r\n\r\nvalue\r\n--foo--\r\n'));
+  await assertRejectsTypeError("not a form type", parseForm("a=1", "text/plain"));
 });
 
-test("FormData.from rejects bodies over the materialized body limit", () => {
+// A Response refuses a body over the limit when it is built; a Blob may hold one, and its formData() refuses it before
+// copying it out.
+test("form body parsers reject bodies over the materialized body limit", async () => {
   const oversized = `a=${"x".repeat(4 * 1024 * 1024)}`;
-  assertThrowsQuota("oversized urlencoded string", () => FormData.from(oversized));
-  assertThrowsQuota("oversized urlencoded blob", () => FormData.from(new Blob([oversized], {
-    type: "application/x-www-form-urlencoded",
-  })));
-  assertThrowsQuota("oversized multipart with explicit boundary", () => FormData.from(oversized, "foo"));
+  for (const type of ["application/x-www-form-urlencoded", "multipart/form-data; boundary=foo"]) {
+    const error = await assertRejectsQuota(type, new Blob([oversized], { type }).formData());
+    assert.equal(error.message, "form data body exceeds the body size limit");
+  }
 });
 
-test("FormData.from caps multipart part and per-part header counts", () => {
+// One entry cap covers both encodings, and a multipart part may carry at most 32 header lines.
+test("form body parsers cap entries and per-part header counts", async () => {
   let manyParts = "";
   for (let i = 0; i < 1001; i++)
     manyParts += `--foo\r\nContent-Disposition: form-data; name="p${i}"\r\n\r\n\r\n`;
   manyParts += "--foo--\r\n";
-  let error = assert.throws(() => FormData.from(manyParts, "foo"), DOMException);
-  assert.equal(error.name, "QuotaExceededError");
+  const partsError = await assertRejectsQuota("1001 multipart parts", parseMultipart(manyParts));
+  assert.equal(partsError.message, "form data entry count exceeded");
+
+  const thousandParts = manyParts.slice(manyParts.indexOf('--foo\r\nContent-Disposition: form-data; name="p1"'));
+  assert.equal((await parseMultipart(thousandParts)).getAll("p1").length, 1);
+
+  const manyPairs = Array.from({ length: 1001 }, (_, i) => `k${i}=v`).join("&");
+  const pairsError = await assertRejectsQuota("1001 urlencoded pairs", parseForm(manyPairs, "application/x-www-form-urlencoded"));
+  assert.equal(pairsError.message, "form data entry count exceeded");
+  const thousandPairs = await parseForm(manyPairs.slice(manyPairs.indexOf("k1=")), "application/x-www-form-urlencoded");
+  assert.equal(Array.from(thousandPairs.keys()).length, 1000);
 
   let headers = 'Content-Disposition: form-data; name="field"\r\n';
   for (let i = 0; i < 32; i++)
     headers += `X-${i}: value\r\n`;
   const manyHeaders = `--foo\r\n${headers}\r\nvalue\r\n--foo--\r\n`;
-  error = assert.throws(() => FormData.from(manyHeaders, "foo"), DOMException);
-  assert.equal(error.name, "QuotaExceededError");
+  await assertRejectsQuota("33 header lines", parseMultipart(manyHeaders));
+});
+
+async function elapsedMs(work) {
+  const start = performance.now();
+  await work();
+  return performance.now() - start;
+}
+
+// Just under the 4 MiB a Response body may hold, and even, so it splits into whole "a&" pairs.
+const nearLimitBodyLength = 4 * 1024 * 1024 - 2;
+
+// The urlencoded parser stops at the first pair past the cap. Parsing every pair before counting them built about two
+// million pairs for a body of tiny ones, against a thousand for a body of the same size whose 1,001st pair holds nearly
+// all of it. Both are refused; the first must now cost no more than a small multiple of the second, plus room for the
+// timer's coarse resolution.
+test("a urlencoded body far past the entry cap is refused at the cap's cost", async () => {
+  const type = "application/x-www-form-urlencoded";
+  const tinyPairs = "a&".repeat(nearLimitBodyLength / 2);
+  const prefix = "a&".repeat(1000) + "b=";
+  const onePastCap = prefix + "x".repeat(nearLimitBodyLength - prefix.length);
+  const refuse = (body) => async () => {
+    const error = await assertRejectsQuota("pairs past the cap", parseForm(body, type));
+    assert.equal(error.message, "form data entry count exceeded");
+  };
+  const baseline = await elapsedMs(refuse(onePastCap));
+  const flood = await elapsedMs(refuse(tinyPairs));
+  assert(flood <= 4 * baseline + 20, `two million pairs took ${flood} ms against ${baseline} ms for 1,001`);
+});
+
+// The opening delimiter is checked at offset 0. A boundary of 70 dashes over a body of dashes matches itself at every
+// byte, so searching the body for an opener with a valid suffix cost about 72 steps per byte, against one per byte for
+// a body of the same size holding no dash. Both are refused; the first must now cost no more than a small multiple of
+// the second, plus room for the timer's coarse resolution.
+test("a multipart body of boundary-like bytes is refused in time linear in its length", async () => {
+  const boundary = "-".repeat(70);
+  const refuse = (body) => () => assertRejectsTypeError("body without an opening delimiter", parseMultipart(body, boundary));
+  const baseline = await elapsedMs(refuse("x".repeat(nearLimitBodyLength)));
+  const dashes = await elapsedMs(refuse("-".repeat(nearLimitBodyLength)));
+  assert(dashes <= 4 * baseline + 20, `a body of dashes took ${dashes} ms against ${baseline} ms for one without`);
 });
 
 test("FormData WebIDL string conversion and arity", () => {
@@ -475,7 +472,7 @@ test("FormData getAll handles many entries", () => {
     form.append("dup", `v${i}`);
     form.append(`unique-${i}`, `u${i}`);
   }
-  assert.equal(form.length, 2000);
+  assert.equal(Array.from(form.keys()).length, 2000);
 
   const all = form.getAll("dup");
   assert.equal(all.length, 1000);
@@ -500,7 +497,7 @@ test("FormData append and set filename overload throws before converting name", 
   assert.equal(conversions, 0, "append must not convert name before overload TypeError");
   assert.throws(() => form.set(name, "value", "file.txt"), TypeError);
   assert.equal(conversions, 0, "set must not convert name before overload TypeError");
-  assert.equal(form.length, 0);
+  assert.equal(Array.from(form).length, 0);
 
   // Valid overloads still convert the name.
   form.append(name, "value");
@@ -552,7 +549,7 @@ test("FormData supports subclass new.target and native receiver brands", () => {
   assert.equal(Object.getPrototypeOf(form), CustomFormData.prototype);
   assert.equal(form.get("a"), "1");
 
-  for (const name of ["append", "delete", "get", "getAll", "has", "set", "forEach", "entries", "keys", "values", "toJSON"])
+  for (const name of ["append", "delete", "get", "getAll", "has", "set", "forEach", "entries", "keys", "values"])
     assert.throws(() => FormData.prototype[name].call({}), TypeError);
 
   const iterator = form.entries();

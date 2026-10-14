@@ -1,22 +1,26 @@
 //! The zygote and its workers against the real kernel (lane
-//! `zygote-integration`, inside the delegated cgroup subtree): zygote boot and
-//! fork, cgroup placement and adoption with every limit on the live leaf, the
-//! WorkerInit handoff and its failures, the sandboxed worker's boot order, its
-//! threads asleep when idle, the footprint its engine reads from its leaf and
-//! its mapped shared objects, a worker with no egress descriptor, workers that
-//! share their host's mount point, the runtime's log lines in a worker's
-//! console ring, the node fs tree and the fs fault channel, module evaluation
-//! at init with its deadline, a worker that loses its egress gateway and is
-//! attached to a new one, wasm after seccomp, and the host's bounded response
-//! reader.
+//! `zygote-integration`, inside the delegated cgroup subtree): zygote boot,
+//! warmup and fork, the zygote's environment, a fork request without a leaf,
+//! cgroup placement with every limit on the live leaf and the child's check
+//! of it, the WorkerInit handoff and its failures with the page left as the
+//! host wrote it, the sandboxed worker's boot order and its trace pipe closed
+//! before tenant code, its threads asleep when idle, the footprint its engine
+//! reads from its leaf and its mapped shared objects, a worker with no egress
+//! descriptor, workers whose `/tmp` the host never sees, a root read-only but
+//! for `/tmp` as `node:fs` sees it, the runtime's log lines and the tenant's
+//! exception in a worker's console ring, module evaluation at init with its
+//! deadline, a worker that loses its egress gateway and is attached to a new
+//! one, wasm after seccomp, and the host's bounded response reader.
 //!
 //! The test thread plays the host against a zygote spawned from the installed
-//! `collo` binary. Most tests launch through `host.launch` and dispatch
-//! through `host.dispatch`, with the runtime harness for requests and
-//! responses; the WorkerInit failure tests send a hand-built WorkerInit
-//! through `zygote.ipc` instead. A test that cannot place a worker skips. The
-//! launch's transitions without a child are in `host/tests/launch.zig`, and
-//! the whole server flow is the `local-e2e` lane.
+//! `collo` binary. Most tests launch through `host.launch` and read
+//! responses through `host.dispatch`; the WorkerInit failure tests hand a
+//! child a hand-built WorkerInit through `zygote.ipc` instead. Every launch
+//! carries a definition of one route or more (`ipc.module_pack`). A test that
+//! cannot place a worker skips. The launch's transitions without a child are
+//! in `host/tests/launch.zig`, the sandbox's own probes in
+//! `zygote/tests/sandbox.zig`, and the whole server flow is the `local-e2e`
+//! lane.
 
 const std = @import("std");
 const os = @import("collo_os");
@@ -26,12 +30,40 @@ const support = @import("zygote_support");
 const fd_mod = os.fd;
 const process = os.process;
 const zygote = support.zygote;
-const fs_index = zygote.ipc.fs_index;
+const ipc = zygote.ipc;
 const host = support.host;
 const worker_cgroup = zygote.worker_boot.cgroup;
 const worker_page = zygote.worker_state.page;
 const rt = @import("collo_test_harness");
 const worker_memory_limit_bytes: u64 = 1024 * 1024 * 1024;
+
+/// One worker definition of one route, sealed as the artifact a launch
+/// carries (`host.dispatch.createModulePackFd`); `deinit` closes it.
+const TestRoute = struct {
+    pack_fd: std.posix.fd_t,
+
+    /// The route's entry is `source`, keyed `<task_root>/<name>.js`.
+    fn init(name: []const u8, source: []const u8) !TestRoute {
+        const specifier = try std.fmt.allocPrint(std.testing.allocator, "{s}/{s}.js", .{
+            ipc.module_pack.task_root,
+            name,
+        });
+        defer std.testing.allocator.free(specifier);
+        return .{ .pack_fd = try host.dispatch.createModulePackFd(std.testing.allocator, specifier, source) };
+    }
+
+    fn deinit(self: *TestRoute) void {
+        std.posix.close(self.pack_fd);
+        self.* = undefined;
+    }
+
+    fn launchRoutes(self: *const TestRoute) host.launch.LaunchRoutes {
+        return .{ .module_pack_fd = self.pack_fd, .isolate_realm = true };
+    }
+};
+
+/// The entry of a route whose behavior a test does not look at.
+const plain_route_source = "export default () => new Response(\"plain\");";
 
 /// Skips the test when this environment cannot place workers at all; every
 /// other launch failure is the test's to judge.
@@ -52,13 +84,109 @@ fn launchOrSkip(
     };
 }
 
-/// The wake descriptors of a WorkerInit sent without a session, as a launch
-/// opens them from a worker's wake set (`WakeSet.openWorkerWake`), here of a
-/// set of their own. The caller closes them once WorkerInit is sent.
-fn detachedWake() !zygote.ipc.egress_shared.WakeFds {
-    var wake_set = try zygote.ipc.egress_shared.WakeSet.create();
-    defer wake_set.deinit();
-    return wake_set.openWorkerWake();
+/// `support.forkBareChild` with the test's memory limit, skipping where
+/// workers cannot be placed.
+fn forkBareOrSkip(spawned: *zygote.host_client.SpawnedZygote, fork_job_id: u64) !support.BareChild {
+    return support.forkBareChild(std.testing.allocator, spawned, worker_memory_limit_bytes, fork_job_id) catch |err| switch (err) {
+        error.WorkerCgroupDelegationUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+}
+
+/// Which descriptors `countDescriptors` counts.
+const DescriptorMatch = union(enum) {
+    /// Every pipe.
+    any_pipe,
+    /// The one open file whose `/proc/<pid>/fd` link this is, such as
+    /// `pipeLink` gives.
+    link: []const u8,
+};
+
+/// How many of process `pid`'s descriptors from `first_fd` up match
+/// `match`, read from `/proc/<pid>/fd`.
+fn countDescriptors(pid: u32, first_fd: std.posix.fd_t, match: DescriptorMatch) !usize {
+    var path_buffer: [32]u8 = undefined;
+    const fd_dir_path = try std.fmt.bufPrint(&path_buffer, "/proc/{d}/fd", .{pid});
+    var dir = try std.fs.openDirAbsolute(fd_dir_path, .{ .iterate = true });
+    defer dir.close();
+    var count: usize = 0;
+    var entries = dir.iterate();
+    while (try entries.next()) |entry| {
+        if (try std.fmt.parseInt(std.posix.fd_t, entry.name, 10) < first_fd)
+            continue;
+        var target_buffer: [64]u8 = undefined;
+        const target = dir.readLink(entry.name, &target_buffer) catch |err| switch (err) {
+            // Closed between the listing and the read.
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        const matched = switch (match) {
+            .any_pipe => std.mem.startsWith(u8, target, "pipe:"),
+            .link => |link| std.mem.eql(u8, target, link),
+        };
+        if (matched)
+            count += 1;
+    }
+    return count;
+}
+
+/// The link of process `pid`'s descriptor `fd` in `/proc/<pid>/fd`, written
+/// into `buffer`; null when the process has no such descriptor.
+fn descriptorLink(pid: u32, fd: std.posix.fd_t, buffer: []u8) !?[]const u8 {
+    var path_buffer: [48]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, "/proc/{d}/fd/{d}", .{ pid, fd });
+    return std.posix.readlink(path, buffer) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+}
+
+/// The `/proc/<pid>/fd` link of the pipe one of whose ends is this
+/// process's `fd`, `pipe:[<inode>]`, written into `buffer`. Every descriptor
+/// of either end, in any process, has the same link.
+fn pipeLink(fd: std.posix.fd_t, buffer: []u8) ![]const u8 {
+    const stat = try std.posix.fstat(fd);
+    return std.fmt.bufPrint(buffer, "pipe:[{d}]", .{stat.ino});
+}
+
+/// Spawns a zygote, with the trace pipe when `trace` is set, whose standard
+/// input is a pipe, as a piped `zig build` hands it one, and gives the test
+/// process its own standard input back before returning. A zygote keeps its
+/// spawner's standard descriptors (`common/os.zig:spawnInternal`), so a test
+/// of the zygote's pipes has to tell its trace pipe from them.
+fn spawnWithPipedStandardInput(trace: bool) !zygote.host_client.SpawnedZygote {
+    const linux = std.os.linux;
+    const pipe = try std.posix.pipe2(.{ .CLOEXEC = true });
+    defer std.posix.close(pipe[0]);
+    defer std.posix.close(pipe[1]);
+    // F_DUPFD_CLOEXEC, the same number on every Linux target.
+    const f_dupfd_cloexec: i32 = 1030;
+    const saved_rc = linux.fcntl(0, f_dupfd_cloexec, 3);
+    const saved_stdin: ?std.posix.fd_t = switch (linux.E.init(saved_rc)) {
+        .SUCCESS => @intCast(saved_rc),
+        // The test process runs with its standard input closed.
+        .BADF => null,
+        else => |errno| return std.posix.unexpectedErrno(errno),
+    };
+    // The test process reads nothing from its standard input while the
+    // pipe stands in for it.
+    std.posix.dup2(pipe[0], 0) catch |err| {
+        if (saved_stdin) |fd|
+            std.posix.close(fd);
+        return err;
+    };
+    defer {
+        if (saved_stdin) |fd| {
+            // `std.posix.dup2` retries the kernel's transient errors, and a
+            // target that is open leaves it no other.
+            std.posix.dup2(fd, 0) catch |err|
+                std.debug.panic("the test's standard input cannot be restored: {s}", .{@errorName(err)});
+            std.posix.close(fd);
+        } else {
+            std.posix.close(0);
+        }
+    }
+    return if (trace) support.spawnZygote() else support.spawnZygoteWithoutTrace();
 }
 
 test "spawned zygote owns a pidfd and deinit observes exit" {
@@ -77,60 +205,17 @@ test "spawned zygote owns a pidfd and deinit observes exit" {
     try support.waitForPidFdExit(pidfd);
 }
 
-test "prepare_for_fork runs once at boot and zygote stays prepared across fork requests" {
+test "the zygote warms up and prepares once at boot, and stays prepared across fork requests" {
+    // The warmup always runs, in this zygote as in the server's, and before
+    // prepareForFork, so its helper threads retire within the short idle
+    // timeout. A corpus exception would fail the boot and every launch.
     var spawned = try support.spawnZygote();
     defer spawned.deinit();
 
-    var first = try zygote.host_client.requestFork(&spawned);
-    var first_armed = true;
-    defer if (first_armed) first.deinit();
-    const first_pidfd = try process.openPidFd(first.pid);
-    defer std.posix.close(first_pidfd);
-
-    first_armed = false;
+    var first = try forkBareOrSkip(&spawned, 90_001);
     first.deinit();
-    try support.waitForPidFdExit(first_pidfd);
-
-    var second = try zygote.host_client.requestFork(&spawned);
-    var second_armed = true;
-    defer if (second_armed) second.deinit();
-    const second_pidfd = try process.openPidFd(second.pid);
-    defer std.posix.close(second_pidfd);
-
-    second_armed = false;
+    var second = try forkBareOrSkip(&spawned, 90_002);
     second.deinit();
-    try support.waitForPidFdExit(second_pidfd);
-
-    spawned.shutdown();
-    try support.expectChildExitStatus(spawned.pid, 0);
-
-    var trace = try support.drainTrace(&spawned, std.testing.allocator);
-    defer trace.deinit();
-
-    try std.testing.expectEqual(@as(usize, 1), trace.countEq("zygote.prepare_for_fork"));
-    try std.testing.expectEqual(@as(usize, 1), trace.countEq("zygote.prepared"));
-    try std.testing.expectEqual(@as(usize, 2), trace.countEq("zygote.fork_request"));
-}
-
-test "zygote boots with the warmup corpus enabled, prepares once, and still forks" {
-    // The server always runs the warmup corpus; every other test runs it off.
-    // A corpus exception fails the zygote's boot, which stops every worker
-    // launch on the node, so this checks that the zygote still serves a fork
-    // after the corpus ran and that prepare_for_fork ran once: the corpus
-    // runs before prepareForFork, and both run once at boot.
-    var spawned = try support.spawnZygoteWithWarmupCorpus();
-    defer spawned.deinit();
-
-    var worker = try zygote.host_client.requestFork(&spawned);
-    defer worker.deinit();
-
-    const worker_pidfd = try std.posix.dup(worker.pidfd.?);
-    defer std.posix.close(worker_pidfd);
-
-    // No WorkerInit follows, so the child stops waiting after
-    // `worker_init_timeout_ms` and exits; that it was forked at all proves
-    // the zygote booted with the corpus and is serving.
-    try std.testing.expect(try process.waitForPidFdExit(worker_pidfd, 3_500));
 
     spawned.shutdown();
     try support.expectChildExitStatus(spawned.pid, 0);
@@ -141,216 +226,103 @@ test "zygote boots with the warmup corpus enabled, prepares once, and still fork
     try std.testing.expectEqual(@as(usize, 1), trace.countEq("zygote.warmup_corpus.done"));
     try std.testing.expectEqual(@as(usize, 1), trace.countEq("zygote.prepare_for_fork"));
     try std.testing.expectEqual(@as(usize, 1), trace.countEq("zygote.prepared"));
-    // The corpus runs before the fork barrier: warmup finishes, then the
-    // zygote declares itself prepared.
+    try std.testing.expectEqual(@as(usize, 2), trace.countEq("zygote.fork_request"));
     try support.expectTraceBefore(trace, "zygote.warmup_corpus.done", "zygote.prepared");
 }
 
-test "worker adopts a host-prepared worker-<job_id> cgroup and deletes it on teardown" {
-    // The production placement: a leaf created by the host before the fork,
-    // entered by CLONE_INTO_CGROUP, adopted after it. Pins single-member
-    // enforcement, the limit rewrite at adoption, and the delete on teardown.
-    var root = support.cgroupRoot(std.testing.allocator) catch |err| switch (err) {
-        error.WorkerCgroupDelegationUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer root.deinit(std.testing.allocator);
-
+test "the zygote's environment is exactly its launch contract's, and its workers inherit it" {
     var spawned = try support.spawnZygote();
     defer spawned.deinit();
+    try expectLaunchEnvironment(spawned.pid);
 
-    // Reserve a fork job id and create and configure its own cgroup, as the
-    // server's launcher does before every fork (`server/supervisor/launcher.zig`).
-    // The prepared cgroup carries a different limit than the launch's below,
-    // so a passing memory.max assertion proves the adoption rewrote it.
-    const fork_job_id: u64 = 90_001;
-    const prepared_limit_bytes: u64 = 2 * worker_memory_limit_bytes;
-    const prepared_fd = root.createWorkerDir(fork_job_id, .{
-        .memory_limit_bytes = prepared_limit_bytes,
-    }) catch return error.SkipZigTest;
-    var prepared_fd_owned = true;
-    errdefer if (prepared_fd_owned) {
-        std.posix.close(prepared_fd);
-        root.removeWorkerDir(fork_job_id);
-    };
-
-    // The child is born inside the prepared cgroup via CLONE_INTO_CGROUP.
-    var worker = try zygote.host_client.requestForkWithJobId(&spawned, fork_job_id, prepared_fd);
-    worker.fork_job_id = fork_job_id;
-    worker.cgroup_dir_fd = prepared_fd;
-    prepared_fd_owned = false;
-    var worker_armed = true;
-    defer if (worker_armed) worker.deinit();
-
-    var wake_set = try zygote.ipc.egress_shared.WakeSet.create();
-    defer wake_set.deinit();
-    var egress_shared = try zygote.ipc.egress_shared.createSessionForWorker(&wake_set);
-    defer egress_shared.deinit();
-    var tmp_mount: host.TmpMountPoint = undefined;
-    try tmp_mount.init(host.tmp_mount.default_parent_dir);
-    defer tmp_mount.deinit();
-
-    var handle = try host.runToReady(
-        std.testing.allocator,
-        &spawned,
-        &worker,
-        worker_memory_limit_bytes,
-        .{
-            .egress = .{ .attached = .{
-                .shared_fds = egress_shared.rawForWorker(),
-                .boot = rt.localBootEgress(),
-            } },
-            .tmp_mount_point_fd = tmp_mount.fd(),
-        },
-    );
-    var handle_armed = true;
-    defer if (handle_armed) handle.deinit();
-
-    // The resolved cgroup is the prepared worker-<id> leaf under the root's
-    // workers directory.
-    const expected_leaf = try std.fmt.allocPrint(std.testing.allocator, "worker-{d}", .{fork_job_id});
-    defer std.testing.allocator.free(expected_leaf);
-    try std.testing.expect(std.mem.endsWith(u8, handle.cgroup_dir, expected_leaf));
-    try std.testing.expect(std.mem.startsWith(u8, handle.cgroup_dir, root.workers_dir_path));
-
-    const expected_cgroup_dir = try std.testing.allocator.dupe(u8, handle.cgroup_dir);
-    defer std.testing.allocator.free(expected_cgroup_dir);
-
-    // The worker is the cgroup's only member: born inside it, nothing else
-    // ever joins.
-    const cgroup_procs_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/cgroup.procs", .{handle.cgroup_dir});
-    defer std.testing.allocator.free(cgroup_procs_path);
-    const cgroup_procs = try support.readFileAlloc(cgroup_procs_path, std.testing.allocator);
-    defer std.testing.allocator.free(cgroup_procs);
-    const pid_string = try std.fmt.allocPrint(std.testing.allocator, "{d}", .{worker.pid});
-    defer std.testing.allocator.free(pid_string);
-    try std.testing.expect(std.mem.containsAtLeast(u8, cgroup_procs, 1, pid_string));
-    try std.testing.expectEqualStrings(
-        pid_string,
-        std.mem.trim(u8, cgroup_procs, &std.ascii.whitespace),
-    );
-
-    // Adoption rewrote the create-time limit to the launch's: memory.high
-    // carries the limit itself and memory.max the kill headroom above it
-    // (`memory.maxBytes`), neither derived from the doubled create-time limit.
-    const memory_high_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/memory.high", .{handle.cgroup_dir});
-    defer std.testing.allocator.free(memory_high_path);
-    try std.testing.expectEqual(worker_memory_limit_bytes, try support.readUnsignedFile(memory_high_path));
-    const memory_max_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/memory.max", .{handle.cgroup_dir});
-    defer std.testing.allocator.free(memory_max_path);
-    try std.testing.expectEqual(
-        worker_cgroup.memory.maxBytes(worker_memory_limit_bytes),
-        try support.readUnsignedFile(memory_max_path),
-    );
-    // A worker never swaps: the leaf's `memory.swap.max` is 0 wherever the
-    // kernel accounts swap, and the file is absent where it does not.
-    const swap_max_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/memory.swap.max", .{handle.cgroup_dir});
-    defer std.testing.allocator.free(swap_max_path);
-    if (support.readFileAlloc(swap_max_path, std.testing.allocator)) |swap_max| {
-        defer std.testing.allocator.free(swap_max);
-        try std.testing.expectEqualStrings("0", std.mem.trim(u8, swap_max, &std.ascii.whitespace));
-    } else |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
-    }
-
-    const worker_pidfd = try std.posix.dup(handle.pidfd);
-    defer std.posix.close(worker_pidfd);
-
-    // Teardown deletes the prepared leaf.
-    handle_armed = false;
-    handle.deinit();
-    try support.waitForPidFdExit(worker_pidfd);
-    try std.testing.expectError(error.FileNotFound, std.fs.accessAbsolute(expected_cgroup_dir, .{}));
-
-    worker_armed = false;
-    worker.deinit();
-
-    spawned.shutdown();
-    try support.expectChildExitStatus(spawned.pid, 0);
+    var route = try TestRoute.init("environment", plain_route_source);
+    defer route.deinit();
+    var launched = try launchOrSkip(&spawned, 90_003, .{ .routes = route.launchRoutes() });
+    defer launched.deinit();
+    try expectLaunchEnvironment(launched.handle.pid);
 }
 
-test "independent runtime gate: prepared cgroup child serves sealed hello-world and exits" {
-    // A worker born into a leaf prepared with the limits it is launched with
-    // is the leaf's only member, serves one request from a sealed route pack,
-    // and on teardown exits and leaves no leaf behind.
-    var root = support.cgroupRoot(std.testing.allocator) catch |err| switch (err) {
-        error.WorkerCgroupDelegationUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer root.deinit(std.testing.allocator);
+/// Fails unless process `pid`'s environment is `zygote.fork_loop.environment`
+/// entry for entry.
+fn expectLaunchEnvironment(pid: u32) !void {
+    var path_buffer: [32]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, "/proc/{d}/environ", .{pid});
+    const environ = try support.readFileAlloc(path, std.testing.allocator);
+    defer std.testing.allocator.free(environ);
+    var entries = std.mem.splitScalar(u8, std.mem.trimEnd(u8, environ, "\x00"), 0);
+    for (zygote.fork_loop.environment) |expected| {
+        const entry = entries.next() orelse return error.EnvironmentEntryMissing;
+        try std.testing.expectEqualStrings(std.mem.span(expected.?), entry);
+    }
+    if (entries.next()) |extra| {
+        std.debug.print("process {d} holds an environment entry beyond the contract: {s}\n", .{ pid, extra });
+        return error.UnexpectedEnvironmentEntry;
+    }
+}
 
+test "a fork request without a leaf ends the zygote before any fork" {
+    // Every child is born inside a leaf, so the receive refuses a request
+    // without exactly one, and the zygote ends rather than fork into its own
+    // cgroup.
     var spawned = try support.spawnZygote();
     defer spawned.deinit();
 
-    var wake_set = try zygote.ipc.egress_shared.WakeSet.create();
-    defer wake_set.deinit();
-    var egress_shared = try zygote.ipc.egress_shared.createSessionForWorker(&wake_set);
-    defer egress_shared.deinit();
+    const request = ipc.ForkRequest.init(90_004);
+    try ipc.packet.sendExact(spawned.control_fd.?, std.mem.asBytes(&request));
+    try std.testing.expectError(error.ZygoteDied, zygote.host_client.receiveForkReply(&spawned, 90_004));
+    try support.waitForPidFdExit(spawned.pidfd);
+    try support.expectChildExitStatus(spawned.pid, 1);
 
-    const fork_job_id: u64 = 90_002;
-    const expected_cgroup_dir = try std.fmt.allocPrint(
-        std.testing.allocator,
-        "{s}/worker-{d}",
-        .{ root.workers_dir_path, fork_job_id },
-    );
-    defer std.testing.allocator.free(expected_cgroup_dir);
+    var trace = try support.drainTrace(&spawned, std.testing.allocator);
+    defer trace.deinit();
+    try std.testing.expectEqual(@as(usize, 0), trace.countEq("zygote.fork_request"));
+    try std.testing.expect(!trace.containsPrefix("zygote.fork_reply="));
+}
 
-    const prepared_fd = root.createWorkerDir(fork_job_id, .{
-        .memory_limit_bytes = worker_memory_limit_bytes,
-    }) catch return error.SkipZigTest;
-    errdefer root.removeWorkerDir(fork_job_id);
-    var prepared_fd_owned = true;
-    errdefer if (prepared_fd_owned) std.posix.close(prepared_fd);
+test "a worker born into its prepared leaf is its only member, finds every limit the launch set, serves, and its teardown removes the leaf" {
+    var spawned = try support.spawnZygote();
+    defer spawned.deinit();
 
-    var worker = try zygote.host_client.requestForkWithJobId(&spawned, fork_job_id, prepared_fd);
-    worker.fork_job_id = fork_job_id;
-    worker.cgroup_dir_fd = prepared_fd;
-    prepared_fd_owned = false;
-    defer {
-        if (worker.pidfd != null) {
-            host.terminateForkedWorkerBestEffort(&worker);
-        } else {
-            worker.deinit();
-        }
-    }
-
-    const route_specifier = "/__collo_route/test/independent-runtime-hello.js";
-    const source =
+    var route = try TestRoute.init("leaf-hello",
         \\export default function handle(request) {
         \\  return new Response("Hello, world! " + request.method);
         \\}
-    ;
-    const route_fd = try rt.createModulePackFd(route_specifier, source);
-    defer std.posix.close(route_fd);
-    var route = try rt.SingleRoute.init(route_fd, route_specifier);
-    defer route.deinit();
-    var tmp_mount: host.TmpMountPoint = undefined;
-    try tmp_mount.init(host.tmp_mount.default_parent_dir);
-    defer tmp_mount.deinit();
-
-    var gate_handle = try host.runToReady(
-        std.testing.allocator,
-        &spawned,
-        &worker,
-        worker_memory_limit_bytes,
-        .{
-            .egress = .{ .attached = .{
-                .shared_fds = egress_shared.rawForWorker(),
-                .boot = rt.localBootEgress(),
-            } },
-            .tmp_mount_point_fd = tmp_mount.fd(),
-            .routes = route.launchRoutes(),
-        },
     );
-    var handle_armed = true;
-    defer if (handle_armed) gate_handle.deinit();
+    defer route.deinit();
+    var wake_set = try ipc.egress_shared.WakeSet.create();
+    defer wake_set.deinit();
+    var egress_shared = try ipc.egress_shared.createSessionForWorker(&wake_set);
+    defer egress_shared.deinit();
+    var launched = try launchOrSkip(&spawned, 90_005, .{
+        .egress = .{ .attached = .{
+            .shared_fds = egress_shared.rawForWorker(),
+            .boot = rt.localBootEgress(),
+        } },
+        .routes = route.launchRoutes(),
+    });
+    defer launched.deinit();
+    const handle = &launched.handle;
+    const leaf = handle.leaf;
 
-    // The live leaf carries every limit the launch set, `memory.swap.max` 0
-    // included where the kernel accounts swap.
-    try std.testing.expectEqualStrings(expected_cgroup_dir, gate_handle.cgroup_dir);
+    // Born inside the leaf and never joined by anything else.
+    var procs_buffer: [64]u8 = undefined;
+    const procs = try leaf.readFile("cgroup.procs", &procs_buffer);
+    var pid_buffer: [10]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        try std.fmt.bufPrint(&pid_buffer, "{d}", .{handle.pid}),
+        std.mem.trim(u8, procs, &std.ascii.whitespace),
+    );
+    // Every limit the launch wrote, `memory.swap.max` 0 included where the
+    // kernel accounts swap, the same ones the child checked before its VM
+    // resumed.
+    try std.testing.expectEqual(worker_memory_limit_bytes, try support.readLeafUnsigned(leaf, "memory.high"));
+    try std.testing.expectEqual(
+        worker_cgroup.memory.maxBytes(worker_memory_limit_bytes),
+        try support.readLeafUnsigned(leaf, "memory.max"),
+    );
     {
-        const leaf_fd = try std.posix.open(gate_handle.cgroup_dir, .{
+        var name_buffer: [host.WorkerLeaf.name_bytes_max]u8 = undefined;
+        const leaf_fd = try std.posix.openat(leaf.workers_dir_fd, leaf.name(&name_buffer), .{
             .ACCMODE = .RDONLY,
             .DIRECTORY = true,
             .CLOEXEC = true,
@@ -359,80 +331,107 @@ test "independent runtime gate: prepared cgroup child serves sealed hello-world 
         try worker_cgroup.worker.validateLimitsAt(leaf_fd, .{ .memory_limit_bytes = worker_memory_limit_bytes });
     }
 
-    const cgroup_procs_path = try std.fmt.allocPrint(
-        std.testing.allocator,
-        "{s}/cgroup.procs",
-        .{gate_handle.cgroup_dir},
-    );
-    defer std.testing.allocator.free(cgroup_procs_path);
-    const cgroup_procs = try support.readFileAlloc(cgroup_procs_path, std.testing.allocator);
-    defer std.testing.allocator.free(cgroup_procs);
-    var pid_buffer: [10]u8 = undefined;
-    const pid_string = try std.fmt.bufPrint(&pid_buffer, "{d}", .{worker.pid});
-    try std.testing.expectEqualStrings(
-        pid_string,
-        std.mem.trim(u8, cgroup_procs, &std.ascii.whitespace),
-    );
-
-    const request_id: u64 = 90_002;
     const request = rt.RequestParts{ .method = "GET", .path = "/hello" };
     var dispatch = try rt.initDispatchWork(std.testing.allocator, .{
-        .request_id = request_id,
+        .request_id = 90_005,
         .deadline_monotonic_ns = try forkedDeadlineNs(),
         .request = request,
     });
     defer dispatch.deinit();
-    try rt.sendIngressRoute(gate_handle.control_fd, &dispatch, 1, request);
-    var response = try readForkedIngressResponse(&gate_handle, request_id, 8_000);
+    try rt.sendIngressRoute(handle.control_fd, &dispatch, 1, request);
+    var response = try readForkedIngressResponse(handle, 90_005, 8_000);
     defer response.deinit();
     try std.testing.expectEqual(@as(u16, 200), response.status);
-    try std.testing.expectEqual(zygote.ipc.RequestDoneStatus.ok, response.doneStatus());
+    try std.testing.expectEqual(ipc.RequestDoneStatus.ok, response.done.status);
     try std.testing.expectEqualStrings("Hello, world! GET", response.body);
-    try std.testing.expect(!process.pidFdHasExited(gate_handle.pidfd));
 
-    var worker_pidfd = try fd_mod.OwnedFd.dupCloexec(gate_handle.pidfd);
+    var worker_pidfd = try fd_mod.OwnedFd.dupCloexec(handle.pidfd);
     defer worker_pidfd.deinit();
-    handle_armed = false;
-    gate_handle.deinit();
+    launched.stopWorker();
     try support.waitForPidFdExit(worker_pidfd.fd());
-    try std.testing.expectError(error.FileNotFound, std.fs.accessAbsolute(expected_cgroup_dir, .{}));
+    try std.testing.expectError(error.FileNotFound, leaf.openFile("cgroup.procs"));
 }
 
-test "a worker refuses a request begin that carries a file descriptor and stops" {
-    // The pack reached the worker in WorkerInit, so no ingress packet
-    // may carry a descriptor. A request begin with the pack attached fails to
+test "a leaf whose limits differ from WorkerInit's fails the child's one check, and the launch leaves no leaf behind" {
+    // The host never reads a leaf back: the child's pass over its leaf is
+    // what refuses limits nobody meant to set.
+    var spawned = try support.spawnZygote();
+    defer spawned.deinit();
+    var root = support.cgroupRoot(std.testing.allocator) catch |err| switch (err) {
+        error.WorkerCgroupDelegationUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer root.deinit(std.testing.allocator);
+    var route = try TestRoute.init("leaf-mismatch", plain_route_source);
+    defer route.deinit();
+    var wake_set = try ipc.egress_shared.WakeSet.create();
+    defer wake_set.deinit();
+
+    const fork_job_id: u64 = 90_006;
+    const leaf_fd = try root.createWorkerDir(fork_job_id, .{ .memory_limit_bytes = 2 * worker_memory_limit_bytes });
+    var machine = host.launch.Machine.init(root.leaf(fork_job_id), leaf_fd, spawned.trace_write_fd);
+    var forked = support.requestFork(&spawned, fork_job_id, leaf_fd) catch |err| {
+        var abandoned = machine.abandon();
+        abandoned.reap();
+        return err;
+    };
+    defer forked.deinit();
+    const options: host.LaunchOptions = .{
+        .memory_limit_bytes = worker_memory_limit_bytes,
+        .egress = .{ .detached = &wake_set },
+        .routes = route.launchRoutes(),
+    };
+    if (host.runToReady(&machine, &forked, &options)) |handle_value| {
+        var handle = handle_value;
+        handle.deinit();
+        return error.UnexpectedWorkerReady;
+    } else |err| {
+        if (err != error.WorkerInitFailed)
+            return err;
+    }
+    const failure = machine.init_failure orelse return error.MissingInitFailure;
+    switch (failure) {
+        .reported => |reason| try std.testing.expectEqual(ipc.WorkerInitFailedReason.invalid_worker_init, reason),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectError(error.FileNotFound, root.leaf(fork_job_id).openFile("cgroup.procs"));
+
+    var trace = try support.drainTrace(&spawned, std.testing.allocator);
+    defer trace.deinit();
+    try std.testing.expect(trace.containsPrefix("child.boot_failed="));
+    try std.testing.expect(!trace.containsPrefix("child.cgroup.validated"));
+}
+
+test "a worker refuses a request begin that carries a file descriptor, stops, and logs why in its console ring" {
+    // The definition reached the worker in WorkerInit, so no ingress packet
+    // may carry a descriptor. A request begin with one attached fails to
     // decode in the worker's control loop, which ends the worker before any
     // handler runs.
     var spawned = try support.spawnZygote();
     defer spawned.deinit();
 
-    const route_specifier = "/__collo_route/test/descriptor-refused.js";
-    const route_fd = try rt.createModulePackFd(route_specifier,
+    var route = try TestRoute.init("descriptor-refused",
         \\export default function handle() {
         \\  return new Response("served");
         \\}
     );
-    defer std.posix.close(route_fd);
-    var route = try rt.SingleRoute.init(route_fd, route_specifier);
     defer route.deinit();
-    var launched = try launchOrSkip(&spawned, 90_019, .{
-        .routes = route.launchRoutes(),
-    });
+    var launched = try launchOrSkip(&spawned, 90_007, .{ .routes = route.launchRoutes() });
     defer launched.deinit();
     const handle = &launched.handle;
 
     var dispatch = try rt.initDispatchWork(std.testing.allocator, .{
-        .request_id = 90_019,
+        .request_id = 90_007,
         .deadline_monotonic_ns = try forkedDeadlineNs(),
     });
     defer dispatch.deinit();
-    const payload_scratch = try std.testing.allocator.alloc(u8, zygote.ipc.max_message_bytes);
+    const payload_scratch = try std.testing.allocator.alloc(u8, ipc.max_message_bytes);
     defer std.testing.allocator.free(payload_scratch);
     var view = dispatch.view();
-    const payload = try zygote.ipc.encodeDispatchWorkInto(payload_scratch, &view);
-    const packet_scratch = try std.testing.allocator.alloc(u8, zygote.ipc.max_message_bytes);
+    const payload = try ipc.encodeDispatchWorkInto(payload_scratch, &view);
+    const packet_scratch = try std.testing.allocator.alloc(u8, ipc.max_message_bytes);
     defer std.testing.allocator.free(packet_scratch);
-    const begin = zygote.ipc.ingress_channel.Descriptor.requestBegin(
+    const begin = ipc.ingress_channel.Descriptor.requestBegin(
         .{
             .request_id = dispatch.request_id,
             .request_generation = dispatch.request_generation,
@@ -445,137 +444,175 @@ test "a worker refuses a request begin that carries a file descriptor and stops"
         @intCast(dispatch.request_headers.len),
         true,
     );
-    const encoded = try zygote.ipc.ingress_channel.encodeDescriptorPayloadInto(packet_scratch, begin, payload);
-    try zygote.ipc.packet.sendWithFds(handle.control_fd, encoded, &.{route_fd});
+    const encoded = try ipc.ingress_channel.encodeDescriptorPayloadInto(packet_scratch, begin, payload);
+    try ipc.packet.sendWithFds(handle.control_fd, encoded, &.{route.pack_fd});
 
     try support.waitForPidFdExit(handle.pidfd);
     // The init socket became the control socket at WorkerReady, so the
     // failed loop leaves nothing on it, a WorkerInitFailed least of all.
-    try std.testing.expectError(error.PeerClosed, zygote.ipc.recvInitOutcome(handle.control_fd));
-    var trace = try support.drainTrace(&spawned, std.testing.allocator);
-    defer trace.deinit();
-    try std.testing.expect(trace.containsPrefix("worker.scheduler.failed=InvalidPacket"));
+    try std.testing.expectError(error.PeerClosed, ipc.recvInitOutcome(handle.control_fd));
+    // The worker's stderr is /dev/null, so its last word reaches the host
+    // only through its page's console ring, as the runtime's line.
+    const lines = try drainConsoleLines(std.testing.allocator, &handle.metrics.?);
+    defer freeConsoleLines(std.testing.allocator, lines);
+    var found = false;
+    for (lines) |line| {
+        if (line.header.flags & worker_page.LogLineFlags.runtime == 0)
+            continue;
+        if (std.mem.indexOf(u8, line.text, "worker event loop failed: ") != null)
+            found = true;
+    }
+    if (!found) {
+        std.debug.print("no runtime line in the console ring names the refused packet ({d} lines)\n", .{lines.len});
+        return error.TestUnexpectedResult;
+    }
 }
 
 test "worker self-timeout without WorkerInit" {
     var spawned = try support.spawnZygote();
     defer spawned.deinit();
 
-    var worker = try zygote.host_client.requestFork(&spawned);
-    defer worker.deinit();
+    var child = try forkBareOrSkip(&spawned, 90_008);
+    defer child.deinit();
 
-    const worker_pidfd = try std.posix.dup(worker.pidfd.?);
-    defer std.posix.close(worker_pidfd);
-
-    // The child stops waiting for WorkerInit after `worker_init_timeout_ms`,
+    // The child stops waiting for WorkerInit after `WORKER_INIT_TIMEOUT_MS`,
     // and this wait outlasts it.
-    try std.testing.expect(try process.waitForPidFdExit(worker_pidfd, 3_500));
-
-    spawned.shutdown();
-    try support.expectChildExitStatus(spawned.pid, 0);
+    try std.testing.expect(try process.waitForPidFdExit(child.pidfd(), limits.process.WORKER_INIT_TIMEOUT_MS + 500));
 
     var trace = try support.drainTrace(&spawned, std.testing.allocator);
     defer trace.deinit();
     try std.testing.expect(trace.containsPrefix("child.worker_init.timeout"));
+    // A child whose WorkerInit never came owes no outcome.
+    try std.testing.expectError(error.PeerClosed, ipc.recvInitOutcome(child.initFd()));
 }
 
-test "valid worker init reseeds immediately, applies sandbox, starts poll loop, and starts sentinel before ready" {
+test "a worker crosses the sandbox in order, closes its trace pipe before tenant code and stamps the rest on its page" {
     var spawned = try support.spawnZygote();
     defer spawned.deinit();
 
-    const fork_job_id: u64 = 90_003;
+    var route = try TestRoute.init("boot-order", plain_route_source);
+    defer route.deinit();
     // An initialized worker has no self-timeout, so a failed assertion must
-    // still tear it down; the worker itself is stopped mid-test so the
-    // post-cleanup assertions can look at what it left behind.
-    var launched = try launchOrSkip(&spawned, fork_job_id, .{});
+    // still tear it down; the worker itself is stopped mid-test so the trace
+    // holds everything it wrote.
+    var launched = try launchOrSkip(&spawned, 90_009, .{ .routes = route.launchRoutes() });
     defer launched.deinit();
     const handle = &launched.handle;
-    // The worker lives in the leaf prepared for its fork job under the root.
-    const expected_cgroup_dir = try std.fmt.allocPrint(
-        std.testing.allocator,
-        "{s}/worker-{d}",
-        .{ launched.root.workers_dir_path, fork_job_id },
-    );
-    defer std.testing.allocator.free(expected_cgroup_dir);
-    try std.testing.expectEqualStrings(expected_cgroup_dir, handle.cgroup_dir);
 
-    const worker_pidfd = try std.posix.dup(handle.pidfd);
-    defer std.posix.close(worker_pidfd);
+    // The host's map checked the page's version.
+    const page = &handle.metrics.?;
+    const lifecycle = page.loadLifecycle();
+    try std.testing.expectEqual(@as(?worker_page.State, .ready), lifecycle.knownState());
+    try std.testing.expectEqual(@as(?worker_page.TerminationReason, .none), lifecycle.knownTerminationReason());
+    // No request was dispatched, so no live slot names one.
+    for (0..worker_page.LIVE_SLOT_COUNT) |index|
+        try std.testing.expectEqual(@as(u64, 0), page.loadLiveSlot(index).request_id);
+    // The phases after the trace closed reach the host through the page,
+    // read here as soon as `WorkerReady` arrived, as the launcher reads it,
+    // so the last stamp is already there.
+    try std.testing.expect(page.loadBootPhaseStampNs(.seccomp_applied) != 0);
+    try std.testing.expect(page.loadBootPhaseStampNs(.routes_evaluated) >= page.loadBootPhaseStampNs(.seccomp_applied));
+    try std.testing.expect(page.loadBootPhaseStampNs(.ready) >= page.loadBootPhaseStampNs(.routes_evaluated));
 
-    const metrics = handle.metrics.?;
-    try std.testing.expectEqual(zygote.worker_state.page.VERSION, metrics.header.version);
-    try std.testing.expectEqual(@intFromEnum(zygote.worker_state.page.State.ready), metrics.header.state);
-    try std.testing.expectEqual(@intFromEnum(zygote.worker_state.page.TerminationReason.none), metrics.header.termination_reason);
-    for (metrics.live_slots) |slot|
-        try std.testing.expectEqual(@intFromEnum(zygote.worker_state.page.LiveSlotState.empty), slot.state);
-
-    const memory_events_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/memory.events.local", .{handle.cgroup_dir});
-    defer std.testing.allocator.free(memory_events_path);
-    const memory_events = try support.readFileAlloc(memory_events_path, std.testing.allocator);
-    defer std.testing.allocator.free(memory_events);
+    var events_buffer: [256]u8 = undefined;
+    const memory_events = try handle.leaf.readFile("memory.events.local", &events_buffer);
     try std.testing.expect(std.mem.containsAtLeast(u8, memory_events, 1, "high 0"));
 
-    const cgroup_procs_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/cgroup.procs", .{handle.cgroup_dir});
-    defer std.testing.allocator.free(cgroup_procs_path);
-    const cgroup_procs = try support.readFileAlloc(cgroup_procs_path, std.testing.allocator);
-    defer std.testing.allocator.free(cgroup_procs);
-    const pid_string = try std.fmt.allocPrint(std.testing.allocator, "{d}", .{handle.pid});
-    defer std.testing.allocator.free(pid_string);
-    try std.testing.expect(std.mem.containsAtLeast(u8, cgroup_procs, 1, pid_string));
-
-    // The worker's tmpfs lived in its own mount namespace, so its teardown
-    // leaves the host's mount point as empty as it found it.
     launched.stopWorker();
-    try support.waitForPidFdExit(worker_pidfd);
-    try std.testing.expectError(error.FileNotFound, std.fs.accessAbsolute(expected_cgroup_dir, .{}));
-    try support.expectDirEmpty(launched.tmp_mount_point.?.fd());
-
     spawned.shutdown();
     try support.expectChildExitStatus(spawned.pid, 0);
 
     var trace = try support.drainTrace(&spawned, std.testing.allocator);
     defer trace.deinit();
 
-    // The boot order the sandbox depends on: the child proves it is
-    // single-threaded, sets no-new-privileges and drops its capabilities
-    // inside the sandbox, and only then resumes JSC and libpas, so every
-    // helper thread it starts later (the crypto pool, the sentinel, the wasm
-    // worklist) inherits no-new-privileges and empty capability sets.
-    try support.expectTraceBefore(trace, "child.wait_worker_init", "child.single_threaded.asserted");
-    try support.expectTraceBefore(trace, "child.single_threaded.asserted", "child.sandbox.applied");
-    try support.expectTraceBefore(trace, "child.sandbox.applied", "child.post_fork_child");
-    try support.expectTraceBefore(trace, "child.post_fork_child", "child.reseed");
-    try support.expectTraceBefore(trace, "child.reseed", "child.process_env.installed");
-    try support.expectTraceBefore(trace, "child.worker_init.validated", "child.metrics.mapped");
-    try support.expectTraceBefore(trace, "child.metrics.mapped", "child.cgroup.validated");
-    try support.expectTraceBefore(trace, "child.cgroup.validated", "child.memory_events.opened");
-    try support.expectTraceBefore(trace, "child.memory_events.opened", "child.sandbox.applied");
-    try support.expectTraceBefore(trace, "child.sandbox.applied", "child.memory_events.registered");
-    try support.expectTraceBefore(trace, "child.memory_events.registered", "child.worker_ring.ready");
-    try support.expectTraceBefore(trace, "child.worker_ring.ready", "child.sentinel.started");
-    try support.expectTraceBefore(trace, "child.sentinel.started", "child.compiler_threads.prespawned");
-    try support.expectTraceBefore(trace, "child.compiler_threads.prespawned", "child.control.nonblocking");
-    try support.expectTraceBefore(trace, "child.control.nonblocking", "child.seccomp.applied");
-    try support.expectTraceBefore(trace, "child.seccomp.applied", "child.node_fs.enabled");
-    try support.expectTraceBefore(trace, "child.node_fs.enabled", "child.worker_ready");
-    try support.expectTraceBefore(trace, "child.worker_ready", "worker.scheduler.uring");
-    try std.testing.expect(trace.containsPrefix("child.gc_override="));
-    try std.testing.expect(trace.containsPrefix("host.cgroup.dir="));
-    try std.testing.expect(trace.containsPrefix("host.cgroup.limits="));
-    try std.testing.expect(trace.containsPrefix("child.sentinel.poll_backend"));
-    try std.testing.expect(trace.containsPrefix("worker.scheduler.uring"));
+    // The boot order the sandbox depends on: the page and its log sink come
+    // before the descriptor close, the leaf's check before the VM resumes,
+    // and the child proves it is single-threaded, sets no-new-privileges and
+    // drops its capabilities inside the sandbox before it resumes JSC and
+    // libpas, so every helper thread it starts later inherits
+    // no-new-privileges and empty capability sets. The trace pipe closes
+    // after the filter and before the first tenant code.
+    const order = [_][]const u8{
+        "child.wait_worker_init",
+        "child.log_sink.installed",
+        "child.worker_init.validated",
+        "child.cgroup.validated",
+        "child.single_threaded.asserted",
+        "child.sandbox.applied",
+        "child.post_fork_child",
+        "child.reseed",
+        "child.process_env.installed",
+        "child.sentinel.started",
+        "child.compiler_threads.prespawned",
+        "child.control.nonblocking",
+        "child.seccomp.applied",
+        "child.node_fs.enabled",
+        "child.trace.closed",
+    };
+    for (order[0 .. order.len - 1], order[1..]) |first, second|
+        try support.expectTraceBefore(trace, first, second);
+    try std.testing.expect(trace.containsPrefix("host.metrics.created"));
 
-    const attach_index = trace.indexOfPrefix("host.cgroup.dir=") orelse return error.MissingTraceEvent;
-    const metrics_index = trace.indexOf("host.metrics.created") orelse return error.MissingTraceEvent;
-    const ready_index = trace.indexOf("child.worker_ready") orelse return error.MissingTraceEvent;
-    try std.testing.expect(attach_index < metrics_index);
-    try std.testing.expect(metrics_index < ready_index);
+    // Nothing of the child follows the close.
+    const closed_index = trace.indexOf("child.trace.closed") orelse return error.MissingTraceEvent;
+    for (trace.messages[closed_index + 1 ..]) |message| {
+        if (std.mem.startsWith(u8, message, "child.") or std.mem.startsWith(u8, message, "worker.")) {
+            std.debug.print("the child traced after closing its pipe: {s}\n", .{message});
+            return error.TestUnexpectedResult;
+        }
+    }
 
-    const gc_event_index = trace.indexOfPrefix("child.gc_override=") orelse return error.MissingTraceEvent;
-    const gc_event = trace.messages[gc_event_index];
     const gc_prefix = "child.gc_override=";
+    const gc_event = trace.messages[trace.indexOfPrefix(gc_prefix) orelse return error.MissingTraceEvent];
     const gc_value = try std.fmt.parseUnsigned(u64, gc_event[gc_prefix.len..], 10);
     try std.testing.expectEqual(worker_cgroup.memory.gcHeapLimitBytes(worker_memory_limit_bytes), gc_value);
+}
+
+test "a worker holds no pipe once its boot ends, its zygote's trace pipe least of all, and a zygote spawned without a trace holds no pipe of its own" {
+    // `.none` gives the worker no egress descriptor, whose liveness pipe
+    // would be its only other pipe. The zygote's own descriptors start at 3:
+    // below are its spawner's standard descriptors, which each zygote here
+    // gets with a pipe among them.
+    const trace_fd = zygote.fork_loop.inherited_trace_fd;
+    var route = try TestRoute.init("no-pipe", plain_route_source);
+    defer route.deinit();
+    {
+        var spawned = try spawnWithPipedStandardInput(true);
+        defer spawned.deinit();
+        var stdin_buffer: [64]u8 = undefined;
+        const zygote_stdin = (try descriptorLink(spawned.pid, 0, &stdin_buffer)) orelse return error.MissingStandardInput;
+        try std.testing.expect(std.mem.startsWith(u8, zygote_stdin, "pipe:"));
+
+        // The trace pipe's write end sits where the launch contract puts it,
+        // and the zygote holds no other pipe of its own.
+        var trace_pipe_buffer: [64]u8 = undefined;
+        const trace_pipe = try pipeLink(spawned.trace_read_fd.?, &trace_pipe_buffer);
+        var link_buffer: [64]u8 = undefined;
+        const zygote_trace = (try descriptorLink(spawned.pid, trace_fd, &link_buffer)) orelse return error.MissingTraceDescriptor;
+        try std.testing.expectEqualStrings(trace_pipe, zygote_trace);
+        try std.testing.expectEqual(@as(usize, 1), try countDescriptors(spawned.pid, 3, .any_pipe));
+
+        // The worker closed its copy of the trace pipe, and its standard
+        // descriptors are /dev/null, so it holds no pipe at all.
+        var launched = try launchOrSkip(&spawned, 90_010, .{ .egress = .none, .routes = route.launchRoutes() });
+        defer launched.deinit();
+        try std.testing.expectEqual(@as(usize, 0), try countDescriptors(launched.handle.pid, 0, .{ .link = trace_pipe }));
+        try std.testing.expectEqual(@as(usize, 0), try countDescriptors(launched.handle.pid, 0, .any_pipe));
+    }
+    {
+        var spawned = try spawnWithPipedStandardInput(false);
+        defer spawned.deinit();
+        try std.testing.expect(spawned.trace_read_fd == null);
+        // Without the trace, `trace_fd` is the lowest free number once the
+        // zygote has found it closed, so the first file the zygote keeps
+        // open takes it, such as the engine's `/proc/self/statm`, which it
+        // reads for its own footprint. None of them is a pipe.
+        try std.testing.expectEqual(@as(usize, 0), try countDescriptors(spawned.pid, 3, .any_pipe));
+
+        var launched = try launchOrSkip(&spawned, 90_011, .{ .egress = .none, .routes = route.launchRoutes() });
+        defer launched.deinit();
+        try std.testing.expectEqual(@as(usize, 0), try countDescriptors(launched.handle.pid, 0, .any_pipe));
+    }
 }
 
 /// How long a worker gets after its last turn before its threads must all
@@ -654,16 +691,28 @@ fn readThreadCount(pid: u32) !u64 {
     return error.MissingThreadCount;
 }
 
+/// The CPU every process of `leaf` has spent, in microseconds, from its
+/// `cpu.stat`.
+fn readLeafCpuUsageUsec(leaf: host.WorkerLeaf) !u64 {
+    var buffer: [1024]u8 = undefined;
+    const stat = try leaf.readFile("cpu.stat", &buffer);
+    var lines = std.mem.splitScalar(u8, stat, '\n');
+    while (lines.next()) |line| {
+        const prefix = "usage_usec ";
+        if (std.mem.startsWith(u8, line, prefix))
+            return std.fmt.parseUnsigned(u64, std.mem.trim(u8, line[prefix.len..], &std.ascii.whitespace), 10);
+    }
+    return error.MissingCpuUsage;
+}
+
 test "an idle worker's threads all sleep and none retires" {
     var spawned = try support.spawnZygote();
     defer spawned.deinit();
 
     // The handler gets a function hot enough for an optimizing compile,
-    // allocates, and awaits a digest of more than `inlineDigestByteLimit`
-    // bytes, which runs on the crypto pool, so the VM thread, a compiler
-    // thread and a crypto thread all hold allocator caches.
-    const route_specifier = "/__collo_route/test/idle-busy.js";
-    const route_fd = try rt.createModulePackFd(route_specifier,
+    // allocates, and awaits a digest, so the VM thread and a compiler thread
+    // both hold allocator caches.
+    var route = try TestRoute.init("idle-busy",
         \\function mix(seed) {
         \\  let value = seed | 0;
         \\  for (let i = 0; i < 64; i++) value = (value * 31 + i) | 0;
@@ -679,24 +728,20 @@ test "an idle worker's threads all sleep and none retires" {
         \\  return new Response(`${total}:${digest.byteLength}:${blocks.length}`);
         \\}
     );
-    defer std.posix.close(route_fd);
-    var route = try rt.SingleRoute.init(route_fd, route_specifier);
     defer route.deinit();
-    var launched = try launchOrSkip(&spawned, 90_018, .{
-        .routes = route.launchRoutes(),
-    });
+    var launched = try launchOrSkip(&spawned, 90_012, .{ .routes = route.launchRoutes() });
     defer launched.deinit();
     const ready_ns = try process.monotonicNowNs();
     const handle = &launched.handle;
 
     for (0..3) |index| {
-        const request_id: u64 = 90_018 + index;
+        const request_id: u64 = 90_012 + index;
         var dispatch = try rt.initDispatchWork(std.testing.allocator, .{
             .request_id = request_id,
             .deadline_monotonic_ns = try forkedDeadlineNs(),
         });
         defer dispatch.deinit();
-        try rt.sendIngressRoute(handle.control_fd, &dispatch, 1, .{});
+        try rt.sendIngressRoute(handle.control_fd, &dispatch, @intCast(2 * index + 1), .{});
         var response = try readForkedIngressResponse(handle, request_id, 8_000);
         defer response.deinit();
         try std.testing.expectEqual(@as(u16, 200), response.status);
@@ -715,9 +760,9 @@ test "an idle worker's threads all sleep and none retires" {
     const switches_before = try readContextSwitches(handle.pid);
     // The worker is the only process in its cgroup, so the cgroup's CPU
     // total is the worker's, every thread included.
-    const usage_before_usec = try host.cgroup.cpu.readStatUsageUsec(std.testing.allocator, handle.cgroup_dir);
+    const usage_before_usec = try readLeafCpuUsageUsec(handle.leaf);
     std.Thread.sleep(idle_worker_window_ns);
-    const usage_after_usec = try host.cgroup.cpu.readStatUsageUsec(std.testing.allocator, handle.cgroup_dir);
+    const usage_after_usec = try readLeafCpuUsageUsec(handle.leaf);
     const switches_after = try readContextSwitches(handle.pid);
     const window_end_ns = try process.monotonicNowNs();
     const threads_after = try readThreadCount(handle.pid);
@@ -753,21 +798,17 @@ test "a worker's engine reads its footprint from its own cgroup leaf, within the
     var spawned = try support.spawnZygote();
     defer spawned.deinit();
 
-    var launched = try launchOrSkip(&spawned, 90_024, .{});
+    var route = try TestRoute.init("footprint", plain_route_source);
+    defer route.deinit();
+    var launched = try launchOrSkip(&spawned, 90_013, .{ .routes = route.launchRoutes() });
     defer launched.deinit();
     // The child read its footprint, its leaf's memory.current, before it
-    // mapped its fs index, built its ring and started its sentinel, crypto
-    // pool and compiler threads, and its heap gives a freed page back only
-    // once the page has sat empty for the scavenger's epoch delay
+    // built its runtime and started its sentinel and compiler threads and
+    // evaluated its route, and its heap gives a freed page back
+    // only once the page has sat empty for the scavenger's epoch delay
     // (`pas_scavenger_max_epoch_delta`, 300 ms off macOS), so the leaf holds
     // at least as much once the worker is ready.
-    var memory_current_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const memory_current_path = try std.fmt.bufPrint(
-        &memory_current_path_buffer,
-        "{s}/memory.current",
-        .{launched.handle.cgroup_dir},
-    );
-    const memory_current = try support.readUnsignedFile(memory_current_path);
+    const memory_current = try support.readLeafUnsigned(launched.handle.leaf, "memory.current");
 
     launched.stopWorker();
     spawned.shutdown();
@@ -785,114 +826,90 @@ test "a worker's engine reads its footprint from its own cgroup leaf, within the
     try std.testing.expectEqual(worker_memory_limit_bytes, limit_bytes);
 }
 
-test "a worker of a definition without a network grant boots through its filter and ring with no egress descriptor and serves" {
+test "a worker of a definition without a network grant boots through its filter with no egress descriptor and serves" {
     var spawned = try support.spawnZygote();
     defer spawned.deinit();
 
-    const route_specifier = "/__collo_route/test/no-grant-hello.js";
-    const route_fd = try rt.createModulePackFd(route_specifier,
+    var route = try TestRoute.init("no-grant-hello",
         \\export default function handle() {
         \\  return new Response("no grant");
         \\}
     );
-    defer std.posix.close(route_fd);
-    var route = try rt.SingleRoute.init(route_fd, route_specifier);
     defer route.deinit();
     // `.none` sends WorkerInit without `flag_egress` and without the wake
-    // descriptors, so the worker registers its ring with the egress slots
-    // empty, which only a kernel that accepts sparse fixed files admits.
-    var launched = try launchOrSkip(&spawned, 90_025, .{
+    // descriptors, so the worker's loop has no egress descriptor to wait on.
+    var launched = try launchOrSkip(&spawned, 90_014, .{
         .egress = .none,
         .routes = route.launchRoutes(),
     });
     defer launched.deinit();
     const handle = &launched.handle;
 
-    const request_id: u64 = 90_025;
     var dispatch = try rt.initDispatchWork(std.testing.allocator, .{
-        .request_id = request_id,
+        .request_id = 90_014,
         .deadline_monotonic_ns = try forkedDeadlineNs(),
-        .egress_token = zygote.ipc.egress_token.none,
+        .egress_token = ipc.egress_token.none,
     });
     defer dispatch.deinit();
     try rt.sendIngressRoute(handle.control_fd, &dispatch, 1, .{});
-    var response = try readForkedIngressResponse(handle, request_id, 8_000);
+    var response = try readForkedIngressResponse(handle, 90_014, 8_000);
     defer response.deinit();
     try std.testing.expectEqual(@as(u16, 200), response.status);
     try std.testing.expectEqualStrings("no grant", response.body);
-
-    launched.stopWorker();
-    spawned.shutdown();
-    try support.expectChildExitStatus(spawned.pid, 0);
-    var trace = try support.drainTrace(&spawned, std.testing.allocator);
-    defer trace.deinit();
-
-    // The trace prints an empty slot as its descriptor,
-    // `restricted_uring.empty_slot` (-1).
-    const ring_event = trace.messages[trace.indexOfPrefix("child.worker_ring.fixed_files=") orelse return error.MissingTraceEvent];
-    if (std.mem.indexOf(u8, ring_event, ",egress_completion:-1,egress_liveness:-1,") == null) {
-        std.debug.print("expected both egress slots of the ring empty, found {s}\n", .{ring_event});
-        return error.EgressSlotsNotEmpty;
-    }
 }
 
-test "two workers of one host share its mount point, each sees only its own /tmp, and the mount point stays empty" {
+test "two workers each see only their own /tmp, and the host's /tmp never gains their files" {
     var spawned = try support.spawnZygote();
     defer spawned.deinit();
-    var tmp_mount: host.TmpMountPoint = undefined;
-    try tmp_mount.init(host.tmp_mount.default_parent_dir);
-    defer tmp_mount.deinit();
 
-    const route_specifier = "/__collo_route/test/tmp-isolation.js";
-    const route_fd = try rt.createModulePackFd(route_specifier,
+    // Names unique to this run, so a file the host's /tmp holds can only be
+    // one a worker wrote.
+    const marker_path = try support.makeTempPath(std.testing.allocator, "collo-worker-tmp");
+    defer std.testing.allocator.free(marker_path);
+    const marker = std.fs.path.basename(marker_path);
+    var route = try TestRoute.init("tmp-isolation",
         \\import fs from "node:fs";
         \\
         \\export default function handle(request) {
         \\  const name = request.query.get("name");
-        \\  fs.writeFileSync(`/tmp/${name}.txt`, name);
-        \\  return new Response(fs.readdirSync("/tmp").sort().join(","));
+        \\  fs.writeFileSync(`/tmp/${name}`, name);
+        \\  return new Response(fs.readdirSync("/tmp").join(","));
         \\}
     );
-    defer std.posix.close(route_fd);
-    var route = try rt.SingleRoute.init(route_fd, route_specifier);
     defer route.deinit();
 
-    var first = try launchOrSkip(&spawned, 90_026, .{
-        .tmp_mount_point_fd = tmp_mount.fd(),
-        .routes = route.launchRoutes(),
-    });
+    var first = try launchOrSkip(&spawned, 90_015, .{ .routes = route.launchRoutes() });
     defer first.deinit();
-    var second = try launchOrSkip(&spawned, 90_027, .{
-        .tmp_mount_point_fd = tmp_mount.fd(),
-        .routes = route.launchRoutes(),
-    });
+    var second = try launchOrSkip(&spawned, 90_016, .{ .routes = route.launchRoutes() });
     defer second.deinit();
 
-    const workers = [_]struct { handle: *host.WorkerHandle, name: []const u8, request_id: u64 }{
-        .{ .handle = &first.handle, .name = "first", .request_id = 90_026 },
-        .{ .handle = &second.handle, .name = "second", .request_id = 90_027 },
+    const workers = [_]struct { handle: *host.WorkerHandle, suffix: []const u8, request_id: u64 }{
+        .{ .handle = &first.handle, .suffix = "first", .request_id = 90_015 },
+        .{ .handle = &second.handle, .suffix = "second", .request_id = 90_016 },
     };
     for (workers) |worker| {
-        var query_buffer: [32]u8 = undefined;
+        var name_buffer: [128]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buffer, "{s}-{s}", .{ marker, worker.suffix });
+        var query_buffer: [160]u8 = undefined;
         var dispatch = try rt.initDispatchWork(std.testing.allocator, .{
             .request_id = worker.request_id,
             .deadline_monotonic_ns = try forkedDeadlineNs(),
-            .request = .{ .raw_query = try std.fmt.bufPrint(&query_buffer, "name={s}", .{worker.name}) },
+            .request = .{ .raw_query = try std.fmt.bufPrint(&query_buffer, "name={s}", .{name}) },
         });
         defer dispatch.deinit();
         try rt.sendIngressRoute(worker.handle.control_fd, &dispatch, 1, .{});
         var response = try readForkedIngressResponse(worker.handle, worker.request_id, 8_000);
         defer response.deinit();
         try std.testing.expectEqual(@as(u16, 200), response.status);
-        var expected_buffer: [32]u8 = undefined;
-        try std.testing.expectEqualStrings(
-            try std.fmt.bufPrint(&expected_buffer, "{s}.txt", .{worker.name}),
-            response.body,
-        );
+        // Each worker's /tmp is a fresh tmpfs holding its own file alone.
+        try std.testing.expectEqualStrings(name, response.body);
+
+        // Each worker mounted its tmpfs in its own mount namespace, so the
+        // host's /tmp never sees the file.
+        var host_path_buffer: [160]u8 = undefined;
+        const host_path = try std.fmt.bufPrint(&host_path_buffer, "/tmp/{s}", .{name});
+        try std.testing.expectError(error.FileNotFound, std.fs.accessAbsolute(host_path, .{}));
     }
-    // Each worker mounted its tmpfs in its own mount namespace, so the host's
-    // directory never sees a file.
-    try support.expectDirEmpty(tmp_mount.fd());
 }
 
 /// One line drained from a worker's console ring, its text copied out of the
@@ -905,7 +922,7 @@ const ConsoleLine = struct {
 /// Drains every line the console ring of `view`, the host's mapping of a
 /// worker's page, holds now, in ring order; the caller frees the result with
 /// `freeConsoleLines`. The test must be the ring's only consumer.
-fn drainConsoleLines(allocator: std.mem.Allocator, view: *worker_page.WorkerWriterView) ![]ConsoleLine {
+fn drainConsoleLines(allocator: std.mem.Allocator, view: *worker_page.HostReaderView) ![]ConsoleLine {
     var lines: std.ArrayList(ConsoleLine) = .empty;
     errdefer {
         for (lines.items) |line|
@@ -938,36 +955,25 @@ fn freeConsoleLines(allocator: std.mem.Allocator, lines: []ConsoleLine) void {
     allocator.free(lines);
 }
 
-test "a worker's runtime log line lands in its console ring flagged runtime, apart from the tenant's exception line" {
-    // A handler that throws makes the worker log the exception twice: the
-    // tenant's line with the exception's text under the request's id, and
-    // the runtime's `std.log` warning about it. The worker's standard error
-    // is /dev/null, so the warning reaches the host only through the log
-    // sink (`zygote/log_sink.zig`), which publishes it into the same ring
-    // under request id 0. The zygote is the installed `collo`, so its workers
-    // log through that binary's `std_options.logFn` (`runtime/src/main.zig`).
+test "a handler's exception lands in its worker's console ring as the tenant's one line, with no runtime copy" {
+    // The tenant's line carries the exception's text under the request's id;
+    // the runtime writes no line of its own about it, so the exception's
+    // text reaches only the tenant's log. The zygote is the installed
+    // `collo`, so its workers log through that binary's `std_options.logFn`
+    // (`runtime/src/main.zig`).
     var spawned = try support.spawnZygote();
     defer spawned.deinit();
 
     const thrown_message = "handler failed on purpose";
-    const route_specifier = "/__collo_route/test/runtime-log-line.js";
-    const route_source = "export default function handle() {\n" ++
+    var route = try TestRoute.init("tenant-exception", "export default function handle() {\n" ++
         "  throw new Error(\"" ++ thrown_message ++ "\");\n" ++
-        "}\n";
-    const route_fd = try rt.createModulePackFd(route_specifier, route_source);
-    defer std.posix.close(route_fd);
-    var route = try rt.SingleRoute.init(route_fd, route_specifier);
+        "}\n");
     defer route.deinit();
-    // The default boot options leave `flag_log_full_js_exceptions` off, so
-    // the runtime's line names the exception by its length and a digest
-    // prefix, never by its text.
-    var launched = try launchOrSkip(&spawned, 90_028, .{
-        .routes = route.launchRoutes(),
-    });
+    var launched = try launchOrSkip(&spawned, 90_017, .{ .routes = route.launchRoutes() });
     defer launched.deinit();
     const handle = &launched.handle;
 
-    const request_id: u64 = 90_028;
+    const request_id: u64 = 90_017;
     var dispatch = try rt.initDispatchWork(std.testing.allocator, .{
         .request_id = request_id,
         .deadline_monotonic_ns = try forkedDeadlineNs(),
@@ -977,60 +983,30 @@ test "a worker's runtime log line lands in its console ring flagged runtime, apa
     var response = try readForkedIngressResponse(handle, request_id, 8_000);
     defer response.deinit();
     try std.testing.expectEqual(@as(u16, 500), response.status);
-    try std.testing.expectEqual(zygote.ipc.RequestDoneStatus.js_exception, response.doneStatus());
+    try std.testing.expectEqual(ipc.RequestDoneStatus.js_exception, response.done.status);
 
-    // The VM thread publishes both lines before it writes the 500
-    // (`answerException` in `worker/serve/termination.zig`), so the ring
-    // holds them once the response is read.
+    // The VM thread publishes the line before it writes the 500, so the ring
+    // holds it once the response is read.
     const lines = try drainConsoleLines(std.testing.allocator, &handle.metrics.?);
     defer freeConsoleLines(std.testing.allocator, lines);
 
-    var named_buffer: [48]u8 = undefined;
-    const named = try std.fmt.bufPrint(&named_buffer, " request_id={d}", .{request_id});
     var tenant_count: usize = 0;
-    var tenant_line: ConsoleLine = undefined;
-    var runtime_count: usize = 0;
-    var runtime_line: ConsoleLine = undefined;
     for (lines) |line| {
         if (line.header.request_id == request_id) {
             tenant_count += 1;
-            tenant_line = line;
-        } else if (std.mem.indexOf(u8, line.text, named) != null) {
-            runtime_count += 1;
-            runtime_line = line;
+            try std.testing.expectEqual(@intFromEnum(worker_page.LogLevel.err), line.header.level);
+            try std.testing.expectEqual(worker_page.LogLineFlags.js_exception, line.header.flags);
+            try std.testing.expect(std.mem.indexOf(u8, line.text, thrown_message) != null);
+        } else if (line.header.flags & worker_page.LogLineFlags.runtime != 0) {
+            var named_buffer: [48]u8 = undefined;
+            const named = try std.fmt.bufPrint(&named_buffer, "request_id={d}", .{request_id});
+            if (std.mem.indexOf(u8, line.text, named) != null) {
+                std.debug.print("the runtime logged its own line about the exception: {s}\n", .{line.text});
+                return error.TestUnexpectedResult;
+            }
         }
     }
     try std.testing.expectEqual(@as(usize, 1), tenant_count);
-    try std.testing.expectEqual(@as(usize, 1), runtime_count);
-
-    // The tenant's line is the whole text, uncut, and not the runtime's.
-    try std.testing.expectEqual(@intFromEnum(worker_page.LogLevel.err), tenant_line.header.level);
-    try std.testing.expectEqual(worker_page.LogLineFlags.js_exception, tenant_line.header.flags);
-    try std.testing.expect(std.mem.indexOf(u8, tenant_line.text, thrown_message) != null);
-
-    try std.testing.expectEqual(@as(u64, 0), runtime_line.header.request_id);
-    try std.testing.expectEqual(@intFromEnum(worker_page.LogLevel.warn), runtime_line.header.level);
-    try std.testing.expectEqual(worker_page.LogLineFlags.runtime, runtime_line.header.flags);
-    try std.testing.expect(std.mem.indexOf(u8, runtime_line.text, thrown_message) == null);
-    // `logFormatted` in `worker/js/jsc/exception_log.zig` names the text the
-    // tenant got by its length and a prefix of its SHA-256 in hex.
-    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(tenant_line.text, &digest, .{});
-    const digest_hex = std.fmt.bytesToHex(digest, .lower);
-    var expected_buffer: [96]u8 = undefined;
-    const expected = try std.fmt.bufPrint(&expected_buffer, "{s} message_len={d} digest=", .{
-        named,
-        tenant_line.text.len,
-    });
-    const expected_index = std.mem.indexOf(u8, runtime_line.text, expected) orelse {
-        std.debug.print("the runtime's line does not name the exception's length and digest: {s}\n", .{
-            runtime_line.text,
-        });
-        return error.TestUnexpectedResult;
-    };
-    const named_digest = runtime_line.text[expected_index + expected.len ..];
-    try std.testing.expect(named_digest.len != 0);
-    try std.testing.expect(std.mem.startsWith(u8, &digest_hex, named_digest));
 }
 
 /// File-name prefixes of the shared objects for libraries the binary links
@@ -1045,7 +1021,9 @@ test "a forked worker maps no zlib, brotli, zstd or ICU shared object" {
     var spawned = try support.spawnZygote();
     defer spawned.deinit();
 
-    var launched = try launchOrSkip(&spawned, 90_023, .{});
+    var route = try TestRoute.init("maps", plain_route_source);
+    defer route.deinit();
+    var launched = try launchOrSkip(&spawned, 90_018, .{ .routes = route.launchRoutes() });
     defer launched.deinit();
 
     var path_buffer: [32]u8 = undefined;
@@ -1065,10 +1043,9 @@ test "worker node fs round trip stays inside chroot tmpfs" {
     defer spawned.deinit();
 
     // The writable scratch is /tmp/**, so the round trip lives under /tmp;
-    // the placeholder index (no files, header only) makes every read in the
-    // read-only tree ENOENT and every write there EROFS.
-    const route_specifier = "/__collo_route/test/fs-roundtrip.js";
-    const source =
+    // the rest of the root is read-only, so a write outside /tmp fails with
+    // the kernel's EROFS, and the machine's /etc does not exist there.
+    var route = try TestRoute.init("fs-roundtrip",
         \\import fs, { readFile, writeFile } from "node:fs";
         \\
         \\export default async function handle() {
@@ -1112,15 +1089,10 @@ test "worker node fs round trip stays inside chroot tmpfs" {
         \\    rootWrite,
         \\  }));
         \\}
-    ;
-    const route_fd = try rt.createModulePackFd(route_specifier, source);
-    defer std.posix.close(route_fd);
-    var route = try rt.SingleRoute.init(route_fd, route_specifier);
+    );
     defer route.deinit();
 
-    var launched = try launchOrSkip(&spawned, 90_004, .{
-        .routes = route.launchRoutes(),
-    });
+    var launched = try launchOrSkip(&spawned, 90_019, .{ .routes = route.launchRoutes() });
     defer launched.deinit();
     const handle = &launched.handle;
 
@@ -1138,7 +1110,7 @@ test "worker node fs round trip stays inside chroot tmpfs" {
     ;
     if (!std.mem.containsAtLeast(u8, response.body, 1, expected)) {
         std.debug.print("unexpected fs roundtrip response (status={d}):\n{s}\n", .{ response.status, response.body });
-        return error.WorkerFsRouteUnexpectedResponse;
+        return error.WorkerFsRoundTripUnexpectedResponse;
     }
 }
 
@@ -1146,8 +1118,7 @@ test "worker node fs tmpfs cap returns ENOSPC" {
     var spawned = try support.spawnZygote();
     defer spawned.deinit();
 
-    const route_specifier = "/__collo_route/test/fs-cap.js";
-    const source =
+    var route = try TestRoute.init("fs-cap",
         \\import fs from "fs";
         \\
         \\export default function handle() {
@@ -1158,13 +1129,10 @@ test "worker node fs tmpfs cap returns ENOSPC" {
         \\    return new Response(error.code);
         \\  }
         \\}
-    ;
-    const route_fd = try rt.createModulePackFd(route_specifier, source);
-    defer std.posix.close(route_fd);
-    var route = try rt.SingleRoute.init(route_fd, route_specifier);
+    );
     defer route.deinit();
 
-    var launched = try launchOrSkip(&spawned, 90_005, .{
+    var launched = try launchOrSkip(&spawned, 90_020, .{
         .tmpfs_size_bytes = 1024 * 1024,
         .routes = route.launchRoutes(),
     });
@@ -1183,642 +1151,94 @@ test "worker node fs tmpfs cap returns ENOSPC" {
     try std.testing.expectEqualStrings("ENOSPC", response.body);
 }
 
-/// A sealed fs index memfd for `files`, which must be in index order: the
-/// artifact a launch hands a worker. The caller owns the fd.
-fn createTestFsIndexMemfd(allocator: std.mem.Allocator, mtime_ms: u64, files: []const fs_index.File) !std.posix.fd_t {
-    const bytes = try fs_index.buildIndexBytes(allocator, mtime_ms, files);
-    defer allocator.free(bytes);
-    return createSealedMemfdFromBytes(bytes);
-}
-
-fn createSealedMemfdFromBytes(bytes: []const u8) !std.posix.fd_t {
-    const fd = try std.posix.memfd_create(
-        "collo-test-fs-index",
-        std.os.linux.MFD.CLOEXEC | std.os.linux.MFD.ALLOW_SEALING,
-    );
-    errdefer std.posix.close(fd);
-    try fd_mod.writeAllRaw(fd, bytes);
-    try std.posix.lseek_SET(fd, 0);
-    try fd_mod.addSeals(fd, fd_mod.memfd_readonly_seals);
-    return fd;
-}
-
-test "worker fs index serves file tree metadata, EROFS matrix, and explicit ENOENT" {
-    // A real forked worker with a non-placeholder index: stat, exists and
-    // readdir answer from the index with no fault traffic; every mutation
-    // outside /tmp, a rename across the two included, is EROFS; /tmp keeps
-    // working. Reads of entries not yet materialized fault, which the
-    // "worker fs fault" tests cover, so this matrix never reads a tree file.
-    // The tree is anchored at /var/task, the working directory, so an entry
-    // whose first segment is `tmp` is served read-only at ./tmp/** while the
-    // absolute /tmp stays independent writable scratch; "/" and "/var" are
-    // virtual read-only directories listing only the namespace roots.
+test "a worker's root is read-only but for /tmp, with /var/task as its empty working directory, as node:fs sees it" {
+    // Each write, mkdir or unlink outside /tmp gets the kernel's EROFS, a
+    // relative one included since the working directory is /var/task, which
+    // a listing of `.` shows empty where `/` would list tmp and var, and a
+    // rename out of /tmp gets EXDEV, the error across mounts. A listing is
+    // sorted, a directory read is EISDIR, a file listed is ENOTDIR, a path
+    // holding a NUL is refused before any syscall, and `existsSync("")`
+    // answers false.
     var spawned = try support.spawnZygote();
     defer spawned.deinit();
 
-    const fs_index_memfd = try createTestFsIndexMemfd(std.testing.allocator, 1_730_000_000_123, &.{
-        .{ .path = "assets/logo.svg", .size = 512, .sha256 = @splat(0x11) },
-        .{ .path = "data/config.json", .size = 42, .sha256 = @splat(0x22) },
-        .{ .path = "data/nested/deep.txt", .size = 7, .sha256 = @splat(0x33) },
-        .{ .path = "index.js", .size = 100, .sha256 = @splat(0x44) },
-        .{ .path = "tmp/config.json", .size = 9, .sha256 = @splat(0x55) },
-    });
-    defer std.posix.close(fs_index_memfd);
-
-    const route_specifier = "/__collo_route/test/fs-index-metadata.js";
-    const source =
+    var route = try TestRoute.init("read-only-root",
         \\import fs from "node:fs";
         \\
+        \\function code(operation) {
+        \\  try {
+        \\    operation();
+        \\    return "ok";
+        \\  } catch (error) {
+        \\    return error.code;
+        \\  }
+        \\}
+        \\
         \\export default function handle() {
-        \\  const st = fs.statSync("data/config.json");
-        \\  const stDir = fs.statSync("./data");
-        \\  const cwdList = fs.readdirSync(".").join(",");
-        \\  const rootList = fs.readdirSync("/").join(",");
-        \\  const varList = fs.readdirSync("/var").join(",");
-        \\  const dataList = fs.readdirSync("data").join(",");
-        \\  let missingDir = "none";
-        \\  try { fs.readdirSync("/does-not-exist"); missingDir = "listed"; } catch (e) { missingDir = e.code; }
-        \\  let writeCode = "none";
-        \\  try { fs.writeFileSync("data/config.json", "x"); writeCode = "wrote"; } catch (e) { writeCode = e.code; }
-        \\  let mkdirCode = "none";
-        \\  try { fs.mkdirSync("data/new-dir"); mkdirCode = "made"; } catch (e) { mkdirCode = e.code; }
-        \\  let unlinkCode = "none";
-        \\  try { fs.unlinkSync("data/config.json"); unlinkCode = "unlinked"; } catch (e) { unlinkCode = e.code; }
+        \\  const task = fs.statSync("/var/task");
+        \\  fs.mkdirSync("/tmp/s");
+        \\  fs.writeFileSync("/tmp/s/b", "b");
+        \\  fs.writeFileSync("/tmp/s/c", "c");
+        \\  fs.writeFileSync("/tmp/s/a", "a");
+        \\  fs.writeFileSync("/tmp/x", "x");
         \\  let renameCode = "none";
-        \\  try { fs.renameSync("data/config.json", "/tmp/stolen.json"); renameCode = "renamed"; } catch (e) { renameCode = e.code; }
-        \\  const shadowSize = fs.statSync("./tmp/config.json").size;
-        \\  let shadowWrite = "none";
-        \\  try { fs.writeFileSync("./tmp/config.json", "x"); shadowWrite = "wrote"; } catch (e) { shadowWrite = e.code; }
-        \\  const scratchBefore = fs.existsSync("/tmp/config.json");
-        \\  fs.writeFileSync("/tmp/config.json", "scratch");
-        \\  const scratchRead = fs.readFileSync("/tmp/config.json", "utf8");
-        \\  const shadowStill = fs.statSync("./tmp/config.json").size;
-        \\  fs.writeFileSync("/tmp/ok.txt", "ok");
-        \\  const tmpRead = fs.readFileSync("/tmp/ok.txt", "utf8");
+        \\  let renameDest = "none";
+        \\  try {
+        \\    fs.renameSync("/tmp/x", "/var/task/x");
+        \\    renameCode = "renamed";
+        \\  } catch (error) {
+        \\    renameCode = error.code;
+        \\    renameDest = error.dest;
+        \\  }
         \\  return new Response(JSON.stringify({
-        \\    size: st.size,
-        \\    mtimeMs: st.mtimeMs,
-        \\    file: st.isFile,
-        \\    dirIsDir: stDir.isDirectory,
-        \\    cwdList,
-        \\    rootList,
-        \\    varList,
-        \\    dataList,
-        \\    missingDir,
-        \\    writeCode,
-        \\    mkdirCode,
-        \\    unlinkCode,
+        \\    taskIsDirectory: task.isDirectory,
+        \\    taskMode: (task.mode & 0o777).toString(8),
+        \\    taskList: fs.readdirSync("/var/task").join(","),
+        \\    cwdList: fs.readdirSync(".").join(","),
+        \\    rootList: fs.readdirSync("/").join(","),
+        \\    sorted: fs.readdirSync("/tmp/s").join(","),
+        \\    writeRoot: code(() => fs.writeFileSync("/new.txt", "x")),
+        \\    writeVar: code(() => fs.writeFileSync("/var/new.txt", "x")),
+        \\    writeTask: code(() => fs.writeFileSync("/var/task/new.txt", "x")),
+        \\    writeRelative: code(() => fs.writeFileSync("relative.txt", "x")),
+        \\    mkdirRoot: code(() => fs.mkdirSync("/made")),
+        \\    mkdirVar: code(() => fs.mkdirSync("/var/made")),
+        \\    mkdirTask: code(() => fs.mkdirSync("/var/task/made")),
+        \\    unlinkRoot: code(() => fs.unlinkSync("/missing")),
+        \\    unlinkVar: code(() => fs.unlinkSync("/var/missing")),
+        \\    unlinkTask: code(() => fs.unlinkSync("/var/task/missing")),
         \\    renameCode,
-        \\    shadowSize,
-        \\    shadowWrite,
-        \\    scratchBefore,
-        \\    scratchRead,
-        \\    shadowStill,
-        \\    tmpRead,
-        \\    missing: fs.existsSync("data/nope.json"),
-        \\    exists: fs.existsSync("data/config.json"),
+        \\    renameDest,
+        \\    etc: code(() => fs.readFileSync("/etc/passwd")),
+        \\    readDirectory: code(() => fs.readFileSync("/tmp/s")),
+        \\    listFile: code(() => fs.readdirSync("/tmp/s/a")),
+        \\    nulPath: code(() => fs.readFileSync("/tmp/a\u0000b")),
+        \\    emptyExists: fs.existsSync(""),
         \\  }));
         \\}
-    ;
-    const route_fd = try rt.createModulePackFd(route_specifier, source);
-    defer std.posix.close(route_fd);
-    var route = try rt.SingleRoute.init(route_fd, route_specifier);
+    );
     defer route.deinit();
 
-    var launched = try launchOrSkip(&spawned, 90_006, .{
-        .fs_index_memfd = fs_index_memfd,
-        .routes = route.launchRoutes(),
-    });
+    var launched = try launchOrSkip(&spawned, 90_021, .{ .routes = route.launchRoutes() });
     defer launched.deinit();
     const handle = &launched.handle;
 
     var dispatch = try rt.initDispatchWork(std.testing.allocator, .{
-        .request_id = 44,
+        .request_id = 90_021,
         .deadline_monotonic_ns = try forkedDeadlineNs(),
     });
     defer dispatch.deinit();
     try rt.sendIngressRoute(handle.control_fd, &dispatch, 1, .{});
-    var response = try readForkedIngressResponse(handle, 44, 8_000);
+    var response = try readForkedIngressResponse(handle, 90_021, 8_000);
     defer response.deinit();
 
     const expected =
-        \\"size":42,"mtimeMs":1730000000123,"file":true,"dirIsDir":true,"cwdList":"assets,data,index.js,tmp","rootList":"tmp,var","varList":"task","dataList":"config.json,nested","missingDir":"ENOENT","writeCode":"EROFS","mkdirCode":"EROFS","unlinkCode":"EROFS","renameCode":"EROFS","shadowSize":9,"shadowWrite":"EROFS","scratchBefore":false,"scratchRead":"scratch","shadowStill":9,"tmpRead":"ok","missing":false,"exists":true
+        \\{"taskIsDirectory":true,"taskMode":"755","taskList":"","cwdList":"","rootList":"tmp,var","sorted":"a,b,c","writeRoot":"EROFS","writeVar":"EROFS","writeTask":"EROFS","writeRelative":"EROFS","mkdirRoot":"EROFS","mkdirVar":"EROFS","mkdirTask":"EROFS","unlinkRoot":"EROFS","unlinkVar":"EROFS","unlinkTask":"EROFS","renameCode":"EXDEV","renameDest":"/var/task/x","etc":"ENOENT","readDirectory":"EISDIR","listFile":"ENOTDIR","nulPath":"ERR_INVALID_ARG_VALUE","emptyExists":false}
     ;
-    if (!std.mem.containsAtLeast(u8, response.body, 1, expected)) {
-        std.debug.print("unexpected fs index metadata response (status={d}):\n{s}\n", .{ response.status, response.body });
-        return error.WorkerFsIndexUnexpectedResponse;
+    if (!std.mem.eql(u8, response.body, expected)) {
+        std.debug.print("unexpected read-only root response (status={d}):\n{s}\n", .{ response.status, response.body });
+        return error.WorkerRootUnexpectedResponse;
     }
-}
-
-// The fs fault fixture: one text file whose index entry carries the sha256
-// of its real bytes, so the worker's check after copying the file in passes
-// end to end. The route reads it with an explicit "utf8", since a read
-// without an encoding returns a Uint8Array.
-const fs_fault_e2e_path = "data/hello.txt";
-const fs_fault_e2e_content = "hello from the fault plane e2e\n";
-
-fn createFsFaultFixtureIndexMemfd(allocator: std.mem.Allocator) !std.posix.fd_t {
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(fs_fault_e2e_content, &digest, .{});
-    return createTestFsIndexMemfd(allocator, 1_730_000_000_123, &.{
-        .{ .path = fs_fault_e2e_path, .size = fs_fault_e2e_content.len, .sha256 = digest },
-    });
-}
-
-const fs_fault_e2e_route_source =
-    \\import fs from "node:fs";
-    \\export default async function handle() {
-    \\  try {
-    \\    const content = await fs.promises.readFile("data/hello.txt", "utf8");
-    \\    return new Response("resolved:" + content);
-    \\  } catch (e) {
-    \\    return new Response("rejected:" + String(e));
-    \\  }
-    \\}
-;
-
-test "worker fs fault: async readFile faults, harness serves bytes, promise resolves" {
-    var spawned = try support.spawnZygote();
-    defer spawned.deinit();
-
-    const fs_index_memfd = try createFsFaultFixtureIndexMemfd(std.testing.allocator);
-    defer std.posix.close(fs_index_memfd);
-
-    const route_specifier = "/__collo_route/test/fs-fault-e1.js";
-    const route_fd = try rt.createModulePackFd(route_specifier, fs_fault_e2e_route_source);
-    defer std.posix.close(route_fd);
-    var route = try rt.SingleRoute.init(route_fd, route_specifier);
-    defer route.deinit();
-
-    var launched = try launchOrSkip(&spawned, 90_007, .{
-        .fs_index_memfd = fs_index_memfd,
-        .routes = route.launchRoutes(),
-    });
-    defer launched.deinit();
-    const handle = &launched.handle;
-
-    var dispatch = try rt.initDispatchWork(std.testing.allocator, .{
-        .request_id = 46,
-        .deadline_monotonic_ns = try forkedDeadlineNs(),
-    });
-    defer dispatch.deinit();
-    try rt.sendIngressRoute(handle.control_fd, &dispatch, 1, .{});
-
-    // The harness plays the host: it receives the fault and serves the bytes.
-    var fault_request = try support.readFsFaultRequest(std.testing.allocator, handle.fs_fault_fd, 8_000);
-    defer fault_request.deinit();
-    try std.testing.expectEqualStrings(fs_fault_e2e_path, fault_request.path);
-    try std.testing.expectEqual(@as(u64, 46), fault_request.request_id);
-    try support.respondFsFaultOk(handle.fs_fault_fd, fault_request.fault_id, fs_fault_e2e_content);
-
-    var response = try readForkedIngressResponse(handle, 46, 8_000);
-    defer response.deinit();
-    try std.testing.expectEqualStrings("resolved:" ++ fs_fault_e2e_content, response.body);
-
-    var trace = try support.drainTrace(&spawned, std.testing.allocator);
-    defer trace.deinit();
-    try support.expectTraceBefore(
-        trace,
-        "worker.fs_fault.sent=" ++ fs_fault_e2e_path,
-        "worker.fs_fault.settled=" ++ fs_fault_e2e_path,
-    );
-}
-
-test "worker fs fault: second read of a materialized path is local, zero second fault" {
-    var spawned = try support.spawnZygote();
-    defer spawned.deinit();
-
-    const fs_index_memfd = try createFsFaultFixtureIndexMemfd(std.testing.allocator);
-    defer std.posix.close(fs_index_memfd);
-
-    const route_specifier = "/__collo_route/test/fs-fault-e2.js";
-    const route_fd = try rt.createModulePackFd(route_specifier, fs_fault_e2e_route_source);
-    defer std.posix.close(route_fd);
-    var route = try rt.SingleRoute.init(route_fd, route_specifier);
-    defer route.deinit();
-
-    var launched = try launchOrSkip(&spawned, 90_008, .{
-        .fs_index_memfd = fs_index_memfd,
-        .routes = route.launchRoutes(),
-    });
-    defer launched.deinit();
-    const handle = &launched.handle;
-
-    // First request faults and materializes.
-    var first_dispatch = try rt.initDispatchWork(std.testing.allocator, .{
-        .request_id = 48,
-        .deadline_monotonic_ns = try forkedDeadlineNs(),
-    });
-    defer first_dispatch.deinit();
-    try rt.sendIngressRoute(handle.control_fd, &first_dispatch, 1, .{});
-    var fault_request = try support.readFsFaultRequest(std.testing.allocator, handle.fs_fault_fd, 8_000);
-    defer fault_request.deinit();
-    try support.respondFsFaultOk(handle.fs_fault_fd, fault_request.fault_id, fs_fault_e2e_content);
-    var first_response = try readForkedIngressResponse(handle, 48, 8_000);
-    defer first_response.deinit();
-    try std.testing.expectEqualStrings("resolved:" ++ fs_fault_e2e_content, first_response.body);
-
-    // Second request, same path: served from the tmpfs copy, so the host sees
-    // no further fault traffic. Its stream id is odd, as a client-initiated
-    // HTTP/2 stream's must be (`validateStreamBeginDescriptor` rejects even
-    // ids).
-    var second_dispatch = try rt.initDispatchWork(std.testing.allocator, .{
-        .request_id = 49,
-        .deadline_monotonic_ns = try forkedDeadlineNs(),
-    });
-    defer second_dispatch.deinit();
-    try rt.sendIngressRoute(handle.control_fd, &second_dispatch, 3, .{});
-    var second_response = try readForkedIngressResponse(handle, 49, 8_000);
-    defer second_response.deinit();
-    try std.testing.expectEqualStrings("resolved:" ++ fs_fault_e2e_content, second_response.body);
-    try support.expectNoFsFaultRequest(handle.fs_fault_fd, 300);
-
-    var trace = try support.drainTrace(&spawned, std.testing.allocator);
-    defer trace.deinit();
-    try std.testing.expect(trace.containsPrefix("worker.fs_fault.hit_local=/var/task/" ++ fs_fault_e2e_path));
-    try std.testing.expectEqual(
-        @as(usize, 1),
-        trace.countEq("worker.fs_fault.sent=" ++ fs_fault_e2e_path),
-    );
-}
-
-test "worker fs fault: sha256 mismatch rejects fail-closed, nothing materializes, worker lives" {
-    var spawned = try support.spawnZygote();
-    defer spawned.deinit();
-
-    const fs_index_memfd = try createFsFaultFixtureIndexMemfd(std.testing.allocator);
-    defer std.posix.close(fs_index_memfd);
-
-    const route_specifier = "/__collo_route/test/fs-fault-e3.js";
-    const route_fd = try rt.createModulePackFd(route_specifier, fs_fault_e2e_route_source);
-    defer std.posix.close(route_fd);
-    var route = try rt.SingleRoute.init(route_fd, route_specifier);
-    defer route.deinit();
-
-    var launched = try launchOrSkip(&spawned, 90_009, .{
-        .fs_index_memfd = fs_index_memfd,
-        .routes = route.launchRoutes(),
-    });
-    defer launched.deinit();
-    const handle = &launched.handle;
-
-    // Wrong bytes of the right size: passes the size check, fails sha256.
-    var wrong_content: [fs_fault_e2e_content.len]u8 = fs_fault_e2e_content.*;
-    wrong_content[0] ^= 0x01;
-
-    var first_dispatch = try rt.initDispatchWork(std.testing.allocator, .{
-        .request_id = 50,
-        .deadline_monotonic_ns = try forkedDeadlineNs(),
-    });
-    defer first_dispatch.deinit();
-    try rt.sendIngressRoute(handle.control_fd, &first_dispatch, 1, .{});
-    var first_fault = try support.readFsFaultRequest(std.testing.allocator, handle.fs_fault_fd, 8_000);
-    defer first_fault.deinit();
-    try support.respondFsFaultOk(handle.fs_fault_fd, first_fault.fault_id, &wrong_content);
-    var first_response = try readForkedIngressResponse(handle, 50, 8_000);
-    defer first_response.deinit();
-    try std.testing.expect(std.mem.containsAtLeast(u8, first_response.body, 1, "rejected:"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, first_response.body, 1, "sha256 mismatch"));
-
-    // The worker is alive and nothing was copied in: the same path faults
-    // again, which proves no bytes were kept, and the right bytes now
-    // resolve it. Its stream id is odd, as a client-initiated HTTP/2
-    // stream's must be.
-    var second_dispatch = try rt.initDispatchWork(std.testing.allocator, .{
-        .request_id = 51,
-        .deadline_monotonic_ns = try forkedDeadlineNs(),
-    });
-    defer second_dispatch.deinit();
-    try rt.sendIngressRoute(handle.control_fd, &second_dispatch, 3, .{});
-    var second_fault = try support.readFsFaultRequest(std.testing.allocator, handle.fs_fault_fd, 8_000);
-    defer second_fault.deinit();
-    try std.testing.expectEqualStrings(fs_fault_e2e_path, second_fault.path);
-    try support.respondFsFaultOk(handle.fs_fault_fd, second_fault.fault_id, fs_fault_e2e_content);
-    var second_response = try readForkedIngressResponse(handle, 51, 8_000);
-    defer second_response.deinit();
-    try std.testing.expectEqualStrings("resolved:" ++ fs_fault_e2e_content, second_response.body);
-}
-
-// ---------------------------------------------------------------------------
-// Synchronous faults, the stash of async answers during a synchronous wait,
-// the module evaluation window, whose fault requests carry the boot
-// context's all-zero identity, and how evaluation failures end. The harness
-// plays the host on the fault channel; during
-// evaluation the launch machine's fault-serve callback (runToReady) answers
-// faults inline, one at a time, between WorkerInit and the init outcome.
-
-const fs_fault_stash_path = "data/stash.txt";
-const fs_fault_stash_content = "stash bytes for the sync wait\n";
-
-fn createFsFaultStashIndexMemfd(allocator: std.mem.Allocator) !std.posix.fd_t {
-    var hello_digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(fs_fault_e2e_content, &hello_digest, .{});
-    var stash_digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(fs_fault_stash_content, &stash_digest, .{});
-    // Index order: the paths sort hello before stash.
-    return createTestFsIndexMemfd(allocator, 1_730_000_000_123, &.{
-        .{ .path = fs_fault_e2e_path, .size = fs_fault_e2e_content.len, .sha256 = hello_digest },
-        .{ .path = fs_fault_stash_path, .size = fs_fault_stash_content.len, .sha256 = stash_digest },
-    });
-}
-
-test "worker fs fault: sync readFileSync miss faults, harness serves, bytes return" {
-    var spawned = try support.spawnZygote();
-    defer spawned.deinit();
-
-    const fs_index_memfd = try createFsFaultFixtureIndexMemfd(std.testing.allocator);
-    defer std.posix.close(fs_index_memfd);
-
-    const route_specifier = "/__collo_route/test/fs-fault-f3-sync.js";
-    const route_fd = try rt.createModulePackFd(route_specifier,
-        \\import fs from "node:fs";
-        \\export default function handle() {
-        \\  const content = fs.readFileSync("data/hello.txt", "utf8");
-        \\  return new Response("sync:" + content);
-        \\}
-    );
-    defer std.posix.close(route_fd);
-    var route = try rt.SingleRoute.init(route_fd, route_specifier);
-    defer route.deinit();
-
-    var launched = try launchOrSkip(&spawned, 90_010, .{
-        .fs_index_memfd = fs_index_memfd,
-        .routes = route.launchRoutes(),
-    });
-    defer launched.deinit();
-    const handle = &launched.handle;
-
-    var dispatch = try rt.initDispatchWork(std.testing.allocator, .{
-        .request_id = 60,
-        .deadline_monotonic_ns = try forkedDeadlineNs(),
-    });
-    defer dispatch.deinit();
-    try rt.sendIngressRoute(handle.control_fd, &dispatch, 1, .{});
-
-    // The worker is blocked inside readFileSync until this answers.
-    var fault_request = try support.readFsFaultRequest(std.testing.allocator, handle.fs_fault_fd, 8_000);
-    defer fault_request.deinit();
-    try std.testing.expectEqualStrings(fs_fault_e2e_path, fault_request.path);
-    try std.testing.expectEqual(@as(u64, 60), fault_request.request_id);
-    try support.respondFsFaultOk(handle.fs_fault_fd, fault_request.fault_id, fs_fault_e2e_content);
-
-    var response = try readForkedIngressResponse(handle, 60, 8_000);
-    defer response.deinit();
-    try std.testing.expectEqualStrings("sync:" ++ fs_fault_e2e_content, response.body);
-
-    var trace = try support.drainTrace(&spawned, std.testing.allocator);
-    defer trace.deinit();
-    try support.expectTraceBefore(
-        trace,
-        "worker.fs_fault.sent=" ++ fs_fault_e2e_path,
-        "worker.fs_fault.settled=" ++ fs_fault_e2e_path,
-    );
-}
-
-test "worker fs fault: async response during sync wait is stashed, both settle" {
-    var spawned = try support.spawnZygote();
-    defer spawned.deinit();
-
-    const fs_index_memfd = try createFsFaultStashIndexMemfd(std.testing.allocator);
-    defer std.posix.close(fs_index_memfd);
-
-    const route_specifier = "/__collo_route/test/fs-fault-f3-stash.js";
-    const route_fd = try rt.createModulePackFd(route_specifier,
-        \\import fs from "node:fs";
-        \\export default async function handle() {
-        \\  const pending = fs.promises.readFile("data/hello.txt", "utf8");
-        \\  const syncContent = fs.readFileSync("data/stash.txt", "utf8");
-        \\  const asyncContent = await pending;
-        \\  return new Response("sync:" + syncContent + "|async:" + asyncContent);
-        \\}
-    );
-    defer std.posix.close(route_fd);
-    var route = try rt.SingleRoute.init(route_fd, route_specifier);
-    defer route.deinit();
-
-    var launched = try launchOrSkip(&spawned, 90_011, .{
-        .fs_index_memfd = fs_index_memfd,
-        .routes = route.launchRoutes(),
-    });
-    defer launched.deinit();
-    const handle = &launched.handle;
-
-    var dispatch = try rt.initDispatchWork(std.testing.allocator, .{
-        .request_id = 62,
-        .deadline_monotonic_ns = try forkedDeadlineNs(),
-    });
-    defer dispatch.deinit();
-    try rt.sendIngressRoute(handle.control_fd, &dispatch, 1, .{});
-
-    // Wire order: the async fault leaves first, then the sync fault blocks
-    // the worker. Answering the async one first lands its response inside
-    // the sync wait, which is the stash path.
-    var async_fault = try support.readFsFaultRequest(std.testing.allocator, handle.fs_fault_fd, 8_000);
-    defer async_fault.deinit();
-    try std.testing.expectEqualStrings(fs_fault_e2e_path, async_fault.path);
-    var sync_fault = try support.readFsFaultRequest(std.testing.allocator, handle.fs_fault_fd, 8_000);
-    defer sync_fault.deinit();
-    try std.testing.expectEqualStrings(fs_fault_stash_path, sync_fault.path);
-
-    try support.respondFsFaultOk(handle.fs_fault_fd, async_fault.fault_id, fs_fault_e2e_content);
-    try support.respondFsFaultOk(handle.fs_fault_fd, sync_fault.fault_id, fs_fault_stash_content);
-
-    var response = try readForkedIngressResponse(handle, 62, 8_000);
-    defer response.deinit();
-    try std.testing.expectEqualStrings(
-        "sync:" ++ fs_fault_stash_content ++ "|async:" ++ fs_fault_e2e_content,
-        response.body,
-    );
-
-    var trace = try support.drainTrace(&spawned, std.testing.allocator);
-    defer trace.deinit();
-    // The async response was consumed inside the sync wait without loss, and
-    // its waiters settled through the normal completion path afterwards.
-    try std.testing.expect(trace.containsPrefix("worker.fs_fault.stashed=" ++ fs_fault_e2e_path));
-    try support.expectTraceBefore(
-        trace,
-        "worker.fs_fault.stashed=" ++ fs_fault_e2e_path,
-        "worker.fs_fault.settled=" ++ fs_fault_e2e_path,
-    );
-}
-
-test "worker fs fault: withheld sync fault answer 504s within the request deadline" {
-    var spawned = try support.spawnZygote();
-    defer spawned.deinit();
-
-    const fs_index_memfd = try createFsFaultFixtureIndexMemfd(std.testing.allocator);
-    defer std.posix.close(fs_index_memfd);
-
-    const route_specifier = "/__collo_route/test/fs-fault-f3-stuck.js";
-    const route_fd = try rt.createModulePackFd(route_specifier,
-        \\import fs from "node:fs";
-        \\export default function handle() {
-        \\  const content = fs.readFileSync("data/hello.txt");
-        \\  return new Response("sync:" + content);
-        \\}
-    );
-    defer std.posix.close(route_fd);
-    var route = try rt.SingleRoute.init(route_fd, route_specifier);
-    defer route.deinit();
-
-    var launched = try launchOrSkip(&spawned, 90_012, .{
-        .fs_index_memfd = fs_index_memfd,
-        .routes = route.launchRoutes(),
-    });
-    defer launched.deinit();
-    const handle = &launched.handle;
-
-    // A short deadline: the ppoll horizon is the request's remaining budget,
-    // so the withheld answer surfaces as the request's own 504 well inside
-    // the reader budget below, never as an unbounded block.
-    var dispatch = try rt.initDispatchWork(std.testing.allocator, .{
-        .request_id = 64,
-        .deadline_monotonic_ns = (try process.monotonicNowNs()) + 2 * std.time.ns_per_s,
-    });
-    defer dispatch.deinit();
-    try rt.sendIngressRoute(handle.control_fd, &dispatch, 1, .{});
-
-    // The host receives the fault and never answers it.
-    var fault_request = try support.readFsFaultRequest(std.testing.allocator, handle.fs_fault_fd, 8_000);
-    defer fault_request.deinit();
-    try std.testing.expectEqualStrings(fs_fault_e2e_path, fault_request.path);
-
-    var response = try readForkedIngressResponse(handle, 64, 8_000);
-    defer response.deinit();
-    try std.testing.expectEqual(@as(u16, 504), response.status);
-}
-
-test "worker fs fault: boot context fault after ready is denied fail-closed" {
-    var spawned = try support.spawnZygote();
-    defer spawned.deinit();
-
-    const fs_index_memfd = try createFsFaultFixtureIndexMemfd(std.testing.allocator);
-    defer std.posix.close(fs_index_memfd);
-
-    const route_specifier = "/__collo_route/test/fs-fault-f3-postready.js";
-    const route_fd = try rt.createModulePackFd(route_specifier,
-        \\import fs from "node:fs";
-        \\export default function handle() { return new Response(globalThis.__boot_read); }
-        \\globalThis.__boot_read = "pending";
-        \\await new Promise((resolve) => setTimeout(resolve, 100));
-        \\try {
-        \\  await fs.promises.readFile("data/hello.txt");
-        \\  globalThis.__boot_read = "resolved";
-        \\} catch (e) {
-        \\  globalThis.__boot_read = "denied";
-        \\}
-    );
-    defer std.posix.close(route_fd);
-    var route = try rt.SingleRoute.init(route_fd, route_specifier);
-    defer route.deinit();
-
-    // A route delivered at init: the synchronous slice of its evaluation
-    // runs before ready, and the timer-parked continuation, with its
-    // readFile, runs after ready, outside the evaluation window, where the
-    // worker must deny it locally with no traffic on the fault channel. The
-    // route makes the launch serve routes, which installs the boot context
-    // that top-level timers need.
-    var launched = try launchOrSkip(&spawned, 90_013, .{
-        .fs_index_memfd = fs_index_memfd,
-        .routes = route.launchRoutes(),
-    });
-    defer launched.deinit();
-    const handle = &launched.handle;
-
-    // The denial happens when the module's timer fires, shortly after
-    // ready; the fault channel must stay silent through it.
-    try support.expectNoFsFaultRequest(handle.fs_fault_fd, 600);
-
-    var dispatch = try rt.initDispatchWork(std.testing.allocator, .{
-        .request_id = 66,
-        .deadline_monotonic_ns = try forkedDeadlineNs(),
-    });
-    defer dispatch.deinit();
-    try rt.sendIngressRoute(handle.control_fd, &dispatch, 1, .{});
-    var response = try readForkedIngressResponse(handle, 66, 8_000);
-    defer response.deinit();
-    try std.testing.expectEqualStrings("denied", response.body);
-
-    var trace = try support.drainTrace(&spawned, std.testing.allocator);
-    defer trace.deinit();
-    try std.testing.expect(trace.containsPrefix("worker.fs_fault.boot_denied=" ++ fs_fault_e2e_path));
-}
-
-test "worker fs fault: a sync read during module evaluation is served under the boot context's all-zero identity" {
-    var spawned = try support.spawnZygote();
-    defer spawned.deinit();
-
-    const fs_index_memfd = try createFsFaultFixtureIndexMemfd(std.testing.allocator);
-    defer std.posix.close(fs_index_memfd);
-
-    const route_specifier = "/__collo_route/test/fs-fault-f3-bootwindow.js";
-    const route_fd = try rt.createModulePackFd(route_specifier,
-        \\import fs from "node:fs";
-        \\const content = fs.readFileSync("data/hello.txt", "utf8");
-        \\export default function handle() { return new Response("boot:" + content); }
-    );
-    defer std.posix.close(route_fd);
-    var route = try rt.SingleRoute.init(route_fd, route_specifier);
-    defer route.deinit();
-
-    // The evaluation-window fault policy, through the launch's serve
-    // callback: the all-zero boot identity with the known path serves the
-    // fixture, any other identity is refused, and any other path is not
-    // found. The drain owns the fd it is handed, so every answer carries a
-    // fresh dup.
-    const content_fd = try createSealedMemfdFromBytes(fs_fault_e2e_content);
-    defer std.posix.close(content_fd);
-    const FaultPolicy = struct {
-        path: []const u8,
-        content_fd: std.posix.fd_t,
-        served_boot_reads: usize = 0,
-
-        fn serve(
-            ctx: ?*anyopaque,
-            request: *const zygote.ipc.FsFaultRequest,
-            _: u64,
-        ) host.launch.FaultAnswer {
-            const self: *@This() = @ptrCast(@alignCast(ctx.?));
-            if (request.request_id != 0 or request.request_generation != 0 or
-                request.worker_id != 0 or request.worker_generation != 0)
-                return .refused;
-            if (!std.mem.eql(u8, request.path, self.path))
-                return .not_found;
-            const served_fd = std.posix.dup(self.content_fd) catch return .fetch_failed;
-            self.served_boot_reads += 1;
-            return .{ .ok = served_fd };
-        }
-    };
-    var fault_policy = FaultPolicy{ .path = fs_fault_e2e_path, .content_fd = content_fd };
-    var launched = try launchOrSkip(&spawned, 90_014, .{
-        .fs_index_memfd = fs_index_memfd,
-        .routes = route.launchRoutes(),
-        .fault_serve = .{ .serve = .{
-            .ctx = &fault_policy,
-            .serve = FaultPolicy.serve,
-        } },
-    });
-    defer launched.deinit();
-    const handle = &launched.handle;
-    try std.testing.expectEqual(@as(usize, 1), fault_policy.served_boot_reads);
-
-    var dispatch = try rt.initDispatchWork(std.testing.allocator, .{
-        .request_id = 68,
-        .deadline_monotonic_ns = try forkedDeadlineNs(),
-    });
-    defer dispatch.deinit();
-    try rt.sendIngressRoute(handle.control_fd, &dispatch, 1, .{});
-    var response = try readForkedIngressResponse(handle, 68, 8_000);
-    defer response.deinit();
-    try std.testing.expectEqualStrings("boot:" ++ fs_fault_e2e_content, response.body);
-
-    var trace = try support.drainTrace(&spawned, std.testing.allocator);
-    defer trace.deinit();
-    try support.expectTraceBefore(
-        trace,
-        "worker.fs_fault.sent=" ++ fs_fault_e2e_path,
-        "worker.fs_fault.settled=" ++ fs_fault_e2e_path,
-    );
 }
 
 test "a fetch during module evaluation whose origin answers 600 rejects instead of hanging" {
@@ -1835,7 +1255,6 @@ test "a fetch during module evaluation whose origin answers 600 rejects instead 
     var spawned = try support.spawnZygote();
     defer spawned.deinit();
 
-    const route_specifier = "/__collo_route/test/fs-fault-f3-c55.js";
     const source = try std.fmt.allocPrint(std.testing.allocator,
         \\export default function handle() {{ return new Response(globalThis.__boot_fetch); }}
         \\globalThis.__boot_fetch = "pending";
@@ -1847,12 +1266,10 @@ test "a fetch during module evaluation whose origin answers 600 rejects instead 
         \\}}
     , .{ origin.host(), origin.port });
     defer std.testing.allocator.free(source);
-    const route_fd = try rt.createModulePackFd(route_specifier, source);
-    defer std.posix.close(route_fd);
-    var route = try rt.SingleRoute.init(route_fd, route_specifier);
+    var route = try TestRoute.init("boot-fetch-600", source);
     defer route.deinit();
 
-    var launched = try launchOrSkip(&spawned, 90_015, .{
+    var launched = try launchOrSkip(&spawned, 90_022, .{
         .egress = .{ .attached = .{
             .shared_fds = egress_shared_fds,
             .boot = rt.localBootEgress(),
@@ -1881,22 +1298,17 @@ test "a synchronous throw during module evaluation pins the route failed and its
     var spawned = try support.spawnZygote();
     defer spawned.deinit();
 
-    const route_specifier = "/__collo_route/test/fs-fault-f3-c56.js";
-    const route_fd = try rt.createModulePackFd(route_specifier,
+    var route = try TestRoute.init("boot-throw",
         \\export default function handle() { return new Response("should-not-serve"); }
         \\throw new Error("boot init failed");
     );
-    defer std.posix.close(route_fd);
-    var route = try rt.SingleRoute.init(route_fd, route_specifier);
     defer route.deinit();
 
     // The sync throw happens after the hoisted default export initialized:
-    // without the sticky failed record the per-request re-import would serve
-    // the handler of an init that failed. The failure is the tenant code's,
-    // so the worker still becomes ready, but it must answer 500.
-    var launched = try launchOrSkip(&spawned, 90_016, .{
-        .routes = route.launchRoutes(),
-    });
+    // without the sticky failed record the handler of an init that failed
+    // would serve. The failure is the tenant code's, so the worker still
+    // becomes ready, but it must answer 500.
+    var launched = try launchOrSkip(&spawned, 90_023, .{ .routes = route.launchRoutes() });
     defer launched.deinit();
     const handle = &launched.handle;
 
@@ -1991,7 +1403,7 @@ test "a worker that loses its egress gateway keeps serving, refuses fetch with a
 
     // The host keeps the worker's wake set, which every session of the worker
     // is built on.
-    var wake_set = try zygote.ipc.egress_shared.WakeSet.create();
+    var wake_set = try ipc.egress_shared.WakeSet.create();
     defer wake_set.deinit();
     var first_gateway = try rt.LocalEgressGateway.startOnWakeSet(std.testing.allocator, .{
         .network = rt.local_origin_network,
@@ -2003,7 +1415,6 @@ test "a worker that loses its egress gateway keeps serving, refuses fetch with a
 
     // The request path picks the origin, and a refused fetch answers with the
     // class of its error.
-    const route_specifier = "/__collo_route/test/egress-reattach.js";
     const source = try std.fmt.allocPrint(std.testing.allocator,
         \\export default async function handle(request) {{
         \\  const port = new URL(request.url).pathname === "/before" ? {d} : {d};
@@ -2016,12 +1427,10 @@ test "a worker that loses its egress gateway keeps serving, refuses fetch with a
         \\}}
     , .{ before_origin.port, after_origin.port, before_origin.host() });
     defer std.testing.allocator.free(source);
-    const route_fd = try rt.createModulePackFd(route_specifier, source);
-    defer std.posix.close(route_fd);
-    var route = try rt.SingleRoute.init(route_fd, route_specifier);
+    var route = try TestRoute.init("egress-reattach", source);
     defer route.deinit();
 
-    var launched = try launchOrSkip(&spawned, 90_020, .{
+    var launched = try launchOrSkip(&spawned, 90_024, .{
         .egress = .{ .attached = .{
             .shared_fds = first_fds,
             .boot = rt.localBootEgress(),
@@ -2031,7 +1440,7 @@ test "a worker that loses its egress gateway keeps serving, refuses fetch with a
     defer launched.deinit();
     const handle = &launched.handle;
 
-    const before_body = try forkedRequestBody(handle, 90_020, 1, "/before");
+    const before_body = try forkedRequestBody(handle, 90_024, 1, "/before");
     defer std.testing.allocator.free(before_body);
     try std.testing.expectEqualStrings("fetched:200", before_body);
     var starts: [2]rt.FetchStartIdentity = undefined;
@@ -2043,7 +1452,7 @@ test "a worker that loses its egress gateway keeps serving, refuses fetch with a
     // and the worker keeps serving.
     first_gateway_alive = false;
     first_gateway.deinit();
-    const during_body = try forkedRequestBody(handle, 90_021, 3, "/during");
+    const during_body = try forkedRequestBody(handle, 90_025, 3, "/during");
     defer std.testing.allocator.free(during_body);
     try std.testing.expectEqualStrings("TypeError", during_body);
     try std.testing.expect(!process.pidFdHasExited(handle.pidfd));
@@ -2054,12 +1463,12 @@ test "a worker that loses its egress gateway keeps serving, refuses fetch with a
     var second_gateway = try attachToNewGateway(handle, &wake_set);
     defer second_gateway.deinit();
 
-    const after_body = try forkedRequestBody(handle, 90_022, 5, "/after");
+    const after_body = try forkedRequestBody(handle, 90_026, 5, "/after");
     defer std.testing.allocator.free(after_body);
     try std.testing.expectEqualStrings("fetched:200", after_body);
     try std.testing.expectEqual(@as(usize, 1), second_gateway.recordedFetchStarts(&starts));
     const presented = try rt.verifyEgressToken(&starts[0].egress_token);
-    try std.testing.expectEqual(@as(u64, 90_022), presented.request_id);
+    try std.testing.expectEqual(@as(u64, 90_026), presented.request_id);
     try std.testing.expectEqual(@as(usize, 1), after_origin.accepted.load(.acquire));
 }
 
@@ -2077,7 +1486,7 @@ test "an egress_attach to a worker still attached fails its fetch in flight with
     var spawned = try support.spawnZygote();
     defer spawned.deinit();
 
-    var wake_set = try zygote.ipc.egress_shared.WakeSet.create();
+    var wake_set = try ipc.egress_shared.WakeSet.create();
     defer wake_set.deinit();
     var first_gateway = try rt.LocalEgressGateway.startOnWakeSet(std.testing.allocator, .{
         .network = rt.local_origin_network,
@@ -2087,7 +1496,6 @@ test "an egress_attach to a worker still attached fails its fetch in flight with
     var first_fds = first_gateway.takeWorkerSharedFds();
     defer first_fds.close();
 
-    const route_specifier = "/__collo_route/test/egress-replace.js";
     const source = try std.fmt.allocPrint(std.testing.allocator,
         \\export default async function handle(request) {{
         \\  const target = new URL(request.url).pathname === "/hang"
@@ -2102,12 +1510,10 @@ test "an egress_attach to a worker still attached fails its fetch in flight with
         \\}}
     , .{ silent_host, silent_server.listen_address.getPort(), origin.host(), origin.port });
     defer std.testing.allocator.free(source);
-    const route_fd = try rt.createModulePackFd(route_specifier, source);
-    defer std.posix.close(route_fd);
-    var route = try rt.SingleRoute.init(route_fd, route_specifier);
+    var route = try TestRoute.init("egress-replace", source);
     defer route.deinit();
 
-    var launched = try launchOrSkip(&spawned, 90_021, .{
+    var launched = try launchOrSkip(&spawned, 90_027, .{
         .egress = .{ .attached = .{
             .shared_fds = first_fds,
             .boot = rt.localBootEgress(),
@@ -2117,7 +1523,7 @@ test "an egress_attach to a worker still attached fails its fetch in flight with
     defer launched.deinit();
     const handle = &launched.handle;
 
-    try sendForkedRequest(handle, 90_021, 1, "/hang");
+    try sendForkedRequest(handle, 90_027, 1, "/hang");
     try waitForFetchStarts(first_gateway, 1, 8_000);
 
     // The worker still holds the first gateway's session when the host
@@ -2125,7 +1531,7 @@ test "an egress_attach to a worker still attached fails its fetch in flight with
     // in flight.
     var second_gateway = try attachToNewGateway(handle, &wake_set);
     defer second_gateway.deinit();
-    const hang_body = try readForkedBody(handle, 90_021);
+    const hang_body = try readForkedBody(handle, 90_027);
     defer std.testing.allocator.free(hang_body);
     try std.testing.expectEqualStrings("TypeError:fetch failed: egress gateway closed", hang_body);
 
@@ -2134,7 +1540,7 @@ test "an egress_attach to a worker still attached fails its fetch in flight with
     // gateway's end, so the first one's exit does not detach the worker.
     first_gateway_alive = false;
     first_gateway.deinit();
-    const after_body = try forkedRequestBody(handle, 90_022, 3, "/after");
+    const after_body = try forkedRequestBody(handle, 90_028, 3, "/after");
     defer std.testing.allocator.free(after_body);
     try std.testing.expectEqualStrings("fetched:200", after_body);
     var starts: [2]rt.FetchStartIdentity = undefined;
@@ -2145,14 +1551,13 @@ test "an egress_attach to a worker still attached fails its fetch in flight with
 /// Starts a gateway on a new egress session of the forked worker behind
 /// `handle` and hands the worker that session in an `egress_attach` packet on
 /// its control socket, as the launcher does once a new gateway is up. The
-/// session is built on `wake_set`, the worker's, which the host keeps: the
-/// worker's ring polls only the files it registered at boot, and nothing can
-/// change that table afterwards (`common/io/restricted_uring.zig`). The new
-/// session's write end of the liveness pipe also ends the hang-up an earlier
-/// gateway's exit left on it.
+/// session is built on `wake_set`, the worker's, which the host keeps: a
+/// worker keeps the wake descriptors it booted with for every later session.
+/// The new session's write end of the liveness pipe also ends the hang-up an
+/// earlier gateway's exit left on it.
 fn attachToNewGateway(
     handle: *host.WorkerHandle,
-    wake_set: *const zygote.ipc.egress_shared.WakeSet,
+    wake_set: *const ipc.egress_shared.WakeSet,
 ) !*rt.LocalEgressGateway {
     const gateway = try rt.LocalEgressGateway.startOnWakeSet(std.testing.allocator, .{
         .network = rt.local_origin_network,
@@ -2160,7 +1565,7 @@ fn attachToNewGateway(
     errdefer gateway.deinit();
     var worker_half = gateway.takeWorkerSharedFds();
     defer worker_half.close();
-    try zygote.ipc.egress_attach.send(handle.control_fd, worker_half);
+    try ipc.egress_attach.send(handle.control_fd, worker_half);
     return gateway;
 }
 
@@ -2214,49 +1619,18 @@ fn forkedRequestBody(
     return readForkedBody(handle, request_id);
 }
 
-test "worker init fails closed on an invalid fs index" {
-    var spawned = try support.spawnZygote();
-    defer spawned.deinit();
-
-    // Sealed, so it passes the fd validation, but not a COLLOFS1 index: the
-    // child's map and parse fail the init rather than boot with a broken view
-    // of the file tree.
-    const bad_index_fd = try createSealedMemfdFromBytes("definitely not an fs index");
-    defer std.posix.close(bad_index_fd);
-
-    if (launchOrSkip(&spawned, 90_017, .{ .fs_index_memfd = bad_index_fd })) |launched_value| {
-        var launched = launched_value;
-        launched.deinit();
-        return error.UnexpectedWorkerReady;
-    } else |err| switch (err) {
-        // A failed launch has already terminated the child and waited for
-        // its exit.
-        error.WorkerInitFailed => {},
-        else => return err,
-    }
-
-    spawned.shutdown();
-    try support.expectChildExitStatus(spawned.pid, 0);
-
-    var trace = try support.drainTrace(&spawned, std.testing.allocator);
-    defer trace.deinit();
-    try std.testing.expect(trace.containsPrefix("child.fs_index.invalid"));
-    try std.testing.expect(!trace.containsPrefix("child.fs_index.mapped"));
-    try std.testing.expect(!trace.containsPrefix("child.worker_ready"));
-}
-
 // WebAssembly must keep a worker alive after seccomp. The JSC wasm compile
 // worklist starts its thread lazily with `clone`, which the filter denies
 // with EPERM, and the failed Thread::create aborts the worker while its
-// metrics still read ready. The worker therefore starts the worklist threads
+// page still reads ready. The worker therefore starts the worklist threads
 // in the boot window between the sandbox's privilege boundary and seccomp
 // (`collo_vm_prespawn_compiler_threads`, which starts the JS worklist in the
 // same call) and keeps them from retiring.
 //
 // Instantiation, async compilation and the IPInt-to-BBQ tier-up under a hot
 // loop each run in their own worker, so an abort in one cannot mask the
-// others, and each must leave its worker alive with its metrics reading
-// ready. Each must also settle: the scheduler pumps JSC's DeferredWorkTimer
+// others, and each must leave its worker alive with its page reading ready.
+// Each must also settle: the scheduler pumps JSC's DeferredWorkTimer
 // (`pumpDeferredWork` in `worker/scheduler/loop.zig`) in place of the
 // RunLoop, which a worker never runs because the scheduler is its event
 // loop, and the worklist thread wakes a blocked loop through the eventfd
@@ -2270,10 +1644,7 @@ fn probeWasmOutcome(allocator: std.mem.Allocator, request_id: u64, source: []con
     var spawned = try support.spawnZygote();
     defer spawned.deinit();
 
-    const route_specifier = "/__collo_route/test/wasm-probe.js";
-    const route_fd = try rt.createModulePackFd(route_specifier, source);
-    defer std.posix.close(route_fd);
-    var route = try rt.SingleRoute.init(route_fd, route_specifier);
+    var route = try TestRoute.init("wasm-probe", source);
     defer route.deinit();
 
     var launched = support.launchWorker(
@@ -2296,14 +1667,15 @@ fn probeWasmOutcome(allocator: std.mem.Allocator, request_id: u64, source: []con
     defer dispatch.deinit();
     try rt.sendIngressRoute(handle.control_fd, &dispatch, 1, .{});
 
-    // A denied clone aborts the worker. The "DIED" text, with the metrics
-    // page state and whether the process exited, is returned instead of an
-    // error, so a worklist thread that was not started early fails the
-    // caller's assertion with the full diagnosis, whose error name and
+    // A denied clone aborts the worker. The "DIED" text, with the page's
+    // state and whether the process exited, is returned instead of an error,
+    // so a worklist thread that was not started early fails the caller's
+    // assertion with the full diagnosis, whose error name and
     // `process_exited` tell a death from a hang.
     var response = readForkedIngressResponse(handle, request_id, 8_000) catch |err| {
-        const state_raw: u32 = if (handle.metrics) |m| m.header.state else 0xffff_ffff;
-        const reason_raw: u32 = if (handle.metrics) |m| m.header.termination_reason else 0xffff_ffff;
+        const lifecycle: ?worker_page.LifecycleSnapshot = if (handle.metrics) |m| m.loadLifecycle() else null;
+        const state_raw: u32 = if (lifecycle) |snapshot| snapshot.state else 0xffff_ffff;
+        const reason_raw: u32 = if (lifecycle) |snapshot| snapshot.termination_reason else 0xffff_ffff;
         const exited = process.pidFdHasExited(handle.pidfd);
         return std.fmt.allocPrint(
             allocator,
@@ -2340,15 +1712,15 @@ test "wasm instantiate, compile, and tier-up keep the worker alive after seccomp
     ;
     const Case = struct { name: []const u8, id: u64, body: []const u8, expected: []const u8 };
     const cases = [_]Case{
-        .{ .name = "instantiate", .id = 77, .expected = "ok:instantiate:42", .body = 
+        .{ .name = "instantiate", .id = 90_029, .expected = "ok:instantiate:42", .body = 
         \\    const { instance } = await WebAssembly.instantiate(bytes);
         \\    outcome = "ok:instantiate:" + instance.exports.f();
         },
-        .{ .name = "compile", .id = 78, .expected = "ok:compile:true", .body = 
+        .{ .name = "compile", .id = 90_030, .expected = "ok:compile:true", .body = 
         \\    const mod = await WebAssembly.compile(bytes);
         \\    outcome = "ok:compile:" + (mod instanceof WebAssembly.Module);
         },
-        .{ .name = "tierup", .id = 79, .expected = "ok:tierup:126000000", .body = 
+        .{ .name = "tierup", .id = 90_031, .expected = "ok:tierup:126000000", .body = 
         \\    const { instance } = await WebAssembly.instantiate(bytes);
         \\    let acc = 0;
         \\    for (let i = 0; i < 3000000; i++) acc += instance.exports.f();
@@ -2394,40 +1766,16 @@ fn readForkedIngressResponse(
     request_id: u64,
     budget_ms: u32,
 ) !host.dispatch.Response {
-    return host.dispatch.readResponse(std.testing.allocator, handle.completionChannels(), request_id, .{
+    return host.dispatch.readResponse(std.testing.allocator, handle.responseChannels(), request_id, .{
         .wall_ms = budget_ms,
         .max_body_bytes = rt.default_read_max_body_bytes,
         .max_headers_bytes = rt.default_read_max_headers_bytes,
     });
 }
 
-test "bounded response reader errors on a malformed trailing control packet" {
-    // Once the completion record is visible on the metrics page, the bounded
-    // reader drains the frames still queued on the control fd. A malformed
-    // frame there, such as kind 8, which names no message, surfaces as the
-    // decode error instead of a partial response returned as success. No
-    // worker is involved: an in-process socketpair and the metrics fixture,
-    // with this side playing both ends.
-    const ipc = zygote.ipc;
-    var fixture = try rt.CompletionFixture.init();
-    defer fixture.deinit();
-    const completion_eventfd = try rt.createCompletionEventfd();
-    defer std.posix.close(completion_eventfd);
-
-    const pair = try rt.socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
-    const server_fd = pair[0];
-    const worker_fd = pair[1];
-    defer std.posix.close(server_fd);
-    defer std.posix.close(worker_fd);
-
-    // The worker's side: a complete, well-formed response for request 91...
-    const request_id: u64 = 91;
-    const identity = ipc.ingress_channel.RequestIdentity{
-        .request_id = request_id,
-        .request_generation = 1,
-        .request_lane_id = 0,
-        .request_slot = 0,
-    };
+/// The response frames of a well-formed answer to `identity`, head, one
+/// chunk and end, as a worker sends them on `worker_fd`.
+fn sendWellFormedResponse(worker_fd: std.posix.fd_t, identity: ipc.ingress_channel.RequestIdentity) !void {
     var send_scratch: [ipc.max_message_bytes]u8 = undefined;
     var head_scratch: [256]u8 = undefined;
     const head_payload = try ipc.ingress_channel.encodeResponseHeadInto(
@@ -2452,79 +1800,75 @@ test "bounded response reader errors on a malformed trailing control packet" {
         ipc.ingress_channel.Descriptor.responseEnd(identity, 1),
         &send_scratch,
     );
-    // ...followed by a malformed trailing packet: message kind 8, which names
-    // no message and decodeMessageKind rejects.
+}
+
+test "bounded response reader errors on a malformed packet before the request_done" {
+    // The reader takes packets until the request's `request_done`, which the
+    // worker sends after every other descriptor of the request. A malformed
+    // packet among them, such as message kind 8, which names no message,
+    // surfaces as the decode error instead of a response returned as
+    // success. No worker is involved: an in-process socketpair, with this
+    // side playing both ends.
+    const pair = try rt.socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
+    const server_fd = pair[0];
+    const worker_fd = pair[1];
+    defer std.posix.close(server_fd);
+    defer std.posix.close(worker_fd);
+
+    const request_id: u64 = 91;
+    const identity = ipc.ingress_channel.RequestIdentity{
+        .request_id = request_id,
+        .request_generation = 1,
+        .request_lane_id = 0,
+        .request_slot = 0,
+    };
+    try sendWellFormedResponse(worker_fd, identity);
     var bogus: [8]u8 = undefined;
     std.mem.writeInt(u32, bogus[0..4], 8, .little);
     std.mem.writeInt(u32, bogus[4..8], 0, .little);
     try fd_mod.writeAllRaw(worker_fd, &bogus);
-
-    // The completion is published before the read, so the reader takes the
-    // ring-first path and then drains the control fd.
-    try fixture.view.publishWorkerCompletion(.{
-        .external_request_id = request_id,
-        .request_lane_id = 0,
-        .request_slot = 0,
-        .request_generation = 1,
-        .worker_id = 1,
-        .worker_generation = 1,
-        .status = @intFromEnum(ipc.RequestDoneStatus.ok),
+    var send_scratch: [ipc.max_message_bytes]u8 = undefined;
+    try ipc.ingress_channel.sendRequestDone(worker_fd, identity, 1, .{
+        .status = .ok,
         .http_status = 200,
-    });
+    }, &send_scratch);
 
-    try std.testing.expectError(error.InvalidMessageKind, rt.readIngressResponseBounded(.{
-        .control_fd = server_fd,
-        .completion_eventfd = completion_eventfd,
-        .metrics = &fixture.view,
-    }, request_id, 2_000));
+    try std.testing.expectError(error.InvalidMessageKind, host.dispatch.readResponse(
+        std.testing.allocator,
+        .{ .control_fd = server_fd },
+        request_id,
+        .{
+            .wall_ms = 2_000,
+            .max_body_bytes = rt.default_read_max_body_bytes,
+            .max_headers_bytes = rt.default_read_max_headers_bytes,
+        },
+    ));
 }
 
 test "bounded response reader errors on a broken control channel (POLLERR/POLLNVAL)" {
-    // Both poll sites classify ERR and NVAL before their readability
-    // branches. Otherwise the ring-first drain masks NVAL as a truncated
-    // success, and the waiting poll reports the socket's incidental recv
-    // error instead of the reader's own. Only WouldBlock and
+    // The reader classifies ERR and NVAL before readability, so a broken
+    // channel reports the reader's own error instead of the socket's
+    // incidental receive error or a truncated success. Only WouldBlock and
     // ControlPeerClosed are benign.
+    const budget: host.dispatch.ReadBudget = .{
+        .wall_ms = 2_000,
+        .max_body_bytes = rt.default_read_max_body_bytes,
+        .max_headers_bytes = rt.default_read_max_headers_bytes,
+    };
     {
-        var fixture = try rt.CompletionFixture.init();
-        defer fixture.deinit();
-        const completion_eventfd = try rt.createCompletionEventfd();
-        defer std.posix.close(completion_eventfd);
-
-        // Ring-first site: a closed fd number makes poll(2) report POLLNVAL.
+        // A closed fd number makes poll(2) report POLLNVAL.
         const pair = try rt.socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
         std.posix.close(pair[0]);
         std.posix.close(pair[1]);
-        const dead_fd = pair[0];
-
-        const request_id: u64 = 92;
-        try fixture.view.publishWorkerCompletion(.{
-            .external_request_id = request_id,
-            .request_lane_id = 0,
-            .request_slot = 0,
-            .request_generation = 1,
-            .worker_id = 1,
-            .worker_generation = 1,
-            .status = @intFromEnum(zygote.ipc.RequestDoneStatus.ok),
-            .http_status = 200,
-        });
-
-        try std.testing.expectError(error.ControlChannelBroken, rt.readIngressResponseBounded(.{
-            .control_fd = dead_fd,
-            .completion_eventfd = completion_eventfd,
-            .metrics = &fixture.view,
-        }, request_id, 2_000));
+        try std.testing.expectError(
+            error.ControlChannelBroken,
+            host.dispatch.readResponse(std.testing.allocator, .{ .control_fd = pair[0] }, 92, budget),
+        );
     }
-
     {
-        var fixture = try rt.CompletionFixture.init();
-        defer fixture.deinit();
-        const completion_eventfd = try rt.createCompletionEventfd();
-        defer std.posix.close(completion_eventfd);
-
-        // Waiting site: connect a nonblocking TCP socket to a just-closed
-        // loopback listener. Linux reports POLLERR|POLLHUP; the probe pins
-        // POLLERR before handing the same fd to the production reader.
+        // Connect a nonblocking TCP socket to a just-closed loopback
+        // listener. Linux reports POLLERR|POLLHUP; the probe pins POLLERR
+        // before handing the same fd to the reader.
         var listener = try (try std.net.Address.parseIp4("127.0.0.1", 0)).listen(.{
             .reuse_address = true,
         });
@@ -2552,11 +1896,10 @@ test "bounded response reader errors on a broken control channel (POLLERR/POLLNV
         try std.testing.expectEqual(@as(usize, 1), try std.posix.poll(&pollerr_probe, 1_000));
         try std.testing.expect((pollerr_probe[0].revents & std.posix.POLL.ERR) != 0);
 
-        try std.testing.expectError(error.ControlChannelBroken, rt.readIngressResponseBounded(.{
-            .control_fd = pollerr_fd,
-            .completion_eventfd = completion_eventfd,
-            .metrics = &fixture.view,
-        }, 93, 2_000));
+        try std.testing.expectError(
+            error.ControlChannelBroken,
+            host.dispatch.readResponse(std.testing.allocator, .{ .control_fd = pollerr_fd }, 93, budget),
+        );
     }
 }
 
@@ -2597,348 +1940,161 @@ test "worker cgroup dir fd validation rejects ordinary directories" {
     );
 }
 
-test "worker init with non-directory tmp root fd fails and marks init_failed" {
-    var spawned = try support.spawnZygote();
-    defer spawned.deinit();
+/// What a host shares with a child it hands a WorkerInit by hand: the state
+/// page, created and mapped here as a launch does, the completion eventfd,
+/// and the payload memfd with its credit eventfd. `deinit` releases them.
+const HandBuiltShared = struct {
+    page_fd: std.posix.fd_t,
+    page: worker_page.HostReaderView,
+    completion_eventfd: std.posix.fd_t,
+    payload_fd: std.posix.fd_t,
+    payload_credit_eventfd: std.posix.fd_t,
 
-    var worker = try zygote.host_client.requestFork(&spawned);
-    var worker_armed = true;
-    defer if (worker_armed) worker.deinit();
-
-    const worker_pidfd = try std.posix.dup(worker.pidfd.?);
-    defer std.posix.close(worker_pidfd);
-
-    const metrics_fd = try zygote.worker_state.page.createMemfd("collo-invalid-metrics");
-    defer std.posix.close(metrics_fd);
-    const completion_eventfd = try std.posix.eventfd(0, std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK);
-    defer std.posix.close(completion_eventfd);
-    const ingress_payload_fd = try zygote.ipc.ingress_channel.createSharedPayloadMemfd();
-    defer std.posix.close(ingress_payload_fd);
-    const ingress_payload_credit_eventfd = try std.posix.eventfd(0, std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK);
-    defer std.posix.close(ingress_payload_credit_eventfd);
-    var metrics = try zygote.worker_state.page.mapReadWrite(metrics_fd);
-    defer metrics.deinit();
-    metrics.initializeCrashDefault();
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var not_dir = try tmp.dir.createFile("not-dir", .{});
-    defer not_dir.close();
-
-    var message = try zygote.ipc.WorkerInit.init(
-        worker_memory_limit_bytes,
-        zygote.ipc.WorkerRuntimeBootOptions.default(),
-    );
-    message.enableEgressGatewaySandbox();
-    // Valid deadline so the probe stays on the tmp-root fd axis.
-    message.init_deadline_mono_ns = (try process.monotonicNowNs()) + 3 * std.time.ns_per_s;
-    var wake = try detachedWake();
-    defer wake.close();
-    try zygote.ipc.sendWorkerInitWithEgressShared(
-        worker.worker_init_fd.?,
-        &message,
-        metrics_fd,
-        completion_eventfd,
-        ingress_payload_fd,
-        ingress_payload_credit_eventfd,
-        not_dir.handle,
-        tmp.dir.fd,
-        zygote.ipc.egress_shared.RawFds.wakeOnly(wake),
-    );
-
-    switch (try zygote.host_client.receiveWorkerInitOutcome(worker.worker_init_fd.?)) {
-        .ready => return error.UnexpectedReady,
-        .failed => |reason| try std.testing.expectEqual(
-            zygote.ipc.WorkerInitFailedReason.invalid_worker_init,
-            reason,
-        ),
+    fn init(self: *HandBuiltShared) !void {
+        const eventfd_flags = std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK;
+        self.page_fd = try worker_page.createMemfd("collo-test-hand-built-page");
+        errdefer std.posix.close(self.page_fd);
+        self.page = try worker_page.mapHostReader(self.page_fd);
+        errdefer self.page.deinit();
+        self.completion_eventfd = try std.posix.eventfd(0, eventfd_flags);
+        errdefer std.posix.close(self.completion_eventfd);
+        self.payload_fd = try ipc.ingress_channel.createSharedPayloadMemfd();
+        errdefer std.posix.close(self.payload_fd);
+        self.payload_credit_eventfd = try std.posix.eventfd(0, eventfd_flags);
     }
 
-    try std.testing.expectEqual(@intFromEnum(zygote.worker_state.page.State.dead), metrics.header.state);
-    try std.testing.expectEqual(
-        @intFromEnum(zygote.worker_state.page.TerminationReason.init_failed),
-        metrics.header.termination_reason,
-    );
+    fn deinit(self: *HandBuiltShared) void {
+        std.posix.close(self.payload_credit_eventfd);
+        std.posix.close(self.payload_fd);
+        std.posix.close(self.completion_eventfd);
+        self.page.deinit();
+        std.posix.close(self.page_fd);
+        self.* = undefined;
+    }
 
-    worker_armed = false;
-    worker.deinit();
-    try support.waitForPidFdExit(worker_pidfd);
+    /// The WorkerInit table for this host's descriptors and the caller's
+    /// leaf, egress and artifact, every one borrowed.
+    fn fds(
+        self: *const HandBuiltShared,
+        leaf_fd: std.posix.fd_t,
+        egress_shared_fds: ipc.egress_shared.RawFds,
+        module_pack_fd: std.posix.fd_t,
+    ) ipc.WorkerInitFds {
+        return .{
+            .metrics_fd = self.page_fd,
+            .completion_eventfd = self.completion_eventfd,
+            .ingress_payload_fd = self.payload_fd,
+            .ingress_payload_credit_eventfd = self.payload_credit_eventfd,
+            .cgroup_dir_fd = leaf_fd,
+            .egress_shared_fds = egress_shared_fds,
+            .module_pack_fd = module_pack_fd,
+        };
+    }
 
-    spawned.shutdown();
-    try support.expectChildExitStatus(spawned.pid, 0);
+    /// Fails unless the page's lifecycle is still the one the host wrote:
+    /// a failed boot reports its reason on the init socket and leaves the
+    /// page alone.
+    fn expectPageAsHostWrote(self: *const HandBuiltShared) !void {
+        const lifecycle = self.page.loadLifecycle();
+        try std.testing.expectEqual(@as(?worker_page.State, .forked), lifecycle.knownState());
+        try std.testing.expectEqual(@as(?worker_page.TerminationReason, .crash), lifecycle.knownTerminationReason());
+    }
+};
+
+test "a WorkerInit whose leaf is no cgroup fails as invalid_worker_init and leaves the page as the host wrote it" {
+    var spawned = try support.spawnZygote();
+    defer spawned.deinit();
+    var child = try forkBareOrSkip(&spawned, 90_032);
+    defer child.deinit();
+    var shared: HandBuiltShared = undefined;
+    try shared.init();
+    defer shared.deinit();
+    var route = try TestRoute.init("leaf-refused", plain_route_source);
+    defer route.deinit();
+    var not_a_leaf = std.testing.tmpDir(.{});
+    defer not_a_leaf.cleanup();
+
+    var message = ipc.WorkerInit.init(worker_memory_limit_bytes);
+    message.init_deadline_mono_ns = (try process.monotonicNowNs()) + 3 * std.time.ns_per_s;
+    try ipc.sendWorkerInit(child.initFd(), &message, shared.fds(not_a_leaf.dir.fd, .{}, route.pack_fd));
+
+    switch (try support.receiveWorkerInitOutcomeBeforeTimeout(child.initFd(), child.pidfd(), 3_000)) {
+        .ready => return error.UnexpectedReady,
+        .failed => |reason| try std.testing.expectEqual(ipc.WorkerInitFailedReason.invalid_worker_init, reason),
+    }
+    try support.waitForPidFdExit(child.pidfd());
+    try shared.expectPageAsHostWrote();
+    // The child mapped the page, so its early phases are there, and never
+    // got past the leaf.
+    try std.testing.expect(shared.page.loadBootPhaseStampNs(.metrics_mapped) != 0);
+    try std.testing.expectEqual(@as(u64, 0), shared.page.loadBootPhaseStampNs(.cgroup_validated));
 
     var trace = try support.drainTrace(&spawned, std.testing.allocator);
     defer trace.deinit();
-    try std.testing.expect(trace.containsPrefix("child.worker_init.invalid_fds"));
+    try std.testing.expect(trace.containsPrefix("child.boot_failed=InvalidWorkerCgroupDir"));
     try std.testing.expect(!trace.containsPrefix("child.cgroup.validated"));
-    try std.testing.expect(!trace.containsPrefix("child.memory_events.opened"));
 }
 
-test "worker init with ordinary cgroup dir fd fails and marks init_failed" {
+test "a WorkerInit with an unknown flag fails as invalid_worker_init and leaves the page as the host wrote it" {
     var spawned = try support.spawnZygote();
     defer spawned.deinit();
+    var child = try forkBareOrSkip(&spawned, 90_033);
+    defer child.deinit();
+    var shared: HandBuiltShared = undefined;
+    try shared.init();
+    defer shared.deinit();
+    var route = try TestRoute.init("flag-refused", plain_route_source);
+    defer route.deinit();
 
-    var worker = try zygote.host_client.requestFork(&spawned);
-    var worker_armed = true;
-    defer if (worker_armed) worker.deinit();
-
-    const worker_pidfd = try std.posix.dup(worker.pidfd.?);
-    defer std.posix.close(worker_pidfd);
-
-    const metrics_fd = try zygote.worker_state.page.createMemfd("collo-invalid-cgroup-metrics");
-    defer std.posix.close(metrics_fd);
-    const completion_eventfd = try std.posix.eventfd(0, std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK);
-    defer std.posix.close(completion_eventfd);
-    const ingress_payload_fd = try zygote.ipc.ingress_channel.createSharedPayloadMemfd();
-    defer std.posix.close(ingress_payload_fd);
-    const ingress_payload_credit_eventfd = try std.posix.eventfd(0, std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK);
-    defer std.posix.close(ingress_payload_credit_eventfd);
-    var metrics = try zygote.worker_state.page.mapReadWrite(metrics_fd);
-    defer metrics.deinit();
-    metrics.initializeCrashDefault();
-
-    const tmp_root_path = try support.makeTempPath(std.testing.allocator, "collo-valid-tmp-root");
-    defer std.testing.allocator.free(tmp_root_path);
-    defer support.cleanupTmpRoot(tmp_root_path);
-    try std.posix.mkdir(tmp_root_path, zygote.worker_boot.sandbox.tmp_root.required_mode);
-    var tmp_root = try std.fs.openDirAbsolute(tmp_root_path, .{ .no_follow = true });
-    defer tmp_root.close();
-
-    var fake_cgroup = std.testing.tmpDir(.{});
-    defer fake_cgroup.cleanup();
-
-    var message = try zygote.ipc.WorkerInit.init(
-        worker_memory_limit_bytes,
-        zygote.ipc.WorkerRuntimeBootOptions.default(),
-    );
-    message.enableEgressGatewaySandbox();
-    // Valid deadline so the probe stays on the cgroup fd axis.
+    var message = ipc.WorkerInit.init(worker_memory_limit_bytes);
     message.init_deadline_mono_ns = (try process.monotonicNowNs()) + 3 * std.time.ns_per_s;
-    var wake = try detachedWake();
-    defer wake.close();
-    try zygote.ipc.sendWorkerInitWithEgressShared(
-        worker.worker_init_fd.?,
-        &message,
-        metrics_fd,
-        completion_eventfd,
-        ingress_payload_fd,
-        ingress_payload_credit_eventfd,
-        tmp_root.fd,
-        fake_cgroup.dir.fd,
-        zygote.ipc.egress_shared.RawFds.wakeOnly(wake),
-    );
+    message.flags |= 1 << 31;
+    try ipc.sendWorkerInit(child.initFd(), &message, shared.fds(child.leaf_fd, .{}, route.pack_fd));
 
-    switch (try zygote.host_client.receiveWorkerInitOutcome(worker.worker_init_fd.?)) {
+    switch (try support.receiveWorkerInitOutcomeBeforeTimeout(child.initFd(), child.pidfd(), 3_000)) {
         .ready => return error.UnexpectedReady,
-        .failed => |reason| try std.testing.expectEqual(
-            zygote.ipc.WorkerInitFailedReason.invalid_worker_init,
-            reason,
-        ),
+        .failed => |reason| try std.testing.expectEqual(ipc.WorkerInitFailedReason.invalid_worker_init, reason),
     }
-
-    try std.testing.expectEqual(@intFromEnum(zygote.worker_state.page.State.dead), metrics.header.state);
-    try std.testing.expectEqual(
-        @intFromEnum(zygote.worker_state.page.TerminationReason.init_failed),
-        metrics.header.termination_reason,
-    );
-
-    worker_armed = false;
-    worker.deinit();
-    try support.waitForPidFdExit(worker_pidfd);
-
-    spawned.shutdown();
-    try support.expectChildExitStatus(spawned.pid, 0);
+    try support.waitForPidFdExit(child.pidfd());
+    try shared.expectPageAsHostWrote();
 
     var trace = try support.drainTrace(&spawned, std.testing.allocator);
     defer trace.deinit();
-    try std.testing.expect(trace.containsPrefix("child.worker_init.invalid_fds"));
-    try std.testing.expect(!trace.containsPrefix("child.cgroup.validated"));
-    try std.testing.expect(!trace.containsPrefix("child.memory_events.opened"));
-}
-
-test "worker init rejects invalid runtime boot options" {
-    var spawned = try support.spawnZygote();
-    defer spawned.deinit();
-
-    var worker = try zygote.host_client.requestFork(&spawned);
-    var worker_armed = true;
-    defer if (worker_armed) worker.deinit();
-
-    const worker_pidfd = try std.posix.dup(worker.pidfd.?);
-    defer std.posix.close(worker_pidfd);
-
-    const metrics_fd = try zygote.worker_state.page.createMemfd("collo-current-alias");
-    defer std.posix.close(metrics_fd);
-    const completion_eventfd = try std.posix.eventfd(0, std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK);
-    defer std.posix.close(completion_eventfd);
-    const ingress_payload_fd = try zygote.ipc.ingress_channel.createSharedPayloadMemfd();
-    defer std.posix.close(ingress_payload_fd);
-    const ingress_payload_credit_eventfd = try std.posix.eventfd(0, std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK);
-    defer std.posix.close(ingress_payload_credit_eventfd);
-    var metrics = try zygote.worker_state.page.mapReadWrite(metrics_fd);
-    defer metrics.deinit();
-    metrics.initializeCrashDefault();
-
-    var tmp_root = std.testing.tmpDir(.{});
-    defer tmp_root.cleanup();
-
-    var options = zygote.ipc.WorkerRuntimeBootOptions.default();
-    options.crypto_thread_count = 0;
-    var message = try zygote.ipc.WorkerInit.init(worker_memory_limit_bytes, options);
-    message.enableEgressGatewaySandbox();
-    var wake = try detachedWake();
-    defer wake.close();
-    try zygote.ipc.sendWorkerInitWithEgressShared(
-        worker.worker_init_fd.?,
-        &message,
-        metrics_fd,
-        completion_eventfd,
-        ingress_payload_fd,
-        ingress_payload_credit_eventfd,
-        tmp_root.dir.fd,
-        tmp_root.dir.fd,
-        zygote.ipc.egress_shared.RawFds.wakeOnly(wake),
-    );
-
-    switch (try zygote.host_client.receiveWorkerInitOutcome(worker.worker_init_fd.?)) {
-        .ready => return error.UnexpectedReady,
-        .failed => |reason| try std.testing.expectEqual(
-            zygote.ipc.WorkerInitFailedReason.invalid_worker_init,
-            reason,
-        ),
-    }
-
-    try std.testing.expectEqual(
-        @intFromEnum(zygote.worker_state.page.TerminationReason.init_failed),
-        metrics.header.termination_reason,
-    );
-
-    worker_armed = false;
-    worker.deinit();
-    try support.waitForPidFdExit(worker_pidfd);
-
-    spawned.shutdown();
-    try support.expectChildExitStatus(spawned.pid, 0);
+    try std.testing.expect(trace.containsPrefix("child.boot_failed=InvalidWorkerInitFlags"));
+    try std.testing.expect(!trace.containsPrefix("child.worker_init.validated"));
 }
 
 test "a child sends one outcome for a WorkerInit short of a descriptor and exits with nothing after it" {
     var spawned = try support.spawnZygote();
     defer spawned.deinit();
-
-    var worker = try zygote.host_client.requestFork(&spawned);
-    var worker_armed = true;
-    defer if (worker_armed) worker.deinit();
-
-    const worker_pidfd = try std.posix.dup(worker.pidfd.?);
-    defer std.posix.close(worker_pidfd);
+    var child = try forkBareOrSkip(&spawned, 90_034);
+    defer child.deinit();
 
     // A WorkerInit without its descriptor table, which the child's receive
     // refuses for its first missing descriptor.
-    var message = try zygote.ipc.WorkerInit.init(
-        worker_memory_limit_bytes,
-        zygote.ipc.WorkerRuntimeBootOptions.default(),
-    );
-    message.enableEgressGatewaySandbox();
+    var message = ipc.WorkerInit.init(worker_memory_limit_bytes);
     message.init_deadline_mono_ns = (try process.monotonicNowNs()) + 3 * std.time.ns_per_s;
-    try zygote.ipc.packet.sendExact(worker.worker_init_fd.?, std.mem.asBytes(&message));
+    try ipc.packet.sendExact(child.initFd(), std.mem.asBytes(&message));
 
-    switch (try zygote.host_client.receiveWorkerInitOutcome(worker.worker_init_fd.?)) {
+    switch (try zygote.host_client.receiveWorkerInitOutcome(child.initFd())) {
         .ready => return error.UnexpectedReady,
-        .failed => |reason| try std.testing.expectEqual(
-            zygote.ipc.WorkerInitFailedReason.missing_metrics_fd,
-            reason,
-        ),
+        .failed => |reason| try std.testing.expectEqual(ipc.WorkerInitFailedReason.missing_metrics_fd, reason),
     }
     // Once the child is gone, its init socket holds no second outcome.
-    try support.waitForPidFdExit(worker_pidfd);
-    try std.testing.expectError(error.PeerClosed, zygote.ipc.recvInitOutcome(worker.worker_init_fd.?));
-
-    worker_armed = false;
-    worker.deinit();
-
-    spawned.shutdown();
-    try support.expectChildExitStatus(spawned.pid, 0);
+    try support.waitForPidFdExit(child.pidfd());
+    try std.testing.expectError(error.PeerClosed, ipc.recvInitOutcome(child.initFd()));
 
     var trace = try support.drainTrace(&spawned, std.testing.allocator);
     defer trace.deinit();
     try std.testing.expect(trace.containsPrefix("child.worker_init.recv_failed=MissingMetricsFd"));
 }
 
-test "post-fork invalid init flushes exit probe before _exit" {
-    const exit_probe_path = try support.makeTempPath(std.testing.allocator, "collo-exit-probe");
-    defer std.testing.allocator.free(exit_probe_path);
-    defer std.fs.deleteFileAbsolute(exit_probe_path) catch {};
-
-    var spawned = try support.spawnZygoteWithExitProbe(exit_probe_path);
-    defer spawned.deinit();
-
-    var worker = try zygote.host_client.requestFork(&spawned);
-    var worker_armed = true;
-    defer if (worker_armed) worker.deinit();
-
-    const worker_pidfd = try std.posix.dup(worker.pidfd.?);
-    defer std.posix.close(worker_pidfd);
-
-    const metrics_fd = try zygote.worker_state.page.createMemfd("collo-exit-probe-metrics");
-    defer std.posix.close(metrics_fd);
-    const completion_eventfd = try std.posix.eventfd(0, std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK);
-    defer std.posix.close(completion_eventfd);
-    const ingress_payload_fd = try zygote.ipc.ingress_channel.createSharedPayloadMemfd();
-    defer std.posix.close(ingress_payload_fd);
-    const ingress_payload_credit_eventfd = try std.posix.eventfd(0, std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK);
-    defer std.posix.close(ingress_payload_credit_eventfd);
-    var metrics = try zygote.worker_state.page.mapReadWrite(metrics_fd);
-    defer metrics.deinit();
-    metrics.initializeCrashDefault();
-
-    var tmp_root = std.testing.tmpDir(.{});
-    defer tmp_root.cleanup();
-
-    // The probe is what this test asserts; the failure only has to happen
-    // after the fork. Invalid runtime options through the production sender
-    // provoke it without hand-building the WorkerInit fd array, so protocol
-    // fd additions cannot silently change which failure this exercises.
-    var options = zygote.ipc.WorkerRuntimeBootOptions.default();
-    options.crypto_thread_count = 0;
-    var message = try zygote.ipc.WorkerInit.init(worker_memory_limit_bytes, options);
-    message.enableEgressGatewaySandbox();
-    var wake = try detachedWake();
-    defer wake.close();
-    try zygote.ipc.sendWorkerInitWithEgressShared(
-        worker.worker_init_fd.?,
-        &message,
-        metrics_fd,
-        completion_eventfd,
-        ingress_payload_fd,
-        ingress_payload_credit_eventfd,
-        tmp_root.dir.fd,
-        tmp_root.dir.fd,
-        zygote.ipc.egress_shared.RawFds.wakeOnly(wake),
-    );
-
-    switch (try zygote.host_client.receiveWorkerInitOutcome(worker.worker_init_fd.?)) {
-        .ready => return error.UnexpectedReady,
-        .failed => |reason| try std.testing.expectEqual(zygote.ipc.WorkerInitFailedReason.invalid_worker_init, reason),
-    }
-
-    worker_armed = false;
-    worker.deinit();
-    try support.waitForPidFdExit(worker_pidfd);
-
-    const probe_contents = try support.readFileAlloc(exit_probe_path, std.testing.allocator);
-    defer std.testing.allocator.free(probe_contents);
-    try std.testing.expectEqualStrings("postfork-exit-probe", probe_contents);
-
-    spawned.shutdown();
-    try support.expectChildExitStatus(spawned.pid, 0);
-}
-
 test "worker boot eval hung in the sync slice dies typed at the init deadline before the wall kill" {
-    try expectBootDiesAtInitDeadline(1, 90_031);
+    try expectBootDiesAtInitDeadline(1, 90_035);
 }
 
 test "a boot past its init deadline evaluates no further route, so a worker of the most isolated routes still dies typed in time" {
-    try expectBootDiesAtInitDeadline(zygote.ipc.route_table.routes_max, 90_032);
+    try expectBootDiesAtInitDeadline(ipc.route_table.routes_max, 90_036);
 }
 
 /// Route 0's entry: its synchronous top-level slice never lets a microtask
@@ -2949,7 +2105,6 @@ const init_deadline_spin_source =
     \\function spin() { Promise.resolve().then(spin); }
     \\spin();
 ;
-const init_deadline_plain_source = "export default () => new Response(\"plain\");";
 
 /// Boots a worker of `route_count` routes, every one past the first in a
 /// realm of its own, whose route 0 spins. The child's watchdog, armed at
@@ -2963,156 +2118,83 @@ fn expectBootDiesAtInitDeadline(route_count: usize, fork_job_id: u64) !void {
     var spawned = try support.spawnZygote();
     defer spawned.deinit();
 
-    // The child is born inside a prepared leaf with the same limits the
-    // WorkerInit below announces, so its cgroup validation passes and the
-    // boot reaches the eval.
-    var root = support.cgroupRoot(std.testing.allocator) catch |err| switch (err) {
-        error.WorkerCgroupDelegationUnavailable => return error.SkipZigTest,
-        else => return err,
-    };
-    defer root.deinit(std.testing.allocator);
-    const cgroup_dir_fd = try root.createWorkerDir(fork_job_id, .{
-        .memory_limit_bytes = worker_memory_limit_bytes,
-        .cpu_max_cores = limits.worker.cpu_max_cores,
-    });
-    defer std.posix.close(cgroup_dir_fd);
-    // After the worker's exit below; a resident member would block the rmdir.
-    defer root.removeWorkerDir(fork_job_id);
-
-    var worker = try zygote.host_client.requestForkWithJobId(&spawned, fork_job_id, cgroup_dir_fd);
-    var worker_armed = true;
-    defer if (worker_armed) worker.deinit();
-
-    const worker_pidfd = try std.posix.dup(worker.pidfd.?);
-    defer std.posix.close(worker_pidfd);
-    // A broken watchdog leaves the child spinning JS forever; never leak it
-    // past a failing test. Errdefer only: the passing path must observe the
-    // voluntary exit, with no signal ever sent.
-    errdefer process.pidFdSendSignal(worker_pidfd, std.posix.SIG.KILL) catch {};
-
-    const tmp_root_path = try support.makeTempPath(std.testing.allocator, "collo-init-deadline-tmp");
-    defer std.testing.allocator.free(tmp_root_path);
-    defer support.cleanupTmpRoot(tmp_root_path);
-    try std.posix.mkdir(tmp_root_path, zygote.worker_boot.sandbox.tmp_root.required_mode);
-    var tmp_root_dir = try std.fs.openDirAbsolute(tmp_root_path, .{ .no_follow = true });
-    defer tmp_root_dir.close();
-
-    const metrics_fd = try zygote.worker_state.page.createMemfd("collo-init-deadline-metrics");
-    defer std.posix.close(metrics_fd);
-    const completion_eventfd = try std.posix.eventfd(0, std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK);
-    defer std.posix.close(completion_eventfd);
-    const ingress_payload_fd = try zygote.ipc.ingress_channel.createSharedPayloadMemfd();
-    defer std.posix.close(ingress_payload_fd);
-    const ingress_payload_credit_eventfd = try std.posix.eventfd(0, std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK);
-    defer std.posix.close(ingress_payload_credit_eventfd);
-    var wake_set = try zygote.ipc.egress_shared.WakeSet.create();
+    // The child is born inside a leaf with the limits the WorkerInit below
+    // announces, so its leaf check passes and the boot reaches the eval.
+    var child = try forkBareOrSkip(&spawned, fork_job_id);
+    defer child.deinit();
+    // A broken watchdog leaves the child spinning JS forever; `deinit` kills
+    // it, while the passing path observes the voluntary exit first.
+    var shared: HandBuiltShared = undefined;
+    try shared.init();
+    defer shared.deinit();
+    var wake_set = try ipc.egress_shared.WakeSet.create();
     defer wake_set.deinit();
-    var egress_shared = try zygote.ipc.egress_shared.createSessionForWorker(&wake_set);
+    var egress_shared = try ipc.egress_shared.createSessionForWorker(&wake_set);
     defer egress_shared.deinit();
-    var metrics = try zygote.worker_state.page.mapReadWrite(metrics_fd);
-    defer metrics.deinit();
-    metrics.initializeCrashDefault();
 
-    const fs_index_fd = try zygote.ipc.zygote_worker.createPlaceholderFsIndexMemfd();
-    defer std.posix.close(fs_index_fd);
-    const fs_fault_pair = try fd_mod.socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
-    defer std.posix.close(fs_fault_pair[0]);
-    defer std.posix.close(fs_fault_pair[1]);
-
-    const routes_max = zygote.ipc.route_table.routes_max;
+    const routes_max = ipc.route_table.routes_max;
     var specifier_buffers: [routes_max][64]u8 = undefined;
-    var modules: [routes_max]zygote.ipc.module_pack.Module = undefined;
-    var routes: [routes_max]zygote.ipc.route_table.RouteInput = undefined;
+    var modules: [routes_max]ipc.module_pack.Module = undefined;
+    var routes: [routes_max]ipc.route_table.RouteInput = undefined;
     for (0..route_count) |index| {
-        const specifier = try std.fmt.bufPrint(&specifier_buffers[index], "/__collo_route/test/init-deadline-{d}.js", .{index});
+        const specifier = try std.fmt.bufPrint(&specifier_buffers[index], "{s}/init-deadline-{d}.js", .{
+            ipc.module_pack.task_root,
+            index,
+        });
         modules[index] = .{
             .specifier = specifier,
-            .source = if (index == 0) init_deadline_spin_source else init_deadline_plain_source,
-            .dependencies = &.{},
+            .source = if (index == 0) init_deadline_spin_source else plain_route_source,
         };
-        routes[index] = .{ .entry_specifier = specifier, .bindings = &.{} };
+        routes[index] = .{ .entry_module = @intCast(index) };
     }
-    const pack_fd = try rt.createModulePackGraphFd(modules[0..route_count], 0);
+    const pack_fd = try host.dispatch.createDefinitionFd(std.testing.allocator, modules[0..route_count], routes[0..route_count]);
     defer std.posix.close(pack_fd);
-    const table = try zygote.ipc.route_table.buildSealed(std.testing.allocator, routes[0..route_count]);
-    defer table.close();
 
-    var message = try zygote.ipc.WorkerInit.init(
-        worker_memory_limit_bytes,
-        zygote.ipc.WorkerRuntimeBootOptions.default(),
-    );
-    message.route_table_len = table.blob_len;
-    message.flags |= zygote.ipc.WorkerInit.flag_serves_routes | zygote.ipc.WorkerInit.flag_isolate_realm;
-    message.enableEgressGatewaySandbox();
+    var message = ipc.WorkerInit.init(worker_memory_limit_bytes);
+    message.flags |= ipc.WorkerInit.flag_isolate_realm;
     // The host's window: now plus WORKER_INIT_TIMEOUT_MS, fixed before the
     // send, the same absolute value both ends enforce. The boot token takes
     // it as its deadline too: this boot ends at the init deadline, so the
     // budget `host/launch.zig:bootEgressDeadline` adds would change nothing.
     const init_deadline_mono_ns = (try process.monotonicNowNs()) +
-        @as(u64, @intCast(zygote.host_client.worker_init_timeout_ms)) * std.time.ns_per_ms;
+        @as(u64, @intCast(limits.process.WORKER_INIT_TIMEOUT_MS)) * std.time.ns_per_ms;
     message.init_deadline_mono_ns = init_deadline_mono_ns;
     message.boot_egress_token = rt.bootEgressToken(init_deadline_mono_ns);
-    try zygote.ipc.sendWorkerInitWithRouteTableAndEgressShared(
-        worker.worker_init_fd.?,
+    try ipc.sendWorkerInit(
+        child.initFd(),
         &message,
-        metrics_fd,
-        completion_eventfd,
-        ingress_payload_fd,
-        ingress_payload_credit_eventfd,
-        tmp_root_dir.fd,
-        cgroup_dir_fd,
-        table.fd,
-        egress_shared.rawForWorker(),
-        fs_index_fd,
-        fs_fault_pair[1],
-        pack_fd,
+        shared.fds(child.leaf_fd, egress_shared.rawForWorker(), pack_fd),
     );
 
     // Wait past the deadline: a working watchdog answers typed before it; a
-    // broken one turns into WorkerInitTimeout here and fails the test, and
-    // the errdefer kills the spinning child.
-    const outcome = try zygote.host_client.receiveWorkerInitOutcomeBeforeTimeout(
-        worker.worker_init_fd.?,
-        worker_pidfd,
-        null,
-        zygote.host_client.worker_init_timeout_ms + 2_000,
+    // broken one turns into WorkerInitTimeout here and fails the test.
+    const outcome = try support.receiveWorkerInitOutcomeBeforeTimeout(
+        child.initFd(),
+        child.pidfd(),
+        limits.process.WORKER_INIT_TIMEOUT_MS + 2_000,
     );
     const outcome_at_ns = try process.monotonicNowNs();
     switch (outcome) {
         .ready => return error.UnexpectedReady,
-        .failed => |reason| try std.testing.expectEqual(
-            zygote.ipc.WorkerInitFailedReason.init_deadline_exceeded,
-            reason,
-        ),
+        .failed => |reason| try std.testing.expectEqual(ipc.WorkerInitFailedReason.init_deadline_exceeded, reason),
     }
     // The watchdog arms at the deadline less the reserve, so the typed
     // failure lands inside the reserve: at or after the arm point and
     // strictly before the deadline at which the host would SIGKILL.
     try std.testing.expect(outcome_at_ns < init_deadline_mono_ns);
-    try std.testing.expect(
-        outcome_at_ns >= init_deadline_mono_ns - zygote.host_client.worker_init_cleanup_reserve_ns,
-    );
+    try std.testing.expect(outcome_at_ns >= init_deadline_mono_ns - limits.process.WORKER_INIT_CLEANUP_RESERVE_NS);
 
     // The child exits by itself inside the reserve; this path sent no
     // signal.
-    worker_armed = false;
-    worker.deinit();
-    try support.waitForPidFdExit(worker_pidfd);
-
-    try std.testing.expectEqual(@intFromEnum(zygote.worker_state.page.State.dead), metrics.header.state);
-    try std.testing.expectEqual(
-        @intFromEnum(zygote.worker_state.page.TerminationReason.init_failed),
-        metrics.header.termination_reason,
-    );
-
-    spawned.shutdown();
-    try support.expectChildExitStatus(spawned.pid, 0);
+    try support.waitForPidFdExit(child.pidfd());
+    try shared.expectPageAsHostWrote();
+    // The child died in the evaluation: every native phase completed, and
+    // the evaluation never did.
+    try std.testing.expect(shared.page.loadBootPhaseStampNs(.seccomp_applied) != 0);
+    try std.testing.expectEqual(@as(u64, 0), shared.page.loadBootPhaseStampNs(.routes_evaluated));
 
     var trace = try support.drainTrace(&spawned, std.testing.allocator);
     defer trace.deinit();
-    // The child died in the evaluation: every native phase completed, and
-    // the evaluation never did.
     try std.testing.expect(trace.containsPrefix("child.node_fs.enabled"));
-    try std.testing.expect(!trace.containsPrefix("child.routes.evaluated"));
-    try std.testing.expect(!trace.containsPrefix("child.worker_ready"));
+    try std.testing.expect(trace.containsPrefix("child.trace.closed"));
 }

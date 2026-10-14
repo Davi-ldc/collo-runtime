@@ -1,6 +1,7 @@
 //! The sending side, in both directions. The host sends request begins,
 //! request body chunks and resets on an ingress lane's thread, and the worker
-//! sends response heads, chunks, ends and resets on its event loop thread. A
+//! sends response heads, chunks, ends, resets and each request's
+//! `request_done` on its event loop thread. A
 //! chunk payload above `shared_payload_threshold` goes through the payload
 //! ring of its direction and a smaller one rides inline, except where a
 //! function says otherwise. A ring payload is published before the packet
@@ -17,8 +18,14 @@ const packet = @import("../packet.zig");
 
 const BatchPacketHeader = @import("framing.zig").BatchPacketHeader;
 const Descriptor = @import("framing.zig").Descriptor;
+const Op = @import("framing.zig").Op;
 const Packet = @import("framing.zig").Packet;
+const RequestDone = @import("framing.zig").RequestDone;
+const RequestDonePayload = @import("framing.zig").RequestDonePayload;
+const RequestIdentity = @import("framing.zig").RequestIdentity;
 const batchPayloadOffset = @import("framing.zig").batchPayloadOffset;
+const decodeRequestDone = @import("framing.zig").decodeRequestDone;
+const encodeRequestDone = @import("framing.zig").encodeRequestDone;
 const descriptorCanUseSharedRing = @import("framing.zig").descriptorCanUseSharedRing;
 const flags = @import("framing.zig").flags;
 const max_batch_descriptors = @import("framing.zig").max_batch_descriptors;
@@ -38,6 +45,24 @@ pub const BatchEntry = struct {
 pub fn sendDescriptor(control_fd: std.posix.fd_t, descriptor: Descriptor, scratch: []u8) !void {
     const encoded = try encodeDescriptorInto(scratch, descriptor);
     try packet.sendWithFds(control_fd, encoded, &.{});
+}
+
+/// Sends `done` as the `request_done` of the request `identity` names on
+/// `stream_id`, alone in a packet encoded in `scratch`. A batch carries one
+/// as an entry whose descriptor is `Descriptor.requestDone` and whose
+/// payload is the bytes of `encodeRequestDone(done)`. A value the server's
+/// decoder would refuse fails here with `error.InvalidPacket`, sending
+/// nothing.
+pub fn sendRequestDone(
+    control_fd: std.posix.fd_t,
+    identity: RequestIdentity,
+    stream_id: u32,
+    done: RequestDone,
+    scratch: []u8,
+) !void {
+    const payload = encodeRequestDone(done);
+    _ = try decodeRequestDone(std.mem.asBytes(&payload));
+    try sendDescriptorPayload(control_fd, Descriptor.requestDone(identity, stream_id), std.mem.asBytes(&payload), scratch);
 }
 
 /// Sends `descriptor` with `payload` inline, encoded in `scratch`.
@@ -155,6 +180,113 @@ pub fn sendDescriptorBatchPayloadsWithRing(
 
     try sendDescriptorBatchPayloads(control_fd, encoded_entries[0..entries.len], scratch);
     packet_sent = true;
+}
+
+/// A batch encoded in a caller's scratch whose last entry is a request's
+/// `request_done`, written by `setRequestDone` once the rest of the batch is
+/// composed, so a worker can report the CPU the composition took. The
+/// batch's ring payloads are published already; `send` takes them back when
+/// the packet does not go out, and `abandon` takes them back unsent. The
+/// scratch must stay untouched until one of them.
+pub const RequestDoneBatch = struct {
+    bytes: []u8,
+    /// Where the `request_done`'s payload sits in `bytes`.
+    done_payload: []u8,
+    shared_writer: ?SharedPayloadWriter,
+    ring_committed_len: usize,
+
+    /// Writes `done` into the batch. A value the server's decoder would
+    /// refuse fails with `error.InvalidPacket` and leaves the batch as it
+    /// was.
+    pub fn setRequestDone(self: *const RequestDoneBatch, done: RequestDone) !void {
+        const payload = encodeRequestDone(done);
+        _ = try decodeRequestDone(std.mem.asBytes(&payload));
+        @memcpy(self.done_payload, std.mem.asBytes(&payload));
+    }
+
+    /// Sends the batch, taking its ring payloads back when it fails.
+    pub fn send(self: *const RequestDoneBatch, control_fd: std.posix.fd_t) !void {
+        packet.sendWithFds(control_fd, self.bytes, &.{}) catch |err| {
+            self.abandon();
+            return err;
+        };
+    }
+
+    /// Takes the batch's ring payloads back without sending it.
+    pub fn abandon(self: *const RequestDoneBatch) void {
+        const writer = self.shared_writer orelse return;
+        writer.view.cancelLastWrite(writer.direction, self.ring_committed_len);
+    }
+};
+
+/// Encodes `entries`, then a `request_done` of the request `identity` names
+/// on `stream_id`, as one batch in `scratch`, and returns it with the
+/// `request_done` holding a placeholder until `setRequestDone`. Payloads are
+/// placed as `sendDescriptorBatchPayloadsWithRing` places them: a chunk
+/// payload above `shared_payload_threshold`, or one that would overflow the
+/// packet, goes to the ring of `shared_writer`, and the rest ride inline. A
+/// payload may already sit at its place in `scratch`, where the caller puts
+/// it with `batchPayloadOffset(entries.len + 1)`. Fails as
+/// `encodeDescriptorBatchPayloadsInto` and the ring writes do, with
+/// `error.IngressSharedPayloadUnavailable` for a payload that needs a ring
+/// none was given for, and with the ring writes taken back.
+pub fn encodeBatchEndingInRequestDone(
+    scratch: []u8,
+    entries: []const BatchEntry,
+    identity: RequestIdentity,
+    stream_id: u32,
+    shared_writer: ?SharedPayloadWriter,
+) !RequestDoneBatch {
+    const entry_count = entries.len + 1;
+    if (entry_count > max_batch_descriptors)
+        return error.InvalidPacket;
+    var encoded_entries: [max_batch_descriptors]BatchEntry = undefined;
+    const payload_start = try batchPayloadOffset(entry_count);
+    const packet_budget = @min(scratch.len, messages.max_message_bytes);
+    // The `request_done`'s own payload rides inline after every other one.
+    const done_len = @sizeOf(RequestDonePayload);
+    const inline_payload_budget = (if (packet_budget > payload_start) packet_budget - payload_start else 0) -| done_len;
+    var inline_payload_len: usize = 0;
+    var committed_len: usize = 0;
+    errdefer if (shared_writer) |writer| writer.view.cancelLastWrite(writer.direction, committed_len);
+
+    for (entries, 0..) |entry, index| {
+        const can_use_ring = entry.payload.len != 0 and descriptorCanUseSharedRing(entry.descriptor);
+        const inline_would_overflow = entry.payload.len > inline_payload_budget -| inline_payload_len;
+        if (can_use_ring and (entry.payload.len > shared_payload_threshold or inline_would_overflow)) {
+            const writer = shared_writer orelse return error.IngressSharedPayloadUnavailable;
+            if (entry.payload.len > shared_payload_ring_capacity)
+                return error.IngressSharedPayloadTooLarge;
+            var encoded_descriptor = entry.descriptor;
+            encoded_descriptor.flag_bits &= ~flags.inline_bytes;
+            encoded_descriptor.flag_bits |= flags.shared_ring;
+            const reservation = try writer.view.write(writer.direction, entry.payload);
+            encoded_descriptor.shared_offset = reservation.offset;
+            committed_len = std.math.add(usize, committed_len, reservation.reserved_len) catch {
+                writer.view.cancelLastWrite(writer.direction, reservation.reserved_len);
+                return error.MessageTooLarge;
+            };
+            encoded_descriptor.byte_len = @intCast(entry.payload.len);
+            encoded_entries[index] = .{ .descriptor = encoded_descriptor };
+            continue;
+        }
+        inline_payload_len = std.math.add(usize, inline_payload_len, entry.payload.len) catch return error.MessageTooLarge;
+        encoded_entries[index] = entry;
+    }
+
+    // A record the server's decoder takes, overwritten by `setRequestDone`.
+    const placeholder = encodeRequestDone(.{ .status = .ok, .http_status = 0 });
+    encoded_entries[entries.len] = .{
+        .descriptor = Descriptor.requestDone(identity, stream_id),
+        .payload = std.mem.asBytes(&placeholder),
+    };
+    const bytes = try encodeDescriptorBatchPayloadsInto(scratch, encoded_entries[0..entry_count]);
+    return .{
+        .bytes = bytes,
+        .done_payload = bytes[bytes.len - done_len ..],
+        .shared_writer = shared_writer,
+        .ring_committed_len = committed_len,
+    };
 }
 
 /// As `sendDescriptorPayloadMaybeSharedWithRing` without a ring.
@@ -284,8 +416,9 @@ pub fn encodeDescriptorPayloadInto(scratch: []u8, descriptor: Descriptor, payloa
 /// may carry `flags.shared_ring` with its ring offset and length already set.
 /// Payloads may already sit at their place in `scratch`; any other overlap
 /// fails with `error.InvalidPacket`, as do an empty batch, one over
-/// `max_batch_descriptors` and an entry whose flags disagree with its
-/// payload. Size failures are those of `encodeDescriptorPayloadInto`.
+/// `max_batch_descriptors`, an entry whose flags disagree with its payload,
+/// and a `request_done` whose payload the server's decoder would refuse. Size
+/// failures are those of `encodeDescriptorPayloadInto`.
 pub fn encodeDescriptorBatchPayloadsInto(scratch: []u8, entries: []const BatchEntry) ![]u8 {
     if (entries.len == 0 or entries.len > max_batch_descriptors)
         return error.InvalidPacket;
@@ -330,6 +463,8 @@ pub fn encodeDescriptorBatchPayloadsInto(scratch: []u8, entries: []const BatchEn
             return error.InvalidPacket;
         }
         try validateDescriptor(encoded_descriptor);
+        if (encoded_descriptor.op == @intFromEnum(Op.request_done))
+            _ = try decodeRequestDone(entry.payload);
         cursor += packet.writeStruct(scratch[cursor..], &encoded_descriptor);
         payload_cursor += entry.payload.len;
     }

@@ -26,8 +26,8 @@ pub const completion_ring_capacity: usize = 4 * 1024 * 1024;
 /// The largest packet either ring accepts.
 pub const max_packet_bytes: usize = 1024 * 1024;
 /// Command ring space that fetch starts and upload batches leave free, so the
-/// cancel and release commands the worker writes without a reserve still fit
-/// when those fill the ring.
+/// stops the worker writes without a reserve still fit when those fill the
+/// ring.
 pub const command_control_reserve_bytes: usize = 64 * 1024;
 
 const frame_header_size = @sizeOf(FrameHeader);
@@ -297,19 +297,6 @@ pub const RingView = struct {
         self.copyOut((offset + frame_header_size) % ring_capacity, out[0..header.len]);
         @atomicStore(u64, &self.consumer.read_seq, read_seq + @as(u64, @intCast(record_len)), .release);
         return out[0..header.len];
-    }
-
-    /// Reads up to `max_packets` packets into `out` and passes each to
-    /// `handler`, valid only during that call; returns how many it read. A
-    /// handler error stops the drain with its packet already consumed.
-    pub fn drainAvailable(self: *RingView, out: []u8, comptime max_packets: usize, handler: anytype) !usize {
-        var count: usize = 0;
-        while (count < max_packets) {
-            const packet = try self.readPacket(out) orelse break;
-            try handler(packet);
-            count += 1;
-        }
-        return count;
     }
 
     fn capacity(self: *const RingView) usize {

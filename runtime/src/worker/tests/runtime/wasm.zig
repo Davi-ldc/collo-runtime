@@ -3,7 +3,7 @@
 //! its DeferredWorkTimer, which needs a RunLoop a worker never runs, so the
 //! settle runs only when the loop calls `pumpDeferredWork`
 //! (`scheduler/loop.zig`). These tests call that same pump between the
-//! harness's collect passes, so the path is the loop's without the ring
+//! harness's collect passes, so the path is the loop's without its `ppoll`
 //! wait. The wake side, the wakeup eventfd and the backstop deadline, needs
 //! the real loop of a forked worker, which `zygote-integration` covers. Runs
 //! in `worker-test`.
@@ -57,13 +57,10 @@ fn enqueueWasmRoute(
 }
 
 /// `collectFast` in `scheduler/loop.zig` without the backlog drain and the
-/// ingress, request completion and fs fault rescans, which only recover work
-/// a full ready queue turned away; these tests never fill it.
+/// ingress and request completion rescans, which only recover work a full
+/// ready queue turned away; these tests never fill it.
 fn collectPass(runtime: *worker.Runtime) !void {
     runtime.collectModuleSettlements();
-    try runtime.collectCompletedCryptoJobs();
-    try runtime.collectCompletedFetches();
-    try runtime.collectReadyFetchBodies();
     try runtime.collectDueTimers();
     try runtime.collectReadyImmediates();
     try runtime.collectDueRequestDeadlines();
@@ -205,9 +202,9 @@ test "a top-level fire-and-forget instantiate settles posthumously under the wor
     defer runtime.deinit();
     try runtime.attachHostRuntime();
 
-    // Top-level code starts the instantiate without awaiting it, so the
-    // module settles at once and the wasm promise is still in flight while
-    // requests run.
+    // The boot evaluates both routes' top-level code. This one starts the
+    // instantiate without awaiting it, so its evaluation settles at once and
+    // the wasm promise is still in flight while requests run.
     const boot_source = try std.fmt.allocPrint(std.testing.allocator,
         \\const bytes = {s};
         \\globalThis.bootWasm = "pending";
@@ -224,6 +221,16 @@ test "a top-level fire-and-forget instantiate settles posthumously under the wor
         \\}}
     , .{wasm_add_module_js_bytes});
     defer std.testing.allocator.free(boot_source);
+    const reader_source =
+        \\export default async function handle() {
+        \\    await new Promise((resolve) => setTimeout(resolve, 1000));
+        \\    return Response.json({ ok: true, bootWasm: globalThis.bootWasm });
+        \\}
+    ;
+    try rt.bootRoutes(&runtime, &.{
+        .{ .specifier = "/wasm-boot-posthumous.js", .source = boot_source },
+        .{ .specifier = "/wasm-boot-reader.js", .source = reader_source },
+    });
 
     // The first request runs without the pump. Only a pump pass can run the
     // settle, so its response reads "pending" every time, and the ticket in
@@ -249,12 +256,6 @@ test "a top-level fire-and-forget instantiate settles posthumously under the wor
     // clock stays at 0 until after the settle, so this request is the only
     // live one for the whole settle window, and its deadline sits an hour
     // out so the later clock advance cannot fire it.
-    const reader_source =
-        \\export default async function handle() {
-        \\    await new Promise((resolve) => setTimeout(resolve, 1000));
-        \\    return Response.json({ ok: true, bootWasm: globalThis.bootWasm });
-        \\}
-    ;
     try enqueueWasmRoute(&runtime, reader_source, 23, "/wasm-boot-reader.js", std.time.ns_per_hour);
     attempts = 0;
     while (true) : (attempts += 1) {

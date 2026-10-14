@@ -1,5 +1,5 @@
 //! The core of the worker runtime, which every domain reads: the allocator,
-//! the VM, the control socket, the resolved limits, the clock, two packet
+//! the VM, the control socket, the limits, the clock, two packet
 //! scratch buffers and the `running` flag that ends the event loop. It
 //! belongs to the worker's VM thread. The VM and the control socket stay the
 //! boot's: `deinit` frees only the two buffers.
@@ -16,8 +16,8 @@ pub const Core = struct {
     limits: runtime_types.RuntimeLimits,
     clock: runtime_types.Clock,
     /// One packet of `ipc.max_message_bytes`, reused by the VM thread for
-    /// every packet it receives on the control socket, the fs fault channel
-    /// or the gateway's completion ring, and for the command and response
+    /// every packet it receives on the control socket or the gateway's
+    /// completion ring, and for the command and response
     /// packets it encodes, so its contents last only until the next use.
     dispatch_recv_scratch: []u8,
     /// Where gateway packets decode their header and body chunk views. It is
@@ -41,7 +41,7 @@ pub const Core = struct {
             .allocator = allocator,
             .vm = vm,
             .control_fd = control_fd,
-            .limits = runtime_types.resolveAutoRuntimeLimits(options.limits),
+            .limits = options.limits,
             .clock = options.clock,
             .dispatch_recv_scratch = dispatch_recv_scratch,
             .egress_decode_scratch = egress_decode_scratch,

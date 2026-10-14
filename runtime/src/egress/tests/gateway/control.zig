@@ -2,12 +2,12 @@
 //! carries its session's descriptors and comes back as an attach ack, and a removal report names
 //! a session, never 0, the two packets the gateway sends after its ready report; the hello carries
 //! the token key and exactly one descriptor, the policy image's memfd, with the image's length; a
-//! `request_ended` batch fills to its bound and leaves as one packet; shutdown carries no
-//! descriptor. Each decoder refuses a packet whose length, reserved bytes, counts, ids, key or
-//! descriptors break the wire's rules, a kind only the other side sends, and the numbers of
-//! retired kinds. The order the gateway takes packets in, the hello first and once, and its checks
-//! of the image the hello lends are its control flow's (`runtime/control_flow.zig`), and the
-//! attach ack's session rule and the server's control client are covered in
+//! `boot_ended` names one session, never 0, and carries no descriptor; shutdown carries no
+//! descriptor. The kinds keep their numbers, and each decoder refuses a packet whose length,
+//! reserved bytes, ids, key or descriptors break the wire's rules, a kind only the other side
+//! sends, and a number no kind has. The order the gateway takes packets in, the hello first and
+//! once, and its checks of the image the hello lends are its control flow's (`control_flow.zig`),
+//! and the attach ack's session rule and the server's control client are covered in
 //! `server/tests/gateway/` (lane server-gateway-control-test). Lane: egress-gateway-test.
 
 const std = @import("std");
@@ -23,7 +23,7 @@ const egress_token = ipc.egress_token;
 
 const test_key = keyFrom(0x21);
 
-test "egress gateway control attach transfers shared endpoint fds" {
+test "an attach carries its request id, its security cell and the session's shared descriptors" {
     const control_pair = try os.fd.socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
     defer std.posix.close(control_pair[0]);
     defer std.posix.close(control_pair[1]);
@@ -35,22 +35,12 @@ test "egress gateway control attach transfers shared endpoint fds" {
 
     var scratch: [256]u8 = undefined;
     const security_cell_id: control.SecurityCellId = [_]u8{42} ** 16;
-    try control.sendAttachWorker(
-        control_pair[0],
-        99,
-        security_cell_id,
-        shared.rawForGateway(),
-    );
+    try control.sendAttachWorker(control_pair[0], 99, security_cell_id, shared.rawForGateway());
 
-    var received = try ipc.recvPacketWithFdsScratch(
-        std.testing.allocator,
-        control_pair[1],
-        &scratch,
-    );
+    var received = try ipc.recvPacketWithFdsScratch(std.testing.allocator, control_pair[1], &scratch);
     defer received.deinit();
 
-    const decoded = try control.decode(&received);
-    switch (decoded) {
+    switch (try control.decode(&received)) {
         .attach_worker => |attach| {
             var fds = attach.fds;
             defer fds.close();
@@ -63,7 +53,7 @@ test "egress gateway control attach transfers shared endpoint fds" {
     }
 }
 
-test "egress gateway control attach ack carries request id and session" {
+test "an attach ack carries its request id and the session it names" {
     const control_pair = try os.fd.socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
     defer std.posix.close(control_pair[0]);
     defer std.posix.close(control_pair[1]);
@@ -79,22 +69,85 @@ test "egress gateway control attach ack carries request id and session" {
     try std.testing.expectEqual(@as(u64, 12345), ack.worker_session_id);
 }
 
-test "a removal report carries the session it names and never session 0" {
+test "a removal report carries the session it names and its cause, and never session 0" {
     const control_pair = try os.fd.socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
     defer std.posix.close(control_pair[0]);
     defer std.posix.close(control_pair[1]);
 
-    try std.testing.expectError(error.InvalidEgressGatewayControl, control.sendSessionRemoved(control_pair[0], 0));
-    try control.sendSessionRemoved(control_pair[0], 4242);
+    try std.testing.expectError(
+        error.InvalidEgressGatewayControl,
+        control.sendSessionRemoved(control_pair[0], 0, .liveness_closed),
+    );
+    for ([_]control.SessionRemovedCause{ .liveness_closed, .protocol_violation }) |cause| {
+        try control.sendSessionRemoved(control_pair[0], 4242, cause);
+
+        var scratch: [256]u8 = undefined;
+        var packet = try ipc.recvPacketWithFdsScratch(std.testing.allocator, control_pair[1], &scratch);
+        defer packet.deinit();
+        try std.testing.expectEqual(@sizeOf(control.Header) + @sizeOf(control.SessionRemoved), packet.bytes.len);
+        switch (try control.decodeGatewayToServerPacket(&packet)) {
+            .session_removed => |removed| {
+                try std.testing.expectEqual(@as(u64, 4242), removed.session_id);
+                try std.testing.expectEqual(cause, removed.cause);
+            },
+            .attach_ack => return error.TestUnexpectedControlPacket,
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 1), @intFromEnum(control.SessionRemovedCause.liveness_closed));
+    try std.testing.expectEqual(@as(u32, 2), @intFromEnum(control.SessionRemovedCause.protocol_violation));
+}
+
+test "a boot_ended packet round-trips the session it names and is never sent for session 0" {
+    const control_pair = try os.fd.socketPairType(
+        std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC | std.posix.SOCK.NONBLOCK,
+    );
+    defer std.posix.close(control_pair[0]);
+    defer std.posix.close(control_pair[1]);
+
+    try std.testing.expectError(error.InvalidEgressGatewayControl, control.sendBootEnded(control_pair[0], 0));
+    try control.sendBootEnded(control_pair[0], 31);
 
     var scratch: [256]u8 = undefined;
-    var packet = try ipc.recvPacketWithFdsScratch(std.testing.allocator, control_pair[1], &scratch);
-    defer packet.deinit();
-    try std.testing.expectEqual(@sizeOf(control.Header) + @sizeOf(control.SessionRemoved), packet.bytes.len);
-    switch (try control.decodeGatewayToServerPacket(&packet)) {
-        .session_removed => |removed| try std.testing.expectEqual(@as(u64, 4242), removed.session_id),
-        .attach_ack => return error.TestUnexpectedControlPacket,
+    {
+        var packet = try ipc.recvPacketWithFdsScratch(std.testing.allocator, control_pair[1], &scratch);
+        defer packet.deinit();
+        try std.testing.expectEqual(@sizeOf(control.Header) + @sizeOf(control.BootEnded), packet.bytes.len);
+        switch (try control.decode(&packet)) {
+            .boot_ended => |ended| try std.testing.expectEqual(@as(u64, 31), ended.session_id),
+            else => return error.UnexpectedControlMessage,
+        }
     }
+    // The refused send for session 0 left nothing on the socket.
+    try std.testing.expectError(
+        error.WouldBlock,
+        ipc.recvPacketWithFdsScratch(std.testing.allocator, control_pair[1], &scratch),
+    );
+}
+
+test "a boot_ended packet for session 0, of another length or with a descriptor is refused" {
+    var buffer: [@sizeOf(control.Header) + @sizeOf(control.BootEnded) + 1]u8 = undefined;
+
+    // The packet every case below breaks in one place decodes.
+    {
+        var packet = receivedFrom(writeBootEnded(&buffer, 5));
+        switch (try control.decode(&packet)) {
+            .boot_ended => |ended| try std.testing.expectEqual(@as(u64, 5), ended.session_id),
+            else => return error.UnexpectedControlMessage,
+        }
+    }
+
+    try expectRefused(writeBootEnded(&buffer, 0));
+
+    // A byte short, a byte over, and a bare header.
+    const whole = writeBootEnded(&buffer, 5);
+    try expectRefused(buffer[0 .. whole.len - 1]);
+    buffer[whole.len] = 0;
+    try expectRefused(buffer[0 .. whole.len + 1]);
+    try expectRefused(writeHeader(&buffer, @intFromEnum(control.Kind.boot_ended)));
+
+    var with_descriptor = try receivedWithDescriptors(writeBootEnded(&buffer, 5), 1);
+    defer with_descriptor.deinit();
+    try std.testing.expectError(error.InvalidEgressGatewayControl, control.decode(&with_descriptor));
 }
 
 test "a hello round-trips its key and the policy image's memfd and length" {
@@ -184,203 +237,19 @@ test "a hello without its one descriptor, with a zero key, or with an image leng
     }
 }
 
-test "a request_ended batch leaves as one packet that decodes to its entries" {
-    const control_pair = try os.fd.socketPairType(
-        std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC | std.posix.SOCK.NONBLOCK,
-    );
-    defer std.posix.close(control_pair[0]);
-    defer std.posix.close(control_pair[1]);
-
-    const batch = try std.testing.allocator.create(control.RequestEndedBatch);
-    defer std.testing.allocator.destroy(batch);
-    batch.* = .{};
-    try std.testing.expect(batch.isEmpty());
-
-    // Two requests of one session and a boot token, whose request id and generation are 0.
-    const entries = [_]control.RequestEndedEntry{
-        .{ .session_id = 7, .request_id = 41, .request_generation = 3 },
-        .{ .session_id = 7, .request_id = 0, .request_generation = 0 },
-        .{ .session_id = 9, .request_id = 41, .request_generation = 4 },
-    };
-    for (entries) |entry|
-        try std.testing.expect(batch.append(entry));
-    try std.testing.expect(!batch.isEmpty());
-    try batch.sendAndClear(control_pair[0]);
-    try std.testing.expect(batch.isEmpty());
-
-    var scratch: [control.request_ended_bytes_max]u8 = undefined;
-    var packet = try ipc.recvPacketWithFdsScratch(std.testing.allocator, control_pair[1], &scratch);
-    defer packet.deinit();
-    try std.testing.expectEqual(requestEndedBytes(entries.len), packet.bytes.len);
-    const ended = switch (try control.decode(&packet)) {
-        .request_ended => |ended| ended,
-        else => return error.UnexpectedControlMessage,
-    };
-    try std.testing.expectEqual(entries.len, ended.count);
-    for (entries, 0..) |expected, index|
-        try std.testing.expectEqual(expected, ended.entry(index));
-    try std.testing.expectError(
-        error.WouldBlock,
-        ipc.recvPacketWithFdsScratch(std.testing.allocator, control_pair[1], &scratch),
-    );
-}
-
-test "a request_ended batch holds its bound of entries and empties when it sends, even if the send fails" {
-    const control_pair = try os.fd.socketPairType(
-        std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC | std.posix.SOCK.NONBLOCK,
-    );
-    defer std.posix.close(control_pair[0]);
-    defer std.posix.close(control_pair[1]);
-
-    const batch = try std.testing.allocator.create(control.RequestEndedBatch);
-    defer std.testing.allocator.destroy(batch);
-    batch.* = .{};
-
-    for (0..control.request_ended_entries_max) |index|
-        try std.testing.expect(batch.append(endedEntryAt(index)));
-    // A full batch refuses the next entry and keeps what it holds, so the caller sends first.
-    try std.testing.expect(!batch.append(endedEntryAt(control.request_ended_entries_max)));
-    try std.testing.expectEqual(control.request_ended_entries_max, batch.count);
-    try batch.sendAndClear(control_pair[0]);
-    try std.testing.expect(batch.isEmpty());
-
-    var scratch: [control.request_ended_bytes_max]u8 = undefined;
-    {
-        var packet = try ipc.recvPacketWithFdsScratch(std.testing.allocator, control_pair[1], &scratch);
-        defer packet.deinit();
-        try std.testing.expectEqual(control.request_ended_bytes_max, packet.bytes.len);
-        const ended = switch (try control.decode(&packet)) {
-            .request_ended => |ended| ended,
-            else => return error.UnexpectedControlMessage,
-        };
-        try std.testing.expectEqual(control.request_ended_entries_max, ended.count);
-        try std.testing.expectEqual(endedEntryAt(0), ended.entry(0));
-        const last = control.request_ended_entries_max - 1;
-        try std.testing.expectEqual(endedEntryAt(last), ended.entry(last));
-    }
-
-    // A send the socket refuses empties the batch all the same: its entries are lost, which
-    // costs their requests' fetches until the tokens' deadlines, and none is sent twice.
-    const closed_pair = try os.fd.socketPairType(
-        std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC | std.posix.SOCK.NONBLOCK,
-    );
-    defer std.posix.close(closed_pair[0]);
-    std.posix.close(closed_pair[1]);
-    try std.testing.expect(batch.append(endedEntryAt(0)));
-    try std.testing.expectError(error.PeerClosed, batch.sendAndClear(closed_pair[0]));
-    try std.testing.expect(batch.isEmpty());
-}
-
-test "clear drops a batch's entries without sending them" {
-    const control_pair = try os.fd.socketPairType(
-        std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC | std.posix.SOCK.NONBLOCK,
-    );
-    defer std.posix.close(control_pair[0]);
-    defer std.posix.close(control_pair[1]);
-
-    const batch = try std.testing.allocator.create(control.RequestEndedBatch);
-    defer std.testing.allocator.destroy(batch);
-    batch.* = .{};
-
-    try std.testing.expect(batch.append(endedEntryAt(1)));
-    try std.testing.expect(batch.append(endedEntryAt(2)));
-    batch.clear();
-    try std.testing.expect(batch.isEmpty());
-    var scratch: [control.request_ended_bytes_max]u8 = undefined;
-    try std.testing.expectError(
-        error.WouldBlock,
-        ipc.recvPacketWithFdsScratch(std.testing.allocator, control_pair[1], &scratch),
-    );
-
-    // Entries appended after the clear are the only ones the next send carries.
-    try std.testing.expect(batch.append(endedEntryAt(3)));
-    try batch.sendAndClear(control_pair[0]);
-    var packet = try ipc.recvPacketWithFdsScratch(std.testing.allocator, control_pair[1], &scratch);
-    defer packet.deinit();
-    const ended = switch (try control.decode(&packet)) {
-        .request_ended => |ended| ended,
-        else => return error.UnexpectedControlMessage,
-    };
-    try std.testing.expectEqual(@as(usize, 1), ended.count);
-    try std.testing.expectEqual(endedEntryAt(3), ended.entry(0));
-}
-
-test "a request_ended packet that breaks the wire's rules is refused" {
-    const entries = [_]control.RequestEndedEntry{
-        .{ .session_id = 3, .request_id = 10, .request_generation = 1 },
-        .{ .session_id = 3, .request_id = 0, .request_generation = 0 },
-    };
-    const fixed = control.RequestEndedHeader{ .count = entries.len };
-    var buffer: [requestEndedBytes(control.request_ended_entries_max + 1)]u8 = undefined;
-
-    // The packet every case below breaks in one place decodes.
-    {
-        var packet = receivedFrom(writeRequestEnded(&buffer, fixed, &entries));
-        const ended = switch (try control.decode(&packet)) {
-            .request_ended => |ended| ended,
-            else => return error.UnexpectedControlMessage,
-        };
-        try std.testing.expectEqual(entries.len, ended.count);
-    }
-
-    {
-        var packet = try receivedWithDescriptors(writeRequestEnded(&buffer, fixed, &entries), 1);
-        defer packet.deinit();
-        try std.testing.expectError(error.InvalidEgressGatewayControl, control.decode(&packet));
-    }
-
-    // A length other than the count gives: a byte short, a byte over, and short of the fixed part.
-    const whole = writeRequestEnded(&buffer, fixed, &entries);
-    try expectRefused(buffer[0 .. whole.len - 1]);
-    buffer[whole.len] = 0;
-    try expectRefused(buffer[0 .. whole.len + 1]);
-    try expectRefused(buffer[0 .. requestEndedBytes(0) - 1]);
-
-    {
-        var broken = fixed;
-        broken._reserved0 = 1;
-        try expectRefused(writeRequestEnded(&buffer, broken, &entries));
-    }
-    {
-        var broken = fixed;
-        broken.count = 0;
-        try expectRefused(writeRequestEnded(&buffer, broken, &.{}));
-    }
-    {
-        var many: [control.request_ended_entries_max + 1]control.RequestEndedEntry = undefined;
-        for (&many, 0..) |*entry, index|
-            entry.* = endedEntryAt(index);
-        var broken = fixed;
-        broken.count = many.len;
-        try expectRefused(writeRequestEnded(&buffer, broken, &many));
-    }
-
-    // One entry broken at a time: no session, and a request id and generation that are not both
-    // zero, as a boot token's are, or both nonzero.
-    var second_breaks: [3]control.RequestEndedEntry = @splat(entries[0]);
-    second_breaks[0].session_id = 0;
-    second_breaks[1].request_id = 0;
-    second_breaks[2].request_generation = 0;
-    for (second_breaks) |broken| {
-        const pair = [_]control.RequestEndedEntry{ entries[1], broken };
-        try expectRefused(writeRequestEnded(&buffer, fixed, &pair));
-    }
-}
-
-test "the control kinds keep their numbers and retired numbers decode as nothing" {
+test "the control kinds are numbered 1 to 7 in flow order and no other number decodes" {
     try std.testing.expectEqual(@as(usize, 7), std.meta.fields(control.Kind).len);
-    try std.testing.expectEqual(@as(u32, 1), @intFromEnum(control.Kind.attach_worker));
-    try std.testing.expectEqual(@as(u32, 2), @intFromEnum(control.Kind.shutdown));
-    try std.testing.expectEqual(@as(u32, 5), @intFromEnum(control.Kind.attach_worker_ack));
-    try std.testing.expectEqual(@as(u32, 7), @intFromEnum(control.Kind.gateway_ready));
-    try std.testing.expectEqual(@as(u32, 9), @intFromEnum(control.Kind.hello));
-    try std.testing.expectEqual(@as(u32, 10), @intFromEnum(control.Kind.request_ended));
-    try std.testing.expectEqual(@as(u32, 11), @intFromEnum(control.Kind.session_removed));
+    try std.testing.expectEqual(@as(u32, 1), @intFromEnum(control.Kind.gateway_ready));
+    try std.testing.expectEqual(@as(u32, 2), @intFromEnum(control.Kind.hello));
+    try std.testing.expectEqual(@as(u32, 3), @intFromEnum(control.Kind.attach_worker));
+    try std.testing.expectEqual(@as(u32, 4), @intFromEnum(control.Kind.attach_worker_ack));
+    try std.testing.expectEqual(@as(u32, 5), @intFromEnum(control.Kind.boot_ended));
+    try std.testing.expectEqual(@as(u32, 6), @intFromEnum(control.Kind.session_removed));
+    try std.testing.expectEqual(@as(u32, 7), @intFromEnum(control.Kind.shutdown));
 
-    // 3, 4, 6 and 8 are retired numbers, which `Kind` never assigns again, and 0 and 12 name no
-    // kind. Each packet below is ack-sized and carries a well-formed ack body, so only its kind is
-    // wrong.
-    for ([_]u32{ 0, 3, 4, 6, 8, 12 }) |number| {
+    // 0 and every number past 7 name no kind. Each packet below is ack-sized and carries a
+    // well-formed ack body, so only its kind is wrong.
+    for ([_]u32{ 0, 8, 9, 10, 11, 12, std.math.maxInt(u32) }) |number| {
         var buffer: [@sizeOf(control.Header) + @sizeOf(control.AttachAck)]u8 = undefined;
         var to_gateway = receivedFrom(writeAck(&buffer, number));
         try std.testing.expectError(error.InvalidEgressGatewayControl, control.decode(&to_gateway));
@@ -401,20 +270,31 @@ test "the server takes nothing from the gateway but attach acks and removal repo
         try std.testing.expectEqual(@as(u64, 1), ack.request_id);
     }
     {
-        var packet = receivedFrom(writeSessionRemoved(&buffer, 9));
+        var packet = receivedFrom(writeSessionRemoved(&buffer, removal_report));
         switch (try control.decodeGatewayToServerPacket(&packet)) {
-            .session_removed => |removed| try std.testing.expectEqual(@as(u64, 9), removed.session_id),
+            .session_removed => |removed| {
+                try std.testing.expectEqual(@as(u64, 9), removed.session_id);
+                try std.testing.expectEqual(control.SessionRemovedCause.protocol_violation, removed.cause);
+            },
             .attach_ack => return error.TestUnexpectedControlPacket,
         }
     }
     {
-        // A report names a session, so 0 is refused, and so is a report of another length.
-        var no_session = receivedFrom(writeSessionRemoved(&buffer, 0));
-        try std.testing.expectError(
-            error.InvalidEgressGatewayControl,
-            control.decodeGatewayToServerPacket(&no_session),
-        );
-        const report = writeSessionRemoved(&buffer, 9);
+        // A report names a session and a cause the enum names, with its reserved word zero, so
+        // each of these is refused, and so is a report of another length.
+        var broken_reports = [_]control.SessionRemoved{ removal_report, removal_report, removal_report, removal_report };
+        broken_reports[0].session_id = 0;
+        broken_reports[1].cause = 0;
+        broken_reports[2].cause = 3;
+        broken_reports[3]._reserved0 = 1;
+        for (broken_reports) |broken| {
+            var refused = receivedFrom(writeSessionRemoved(&buffer, broken));
+            try std.testing.expectError(
+                error.InvalidEgressGatewayControl,
+                control.decodeGatewayToServerPacket(&refused),
+            );
+        }
+        const report = writeSessionRemoved(&buffer, removal_report);
         var short = receivedFrom(report[0 .. report.len - 1]);
         try std.testing.expectError(
             error.InvalidEgressGatewayControl,
@@ -425,7 +305,7 @@ test "the server takes nothing from the gateway but attach acks and removal repo
             error.InvalidEgressGatewayControl,
             control.decodeGatewayToServerPacket(&ack_sized),
         );
-        var with_descriptor = try receivedWithDescriptors(writeSessionRemoved(&buffer, 9), 1);
+        var with_descriptor = try receivedWithDescriptors(writeSessionRemoved(&buffer, removal_report), 1);
         defer with_descriptor.deinit();
         try std.testing.expectError(
             error.InvalidEgressGatewayControl,
@@ -447,7 +327,7 @@ test "the server takes nothing from the gateway but attach acks and removal repo
 
     // The ready report, which the spawn reads before any control reader runs, and the kinds only
     // the server sends, both as a bare header and with an ack's body.
-    const others = [_]control.Kind{ .gateway_ready, .hello, .request_ended, .attach_worker, .shutdown };
+    const others = [_]control.Kind{ .gateway_ready, .hello, .boot_ended, .attach_worker, .shutdown };
     for (others) |kind| {
         const number = @intFromEnum(kind);
         var with_body = receivedFrom(writeAck(&buffer, number));
@@ -470,7 +350,7 @@ test "the gateway refuses the packets only it sends and malformed headers" {
     try std.testing.expectError(error.InvalidEgressGatewayControl, control.decode(&ack));
     var ready = receivedFrom(writeHeader(&buffer, @intFromEnum(control.Kind.gateway_ready)));
     try std.testing.expectError(error.InvalidEgressGatewayControl, control.decode(&ready));
-    var report = receivedFrom(writeSessionRemoved(&buffer, 9));
+    var report = receivedFrom(writeSessionRemoved(&buffer, removal_report));
     try std.testing.expectError(error.InvalidEgressGatewayControl, control.decode(&report));
 
     var short = receivedFrom(buffer[0 .. @sizeOf(control.Header) - 1]);
@@ -492,7 +372,7 @@ test "the gateway refuses the packets only it sends and malformed headers" {
     try std.testing.expectError(error.InvalidEgressGatewayControl, control.decode(&with_descriptor));
 }
 
-test "egress gateway control shutdown carries no fds" {
+test "a shutdown carries no descriptor and decodes as shutdown" {
     const control_pair = try os.fd.socketPairType(std.posix.SOCK.SEQPACKET | std.posix.SOCK.CLOEXEC);
     defer std.posix.close(control_pair[0]);
     defer std.posix.close(control_pair[1]);
@@ -500,15 +380,22 @@ test "egress gateway control shutdown carries no fds" {
     try control.sendShutdown(control_pair[0]);
 
     var scratch: [256]u8 = undefined;
-    var received = try ipc.recvPacketWithFdsScratch(
-        std.testing.allocator,
-        control_pair[1],
-        &scratch,
-    );
+    var received = try ipc.recvPacketWithFdsScratch(std.testing.allocator, control_pair[1], &scratch);
     defer received.deinit();
+    try std.testing.expectEqual(@as(usize, 0), received.fd_count);
+    try std.testing.expect((try control.decode(&received)) == .shutdown);
+}
 
-    const decoded = try control.decode(&received);
-    try std.testing.expect(decoded == .shutdown);
+test "the gateway's ready report is a bare header the spawn's check accepts and nothing else" {
+    var buffer: [@sizeOf(control.Header) + 1]u8 = undefined;
+    try control.decodeGatewayReady(writeHeader(&buffer, @intFromEnum(control.Kind.gateway_ready)));
+    const whole = writeHeader(&buffer, @intFromEnum(control.Kind.gateway_ready));
+    buffer[whole.len] = 0;
+    try std.testing.expectError(error.InvalidEgressGatewayControl, control.decodeGatewayReady(buffer[0 .. whole.len + 1]));
+    try std.testing.expectError(
+        error.InvalidEgressGatewayControl,
+        control.decodeGatewayReady(writeHeader(&buffer, @intFromEnum(control.Kind.hello))),
+    );
 }
 
 /// A key whose bytes all differ, so a key read shifted or truncated would not match.
@@ -519,20 +406,6 @@ fn keyFrom(seed: u8) egress_token.Key {
     return key;
 }
 
-fn requestEndedBytes(entry_count: usize) usize {
-    return @sizeOf(control.Header) + @sizeOf(control.RequestEndedHeader) +
-        entry_count * @sizeOf(control.RequestEndedEntry);
-}
-
-/// Entry `index` of a run whose entries all differ, every one a request's.
-fn endedEntryAt(index: usize) control.RequestEndedEntry {
-    return .{
-        .session_id = 100 + index,
-        .request_id = 1 + index,
-        .request_generation = 2 + index,
-    };
-}
-
 /// A hello written field by field, so a test can break any of them.
 fn writeHello(buffer: []u8, fixed: control.HelloHeader) []u8 {
     var cursor = writeHeader(buffer, @intFromEnum(control.Kind.hello)).len;
@@ -540,16 +413,11 @@ fn writeHello(buffer: []u8, fixed: control.HelloHeader) []u8 {
     return buffer[0..cursor];
 }
 
-/// A `request_ended` packet written field by field, so a test can break any of them.
-fn writeRequestEnded(
-    buffer: []u8,
-    fixed: control.RequestEndedHeader,
-    entries: []const control.RequestEndedEntry,
-) []u8 {
-    var cursor = writeHeader(buffer, @intFromEnum(control.Kind.request_ended)).len;
-    cursor += ipc.packet.writeStruct(buffer[cursor..], &fixed);
-    for (entries) |*entry|
-        cursor += ipc.packet.writeStruct(buffer[cursor..], entry);
+/// A `boot_ended` packet for `session_id` written field by field, so a test can name session 0.
+fn writeBootEnded(buffer: []u8, session_id: u64) []u8 {
+    var cursor = writeHeader(buffer, @intFromEnum(control.Kind.boot_ended)).len;
+    const body = control.BootEnded{ .session_id = session_id };
+    cursor += ipc.packet.writeStruct(buffer[cursor..], &body);
     return buffer[0..cursor];
 }
 
@@ -565,10 +433,16 @@ fn writeAck(buffer: []u8, kind_number: u32) []u8 {
     return buffer[0..cursor];
 }
 
-/// A removal report for `session_id` written field by field, so a test can name session 0.
-fn writeSessionRemoved(buffer: []u8, session_id: u64) []u8 {
+/// A well-formed removal report, which a test copies to break one field.
+const removal_report: control.SessionRemoved = .{
+    .session_id = 9,
+    .cause = @intFromEnum(control.SessionRemovedCause.protocol_violation),
+};
+
+/// A removal report with `body` written as it is, so a test can name session 0 or a cause the
+/// enum does not.
+fn writeSessionRemoved(buffer: []u8, body: control.SessionRemoved) []u8 {
     var cursor = writeHeader(buffer, @intFromEnum(control.Kind.session_removed)).len;
-    const body = control.SessionRemoved{ .session_id = session_id };
     cursor += ipc.packet.writeStruct(buffer[cursor..], &body);
     return buffer[0..cursor];
 }

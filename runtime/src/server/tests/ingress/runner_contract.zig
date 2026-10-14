@@ -8,7 +8,6 @@
 
 const std = @import("std");
 const server_main = @import("collo_server_main");
-const supervision = @import("collo_server_supervisor");
 const limits = @import("collo_limits");
 const ingress_assertions = @import("assertions.zig");
 
@@ -19,7 +18,7 @@ const stream_table = ingress.runner.stream_table;
 const deadline_driver = ingress.runner.deadline_driver;
 
 test "runner event data round trips kind index and generation, and refuses a tag naming no kind" {
-    const original = event_sources.EventData{ .kind = .worker_completion, .index = 42, .generation = 77 };
+    const original = event_sources.EventData{ .kind = .worker_ring_credit, .index = 42, .generation = 77 };
     const decoded = try event_sources.unpackEventData(event_sources.packEventData(original));
     try std.testing.expectEqual(original.kind, decoded.kind);
     try std.testing.expectEqual(original.index, decoded.index);
@@ -158,21 +157,20 @@ test "a connection slot holds positions into the lane's stream slab, not its str
     );
 }
 
-test "the command reserve counts, per worker entry, a death, a reader grant, one completion per slot of its own definition and the forwarding window" {
-    const per_entry_without_slots = 2 + limits.ingress.forwarded_commands_per_worker_max;
+test "the command reserve counts, per worker entry, a death, a reader grant, a request_done per slot of its definition and the forwarding window" {
+    const per_entry = 2 + limits.ingress.forwarded_commands_per_worker_max;
     const entries = limits.pool.pool_workers_max;
-    try std.testing.expectEqual(@as(usize, 0), ingress.lane.obligationReserve(0, 0));
-    // One definition at the default `concurrency` of 2.
-    try std.testing.expectEqual((per_entry_without_slots + 2) * entries, ingress.lane.obligationReserve(1, 2));
-    // One at the largest `concurrency`, whose entries need a place for every
-    // slot a worker has.
-    const slots_max: usize = supervision.pool.slots_per_worker_max;
-    try std.testing.expectEqual((per_entry_without_slots + slots_max) * entries, ingress.lane.obligationReserve(1, slots_max));
-    // Three definitions of `concurrency` 1, 2 and 16: each entry counts its
-    // own definition's slots, not the largest a worker may have.
+    try std.testing.expectEqual(@as(usize, 0), ingress.lane.obligationReserve(.{ .count = 0, .slots_per_worker_total = 0 }));
     try std.testing.expectEqual(
-        (3 * per_entry_without_slots + 1 + 2 + 16) * entries,
-        ingress.lane.obligationReserve(3, 1 + 2 + 16),
+        (per_entry + 2) * entries,
+        ingress.lane.obligationReserve(.{ .count = 1, .slots_per_worker_total = 2 }),
+    );
+    // Each definition adds its own `concurrency`: a worker of it has that
+    // many requests in flight, each of which forwards one `request_done`
+    // outside the window.
+    try std.testing.expectEqual(
+        (3 * per_entry + 1 + 4 + 16) * entries,
+        ingress.lane.obligationReserve(.{ .count = 3, .slots_per_worker_total = 1 + 4 + 16 }),
     );
 }
 

@@ -1,17 +1,18 @@
-//! Evaluations: the owners of route modules' top-level code. One evaluation
-//! exists per module instance being evaluated. It opens for the route whose
-//! entry first runs the instance, every route that shares the instance
-//! joins it (`evaluationInFlight` in `worker/modules/routes.zig`), and it
-//! closes once no route evaluates under it: when the instance's evaluation
-//! settles, throws or passes its budget. `Evaluations` is the state they
-//! share, and `Methods` holds the runtime's operations on them, which
-//! `Runtime` declares as its own. They run on the worker's VM thread.
+//! Evaluations: the owners of route modules' top-level code. Only the boot
+//! evaluates modules, and one evaluation exists per module instance it
+//! evaluates. It opens for the route whose entry first runs the instance,
+//! every route that shares the instance joins it (`evaluationInFlight` in
+//! `worker/modules/routes.zig`), and it closes once no route evaluates under
+//! it: when the instance's evaluation settles, throws or passes its budget.
+//! `Evaluations` is the state they share, and `Methods` holds the runtime's
+//! operations on them, which `Runtime` declares as its own. They run on the
+//! worker's VM thread.
 //!
 //! An evaluation's context sits in the active map under its id
-//! (`request_context.evaluationId`), so its top-level code sets timers,
-//! fetches and starts crypto jobs under that id as a request does under its
-//! own: one route's top-level code cannot clear another's timers, and a
-//! route's top-level timers end with its own evaluation. The startup
+//! (`request_context.evaluationId`), so its top-level code sets timers and
+//! fetches under that id as a request does under its own: one route's
+//! top-level code cannot clear another's timers, and a route's top-level
+//! timers end with its own evaluation. The startup
 //! evaluations, those opened before `sealStartupEvaluations`, present their
 //! copies of WorkerInit's boot token, whose request id and generation 0 mark
 //! it as the boot token on the egress wire; a later evaluation gets none.
@@ -24,10 +25,9 @@
 //! (`owner.zig`).
 //!
 //! Deadlines: the init deadline bounds the synchronous part of every route
-//! the boot evaluates, a pending one's continuations included; an evaluation
-//! a request starts runs its synchronous part under that request's
-//! deadline; past its synchronous part, a pending evaluation has its routes'
-//! own budget (`Evaluating.deadline_mono_ns` in `worker/modules/state.zig`).
+//! the boot evaluates, a pending one's continuations included; past its
+//! synchronous part, a pending evaluation has its routes' own budget
+//! (`Evaluating.deadline_mono_ns` in `worker/modules/state.zig`).
 //! The sentinel stops a turn only for the evaluation whose turn it is, and a
 //! fire still retires the worker, since it forbids execution in the whole
 //! VM (`retirement.zig`).
@@ -70,12 +70,13 @@ const Evaluation = struct {
 
 pub fn Methods(comptime Runtime: type) type {
     return struct {
-        /// Registers the definition's pack WorkerInit delivered and evaluates
-        /// every route's entry, in route order, before the worker reports
-        /// ready (`bootRegisterPack` and `bootEvaluateRoute` in
-        /// `worker/modules/routes.zig`). With a top-level await, ready means
-        /// the synchronous part is done and the event loop settles the
-        /// evaluation later.
+        /// Registers the definition's artifact WorkerInit delivered in
+        /// `module_pack_fd`, which stays the caller's, takes the routes from
+        /// it and evaluates every route's entry, in route order, before the
+        /// worker reports ready (`bootRegisterPack` and `bootEvaluateRoute`
+        /// in `worker/modules/routes.zig`). A runtime boots once. With a
+        /// top-level await, ready means the synchronous part is done and the
+        /// event loop settles the evaluation later.
         ///
         /// A nonzero `init_deadline_mono_ns` is the host's absolute init
         /// deadline minus the child's cleanup reserve. Every evaluation the
@@ -94,16 +95,6 @@ pub fn Methods(comptime Runtime: type) type {
             init_deadline_mono_ns: u64,
             marks: ?*modules_routes.BootEvalMarks,
         ) !void {
-            // Fs faults of top-level code, synchronous or not, are allowed
-            // only while the synchronous evaluation runs. The window closes
-            // on return, before the zygote's child sends ready, so every boot
-            // permit (request id and generation 0) a legitimate fault sends
-            // is already queued on the socket when the host reads ready, and
-            // the host refuses one that comes after. Top-level code after an
-            // await runs after ready and the worker refuses it at the same
-            // gate (`faultIdentity` in `worker/fs/fault.zig`).
-            self.fs_fault.boot_window_open = true;
-            defer self.fs_fault.boot_window_open = false;
             var ctx = self.modulesContext();
             try modules_routes.bootRegisterPack(&ctx, module_pack_fd, marks);
             var any_pending = false;
@@ -128,10 +119,10 @@ pub fn Methods(comptime Runtime: type) type {
         }
 
         /// Ends the set of startup evaluations once the boot evaluated every
-        /// route, at once for a worker without routes (`zygote/child_boot.zig`).
-        /// Clears the runtime's copy of the boot token, so a later evaluation
-        /// gets none while the startup evaluations still open keep theirs, and
-        /// sets the startup-end flag when none is open.
+        /// route (`zygote/child_boot.zig`). Clears the runtime's copy of the
+        /// boot token, so a later evaluation gets none while the startup
+        /// evaluations still open keep theirs, and sets the startup-end flag
+        /// when none is open.
         pub fn sealStartupEvaluations(self: *Runtime) void {
             self.evaluations.startup_sealed = true;
             self.evaluations.boot_egress_token = ipc.egress_token.none;
@@ -143,41 +134,6 @@ pub fn Methods(comptime Runtime: type) type {
                 self.evaluations.startup_owners.count() != 0)
                 return;
             self.observability.metrics_view.publishStartupEvaluationsEnded();
-        }
-
-        /// The handler and `env` of the route `request_ctx` dispatches to
-        /// (`lookupRouteHandler` in `worker/modules/routes.zig`). A route
-        /// still `idle` has its entry evaluated now, under the evaluation of
-        /// its module instance, whose synchronous part runs under the
-        /// request's deadline: `.pending` parks the request on the
-        /// evaluation, armed from then on at its budget, and `.exception`
-        /// pins the route failed. Fails as `lookupRouteHandler` and
-        /// `evaluateRequestedRoute` do, or when the evaluation cannot be
-        /// opened or armed.
-        pub fn ensureRouteHandler(
-            self: *Runtime,
-            request_ctx: *request_context.RequestContext,
-        ) !modules_routes.RouteHandlerResult {
-            var ctx = self.modulesContext();
-            switch (try modules_routes.lookupRouteHandler(&ctx, request_ctx)) {
-                .ready => |route| return .{ .ready = route },
-                .pending => return .pending,
-                .idle => {},
-            }
-            const evaluation = try openOrJoin(
-                self,
-                request_ctx.dispatch_work.route_index,
-                request_ctx.exec.deadline_monotonic_ns,
-            );
-            const result = evaluateRequested(self, evaluation, request_ctx) catch |err| {
-                self.closeEvaluationOnceSettled(evaluation.id);
-                return err;
-            };
-            switch (result) {
-                .pending => try self.armEvaluationBudget(evaluation.id),
-                .ready, .exception => self.closeEvaluationOnceSettled(evaluation.id),
-            }
-            return result;
         }
 
         /// Arms evaluation `evaluation_id` at its routes' budget
@@ -227,8 +183,8 @@ pub fn Methods(comptime Runtime: type) type {
         /// After it, a native completion still in flight for the id finds no
         /// owner and is dropped, like one for a finished request: a fetch
         /// completion before its rejection turn could run
-        /// (`egress/completion_runtime.zig`), an fs fault waiter, a crypto
-        /// job. A fetch is reaped rather than canceled: a canceled fetch may
+        /// (`egress/completion_runtime.zig`). A fetch is
+        /// reaped rather than canceled: a canceled fetch may
         /// never get a gateway completion, and with the context gone no
         /// JavaScript can observe its promise, so the task ends here instead
         /// of leaking until teardown.
@@ -238,7 +194,6 @@ pub fn Methods(comptime Runtime: type) type {
             evaluation.dispatch_work.egress_token = ipc.egress_token.none;
             self.disarmRequestDeadline(evaluation);
             evaluation.exec.deadline_monotonic_ns = 0;
-            self.cancelCryptoJobsForRequest(evaluation_id);
             self.reapFetchesForRequest(evaluation_id);
             self.cleanupFetchBodiesForRequest(evaluation_id);
             self.cancelTimersForRequest(evaluation_id);
@@ -263,9 +218,9 @@ pub fn Methods(comptime Runtime: type) type {
             return runtime_owner.enter(self, runtime_owner.ownerOf(exec_ctx), .{});
         }
 
-        /// Undoes `enterTurnless`. No two of these steps nest: a request
-        /// evaluates a route between turns, never inside one, and the loop
-        /// runs a settlement only between work items.
+        /// Undoes `enterTurnless`. No two of these steps nest: the boot
+        /// evaluates a route outside every turn, and the loop runs a
+        /// settlement only between work items.
         pub fn leaveTurnless(self: *Runtime, previous_owner_id: u64) void {
             runtime_owner.leave(self, previous_owner_id);
             self.core.vm.setTurnlessExecCtx(null) catch |err|
@@ -280,8 +235,6 @@ pub fn Methods(comptime Runtime: type) type {
             index: usize,
             init_deadline_mono_ns: u64,
         ) !modules_routes.BootRouteOutcome {
-            if (self.modules.state.routes.items[index].module != .idle)
-                return .settled;
             const evaluation = try openOrJoin(self, index, init_deadline_mono_ns);
             const outcome = bootEvaluateUnder(self, evaluation, index) catch |err| {
                 self.closeEvaluationOnceSettled(evaluation.id);
@@ -316,17 +269,6 @@ pub fn Methods(comptime Runtime: type) type {
             defer self.leaveTurnless(previous_owner_id);
             var ctx = self.modulesContext();
             return modules_routes.bootEvaluateRoute(&ctx, index, evaluation.id);
-        }
-
-        fn evaluateRequested(
-            self: *Runtime,
-            evaluation: Evaluation,
-            request_ctx: *request_context.RequestContext,
-        ) !modules_routes.RouteHandlerResult {
-            const previous_owner_id = try self.enterTurnless(&evaluation.context.exec);
-            defer self.leaveTurnless(previous_owner_id);
-            var ctx = self.modulesContext();
-            return modules_routes.evaluateRequestedRoute(&ctx, request_ctx, evaluation.id);
         }
 
         /// The evaluation the route at `index` evaluates its entry under: the

@@ -10,19 +10,20 @@
 //!   pass (its place on the lane's death queue, `slab_link.queued`).
 //!   `tenure` is set exactly while the lane is the worker's reader
 //!   (`server/supervisor/pool.zig`); only then does the registration poll
-//!   the worker's completion eventfd, control socket, fault socket and pidfd,
-//!   on behalf of every lane with requests on the worker. A reader stops
-//!   reading only when `Pool.transferReader` ends its tenure (`.vacated` or
-//!   `.retire`), so an idle worker keeps its reader. Either kind of
-//!   registration may poll the control socket for writability while a send
-//!   of the lane's waits for room; a send that waits on the worker's full
-//!   payload ring polls nothing (`runner/request_body.zig`).
+//!   the worker's control socket, completion eventfd and pidfd, on behalf of
+//!   every lane with requests on the worker. A reader stops reading only
+//!   when `Pool.transferReader` ends its tenure (`.vacated` or `.retire`),
+//!   so an idle worker keeps its reader. Either kind of registration may
+//!   poll the control socket for writability while a send of the lane's
+//!   waits for room; a send that waits on the worker's full payload ring
+//!   polls nothing (`runner/request_body.zig`).
 //! - A reader whose worker's forwarding window is full (`window_blocked`)
 //!   arms no poll on the worker's control socket until the window reopens,
 //!   so it neither receives the worker's packets nor spins on them
-//!   (`runner/worker_control.zig`). Its completion wake meanwhile serves
-//!   only the request bodies waiting for ring room, and the ring waits behind
-//!   the control socket (`runner/worker_completions.zig`).
+//!   (`runner/worker_control.zig`). The completion eventfd carries only the
+//!   worker's room in its server-to-worker payload ring, so its wake serves
+//!   the request bodies waiting for that room whatever the window holds
+//!   (`runner/request_body.zig`).
 //! - The descriptors and the payload view are borrowed from the worker's
 //!   record (`server/supervisor/worker_table.zig`). The record outlives the
 //!   registration, because a request's slot or the reader role keeps the
@@ -45,13 +46,10 @@ const fault = @import("fault.zig");
 const lifecycle = @import("collo_server_lifecycle");
 const slab = @import("slab.zig");
 const supervision = @import("collo_server_supervisor");
-const worker_shared_page = @import("collo_worker_state").page;
 
 const pool = supervision.pool;
 const WorkerRecord = supervision.worker_table.Record;
 const WorkerPool = supervision.WorkerPool;
-
-pub const WorkerCompletionRecord = worker_shared_page.WorkerCompletionRecord;
 
 /// The lane's registrations.
 pub const RegistrationSlab = slab.FaultInSlab(Registration);
@@ -67,7 +65,7 @@ pub const max_worker_inflight_requests: usize = pool.slots_per_worker_max;
 /// after the owner's queue refused one of their descriptors: the rest of each
 /// response drops too, and the header of `runner/h2_worker_ipc.zig` says how
 /// such a request ends. A key leaves when the response's last descriptor or
-/// the request's completion passes the reader. A worker produces at most
+/// the request's `request_done` passes the reader. A worker produces at most
 /// `pool.slots_per_worker_max` responses at once, so a full list forgets its
 /// oldest key.
 pub const ForwardLoss = struct {
@@ -125,12 +123,12 @@ pub const Registration = struct {
     /// which the death path still owes the lanes it names
     /// (`worker_fault.deferWorkerFault`).
     death_notice: ?WorkerPool.Death = null,
-    event_fd: std.posix.fd_t = -1,
+    /// The worker's completion eventfd (`WorkerHandle.completion_eventfd`),
+    /// which the worker writes only when it frees room in its
+    /// server-to-worker payload ring that a lane marked itself waiting for.
+    ring_credit_fd: std.posix.fd_t = -1,
     control_fd: std.posix.fd_t = -1,
     pidfd: std.posix.fd_t = -1,
-    /// The server end of the worker's fault socket pair. Only the reader
-    /// reads it and answers on it.
-    fs_fault_fd: std.posix.fd_t = -1,
     ingress_payload: ?*ipc.ingress_channel.SharedPayloadView = null,
     /// The eventfd the worker polls for room in its worker-to-server ring,
     /// which the reader signals only when the worker marked itself waiting
@@ -139,9 +137,8 @@ pub const Registration = struct {
     inflight_request_keys: [max_worker_inflight_requests]lifecycle.RequestKey = undefined,
     inflight_request_len: usize = 0,
     /// One flag per poll in flight; a completion clears its own.
-    poll_registered: bool = false,
+    ring_credit_poll_registered: bool = false,
     control_poll_registered: bool = false,
-    fs_fault_poll_registered: bool = false,
     pidfd_poll_registered: bool = false,
     control_writable_poll_registered: bool = false,
     /// The reader stopped receiving the worker's packets until the worker's

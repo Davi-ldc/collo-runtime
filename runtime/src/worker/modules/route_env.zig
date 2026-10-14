@@ -2,17 +2,18 @@
 //! own properties are the route's text bindings, names to string values in
 //! configuration order. Runs in the worker on the VM thread.
 //!
-//! Each route's bindings arrive as one section of the definition's route
-//! table, in the layout and under the rules of
-//! `common/ipc/route_bindings.zig`; the server builds the table once per
+//! Each route's bindings arrive as one section of the routes section of the
+//! definition's artifact, in the layout and under the rules of
+//! `common/ipc/route_bindings.zig`; the server builds the artifact once per
 //! definition (`server/routes/artifacts.zig`) and hands it over in
-//! WorkerInit. The runtime checks the whole table when it starts
-//! (`Modules.init` in `worker/runtime/modules.zig`), so a malformed section
-//! fails the worker's boot instead of its first request, and `routes.zig`
-//! builds the object once per route, in the route's realm, from that route's
-//! section alone, when the route's module becomes ready. Every request of the
-//! route then receives the same object, and no route ever receives another
-//! route's bindings.
+//! WorkerInit. The boot checks every route's section when it registers the
+//! artifact (`module_pack.parse`, through `route_table.validate`, in
+//! `bootRegisterPack` in `routes.zig`), so a malformed section fails the
+//! worker's boot instead of its first request, and `routes.zig` builds the
+//! object once per route, in the route's realm, from that route's section
+//! alone, when the route's module becomes ready. Every request of the route
+//! then receives the same object, and no route ever receives another route's
+//! bindings.
 //!
 //! Building the object runs no JavaScript (`collo_env_object_new` in
 //! `abi.h`), so it is safe outside a turn and no tenant setter observes a

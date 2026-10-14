@@ -1,22 +1,21 @@
 //! The names under which a host claims directories in a parent other hosts
-//! share, and the proof that the host behind such a name is gone, which every
+//! share, and the proof that the host behind such a name is gone, which the
 //! boot-time sweep of a host's leftovers uses: the worker cgroup directories
-//! under an env root (`cgroup_root.zig`) and the tmpfs mount points under
-//! /tmp (`tmp_mount.zig`). A claimed name is `<prefix><pid>-<start>-<n>`:
-//! the host's pid, its start time in clock ticks since boot (field 22 of
-//! `/proc/<pid>/stat`) and a claim number that separates several directories
-//! one process holds under one parent, as a test binary does.
+//! under an env root (`cgroup_root.zig`). A claimed name is
+//! `<prefix><pid>-<start>-<n>`: the host's pid, its start time in clock ticks
+//! since boot (field 22 of `/proc/<pid>/stat`) and a claim number that
+//! separates several directories one process holds under one parent, as a
+//! test binary does.
 //!
 //! Within one boot a (pid, start) pair names exactly one process
 //! incarnation, because a reused pid starts later, so a pair recorded by a
 //! process that is since gone never matches a live one; a pid that cannot be
-//! inspected counts as alive, since it may still serve workers. A directory
-//! that outlives a reboot, as one on a disk-backed /tmp does, is judged gone
-//! unless a process of the new boot holds its pid and started at the same
-//! tick, which only keeps it. The proof reads `/proc` of this pid namespace,
-//! so hosts that share a parent must share the pid namespace: a live host in
-//! another one would have no visible pid and be judged gone. Stateless, and
-//! no function here allocates.
+//! inspected counts as alive, since it may still serve workers. That holds
+//! within the boot that made the name, and the one parent these names live
+//! in, the cgroupfs subtree, never outlives its boot. The proof reads `/proc`
+//! of this pid namespace, so hosts that share a parent must share the pid
+//! namespace: a live host in another one would have no visible pid and be
+//! judged gone. Stateless, and no function here allocates.
 
 const std = @import("std");
 const process = @import("collo_os").process;
@@ -153,8 +152,7 @@ pub fn sweepDeadAt(
         if (entry.kind != .directory)
             continue;
         const owner = parseName(prefix, entry.name) orelse continue;
-        // A directory another user made is that user's to remove, and a
-        // sticky parent such as /tmp would refuse the removal anyway.
+        // A directory another user made is that user's to remove.
         const stat = std.posix.fstatat(iterator_fd, entry.name, std.posix.AT.SYMLINK_NOFOLLOW) catch continue;
         if (stat.uid != own_uid)
             continue;

@@ -1,570 +1,479 @@
 //! Tests for the HTTP/1 exchange and body continuation against the local
-//! origin in support.zig, covering pooling, replay, framing, redirects and
-//! the network policy on each redirect hop, drive budgets, would-block parks
-//! and billing. The support drivers stand in for the owner loop, parking on
-//! poll(2) between drives, and for a connector thread, dialing on
-//! `.connect`. Paced tests hold the origin on parks the client recorded
-//! instead of on sleeps. Behavior that needs the real owner and connector
-//! threads, such as fairness between fetches, is tested in client/all.zig.
+//! origin in support.zig: pooling and the rules that keep a pooled wire
+//! clean, the lease that brings a pooled wire up to date with its socket,
+//! replay after a dead pooled wire, framing and leniency, interim heads,
+//! redirects and the network policy on each hop, a body step's wait on its
+//! wire, and the stall deadline. The support harness stands in for the
+//! engine's owner loop on the production data driver, and paced routes hold
+//! their writes on what the client did instead of on sleeps. Fairness
+//! between fetches and everything else that needs the real owner thread is
+//! tested in client/engine/, HTTP/1 over TLS wires in http1/tls.zig, and the
+//! wire alone in client/wire.zig.
 
 const std = @import("std");
-const network_policy = @import("../network_policy.zig");
 const test_support = @import("support.zig");
 const transport = test_support.transport;
 const decompress = test_support.decompress;
-const fetch_body = test_support.fetch_body;
-const Http1HeaderContext = test_support.Http1HeaderContext;
+const Client = test_support.Client;
 const LocalHttp1Origin = test_support.LocalHttp1Origin;
+const Response = test_support.Response;
+const WaitLog = test_support.WaitLog;
+const driveContinuationToEnd = test_support.driveContinuationToEnd;
 const fetchViaExchange = test_support.fetchViaExchange;
 const runExchange = test_support.runExchange;
 
-const default_body_pipe_capacity: usize = 64 * 1024;
+const gpa = std.testing.allocator;
 
-fn expectBodyBytes(body_pipe: *fetch_body.Body, expected: []const u8) !void {
-    const bytes = try test_support.collectBodyBytes(body_pipe, std.testing.allocator);
-    defer std.testing.allocator.free(bytes);
-    try std.testing.expectEqualStrings(expected, bytes);
-}
-
-test "egress request plan does not resolve network addresses" {
-    var plan = try transport.prepareRequest(
-        std.testing.allocator,
-        "https://does-not-exist.invalid/hello",
-        "GET",
-        &.{},
-        .{ .network = network_policy.public_https },
-    );
-    defer plan.deinit();
-
-    try std.testing.expectEqualStrings("does-not-exist.invalid", plan.target.authority_host);
-    try std.testing.expectEqualStrings("/hello", plan.request_target);
-}
+/// The head-size bound the parser calls below pass; any bound above their
+/// heads serves.
+const head_bytes_max: usize = 16 * 1024;
 
 test "egress http1 streaming path publishes headers before body" {
-    var origin = try LocalHttp1Origin.start(std.testing.allocator);
-    defer origin.stop(std.testing.allocator);
+    const origin = try LocalHttp1Origin.start(gpa);
+    defer origin.stop(gpa);
+    var client: Client = undefined;
+    try client.init(gpa);
+    defer client.deinit();
 
-    const url = try std.fmt.allocPrint(std.testing.allocator, "http://{s}:{d}/data", .{ origin.host(), origin.port });
-    defer std.testing.allocator.free(url);
-
+    const url = try origin.url(gpa, "/data");
+    defer gpa.free(url);
     const headers = [_]transport.Header{.{ .name = "x-collo-test", .value = "yes" }};
-    var dns_cache = transport.DnsCache.init(std.testing.allocator, .{});
-    defer dns_cache.deinit();
-    var pool = transport.Http1Pool.init(std.testing.allocator);
-    defer pool.deinit();
-    const body_pipe = try test_support.makeBodyPipe(std.testing.allocator, default_body_pipe_capacity);
-    defer test_support.releaseBodyPipe(body_pipe, std.testing.allocator);
-    var context = Http1HeaderContext{ .expected_url = url };
-    try fetchViaExchange(
-        std.testing.allocator,
-        &pool,
-        &dns_cache,
-        url,
-        "POST",
-        "payload",
-        &headers,
-        .{
-            .network = origin.policy(),
-            .max_response_body_bytes = 64,
-        },
-        .{},
-        body_pipe,
-        &context,
-    );
+    var response = Response.init(url);
+    defer response.deinit(gpa);
+    try fetchViaExchange(&client, .{
+        .url = url,
+        .method = "POST",
+        .body = "payload",
+        .headers = &headers,
+    }, .{ .network = origin.policy(), .max_response_body_bytes = 64 }, &response);
 
-    try std.testing.expect(context.published);
-    try std.testing.expectEqual(fetch_body.State.complete, body_pipe.state);
-    try expectBodyBytes(body_pipe, "post ok");
+    try std.testing.expect(response.published);
+    try response.expectBody(gpa, "post ok");
     try std.testing.expectEqual(@as(usize, 1), origin.accepted.load(.acquire));
-    try std.testing.expectEqual(
-        origin.request_wire.load(.acquire) + origin.response_wire.load(.acquire),
-        test_support.bodyBilledTotal(body_pipe),
-    );
 }
 
 test "egress http1 compressed response decodes through streaming body path" {
-    var origin = try LocalHttp1Origin.start(std.testing.allocator);
-    defer origin.stop(std.testing.allocator);
+    const origin = try LocalHttp1Origin.start(gpa);
+    defer origin.stop(gpa);
+    var client: Client = undefined;
+    try client.init(gpa);
+    defer client.deinit();
 
-    const url = try std.fmt.allocPrint(std.testing.allocator, "http://{s}:{d}/gzip", .{ origin.host(), origin.port });
-    defer std.testing.allocator.free(url);
-
-    var dns_cache = transport.DnsCache.init(std.testing.allocator, .{});
-    defer dns_cache.deinit();
-    var pool = transport.Http1Pool.init(std.testing.allocator);
-    defer pool.deinit();
-    const body_pipe = try test_support.makeBodyPipe(std.testing.allocator, default_body_pipe_capacity);
-    defer test_support.releaseBodyPipe(body_pipe, std.testing.allocator);
-    var context = Http1HeaderContext{ .expected_url = url };
+    const url = try origin.url(gpa, "/gzip");
+    defer gpa.free(url);
+    var response = Response.init(url);
+    defer response.deinit(gpa);
     try fetchViaExchange(
-        std.testing.allocator,
-        &pool,
-        &dns_cache,
-        url,
-        "POST",
-        "payload",
-        &.{},
-        .{
-            .network = origin.policy(),
-            .max_response_body_bytes = 64,
-        },
-        .{},
-        body_pipe,
-        &context,
+        &client,
+        .{ .url = url, .method = "POST", .body = "payload" },
+        .{ .network = origin.policy(), .max_response_body_bytes = 64 },
+        &response,
     );
 
-    try std.testing.expect(context.published);
-    try std.testing.expectEqual(fetch_body.State.complete, body_pipe.state);
-    try expectBodyBytes(body_pipe, "hello world");
+    try std.testing.expect(response.published);
+    try response.expectBody(gpa, "hello world");
 }
 
 test "egress http1 pool caps requests per connection" {
-    var origin = try LocalHttp1Origin.start(std.testing.allocator);
-    defer origin.stop(std.testing.allocator);
+    const origin = try LocalHttp1Origin.start(gpa);
+    defer origin.stop(gpa);
+    var client: Client = undefined;
+    try client.init(gpa);
+    defer client.deinit();
 
-    const url = try std.fmt.allocPrint(std.testing.allocator, "http://{s}:{d}/one", .{ origin.host(), origin.port });
-    defer std.testing.allocator.free(url);
-
-    var dns_cache = transport.DnsCache.init(std.testing.allocator, .{});
-    defer dns_cache.deinit();
-    var pool = transport.Http1Pool.init(std.testing.allocator);
-    defer pool.deinit();
-
-    const config = transport.Config{
+    const url = try origin.url(gpa, "/one");
+    defer gpa.free(url);
+    const config: transport.Config = .{
         .network = origin.policy(),
         .max_response_body_bytes = 64,
         .http1_pool_max_requests_per_connection = 2,
     };
 
     for (0..3) |_| {
-        const body_pipe = try test_support.makeBodyPipe(std.testing.allocator, default_body_pipe_capacity);
-        defer test_support.releaseBodyPipe(body_pipe, std.testing.allocator);
-        var context = Http1HeaderContext{ .expected_url = url };
-        try fetchViaExchange(
-            std.testing.allocator,
-            &pool,
-            &dns_cache,
-            url,
-            "POST",
-            "payload",
-            &.{},
-            config,
-            .{},
-            body_pipe,
-            &context,
-        );
-        try expectBodyBytes(body_pipe, "one ok");
+        var response = Response.init(url);
+        defer response.deinit(gpa);
+        try fetchViaExchange(&client, .{ .url = url, .method = "POST", .body = "payload" }, config, &response);
+        try response.expectBody(gpa, "one ok");
     }
     try std.testing.expectEqual(@as(usize, 2), origin.accepted.load(.acquire));
 }
 
-test "egress http1 retries idempotent request when pooled connection was half closed" {
-    var origin = try LocalHttp1Origin.start(std.testing.allocator);
-    defer origin.stop(std.testing.allocator);
+// `/close-second` answers the first request on a connection and closes on
+// the second without answering. The pooled wire is clean when the second
+// GET leases it, the origin closes under the request, and the GET, bodiless
+// and idempotent, is sent again on a fresh dial.
+test "egress http1 replays a GET whose pooled wire's peer closes under it" {
+    try expectGetReplayedAfterPeerEnd("/close-second");
+}
 
-    const url = try std.fmt.allocPrint(std.testing.allocator, "http://{s}:{d}/stale", .{ origin.host(), origin.port });
-    defer std.testing.allocator.free(url);
+// The same death as a reset, which reads as the end of the stream.
+test "egress http1 replays a GET whose pooled wire's peer resets under it" {
+    try expectGetReplayedAfterPeerEnd("/reset-second");
+}
 
-    var dns_cache = transport.DnsCache.init(std.testing.allocator, .{});
-    defer dns_cache.deinit();
-    var pool = transport.Http1Pool.init(std.testing.allocator);
-    defer pool.deinit();
+fn expectGetReplayedAfterPeerEnd(path: []const u8) !void {
+    const origin = try LocalHttp1Origin.start(gpa);
+    defer origin.stop(gpa);
+    var client: Client = undefined;
+    try client.init(gpa);
+    defer client.deinit();
 
-    const config = transport.Config{
-        .network = origin.policy(),
-        .max_response_body_bytes = 64,
-    };
+    const url = try origin.url(gpa, path);
+    defer gpa.free(url);
+    const config: transport.Config = .{ .network = origin.policy(), .max_response_body_bytes = 64 };
 
     for (0..2) |_| {
-        const body_pipe = try test_support.makeBodyPipe(std.testing.allocator, default_body_pipe_capacity);
-        defer test_support.releaseBodyPipe(body_pipe, std.testing.allocator);
-        var context = Http1HeaderContext{ .expected_url = url };
-        try fetchViaExchange(
-            std.testing.allocator,
-            &pool,
-            &dns_cache,
-            url,
-            "GET",
-            "",
-            &.{},
-            config,
-            .{},
-            body_pipe,
-            &context,
-        );
-        try expectBodyBytes(body_pipe, "stale ok");
+        var response = Response.init(url);
+        defer response.deinit(gpa);
+        try fetchViaExchange(&client, .{ .url = url }, config, &response);
+        try response.expectBody(gpa, test_support.kept_body);
     }
     try std.testing.expectEqual(@as(usize, 2), origin.accepted.load(.acquire));
+}
+
+// A POST may have taken effect before its connection died, so the same
+// death fails it instead of sending it again.
+test "egress http1 does not replay a POST whose pooled wire's peer closes under it" {
+    const origin = try LocalHttp1Origin.start(gpa);
+    defer origin.stop(gpa);
+    var client: Client = undefined;
+    try client.init(gpa);
+    defer client.deinit();
+
+    const url = try origin.url(gpa, "/close-second");
+    defer gpa.free(url);
+    const config: transport.Config = .{ .network = origin.policy(), .max_response_body_bytes = 64 };
+
+    var first = Response.init(url);
+    defer first.deinit(gpa);
+    try fetchViaExchange(&client, .{ .url = url }, config, &first);
+    try first.expectBody(gpa, test_support.kept_body);
+
+    var second = Response.init(url);
+    defer second.deinit(gpa);
+    try std.testing.expectError(
+        error.FetchResponseTruncated,
+        fetchViaExchange(&client, .{ .url = url, .method = "POST", .body = "payload" }, config, &second),
+    );
+    try std.testing.expect(!second.published);
+    try std.testing.expectEqual(@as(usize, 1), origin.accepted.load(.acquire));
 }
 
 test "egress http1 pool evicts connections past max age" {
-    var origin = try LocalHttp1Origin.start(std.testing.allocator);
-    defer origin.stop(std.testing.allocator);
+    const origin = try LocalHttp1Origin.start(gpa);
+    defer origin.stop(gpa);
+    var client: Client = undefined;
+    try client.init(gpa);
+    defer client.deinit();
 
-    const url = try std.fmt.allocPrint(std.testing.allocator, "http://{s}:{d}/one", .{ origin.host(), origin.port });
-    defer std.testing.allocator.free(url);
-
-    var dns_cache = transport.DnsCache.init(std.testing.allocator, .{});
-    defer dns_cache.deinit();
-    var pool = transport.Http1Pool.init(std.testing.allocator);
-    defer pool.deinit();
-
-    const config = transport.Config{
+    const url = try origin.url(gpa, "/one");
+    defer gpa.free(url);
+    // A connection is older than 1 ns by the time the next fetch looks.
+    const config: transport.Config = .{
         .network = origin.policy(),
         .max_response_body_bytes = 64,
         .http1_pool_max_connection_age_ns = 1,
     };
 
-    for (0..2) |round| {
-        const body_pipe = try test_support.makeBodyPipe(std.testing.allocator, default_body_pipe_capacity);
-        defer test_support.releaseBodyPipe(body_pipe, std.testing.allocator);
-        var context = Http1HeaderContext{ .expected_url = url };
-        try fetchViaExchange(
-            std.testing.allocator,
-            &pool,
-            &dns_cache,
-            url,
-            "POST",
-            "payload",
-            &.{},
-            config,
-            .{},
-            body_pipe,
-            &context,
-        );
-        try expectBodyBytes(body_pipe, "one ok");
-        if (round == 0)
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+    for (0..2) |_| {
+        var response = Response.init(url);
+        defer response.deinit(gpa);
+        try fetchViaExchange(&client, .{ .url = url, .method = "POST", .body = "payload" }, config, &response);
+        try response.expectBody(gpa, "one ok");
     }
     try std.testing.expectEqual(@as(usize, 2), origin.accepted.load(.acquire));
 }
 
 test "egress http1 empty-body POST sends explicit content-length zero" {
-    var origin = try LocalHttp1Origin.start(std.testing.allocator);
-    defer origin.stop(std.testing.allocator);
+    const origin = try LocalHttp1Origin.start(gpa);
+    defer origin.stop(gpa);
+    var client: Client = undefined;
+    try client.init(gpa);
+    defer client.deinit();
 
-    const url = try std.fmt.allocPrint(std.testing.allocator, "http://{s}:{d}/empty", .{ origin.host(), origin.port });
-    defer std.testing.allocator.free(url);
-
-    var dns_cache = transport.DnsCache.init(std.testing.allocator, .{});
-    defer dns_cache.deinit();
-    var pool = transport.Http1Pool.init(std.testing.allocator);
-    defer pool.deinit();
-    const body_pipe = try test_support.makeBodyPipe(std.testing.allocator, default_body_pipe_capacity);
-    defer test_support.releaseBodyPipe(body_pipe, std.testing.allocator);
-    var context = Http1HeaderContext{ .expected_url = url };
+    const url = try origin.url(gpa, "/empty");
+    defer gpa.free(url);
+    var response = Response.init(url);
+    defer response.deinit(gpa);
     try fetchViaExchange(
-        std.testing.allocator,
-        &pool,
-        &dns_cache,
-        url,
-        "POST",
-        "",
-        &.{},
-        .{
-            .network = origin.policy(),
-            .max_response_body_bytes = 64,
-        },
-        .{},
-        body_pipe,
-        &context,
+        &client,
+        .{ .url = url, .method = "POST" },
+        .{ .network = origin.policy(), .max_response_body_bytes = 64 },
+        &response,
     );
 
-    try expectBodyBytes(body_pipe, "empty ok");
+    try response.expectBody(gpa, "empty ok");
 }
 
+// The origin answers the first request and stays silent on the second, so
+// the second fails at its read deadline; a timeout says nothing about
+// whether the origin acted on the request, so it is not sent again.
 test "egress http1 does not replay pooled request after read timeout" {
-    var origin = try LocalHttp1Origin.start(std.testing.allocator);
-    defer origin.stop(std.testing.allocator);
+    const origin = try LocalHttp1Origin.start(gpa);
+    defer origin.stop(gpa);
+    var client: Client = undefined;
+    try client.init(gpa);
+    defer client.deinit();
 
-    const url = try std.fmt.allocPrint(std.testing.allocator, "http://{s}:{d}/hang-second", .{ origin.host(), origin.port });
-    defer std.testing.allocator.free(url);
-
-    var dns_cache = transport.DnsCache.init(std.testing.allocator, .{});
-    defer dns_cache.deinit();
-    var pool = transport.Http1Pool.init(std.testing.allocator);
-    defer pool.deinit();
-
-    const config = transport.Config{
+    const url = try origin.url(gpa, "/hang-second");
+    defer gpa.free(url);
+    const config: transport.Config = .{
         .network = origin.policy(),
         .max_response_body_bytes = 64,
         .socket_timeout_ms = 100,
     };
 
-    const first_body = try test_support.makeBodyPipe(std.testing.allocator, default_body_pipe_capacity);
-    defer test_support.releaseBodyPipe(first_body, std.testing.allocator);
-    var first_context = Http1HeaderContext{ .expected_url = url };
-    try fetchViaExchange(
-        std.testing.allocator,
-        &pool,
-        &dns_cache,
-        url,
-        "GET",
-        "",
-        &.{},
-        config,
-        .{},
-        first_body,
-        &first_context,
-    );
-    try expectBodyBytes(first_body, "hang ok");
+    var first = Response.init(url);
+    defer first.deinit(gpa);
+    try fetchViaExchange(&client, .{ .url = url }, config, &first);
+    try first.expectBody(gpa, "hang ok");
 
-    const second_body = try test_support.makeBodyPipe(std.testing.allocator, default_body_pipe_capacity);
-    defer test_support.releaseBodyPipe(second_body, std.testing.allocator);
-    var second_context = Http1HeaderContext{ .expected_url = url };
-    try std.testing.expectError(error.FetchReadTimeout, fetchViaExchange(
-        std.testing.allocator,
-        &pool,
-        &dns_cache,
-        url,
-        "GET",
-        "",
-        &.{},
-        config,
-        .{},
-        second_body,
-        &second_context,
-    ));
-    try std.testing.expect(!second_context.published);
+    var second = Response.init(url);
+    defer second.deinit(gpa);
+    try std.testing.expectError(
+        error.FetchReadTimeout,
+        fetchViaExchange(&client, .{ .url = url }, config, &second),
+    );
+    try std.testing.expect(!second.published);
     try std.testing.expectEqual(@as(usize, 1), origin.accepted.load(.acquire));
 }
 
-test "egress http1 liveness probe discards dead pooled connections before non-retryable requests" {
-    var origin = try LocalHttp1Origin.start(std.testing.allocator);
-    defer origin.stop(std.testing.allocator);
+test "egress http1 pool drops an idle wire its peer closed before a non-retryable request leases it" {
+    const origin = try LocalHttp1Origin.start(gpa);
+    defer origin.stop(gpa);
+    var client: Client = undefined;
+    try client.init(gpa);
+    defer client.deinit();
 
-    const url = try std.fmt.allocPrint(std.testing.allocator, "http://{s}:{d}/stale-post", .{ origin.host(), origin.port });
-    defer std.testing.allocator.free(url);
+    const url = try origin.url(gpa, "/stale");
+    defer gpa.free(url);
+    const config: transport.Config = .{ .network = origin.policy(), .max_response_body_bytes = 64 };
 
-    var dns_cache = transport.DnsCache.init(std.testing.allocator, .{});
-    defer dns_cache.deinit();
-    var pool = transport.Http1Pool.init(std.testing.allocator);
-    defer pool.deinit();
+    var first = Response.init(url);
+    defer first.deinit(gpa);
+    try fetchViaExchange(&client, .{ .url = url, .method = "POST", .body = "payload" }, config, &first);
+    try first.expectBody(gpa, "stale ok");
+    try std.testing.expectEqual(@as(usize, 1), client.pool.idleEntries().len);
 
-    const config = transport.Config{
-        .network = origin.policy(),
-        .max_response_body_bytes = 64,
-    };
+    // The origin closed after its answer. The receive armed on the idle wire
+    // hears the EOF, and the eviction that follows drops the wire.
+    try std.testing.expect(try client.serviceIdleEntries(2_000));
+    try std.testing.expectEqual(@as(usize, 0), client.pool.idleEntries().len);
 
-    for (0..2) |round| {
-        const body_pipe = try test_support.makeBodyPipe(std.testing.allocator, default_body_pipe_capacity);
-        defer test_support.releaseBodyPipe(body_pipe, std.testing.allocator);
-        var context = Http1HeaderContext{ .expected_url = url };
-        try fetchViaExchange(
-            std.testing.allocator,
-            &pool,
-            &dns_cache,
-            url,
-            "POST",
-            "payload",
-            &.{},
-            config,
-            .{},
-            body_pipe,
-            &context,
-        );
-        try expectBodyBytes(body_pipe, "stale ok");
-        if (round == 0)
-            std.Thread.sleep(100 * std.time.ns_per_ms);
-    }
+    // A POST is never sent twice, so on the dead wire it would fail; it
+    // succeeds only because it dials a fresh one.
+    var second = Response.init(url);
+    defer second.deinit(gpa);
+    try fetchViaExchange(&client, .{ .url = url, .method = "POST", .body = "payload" }, config, &second);
+    try second.expectBody(gpa, "stale ok");
     try std.testing.expectEqual(@as(usize, 2), origin.accepted.load(.acquire));
 }
 
+// `/stale` promises keep-alive and closes after its answer, and the test
+// waits until the close reached the pooled wire's socket. The next fetch
+// leases in the same iteration that pooled the wire, before any wait could
+// arm the idle receive. A POST is never sent twice, so on the dead wire it
+// would fail; the lease takes the close from the socket first and the POST
+// dials a fresh wire.
+test "egress http1 lease drops a pooled wire whose peer closed after its response, so a POST dials fresh" {
+    const origin = try LocalHttp1Origin.start(gpa);
+    defer origin.stop(gpa);
+    var client: Client = undefined;
+    try client.init(gpa);
+    defer client.deinit();
+
+    const url = try origin.url(gpa, "/stale");
+    defer gpa.free(url);
+    const config: transport.Config = .{ .network = origin.policy(), .max_response_body_bytes = 64 };
+
+    var first = Response.init(url);
+    defer first.deinit(gpa);
+    try fetchViaExchange(&client, .{ .url = url, .method = "POST", .body = "payload" }, config, &first);
+    try first.expectBody(gpa, "stale ok");
+    try client.awaitIdleSocketReadable(2_000);
+
+    var second = Response.init(url);
+    defer second.deinit(gpa);
+    try fetchViaExchange(&client, .{ .url = url, .method = "POST", .body = "payload" }, config, &second);
+    try second.expectBody(gpa, "stale ok");
+    try std.testing.expectEqual(@as(usize, 2), origin.accepted.load(.acquire));
+}
+
+// `/stray-later` sends a stray head in its own segment once the client
+// finished the response, and the test waits until it reached the pooled
+// wire's socket. Leased as it is, the wire would answer the next request
+// with that head; the lease takes it from the socket first, so it costs the
+// wire and the next fetch dials.
+test "egress http1 lease drops a pooled wire whose peer sent a stray head after its response" {
+    const origin = try LocalHttp1Origin.start(gpa);
+    defer origin.stop(gpa);
+    var client: Client = undefined;
+    try client.init(gpa);
+    defer client.deinit();
+
+    const stray_url = try origin.url(gpa, "/stray-later");
+    defer gpa.free(stray_url);
+    const one_url = try origin.url(gpa, "/one");
+    defer gpa.free(one_url);
+    const config: transport.Config = .{ .network = origin.policy(), .max_response_body_bytes = 64 };
+
+    var first = Response.init(stray_url);
+    defer first.deinit(gpa);
+    try fetchViaExchange(&client, .{ .url = stray_url }, config, &first);
+    try first.expectBody(gpa, test_support.stray_later_body);
+    try std.testing.expectEqual(@as(usize, 1), client.pool.idleEntries().len);
+    origin.gate.store(1, .release);
+    try client.awaitIdleSocketReadable(2_000);
+
+    var second = Response.init(one_url);
+    defer second.deinit(gpa);
+    try fetchViaExchange(&client, .{ .url = one_url }, config, &second);
+    try second.expectBody(gpa, "one ok");
+    try std.testing.expectEqual(@as(usize, 2), origin.accepted.load(.acquire));
+}
+
+// Here a wait arms the pooled wire's receive and ends before the stray head
+// arrives; the receive then takes the head, and its completion waits in the
+// driver's ring with no wait to serve it. Having been through a wait does
+// not make the wire safe to lease: the lease ingests the ring's completions
+// first, so the head costs the wire.
+test "egress http1 lease drops a pooled wire whose armed receive took a stray head no wait served" {
+    const origin = try LocalHttp1Origin.start(gpa);
+    defer origin.stop(gpa);
+    var client: Client = undefined;
+    try client.init(gpa);
+    defer client.deinit();
+
+    const stray_url = try origin.url(gpa, "/stray-later");
+    defer gpa.free(stray_url);
+    const one_url = try origin.url(gpa, "/one");
+    defer gpa.free(one_url);
+    const config: transport.Config = .{ .network = origin.policy(), .max_response_body_bytes = 64 };
+
+    var first = Response.init(stray_url);
+    defer first.deinit(gpa);
+    try fetchViaExchange(&client, .{ .url = stray_url }, config, &first);
+    try first.expectBody(gpa, test_support.stray_later_body);
+    // The idle receive is armed, and nothing arrives within the window.
+    try std.testing.expect(!try client.serviceIdleEntries(20));
+    try std.testing.expectEqual(@as(usize, 1), client.pool.idleEntries().len);
+    origin.gate.store(1, .release);
+    try client.awaitIdleReceivePosted();
+
+    var second = Response.init(one_url);
+    defer second.deinit(gpa);
+    try fetchViaExchange(&client, .{ .url = one_url }, config, &second);
+    try second.expectBody(gpa, "one ok");
+    try std.testing.expectEqual(@as(usize, 2), origin.accepted.load(.acquire));
+}
+
+// `Keep-Alive: timeout=0` expires the pooled wire at once, so the second
+// fetch dials anew.
 test "egress http1 honors server keep-alive timeout hint" {
-    var origin = try LocalHttp1Origin.start(std.testing.allocator);
-    defer origin.stop(std.testing.allocator);
+    const origin = try LocalHttp1Origin.start(gpa);
+    defer origin.stop(gpa);
+    var client: Client = undefined;
+    try client.init(gpa);
+    defer client.deinit();
 
-    const url = try std.fmt.allocPrint(std.testing.allocator, "http://{s}:{d}/ka-zero", .{ origin.host(), origin.port });
-    defer std.testing.allocator.free(url);
+    const url = try origin.url(gpa, "/ka-zero");
+    defer gpa.free(url);
+    const config: transport.Config = .{ .network = origin.policy(), .max_response_body_bytes = 64 };
 
-    var dns_cache = transport.DnsCache.init(std.testing.allocator, .{});
-    defer dns_cache.deinit();
-    var pool = transport.Http1Pool.init(std.testing.allocator);
-    defer pool.deinit();
-
-    const config = transport.Config{
-        .network = origin.policy(),
-        .max_response_body_bytes = 64,
-    };
-
-    for (0..2) |round| {
-        const body_pipe = try test_support.makeBodyPipe(std.testing.allocator, default_body_pipe_capacity);
-        defer test_support.releaseBodyPipe(body_pipe, std.testing.allocator);
-        var context = Http1HeaderContext{ .expected_url = url };
-        try fetchViaExchange(
-            std.testing.allocator,
-            &pool,
-            &dns_cache,
-            url,
-            "GET",
-            "",
-            &.{},
-            config,
-            .{},
-            body_pipe,
-            &context,
-        );
-        try expectBodyBytes(body_pipe, "ka ok");
-        if (round == 0)
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+    for (0..2) |_| {
+        var response = Response.init(url);
+        defer response.deinit(gpa);
+        try fetchViaExchange(&client, .{ .url = url }, config, &response);
+        try response.expectBody(gpa, "ka ok");
     }
     try std.testing.expectEqual(@as(usize, 2), origin.accepted.load(.acquire));
 }
 
 test "egress http1 caps consecutive interim responses" {
-    var origin = try LocalHttp1Origin.start(std.testing.allocator);
-    defer origin.stop(std.testing.allocator);
+    const origin = try LocalHttp1Origin.start(gpa);
+    defer origin.stop(gpa);
+    var client: Client = undefined;
+    try client.init(gpa);
+    defer client.deinit();
 
-    const flood_url = try std.fmt.allocPrint(std.testing.allocator, "http://{s}:{d}/interim-flood", .{ origin.host(), origin.port });
-    defer std.testing.allocator.free(flood_url);
+    const config: transport.Config = .{ .network = origin.policy(), .max_response_body_bytes = 64 };
 
-    var dns_cache = transport.DnsCache.init(std.testing.allocator, .{});
-    defer dns_cache.deinit();
-    var pool = transport.Http1Pool.init(std.testing.allocator);
-    defer pool.deinit();
-
-    const config = transport.Config{
-        .network = origin.policy(),
-        .max_response_body_bytes = 64,
-    };
-
-    const flood_body = try test_support.makeBodyPipe(std.testing.allocator, default_body_pipe_capacity);
-    defer test_support.releaseBodyPipe(flood_body, std.testing.allocator);
-    var flood_context = Http1HeaderContext{ .expected_url = flood_url };
-    try std.testing.expectError(error.TooManyInterimResponses, fetchViaExchange(
-        std.testing.allocator,
-        &pool,
-        &dns_cache,
-        flood_url,
-        "GET",
-        "",
-        &.{},
-        config,
-        .{},
-        flood_body,
-        &flood_context,
-    ));
-    try std.testing.expect(!flood_context.published);
-
-    const ok_url = try std.fmt.allocPrint(std.testing.allocator, "http://{s}:{d}/interim-ok", .{ origin.host(), origin.port });
-    defer std.testing.allocator.free(ok_url);
-    const ok_body = try test_support.makeBodyPipe(std.testing.allocator, default_body_pipe_capacity);
-    defer test_support.releaseBodyPipe(ok_body, std.testing.allocator);
-    var ok_context = Http1HeaderContext{ .expected_url = ok_url };
-    try fetchViaExchange(
-        std.testing.allocator,
-        &pool,
-        &dns_cache,
-        ok_url,
-        "GET",
-        "",
-        &.{},
-        config,
-        .{},
-        ok_body,
-        &ok_context,
+    const flood_url = try origin.url(gpa, "/interim-flood");
+    defer gpa.free(flood_url);
+    var flood = Response.init(flood_url);
+    defer flood.deinit(gpa);
+    try std.testing.expectError(
+        error.TooManyInterimResponses,
+        fetchViaExchange(&client, .{ .url = flood_url }, config, &flood),
     );
-    try expectBodyBytes(ok_body, "interim ok");
+    try std.testing.expect(!flood.published);
+
+    const ok_url = try origin.url(gpa, "/interim-ok");
+    defer gpa.free(ok_url);
+    var ok = Response.init(ok_url);
+    defer ok.deinit(gpa);
+    try fetchViaExchange(&client, .{ .url = ok_url }, config, &ok);
+    try ok.expectBody(gpa, "interim ok");
 }
 
 test "egress http1 accepts bare-LF response heads from the wire" {
-    var origin = try LocalHttp1Origin.start(std.testing.allocator);
-    defer origin.stop(std.testing.allocator);
+    const origin = try LocalHttp1Origin.start(gpa);
+    defer origin.stop(gpa);
+    var client: Client = undefined;
+    try client.init(gpa);
+    defer client.deinit();
 
-    const url = try std.fmt.allocPrint(std.testing.allocator, "http://{s}:{d}/bare-lf", .{ origin.host(), origin.port });
-    defer std.testing.allocator.free(url);
-
-    var dns_cache = transport.DnsCache.init(std.testing.allocator, .{});
-    defer dns_cache.deinit();
-    var pool = transport.Http1Pool.init(std.testing.allocator);
-    defer pool.deinit();
-    const body_pipe = try test_support.makeBodyPipe(std.testing.allocator, default_body_pipe_capacity);
-    defer test_support.releaseBodyPipe(body_pipe, std.testing.allocator);
-    var context = Http1HeaderContext{ .expected_url = url };
+    const url = try origin.url(gpa, "/bare-lf");
+    defer gpa.free(url);
+    var response = Response.init(url);
+    defer response.deinit(gpa);
     try fetchViaExchange(
-        std.testing.allocator,
-        &pool,
-        &dns_cache,
-        url,
-        "GET",
-        "",
-        &.{},
-        .{
-            .network = origin.policy(),
-            .max_response_body_bytes = 64,
-        },
-        .{},
-        body_pipe,
-        &context,
+        &client,
+        .{ .url = url },
+        .{ .network = origin.policy(), .max_response_body_bytes = 64 },
+        &response,
     );
-    try expectBodyBytes(body_pipe, "lf ok");
+    try response.expectBody(gpa, "lf ok");
 }
 
 test "egress http1 does not pool lenient bare-LF keep-alive responses" {
-    var origin = try LocalHttp1Origin.start(std.testing.allocator);
-    defer origin.stop(std.testing.allocator);
+    const origin = try LocalHttp1Origin.start(gpa);
+    defer origin.stop(gpa);
+    var client: Client = undefined;
+    try client.init(gpa);
+    defer client.deinit();
 
-    const first_url = try std.fmt.allocPrint(
-        std.testing.allocator,
-        "http://{s}:{d}/bare-lf-keepalive",
-        .{ origin.host(), origin.port },
-    );
-    defer std.testing.allocator.free(first_url);
-    const second_url = try std.fmt.allocPrint(
-        std.testing.allocator,
-        "http://{s}:{d}/one",
-        .{ origin.host(), origin.port },
-    );
-    defer std.testing.allocator.free(second_url);
+    const first_url = try origin.url(gpa, "/bare-lf-keepalive");
+    defer gpa.free(first_url);
+    const second_url = try origin.url(gpa, "/one");
+    defer gpa.free(second_url);
+    const config: transport.Config = .{ .network = origin.policy(), .max_response_body_bytes = 64 };
 
-    var dns_cache = transport.DnsCache.init(std.testing.allocator, .{});
-    defer dns_cache.deinit();
-    var pool = transport.Http1Pool.init(std.testing.allocator);
-    defer pool.deinit();
-    const config = transport.Config{
-        .network = origin.policy(),
-        .max_response_body_bytes = 64,
-    };
+    var first = Response.init(first_url);
+    defer first.deinit(gpa);
+    try fetchViaExchange(&client, .{ .url = first_url }, config, &first);
+    try first.expectBody(gpa, "lf ok");
+    try std.testing.expectEqual(@as(usize, 0), client.pool.idleEntries().len);
 
-    const first_body = try test_support.makeBodyPipe(std.testing.allocator, default_body_pipe_capacity);
-    defer test_support.releaseBodyPipe(first_body, std.testing.allocator);
-    var first_context = Http1HeaderContext{ .expected_url = first_url };
-    try fetchViaExchange(
-        std.testing.allocator,
-        &pool,
-        &dns_cache,
-        first_url,
-        "GET",
-        "",
-        &.{},
-        config,
-        .{},
-        first_body,
-        &first_context,
-    );
-    try expectBodyBytes(first_body, "lf ok");
-
-    const second_body = try test_support.makeBodyPipe(std.testing.allocator, default_body_pipe_capacity);
-    defer test_support.releaseBodyPipe(second_body, std.testing.allocator);
-    var second_context = Http1HeaderContext{ .expected_url = second_url };
-    try fetchViaExchange(
-        std.testing.allocator,
-        &pool,
-        &dns_cache,
-        second_url,
-        "POST",
-        "payload",
-        &.{},
-        config,
-        .{},
-        second_body,
-        &second_context,
-    );
-    try expectBodyBytes(second_body, "one ok");
+    var second = Response.init(second_url);
+    defer second.deinit(gpa);
+    try fetchViaExchange(&client, .{ .url = second_url, .method = "POST", .body = "payload" }, config, &second);
+    try second.expectBody(gpa, "one ok");
     try std.testing.expectEqual(@as(usize, 2), origin.accepted.load(.acquire));
 }
 
-test "egress http1 retry predicate only fires on connection death before response bytes" {
+// A replay needs both: a request whose second send cannot repeat its
+// effects (idempotent, no body), and a failure showing the origin never
+// started a response.
+test "egress http1 replays only a bodiless idempotent request whose connection died before any response byte" {
+    try std.testing.expect(transport.isReplayableBeforeResponse("GET", ""));
+    try std.testing.expect(transport.isReplayableBeforeResponse("head", ""));
+    try std.testing.expect(transport.isReplayableBeforeResponse("OPTIONS", ""));
+    try std.testing.expect(transport.isReplayableBeforeResponse("DELETE", ""));
+    try std.testing.expect(!transport.isReplayableBeforeResponse("POST", ""));
+    try std.testing.expect(!transport.isReplayableBeforeResponse("PUT", ""));
+    try std.testing.expect(!transport.isReplayableBeforeResponse("GET", "body"));
+
     const http1 = transport.http1;
     try std.testing.expect(http1.isHttp1ConnectionDeathBeforeResponse(error.FetchResponseTruncated, .{}));
     try std.testing.expect(http1.isHttp1ConnectionDeathBeforeResponse(error.BrokenPipe, .{}));
@@ -603,20 +512,20 @@ test "egress http1 resolves transfer-coded response encodings" {
     const http1_protocol = transport.http1_protocol;
     var scan_start: usize = 0;
     var gzip_chunked = (try http1_protocol.completeResponseHead(
-        std.testing.allocator,
+        gpa,
         "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n",
         &scan_start,
-        http1_protocol.default_max_header_bytes,
+        head_bytes_max,
     )).?;
     defer gzip_chunked.deinit();
     try std.testing.expectEqual(decompress.Encoding.gzip, try transport.http1.responseEncodingForHead(gzip_chunked));
 
     var conflict_scan: usize = 0;
     var conflicting = (try http1_protocol.completeResponseHead(
-        std.testing.allocator,
+        gpa,
         "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\nContent-Encoding: br\r\n\r\n",
         &conflict_scan,
-        http1_protocol.default_max_header_bytes,
+        head_bytes_max,
     )).?;
     defer conflicting.deinit();
     try std.testing.expectError(
@@ -626,263 +535,168 @@ test "egress http1 resolves transfer-coded response encodings" {
 }
 
 test "egress http1 rejects ambiguous response framing before publishing body" {
-    var origin = try LocalHttp1Origin.start(std.testing.allocator);
-    defer origin.stop(std.testing.allocator);
+    const origin = try LocalHttp1Origin.start(gpa);
+    defer origin.stop(gpa);
+    var client: Client = undefined;
+    try client.init(gpa);
+    defer client.deinit();
 
-    const url = try std.fmt.allocPrint(std.testing.allocator, "http://{s}:{d}/ambiguous", .{ origin.host(), origin.port });
-    defer std.testing.allocator.free(url);
-
-    var dns_cache = transport.DnsCache.init(std.testing.allocator, .{});
-    defer dns_cache.deinit();
-    var pool = transport.Http1Pool.init(std.testing.allocator);
-    defer pool.deinit();
-    const body_pipe = try test_support.makeBodyPipe(std.testing.allocator, default_body_pipe_capacity);
-    defer test_support.releaseBodyPipe(body_pipe, std.testing.allocator);
-    var context = Http1HeaderContext{ .expected_url = url };
-
+    const url = try origin.url(gpa, "/ambiguous");
+    defer gpa.free(url);
+    var response = Response.init(url);
+    defer response.deinit(gpa);
     try std.testing.expectError(error.InvalidResponseBodyFraming, fetchViaExchange(
-        std.testing.allocator,
-        &pool,
-        &dns_cache,
-        url,
-        "GET",
-        "",
-        &.{},
-        .{
-            .network = origin.policy(),
-            .max_response_body_bytes = 64,
-        },
-        .{},
-        body_pipe,
-        &context,
+        &client,
+        .{ .url = url },
+        .{ .network = origin.policy(), .max_response_body_bytes = 64 },
+        &response,
     ));
-    try std.testing.expect(!context.published);
+    try std.testing.expect(!response.published);
 }
 
 test "egress http1 redirect to a loopback address fails with EgressReservedAddressDenied" {
-    var origin = try LocalHttp1Origin.start(std.testing.allocator);
-    defer origin.stop(std.testing.allocator);
+    const origin = try LocalHttp1Origin.start(gpa);
+    defer origin.stop(gpa);
+    var client: Client = undefined;
+    try client.init(gpa);
+    defer client.deinit();
 
     // The origin redirects to 127.0.0.1 on its own port.
-    const url = try std.fmt.allocPrint(std.testing.allocator, "http://{s}:{d}/redirect-loopback", .{ origin.host(), origin.port });
-    defer std.testing.allocator.free(url);
-
-    var dns_cache = transport.DnsCache.init(std.testing.allocator, .{});
-    defer dns_cache.deinit();
-    var pool = transport.Http1Pool.init(std.testing.allocator);
-    defer pool.deinit();
-    const body_pipe = try test_support.makeBodyPipe(std.testing.allocator, default_body_pipe_capacity);
-    defer test_support.releaseBodyPipe(body_pipe, std.testing.allocator);
-    var context = Http1HeaderContext{ .expected_url = url };
-
+    const url = try origin.url(gpa, "/redirect-loopback");
+    defer gpa.free(url);
+    var response = Response.init(url);
+    defer response.deinit(gpa);
     try std.testing.expectError(error.EgressReservedAddressDenied, fetchViaExchange(
-        std.testing.allocator,
-        &pool,
-        &dns_cache,
-        url,
-        "GET",
-        "",
-        &.{},
-        .{
-            .network = origin.policy(),
-            .max_response_body_bytes = 64,
-        },
-        .{},
-        body_pipe,
-        &context,
+        &client,
+        .{ .url = url },
+        .{ .network = origin.policy(), .max_response_body_bytes = 64 },
+        &response,
     ));
-    try std.testing.expect(!context.published);
+    try std.testing.expect(!response.published);
     try std.testing.expectEqual(@as(usize, 1), origin.accepted.load(.acquire));
 }
 
 test "egress http1 redirect to a port the policy does not name fails with EgressPortDenied and connects nowhere" {
-    var origin = try LocalHttp1Origin.start(std.testing.allocator);
-    defer origin.stop(std.testing.allocator);
+    const origin = try LocalHttp1Origin.start(gpa);
+    defer origin.stop(gpa);
     // Serves on the same address as `origin`, on a port its policy omits.
-    var unnamed = try LocalHttp1Origin.start(std.testing.allocator);
-    defer unnamed.stop(std.testing.allocator);
+    const unnamed = try LocalHttp1Origin.start(gpa);
+    defer unnamed.stop(gpa);
+    var client: Client = undefined;
+    try client.init(gpa);
+    defer client.deinit();
 
-    const url = try std.fmt.allocPrint(
-        std.testing.allocator,
-        "http://{s}:{d}/redirect-port/{d}",
-        .{ origin.host(), origin.port, unnamed.port },
-    );
-    defer std.testing.allocator.free(url);
-
-    var dns_cache = transport.DnsCache.init(std.testing.allocator, .{});
-    defer dns_cache.deinit();
-    var pool = transport.Http1Pool.init(std.testing.allocator);
-    defer pool.deinit();
-    const body_pipe = try test_support.makeBodyPipe(std.testing.allocator, default_body_pipe_capacity);
-    defer test_support.releaseBodyPipe(body_pipe, std.testing.allocator);
-    var context = Http1HeaderContext{ .expected_url = url };
-
+    const url = try std.fmt.allocPrint(gpa, "http://{s}:{d}/redirect-port/{d}", .{ origin.host(), origin.port, unnamed.port });
+    defer gpa.free(url);
+    var response = Response.init(url);
+    defer response.deinit(gpa);
     try std.testing.expectError(error.EgressPortDenied, fetchViaExchange(
-        std.testing.allocator,
-        &pool,
-        &dns_cache,
-        url,
-        "GET",
-        "",
-        &.{},
-        .{
-            .network = origin.policy(),
-            .max_response_body_bytes = 64,
-        },
-        .{},
-        body_pipe,
-        &context,
+        &client,
+        .{ .url = url },
+        .{ .network = origin.policy(), .max_response_body_bytes = 64 },
+        &response,
     ));
-    try std.testing.expect(!context.published);
+    try std.testing.expect(!response.published);
     try std.testing.expectEqual(@as(usize, 1), origin.accepted.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), unnamed.accepted.load(.acquire));
 }
 
-test "egress http1 detached body completion returns connection to the pool" {
-    var origin = try LocalHttp1Origin.start(std.testing.allocator);
-    defer origin.stop(std.testing.allocator);
+// The 302's small body is drained only so its wire stays reusable, and the
+// next hop, to the same origin, leases that wire instead of dialing.
+test "egress http1 drained redirect hop hands its wire to the next hop" {
+    const origin = try LocalHttp1Origin.start(gpa);
+    defer origin.stop(gpa);
+    var client: Client = undefined;
+    try client.init(gpa);
+    defer client.deinit();
 
-    const url = try std.fmt.allocPrint(std.testing.allocator, "http://{s}:{d}/one", .{ origin.host(), origin.port });
-    defer std.testing.allocator.free(url);
-
-    var dns_cache = transport.DnsCache.init(std.testing.allocator, .{});
-    defer dns_cache.deinit();
-    var pool = transport.Http1Pool.init(std.testing.allocator);
-    defer pool.deinit();
-    const config = transport.Config{
-        .network = origin.policy(),
-        .max_response_body_bytes = 64,
-    };
-
-    for (0..2) |_| {
-        const body_pipe = try test_support.makeBodyPipe(std.testing.allocator, 4096);
-        defer test_support.releaseBodyPipe(body_pipe, std.testing.allocator);
-        var context = Http1HeaderContext{ .expected_url = url };
-        const continuation = (try runExchange(
-            std.testing.allocator,
-            &pool,
-            &dns_cache,
-            url,
-            "POST",
-            "payload",
-            &.{},
-            config,
-            .{},
-            body_pipe,
-            &context,
-        )) orelse return error.ExpectedBodyContinuation;
-        var budget = transport.Http1DriveBudget{};
-        switch (try continuation.step(.{}, &budget)) {
-            .done => {},
-            .paused, .yielded => {
-                continuation.failAndDeinit("unexpected pause");
-                return error.UnexpectedBodyPause;
-            },
-        }
-        try std.testing.expect(context.published);
-        // The clean framed completion hands the connection back; the next
-        // round must lease it instead of dialing the origin again.
-        continuation.returnConnectionIfReusable();
-        continuation.deinit();
-    }
-
+    const hop_url = try origin.url(gpa, "/hop");
+    defer gpa.free(hop_url);
+    const final_url = try origin.url(gpa, "/hop-final");
+    defer gpa.free(final_url);
+    // The published head names the last hop.
+    var response = Response.init(final_url);
+    defer response.deinit(gpa);
+    try fetchViaExchange(
+        &client,
+        .{ .url = hop_url },
+        .{ .network = origin.policy(), .max_response_body_bytes = 64 },
+        &response,
+    );
+    try response.expectBody(gpa, "final ok");
     try std.testing.expectEqual(@as(usize, 1), origin.accepted.load(.acquire));
 }
 
-// One step() spends at most one drive budget: a large fast body must yield
-// every ~drive_budget_max_bytes instead of running to EOF in a single
-// drive, and the yielded continuation must resume exactly where it stopped
-// and deliver every byte once. 1 MiB against the 256 KiB byte quantum needs
-// at least three yields.
-test "egress http1 body continuation yields on the drive budget" {
-    var origin = try LocalHttp1Origin.start(std.testing.allocator);
-    defer origin.stop(std.testing.allocator);
+// `/hop` sends its body whatever the method, and the answer to HEAD ends at
+// its head, so that body is surplus: the redirect hop gives up its wire and
+// the next hop dials.
+test "egress http1 redirect answering HEAD with a body does not hand its wire to the next hop" {
+    const origin = try LocalHttp1Origin.start(gpa);
+    defer origin.stop(gpa);
+    var client: Client = undefined;
+    try client.init(gpa);
+    defer client.deinit();
 
-    const url = try std.fmt.allocPrint(std.testing.allocator, "http://{s}:{d}/big", .{ origin.host(), origin.port });
-    defer std.testing.allocator.free(url);
-
-    var dns_cache = transport.DnsCache.init(std.testing.allocator, .{});
-    defer dns_cache.deinit();
-    var pool = transport.Http1Pool.init(std.testing.allocator);
-    defer pool.deinit();
-    const big_len = test_support.big_body_bytes;
-    // Ample credit everywhere: the pump never pauses, so only the drive
-    // budget can stop the transfer mid-body.
-    const config = transport.Config{
-        .network = origin.policy(),
-        .max_response_body_bytes = big_len * 2,
-        .max_encoded_response_bytes = big_len * 2,
-        .max_pending_decoded_body_bytes = big_len * 2,
-    };
-
-    const body_pipe = try test_support.makeBodyPipe(std.testing.allocator, big_len * 2);
-    defer test_support.releaseBodyPipe(body_pipe, std.testing.allocator);
-    var context = Http1HeaderContext{ .expected_url = url };
-    const continuation = (try runExchange(
-        std.testing.allocator,
-        &pool,
-        &dns_cache,
-        url,
-        "GET",
-        "",
-        &.{},
-        config,
-        .{},
-        body_pipe,
-        &context,
-    )) orelse return error.ExpectedBodyContinuation;
-
-    var yields: usize = 0;
-    var steps: usize = 0;
-    while (true) {
-        steps += 1;
-        if (steps > 1_000) {
-            continuation.failAndDeinit("drive budget loop runaway");
-            return error.DriveBudgetLoopRunaway;
-        }
-        // A fresh budget per step, as the owner gives each driveOneH1 call.
-        var budget = transport.Http1DriveBudget{};
-        const outcome = continuation.step(.{}, &budget) catch |err| {
-            continuation.failAndDeinit(@errorName(err));
-            return err;
-        };
-        switch (outcome) {
-            .done => break,
-            .paused => {
-                continuation.failAndDeinit("unexpected pause");
-                return error.UnexpectedBodyPause;
-            },
-            .yielded => yields += 1,
-        }
-    }
-    try std.testing.expect(context.published);
-    try std.testing.expect(yields >= 3);
-    // Nothing consumed the pipe, so the queued decoded bytes are the whole
-    // body: yields dropped and duplicated nothing.
-    try std.testing.expectEqual(big_len, body_pipe.queuedDecodedBytes());
-    continuation.returnConnectionIfReusable();
-    continuation.deinit();
+    const hop_url = try origin.url(gpa, "/hop");
+    defer gpa.free(hop_url);
+    const final_url = try origin.url(gpa, "/hop-final");
+    defer gpa.free(final_url);
+    var response = Response.init(final_url);
+    defer response.deinit(gpa);
+    try fetchViaExchange(
+        &client,
+        .{ .url = hop_url, .method = "HEAD" },
+        .{ .network = origin.policy(), .max_response_body_bytes = 64 },
+        &response,
+    );
+    try response.expectBody(gpa, "");
+    try std.testing.expectEqual(@as(usize, 2), origin.accepted.load(.acquire));
 }
 
-// The owner never blocks inside step(): a dry socket unwinds with
-// error.EgressWouldBlock, and the request parks on the recorded interest and
-// re-enters with a fresh budget (driveOneH1 and parkH1Io in
-// engine/h2_engine.zig). A paced origin forces several such parks; the
-// owner-shaped driver must deliver the whole body across them, and every park
-// on this plain TCP stream records read interest.
-test "egress http1 body continuation re-parks through the would_block probe" {
-    var origin = try LocalHttp1Origin.start(std.testing.allocator);
-    defer origin.stop(std.testing.allocator);
+test "egress http1 body finish returns a clean wire to the pool for the next fetch" {
+    const origin = try LocalHttp1Origin.start(gpa);
+    defer origin.stop(gpa);
+    var client: Client = undefined;
+    try client.init(gpa);
+    defer client.deinit();
 
-    const url = try std.fmt.allocPrint(std.testing.allocator, "http://{s}:{d}/paced", .{ origin.host(), origin.port });
-    defer std.testing.allocator.free(url);
+    const url = try origin.url(gpa, "/one");
+    defer gpa.free(url);
+    const config: transport.Config = .{ .network = origin.policy(), .max_response_body_bytes = 64 };
 
-    var dns_cache = transport.DnsCache.init(std.testing.allocator, .{});
-    defer dns_cache.deinit();
-    var pool = transport.Http1Pool.init(std.testing.allocator);
-    defer pool.deinit();
+    for (0..2) |_| {
+        var response = Response.init(url);
+        defer response.deinit(gpa);
+        const continuation = (try runExchange(
+            &client,
+            .{ .url = url, .method = "POST", .body = "payload" },
+            config,
+            &response,
+        )) orelse return error.ExpectedBodyContinuation;
+        try driveContinuationToEnd(&client, continuation, &response, config.socket_timeout_ms, null);
+        try std.testing.expect(response.published);
+        try response.expectBody(gpa, "one ok");
+        try std.testing.expectEqual(@as(usize, 1), client.pool.idleEntries().len);
+    }
+    try std.testing.expectEqual(@as(usize, 1), origin.accepted.load(.acquire));
+}
+
+// A step consumes only what the wire holds. The paced origin writes chunk N
+// only after the client recorded its Nth wait, so every gap between chunks
+// is a step that found the wire empty, returned `.wait = .read`, and went
+// on after the receive the harness serviced.
+test "egress http1 body step waits for a read on an empty wire and resumes after the receive" {
+    const origin = try LocalHttp1Origin.start(gpa);
+    defer origin.stop(gpa);
+    var client: Client = undefined;
+    try client.init(gpa);
+    defer client.deinit();
+
+    const url = try origin.url(gpa, "/paced");
+    defer gpa.free(url);
     const body_len = test_support.paced_body_bytes;
-    const config = transport.Config{
+    // Ample credit: nothing pauses the body, so only an empty wire stops a step.
+    const config: transport.Config = .{
         .network = origin.policy(),
         .max_response_body_bytes = body_len * 2,
         .max_encoded_response_bytes = body_len * 2,
@@ -890,327 +704,158 @@ test "egress http1 body continuation re-parks through the would_block probe" {
         .socket_timeout_ms = 2_000,
     };
 
-    const body_pipe = try test_support.makeBodyPipe(std.testing.allocator, body_len * 2);
-    defer test_support.releaseBodyPipe(body_pipe, std.testing.allocator);
-    var context = Http1HeaderContext{ .expected_url = url };
-    const continuation = (try runExchange(
-        std.testing.allocator,
-        &pool,
-        &dns_cache,
-        url,
-        "GET",
-        "",
-        &.{},
-        config,
-        .{},
-        body_pipe,
-        &context,
-    )) orelse return error.ExpectedBodyContinuation;
+    var response = Response.init(url);
+    defer response.deinit(gpa);
+    const continuation = (try runExchange(&client, .{ .url = url }, config, &response)) orelse
+        return error.ExpectedBodyContinuation;
+    var wait_log: WaitLog = .{ .signal = &origin.gate };
+    try driveContinuationToEnd(&client, continuation, &response, config.socket_timeout_ms, &wait_log);
 
-    // The origin releases chunk N only after the client recorded its Nth park
-    // (park_signal feeds the origin's gate), so every gap between chunks is a
-    // would-block unwind under any scheduler load.
-    var park_log = test_support.OwnerShapedParkLog{ .park_signal = &origin.paced_gate };
-    try test_support.driveContinuationOwnerShaped(continuation, config.socket_timeout_ms, &park_log);
-
-    try std.testing.expect(context.published);
-    try std.testing.expectEqual(fetch_body.State.complete, body_pipe.state);
-    try std.testing.expectEqual(body_len, body_pipe.queuedDecodedBytes());
-    // Chunk N waited for park N, so a complete body proves at least
-    // chunk_count - 1 real would-block unwinds, a path the blocking driver
-    // never takes.
-    try std.testing.expect(park_log.parks >= test_support.paced_chunk_count - 1);
-    for (park_log.recorded()) |interest|
+    try std.testing.expect(response.published);
+    try response.expectBody(gpa, &([_]u8{'p'} ** test_support.paced_body_bytes));
+    // Chunk N waited for wait N, so a complete body proves at least
+    // `paced_chunk_count - 1` waits.
+    try std.testing.expect(wait_log.waits >= test_support.paced_chunk_count - 1);
+    for (wait_log.recorded()) |interest|
         try std.testing.expectEqual(transport.IoInterest.read, interest);
 }
 
-// An origin that goes silent mid-body must fail the fetch through the
-// would-block path, with the park's recorded stage error after one stall
-// window (parkH1Io's per-park deadline), and the bytes that arrived before
-// the silence must stay delivered.
-test "egress http1 owner-shaped stall window expires a silent mid-body origin" {
-    var origin = try LocalHttp1Origin.start(std.testing.allocator);
-    defer origin.stop(std.testing.allocator);
+// The origin sends part of its body and goes silent without closing. The
+// body fails after one stall window with the stage error the engine
+// reports, and the bytes that arrived before the silence reached the queue
+// first.
+test "egress http1 silent mid-body origin fails the body with FetchReadTimeout" {
+    const origin = try LocalHttp1Origin.start(gpa);
+    defer origin.stop(gpa);
+    var client: Client = undefined;
+    try client.init(gpa);
+    defer client.deinit();
 
-    const url = try std.fmt.allocPrint(std.testing.allocator, "http://{s}:{d}/stall-mid", .{ origin.host(), origin.port });
-    defer std.testing.allocator.free(url);
-
-    var dns_cache = transport.DnsCache.init(std.testing.allocator, .{});
-    defer dns_cache.deinit();
-    var pool = transport.Http1Pool.init(std.testing.allocator);
-    defer pool.deinit();
-    const config = transport.Config{
+    const url = try origin.url(gpa, "/stall-mid");
+    defer gpa.free(url);
+    const config: transport.Config = .{
         .network = origin.policy(),
         .max_response_body_bytes = 1024,
         .socket_timeout_ms = 150,
     };
 
-    const body_pipe = try test_support.makeBodyPipe(std.testing.allocator, default_body_pipe_capacity);
-    defer test_support.releaseBodyPipe(body_pipe, std.testing.allocator);
-    var context = Http1HeaderContext{ .expected_url = url };
-    const continuation = (try runExchange(
-        std.testing.allocator,
-        &pool,
-        &dns_cache,
-        url,
-        "GET",
-        "",
-        &.{},
-        config,
-        .{},
-        body_pipe,
-        &context,
-    )) orelse return error.ExpectedBodyContinuation;
-
-    var park_log = test_support.OwnerShapedParkLog{};
+    var response = Response.init(url);
+    defer response.deinit(gpa);
+    const continuation = (try runExchange(&client, .{ .url = url }, config, &response)) orelse
+        return error.ExpectedBodyContinuation;
+    var wait_log: WaitLog = .{};
     try std.testing.expectError(
         error.FetchReadTimeout,
-        test_support.driveContinuationOwnerShaped(continuation, config.socket_timeout_ms, &park_log),
+        driveContinuationToEnd(&client, continuation, &response, config.socket_timeout_ms, &wait_log),
     );
-    try std.testing.expect(body_pipe.isFailed());
-    // The partial prefix (32 of 128 content-length bytes) was delivered
-    // before the stall; the expiry must not drop it.
-    try std.testing.expectEqual(@as(usize, 32), body_pipe.queuedDecodedBytes());
-    try std.testing.expect(park_log.parks >= 1);
-    const parked = park_log.recorded();
-    try std.testing.expectEqual(transport.IoInterest.read, parked[parked.len - 1]);
+
+    try std.testing.expectEqualStrings("FetchReadTimeout", response.queue.failureMessage().?);
+    try std.testing.expectEqual(test_support.stall_mid_prefix_bytes, response.queue.queuedBytes());
+    const waited = wait_log.recorded();
+    try std.testing.expect(waited.len >= 1);
+    try std.testing.expectEqual(transport.IoInterest.read, waited[waited.len - 1]);
 }
 
-// On TLS a body read can need write readiness first (tlsBioDirectReadStep
-// returns `.wait = .write` while ciphertext is queued behind a full socket
-// send buffer), so each re-park may ask for either direction and must record
-// its own interest; an owner that re-armed a stale interest would poll the
-// wrong direction until the stall deadline. The setup is a hand-built
-// close-delimited continuation over an unhandshaken tls_bio_direct
-// socketpair whose send buffer the test fills first. The first park asks for
-// write (handshake ciphertext queued, buffer full); the peer drains, the
-// re-entry sends, and the next park asks for read, whose stall window the
-// silent peer then lets expire.
-test "egress http1 would_block park records TLS mask changes per re-park" {
-    var fds: [2]i32 = undefined;
-    const rc = std.c.socketpair(
-        std.posix.AF.UNIX,
-        std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC | std.posix.SOCK.NONBLOCK,
-        0,
-        &fds,
-    );
-    switch (std.posix.errno(rc)) {
-        .SUCCESS => {},
-        else => |err| return std.posix.unexpectedErrno(err),
-    }
-    defer std.posix.close(fds[1]);
-
-    const bio = transport.TlsBioTransport.createUnhandshaken(
-        std.testing.allocator,
-        .{ .handle = fds[0] },
-        "example.com",
-        true,
-        .http_1_1,
-        transport.default_tls_ciphertext_buffer_bytes,
-        null,
-    ) catch |err| {
-        std.posix.close(fds[0]);
-        return err;
-    };
-    var bio_owned = true;
-    errdefer if (bio_owned) bio.deinit();
-
-    // Shrink and then fill the send buffer, so the handshake ciphertext the
-    // first read queues cannot leave the process and the read must park on
-    // write readiness.
-    try std.posix.setsockopt(fds[0], std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, &std.mem.toBytes(@as(c_int, 4096)));
-    const junk = [_]u8{'j'} ** 4096;
-    var filled: usize = 0;
-    while (filled < 64 * 1024 * 1024) {
-        const written = std.posix.write(fds[0], &junk) catch |err| switch (err) {
-            error.WouldBlock => break,
-            else => return err,
-        };
-        filled += written;
-    } else return error.SendBufferNeverFilled;
-
-    var pool = transport.Http1Pool.init(std.testing.allocator);
-    defer pool.deinit();
-    const config = transport.Config{
-        .network = network_policy.public_https,
-        .insecure_tls = true,
-        .max_response_body_bytes = 4096,
-        .socket_timeout_ms = 300,
-    };
-    const body_pipe = try test_support.makeBodyPipe(std.testing.allocator, 4096);
-    defer test_support.releaseBodyPipe(body_pipe, std.testing.allocator);
-
-    const reason = try std.testing.allocator.dupe(u8, "OK");
-    var reason_owned = true;
-    errdefer if (reason_owned) std.testing.allocator.free(reason);
-    const head_headers = try std.testing.allocator.alloc(transport.Header, 0);
-    var headers_owned = true;
-    errdefer if (headers_owned) std.testing.allocator.free(head_headers);
-    const response = transport.Http1OwnedResponseHead{
-        .allocator = std.testing.allocator,
-        .wire = .empty,
-        .head = .{
-            .allocator = std.testing.allocator,
-            .minor_version = 1,
-            .status_code = 200,
-            .reason = reason,
-            .consumed_len = 0,
-            .headers = head_headers,
-            .body_framing = .close_delimited,
-            .transfer_coding = .none,
-            .content_length = 0,
-            .post_head_bytes = &.{},
-            .initial_body_bytes = &.{},
-            .close_after_response = true,
-        },
-    };
-
-    const continuation = try transport.Http1BodyContinuation.init(
-        std.testing.allocator,
-        &pool,
-        .{ .tls_bio_direct = bio },
-        response,
-        .{},
-        0,
-        1,
-        false,
-        .identity,
-        config.http1StreamPumpLimits(),
-        config,
-        body_pipe,
-        null,
-        test_support.noopBodyReady,
-        .generic,
-        null,
-    );
-    bio_owned = false;
-    reason_owned = false;
-    headers_owned = false;
-
-    // Releases the write park. The drain thread touches the socket only after
-    // the client's first park is recorded (the filled send buffer makes that
-    // park ask for write), then keeps the peer drained without ever writing,
-    // so every later read park expires on its stall window.
-    var park_signal = std.atomic.Value(usize).init(0);
-    var drain_state = DrainPeerState{ .fd = fds[1], .parked = &park_signal };
-    const drain_thread = try std.Thread.spawn(.{}, drainPeerAfterPark, .{&drain_state});
-    defer {
-        drain_state.stop.store(true, .release);
-        drain_thread.join();
-    }
-
-    var park_log = test_support.OwnerShapedParkLog{ .park_signal = &park_signal };
-    try std.testing.expectError(
-        error.FetchReadTimeout,
-        test_support.driveContinuationOwnerShaped(continuation, config.socket_timeout_ms, &park_log),
-    );
-
-    const parked = park_log.recorded();
-    try std.testing.expect(parked.len >= 2);
-    // The interest changed across re-parks of the same read: write first,
-    // with ciphertext stuck behind the full buffer and nothing drained before
-    // that park was recorded, then read once the peer drained it.
-    try std.testing.expectEqual(transport.IoInterest.write, parked[0]);
-    try std.testing.expectEqual(transport.IoInterest.read, parked[parked.len - 1]);
-    try std.testing.expect(body_pipe.isFailed());
+// Bytes after a response's framing would be read as the next response's
+// head, so the wire that carried them never returns to the pool, and the
+// response itself completes whichever receive carried them. `/surplus` sends
+// its head, then, once the gate opens after the head was parsed, its
+// Content-Length body and a stray head in one write, so the stray head stays
+// unread in the wire.
+test "egress http1 response with bytes past its framing in a later receive does not pool its wire" {
+    try expectSurplusDropsWire("/surplus", true, 200, test_support.surplus_body);
 }
 
-const DrainPeerState = struct {
-    fd: std.posix.fd_t,
-    parked: *std.atomic.Value(usize),
-    stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-};
-
-/// Waits for the client's first recorded park (the write park the filled
-/// buffer forces), then drains the peer side without ever writing until the
-/// test stops it. Both ends wait on conditions, so no sleep decides whether
-/// the drain raced the park.
-fn drainPeerAfterPark(state: *DrainPeerState) void {
-    while (state.parked.load(.acquire) == 0) {
-        if (state.stop.load(.acquire))
-            return;
-        std.Thread.sleep(1 * std.time.ns_per_ms);
-    }
-    var sink: [4096]u8 = undefined;
-    while (!state.stop.load(.acquire)) {
-        const got = std.posix.read(state.fd, &sink) catch |err| switch (err) {
-            error.WouldBlock => {
-                std.Thread.sleep(1 * std.time.ns_per_ms);
-                continue;
-            },
-            else => return,
-        };
-        if (got == 0)
-            return;
-    }
+// `/surplus-inline` writes head, body and stray head at once, so the stray
+// head arrives in the receive that carried the head.
+test "egress http1 response with bytes past its framing in the head's receive completes and does not pool its wire" {
+    try expectSurplusDropsWire("/surplus-inline", false, 200, test_support.surplus_body);
 }
 
-test "egress http1 redirect chain sums billed bytes across hops" {
-    var origin = try LocalHttp1Origin.start(std.testing.allocator);
-    defer origin.stop(std.testing.allocator);
+// A response without a body ends at its head, so any byte after the head is
+// surplus.
+test "egress http1 bodiless response followed by bytes does not pool its wire" {
+    try expectSurplusDropsWire("/no-content-surplus", false, 204, "");
+}
 
-    const url_hop = try std.fmt.allocPrint(std.testing.allocator, "http://{s}:{d}/hop", .{ origin.host(), origin.port });
-    defer std.testing.allocator.free(url_hop);
-    const url_final = try std.fmt.allocPrint(std.testing.allocator, "http://{s}:{d}/hop-final", .{ origin.host(), origin.port });
-    defer std.testing.allocator.free(url_final);
+fn expectSurplusDropsWire(path: []const u8, open_gate: bool, status: u16, expected_body: []const u8) !void {
+    const origin = try LocalHttp1Origin.start(gpa);
+    defer origin.stop(gpa);
+    var client: Client = undefined;
+    try client.init(gpa);
+    defer client.deinit();
 
-    var dns_cache = transport.DnsCache.init(std.testing.allocator, .{});
-    defer dns_cache.deinit();
-    var pool = transport.Http1Pool.init(std.testing.allocator);
-    defer pool.deinit();
-    const config = transport.Config{
-        .network = origin.policy(),
-        .max_response_body_bytes = 64,
-    };
+    const surplus_url = try origin.url(gpa, path);
+    defer gpa.free(surplus_url);
+    const one_url = try origin.url(gpa, "/one");
+    defer gpa.free(one_url);
+    const config: transport.Config = .{ .network = origin.policy(), .max_response_body_bytes = 64 };
 
-    // Baseline: the final hop alone.
-    const direct_body = try test_support.makeBodyPipe(std.testing.allocator, default_body_pipe_capacity);
-    defer test_support.releaseBodyPipe(direct_body, std.testing.allocator);
-    var direct_context = Http1HeaderContext{ .expected_url = url_final };
-    try fetchViaExchange(
-        std.testing.allocator,
-        &pool,
-        &dns_cache,
-        url_final,
-        "GET",
-        "",
-        &.{},
-        config,
-        .{},
-        direct_body,
-        &direct_context,
-    );
-    try expectBodyBytes(direct_body, "final ok");
-    const direct_billed = test_support.bodyBilledTotal(direct_body);
-    try std.testing.expect(direct_billed > 0);
+    var first = Response.init(surplus_url);
+    first.expected_status = status;
+    defer first.deinit(gpa);
+    const continuation = (try runExchange(&client, .{ .url = surplus_url }, config, &first)) orelse
+        return error.ExpectedBodyContinuation;
+    if (open_gate)
+        origin.gate.store(1, .release);
+    try driveContinuationToEnd(&client, continuation, &first, config.socket_timeout_ms, null);
+    try first.expectBody(gpa, expected_body);
+    try std.testing.expectEqual(@as(usize, 0), client.pool.idleEntries().len);
 
-    // The chain is a 302 with a drained 5-byte body, then the final
-    // response. Billing sums every hop, so the chain total must exceed the
-    // direct fetch by at least the 302 hop's request head and response.
-    const chain_body = try test_support.makeBodyPipe(std.testing.allocator, default_body_pipe_capacity);
-    defer test_support.releaseBodyPipe(chain_body, std.testing.allocator);
-    // The published head carries the final hop's URL.
-    var chain_context = Http1HeaderContext{ .expected_url = url_final };
-    try fetchViaExchange(
-        std.testing.allocator,
-        &pool,
-        &dns_cache,
-        url_hop,
-        "GET",
-        "",
-        &.{},
-        config,
-        .{},
-        chain_body,
-        &chain_context,
-    );
-    try expectBodyBytes(chain_body, "final ok");
-    try std.testing.expect(test_support.bodyBilledTotal(chain_body) > direct_billed);
-    // Plain TCP observes no ciphertext, so cost stays 0.
-    try std.testing.expectEqual(@as(u64, 0), test_support.bodyCost(chain_body));
-    // The drained 302 connection must serve the final hop too: one accept
-    // for the direct baseline and one for the whole chain. Abandoning the
-    // drained connection and redialing would pass the body and billing
-    // checks above but show a third accept here.
+    // A reused wire would answer this request with the stray head.
+    var second = Response.init(one_url);
+    defer second.deinit(gpa);
+    try fetchViaExchange(&client, .{ .url = one_url, .method = "POST", .body = "payload" }, config, &second);
+    try second.expectBody(gpa, "one ok");
     try std.testing.expectEqual(@as(usize, 2), origin.accepted.load(.acquire));
+}
+
+// The two policies name the same address and port and differ only in
+// allowHttp. The refused fetch runs first, so the accept count shows it
+// opened no connection.
+test "egress http1 plain HTTP fetch runs under allowHttp and is refused before any connection without it" {
+    const origin = try LocalHttp1Origin.start(gpa);
+    defer origin.stop(gpa);
+    var client: Client = undefined;
+    try client.init(gpa);
+    defer client.deinit();
+
+    const url = try origin.url(gpa, "/one");
+    defer gpa.free(url);
+    const network = transport.network;
+    const address = try std.net.Address.parseIp4(origin.host(), 0);
+    const rules = [_]network.Pattern{.{ .host = .{ .ipv4 = network.address.ipv4Bytes(address) }, .port = origin.port }};
+    const https_only_grant: network.Grant = .{
+        .allow_http = false,
+        .allow_private_networks = true,
+        .any = false,
+        .names = &.{},
+        .suffixes = &.{},
+        .ipv4 = &rules,
+        .ipv6 = &.{},
+    };
+    const https_only_grants = [_]*const network.Grant{&https_only_grant};
+    const https_only: network.Policy = .{ .grants = &https_only_grants };
+
+    var refused = Response.init(url);
+    defer refused.deinit(gpa);
+    try std.testing.expectError(error.EgressSchemeDenied, fetchViaExchange(
+        &client,
+        .{ .url = url, .method = "POST", .body = "payload" },
+        .{ .network = https_only, .max_response_body_bytes = 64 },
+        &refused,
+    ));
+    try std.testing.expect(!refused.published);
+    try std.testing.expectEqual(@as(usize, 0), origin.accepted.load(.acquire));
+
+    var allowed = Response.init(url);
+    defer allowed.deinit(gpa);
+    try fetchViaExchange(
+        &client,
+        .{ .url = url, .method = "POST", .body = "payload" },
+        .{ .network = origin.policy(), .max_response_body_bytes = 64 },
+        &allowed,
+    );
+    try allowed.expectBody(gpa, "one ok");
+    try std.testing.expectEqual(@as(usize, 1), origin.accepted.load(.acquire));
 }

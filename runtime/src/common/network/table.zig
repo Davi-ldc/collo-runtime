@@ -13,10 +13,7 @@
 //! previous grant's, in canonical order (`Pattern.order`), and each name or
 //! suffix rule owns the next `name_len` name bytes after the previous one's.
 //! Each policy owns the next `member_count` members after the previous
-//! policy's, in increasing grant order. The header's digest is the SHA-256
-//! of every byte after it, so a byte changed anywhere past the magic fails
-//! the image, and the gateway can fold the digest into its pool isolation
-//! ids.
+//! policy's, in increasing grant order.
 //!
 //! A valid image holds what `Builder` writes and nothing else. Every count
 //! is within its bound, and together the counts give the image's exact
@@ -45,7 +42,6 @@ const setting_mod = @import("setting.zig");
 
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
-const Sha256 = std.crypto.hash.sha2.Sha256;
 const Grant = grant_mod.Grant;
 const Pattern = pattern.Pattern;
 const Policy = grant_mod.Policy;
@@ -112,8 +108,6 @@ pub const magic = [4]u8{ 'C', 'N', 'P', '1' };
 
 pub const Header = extern struct {
     magic: [4]u8,
-    /// SHA-256 of every byte after this field.
-    digest: [Sha256.digest_length]u8,
     grant_count: u32,
     rule_count: u32,
     policy_count: u32,
@@ -143,14 +137,10 @@ pub const PolicyRecord = extern struct {
     member_count: u16,
 };
 
-/// The digest covers the image from this offset to its end.
-pub const digest_end: usize = @offsetOf(Header, "digest") + Sha256.digest_length;
-
 comptime {
-    assert(@sizeOf(Header) == 56);
-    assert(@offsetOf(Header, "digest") == 4);
-    assert(@offsetOf(Header, "grant_count") == digest_end);
-    assert(@offsetOf(Header, "name_bytes") == 52);
+    assert(@sizeOf(Header) == 24);
+    assert(@offsetOf(Header, "grant_count") == 4);
+    assert(@offsetOf(Header, "name_bytes") == 20);
     assert(@sizeOf(GrantRecord) == 4);
     assert(@offsetOf(GrantRecord, "allow_private_networks") == 3);
     assert(@sizeOf(RuleRecord) == 20);
@@ -164,8 +154,6 @@ pub const Problem = enum {
     /// Shorter than a header.
     truncated,
     magic,
-    /// The digest does not match the bytes after it.
-    digest,
     grant_count,
     rule_count,
     /// Zero, since policy 0 is always present, or past `policies_max`.
@@ -217,11 +205,6 @@ pub fn check(image: []const u8) ?Problem {
     const header = readHeader(image);
     if (!std.mem.eql(u8, &header.magic, &magic))
         return .magic;
-    var digest: [Sha256.digest_length]u8 = undefined;
-    Sha256.hash(image[digest_end..], &digest, .{});
-    if (!std.mem.eql(u8, &digest, &header.digest))
-        return .digest;
-
     if (header.grant_count > grants_max)
         return .grant_count;
     if (header.rule_count > rules_max)
@@ -239,13 +222,6 @@ pub fn check(image: []const u8) ?Problem {
     if (checkGrants(image, layout)) |problem|
         return problem;
     return checkPolicies(image, layout);
-}
-
-/// Writes the digest of an image whose other bytes are final.
-pub fn seal(image: []u8) void {
-    assert(image.len >= @sizeOf(Header));
-    const digest = image[@offsetOf(Header, "digest")..][0..Sha256.digest_length];
-    Sha256.hash(image[digest_end..], digest, .{});
 }
 
 pub fn readHeader(image: []const u8) Header {
@@ -351,8 +327,6 @@ pub const Table = struct {
     rules: []Pattern,
     members: []*const Grant,
     names: []u8,
-    /// The image's digest, which tells this table apart from any other.
-    digest: [Sha256.digest_length]u8,
 
     pub const DecodeError = Allocator.Error || error{InvalidPolicyImage};
 
@@ -408,7 +382,6 @@ pub const Table = struct {
             .rules = rules,
             .members = members,
             .names = names,
-            .digest = header.digest,
         };
     }
 
@@ -606,12 +579,11 @@ pub const Builder = struct {
         return @intCast(builder.policies.items.len);
     }
 
-    /// The image of everything added so far, sealed, allocated with `gpa`;
-    /// the caller frees it.
+    /// The image of everything added so far, allocated with `gpa`; the
+    /// caller frees it.
     pub fn encode(builder: *const Builder, gpa: Allocator) Allocator.Error![]u8 {
         const header: Header = .{
             .magic = magic,
-            .digest = @splat(0),
             .grant_count = @intCast(builder.grants.items.len),
             .rule_count = @intCast(builder.rule_count),
             .policy_count = @intCast(builder.policies.items.len + 1),
@@ -652,7 +624,6 @@ pub const Builder = struct {
         }
         assert(member_index == layout.member_count);
 
-        seal(image);
         assert(check(image) == null);
         return image;
     }
