@@ -1,8 +1,6 @@
 # Collo
 
-Collo is a blazingly fast JavaScript running for serverless envirments. Workers start in ~10ms using ~2 MiB* while keeping a strong process isolation boundary and flexibility. 
-
-* Benchmarked on ampere A1
+Collo is fast and flexible JavaScript runtime for isolating workers in serverless envirments. 
 
 ## Getting started
 
@@ -70,14 +68,12 @@ collo serve app.js
 
 # Why 
 
-JavaScript is eating the world. With [sound types, aot compilation](https://github.com/oven-sh/WebKit/pull/757), [multithreading](https://github.com/oven-sh/WebKit/pull/249), and [jitcache](https://github.com/Davi-ldc/jitcache) JS will soon be faster them go and probabily > 50% of all agent writen code. 
+With [sound types, aot compilation](https://github.com/oven-sh/WebKit/pull/757), [multithreading](https://github.com/oven-sh/WebKit/pull/249), and [jitcache](https://github.com/Davi-ldc/jitcache) JS will soon be faster them go and > 50% of all agent writen code. 
 
 One of the coolest part about it is that, because you control the runtime, [JS is (technically) extremely cheap to run](https://developers.cloudflare.com/workers/platform/pricing/). Sadly, current options today are either generic heavy systems (like gVisor or Firecracker) that use a lot of memory (aka dollars) and take a long time to start, or Cloudflare Workers, that are cheap and start fast but are incredibly limited and algorithmically slow. Also, because of the current architecture on top of v8, workers wont support AOT, jitcache or multithreading.
 
-Collo solves that. Its a serverless runtime build to isolate untrustable JavaScript code btween process keeping memory usage at ~x per worker with build in limits, analytics and configuration.
+Collo solves that. 
 
 ## How it works
 
-![How Collo works: a zygote forks workers that share its memory pages, and workers reach the network only through the egress gateway](assets/collo.gif)
-
-The core idea is to isolate workers between processes that come from a Linux fork and let them share as much memory as possible (JSC allocations favor this). Compared to workerd, (where I/O becomes a KJ promise and then its wrapped into a JS promise) 
+The core idea is to isolate workers between processes that come from a Linux fork and let them share as much memory as possible (JSC allocations favor this). 
