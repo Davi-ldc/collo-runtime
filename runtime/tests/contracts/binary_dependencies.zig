@@ -1,6 +1,6 @@
 //! The installed `collo`'s dynamic dependencies: its `DT_NEEDED` entries are
-//! exactly the platform's libraries (libc, libm, libstdc++, libgcc_s and the
-//! dynamic loader), it names no library search path, and the functions of
+//! exactly the platform's libraries (libc, libm, libstdc++, libgcc_s, and on
+//! x86_64 the dynamic loader), it names no library search path, and the functions of
 //! the dynamic loader it imports are exactly `loader_imports`. Every other
 //! library it runs, ICU, BoringSSL and the codecs among them, is linked in
 //! from a pinned build (`skills/runtime/references/internals/build.md`,
@@ -24,12 +24,15 @@ const platform_libraries = [_][]const u8{
     "libm.so.6",
     "libstdc++.so.6",
     "libgcc_s.so.1",
-    dynamic_loader,
-};
+} ++ loader_library;
 
-const dynamic_loader = switch (builtin.cpu.arch) {
-    .x86_64 => "ld-linux-x86-64.so.2",
-    .aarch64 => "ld-linux-aarch64.so.1",
+/// x86_64 code compiled as position-independent reaches thread-local storage
+/// through `__tls_get_addr`, which the dynamic loader exports, so the loader
+/// is a needed library there. aarch64 uses TLS descriptors, which the loader
+/// resolves without an imported symbol, so its binary needs no loader entry.
+const loader_library = switch (builtin.cpu.arch) {
+    .x86_64 => [_][]const u8{"ld-linux-x86-64.so.2"},
+    .aarch64 => [_][]const u8{},
     else => @compileError("Collo targets x86_64 and aarch64 Linux only"),
 };
 

@@ -128,6 +128,11 @@ pub fn releaseInternal(
     const allocator = runtime.core.allocator;
     const preserve_waiter = preserve_open_source and body.hasPendingWaiter();
     const source_identity = body.sourceIdentity();
+    // `identity` may be the identity stored in `body` itself
+    // (`releaseAllForShutdown`), and Zig may pass a struct parameter by
+    // reference, so nothing is read from it once `removeFromTable` frees the
+    // body: what is needed afterwards is copied here.
+    const body_id = identity.body_id;
     if (preserve_waiter) {
         body.markViewReleasedPreservingWaiters();
     } else {
@@ -145,7 +150,7 @@ pub fn releaseInternal(
         return true;
     }
     removeFromTable(runtime, body);
-    if (source_identity.body_id != identity.body_id)
+    if (source_identity.body_id != body_id)
         removeReleasedSourceIfIdle(runtime, source_identity);
     return true;
 }
