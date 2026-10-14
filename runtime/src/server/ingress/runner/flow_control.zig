@@ -22,6 +22,9 @@
 //!   is owed none of its own.
 //! - No window grows past `h2.max_window_size`; an update that would is
 //!   `error.Http2FlowControlError`.
+//! - Each DATA frame the server sends earns the client two WINDOW_UPDATE
+//!   frames outside the per-read frame budget, the most a client that
+//!   returns every frame's credit sends for it (`h2_earned_window_updates`).
 
 const std = @import("std");
 
@@ -241,14 +244,34 @@ pub fn h2AvailableOutboundWindow(self: *Slot, stream_id: u32, byte_len: usize) !
     return @min(byte_len, @min(connection_available, stream_available));
 }
 
-pub fn h2ConsumeOutboundWindow(self: *Slot, stream_id: u32, byte_len: usize) !void {
+/// Charges the send windows for `frame_count` DATA frames that carry
+/// `byte_len` bytes on `stream_id`, and earns the client two WINDOW_UPDATE
+/// frames for each of them (`h2SpendEarnedWindowUpdate`).
+pub fn h2ConsumeOutboundWindow(self: *Slot, stream_id: u32, byte_len: usize, frame_count: usize) !void {
     if (byte_len == 0)
         return;
+    std.debug.assert(frame_count != 0 and frame_count <= byte_len);
     const entry = stream_table.h2StreamEntry(self, stream_id) orelse return error.Http2UnknownStream;
     if (self.h2_connection_send_window < byte_len or entry.send_window < byte_len)
         return error.Http2FlowControlError;
     self.h2_connection_send_window -= @intCast(byte_len);
     entry.send_window -= @intCast(byte_len);
+    self.h2_earned_window_updates +|= std.math.lossyCast(u32, frame_count *| 2);
+}
+
+/// Spends one of the WINDOW_UPDATE frames the server's DATA frames earned,
+/// and returns whether one was left. A client may return the credit of
+/// every DATA frame it reads, to the connection and to the stream, and a
+/// lane that reads late finds all of those updates in one read, however
+/// small the frames were; they answer frames the server sent, so only the
+/// updates past them count against the per-read frame budget
+/// (`reading.zig:frameDisposition`). A flood of updates thus costs the lane
+/// at most two frames for each DATA frame it sent before the budget applies.
+pub fn h2SpendEarnedWindowUpdate(self: *Slot) bool {
+    if (self.h2_earned_window_updates == 0)
+        return false;
+    self.h2_earned_window_updates -= 1;
+    return true;
 }
 
 pub fn h2ConsumeInboundWindow(self: *Slot, stream_id: u32, byte_len: usize) !void {

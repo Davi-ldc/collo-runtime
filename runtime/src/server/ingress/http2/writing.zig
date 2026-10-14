@@ -704,7 +704,7 @@ fn queueResponseDataAvailableWindow(
     if (!runtime.h2WritesPending()) {
         const direct = try writeDataFramesDirectNoWindowAccounting(Worker, worker, runtime, stream_id, payload[0..send_len], final, chunk);
         if (direct.committed_payload_len != 0) {
-            try runtime.h2ConsumeOutboundWindow(stream_id, direct.committed_payload_len);
+            try runtime.h2ConsumeOutboundWindow(stream_id, direct.committed_payload_len, direct.committed_frames);
             if (final and direct.committed_payload_len == send_len)
                 runtime.h2NoteResponseEndQueued(stream_id);
             return direct.committed_payload_len;
@@ -719,18 +719,22 @@ fn queueResponseDataAvailableWindow(
         var header: [h2.frame_header_len]u8 = undefined;
         try encodeFrameHeader(&header, frame_len, .data, if (frame_final) 0x1 else 0, stream_id);
         try queueChunkFrameTail(Worker, worker, runtime, &header, @constCast(payload[0..frame_len]), 0, worker_chunk);
-        try runtime.h2ConsumeOutboundWindow(stream_id, frame_len);
+        try runtime.h2ConsumeOutboundWindow(stream_id, frame_len, 1);
         if (frame_final)
             runtime.h2NoteResponseEndQueued(stream_id);
         return frame_len;
     }
     _ = try queueDataFramesNoWindowAccounting(Worker, worker, runtime, stream_id, payload[0..send_len], final);
-    try runtime.h2ConsumeOutboundWindow(stream_id, send_len);
+    // `h2.encodeDataFrames` cut the bytes into frames of the peer's largest size.
+    const frame_count = std.math.divCeil(usize, send_len, runtime.h2_peer_settings.max_frame_size) catch unreachable;
+    try runtime.h2ConsumeOutboundWindow(stream_id, send_len, frame_count);
     return send_len;
 }
 
 const DirectDataWriteResult = struct {
     committed_payload_len: usize = 0,
+    /// The DATA frames that carry `committed_payload_len`.
+    committed_frames: usize = 0,
     did_work: bool = false,
 };
 
@@ -786,10 +790,12 @@ fn writeDataFramesDirectNoWindowAccounting(
                 _ = try queueOwnedWrite(Worker, worker, runtime, remaining_wire);
             }
             result.committed_payload_len += frame_payload.len;
+            result.committed_frames += 1;
             return result;
         }
 
         result.committed_payload_len += frame_payload.len;
+        result.committed_frames += 1;
         offset += frame_payload.len;
     }
 

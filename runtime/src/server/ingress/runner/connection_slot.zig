@@ -137,6 +137,12 @@ pub const Slot = struct {
     h2_connection_send_window: i64 = h2.default_initial_window_size,
     h2_connection_recv_window: i64 = limits.h2.INGRESS_CONNECTION_RECV_WINDOW_BYTES,
     h2_pending_connection_window_update: u32 = 0,
+    /// WINDOW_UPDATE frames the client may still send outside the per-read
+    /// frame budget: each DATA frame the server sends earns two, one to
+    /// return its credit to the connection's window and one to the stream's
+    /// (`flow_control.zig:h2ConsumeOutboundWindow`,
+    /// `h2SpendEarnedWindowUpdate`).
+    h2_earned_window_updates: u32 = 0,
     h2_write_buffer: [h2.frame_header_len * 2]u8 = undefined,
     h2_write_inline_segment: H2WriteSegment = .{},
     h2_write_inline_active: bool = false,
@@ -372,6 +378,7 @@ pub const Slot = struct {
     pub const h2IncreaseStreamSendWindow = flow_control.h2IncreaseStreamSendWindow;
     pub const h2AvailableOutboundWindow = flow_control.h2AvailableOutboundWindow;
     pub const h2ConsumeOutboundWindow = flow_control.h2ConsumeOutboundWindow;
+    pub const h2SpendEarnedWindowUpdate = flow_control.h2SpendEarnedWindowUpdate;
     pub const h2ConsumeInboundWindow = flow_control.h2ConsumeInboundWindow;
     pub const h2DiscardInboundData = flow_control.h2DiscardInboundData;
     pub const h2BufferInboundWindowUpdate = flow_control.h2BufferInboundWindowUpdate;

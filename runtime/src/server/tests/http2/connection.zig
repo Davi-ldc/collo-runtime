@@ -62,6 +62,7 @@ const encodeHeadersAndDataFrames = h2.encodeHeadersAndDataFrames;
 const encodeRstStreamFrame = h2.encodeRstStreamFrame;
 const encodeGoawayFrame = h2.encodeGoawayFrame;
 const server_max_frame_size = limits.h2.INGRESS_MAX_FRAME_SIZE_BYTES;
+const window_update_frame_len = h2.frame_header_len + 4;
 const max_response_header_block_bytes: usize = 64 * 1024;
 
 /// Streams the suite's lane holds at once, far above what its tests open.
@@ -3166,6 +3167,83 @@ test "http2 driver budgets padded empty data frame flood" {
         @intFromEnum(h2.ErrorCode.enhance_your_calm),
         readU32(goaway.payload[4..8]),
     );
+}
+
+test "http2 a client that returns each DATA frame's credit keeps its connection when a whole window of updates lands in one read" {
+    // A client may return the credit of every DATA frame it reads, to the
+    // connection and to the stream, and a lane that reads late finds all of
+    // those updates in one read. They answer frames the server sent, so they
+    // do not count against the per-read frame budget, however small the
+    // frames were.
+    const allocator = std.testing.allocator;
+    var setup = try newH2SocketPairRuntime();
+    defer std.posix.close(setup.pair[0]);
+    defer std.posix.close(setup.pair[1]);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
+    var worker = TestWorker{ .service = .{ .allocator = allocator } };
+
+    try writeClientPrefaceAndSettings(setup.pair[1]);
+    try driveUntilIdle(TestWorker, &worker, &setup.runtime);
+    var settings_out: [256]u8 = undefined;
+    _ = try readAvailableFd(setup.pair[1], &settings_out);
+
+    // The connection's window opens one byte at a time, so each byte of the
+    // response leaves in a DATA frame of its own.
+    const frame_count = http2_reading.max_h2_budgeted_frames_per_read;
+    try setup.runtime.h2ReserveStream(1);
+    try setup.runtime.h2ActivateStream(1, .{ .lane_id = 0, .slot = 1, .generation = 1 }, 1);
+    setup.runtime.h2_connection_send_window = 0;
+    var body: [2 * frame_count]u8 = undefined;
+    @memset(&body, 'r');
+    _ = try queueResponseChunk(TestWorker, &worker, &setup.runtime, 1, &body, false);
+    for (0..frame_count) |_| {
+        try setup.runtime.h2IncreaseConnectionSendWindow(1);
+        _ = try flushPendingResponseData(TestWorker, &worker, &setup.runtime, null);
+    }
+    var data_out: [frame_count * (h2.frame_header_len + 1) + 64]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, frame_count), countFrames(try readAvailableFd(setup.pair[1], &data_out), .data));
+
+    // One write, since a socket pair charges its buffer per write.
+    var updates: [2 * frame_count * window_update_frame_len]u8 = undefined;
+    for (0..frame_count) |index| {
+        try h2.encodeWindowUpdateFrame(updates[2 * index * window_update_frame_len ..][0..window_update_frame_len], 0, 1);
+        try h2.encodeWindowUpdateFrame(updates[(2 * index + 1) * window_update_frame_len ..][0..window_update_frame_len], 1, 1);
+    }
+    try writeAllFd(setup.pair[1], &updates);
+    try driveUntilIdle(TestWorker, &worker, &setup.runtime);
+
+    try std.testing.expect(setup.runtime.isOpen());
+    try std.testing.expect(worker.close == null);
+    // The returned credit sent the rest of the response, a byte a frame.
+    try std.testing.expect(!setup.runtime.h2HasPendingResponse(1));
+    var rest_out: [frame_count * (h2.frame_header_len + 1) + 64]u8 = undefined;
+    const rest = try readAvailableFd(setup.pair[1], &rest_out);
+    try std.testing.expectEqual(@as(usize, frame_count), countFrames(rest, .data));
+    try std.testing.expect(findFrame(rest, .goaway, 0) == null);
+}
+
+test "http2 driver sends enhance your calm on a flood of WINDOW_UPDATE frames that no DATA frame earned" {
+    const allocator = std.testing.allocator;
+    var setup = try newH2SocketPairRuntime();
+    defer std.posix.close(setup.pair[0]);
+    defer std.posix.close(setup.pair[1]);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
+    var worker = TestWorker{ .service = .{ .allocator = allocator } };
+
+    try writeClientPrefaceAndSettings(setup.pair[1]);
+    const update_count = http2_reading.max_h2_budgeted_frames_per_read + 1;
+    var updates: [update_count * window_update_frame_len]u8 = undefined;
+    for (0..update_count) |index|
+        try h2.encodeWindowUpdateFrame(updates[index * window_update_frame_len ..][0..window_update_frame_len], 0, 1);
+    try writeAllFd(setup.pair[1], &updates);
+
+    try driveUntilIdle(TestWorker, &worker, &setup.runtime);
+
+    try std.testing.expect(!setup.runtime.isOpen());
+    var out: [8192]u8 = undefined;
+    const received = try readAvailableFd(setup.pair[1], &out);
+    const goaway = findFrame(received, .goaway, 0) orelse return error.MissingGoaway;
+    try std.testing.expectEqual(@intFromEnum(h2.ErrorCode.enhance_your_calm), readU32(goaway.payload[4..8]));
 }
 
 test "http2 stream reservation enforces the advertised concurrency cap not just advertises it" {

@@ -31,10 +31,12 @@
 //! - Receive credit goes back to the client only for bytes the server no
 //!   longer holds (`DataFrameHandling`). DATA the lane drops on a stream that
 //!   takes no body gives the connection's share back at once.
-//! - Within one read, every frame other than HEADERS and DATA counts against
-//!   `limits.ingress.budgeted_frames_per_read_max`, and so does a DATA frame
-//!   that is empty or all padding. A client that floods such frames gets
-//!   GOAWAY ENHANCE_YOUR_CALM.
+//! - Within one read, every frame other than HEADERS, DATA and WINDOW_UPDATE
+//!   counts against `limits.ingress.budgeted_frames_per_read_max`, and so do
+//!   a DATA frame that is empty or all padding and a WINDOW_UPDATE past the
+//!   two each DATA frame the server sent earns, which return its credit
+//!   (`Slot.h2SpendEarnedWindowUpdate`). A client that floods such frames
+//!   gets GOAWAY ENHANCE_YOUR_CALM.
 
 const std = @import("std");
 
@@ -217,6 +219,8 @@ fn frameDisposition(runtime: *Slot, header: h2.FrameHeader, budget: *FrameBudget
         .window_update => {
             if (header.length != 4)
                 return error.Http2FrameSizeError;
+            if (!runtime.h2SpendEarnedWindowUpdate())
+                try budget.count(1);
             return .buffer;
         },
         .priority => {
@@ -533,14 +537,15 @@ fn isAckFlagSet(header: h2.FrameHeader) bool {
 
 /// Whether a frame of `frame_type` counts against the read's frame budget by
 /// its type alone. HEADERS carries a request and DATA a body, so neither
-/// does; an empty or all-padding DATA frame counts on its own.
+/// does; an empty or all-padding DATA frame counts on its own, and so does a
+/// WINDOW_UPDATE past those the server's DATA frames earned
+/// (`Slot.h2SpendEarnedWindowUpdate`).
 fn isBudgetedFrameType(frame_type: h2.FrameType) bool {
     return switch (frame_type) {
-        .data, .headers => false,
+        .data, .headers, .window_update => false,
         .continuation,
         .settings,
         .ping,
-        .window_update,
         .priority,
         .rst_stream,
         .goaway,

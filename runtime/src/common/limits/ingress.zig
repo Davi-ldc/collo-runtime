@@ -46,8 +46,11 @@ pub const header_block_frames_max: u32 = 128;
 
 /// Frames one socket read may carry that cost the lane work without moving
 /// a request forward: every frame but HEADERS and DATA, and DATA that is
-/// empty or all padding. Past it the connection gets GOAWAY
-/// ENHANCE_YOUR_CALM, so a flood costs the client its connection.
+/// empty or all padding. A WINDOW_UPDATE counts only past the two that each
+/// DATA frame the server sent earns, since a client may return every
+/// frame's credit to the connection and to the stream. Past it the
+/// connection gets GOAWAY ENHANCE_YOUR_CALM, so a flood costs the client its
+/// connection.
 pub const budgeted_frames_per_read_max: u32 = 128;
 
 /// How long an accepted connection may take to open its first stream: the
