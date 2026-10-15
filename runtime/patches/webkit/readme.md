@@ -9,6 +9,7 @@
 | `0003-string-prefix-copy-and-console-label-clamp` | A bounded copy of a string prefix that does not resolve ropes, and a clamp on the label of `console.count`/`time`/`profile`. |
 | `0004-microtask-owner-context` | The owner context of a promise reaction travels from registration to execution, for concurrent requests in one worker. |
 | `0005-random-source-getrandom` | WTF's and bmalloc's cryptographically random sources call `getrandom` on Linux and keep no descriptor or ARC4 stream, so a worker never reads a descriptor it closed and sibling workers never share a stream. |
+| `0006-collection-writes-only-what-changes` | A collection and its bookkeeping store only values that change (VM caches, profiles, allocator state, mark bits and cell colors), so a worker forked from the zygote keeps sharing the pages a collection would only have rewritten with the same bytes. |
 
 The addendum `arm64-pages16k/` applies after the series to the aarch64 engine of `-Darm64-pages=16k`, the default, and to no other engine ([build.md, Engine profiles](../../../skills/runtime/references/internals/build.md#engine-profiles)). Its patches are written on a branch off `collo-patches` and exported by hand, since `zig build webkit-export` regenerates only the series.
 

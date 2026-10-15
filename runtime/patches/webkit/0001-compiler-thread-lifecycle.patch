@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Davi <davilimacarv2536@gmail.com>
 Date: Sun, 13 Sep 2026 22:38:41 -0300
-Subject: [PATCH 1/5] compiler thread lifecycle
+Subject: [PATCH 1/6] compiler thread lifecycle
 
 Gives the embedder control over when a `WTF::AutomaticThread` is born,
 whether it may die, and what it does with its memory while it waits,

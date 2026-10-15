@@ -1,0 +1,648 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Davi <davilimacarv2536@gmail.com>
+Date: Thu, 15 Oct 2026 03:07:49 -0300
+Subject: [PATCH 6/6] collection writes only what changes
+
+A collection rewrites a lot of state with the value it already holds:
+the epilogue clears caches that are already empty, every profile of
+every CodeBlock it visits is merged into itself, the allocator's
+bookkeeping is reset to where it stands, and an atomic test-and-set
+writes a mark bit that is already set. In a process forked from a
+parent that prepared the heap, every such store copies a page it shared
+with the parent. On the Oracle A1 a worker's first full collection made
+0.4 to 0.9 MiB of the zygote's pages private this way, most of them
+holding the bytes they held before.
+
+Each of those sites now stores only a value that differs: the VM caches
+reset only entries that are not empty, the profiles store only a merged
+prediction or mode that changed, the directory's bit vectors store only
+the words that change, the free lists, allocator cursors, weak block
+links and JIT stub flags skip a store of the same value, the
+megamorphic cache leaves invalid entries alone, and a block's mark bit
+is tested with a plain load before the atomic test-and-set.
+
+Cell colors are left as they were. Keeping a cell that is still black
+from the last cycle black until its visit would save more pages, but
+the collector's grey and black stores are what orders its mark against
+the mutator's whitening barrier, and without them a marked, scanned
+cell can end white on a weakly ordered CPU and lose its barrier.
+---
+ .../bytecode/ArrayAllocationProfile.cpp       |  4 ++
+ .../JavaScriptCore/bytecode/ArrayProfile.cpp  | 14 +++--
+ Source/JavaScriptCore/bytecode/ArrayProfile.h | 14 +++--
+ Source/JavaScriptCore/bytecode/CodeBlock.cpp  | 16 ++++--
+ .../JavaScriptCore/bytecode/SpeculatedType.h  |  5 +-
+ Source/JavaScriptCore/bytecode/ValueProfile.h | 19 ++++---
+ Source/JavaScriptCore/heap/BlockDirectory.cpp |  9 ++--
+ .../JavaScriptCore/heap/BlockDirectoryBits.h  | 26 +++++++---
+ Source/JavaScriptCore/heap/FreeList.cpp       |  7 ++-
+ .../JavaScriptCore/heap/JITStubRoutineSet.cpp |  9 ++--
+ Source/JavaScriptCore/heap/LocalAllocator.cpp |  3 ++
+ Source/JavaScriptCore/heap/MarkedBlock.h      |  4 ++
+ Source/JavaScriptCore/heap/Subspace.cpp       |  5 +-
+ Source/JavaScriptCore/heap/WeakBlock.cpp      |  5 +-
+ Source/JavaScriptCore/heap/WeakBlock.h        |  5 +-
+ .../runtime/HasOwnPropertyCache.h             | 14 +++--
+ .../runtime/JSONAtomStringCache.h             | 17 ++++--
+ .../runtime/KeyAtomStringCache.h              |  7 ++-
+ .../runtime/MegamorphicCache.cpp              | 52 ++++++++-----------
+ .../JavaScriptCore/runtime/NumericStrings.h   | 12 +++--
+ .../runtime/StringReplaceCache.h              |  9 +++-
+ .../JavaScriptCore/runtime/StringSplitCache.h | 13 ++++-
+ 22 files changed, 189 insertions(+), 80 deletions(-)
+
+diff --git a/Source/JavaScriptCore/bytecode/ArrayAllocationProfile.cpp b/Source/JavaScriptCore/bytecode/ArrayAllocationProfile.cpp
+index 6e01ad91..3b6e590e 100644
+--- a/Source/JavaScriptCore/bytecode/ArrayAllocationProfile.cpp
++++ b/Source/JavaScriptCore/bytecode/ArrayAllocationProfile.cpp
+@@ -53,6 +53,10 @@ void ArrayAllocationProfile::updateProfile()
+     // So for now, we update the allocation profile only from the main thread.
+     
+     ASSERT(!isCompilationThread());
++    // A profile that saw no array since the last update is not stored again: a collection runs this on every
++    // allocation profile, and a process forked from a prepared parent shares their pages until it writes them.
++    if (!m_storage.pointer())
++        return;
+     Storage storage = std::exchange(m_storage, Storage(nullptr, m_storage.type()));
+     JSArray* lastArray = storage.pointer();
+     IndexingTypeAndVectorLength current = storage.type();
+diff --git a/Source/JavaScriptCore/bytecode/ArrayProfile.cpp b/Source/JavaScriptCore/bytecode/ArrayProfile.cpp
+index 2d20e49f..6b43ad0b 100644
+--- a/Source/JavaScriptCore/bytecode/ArrayProfile.cpp
++++ b/Source/JavaScriptCore/bytecode/ArrayProfile.cpp
+@@ -125,10 +125,16 @@ void dumpArrayModes(PrintStream& out, ArrayModes arrayModes)
+ 
+ void ArrayProfile::computeUpdatedPrediction(CodeBlock* codeBlock)
+ {
+-    if (auto structureID = std::exchange(m_lastSeenStructureID, StructureID()))
+-        computeUpdatedPrediction(codeBlock, structureID.decode());
+-    if (auto structureID = std::exchange(m_speculationFailureStructureID, StructureID()))
+-        computeUpdatedPrediction(codeBlock, structureID.decode());
++    // A structure slot that is already empty is not stored again: a collection runs this on every array profile,
++    // and a process forked from a prepared parent shares the profiles' pages until it writes them.
++    if (m_lastSeenStructureID) {
++        if (auto structureID = std::exchange(m_lastSeenStructureID, StructureID()))
++            computeUpdatedPrediction(codeBlock, structureID.decode());
++    }
++    if (m_speculationFailureStructureID) {
++        if (auto structureID = std::exchange(m_speculationFailureStructureID, StructureID()))
++            computeUpdatedPrediction(codeBlock, structureID.decode());
++    }
+ }
+ 
+ void ArrayProfile::computeUpdatedPrediction(CodeBlock* codeBlock, Structure* lastSeenStructure)
+diff --git a/Source/JavaScriptCore/bytecode/ArrayProfile.h b/Source/JavaScriptCore/bytecode/ArrayProfile.h
+index 6b57f404..8ad49390 100644
+--- a/Source/JavaScriptCore/bytecode/ArrayProfile.h
++++ b/Source/JavaScriptCore/bytecode/ArrayProfile.h
+@@ -280,16 +280,22 @@ class UnlinkedArrayProfile {
+ public:
+     explicit UnlinkedArrayProfile() = default;
+ 
++    // Stores only what changes, as mergeSpeculation does: a collection runs this on every array profile, and a
++    // process forked from a prepared parent shares the profiles' pages until it writes them.
+     void update(ArrayProfile& arrayProfile)
+     {
+         ArrayModes newModes = arrayProfile.m_observedArrayModes | m_observedArrayModes;
+-        m_observedArrayModes = newModes;
+-        arrayProfile.m_observedArrayModes = newModes;
++        if (m_observedArrayModes != newModes)
++            m_observedArrayModes = newModes;
++        if (arrayProfile.m_observedArrayModes != newModes)
++            arrayProfile.m_observedArrayModes = newModes;
+ 
+-        arrayProfile.m_arrayProfileFlags.add(m_arrayProfileFlags);
++        if (!arrayProfile.m_arrayProfileFlags.containsAll(m_arrayProfileFlags))
++            arrayProfile.m_arrayProfileFlags.add(m_arrayProfileFlags);
+         auto unlinkedArrayProfileFlags = arrayProfile.m_arrayProfileFlags;
+         unlinkedArrayProfileFlags.remove(ArrayProfileFlag::DidPerformFirstRunPruning); // We do not propagate DidPerformFirstRunPruning.
+-        m_arrayProfileFlags = unlinkedArrayProfileFlags;
++        if (m_arrayProfileFlags != unlinkedArrayProfileFlags)
++            m_arrayProfileFlags = unlinkedArrayProfileFlags;
+     }
+ 
+ private:
+diff --git a/Source/JavaScriptCore/bytecode/CodeBlock.cpp b/Source/JavaScriptCore/bytecode/CodeBlock.cpp
+index 88b39f3d..9646c5a5 100644
+--- a/Source/JavaScriptCore/bytecode/CodeBlock.cpp
++++ b/Source/JavaScriptCore/bytecode/CodeBlock.cpp
+@@ -1251,8 +1251,11 @@ void CodeBlock::visitChildren(Visitor& visitor)
+ 
+         // In CodeBlock::shouldVisitStrongly() we may have decided to skip visiting this
+         // codeBlock. However, if we end up visiting it anyway due to other references,
+-        // we can clear this flag and allow the verifier GC to visit it as well.
+-        m_visitChildrenSkippedDueToOldAge = false;
++        // we can clear this flag and allow the verifier GC to visit it as well. A flag that is already clear
++        // is not stored again: a process forked from a prepared parent shares this CodeBlock's page until it
++        // writes it.
++        if (m_visitChildrenSkippedDueToOldAge)
++            m_visitChildrenSkippedDueToOldAge = false;
+         if (CodeBlock* otherBlock = specialOSREntryBlockOrNull())
+             visitor.appendUnbarriered(otherBlock);
+ 
+@@ -1288,7 +1291,9 @@ bool CodeBlock::shouldVisitStrongly(const ConcurrentJSLocker& locker, Visitor& v
+     if (m_visitChildrenSkippedDueToOldAge && Options::verifyGC()) [[unlikely]]
+         return false;
+ 
+-    m_visitChildrenSkippedDueToOldAge = shouldJettisonDueToOldAge(locker, visitor);
++    bool skippedDueToOldAge = shouldJettisonDueToOldAge(locker, visitor);
++    if (m_visitChildrenSkippedDueToOldAge != skippedDueToOldAge)
++        m_visitChildrenSkippedDueToOldAge = skippedDueToOldAge;
+     if (m_visitChildrenSkippedDueToOldAge)
+         return false;
+ 
+@@ -2000,8 +2005,9 @@ void CodeBlock::reconcileWeakReferencesAtGCEnd(VM& vm, CollectionScope)
+ 
+     // In CodeBlock::shouldVisitStrongly() we may have decided to skip visiting this
+     // codeBlock. By the time we get here, we're done with the verifier GC. So, let's
+-    // reset this flag for the next GC cycle.
+-    m_visitChildrenSkippedDueToOldAge = false;
++    // reset this flag for the next GC cycle, unless it is already clear.
++    if (m_visitChildrenSkippedDueToOldAge)
++        m_visitChildrenSkippedDueToOldAge = false;
+ }
+ 
+ void CodeBlock::destroy(JSCell* cell)
+diff --git a/Source/JavaScriptCore/bytecode/SpeculatedType.h b/Source/JavaScriptCore/bytecode/SpeculatedType.h
+index d71207ff..eb18b093 100644
+--- a/Source/JavaScriptCore/bytecode/SpeculatedType.h
++++ b/Source/JavaScriptCore/bytecode/SpeculatedType.h
+@@ -548,7 +548,10 @@ inline bool mergeSpeculation(T& left, SpeculatedType right)
+ {
+     SpeculatedType newSpeculation = static_cast<T>(mergeSpeculations(static_cast<SpeculatedType>(left), right));
+     bool result = newSpeculation != static_cast<SpeculatedType>(left);
+-    left = newSpeculation;
++    // An unchanged speculation is not stored again: a collection merges every profile of every CodeBlock it
++    // visits, and a process forked from a prepared parent shares those profiles' pages until it writes them.
++    if (result)
++        left = newSpeculation;
+     return result;
+ }
+ 
+diff --git a/Source/JavaScriptCore/bytecode/ValueProfile.h b/Source/JavaScriptCore/bytecode/ValueProfile.h
+index 41e0aebb..71e18d1f 100644
+--- a/Source/JavaScriptCore/bytecode/ValueProfile.h
++++ b/Source/JavaScriptCore/bytecode/ValueProfile.h
+@@ -128,10 +128,12 @@ struct ValueProfileBase {
+         return m_prediction;
+     }
+ 
++    // An empty value is not stored again, as mergeSpeculation does not store an unchanged prediction.
+     void computeUpdatedPredictionForExtraValue(JSValue& value)
+     {
+-        if (value)
+-            mergeSpeculation(m_prediction, speculationFromValueForProfiling(value));
++        if (!value)
++            return;
++        mergeSpeculation(m_prediction, speculationFromValueForProfiling(value));
+         value = JSValue();
+     }
+ 
+@@ -215,18 +217,23 @@ class UnlinkedValueProfile {
+ public:
+     UnlinkedValueProfile() = default;
+ 
++    // Both store only a prediction that changes, as mergeSpeculation does.
+     void update(ValueProfile& profile)
+     {
+         SpeculatedType newType = profile.m_prediction | m_prediction;
+-        profile.m_prediction = newType;
+-        m_prediction = newType;
++        if (profile.m_prediction != newType)
++            profile.m_prediction = newType;
++        if (m_prediction != newType)
++            m_prediction = newType;
+     }
+ 
+     void update(ArgumentValueProfile& profile)
+     {
+         SpeculatedType newType = profile.m_prediction | m_prediction;
+-        profile.m_prediction = newType;
+-        m_prediction = newType;
++        if (profile.m_prediction != newType)
++            profile.m_prediction = newType;
++        if (m_prediction != newType)
++            m_prediction = newType;
+     }
+ 
+ private:
+diff --git a/Source/JavaScriptCore/heap/BlockDirectory.cpp b/Source/JavaScriptCore/heap/BlockDirectory.cpp
+index 93ac2023..1f5d559d 100644
+--- a/Source/JavaScriptCore/heap/BlockDirectory.cpp
++++ b/Source/JavaScriptCore/heap/BlockDirectory.cpp
+@@ -233,9 +233,12 @@ void BlockDirectory::prepareForAllocation()
+             allocator->prepareForAllocation();
+         });
+     
+-    m_unsweptCursor = 0;
+-    m_emptyCursor = 0;
+-    
++    // A cursor already at zero is not stored again; see BlockDirectoryBits::clearAll.
++    if (m_unsweptCursor)
++        m_unsweptCursor = 0;
++    if (m_emptyCursor)
++        m_emptyCursor = 0;
++
+     assertSweeperIsSuspended();
+     edenBits().clearAll();
+ 
+diff --git a/Source/JavaScriptCore/heap/BlockDirectoryBits.h b/Source/JavaScriptCore/heap/BlockDirectoryBits.h
+index ab7753e7..9584d222 100644
+--- a/Source/JavaScriptCore/heap/BlockDirectoryBits.h
++++ b/Source/JavaScriptCore/heap/BlockDirectoryBits.h
+@@ -104,10 +104,15 @@ public:
+             return const_cast<Segment*>(m_segments)[index].m_data[static_cast<unsigned>(kind)];
+         }
+ 
++        // Stores only the words that change: a process forked from a prepared parent shares these pages until it
++        // writes them, and storing the value a word already holds would copy its page for nothing.
+         void clearAll()
+         {
+-            for (size_t index = 0; index < WTF::fastBitVectorArrayLength(numBits()); ++index)
+-                const_cast<Segment*>(m_segments)[index].m_data[static_cast<unsigned>(kind)] = 0;
++            for (size_t index = 0; index < WTF::fastBitVectorArrayLength(numBits()); ++index) {
++                uint32_t& data = const_cast<Segment*>(m_segments)[index].m_data[static_cast<unsigned>(kind)];
++                if (data)
++                    data = 0;
++            }
+         }
+ 
+         BlockDirectoryBitVectorWordView view() const { return *this; }
+@@ -130,12 +135,17 @@ public:
+         {
+         }
+ 
++        // Both store only the words that change, as clearAll does.
+         template<typename OtherWords>
+         BlockDirectoryBitVectorRef& operator=(const WTF::FastBitVectorImpl<OtherWords>& other)
+         {
+             ASSERT(Base::numBits() == other.numBits());
+-            for (unsigned i = Base::arrayLength(); i--;)
+-                Base::unsafeWords().word(i) = other.unsafeWords().word(i);
++            for (unsigned i = Base::arrayLength(); i--;) {
++                uint32_t value = other.unsafeWords().word(i);
++                uint32_t& word = Base::unsafeWords().word(i);
++                if (word != value)
++                    word = value;
++            }
+             return *this;
+         }
+ 
+@@ -143,8 +153,12 @@ public:
+         BlockDirectoryBitVectorRef& operator|=(const WTF::FastBitVectorImpl<OtherWords>& other)
+         {
+             ASSERT(Base::numBits() == other.numBits());
+-            for (unsigned i = Base::arrayLength(); i--;)
+-                Base::unsafeWords().word(i) |= other.unsafeWords().word(i);
++            for (unsigned i = Base::arrayLength(); i--;) {
++                uint32_t value = other.unsafeWords().word(i);
++                uint32_t& word = Base::unsafeWords().word(i);
++                if (value & ~word)
++                    word |= value;
++            }
+             return *this;
+         }
+ 
+diff --git a/Source/JavaScriptCore/heap/FreeList.cpp b/Source/JavaScriptCore/heap/FreeList.cpp
+index d636db72..2b2f1a92 100644
+--- a/Source/JavaScriptCore/heap/FreeList.cpp
++++ b/Source/JavaScriptCore/heap/FreeList.cpp
+@@ -37,9 +37,14 @@ FreeList::~FreeList() = default;
+ 
+ void FreeList::clear()
+ {
++    // A free list that is already clear is not stored again: a process forked from a prepared parent shares this
++    // page until it writes it.
++    FreeCell* const emptyNextInterval = std::bit_cast<FreeCell*>(static_cast<uintptr_t>(1));
++    if (!m_intervalStart && !m_intervalEnd && m_nextInterval == emptyNextInterval && !m_secret && !m_originalSize)
++        return;
+     m_intervalStart = nullptr;
+     m_intervalEnd = nullptr;
+-    m_nextInterval = std::bit_cast<FreeCell*>(static_cast<uintptr_t>(1));
++    m_nextInterval = emptyNextInterval;
+     m_secret = 0;
+     m_originalSize = 0;
+ }
+diff --git a/Source/JavaScriptCore/heap/JITStubRoutineSet.cpp b/Source/JavaScriptCore/heap/JITStubRoutineSet.cpp
+index 98ce8002..ec7e5a5e 100644
+--- a/Source/JavaScriptCore/heap/JITStubRoutineSet.cpp
++++ b/Source/JavaScriptCore/heap/JITStubRoutineSet.cpp
+@@ -94,9 +94,12 @@ void JITStubRoutineSet::prepareForConservativeScan()
+ 
+ void JITStubRoutineSet::clearMarks()
+ {
+-    // Immutable code routines do not matter.
+-    for (auto& entry : m_routines)
+-        entry.routine->m_mayBeExecuting = false;
++    // Immutable code routines do not matter. A flag that is already clear is not stored again: a process forked
++    // from a prepared parent shares the routine's page until it writes it.
++    for (auto& entry : m_routines) {
++        if (entry.routine->m_mayBeExecuting)
++            entry.routine->m_mayBeExecuting = false;
++    }
+ }
+ 
+ void JITStubRoutineSet::markSlow(uintptr_t address)
+diff --git a/Source/JavaScriptCore/heap/LocalAllocator.cpp b/Source/JavaScriptCore/heap/LocalAllocator.cpp
+index 90409bd5..7c639bf1 100644
+--- a/Source/JavaScriptCore/heap/LocalAllocator.cpp
++++ b/Source/JavaScriptCore/heap/LocalAllocator.cpp
+@@ -47,6 +47,9 @@ LocalAllocator::LocalAllocator(BlockDirectory* directory)
+ void LocalAllocator::reset()
+ {
+     m_freeList.clear();
++    // Fields that are already reset are not stored again, as in FreeList::clear.
++    if (!m_currentBlock && !m_lastActiveBlock && !m_allocationCursor)
++        return;
+     m_currentBlock = nullptr;
+     m_lastActiveBlock = nullptr;
+     m_allocationCursor = 0;
+diff --git a/Source/JavaScriptCore/heap/MarkedBlock.h b/Source/JavaScriptCore/heap/MarkedBlock.h
+index 959b2b2e..7a75128d 100644
+--- a/Source/JavaScriptCore/heap/MarkedBlock.h
++++ b/Source/JavaScriptCore/heap/MarkedBlock.h
+@@ -632,6 +632,10 @@ inline bool MarkedBlock::isMarked(const void* p, Dependency dependency)
+ inline bool MarkedBlock::testAndSetMarked(const void* p, Dependency dependency)
+ {
+     assertMarksNotStale();
++    // A bit already set is recognized by a plain load first: the atomic read-modify-write needs write access, so in
++    // a process forked from a prepared parent it would copy the block's shared page even when it changes nothing.
++    if (header().m_marks.concurrentGet(atomNumber(p), dependency))
++        return true;
+     return header().m_marks.concurrentTestAndSet(atomNumber(p), dependency);
+ }
+ 
+diff --git a/Source/JavaScriptCore/heap/Subspace.cpp b/Source/JavaScriptCore/heap/Subspace.cpp
+index 168cfe37..eac6d09d 100644
+--- a/Source/JavaScriptCore/heap/Subspace.cpp
++++ b/Source/JavaScriptCore/heap/Subspace.cpp
+@@ -74,7 +74,10 @@ void Subspace::prepareForAllocation()
+             directory.prepareForAllocation();
+         });
+ 
+-    m_directoryForEmptyAllocation = m_alignedMemoryAllocator->firstDirectory();
++    // A cursor that already points there is not stored again, as in FreeList::clear.
++    BlockDirectory* first = m_alignedMemoryAllocator->firstDirectory();
++    if (m_directoryForEmptyAllocation != first)
++        m_directoryForEmptyAllocation = first;
+ }
+ 
+ MarkedBlock::Handle* Subspace::findEmptyBlockToSteal()
+diff --git a/Source/JavaScriptCore/heap/WeakBlock.cpp b/Source/JavaScriptCore/heap/WeakBlock.cpp
+index 55c85d5a..bafcfe27 100644
+--- a/Source/JavaScriptCore/heap/WeakBlock.cpp
++++ b/Source/JavaScriptCore/heap/WeakBlock.cpp
+@@ -97,7 +97,10 @@ void WeakBlock::sweep()
+         }
+     }
+ 
+-    m_sweepResult = sweepResult;
++    // An unchanged result is not stored again (addToFreeList).
++    if (m_sweepResult.blockIsFree != sweepResult.blockIsFree || m_sweepResult.blockIsLogicallyEmpty != sweepResult.blockIsLogicallyEmpty
++        || m_sweepResult.freeList != sweepResult.freeList)
++        m_sweepResult = sweepResult;
+     ASSERT(!m_sweepResult.isNull());
+ }
+ 
+diff --git a/Source/JavaScriptCore/heap/WeakBlock.h b/Source/JavaScriptCore/heap/WeakBlock.h
+index e5a51d29..51463f18 100644
+--- a/Source/JavaScriptCore/heap/WeakBlock.h
++++ b/Source/JavaScriptCore/heap/WeakBlock.h
+@@ -136,7 +136,10 @@ inline void WeakBlock::addToFreeList(FreeCell** freeList, WeakImpl* weakImpl)
+     FreeCell* freeCell = asFreeCell(weakImpl);
+     ASSERT(!*freeList || ((char*)*freeList > (char*)this && (char*)*freeList < (char*)this + blockSize));
+     ASSERT((char*)freeCell > (char*)this && (char*)freeCell < (char*)this + blockSize);
+-    freeCell->next = *freeList;
++    // A sweep of a block whose handles did not change rebuilds the same list; a link that already points where it
++    // should is not stored again, so a process forked from a prepared parent keeps sharing the block's page.
++    if (freeCell->next != *freeList)
++        freeCell->next = *freeList;
+     *freeList = freeCell;
+ }
+ 
+diff --git a/Source/JavaScriptCore/runtime/HasOwnPropertyCache.h b/Source/JavaScriptCore/runtime/HasOwnPropertyCache.h
+index 490d7948..71264ef7 100644
+--- a/Source/JavaScriptCore/runtime/HasOwnPropertyCache.h
++++ b/Source/JavaScriptCore/runtime/HasOwnPropertyCache.h
+@@ -114,13 +114,19 @@ public:
+         }
+     }
+ 
++    // Resets only the entries that are not already empty: every collection clears the cache, and a process forked
++    // from a prepared parent shares its pages until it writes them. An empty entry holds no reference, so leaving it
++    // alone is the same as destroying and constructing it again.
+     void clear()
+     {
+         Entry* buffer = std::bit_cast<Entry*>(this);
+-        for (uint32_t i = 0; i < size; ++i)
+-            buffer[i].Entry::~Entry();
+-
+-        clearBuffer();
++        for (uint32_t i = 0; i < size; ++i) {
++            Entry& entry = buffer[i];
++            if (!entry.impl && !entry.structureID && !entry.result)
++                continue;
++            entry.Entry::~Entry();
++            new (&entry) Entry();
++        }
+     }
+ 
+ private:
+diff --git a/Source/JavaScriptCore/runtime/JSONAtomStringCache.h b/Source/JavaScriptCore/runtime/JSONAtomStringCache.h
+index 66469583..582fed16 100644
+--- a/Source/JavaScriptCore/runtime/JSONAtomStringCache.h
++++ b/Source/JavaScriptCore/runtime/JSONAtomStringCache.h
+@@ -56,15 +56,26 @@ public:
+     template<typename CharacterType>
+     ALWAYS_INLINE JSString* tryMakeJSString(std::span<const CharacterType> characters);
+ 
++    // Both store only into slots that are not already empty: the cache is cleared at every collection, and a
++    // process forked from a prepared parent shares its pages until it writes them.
+     ALWAYS_INLINE void clear()
+     {
+-        m_cache.fill({ });
+-        m_jsStrings.fill(nullptr);
++        for (auto& slot : m_cache) {
++            bool empty = !slot.m_length && !slot.m_impl;
++            for (char16_t character : slot.m_buffer)
++                empty = empty && !character;
++            if (!empty)
++                slot = { };
++        }
++        clearJSStrings();
+     }
+ 
+     ALWAYS_INLINE void clearJSStrings()
+     {
+-        m_jsStrings.fill(nullptr);
++        for (auto& string : m_jsStrings) {
++            if (string)
++                string = nullptr;
++        }
+     }
+ 
+     VM& vm() const;
+diff --git a/Source/JavaScriptCore/runtime/KeyAtomStringCache.h b/Source/JavaScriptCore/runtime/KeyAtomStringCache.h
+index 16ddca86..ac15e75f 100644
+--- a/Source/JavaScriptCore/runtime/KeyAtomStringCache.h
++++ b/Source/JavaScriptCore/runtime/KeyAtomStringCache.h
+@@ -41,9 +41,14 @@ public:
+     template<typename Buffer, typename Func>
+     JSString* make(VM&, Buffer&, const Func&);
+ 
++    // Clears every slot, storing only into those that hold a string: every collection clears the cache, and a
++    // process forked from a prepared parent shares its pages until it writes them.
+     ALWAYS_INLINE void clear()
+     {
+-        m_cache.fill({ });
++        for (auto& slot : m_cache) {
++            if (slot)
++                slot = nullptr;
++        }
+     }
+ 
+ private:
+diff --git a/Source/JavaScriptCore/runtime/MegamorphicCache.cpp b/Source/JavaScriptCore/runtime/MegamorphicCache.cpp
+index e3809abc..f1912c5d 100644
+--- a/Source/JavaScriptCore/runtime/MegamorphicCache.cpp
++++ b/Source/JavaScriptCore/runtime/MegamorphicCache.cpp
+@@ -39,38 +39,30 @@ void MegamorphicCache::age(CollectionScope collectionScope)
+ {
+     ++m_epoch;
+     if (collectionScope == CollectionScope::Full || m_epoch == invalidEpoch) {
+-        for (auto& entry : m_loadCachePrimaryEntries) {
++        // An entry that is already invalid is left alone. The table is large and mostly empty in a process that
++        // barely used it, and a process forked from a prepared parent shares its pages until it writes them.
++        auto invalidate = [](auto& entry) {
++            if (!entry.m_uid && entry.m_epoch == invalidEpoch)
++                return;
+             entry.m_uid = nullptr;
+             entry.m_epoch = invalidEpoch;
+-        }
+-        for (auto& entry : m_loadCacheSecondaryEntries) {
+-            entry.m_uid = nullptr;
+-            entry.m_epoch = invalidEpoch;
+-        }
+-        for (auto& entry : m_storeCachePrimaryEntries) {
+-            entry.m_uid = nullptr;
+-            entry.m_epoch = invalidEpoch;
+-        }
+-        for (auto& entry : m_storeCacheSecondaryEntries) {
+-            entry.m_uid = nullptr;
+-            entry.m_epoch = invalidEpoch;
+-        }
+-        for (auto& entry : m_hasCachePrimaryEntries) {
+-            entry.m_uid = nullptr;
+-            entry.m_epoch = invalidEpoch;
+-        }
+-        for (auto& entry : m_hasCacheSecondaryEntries) {
+-            entry.m_uid = nullptr;
+-            entry.m_epoch = invalidEpoch;
+-        }
+-        for (auto& entry : m_getterCachePrimaryEntries) {
+-            entry.m_uid = nullptr;
+-            entry.m_epoch = invalidEpoch;
+-        }
+-        for (auto& entry : m_getterCacheSecondaryEntries) {
+-            entry.m_uid = nullptr;
+-            entry.m_epoch = invalidEpoch;
+-        }
++        };
++        for (auto& entry : m_loadCachePrimaryEntries)
++            invalidate(entry);
++        for (auto& entry : m_loadCacheSecondaryEntries)
++            invalidate(entry);
++        for (auto& entry : m_storeCachePrimaryEntries)
++            invalidate(entry);
++        for (auto& entry : m_storeCacheSecondaryEntries)
++            invalidate(entry);
++        for (auto& entry : m_hasCachePrimaryEntries)
++            invalidate(entry);
++        for (auto& entry : m_hasCacheSecondaryEntries)
++            invalidate(entry);
++        for (auto& entry : m_getterCachePrimaryEntries)
++            invalidate(entry);
++        for (auto& entry : m_getterCacheSecondaryEntries)
++            invalidate(entry);
+         if (m_epoch == invalidEpoch)
+             m_epoch = 1;
+     }
+diff --git a/Source/JavaScriptCore/runtime/NumericStrings.h b/Source/JavaScriptCore/runtime/NumericStrings.h
+index 17c6f0c3..29adfdef 100644
+--- a/Source/JavaScriptCore/runtime/NumericStrings.h
++++ b/Source/JavaScriptCore/runtime/NumericStrings.h
+@@ -111,17 +111,23 @@ public:
+     JSString* addJSString(VM&, int);
+     JSString* addJSString(VM&, double);
+ 
++    // Stores only into entries that still hold a string: every full collection clears the cache, and a process
++    // forked from a prepared parent shares its pages until it writes them.
+     void clearOnGarbageCollection()
+     {
++        auto clearString = [](auto& entry) {
++            if (entry.jsString)
++                entry.jsString = nullptr;
++        };
+         for (auto& entry : m_intCache)
+-            entry.jsString = nullptr;
++            clearString(entry);
+         if (m_doubleCache) {
+             for (auto& entry : m_doubleCache->m_doubleCache)
+-                entry.jsString = nullptr;
++                clearString(entry);
+         }
+         // 0-9 are managed by SmallStrings. They never die.
+         for (unsigned i = 10; i < m_smallIntCache.size(); ++i)
+-            m_smallIntCache[i].jsString = nullptr;
++            clearString(m_smallIntCache[i]);
+     }
+ 
+     template<typename Visitor>
+diff --git a/Source/JavaScriptCore/runtime/StringReplaceCache.h b/Source/JavaScriptCore/runtime/StringReplaceCache.h
+index 8b0fe63e..a2429877 100644
+--- a/Source/JavaScriptCore/runtime/StringReplaceCache.h
++++ b/Source/JavaScriptCore/runtime/StringReplaceCache.h
+@@ -62,9 +62,16 @@ public:
+ 
+     DECLARE_VISIT_AGGREGATE;
+ 
++    // Stores only into entries that are not already empty: every full collection clears the cache, and a process
++    // forked from a prepared parent shares its pages until it writes them. Resetting an entry also releases its
++    // m_lastMatch buffer, which set() would replace anyway; get() reads no entry without a subject.
+     void clear()
+     {
+-        m_entries.fill(Entry { });
++        for (auto& entry : m_entries) {
++            bool defaultMatch = entry.m_matchResult.start == WTF::notFound && !entry.m_matchResult.end;
++            if (entry.m_subject || entry.m_regExp || entry.m_result || !defaultMatch || entry.m_lastMatch.capacity())
++                entry = Entry { };
++        }
+     }
+ 
+ private:
+diff --git a/Source/JavaScriptCore/runtime/StringSplitCache.h b/Source/JavaScriptCore/runtime/StringSplitCache.h
+index a31651fe..ceeff065 100644
+--- a/Source/JavaScriptCore/runtime/StringSplitCache.h
++++ b/Source/JavaScriptCore/runtime/StringSplitCache.h
+@@ -67,10 +67,19 @@ public:
+     JSCellButterfly* getForRegExp(const String& subject, RegExp*, MatchResult& lastMatch);
+     void setForRegExp(const String& subject, RegExp*, JSCellButterfly*, MatchResult lastMatch);
+ 
++    // Stores only into entries that are not already empty: every collection clears the cache, and a process forked
++    // from a prepared parent shares its pages until it writes them.
+     void clear()
+     {
+-        m_stringEntries.fill(StringEntry { });
+-        m_regExpEntries.fill(RegExpEntry { });
++        for (auto& entry : m_stringEntries) {
++            if (entry.m_subject || entry.m_separator || entry.m_butterfly)
++                entry = StringEntry { };
++        }
++        for (auto& entry : m_regExpEntries) {
++            bool defaultMatch = entry.m_lastMatch.start == WTF::notFound && !entry.m_lastMatch.end;
++            if (entry.m_subject || entry.m_regExp || entry.m_butterfly || !defaultMatch)
++                entry = RegExpEntry { };
++        }
+     }
+ 
+ private:
