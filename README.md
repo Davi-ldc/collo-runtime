@@ -68,16 +68,6 @@ To serve one module on every path without a `collo.json` (its `fetch` may reach 
 collo serve app.js
 ```
 
-## Memory
-
-Median of 5 runs on an Oracle Cloud A1 (Ampere Altra, aarch64). checking cgroup's `memory.current`
-
-| Workload | Collo | workerd | workerd, one process per worker |
-| --- | ---: | ---: | ---: |
-| hello | 2.11 | 2.25 | 8.32 |
-| Hono API | 4.32 | 2.74 | 9.54 |
-| crypto | 4.04 | 11.94 | 20.47 |
-
 # Why 
 
 With [sound types, aot compilation](https://github.com/oven-sh/WebKit/pull/757), [multithreading](https://github.com/oven-sh/WebKit/pull/249), and [jitcache](https://github.com/Davi-ldc/jitcache) JS will soon be faster them go and > 50% of all agent writen code. 
@@ -88,4 +78,16 @@ Collo solves that.
 
 ## How it works
 
-TODO ASAP. 
+TODO.
+
+
+## Bench
+
+### Memory
+Median of 5 runs on an Oracle Cloud A1 (Ampere Altra, aarch64). checking cgroup's `memory.current`
+
+| Workload | Collo | workerd | workerd, one process per worker |
+| --- | ---: | ---: | ---: |
+| hello | 2.11 | 2.25 | 8.32 |
+| Hono API | 4.32 | 2.74 | 9.54 |
+| crypto | 4.04 | 11.94 | 20.47 |
