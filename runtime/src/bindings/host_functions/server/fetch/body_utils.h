@@ -37,9 +37,9 @@ void throwAlreadyUsedTypeError(JSC::JSGlobalObject*, JSC::ThrowScope&, WTF::ASCI
 // Appends the string's UTF-8 encoding, with each unpaired surrogate encoded as U+FFFD.
 bool appendStringBytes(JSC::JSGlobalObject*, JSC::ThrowScope&, WTF::Vector<uint8_t>&, const WTF::String&);
 bool copyBytes(JSC::JSGlobalObject*, JSC::ThrowScope&, WTF::Vector<uint8_t>&, std::span<const uint8_t>);
-// The number of bytes appendStringBytes appends, counted without encoding. Returns false when the count overflows
-// size_t, and stringUtf8LengthWithinLimit then returns false too.
-bool stringUtf8ByteLength(const WTF::String&, size_t& out);
+// The number of bytes appendStringBytes appends, counted without encoding. A string holds at most
+// WTF::String::MaxLength units of at most three bytes each, so the count fits a size_t.
+size_t stringUtf8ByteLength(const WTF::String&);
 bool stringUtf8LengthWithinLimit(const WTF::String&, size_t limit);
 // An empty span for a null buffer.
 std::span<const uint8_t> sharedBytesSpan(const WTF::RefPtr<ColloSharedBytes>&);

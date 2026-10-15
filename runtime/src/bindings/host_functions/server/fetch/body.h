@@ -83,7 +83,7 @@ public:
     // byteLength, appendBytes and copyBytesInto, like extractByteSegmentsForHostResponse, neither check nor set the
     // used flag. Empty, Text, Bytes and SharedBytes bodies answer synchronously. A fetch stream answers byteLength and
     // appendBytes during its own request turn once Zig holds its whole body; every other case throws a TypeError.
-    // Measuring or copying a text body, and appending a non-empty body's bytes, can also throw an OutOfMemoryError.
+    // Copying a text body, and appending a non-empty body's bytes, can also throw an OutOfMemoryError.
     bool byteLength(JSC::JSGlobalObject*, JSC::ThrowScope&, size_t& out) const;
     bool appendBytes(JSC::JSGlobalObject*, JSC::ThrowScope&, WTF::Vector<uint8_t>& out) const;
     // Throws a TypeError when `out` differs from the body's length, so size it with byteLength.

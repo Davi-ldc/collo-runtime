@@ -49,12 +49,5 @@ bool publishOwnedByteSegment(ColloOwnedByteSegments&, ColloExtractedResponseBody
 // body untouched, when a segment falls outside its bytes, the segments do not add up to `expected_byte_length`, or
 // allocation fails.
 bool publishBlobSegments(ColloOwnedByteSegments&, ColloExtractedResponseBody&, size_t expected_byte_length);
-// Copies the pairs as UTF-8 into a new header block and publishes it in the last argument, which stays untouched
-// when there are no pairs and on failure. Fails with COLLO_STATUS_RESPONSE_HEADER_COUNT_TOO_LARGE or
-// COLLO_STATUS_RESPONSE_HEADER_BYTES_TOO_LARGE when the pairs exceed the limits, where the byte limit covers every
-// name and value, or with COLLO_STATUS_OUT_OF_MEMORY. The byte limit must fit in 32 bits, since the views hold 32-bit
-// offsets.
-ColloStatus copyHeadersToExtracted(
-    const WTF::Vector<ColloHeaderPair>&, const ColloResponseExtractLimits&, ColloExtractedHeaderBlock*);
 
 } // namespace Collo::HostFunctions

@@ -175,6 +175,41 @@ test "timer heap reuses capacity after pop and cancel" {
     try std.testing.expectEqual(@as(usize, 2), heap.len());
 }
 
+test "a request's cancel finds nothing in an empty timer heap or immediate queue, emptied ones included, and finds what is scheduled again" {
+    // A request's finish cancels its timers and immediates whether or not
+    // anything is scheduled, and an empty heap or queue answers at once.
+    var heap = try timers.TimerHeap.initCapacity(std.testing.allocator, 2);
+    defer heap.deinit();
+    try std.testing.expectEqual(@as(usize, 0), heap.cancelForRequest(10));
+    try heap.push(.{ .id = 1, .request_id = 10, .due_mono_ns = 5, .callback = .{ .inner = .{} } });
+    var popped = heap.popDue(5).?;
+    popped.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), heap.cancelForRequest(10));
+    try heap.push(.{ .id = 2, .request_id = 10, .due_mono_ns = 5, .callback = .{ .inner = .{} } });
+    try std.testing.expectEqual(@as(usize, 1), heap.cancelForRequest(10));
+    try std.testing.expectEqual(@as(usize, 0), heap.reservedCount());
+
+    var queue = try immediates.ImmediateQueue.initCapacity(std.testing.allocator, 2);
+    defer queue.deinit();
+    try std.testing.expect(queue.takeForRequest(10) == null);
+    try queue.push(.{ .id = 1, .request_id = 10, .generation = 0, .callback = .{ .inner = .{} } });
+    var taken = queue.takeForRequest(10).?;
+    taken.deinit(std.testing.allocator);
+    try std.testing.expect(queue.takeForRequest(10) == null);
+    try std.testing.expectEqual(@as(usize, 0), queue.reservedCount());
+
+    // A full queue, no free slot left, still answers for each request.
+    try queue.push(.{ .id = 2, .request_id = 10, .generation = 0, .callback = .{ .inner = .{} } });
+    try queue.push(.{ .id = 3, .request_id = 11, .generation = 0, .callback = .{ .inner = .{} } });
+    var first = queue.takeForRequest(10).?;
+    first.deinit(std.testing.allocator);
+    try std.testing.expect(queue.takeForRequest(10) == null);
+    try std.testing.expectEqual(@as(usize, 1), queue.reservedCount());
+    var second = queue.takeForRequest(11).?;
+    second.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), queue.reservedCount());
+}
+
 test "immediate queue preserves fifo order within generation" {
     var queue = try immediates.ImmediateQueue.initCapacity(std.testing.allocator, 3);
     defer queue.deinit();

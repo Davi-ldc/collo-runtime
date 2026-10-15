@@ -5,6 +5,7 @@
 // threads call memoryCost().
 
 #include "host_functions/server/fetch/headers.h"
+#include "host_functions/server/fetch/extracted_response.h"
 #include "host_functions/server/fetch/headers_list.h"
 #include "host_functions/webapi/dom/dom_exception.h"
 #include "host_functions/webapi/limits.h"
@@ -13,8 +14,8 @@
 #include <JavaScriptCore/IdentifierInlines.h>
 #include <JavaScriptCore/InternalFunction.h>
 #include <JavaScriptCore/IteratorOperations.h>
-#include <JavaScriptCore/JSCInlines.h>
 #include <JavaScriptCore/JSArray.h>
+#include <JavaScriptCore/JSCInlines.h>
 #include <JavaScriptCore/JSDestructibleObject.h>
 #include <JavaScriptCore/JSFunction.h>
 #include <JavaScriptCore/JSONObject.h>
@@ -32,6 +33,8 @@
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include <memory>
+#include <new>
 #include <optional>
 #include <span>
 
@@ -726,22 +729,54 @@ bool collectHeadersToPairs(JSC::JSGlobalObject* global_object, JSC::ThrowScope& 
     return true;
 }
 
-bool inspectHeadersForExtraction(
-    JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSC::JSObject* headers, HeaderExtractionStats& out)
+ColloStatus copyHeadersForHostResponse(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope,
+    JSC::JSObject* headers, const ColloResponseExtractLimits& limits, ColloExtractedHeaderBlock& out)
 {
-    out = {};
     auto* native_headers = requireHeaders(global_object, scope, headers);
-    RETURN_IF_EXCEPTION(scope, false);
+    RETURN_IF_EXCEPTION(scope, COLLO_STATUS_JS_EXCEPTION);
     if (!native_headers)
-        return false;
+        return COLLO_STATUS_ERROR;
+    const HeadersList& list = native_headers->list();
 
-    auto keys = sortedHeaderKeys(native_headers->list(), true);
-    out.count = keys.size();
+    auto keys = sortedHeaderKeys(list, true);
+    if (keys.isEmpty())
+        return COLLO_STATUS_OK;
+    if (keys.size() > limits.max_header_count)
+        return COLLO_STATUS_RESPONSE_HEADER_COUNT_TOO_LARGE;
+    // The limit bounds the storage the views address with 32-bit offsets, and it is checked before anything is
+    // allocated.
+    size_t storage_size = 0;
     for (auto key : keys) {
-        addSaturated(out.aggregate_bytes, native_headers->list().nameBytesForKey(key).size());
-        addSaturated(out.aggregate_bytes, native_headers->list().valueBytesForKey(key).size());
+        addSaturated(storage_size, list.nameBytesForKey(key).size());
+        addSaturated(storage_size, list.valueBytesForKey(key).size());
     }
-    return true;
+    if (storage_size > limits.max_header_bytes || storage_size > std::numeric_limits<uint32_t>::max())
+        return COLLO_STATUS_RESPONSE_HEADER_BYTES_TOO_LARGE;
+
+    std::unique_ptr<ColloOwnedHeaderBlock> owner { new (std::nothrow) ColloOwnedHeaderBlock };
+    if (!owner || !owner->storage.tryReserveInitialCapacity(storage_size)
+        || !owner->headers.tryReserveInitialCapacity(keys.size()))
+        return COLLO_STATUS_OUT_OF_MEMORY;
+    // The list holds every name and value as UTF-8, which is what Zig reads, so no String is built.
+    for (auto key : keys) {
+        auto name = list.nameBytesForKey(key);
+        auto value = list.valueBytesForKey(key);
+        const auto name_offset = static_cast<uint32_t>(owner->storage.size());
+        owner->storage.append(name);
+        const auto value_offset = static_cast<uint32_t>(owner->storage.size());
+        owner->storage.append(value);
+        owner->headers.append(ColloHeaderView {
+            name_offset,
+            static_cast<uint32_t>(name.size()),
+            value_offset,
+            static_cast<uint32_t>(value.size()),
+        });
+    }
+    out.storage = { owner->storage.isEmpty() ? nullptr : owner->storage.span().data(), owner->storage.size() };
+    out.headers = owner->headers.span().data();
+    out.headers_len = owner->headers.size();
+    out.owner = owner.release();
+    return COLLO_STATUS_OK;
 }
 
 bool setHeaderDefault(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, JSC::JSObject* headers,

@@ -208,10 +208,8 @@ bool BodyState::byteLength(JSC::JSGlobalObject* global_object, JSC::ThrowScope& 
     case Source::Empty:
         return true;
     case Source::Text:
-        if (stringUtf8ByteLength(m_text, out))
-            return true;
-        JSC::throwOutOfMemoryError(global_object, scope);
-        return false;
+        out = stringUtf8ByteLength(m_text);
+        return true;
     case Source::Bytes:
         out = m_bytes ? m_bytes->size() : 0;
         return true;

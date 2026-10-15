@@ -162,14 +162,14 @@ fn extractNativeResponse(
     };
     errdefer extracted.deinit(runtime);
 
+    // `validateHostResponseShape` checked every header kept here.
+    try extracted.headers.ensureTotalCapacityPrecise(runtime.core.allocator, extracted.header_block.headersSlice().len);
     for (extracted.header_block.headersSlice()) |header| {
         const name = extracted.header_block.nameSlice(header);
         if (shouldDropHostHeader(host, name)) {
             continue;
         }
-        const header_value = extracted.header_block.valueSlice(header);
-        try response_model.validateHeader(name, header_value);
-        try extracted.headers.append(runtime.core.allocator, .{ .name = name, .value = header_value });
+        extracted.headers.appendAssumeCapacity(.{ .name = name, .value = extracted.header_block.valueSlice(header) });
     }
 
     return .{ .extracted = extracted };

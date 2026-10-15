@@ -13,26 +13,12 @@
 #include <JavaScriptCore/JSCInlines.h>
 #include <JavaScriptCore/JSGenericTypedArrayViewInlines.h>
 #include <JavaScriptCore/JSONObject.h>
+#include <wtf/SIMDUTF.h>
 #include <wtf/text/StringBuilder.h>
 
 #include <cstring>
-#include <limits>
 
 namespace Collo::HostFunctions {
-namespace {
-
-    bool addUtf8CodePointLength(size_t& total, uint32_t code_point)
-    {
-        size_t bytes = 1;
-        if (code_point > 0x7f)
-            bytes = code_point <= 0x7ff ? 2 : code_point <= 0xffff ? 3 : 4;
-        if (total > std::numeric_limits<size_t>::max() - bytes)
-            return false;
-        total += bytes;
-        return true;
-    }
-
-} // namespace
 
 void releaseReadableStreamReader(JSC::JSGlobalObject* global_object, JSC::JSObject* reader)
 {
@@ -64,14 +50,47 @@ void throwAlreadyUsedTypeError(JSC::JSGlobalObject* global_object, JSC::ThrowSco
 bool appendStringBytes(
     JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, WTF::Vector<uint8_t>& output, const WTF::String& string)
 {
-    auto result = string.tryGetUTF8([&](std::span<const char8_t> utf8) -> bool {
-        return output.tryAppend(
-            std::span<const uint8_t> { reinterpret_cast<const uint8_t*>(utf8.data()), utf8.size() });
-    });
-    if (!result || !result.value()) {
+    // The string is encoded straight into the output, sized by stringUtf8ByteLength, with no buffer in between. An
+    // ASCII Latin-1 string, which JSON.stringify and most response bodies make, is its own UTF-8.
+    if (string.isEmpty())
+        return true;
+    const size_t start = output.size();
+    if (string.is8Bit()) {
+        auto latin1 = string.span8();
+        const auto* chars = reinterpret_cast<const char*>(latin1.data());
+        if (simdutf::validate_ascii(chars, latin1.size())) {
+            if (output.tryAppend(latin1))
+                return true;
+            JSC::throwOutOfMemoryError(global_object, scope);
+            return false;
+        }
+        const size_t utf8_length = simdutf::utf8_length_from_latin1(chars, latin1.size());
+        if (!output.tryGrow(start + utf8_length)) {
+            JSC::throwOutOfMemoryError(global_object, scope);
+            return false;
+        }
+        const size_t written = simdutf::convert_latin1_to_utf8(
+            chars, latin1.size(), reinterpret_cast<char*>(output.mutableSpan().subspan(start).data()));
+        // The output was sized by the count; a converter that disagreed has written past it or left bytes unset,
+        // and neither may leave the worker.
+        RELEASE_ASSERT(written == utf8_length);
+        return true;
+    }
+    auto units = string.span16();
+    const auto measured = simdutf::utf8_length_from_utf16_with_replacement(units.data(), units.size());
+    if (!output.tryGrow(start + measured.count)) {
         JSC::throwOutOfMemoryError(global_object, scope);
         return false;
     }
+    auto* destination = reinterpret_cast<char*>(output.mutableSpan().subspan(start).data());
+    // The count reports any surrogate it met, paired or not. Well-formed text, surrogate pairs included, takes the
+    // vectorized conversion; only text with an unpaired surrogate takes the replacing one, which writes U+FFFD for
+    // each and in this simdutf runs scalar. Both write what the count counted.
+    const bool well_formed = measured.error == simdutf::SUCCESS || simdutf::validate_utf16(units.data(), units.size());
+    const size_t written = well_formed
+        ? simdutf::convert_valid_utf16_to_utf8(units.data(), units.size(), destination)
+        : simdutf::convert_utf16_to_utf8_with_replacement(units.data(), units.size(), destination);
+    RELEASE_ASSERT(written == measured.count);
     return true;
 }
 
@@ -84,47 +103,23 @@ bool copyBytes(JSC::JSGlobalObject* global_object, JSC::ThrowScope& scope, WTF::
     return false;
 }
 
-bool stringUtf8ByteLength(const WTF::String& string, size_t& out)
+size_t stringUtf8ByteLength(const WTF::String& string)
 {
-    out = 0;
     if (string.isEmpty())
-        return true;
-
+        return 0;
     if (string.is8Bit()) {
-        for (auto ch : string.span8()) {
-            if (!addUtf8CodePointLength(out, ch))
-                return false;
-        }
-        return true;
+        auto latin1 = string.span8();
+        return simdutf::utf8_length_from_latin1(reinterpret_cast<const char*>(latin1.data()), latin1.size());
     }
-
-    // An unpaired surrogate counts as U+FFFD, three bytes, because tryGetUTF8's lenient conversion writes U+FFFD for
-    // it; appendStringBytes then appends exactly this many bytes.
+    // An unpaired surrogate counts as U+FFFD, three bytes, which appendStringBytes writes for it, and a pair as
+    // four; simdutf's error field only reports that a surrogate was seen.
     auto units = string.span16();
-    for (size_t index = 0; index < units.size(); index++) {
-        uint16_t unit = units[index];
-        uint32_t code_point = unit;
-        if (unit >= 0xd800 && unit <= 0xdbff && index + 1 < units.size()) {
-            uint16_t low = units[index + 1];
-            if (low >= 0xdc00 && low <= 0xdfff) {
-                code_point = 0x10000 + (((unit - 0xd800) << 10) | (low - 0xdc00));
-                index++;
-            } else {
-                code_point = 0xfffd;
-            }
-        } else if (unit >= 0xdc00 && unit <= 0xdfff) {
-            code_point = 0xfffd;
-        }
-        if (!addUtf8CodePointLength(out, code_point))
-            return false;
-    }
-    return true;
+    return simdutf::utf8_length_from_utf16_with_replacement(units.data(), units.size()).count;
 }
 
 bool stringUtf8LengthWithinLimit(const WTF::String& string, size_t limit)
 {
-    size_t length = 0;
-    return stringUtf8ByteLength(string, length) && length <= limit;
+    return stringUtf8ByteLength(string) <= limit;
 }
 
 std::span<const uint8_t> sharedBytesSpan(const WTF::RefPtr<ColloSharedBytes>& bytes)

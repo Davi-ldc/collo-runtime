@@ -3,21 +3,7 @@
 
 #include "host_functions/server/fetch/extracted_response.h"
 
-#include <limits>
-#include <new>
-
 namespace Collo::HostFunctions {
-namespace {
-
-    bool addCopiedBytesWithinLimit(size_t& total, size_t bytes, size_t limit)
-    {
-        if (bytes > limit || total > limit - bytes)
-            return false;
-        total += bytes;
-        return true;
-    }
-
-} // namespace
 
 void resetExtractedResponse(ColloExtractedResponse* response)
 {
@@ -87,83 +73,6 @@ bool publishBlobSegments(ColloOwnedByteSegments& owner, ColloExtractedResponseBo
     out.segments_len = owner.segments.size();
     out.owner = &owner;
     return true;
-}
-
-ColloStatus copyHeadersToExtracted(
-    const WTF::Vector<ColloHeaderPair>& pairs, const ColloResponseExtractLimits& limits, ColloExtractedHeaderBlock* out)
-{
-    if (pairs.isEmpty())
-        return COLLO_STATUS_OK;
-    if (pairs.size() > limits.max_header_count)
-        return COLLO_STATUS_RESPONSE_HEADER_COUNT_TOO_LARGE;
-
-    auto* owner = new (std::nothrow) ColloOwnedHeaderBlock;
-    if (!owner)
-        return COLLO_STATUS_OUT_OF_MEMORY;
-
-    // This pass only measures, so a block over the byte limit fails before its storage is allocated.
-    size_t storage_size = 0;
-    for (unsigned index = 0; index < pairs.size(); index++) {
-        auto name = pairs[index].name.tryGetUTF8();
-        auto value = pairs[index].value.tryGetUTF8();
-        if (!name || !value) {
-            delete owner;
-            return COLLO_STATUS_OUT_OF_MEMORY;
-        }
-        if (!addCopiedBytesWithinLimit(storage_size, name.value().length(), limits.max_header_bytes)) {
-            delete owner;
-            return COLLO_STATUS_RESPONSE_HEADER_BYTES_TOO_LARGE;
-        }
-        if (!addCopiedBytesWithinLimit(storage_size, value.value().length(), limits.max_header_bytes)) {
-            delete owner;
-            return COLLO_STATUS_RESPONSE_HEADER_BYTES_TOO_LARGE;
-        }
-    }
-
-    if (!owner->storage.tryReserveInitialCapacity(storage_size)
-        || !owner->headers.tryReserveInitialCapacity(pairs.size())) {
-        delete owner;
-        return COLLO_STATUS_OUT_OF_MEMORY;
-    }
-
-    for (unsigned index = 0; index < pairs.size(); index++) {
-        auto name = pairs[index].name.tryGetUTF8();
-        auto value = pairs[index].value.tryGetUTF8();
-        if (!name || !value) {
-            delete owner;
-            return COLLO_STATUS_OUT_OF_MEMORY;
-        }
-        const uint32_t name_offset = static_cast<uint32_t>(owner->storage.size());
-        if (!owner->storage.tryAppend(std::span<const uint8_t> {
-                reinterpret_cast<const uint8_t*>(name.value().data()), name.value().length() })) {
-            delete owner;
-            return COLLO_STATUS_OUT_OF_MEMORY;
-        }
-        const uint32_t value_offset = static_cast<uint32_t>(owner->storage.size());
-        if (!owner->storage.tryAppend(std::span<const uint8_t> {
-                reinterpret_cast<const uint8_t*>(value.value().data()), value.value().length() })) {
-            delete owner;
-            return COLLO_STATUS_OUT_OF_MEMORY;
-        }
-        if (!owner->headers.tryAppend(ColloHeaderView {
-                name_offset,
-                static_cast<uint32_t>(name.value().length()),
-                value_offset,
-                static_cast<uint32_t>(value.value().length()),
-            })) {
-            delete owner;
-            return COLLO_STATUS_OUT_OF_MEMORY;
-        }
-    }
-
-    out->storage = {
-        owner->storage.isEmpty() ? nullptr : owner->storage.span().data(),
-        owner->storage.size(),
-    };
-    out->headers = owner->headers.isEmpty() ? nullptr : owner->headers.span().data();
-    out->headers_len = owner->headers.size();
-    out->owner = owner;
-    return COLLO_STATUS_OK;
 }
 
 } // namespace Collo::HostFunctions

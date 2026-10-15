@@ -113,11 +113,7 @@ bool createBodyStateFromJS(
 
     auto body_text = valueToWebApiString(global_object, scope, body_value);
     RETURN_IF_EXCEPTION(scope, false);
-    size_t body_text_bytes = 0;
-    if (!stringUtf8ByteLength(body_text, body_text_bytes)) {
-        JSC::throwOutOfMemoryError(global_object, scope);
-        return false;
-    }
+    const size_t body_text_bytes = stringUtf8ByteLength(body_text);
     if (!ensureBodyMaterializationBudget(global_object, scope, body_text_bytes))
         return false;
     out.body.state = BodyState::fromText(WTF::move(body_text));

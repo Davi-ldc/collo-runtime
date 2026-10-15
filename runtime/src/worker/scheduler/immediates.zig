@@ -191,6 +191,10 @@ pub const ImmediateQueue = struct {
     /// Removes one entry `request_id` scheduled and hands it to the caller;
     /// null when none is left.
     pub fn takeForRequest(self: *ImmediateQueue, request_id: u64) ?ImmediateEntry {
+        // Every request's finish calls this, so an empty queue answers
+        // without walking all its slots.
+        if (self.reservedCount() == 0)
+            return null;
         for (0..self.nodes.len) |slot| {
             const node = &self.nodes[slot];
             if (!node.active)

@@ -1,6 +1,6 @@
 // The Headers API the rest of the fetch bridge uses: building a Headers cell from a JavaScript init or from ABI pairs,
-// cloning one, reading or defaulting a single header, and flattening one into pairs for an outbound fetch or a host
-// response. The cell and its storage live in headers.cpp and headers_list.h. VM thread only.
+// cloning one, reading or defaulting a single header, flattening one into pairs for an outbound fetch, and copying one
+// into a host response's header block. The cell and its storage live in headers.cpp and headers_list.h. VM thread only.
 //
 // A JSObject* parameter named headers must be a Headers cell; anything else throws a TypeError. Every JSGlobalObject
 // parameter must be a Collo::GlobalObject, which these functions downcast without checking. A function that returns
@@ -20,13 +20,6 @@ namespace Collo::HostFunctions {
 struct ColloHeaderPair {
     WTF::String name;
     WTF::String value;
-};
-
-// The pair count and the name and value bytes that collectHeadersToPairs would produce. The byte total saturates at
-// SIZE_MAX.
-struct HeaderExtractionStats {
-    size_t count { 0 };
-    size_t aggregate_bytes { 0 };
 };
 
 // The Fetch Standard's headers guard. Immutable throws on every write. Request silently drops forbidden
@@ -60,9 +53,15 @@ JSC::JSObject* cloneHeadersPreservingGuard(JSC::JSGlobalObject*, JSC::ThrowScope
 // OutOfMemoryError when `pairs` cannot grow.
 bool collectHeadersToPairs(
     JSC::JSGlobalObject*, JSC::ThrowScope&, JSC::JSObject* headers, WTF::Vector<ColloHeaderPair>& pairs);
-// Fills `out` without applying any limit, so the caller can check its own before collecting the pairs.
-bool inspectHeadersForExtraction(
-    JSC::JSGlobalObject*, JSC::ThrowScope&, JSC::JSObject* headers, HeaderExtractionStats& out);
+// For collo_response_extract: copies every header, in collectHeadersToPairs' order, into a new header block it
+// publishes in `out`, which the extracted response then owns; `out` stays untouched when there is no header and on
+// failure. The bytes come straight from the list, which holds every name and value as UTF-8. Fails with
+// COLLO_STATUS_RESPONSE_HEADER_COUNT_TOO_LARGE past `limits.max_header_count` headers or
+// COLLO_STATUS_RESPONSE_HEADER_BYTES_TOO_LARGE past `limits.max_header_bytes` name and value bytes, both before
+// anything is allocated, with COLLO_STATUS_OUT_OF_MEMORY, or with COLLO_STATUS_JS_EXCEPTION after throwing for an
+// object that is not a Headers cell.
+ColloStatus copyHeadersForHostResponse(JSC::JSGlobalObject*, JSC::ThrowScope&, JSC::JSObject* headers,
+    const ColloResponseExtractLimits&, ColloExtractedHeaderBlock& out);
 // Sets `name` to `value` unless the Headers already has `name`, as a body's Content-Type or a redirect's Location is
 // defaulted. `name` must be a valid header name other than set-cookie, which HeadersList::has never reports; it is
 // lowercased here. `value` is trimmed but not checked for NUL, CR or LF, so the caller passes a valid header value.

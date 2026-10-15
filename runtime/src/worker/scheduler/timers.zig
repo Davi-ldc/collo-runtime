@@ -158,6 +158,10 @@ pub const TimerHeap = struct {
     /// Frees every timer `request_id` scheduled and returns how many there
     /// were.
     pub fn cancelForRequest(self: *TimerHeap, request_id: u64) usize {
+        // Every request's finish calls this, so a heap with no timer answers
+        // without walking all its slots.
+        if (self.reservedCount() == 0)
+            return 0;
         var canceled: usize = 0;
         for (self.nodes) |*node| {
             if (!node.active or node.entry.request_id != request_id)

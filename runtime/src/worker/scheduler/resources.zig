@@ -316,7 +316,8 @@ pub fn nextRequestDeadlineNs(runtime: anytype) ?u64 {
 /// Frees every timer of `request_id` in the heap and in the ready map.
 pub fn cancelTimersForRequest(runtime: anytype, request_id: u64) void {
     _ = runtime.scheduler.timers.cancelForRequest(request_id);
-    while (true) {
+    // Iterating a hash map walks its whole capacity, empty or not.
+    while (runtime.scheduler.ready_timer_callbacks.count() != 0) {
         var remove_id: ?u64 = null;
         var iterator = runtime.scheduler.ready_timer_callbacks.iterator();
         while (iterator.next()) |entry| {
@@ -339,7 +340,7 @@ pub fn cancelImmediatesForRequest(runtime: anytype, request_id: u64) void {
         var immediate = entry;
         immediate.deinit(runtime.core.allocator);
     }
-    while (true) {
+    while (runtime.scheduler.ready_immediate_callbacks.count() != 0) {
         var remove_id: ?u64 = null;
         var iterator = runtime.scheduler.ready_immediate_callbacks.iterator();
         while (iterator.next()) |entry| {

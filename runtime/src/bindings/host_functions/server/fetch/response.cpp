@@ -1009,17 +1009,14 @@ namespace {
     {
         out->status = response->status();
 
-        HeaderExtractionStats header_stats;
-        if (!inspectHeadersForExtraction(global_object, scope, response->headers(), header_stats)) {
-            if (auto exception_status = consumeExceptionStatus(vm, scope, out_exception);
-                exception_status != COLLO_STATUS_OK)
-                return exception_status;
-            return COLLO_STATUS_ERROR;
+        // The headers come first, so their limits answer before any body work; on a later failure the caller frees
+        // the block with the rest of `out`.
+        if (auto status = copyHeadersForHostResponse(global_object, scope, response->headers(), limits, out->headers);
+            status != COLLO_STATUS_OK) {
+            if (status == COLLO_STATUS_JS_EXCEPTION)
+                return statusOr(consumeExceptionStatus(vm, scope, out_exception), COLLO_STATUS_ERROR);
+            return status;
         }
-        if (header_stats.count > limits.max_header_count)
-            return COLLO_STATUS_RESPONSE_HEADER_COUNT_TOO_LARGE;
-        if (header_stats.aggregate_bytes > limits.max_header_bytes)
-            return COLLO_STATUS_RESPONSE_HEADER_BYTES_TOO_LARGE;
 
         if (response->body().source() == BodyState::Source::FetchStream) {
             if (!response->body().canTransferFetchStreamForHostResponse(
@@ -1030,18 +1027,6 @@ namespace {
                 return COLLO_STATUS_ERROR;
             }
 
-            WTF::Vector<ColloHeaderPair> pairs;
-            if (!collectHeadersToPairs(global_object, scope, response->headers(), pairs)) {
-                if (auto exception_status = consumeExceptionStatus(vm, scope, out_exception);
-                    exception_status != COLLO_STATUS_OK)
-                    return exception_status;
-                return COLLO_STATUS_ERROR;
-            }
-
-            auto status = copyHeadersToExtracted(pairs, limits, &out->headers);
-            if (status != COLLO_STATUS_OK)
-                return status;
-
             // The stream moves to the caller only after every step that can fail, so a failed extraction leaves the
             // fetch body with the Response.
             out->body.kind = COLLO_EXTRACTED_RESPONSE_BODY_FETCH_STREAM;
@@ -1050,19 +1035,8 @@ namespace {
         }
 
         if (response->body().source() == BodyState::Source::ReadableStream) {
-            WTF::Vector<ColloHeaderPair> pairs;
-            if (!collectHeadersToPairs(global_object, scope, response->headers(), pairs)) {
-                if (auto exception_status = consumeExceptionStatus(vm, scope, out_exception);
-                    exception_status != COLLO_STATUS_OK)
-                    return exception_status;
-                return COLLO_STATUS_ERROR;
-            }
-            auto status = copyHeadersToExtracted(pairs, limits, &out->headers);
-            if (status != COLLO_STATUS_OK)
-                return status;
-
             // Taking or locking the stream comes last, because nothing undoes either.
-            status = extractResponseBodyStream(
+            auto status = extractResponseBodyStream(
                 vm, global_object, scope, response->bodyStream(), limits.max_body_bytes, out->body);
             if (status == COLLO_STATUS_JS_EXCEPTION)
                 return statusOr(consumeExceptionStatus(vm, scope, out_exception), COLLO_STATUS_ERROR);
@@ -1086,16 +1060,7 @@ namespace {
                 return exception_status;
             return COLLO_STATUS_ERROR;
         }
-
-        WTF::Vector<ColloHeaderPair> pairs;
-        if (!collectHeadersToPairs(global_object, scope, response->headers(), pairs)) {
-            if (auto exception_status = consumeExceptionStatus(vm, scope, out_exception);
-                exception_status != COLLO_STATUS_OK)
-                return exception_status;
-            return COLLO_STATUS_ERROR;
-        }
-
-        return copyHeadersToExtracted(pairs, limits, &out->headers);
+        return COLLO_STATUS_OK;
     }
 
 } // namespace
