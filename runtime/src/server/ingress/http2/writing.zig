@@ -1,29 +1,37 @@
 //! The writing half of the HTTP/2 connection driver (`connection.zig`), on
 //! the lane thread that owns the connection slot: everything bound for the
-//! client, encoded into frames and written to the socket, through the
-//! connection's write queue (`runner/write_queue.zig`) or straight from the
-//! caller's bytes. That covers the answers the lane writes alone
-//! (`queueServerResponse`), a worker's response descriptors, response heads
-//! encoded with the connection's HPACK encoder, DATA within the send
-//! windows, and the control frames: SETTINGS, PING acknowledgements, the
-//! WINDOW_UPDATE frames that return receive credit to the client,
-//! RST_STREAM and GOAWAY. Worker response heads are decoded within the caps
-//! below and forwarded as the worker wrote them, once `response.zig` has
-//! checked every header.
+//! client, encoded into frames, queued on the connection's write queue
+//! (`runner/write_queue.zig`) and written to the socket. That covers the
+//! answers the lane writes alone (`queueServerResponse`), a worker's
+//! response descriptors, response heads encoded with the connection's HPACK
+//! encoder, DATA within the send windows, and the control frames: SETTINGS,
+//! PING acknowledgements, the WINDOW_UPDATE frames that return receive
+//! credit to the client, RST_STREAM and GOAWAY. Worker response heads are
+//! decoded within the caps below and forwarded as the worker wrote them,
+//! once `response.zig` has checked every header.
 //!
 //! Invariants:
-//! - A response head is encoded when it is queued, and the client decodes
-//!   header blocks in the order they reach it, so they must go out in the
-//!   order they were encoded: a frame goes straight to the socket only while
-//!   nothing is queued.
+//! - Every frame goes through the queue and only `flushPendingWrite` writes
+//!   it, so frames reach the client in the order they were queued, which
+//!   keeps header blocks in the order the HPACK encoder encoded them.
+//! - A queue function only appends, and the connection's next flush writes
+//!   what it appended (`noteQueued`): a drive that runs now flushes after
+//!   each read and before it ends (`connection.zig`), and an append outside
+//!   a drive gives the connection a turn of the lane's loop, which the pass
+//!   that queued it runs (`queueConnectionTurn` on `Worker`). So the frames a
+//!   pass queues for a connection, a worker's head, DATA and END_STREAM
+//!   among them, leave in one write. An append that brings an unblocked
+//!   queue to `write_queue.cork_bytes_max` writes it at once.
+//! - A write the socket takes in part marks the queue blocked and arms the
+//!   write poll without a retry that would take nothing, and no write is
+//!   tried while that poll is in flight.
 //! - Body bytes go out only as far as the stream's and the connection's send
 //!   windows allow; the rest waits on its stream, and bytes queued after them
-//!   append behind them.
-//! - Receive credit the connection owes goes out in WINDOW_UPDATE frames of
-//!   their own only once it is due (`Slot.h2WindowUpdateDue`); until then it
-//!   rides at the tail of the next write of the queue (`flushPendingWrite`),
-//!   which every response head and control frame makes, while DATA written
-//!   straight from its buffer carries none.
+//!   append behind them. What waits on a stream stays there while the queue
+//!   is blocked.
+//! - Receive credit the connection owes rides at the tail of the next write
+//!   the connection makes, and once it is due (`Slot.h2WindowUpdateDue`) the
+//!   connection gets a write for it alone (`scheduleDueWindowUpdates`).
 
 const std = @import("std");
 
@@ -50,7 +58,10 @@ const Slot = connection_slot.Slot;
 pub const ServerResponse = server_responses.Response;
 
 /// Queued segments one writev covers; `flushPendingWrite` loops for the rest.
-const max_writev_segments: usize = 16;
+/// A worker's chunk queues two segments per DATA frame (`queueChunkFrames`),
+/// so the head, DATA and END_STREAM of several streams' responses with their
+/// control frames fit in one.
+const max_writev_segments: usize = 64;
 // Caps on decoding a worker's response head. They must admit every head the
 // worker's validator accepts (`max_response_header_count` and
 // `max_response_header_bytes` in `worker/request/response_model.zig`), or a
@@ -410,12 +421,15 @@ fn decodeWorkerResponseResetCode(raw: u32) ?h2.ErrorCode {
     };
 }
 
-/// Writes queued bytes until the queue drains or the socket would block, and
-/// returns whether anything happened. The receive credit the connection
-/// owes rides at the tail of the write (`appendOwedCreditToWrite`). A socket
-/// that would block arms the connection's write poll, and one that failed
-/// asks the lane to close the connection. A closing connection writes only
-/// while its close flushes the queue.
+/// Writes the queue, with the receive credit the connection owes at its
+/// tail (`appendOwedCredit`), until it drains or the socket takes less than
+/// it was offered, and returns whether anything happened. A socket that took
+/// part of a write, or would block, marks the queue blocked and arms the
+/// connection's write poll; one that failed asks the lane to close the
+/// connection. Nothing is tried while the queue is blocked and its write poll
+/// is in flight, since the poll reports when the socket takes bytes again. A
+/// closing connection writes only while its close flushes the queue. Each
+/// write that moves bytes counts in the lane's `client_socket_writes`.
 pub fn flushPendingWrite(comptime Worker: type, worker: *Worker, runtime: *Slot) LaneFault!bool {
     if (!runtime.isLive())
         return false;
@@ -423,22 +437,42 @@ pub fn flushPendingWrite(comptime Worker: type, worker: *Worker, runtime: *Slot)
         if (!closing.flush)
             return false;
     }
-    if (runtime.h2WritesPending())
-        try appendOwedCreditToWrite(Worker, worker, runtime);
+    if (runtime.h2WritesBlocked() and runtime.registered_wait_events & event_sources.write_interest != 0)
+        return false;
+    try appendOwedCredit(Worker, worker, runtime);
     var did_work = false;
     while (runtime.h2WritesPending()) {
-        const written = writeQueuedSegments(runtime) catch |err|
+        var iovecs: [max_writev_segments]std.posix.iovec_const = undefined;
+        const vectors = runtime.h2QueuedWriteVectors(&iovecs);
+        var offered: usize = 0;
+        for (vectors) |vector|
+            offered += vector.len;
+        const written = std.posix.writev(runtime.fd, vectors) catch |err| {
+            runtime.h2_write_blocked = true;
             return (try connection.actOnClientIo(Worker, worker, runtime, .write, err)) or did_work;
+        };
         if (written == 0) {
             // A socket that takes no byte of a write has closed.
             _ = try connection.actOnClientIo(Worker, worker, runtime, .write, error.PeerClosed);
             return true;
         }
+        worker.lane.counters.client_socket_writes += 1;
         runtime.h2ConsumeQueuedWrite(worker.service.allocator, written);
-        try retireResponseChunks(Worker, worker, runtime);
         runtime.noteProgress(process.monotonicNowNsOrZero());
         did_work = true;
+        if (written < offered) {
+            // The socket's buffer is full, so a write now would take
+            // nothing; the write poll brings the connection back once it
+            // has room.
+            runtime.h2_write_blocked = true;
+            runtime.wait_events = event_sources.write_events;
+            try worker.updateConnectionInterest(runtime);
+            try retireResponseChunks(Worker, worker, runtime);
+            return true;
+        }
+        try retireResponseChunks(Worker, worker, runtime);
     }
+    runtime.h2_write_blocked = false;
     return did_work;
 }
 
@@ -518,29 +552,22 @@ pub fn queuePingAck(comptime Worker: type, worker: *Worker, runtime: *Slot, payl
     return queueWriteCopy(Worker, worker, runtime, &scratch);
 }
 
-/// Queues WINDOW_UPDATE frames for the receive credit the connection owes
-/// once that credit is due (`Slot.h2WindowUpdateDue`), and writes what the
-/// socket takes. Credit that is not due waits for the next frames the
-/// connection writes anyway, which carry it at their tail
-/// (`flushPendingWrite`). Nothing is queued while the socket holds other
-/// writes back. A connection that cannot take the frames is asked to close,
-/// and only lane faults return.
-pub fn queueDueWindowUpdates(
+/// Gives the connection the write that carries the receive credit it owes
+/// outside a drive, once that credit is due (`Slot.h2WindowUpdateDue`): a
+/// turn of the lane's loop, whose flush appends the credit
+/// (`appendOwedCredit`). A drive that runs now flushes it itself, credit
+/// that is not due waits for the next write the connection makes anyway, and
+/// a blocked queue's write poll brings the connection back before any write.
+pub fn scheduleDueWindowUpdates(
     comptime Worker: type,
     worker: *Worker,
     runtime: *Slot,
-) LaneFault!bool {
-    if (!runtime.isOpen() or runtime.h2WritesPending())
-        return false;
+) LaneFault!void {
+    if (!runtime.isOpen() or runtime.h2WritesBlocked() or runtime.h2_driving)
+        return;
     if (!runtime.h2WindowUpdateDue())
-        return false;
-    const queued = appendWindowUpdates(worker.service.allocator, runtime) catch |err| {
-        try connection.closeForError(Worker, worker, runtime, err);
-        return true;
-    };
-    if (!queued)
-        return false;
-    return flushPendingWrite(Worker, worker, runtime);
+        return;
+    try worker.queueConnectionTurn(runtime);
 }
 
 /// Appends a WINDOW_UPDATE for every credit the connection owes to the end
@@ -578,33 +605,42 @@ fn appendWindowUpdates(allocator: std.mem.Allocator, runtime: *Slot) !bool {
 }
 
 /// Appends the credit an open connection owes behind the frames about to be
-/// written, so it rides their write instead of a write of its own. The queue
+/// written, so it rides their write, or alone once it is due. The queue
 /// holds whole frames only, a header block's HEADERS and CONTINUATION frames
 /// as one segment, so the frames never land inside a header block; a closing
-/// connection appends nothing behind its GOAWAY. A queue without room, or an
-/// allocation that fails, leaves the credit owed for a later write or its
-/// due time; credit no frame can carry asks the lane to close the
-/// connection.
-fn appendOwedCreditToWrite(comptime Worker: type, worker: *Worker, runtime: *Slot) LaneFault!void {
+/// connection appends nothing behind its GOAWAY. A queue without room leaves
+/// the credit owed for the write that drains it, and so does a failed
+/// allocation while the credit is not due. Due credit no frame can carry asks
+/// the lane to close the connection: a client at half its window or below may
+/// send nothing more, so no later write would come to carry it.
+fn appendOwedCredit(comptime Worker: type, worker: *Worker, runtime: *Slot) LaneFault!void {
     if (!runtime.isOpen() or !runtime.h2HasPendingWindowUpdate())
         return;
+    const due = runtime.h2WindowUpdateDue();
+    if (!runtime.h2WritesPending() and !due)
+        return;
     _ = appendWindowUpdates(worker.service.allocator, runtime) catch |err| switch (err) {
-        error.OutOfMemory, error.Http2WriteBackpressure => return,
+        error.Http2WriteBackpressure => return,
+        error.OutOfMemory => {
+            if (due)
+                return connection.closeForError(Worker, worker, runtime, err);
+            return;
+        },
         else => |other| return connection.closeForError(Worker, worker, runtime, other),
     };
 }
 
-/// Sends waiting response bytes that the send windows now admit, for
+/// Queues waiting response bytes that the send windows now admit, for
 /// `stream_filter` alone or, with null, for every stream in turn. The turn
 /// starts after the last stream that made progress, so the streams share the
-/// connection window. Stops as soon as a write stays queued.
+/// connection window. Stops as soon as the queue is blocked.
 pub fn flushPendingResponseData(
     comptime Worker: type,
     worker: *Worker,
     runtime: *Slot,
     stream_filter: ?u32,
 ) !bool {
-    if (!runtime.isOpen() or runtime.h2WritesPending())
+    if (!runtime.isOpen() or runtime.h2WritesBlocked())
         return false;
 
     if (stream_filter) |stream_id|
@@ -621,7 +657,7 @@ pub fn flushPendingResponseData(
                 runtime.h2_response_rr_cursor = (index + 1) % positions;
                 did_work = true;
             }
-            if (!runtime.isOpen() or runtime.h2WritesPending())
+            if (!runtime.isOpen() or runtime.h2WritesBlocked())
                 return did_work;
         }
         index = (index + 1) % positions;
@@ -629,7 +665,7 @@ pub fn flushPendingResponseData(
     return did_work;
 }
 
-/// Sends what the windows admit of one stream's waiting response. Once its
+/// Queues what the windows admit of one stream's waiting response. Once its
 /// END_STREAM is queued the stream drains out of the table, or closes when
 /// its request is done too (`Slot.h2CloseStreamIfDone`).
 fn flushPendingResponseStream(
@@ -640,13 +676,14 @@ fn flushPendingResponseStream(
 ) !bool {
     const allocator = worker.service.allocator;
     var did_work = false;
-    // Nothing appends to the stream during the flush. A pass sends a whole
-    // chunk, of which a worker's stream holds at most its credit window, or
-    // the END_STREAM. After a pass that sends less, the next one queues the
-    // frame the socket refused, or stops. The bound covers those passes with
-    // one to spare.
+    // Nothing appends to the stream during the flush. A pass queues what the
+    // windows admit of one chunk, of which a worker's stream holds at most
+    // its credit window, or of a server response's one buffer, or the
+    // END_STREAM; a pass that queues less than its chunk found a window
+    // closed, and the next one stops. The bound covers those passes with one
+    // to spare.
     for (0..limits.http_body.INGRESS_RESPONSE_CHUNKS_IN_FLIGHT_MAX + 3) |_| {
-        if (!runtime.isOpen() or runtime.h2WritesPending())
+        if (!runtime.isOpen() or runtime.h2WritesBlocked())
             break;
         const pending = runtime.h2PendingResponseSlice(stream_id) orelse break;
         const end_stream = runtime.h2PendingResponseEndsStream(stream_id);
@@ -672,15 +709,12 @@ fn flushPendingResponseStream(
     return did_work;
 }
 
-/// Sends as much of `payload` as the send windows allow and returns how much
-/// it took; the caller keeps the rest waiting. `chunk` is the worker's chunk
-/// that holds `payload`, or null for a server response. With nothing queued,
-/// frames go to the socket straight from `payload`, and a frame the socket
-/// took in part has its tail queued. When writes are already queued, or the
-/// socket would block before taking a byte, a server response's admitted
-/// bytes are copied into the queue as frames, and a worker's chunk queues one
-/// frame that points into it. The stream records END_STREAM once its frame
-/// is queued.
+/// Queues as much of `payload` as the send windows allow and returns how
+/// much it took; the caller keeps the rest waiting. `chunk` is the worker's
+/// chunk that holds `payload`, whose frames point into it
+/// (`queueChunkFrames`), or null for a server response, whose admitted bytes
+/// are copied into the queue as frames. The stream records END_STREAM once
+/// its frame is queued.
 fn queueResponseDataAvailableWindow(
     comptime Worker: type,
     worker: *Worker,
@@ -700,130 +734,61 @@ fn queueResponseDataAvailableWindow(
     if (send_len == 0)
         return 0;
     const final = end_stream and send_len == payload.len;
-
-    if (!runtime.h2WritesPending()) {
-        const direct = try writeDataFramesDirectNoWindowAccounting(Worker, worker, runtime, stream_id, payload[0..send_len], final, chunk);
-        if (direct.committed_payload_len != 0) {
-            try runtime.h2ConsumeOutboundWindow(stream_id, direct.committed_payload_len, direct.committed_frames);
-            if (final and direct.committed_payload_len == send_len)
-                runtime.h2NoteResponseEndQueued(stream_id);
-            return direct.committed_payload_len;
-        }
-        if (direct.did_work or runtime.h2WritesPending())
-            return 0;
-    }
-
+    const max_frame_size: usize = runtime.h2_peer_settings.max_frame_size;
+    if (max_frame_size == 0)
+        return error.Http2FrameTooLarge;
+    // Both paths cut the bytes into frames of the peer's largest size.
+    const frame_count = std.math.divCeil(usize, send_len, max_frame_size) catch unreachable;
     if (chunk) |worker_chunk| {
-        const frame_len = @min(send_len, runtime.h2_peer_settings.max_frame_size);
-        const frame_final = final and frame_len == send_len;
-        var header: [h2.frame_header_len]u8 = undefined;
-        try encodeFrameHeader(&header, frame_len, .data, if (frame_final) 0x1 else 0, stream_id);
-        try queueChunkFrameTail(Worker, worker, runtime, &header, @constCast(payload[0..frame_len]), 0, worker_chunk);
-        try runtime.h2ConsumeOutboundWindow(stream_id, frame_len, 1);
-        if (frame_final)
+        try queueChunkFrames(Worker, worker, runtime, stream_id, @constCast(payload[0..send_len]), final, worker_chunk);
+        if (final)
             runtime.h2NoteResponseEndQueued(stream_id);
-        return frame_len;
+    } else {
+        _ = try queueDataFramesNoWindowAccounting(Worker, worker, runtime, stream_id, payload[0..send_len], final);
     }
-    _ = try queueDataFramesNoWindowAccounting(Worker, worker, runtime, stream_id, payload[0..send_len], final);
-    // `h2.encodeDataFrames` cut the bytes into frames of the peer's largest size.
-    const frame_count = std.math.divCeil(usize, send_len, runtime.h2_peer_settings.max_frame_size) catch unreachable;
     try runtime.h2ConsumeOutboundWindow(stream_id, send_len, frame_count);
     return send_len;
 }
 
-const DirectDataWriteResult = struct {
-    committed_payload_len: usize = 0,
-    /// The DATA frames that carry `committed_payload_len`.
-    committed_frames: usize = 0,
-    did_work: bool = false,
-};
-
-/// Writes DATA frames for `payload` straight from it until the socket would
-/// block. A frame the socket took in part has its tail queued and counts as
-/// committed, since the client will receive it whole: as a copy, or, when
-/// `payload` lies in a worker's `chunk`, as a segment that points into it.
-/// The caller charges the send windows for `committed_payload_len`.
-fn writeDataFramesDirectNoWindowAccounting(
+/// Queues `payload`, which lies in the worker's `chunk`, as DATA frames of at
+/// most the peer's frame size: each frame's header in the slot's arena or a
+/// copy, then a segment that points into the chunk, so the body's bytes are
+/// never copied. The segment list takes its room before the first append, so
+/// a failure there leaves the queue as it was for the caller to sort. A
+/// failure after it, an allocation for a header the arena has no room for,
+/// leaves a header without its payload, which no frame may follow, so it
+/// closes the connection without GOAWAY.
+fn queueChunkFrames(
     comptime Worker: type,
     worker: *Worker,
     runtime: *Slot,
     stream_id: u32,
-    payload: []const u8,
-    end_stream: bool,
-    chunk: ?*write_queue.ResponseChunk,
-) !DirectDataWriteResult {
-    const budget: usize = @intCast(runtime.h2_peer_settings.max_frame_size);
-    if (budget == 0)
-        return error.Http2FrameTooLarge;
-
-    var result = DirectDataWriteResult{};
-    var offset: usize = 0;
-    while (offset < payload.len) {
-        const remaining = payload.len - offset;
-        const frame_len = @min(remaining, budget);
-        const frame_payload = payload[offset..][0..frame_len];
-        const is_last = offset + frame_len == payload.len;
-        var header: [h2.frame_header_len]u8 = undefined;
-        try encodeFrameHeader(&header, frame_len, .data, if (is_last and end_stream) 0x1 else 0, stream_id);
-
-        const written = writeDataFrameVectored(runtime.fd, &header, frame_payload) catch |err| {
-            if (try connection.actOnClientIo(Worker, worker, runtime, .write, err))
-                result.did_work = true;
-            return result;
-        };
-        if (written == 0) {
-            _ = try connection.actOnClientIo(Worker, worker, runtime, .write, error.PeerClosed);
-            result.did_work = true;
-            return result;
-        }
-        result.did_work = true;
-        runtime.noteProgress(process.monotonicNowNsOrZero());
-
-        const total_len = h2.frame_header_len + frame_payload.len;
-        if (written < total_len) {
-            if (chunk) |worker_chunk| {
-                try queueChunkFrameTail(Worker, worker, runtime, &header, @constCast(frame_payload), written, worker_chunk);
-            } else {
-                // No other frame may follow a DATA frame whose tail was lost.
-                errdefer worker.closeRuntimeConnection(runtime, .{ .reason = .allocation_failed, .goaway = null });
-                const remaining_wire = try copyRemainingDataFrameWire(worker.service.allocator, &header, frame_payload, written);
-                _ = try queueOwnedWrite(Worker, worker, runtime, remaining_wire);
-            }
-            result.committed_payload_len += frame_payload.len;
-            result.committed_frames += 1;
-            return result;
-        }
-
-        result.committed_payload_len += frame_payload.len;
-        result.committed_frames += 1;
-        offset += frame_payload.len;
-    }
-
-    return result;
-}
-
-/// Queues the unsent part of a DATA frame whose payload lies in `chunk`: a
-/// copy of the header's unsent bytes, then a segment that points into the
-/// chunk. The queue was empty, so only the second append can fail, and the
-/// connection then closes without GOAWAY.
-fn queueChunkFrameTail(
-    comptime Worker: type,
-    worker: *Worker,
-    runtime: *Slot,
-    header: *const [h2.frame_header_len]u8,
     payload: []u8,
-    written: usize,
+    end_stream: bool,
     chunk: *write_queue.ResponseChunk,
 ) !void {
+    std.debug.assert(payload.len != 0);
     const allocator = worker.service.allocator;
-    // A header without its payload cannot be followed by another frame.
-    errdefer worker.closeRuntimeConnection(runtime, .{ .reason = .allocation_failed, .goaway = null });
-    if (written < header.len)
-        try runtime.h2AppendWriteCopy(allocator, header[written..]);
-    const payload_offset = written -| header.len;
-    try runtime.h2AppendChunkWrite(allocator, payload[payload_offset..], chunk);
-    runtime.wait_events = event_sources.write_events;
-    try worker.updateConnectionInterest(runtime);
+    const max_frame_size: usize = runtime.h2_peer_settings.max_frame_size;
+    std.debug.assert(max_frame_size != 0);
+    const frame_count = std.math.divCeil(usize, payload.len, max_frame_size) catch unreachable;
+    try runtime.h2ReserveWriteSegments(allocator, 2 * frame_count, payload.len + frame_count * h2.frame_header_len);
+    {
+        var appended = false;
+        errdefer if (appended) worker.closeRuntimeConnection(runtime, .{ .reason = .allocation_failed, .goaway = null });
+        var offset: usize = 0;
+        while (offset < payload.len) {
+            const frame_len = @min(payload.len - offset, max_frame_size);
+            const is_last = offset + frame_len == payload.len;
+            var header: [h2.frame_header_len]u8 = undefined;
+            try encodeFrameHeader(&header, frame_len, .data, if (is_last and end_stream) 0x1 else 0, stream_id);
+            try runtime.h2AppendWriteCopy(allocator, &header);
+            appended = true;
+            try runtime.h2AppendChunkWrite(allocator, payload[offset..][0..frame_len], chunk);
+            offset += frame_len;
+        }
+    }
+    try noteQueued(Worker, worker, runtime);
 }
 
 /// Destroys each chunk whose last byte the client socket took
@@ -846,37 +811,6 @@ fn retireResponseChunks(comptime Worker: type, worker: *Worker, runtime: *Slot) 
         worker.service.allocator.destroy(chunk);
         try worker.grantResponseCredit(owner);
     }
-}
-
-fn writeDataFrameVectored(fd: std.posix.fd_t, header: *const [h2.frame_header_len]u8, payload: []const u8) !usize {
-    var iovecs: [2]std.posix.iovec_const = undefined;
-    iovecs[0] = .{ .base = header.ptr, .len = header.len };
-    iovecs[1] = .{ .base = payload.ptr, .len = payload.len };
-    return std.posix.writev(fd, &iovecs);
-}
-
-fn copyRemainingDataFrameWire(
-    allocator: std.mem.Allocator,
-    header: *const [h2.frame_header_len]u8,
-    payload: []const u8,
-    written: usize,
-) ![]u8 {
-    const total_len = h2.frame_header_len + payload.len;
-    if (written >= total_len)
-        return &.{};
-    const out = try allocator.alloc(u8, total_len - written);
-    var cursor: usize = 0;
-    if (written < h2.frame_header_len) {
-        const header_remaining = header[written..];
-        @memcpy(out[cursor..][0..header_remaining.len], header_remaining);
-        cursor += header_remaining.len;
-        @memcpy(out[cursor..][0..payload.len], payload);
-        return out;
-    }
-    const payload_offset = written - h2.frame_header_len;
-    const payload_remaining = payload[payload_offset..];
-    @memcpy(out[cursor..][0..payload_remaining.len], payload_remaining);
-    return out;
 }
 
 /// Queues DATA frames for `payload`, without charging the send windows, and
@@ -921,29 +855,39 @@ fn encodeFrameHeader(out: []u8, payload_len: usize, frame_type: h2.FrameType, fl
     try header.encode(out);
 }
 
-/// Copies `bytes` to the end of the write queue and writes what the socket
-/// takes.
+/// Copies `bytes` to the end of the write queue, which the connection's next
+/// flush writes (`noteQueued`), and returns true.
 fn queueWriteCopy(comptime Worker: type, worker: *Worker, runtime: *Slot, bytes: []const u8) !bool {
     try runtime.h2AppendWriteCopy(worker.service.allocator, bytes);
-    return flushPendingWrite(Worker, worker, runtime);
+    try noteQueued(Worker, worker, runtime);
+    return true;
 }
 
 /// Moves `owned`, which the queue frees once written, to the end of the
-/// write queue and writes what the socket takes. On failure `owned` is
-/// freed.
+/// write queue, which the connection's next flush writes (`noteQueued`), and
+/// returns whether it held a byte. On failure `owned` is freed.
 fn queueOwnedWrite(comptime Worker: type, worker: *Worker, runtime: *Slot, owned: []u8) !bool {
     if (owned.len == 0)
         return false;
     try runtime.h2AppendOwnedWrite(worker.service.allocator, owned);
-    return flushPendingWrite(Worker, worker, runtime);
+    try noteQueued(Worker, worker, runtime);
+    return true;
 }
 
-/// Writes the oldest queued segments, at most `max_writev_segments` of them,
-/// in one writev, and returns the bytes the socket took.
-fn writeQueuedSegments(runtime: *Slot) !usize {
-    var iovecs: [max_writev_segments]std.posix.iovec_const = undefined;
-    const vectors = runtime.h2QueuedWriteVectors(&iovecs);
-    if (vectors.len == 0)
-        return 0;
-    return std.posix.writev(runtime.fd, vectors);
+/// Makes sure the connection's next flush takes what was just appended. A
+/// blocked queue waits for its write poll, a queue at
+/// `write_queue.cork_bytes_max` is written now, a drive that runs now writes
+/// it at its next flush, and otherwise the connection asks for a turn of the
+/// lane's loop, which the pass runs once its completions are handled
+/// (`queueConnectionTurn` on `Worker`).
+fn noteQueued(comptime Worker: type, worker: *Worker, runtime: *Slot) LaneFault!void {
+    if (runtime.h2WritesBlocked())
+        return;
+    if (runtime.h2QueuedWriteBytes() >= write_queue.cork_bytes_max) {
+        _ = try flushPendingWrite(Worker, worker, runtime);
+        return;
+    }
+    if (runtime.h2_driving)
+        return;
+    try worker.queueConnectionTurn(runtime);
 }

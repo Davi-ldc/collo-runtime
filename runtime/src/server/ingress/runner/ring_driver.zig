@@ -26,6 +26,11 @@
 //!   connection's turn, a deferred worker fault), and with the wait
 //!   otherwise (`event_sources.LaneRing`). Only a pass that fills the
 //!   submission queue enters early.
+//! - Handlers only queue what they send a client, and a frame queued outside
+//!   a connection's drive gives the connection a turn
+//!   (`http2/writing.zig`), so the turns at the end of the pass write each
+//!   connection's frames of the pass in one write, and a turn still queued
+//!   after them ends the pass without the wait.
 //! - A pass first renews the lane's egress lease when the manager's current
 //!   gateway is not the one the lease holds (`renewEgressLease`). It waits
 //!   for a completion only after that, and the wait ends the pass, so no
@@ -495,12 +500,18 @@ pub fn Methods(comptime Self: type) type {
         }
 
         /// The rest of a pass after the completions it ran: the connections
-        /// handlers queued for a turn, then the worker faults they deferred.
-        /// Returns whether the connections or the faults found work.
+        /// handlers queued for a turn, then the worker faults they deferred,
+        /// then the turns those faults asked for, since a fault's answers
+        /// queue frames that must leave in the pass that queued them
+        /// (`http2/writing.zig`). Returns whether the connections or the
+        /// faults found work.
         pub fn runQueuedWork(self: *Self) LaneFault!bool {
             const drove = try driveQueuedConnections(self);
             const faulted = try WorkerFault.processDeferredWorkerFaults(self);
-            return drove or faulted;
+            if (!faulted)
+                return drove;
+            _ = try driveQueuedConnections(self);
+            return true;
         }
 
         /// Takes the completions the ring holds without waiting and runs

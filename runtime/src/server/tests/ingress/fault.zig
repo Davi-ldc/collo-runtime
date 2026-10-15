@@ -159,7 +159,7 @@ test "every error the classified callees return today is in their table or is a 
         assertCovered(ErrorsOfCall(@TypeOf(writing.flushPendingWrite(StubLane, stub_lane, stub_slot))), fault.Http2Error, "Http2Error");
         assertCovered(ErrorsOfCall(@TypeOf(writing.queueRstStream(StubLane, stub_lane, stub_slot, 1, .cancel))), fault.Http2Error, "Http2Error");
         assertCovered(ErrorsOfCall(@TypeOf(writing.queueGoawayNoNewStreams(StubLane, stub_lane, stub_slot))), fault.Http2Error, "Http2Error");
-        assertCovered(ErrorsOfCall(@TypeOf(writing.queueDueWindowUpdates(StubLane, stub_lane, stub_slot))), fault.Http2Error, "Http2Error");
+        assertCovered(ErrorsOfCall(@TypeOf(writing.scheduleDueWindowUpdates(StubLane, stub_lane, stub_slot))), fault.Http2Error, "Http2Error");
         assertCovered(ErrorsOfCall(@TypeOf(writing.flushPendingResponseData(StubLane, stub_lane, stub_slot, null))), fault.Http2Error, "Http2Error");
         assertCovered(ErrorsOfCall(@TypeOf(writing.queueResponseHead(StubLane, stub_lane, stub_slot, 1, 200, &.{}, true))), fault.Http2Error, "Http2Error");
         assertCovered(ErrorsOfCall(@TypeOf(writing.queueResponseChunk(StubLane, stub_lane, stub_slot, 1, "", true))), fault.Http2Error, "Http2Error");
@@ -807,8 +807,11 @@ fn ErrorsOfCall(comptime Result: type) type {
 const StubLane = struct {
     service: struct { allocator: std.mem.Allocator },
     h2_lane: server_main.ingress.http2.lane_resources.LaneResources,
+    lane: struct { counters: server_main.ingress.lane.CounterSnapshot },
 
     pub fn updateConnectionInterest(_: *StubLane, _: *Slot) error{}!void {}
+
+    pub fn queueConnectionTurn(_: *StubLane, _: *Slot) error{}!void {}
 
     pub fn closeRuntimeConnection(_: *StubLane, _: *Slot, _: anytype) void {}
 

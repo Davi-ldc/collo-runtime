@@ -400,8 +400,8 @@ pub fn Methods(comptime Self: type) type {
 
         /// Sends the body a dispatched stream buffered, as one chunk, and
         /// owes the client its flow-control credit once the worker has the
-        /// bytes, which a WINDOW_UPDATE carries when it is due or behind the
-        /// connection's next frames (`http2/writing.zig`). A send that would
+        /// bytes, which a WINDOW_UPDATE carries behind the connection's next
+        /// frames, or alone once it is due (`http2/writing.zig`). A send that would
         /// block leaves the bytes where they are and says what the request
         /// waits for (`send_blocked`).
         pub fn flushPendingBody(self: *Self, request_slot: u32) LaneFault!WorkerOutcome {
@@ -430,7 +430,7 @@ pub fn Methods(comptime Self: type) type {
                 return error.Http2PendingBodyTransferLost;
             defer transferred.deinit(self.service.allocator);
             self.lane.counters.h2_request_body_deferred_flushes += 1;
-            if (returnBodyCredit(self, runtime, stream_id, &transferred)) |_| {} else |err| try settleStreamError(self, runtime, err);
+            returnBodyCredit(self, runtime, stream_id, &transferred) catch |err| try settleStreamError(self, runtime, err);
             return .ok;
         }
 
@@ -439,16 +439,16 @@ pub fn Methods(comptime Self: type) type {
             runtime: *ConnectionSlot,
             stream_id: u32,
             pending: *flow_control.PendingH2Body,
-        ) StreamError!bool {
+        ) StreamError!void {
             const window_credit_len = pending.window_credit_len;
             if (window_credit_len == 0)
-                return false;
+                return;
             runtime.h2BufferInboundWindowUpdate(stream_id, window_credit_len) catch |err| {
                 try runtime.h2RestoreTakenPendingBodyConnectionCredit(pending);
                 return err;
             };
             pending.window_credit_len = 0;
-            return http2_writing.queueDueWindowUpdates(Self, self, runtime);
+            try http2_writing.scheduleDueWindowUpdates(Self, self, runtime);
         }
 
         /// Sends one body chunk inline, or through the payload ring above

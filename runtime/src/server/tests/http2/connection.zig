@@ -22,7 +22,9 @@
 //! the response
 //! path: queueing behind flow control, worker response descriptors, the
 //! lane's record of a worker's head, how a stream ends when its request
-//! leaves it, framing and write buffers. A fault a client causes closes only
+//! leaves it, framing, the write queue's flushes (frames queued outside a
+//! drive wait for the connection's turn and leave in one write, and a
+//! response the socket takes in parts arrives whole) and its arena. A fault a client causes closes only
 //! its connection, with GOAWAY when the HTTP/2 layer can still speak, and
 //! `drive` returns without an error; a lane fault is the one error `drive`
 //! returns. Root of the `h2-connection` suite, which runs with no engine in
@@ -688,6 +690,16 @@ const TestWorker = struct {
     /// Heads answered 413 for a declared body over the bound, as the lane
     /// answers them once it matched their route.
     oversized_count: usize = 0,
+    /// The lane's counters the driver adds to, of which it touches only the
+    /// writes that put bytes on the client's socket.
+    lane: struct { counters: struct { client_socket_writes: u64 = 0 } = .{} } = .{},
+    /// Turns the driver asked for a connection that queued frames outside a
+    /// drive (`queueConnectionTurn`).
+    turns_requested: usize = 0,
+    /// Whether an asked turn waits for the test to drive the connection, as
+    /// the lane's pass runs it once its completions are handled, instead of
+    /// writing the queue before the call that asked returns.
+    defer_turns: bool = false,
 
     pub fn monotonicNowNs(self: *const TestWorker) u64 {
         return self.clock_ns;
@@ -696,6 +708,17 @@ const TestWorker = struct {
     pub fn updateConnectionInterest(self: *TestWorker, runtime: *Slot) fault.LaneFault!void {
         _ = self;
         _ = runtime;
+    }
+
+    /// The turn the lane gives a connection that queued frames outside a
+    /// drive, whose drive writes them. Unless the test defers it, it writes
+    /// the queue at once, so a test that queues outside a drive reads the
+    /// frames once the call returns.
+    pub fn queueConnectionTurn(self: *TestWorker, runtime: *Slot) fault.LaneFault!void {
+        self.turns_requested += 1;
+        if (self.defer_turns)
+            return;
+        _ = try http2_writing.flushPendingWrite(TestWorker, self, runtime);
     }
 
     pub fn responseChunkRetired(_: *TestWorker, _: RequestKey) fault.LaneFault!void {}
@@ -860,6 +883,7 @@ const BackpressuredTestWorker = struct {
     data_batch_count: usize = 0,
     /// The first close the driver asked for, null while it asked none.
     close: ?fault.ConnectionClose = null,
+    lane: struct { counters: struct { client_socket_writes: u64 = 0 } = .{} } = .{},
 
     pub fn monotonicNowNs(self: *const BackpressuredTestWorker) u64 {
         _ = self;
@@ -873,6 +897,11 @@ const BackpressuredTestWorker = struct {
     pub fn updateConnectionInterest(self: *BackpressuredTestWorker, runtime: *Slot) fault.LaneFault!void {
         _ = self;
         _ = runtime;
+    }
+
+    /// The connection's turn, run at once.
+    pub fn queueConnectionTurn(self: *BackpressuredTestWorker, runtime: *Slot) fault.LaneFault!void {
+        _ = try http2_writing.flushPendingWrite(BackpressuredTestWorker, self, runtime);
     }
 
     pub fn responseChunkRetired(_: *BackpressuredTestWorker, _: RequestKey) fault.LaneFault!void {}
@@ -1584,19 +1613,12 @@ test "http2 driver streams POST body and responds after end stream" {
     const received = try readAvailableFd(setup.pair[1], &out);
     try expectResponseHeader(allocator, received, 1, "200", "x-mode", "h2");
     try expectResponseBody(received, 1, "uploaded");
-    // The stub answered from inside the body's handler, so the response went
-    // out before the body's credit was owed, and the stream is owed nothing
-    // once its request ended. The connection's credit is far from half its
-    // window, so it waits for the next write the connection makes.
-    try std.testing.expect(findWindowUpdateWithIncrement(received, 0, 11) == null);
-    try std.testing.expectEqual(@as(u32, 11), setup.runtime.h2_pending_connection_window_update);
-
-    // A PING's acknowledgement is that write, and the credit rides it.
-    try writeFrameFd(setup.pair[1], .ping, 0, 0, "credit!!");
-    try driveUntilIdle(TestWorker, &worker, &setup.runtime);
-    const after_ping = try readAvailableFd(setup.pair[1], &out);
-    _ = findFrame(after_ping, .ping, 0) orelse return error.MissingPingAck;
-    _ = findWindowUpdateWithIncrement(after_ping, 0, 11) orelse return error.MissingConnectionWindowUpdate;
+    // The stub answered from inside the body's handler, and the response
+    // waited for the flush after the read, by which time the body's credit
+    // was owed, so the credit rides the response's write. The stream is owed
+    // nothing once its request ended.
+    _ = findWindowUpdateWithIncrement(received, 0, 11) orelse return error.MissingConnectionWindowUpdate;
+    try std.testing.expect(findFrame(received, .window_update, 1) == null);
     try std.testing.expectEqual(@as(u32, 0), setup.runtime.h2_pending_connection_window_update);
 }
 
@@ -1728,11 +1750,10 @@ test "http2 driver accepts padded priority headers and padded data" {
     var out: [1024]u8 = undefined;
     const received = try readAvailableFd(setup.pair[1], &out);
     try expectResponseBody(received, 1, "padded-ok");
-    // The padding's credit is owed with the payload's, behind the response
-    // the stub wrote from inside the body's handler, until a write carries
-    // it.
-    try std.testing.expect(findWindowUpdateWithIncrement(received, 0, 6) == null);
-    try std.testing.expectEqual(@as(u32, 6), setup.runtime.h2_pending_connection_window_update);
+    // The padding's credit is owed with the payload's and rides the write of
+    // the response the stub queued from inside the body's handler.
+    _ = findWindowUpdateWithIncrement(received, 0, 6) orelse return error.MissingConnectionWindowUpdate;
+    try std.testing.expectEqual(@as(u32, 0), setup.runtime.h2_pending_connection_window_update);
 }
 
 test "http2 driver accepts request trailers as body terminator" {
@@ -2597,6 +2618,40 @@ test "http2 owed receive credit falls due once the client's view of a stream win
     try runtime.h2ConsumeInboundWindow(1, 1);
     try runtime.h2BufferInboundWindowUpdate(1, 1);
     try std.testing.expect(runtime.h2WindowUpdateDue());
+}
+
+test "http2 due receive credit whose frames cannot be allocated closes the connection, and credit not due stays owed" {
+    // Ten streams and the connection owe credit, more WINDOW_UPDATE frames
+    // than the slot's arena holds, so the frames take an allocation, which
+    // fails.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var runtime = testSlot();
+    runtime.slab_link.live = true;
+    defer runtime.deinitProtocolState(std.testing.allocator, &shared_lane.header_blocks);
+    var worker = TestWorker{ .service = .{ .allocator = failing.allocator() } };
+    const stream_count = write_queue.write_arena_bytes / window_update_frame_len + 1;
+    for (0..stream_count) |index| {
+        const stream_id: u32 = @intCast(2 * index + 1);
+        try runtime.h2ReserveStream(stream_id);
+        try runtime.h2SetRequestBodyExpectation(stream_id, .ingress_channel, null, false);
+        try runtime.h2ConsumeInboundWindow(stream_id, 1);
+        try runtime.h2BufferInboundWindowUpdate(stream_id, 1);
+    }
+    // Not due: the credit waits for a write that carries frames anyway.
+    try std.testing.expect(!runtime.h2WindowUpdateDue());
+    try std.testing.expect(!try http2_writing.flushPendingWrite(TestWorker, &worker, &runtime));
+    try std.testing.expect(worker.close == null);
+    try std.testing.expect(runtime.h2HasPendingWindowUpdate());
+
+    // Half the first stream's window owed makes it due, and a client at that
+    // window may send nothing more, so no later write would carry it.
+    const stream_half = limits.h2.INGRESS_STREAM_RECV_WINDOW_BYTES / 2;
+    try runtime.h2ConsumeInboundWindow(1, stream_half);
+    try runtime.h2BufferInboundWindowUpdate(1, stream_half);
+    try std.testing.expect(runtime.h2WindowUpdateDue());
+    _ = try http2_writing.flushPendingWrite(TestWorker, &worker, &runtime);
+    try std.testing.expectEqual(fault.ConnectionCloseReason.allocation_failed, worker.close.?.reason);
+    try std.testing.expect(!runtime.isOpen());
 }
 
 test "http2 a stream whose request ended owes no credit of its own, and bytes the server holds bring the connection's due" {
@@ -3529,9 +3584,10 @@ test "http2 driver closes a connection whose client-sized allocation fails, with
 
 test "http2 driver keeps a client that stops reading while it widens its windows, its write queue within its bound" {
     // Each stream buffers the most a stream may hold, together more than the
-    // write queue's bound. A flush adds to the queue only while it is empty,
-    // so the client's credit moves one stream's response into the queue and
-    // the others keep waiting on their streams.
+    // write queue's bound. A flush adds to the queue only while it is not
+    // blocked, and the first stream's response passes the cork bound, whose
+    // write finds the socket full, so the client's credit moves one stream's
+    // response into the queue and the others keep waiting on their streams.
     const allocator = std.testing.allocator;
     var setup = try newH2SocketPairRuntime();
     defer std.posix.close(setup.pair[0]);
@@ -4791,31 +4847,134 @@ test "http2 combined headers and data encoder uses one output allocation" {
     try std.testing.expectEqualSlices(u8, data, bytes[headers.len..]);
 }
 
-test "http2 response data direct writev avoids heap allocation" {
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-    var sink = try std.fs.openFileAbsolute("/dev/null", .{ .mode = .write_only });
-    defer sink.close();
+test "http2 frames queued outside a drive wait for the connection's turn, which writes them in one write" {
+    const allocator = std.testing.allocator;
+    var setup = try newH2SocketPairRuntime();
+    defer std.posix.close(setup.pair[0]);
+    defer std.posix.close(setup.pair[1]);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
+    var worker = TestWorker{ .service = .{ .allocator = allocator } };
 
-    var runtime = Slot{
-        .slab_link = .{ .live = true },
-        .streams = &sharedLane().streams,
-        .fd = sink.handle,
-    };
-    defer runtime.deinitProtocolState(failing.allocator(), &shared_lane.header_blocks);
-    runtime.h2_peer_settings.max_frame_size = 4;
-    var worker = TestWorker{ .service = .{ .allocator = failing.allocator() } };
-    try runtime.h2ReserveStream(7);
+    try writeClientPrefaceAndSettings(setup.pair[1]);
+    try writeHeadersFrameFd(allocator, setup.pair[1], 1, &.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "example.com" },
+        .{ .name = ":path", .value = "/" },
+    }, true);
+    try driveUntilIdle(TestWorker, &worker, &setup.runtime);
+    var out: [1024]u8 = undefined;
+    _ = try readAvailableFd(setup.pair[1], &out);
 
-    _ = try queueResponseChunk(TestWorker, &worker, &runtime, 7, "abcdef", true);
+    // A worker's head, its body and its end, each queued as the lane queues
+    // a descriptor it read, with the turns left to the lane's pass.
+    worker.defer_turns = true;
+    const writes_before = worker.lane.counters.client_socket_writes;
+    _ = try queueResponseHead(TestWorker, &worker, &setup.runtime, 1, 200, &.{}, false);
+    _ = try queueResponseChunk(TestWorker, &worker, &setup.runtime, 1, "hello", false);
+    _ = try queueResponseChunk(TestWorker, &worker, &setup.runtime, 1, "", true);
+    try std.testing.expectEqual(writes_before, worker.lane.counters.client_socket_writes);
+    try std.testing.expect(setup.runtime.h2WritesPending());
+    try std.testing.expect(!setup.runtime.h2WritesBlocked());
+    try std.testing.expect(worker.turns_requested != 0);
+    // Frames the lane has to write, not ones the client holds back, so the
+    // connection does not stall.
+    try std.testing.expect(!setup.runtime.stalled());
 
-    try std.testing.expect(runtime.isOpen());
-    try std.testing.expectEqual(@as(usize, 0), runtime.h2_write_len);
-    try std.testing.expectEqual(@as(usize, 0), runtime.h2_write_offset);
-    try std.testing.expectEqual(@as(usize, 0), runtime.h2_write_queue.items.len);
-    try std.testing.expectEqual(@as(i64, h2.default_initial_window_size - 6), runtime.h2_connection_send_window);
+    // The pass's turn drives the connection: one write takes all of it.
+    _ = try drive(TestWorker, &worker, &setup.runtime);
+    try std.testing.expectEqual(writes_before + 1, worker.lane.counters.client_socket_writes);
+    try std.testing.expect(!setup.runtime.h2WritesPending());
+    const received = try readAvailableFd(setup.pair[1], &out);
+    _ = findFrame(received, .headers, 1) orelse return error.MissingResponseHeaders;
+    const data = findNthFrame(received, .data, 1, 0) orelse return error.MissingResponseData;
+    try std.testing.expectEqualStrings("hello", data.payload);
+    try std.testing.expect(!data.header.flags.end_stream);
+    const end = findNthFrame(received, .data, 1, 1) orelse return error.MissingResponseEnd;
+    try std.testing.expectEqual(@as(u32, 0), end.header.length);
+    try std.testing.expect(end.header.flags.end_stream);
+    try std.testing.expectEqual(@as(i64, h2.default_initial_window_size - 5), setup.runtime.h2_connection_send_window);
 }
 
-test "http2 empty data end stream uses fixed write buffer without heap allocation" {
+test "http2 a response larger than the socket takes leaves in parts, whole and in order, as the socket drains" {
+    const allocator = std.testing.allocator;
+    var setup = try newH2SocketPairRuntime();
+    defer std.posix.close(setup.pair[0]);
+    defer std.posix.close(setup.pair[1]);
+    defer setup.runtime.deinitProtocolState(allocator, &shared_lane.header_blocks);
+    var worker = TestWorker{ .service = .{ .allocator = allocator } };
+
+    // A small send buffer on the lane's end, so one write takes only part of
+    // what the queue offers.
+    const send_buffer_bytes: c_int = 4096;
+    try std.posix.setsockopt(setup.pair[0], std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, std.mem.asBytes(&send_buffer_bytes));
+    try writeClientPrefaceAndSettings(setup.pair[1]);
+    try writeHeadersFrameFd(allocator, setup.pair[1], 1, &.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "example.com" },
+        .{ .name = ":path", .value = "/" },
+    }, true);
+    try driveUntilIdle(TestWorker, &worker, &setup.runtime);
+    var settings_out: [1024]u8 = undefined;
+    _ = try readAvailableFd(setup.pair[1], &settings_out);
+
+    // A body within the client's windows and far over what the socket takes
+    // at once, each byte set by its offset, queued outside a drive behind
+    // its head.
+    const body = try allocator.alloc(u8, 48 * 1024);
+    defer allocator.free(body);
+    for (body, 0..) |*byte, offset|
+        byte.* = @truncate(offset *% 31 +% offset / 251);
+    _ = try queueResponseHead(TestWorker, &worker, &setup.runtime, 1, 200, &.{}, false);
+    _ = try queueResponseChunk(TestWorker, &worker, &setup.runtime, 1, body, true);
+    try std.testing.expect(setup.runtime.h2WritesBlocked());
+
+    // The client reads what arrived, which gives the socket room, and the
+    // drive the write poll would start writes the next part, until the queue
+    // drains.
+    const received = try allocator.alloc(u8, 2 * body.len);
+    defer allocator.free(received);
+    var received_len: usize = 0;
+    var parts: usize = 0;
+    while (setup.runtime.h2WritesPending()) : (parts += 1) {
+        if (parts == 4096)
+            return error.ResponseNeverDrained;
+        received_len += (try readAvailableFd(setup.pair[1], received[received_len..])).len;
+        _ = try drive(TestWorker, &worker, &setup.runtime);
+    }
+    received_len += (try readAvailableFd(setup.pair[1], received[received_len..])).len;
+    try std.testing.expect(parts > 1);
+    try std.testing.expect(!setup.runtime.h2WritesBlocked());
+    try std.testing.expect(worker.lane.counters.client_socket_writes > 2);
+
+    // The DATA frames carry the body whole and in order.
+    const collected = try allocator.alloc(u8, body.len);
+    defer allocator.free(collected);
+    var collected_len: usize = 0;
+    var cursor: usize = 0;
+    var ended = false;
+    while (received_len - cursor >= h2.frame_header_len) {
+        const header = try h2.FrameHeader.parse(received[cursor..][0..h2.frame_header_len]);
+        const frame_end = cursor + h2.frame_header_len + header.length;
+        if (frame_end > received_len)
+            return error.TruncatedFrame;
+        if (header.frame_type == .data and header.stream_id == 1) {
+            const payload = received[cursor + h2.frame_header_len .. frame_end];
+            if (payload.len > collected.len - collected_len)
+                return error.ResponseLongerThanBody;
+            @memcpy(collected[collected_len..][0..payload.len], payload);
+            collected_len += payload.len;
+            ended = header.flags.end_stream;
+        }
+        cursor = frame_end;
+    }
+    try std.testing.expectEqual(received_len, cursor);
+    try std.testing.expect(ended);
+    try std.testing.expectEqualSlices(u8, body, collected[0..collected_len]);
+}
+
+test "http2 an empty DATA frame that ends a stream takes the slot's arena, no allocation" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     var sink = try std.fs.openFileAbsolute("/dev/null", .{ .mode = .write_only });
     defer sink.close();
@@ -4837,7 +4996,7 @@ test "http2 empty data end stream uses fixed write buffer without heap allocatio
     try std.testing.expectEqual(@as(usize, 0), runtime.h2_write_queue.items.len);
 }
 
-test "http2 small control frames use fixed write buffer without heap allocation" {
+test "http2 a small control frame takes the slot's arena, no allocation" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     var sink = try std.fs.openFileAbsolute("/dev/null", .{ .mode = .write_only });
     defer sink.close();
@@ -4869,13 +5028,18 @@ test "http2 pending writes remain segmented when socket backpressures" {
     try http2_writing.queueRstStream(TestWorker, &worker, &setup.runtime, 7, .cancel);
     try http2_writing.queueRstStream(TestWorker, &worker, &setup.runtime, 9, .cancel);
 
+    // The first frame's turn found the socket full and blocked the queue,
+    // so the second waits behind it. Both sit in the slot's arena, whose
+    // room comes back only once the queue empties.
+    try std.testing.expect(setup.runtime.h2WritesBlocked());
     try std.testing.expect(setup.runtime.h2_write_inline_active);
     try std.testing.expectEqual(@as(usize, 1), setup.runtime.h2_write_queue.items.len);
     try std.testing.expectEqual(@as(usize, 0), setup.runtime.h2_write_queue_start);
     try std.testing.expectEqual(@as(usize, (h2.frame_header_len + 4) * 2), setup.runtime.h2_write_len);
     try std.testing.expectEqual(@as(usize, 0), setup.runtime.h2_write_offset);
     try std.testing.expect(!setup.runtime.h2_write_inline_segment.owned);
-    try std.testing.expect(setup.runtime.h2_write_queue.items[0].owned);
+    try std.testing.expect(!setup.runtime.h2_write_queue.items[0].owned);
+    try std.testing.expectEqual(@as(usize, (h2.frame_header_len + 4) * 2), setup.runtime.h2_write_arena_len);
 }
 
 test "http2 rst stream frame encodes recoverable stream errors" {

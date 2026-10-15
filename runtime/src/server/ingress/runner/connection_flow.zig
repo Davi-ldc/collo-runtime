@@ -25,11 +25,11 @@
 //! the ring behind the cancels of its polls (`event_sources.LaneRing`), so
 //! the descriptor's number stays taken until no prepared entry names it.
 //!
-//! Every drive ends by bringing the connection's deadline in step with what
-//! it now waits for (`deadline_driver.syncConnectionDeadline`): the loop's
-//! turn (`driveConnection`) and a handler's drive of a connection with bytes
-//! waiting (`driveHttp2`) alike. Whatever changes a connection outside a
-//! drive queues it for a turn, so its deadline follows within the pass.
+//! Every drive, which only the loop's turn of a connection (`driveConnection`)
+//! makes, ends by bringing the connection's deadline in step with what it now
+//! waits for (`deadline_driver.syncConnectionDeadline`). Whatever changes a
+//! connection outside a drive queues it for a turn, so its deadline follows
+//! within the pass.
 
 const std = @import("std");
 const process = @import("collo_os").process;
@@ -82,10 +82,8 @@ pub fn Methods(comptime Self: type) type {
 
         /// Drives an HTTP/2 connection that has not been asked to close,
         /// then brings its deadline in step unless the drive decided a
-        /// close. A decided close waits for the connection's next turn
-        /// (`driveConnection`), so a handler that drives a connection
-        /// between its own steps still finds the slot afterwards. Returns
-        /// whether anything happened.
+        /// close, which `driveConnection` finishes. Returns whether anything
+        /// happened.
         pub fn driveHttp2(self: *Self, runtime: *ConnectionSlot) LaneFault!bool {
             std.debug.assert(runtime.state == .http2_connection);
             const start_ns = monotonicNowNs();
@@ -164,6 +162,14 @@ pub fn Methods(comptime Self: type) type {
                 return;
             closeRuntimeConnection(self, runtime, .{ .reason = .server_stop, .goaway = null });
             _ = try finishClose(Self, self, runtime);
+        }
+
+        /// Queues the connection for a turn at the end of the pass, whose
+        /// drive writes the frames a handler queued for it outside a drive
+        /// (`http2/writing.zig`), so they share one write with whatever else
+        /// the pass queues for it.
+        pub fn queueConnectionTurn(self: *Self, runtime: *ConnectionSlot) LaneFault!void {
+            Queues.enqueueConnection(self, runtime.key.slot);
         }
 
         /// Resumes a connection after one of its requests finished: its next

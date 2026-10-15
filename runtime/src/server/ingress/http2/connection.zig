@@ -12,8 +12,11 @@
 //! `refuseH2Stream`) and `runner/request_body.zig` (`handleH2DataFrame`,
 //! `handleH2DataFrameBatch`, `handleH2ResetFrame`,
 //! `flushPendingH2RequestBodies`), `updateConnectionInterest`,
-//! `closeRuntimeConnection` and the lane's clock (`monotonicNowNs`), each of
-//! which `LaneWorker` declares (`runner/root.zig`).
+//! `queueConnectionTurn`, `closeRuntimeConnection`, the response credit of
+//! `runner/dispatch.zig` (`responseChunkRetired`, `grantResponseCredit`)
+//! and the lane's clock (`monotonicNowNs`), each of which `LaneWorker`
+//! declares (`runner/root.zig`), and counts its client writes in
+//! `lane.counters`.
 //!
 //! Every error a client causes ends in the driver as a `ConnectionOutcome`
 //! (`server/ingress/fault.zig`), sorted with the table of the callee that
@@ -27,9 +30,14 @@
 //! caller knows the worker.
 //!
 //! Invariants:
-//! - No read starts while queued writes remain, so a client that does not
-//!   read its responses is not read either. A read once made is handled to
-//!   its last byte (`reading.zig`).
+//! - No read starts while the socket refuses queued writes (the queue is
+//!   blocked, `runner/write_queue.zig`), so a client that does not read its
+//!   responses is not read either. A read once made is handled to its last
+//!   byte (`reading.zig`).
+//! - A drive flushes the connection's queue before its first read and after
+//!   each read, and what it queues in between waits for the next of those
+//!   flushes (`Slot.h2_driving`), so the frames one read brings about leave
+//!   in one write, with the receive credit the connection owes at its tail.
 //! - A connection closes in two steps (`runner/connection_flow.zig`). The
 //!   driver only asks the lane to close it, and from then on the connection
 //!   reads no frame and queues none; its queue is written only while the
@@ -84,14 +92,22 @@ pub const DataFrameChunk = struct {
 };
 
 /// Advances one connection until its socket would block or a read leaves
-/// room in the read buffer, a write stays queued, the connection closes or
-/// `reads_per_drive_max` reads are made, and returns whether anything
-/// happened. A connection whose read poll is in flight is not read. A stream error resets its stream;
-/// any other error a client causes asks the lane to close the connection
-/// (`closeRuntimeConnection` on `Worker`). Fails only with a lane fault.
+/// room in the read buffer, the socket refuses queued writes, the
+/// connection closes or `reads_per_drive_max` reads are made, and returns
+/// whether anything happened. A connection whose read poll is in flight is
+/// not read. What the drive queues leaves at its flushes: one before the
+/// first read, which also takes what the pass queued for the connection
+/// before the drive, and one after each read. A stream error resets its
+/// stream; any other error a client causes asks the lane to close the
+/// connection (`closeRuntimeConnection` on `Worker`). Fails only with a lane
+/// fault.
 pub fn drive(comptime Worker: type, worker: *Worker, runtime: *Slot) LaneFault!bool {
     if (!runtime.isOpen())
         return false;
+    // Appends during the drive leave at its flushes and ask for no turn
+    // (`writing.zig:noteQueued`).
+    runtime.h2_driving = true;
+    defer runtime.h2_driving = false;
     return driveFrames(Worker, worker, runtime) catch |err| {
         try closeForError(Worker, worker, runtime, err);
         return true;
@@ -99,19 +115,29 @@ pub fn drive(comptime Worker: type, worker: *Worker, runtime: *Slot) LaneFault!b
 }
 
 fn driveFrames(comptime Worker: type, worker: *Worker, runtime: *Slot) Http2Failure!bool {
-    var did_work = try writing.flushPendingWrite(Worker, worker, runtime);
-    if (!runtime.isOpen() or runtime.h2WritesPending())
-        return did_work;
+    var did_work = false;
+    // A queue the socket refused moves first, and nothing else does until
+    // the socket takes it: its write poll brought the connection here, or
+    // the turn finds that poll still in flight and the write is not tried.
+    if (runtime.h2WritesBlocked()) {
+        did_work = try writing.flushPendingWrite(Worker, worker, runtime);
+        if (!runtime.isOpen() or runtime.h2WritesBlocked())
+            return did_work;
+    }
     did_work = (try worker.flushPendingH2RequestBodies(runtime)) or did_work;
-    did_work = (try writing.queueDueWindowUpdates(Worker, worker, runtime)) or did_work;
     did_work = (try writing.flushPendingResponseData(Worker, worker, runtime, null)) or did_work;
+    // What the pass queued before the drive and what the drive queued so far
+    // leave in one write, with the receive credit the connection owes.
+    did_work = (try writing.flushPendingWrite(Worker, worker, runtime)) or did_work;
+    if (!runtime.isOpen() or runtime.h2WritesBlocked())
+        return did_work;
 
     // A read poll in flight reports the socket's next bytes, so a turn the
     // connection got for its writes or a request's finish reads nothing.
     if (runtime.registered_wait_events & event_sources.read_interest != 0)
         return did_work;
     var reads: usize = 0;
-    while (runtime.isOpen() and !runtime.h2WritesPending()) : (reads += 1) {
+    while (runtime.isOpen() and !runtime.h2WritesBlocked()) : (reads += 1) {
         if (reads == reads_per_drive_max) {
             // Bytes may remain on the socket. The read poll then completes
             // at once and brings the connection back on a later pass.
@@ -123,9 +149,11 @@ fn driveFrames(comptime Worker: type, worker: *Worker, runtime: *Slot) Http2Fail
             .idle => return did_work,
             .ended, .full, .short => did_work = true,
         }
-        if (runtime.h2WritesPending())
-            _ = try writing.flushPendingWrite(Worker, worker, runtime);
-        _ = try writing.queueDueWindowUpdates(Worker, worker, runtime);
+        // What the read queued leaves before the next read, with the credit
+        // the read made owed, alone once it is due, so a drive of several
+        // reads never holds the client's window at half or below
+        // (`Slot.h2WindowUpdateDue`).
+        _ = try writing.flushPendingWrite(Worker, worker, runtime);
         switch (outcome) {
             .idle, .ended, .full => {},
             // A read that left room in the buffer emptied the socket, so the
@@ -141,10 +169,10 @@ fn driveFrames(comptime Worker: type, worker: *Worker, runtime: *Slot) Http2Fail
 }
 
 /// Arms the connection's read poll, unless the connection closes or the
-/// socket holds writes back: such a connection is read again only once they
-/// drained.
+/// socket refuses queued writes: such a connection is read again only once
+/// its write poll brought it back and the queue drained.
 fn awaitReadable(comptime Worker: type, worker: *Worker, runtime: *Slot) LaneFault!void {
-    if (!runtime.isOpen() or runtime.h2WritesPending())
+    if (!runtime.isOpen() or runtime.h2WritesBlocked())
         return;
     runtime.wait_events = event_sources.read_events;
     try worker.updateConnectionInterest(runtime);

@@ -189,9 +189,10 @@ pub fn Methods(comptime Self: type) type {
         /// for `processDeferredWorkerFaults`, and takes the worker out of
         /// service at once, so no lane takes a slot of it in the rest of the
         /// pass. The rest of the death path waits for the stream handler
-        /// running now to return, because it drives other connections and
-        /// reads the worker's output, which must not happen in the middle of
-        /// a connection's frames. The registration keeps the reason and the
+        /// running now to return, because it reads the worker's output and
+        /// ends the worker's requests, which change streams of this lane's
+        /// connections and must not happen in the middle of a connection's
+        /// frames. The registration keeps the reason and the
         /// pool's death notice until that path runs, even if its last request
         /// ends first (`worker_registration.releaseRegistrationIfIdle`).
         pub fn deferWorkerFault(self: *Self, registration_index: u32, reason: fault.WorkerFaultReason) LaneFault!void {

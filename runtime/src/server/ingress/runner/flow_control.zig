@@ -386,16 +386,19 @@ pub fn h2HasPendingWindowUpdate(self: *const Slot) bool {
 /// The client's view of a window is the lane's own less the credit owed:
 /// A = W - H - U, where W is the advertised window, H the bytes the server
 /// still holds, whose credit it withholds, and U the credit owed and unsent.
-/// While A > W/2 the credit may wait, and once A <= W/2 it goes out: a drive
-/// checks as it starts and after each socket read, and credit owed outside a
-/// drive is checked where it is owed or by the turn its connection gets
-/// (`http2/connection.zig`, `writing.queueDueWindowUpdates`), so waiting
-/// for a write the connection
-/// makes anyway never keeps the client at W/2 or below past the read that
-/// brought it there, and once H alone reaches W/2 every credit goes out as
-/// it is owed. The client's sender stalls only when H reaches W, as it would
-/// with every credit sent at once, and credit is still owed only for bytes
-/// the server no longer holds; only the moment its frame leaves moves.
+/// While A > W/2 the credit may wait, and once A <= W/2 it goes out with the
+/// connection's next flush: a drive flushes before its first read and after
+/// each one, and credit owed outside a drive asks for the turn whose drive
+/// flushes it in the same pass (`http2/connection.zig`,
+/// `writing.scheduleDueWindowUpdates`), so waiting for a write the
+/// connection makes anyway never keeps the client at W/2 or below past the
+/// read that brought it there, and once H alone reaches W/2 every credit
+/// goes out as it is owed. The client's sender stalls only when H reaches W,
+/// as it would with every credit sent at once, and credit is still owed only
+/// for bytes the server no longer holds; only the moment its frame leaves
+/// moves. The one exception is a connection whose socket refuses its writes:
+/// nothing of it moves until its write poll, the credit included, and it is
+/// not read meanwhile either.
 pub fn h2WindowUpdateDue(self: *const Slot) bool {
     const connection_half: i64 = limits.h2.INGRESS_CONNECTION_RECV_WINDOW_BYTES / 2;
     const stream_half: i64 = limits.h2.INGRESS_STREAM_RECV_WINDOW_BYTES / 2;

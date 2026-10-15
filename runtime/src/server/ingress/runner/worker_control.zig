@@ -45,10 +45,15 @@ const Handled = h2_worker_ipc.Handled;
 /// keeps its socket full shares the lane with everything else on it.
 pub const control_packets_per_drain_max: usize = 64;
 
-/// Whether a drain stops at a connection that has bytes to write before more
-/// of a worker's response, and at a full forwarding window. The loop's
-/// drains stop there and let the loop write the bytes first, or wait for
-/// the window. A drain that must take the worker's output now, the last read
+/// Whether a drain stops at a connection that cannot take more of a worker's
+/// response, its socket refusing queued writes or its send windows holding
+/// response bytes back (`h2_worker_ipc.zig:hasBacklog`), and at a full
+/// forwarding window. The loop's drains stop there: after such a connection
+/// the next packet waits for the lane's next pass, which the re-armed control
+/// poll brings at once, so the connection's response grows by a packet a
+/// pass, within its request's response credit; after a full window the
+/// worker's output waits in its socket until the window reopens. A drain
+/// that must take the worker's output now, the last read
 /// of a dead worker or the grace backstop, reads on: the connection's
 /// pending-response bound still caps what it buffers, a response descriptor
 /// that finds the window full drops, and a `request_done`, which takes no
@@ -67,9 +72,9 @@ pub fn Methods(comptime Self: type) type {
 
         /// The reader's read of the worker of registration
         /// `registration_index` when its control socket's poll fires: a
-        /// bounded drain that yields to the connections it gave bytes to,
-        /// then the worker's polls armed again, or the death path on a
-        /// fault.
+        /// bounded drain that yields at a connection that cannot take more
+        /// (`Pace`), then the worker's polls armed again, or the death path
+        /// on a fault.
         pub fn readWorkerControl(self: *Self, registration_index: u32) LaneFault!void {
             switch (try drainWorkerControl(self, registration_index, .yield_to_backlog)) {
                 .ok, .would_block => try WorkerRegistration.armWorkerPolls(self, registration_index),
@@ -97,7 +102,7 @@ pub fn Methods(comptime Self: type) type {
         /// Reads the control socket of the worker that the registration at
         /// `registration_index` reads, until the socket is empty, a bounded
         /// batch was read, or, with `.yield_to_backlog`, a connection the
-        /// responses went to has bytes to write first, the worker's
+        /// responses went to cannot take more for now, the worker's
         /// forwarding window has no room for another packet, or a packet
         /// left the worker with no request whose `request_done` is still to
         /// come. Returns `.would_block` once the socket is empty; `.ok` when

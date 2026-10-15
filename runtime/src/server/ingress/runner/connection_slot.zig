@@ -143,7 +143,16 @@ pub const Slot = struct {
     /// (`flow_control.zig:h2ConsumeOutboundWindow`,
     /// `h2SpendEarnedWindowUpdate`).
     h2_earned_window_updates: u32 = 0,
-    h2_write_buffer: [h2.frame_header_len * 2]u8 = undefined,
+    /// The socket took part of the write queue it was offered last, and its
+    /// write poll decides when the queue moves again (`write_queue.zig`).
+    h2_write_blocked: bool = false,
+    /// A drive of the connection runs now, and its own flushes write what is
+    /// queued meanwhile, so an append asks for no turn (`http2/connection.zig`).
+    h2_driving: bool = false,
+    /// Small frames the write queue holds, which its segments point into
+    /// (`write_queue.zig`).
+    h2_write_arena: [write_queue.write_arena_bytes]u8 = undefined,
+    h2_write_arena_len: usize = 0,
     h2_write_inline_segment: H2WriteSegment = .{},
     h2_write_inline_active: bool = false,
     h2_write_queue: std.ArrayListUnmanaged(H2WriteSegment) = .empty,
@@ -210,11 +219,13 @@ pub const Slot = struct {
 
     /// Whether the lane holds something of the connection that only the
     /// client can move: part of a frame or of a header block, writes the
-    /// socket has not taken, or response bytes flow control holds back.
+    /// socket refused, or response bytes flow control holds back. Bytes
+    /// queued for the connection's next flush wait for the lane, not for the
+    /// client.
     pub fn stalled(self: *const Slot) bool {
         return self.frame_reader.midFrame() or
             self.h2HasPendingHeaderBlock() or
-            self.h2WritesPending() or
+            self.h2WritesBlocked() or
             self.h2_pending_response_bytes != 0;
     }
 
@@ -387,9 +398,12 @@ pub const Slot = struct {
     pub const h2RestoreTakenPendingBodyConnectionCredit = flow_control.h2RestoreTakenPendingBodyConnectionCredit;
 
     pub const h2WritesPending = write_queue.h2WritesPending;
+    pub const h2WritesBlocked = write_queue.h2WritesBlocked;
+    pub const h2QueuedWriteBytes = write_queue.h2QueuedWriteBytes;
     pub const h2AppendWriteCopy = write_queue.h2AppendWriteCopy;
     pub const h2AppendOwnedWrite = write_queue.h2AppendOwnedWrite;
     pub const h2AppendChunkWrite = write_queue.h2AppendChunkWrite;
+    pub const h2ReserveWriteSegments = write_queue.h2ReserveWriteSegments;
     pub const h2AppendResponseChunk = write_queue.h2AppendResponseChunk;
     pub const h2PendingResponseChunk = write_queue.h2PendingResponseChunk;
     pub const h2TakeRetiredResponseChunk = write_queue.h2TakeRetiredResponseChunk;

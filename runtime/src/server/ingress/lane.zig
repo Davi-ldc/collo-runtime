@@ -140,6 +140,10 @@ pub const CounterSnapshot = struct {
     /// lane's header block budget.
     header_block_budget_closes: u64 = 0,
     h2_server_protocol_time_ns: u64 = 0,
+    /// Writes that put bytes on a client socket (`http2/writing.zig`), each
+    /// one TLS record or more, so their count against `completed_requests`
+    /// shows how many a response costs.
+    client_socket_writes: u64 = 0,
     ingress_channels_started: u64 = 0,
     h2_request_body_frames: u64 = 0,
     h2_request_body_bytes: u64 = 0,

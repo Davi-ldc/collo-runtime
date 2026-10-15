@@ -106,11 +106,15 @@ test "a connection's one deadline follows its state: pre-request, none while a s
     try expectDeadline(deadline_driver.desiredDeadline(&slot, timeouts), .stall, 2010);
 
     // No stream: idle from the moment the connection came to serve none,
-    // unless a write the socket has not taken stalls first.
+    // unless a write the socket refused stalls first. Bytes only queued for
+    // the pass's flush wait for the lane, not for the client.
     try std.testing.expect(slot.h2RemoveStream(std.testing.allocator, 1));
     slot.h2_pending_response_bytes = 0;
     slot.idle_since_ns = 5000;
+    try expectDeadline(deadline_driver.desiredDeadline(&slot, timeouts), .idle, 5300);
+    slot.h2_write_blocked = true;
     try expectDeadline(deadline_driver.desiredDeadline(&slot, timeouts), .stall, 2010);
+    slot.h2_write_blocked = false;
     slot.h2_write_len = 0;
     try expectDeadline(deadline_driver.desiredDeadline(&slot, timeouts), .idle, 5300);
 

@@ -7,7 +7,8 @@
 //! chunk past the window faults the worker, one
 //! WINDOW_UPDATE drains a stream, a full control socket keeps the newest
 //! total, and ring bytes go back at once. Also the order streams share a
-//! flush in, and a write queue too full for a head. Lane
+//! flush in, a write queue too full for a head, and a chunk's frames the
+//! queue cannot take whole. Lane
 //! `server-ingress-test`; local-e2e covers real worker streams.
 
 const std = @import("std");
@@ -77,8 +78,15 @@ const Writer = struct {
     /// chunk of the write was counted.
     grants: usize = 0,
     closed: bool = false,
+    lane: struct { counters: ingress.lane.CounterSnapshot = .{} } = .{},
 
     pub fn updateConnectionInterest(_: *Writer, _: *Slot) ingress.fault.LaneFault!void {}
+
+    /// The connection's turn, run at once, so what a call queued outside a
+    /// drive is written before it returns.
+    pub fn queueConnectionTurn(self: *Writer, slot: *Slot) ingress.fault.LaneFault!void {
+        _ = try writing.flushPendingWrite(Writer, self, slot);
+    }
 
     pub fn closeRuntimeConnection(self: *Writer, slot: *Slot, close: ingress.fault.ConnectionClose) void {
         self.closed = true;
@@ -438,18 +446,36 @@ fn fillSocket(socket: std.posix.fd_t) !usize {
     return error.SocketDidNotFill;
 }
 
-test "a failed DATA payload append closes without flushing its queued header" {
+test "a chunk's DATA frames that find no room in the queue's segment list leave the queue and the chunk as they were" {
     var fixture: Fixture = undefined;
     try fixture.init();
     defer fixture.deinit();
-    const pair = try fd.socketPairType(std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC | std.posix.SOCK.NONBLOCK);
-    defer std.posix.close(pair[0]);
-    defer std.posix.close(pair[1]);
-    fixture.slot.fd = pair[0];
-    _ = try fillSocket(pair[0]);
     var received = receivedChunk(1, identity, "body");
     try fixture.slot.h2AppendResponseChunk(allocator, &received);
+    // A frame's header and its payload segment take room in the list before
+    // the first is appended, and that allocation is the one that fails.
     var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    var writer: Writer = .{ .service = .{ .allocator = failing.allocator() } };
+    try std.testing.expectError(error.OutOfMemory, writing.flushPendingResponseData(Writer, &writer, &fixture.slot, 1));
+    try std.testing.expect(!writer.closed);
+    try std.testing.expect(fixture.slot.isOpen());
+    try std.testing.expect(!fixture.slot.h2WritesPending());
+    try std.testing.expectEqualStrings("body", fixture.slot.h2PendingResponseSlice(1).?);
+}
+
+test "a chunk's DATA frame whose header finds no room after the first frame closes without flushing that frame" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    // Two frames of two bytes each, and room in the slot's arena for the
+    // first one's header only, so the second header needs an allocation.
+    fixture.slot.h2_peer_settings.max_frame_size = 2;
+    const filler: [writes.write_arena_bytes - h2.frame_header_len]u8 = @splat(0);
+    try fixture.slot.h2AppendWriteCopy(allocator, &filler);
+    var received = receivedChunk(1, identity, "body");
+    try fixture.slot.h2AppendResponseChunk(allocator, &received);
+    // The list's room is allocation 0; the second header is allocation 1.
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 1 });
     var writer: Writer = .{ .service = .{ .allocator = failing.allocator() } };
     try std.testing.expectError(error.OutOfMemory, writing.flushPendingResponseData(Writer, &writer, &fixture.slot, 1));
     try std.testing.expect(writer.closed);

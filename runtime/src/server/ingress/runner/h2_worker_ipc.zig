@@ -81,7 +81,6 @@ const connection_flow = @import("connection_flow.zig");
 const connection_slot = @import("connection_slot.zig");
 const dispatch = @import("dispatch.zig");
 const request_slot = @import("request_slot.zig");
-const work_queues = @import("work_queues.zig");
 const request_done = @import("request_done.zig");
 const runner = @import("root.zig");
 
@@ -147,9 +146,9 @@ fn acquireForwardUnit(worker: *WorkerRecord) bool {
 pub const Handled = struct {
     /// `.ok`, or `.fault` with the worker's reason; never `.would_block`.
     outcome: WorkerOutcome = .ok,
-    /// A connection the packet's responses went to has bytes waiting to be
-    /// written, and the lane queued it to be driven: the drain stops here
-    /// and lets the loop write them before it reads more.
+    /// A connection the packet's responses went to cannot take more of a
+    /// worker's response now (`hasBacklog`): the drain stops here and leaves
+    /// the rest of the worker's output to the lane's next pass.
     yield: bool = false,
 };
 
@@ -159,7 +158,6 @@ pub fn Methods(comptime Self: type) type {
         const Done = request_done.Methods(Self);
         const Connection = connection_flow.Methods(Self);
         const Dispatch = dispatch.Methods(Self);
-        const Queues = work_queues.Methods(Self);
 
         /// The request a descriptor acts on and the connection its stream
         /// lives on.
@@ -211,9 +209,8 @@ pub fn Methods(comptime Self: type) type {
 
         /// Applies a descriptor another lane's reader forwarded for a request
         /// of this lane, as `handleWorkerDescriptor` applies one this lane
-        /// read, and ends the command's window unit before it drives the
-        /// connection or finishes the request: a ring payload's answer takes
-        /// it to the reader. Returns `.fault` when the descriptor shows the
+        /// read, and ends the command's window unit once it is applied: a
+        /// ring payload's answer takes it to the reader. Returns `.fault` when the descriptor shows the
         /// worker faulty; the caller runs the death path for
         /// `forwarded.worker_key`, which this lane may not read. The caller
         /// keeps `forwarded` and frees it (`ForwardedDescriptor.deinit`).
@@ -255,17 +252,11 @@ pub fn Methods(comptime Self: type) type {
                 },
             }
             defer received.deinit();
-            // A drive can end the request, and its slot may go back to the
-            // pool only after the reader has the answer.
             const outcome = try queueDescriptor(self, target, &received);
+            // The descriptor copied any ring bytes it keeps into its chunk,
+            // so the answer may let the reader free them.
             try endForwardedUnit(self, forwarded);
-            switch (outcome) {
-                .ok => {},
-                .would_block, .fault => return outcome,
-            }
-            try driveBacklog(self, target.runtime);
-            _ = yieldForBacklog(self, target.runtime);
-            return .ok;
+            return outcome;
         }
 
         /// Drops a forwarded descriptor the lane will never apply, at its
@@ -369,7 +360,7 @@ pub fn Methods(comptime Self: type) type {
                 };
                 return .{ .outcome = try Done.completeRequest(self, registration.worker_key, descriptor, done) };
             }
-            const resolution = try resolveAfterBacklog(self, registration.worker_key, descriptor);
+            const resolution = try resolveDescriptor(self, registration.worker_key, descriptor);
             const target = switch (resolution) {
                 .local => |target| target,
                 .stale => {
@@ -384,29 +375,7 @@ pub fn Methods(comptime Self: type) type {
                 .ok => {},
                 .would_block, .fault => return .{ .outcome = outcome },
             }
-            try driveBacklog(self, target.runtime);
-            return .{ .yield = yieldForBacklog(self, target.runtime) };
-        }
-
-        /// Matches a descriptor read by this lane to its request, after
-        /// driving the request's connection when it has bytes waiting, so
-        /// they go out before more of the worker's response. The drive may
-        /// end the request or its stream, so the match comes after it.
-        fn resolveAfterBacklog(
-            self: *Self,
-            worker_key: lifecycle.WorkerKey,
-            descriptor: Descriptor,
-        ) LaneFault!Resolution {
-            const resolution = try resolveDescriptor(self, worker_key, descriptor);
-            switch (resolution) {
-                .local => |target| {
-                    if (!hasBacklog(target.runtime))
-                        return resolution;
-                    try driveBacklog(self, target.runtime);
-                    return resolveDescriptor(self, worker_key, descriptor);
-                },
-                .stale, .fault => return resolution,
-            }
+            return .{ .yield = hasBacklog(target.runtime) };
         }
 
         /// Sends a descriptor of another lane's response to that lane, under
@@ -715,28 +684,6 @@ pub fn Methods(comptime Self: type) type {
             return null;
         }
 
-        /// Drives a connection with bytes waiting before more of a worker's
-        /// response goes onto it, its deadline brought in step as after any
-        /// drive.
-        fn driveBacklog(self: *Self, runtime: *ConnectionSlot) LaneFault!void {
-            if (!runtime.isOpen() or runtime.state != .http2_connection)
-                return;
-            if (!hasBacklog(runtime))
-                return;
-            _ = try Connection.driveHttp2(self, runtime);
-        }
-
-        /// Queues the connection to be driven when it has bytes waiting, and
-        /// says whether it did.
-        fn yieldForBacklog(self: *Self, runtime: *ConnectionSlot) bool {
-            if (!runtime.isLive() or runtime.state != .http2_connection)
-                return false;
-            if (!hasBacklog(runtime))
-                return false;
-            Queues.enqueueConnection(self, runtime.key.slot);
-            return true;
-        }
-
         fn resetClientStream(
             self: *Self,
             runtime: *ConnectionSlot,
@@ -812,8 +759,14 @@ fn endsResponse(descriptor: Descriptor) bool {
     return descriptor.hasFlag(ipc.ingress_channel.flags.end_stream);
 }
 
-fn hasBacklog(runtime: *ConnectionSlot) bool {
-    if (runtime.h2WritesPending())
+/// Whether an open connection cannot take more of a worker's response now:
+/// its socket refuses queued writes, or its send windows hold response bytes
+/// or an END_STREAM back. Bytes queued for the connection's next flush are no
+/// backlog, since the pass writes them (`http2/writing.zig`).
+fn hasBacklog(runtime: *const ConnectionSlot) bool {
+    if (!runtime.isOpen())
+        return false;
+    if (runtime.h2WritesBlocked())
         return true;
     if (runtime.h2_pending_response_bytes != 0)
         return true;

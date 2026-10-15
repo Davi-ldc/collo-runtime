@@ -13,6 +13,16 @@
 //! - The queue holds at most `max_queued_write_bytes`. An append past it
 //!   fails with `error.Http2WriteBackpressure` and leaves the queue as it
 //!   was.
+//! - Queued and blocked are two states. Bytes wait in the queue for the
+//!   connection's next write (`http2/writing.zig`), and the queue is blocked
+//!   (`Slot.h2_write_blocked`) only from a write the socket took in part
+//!   until a write empties it; every backpressure decision reads blocked.
+//!   An unblocked queue therefore holds only bytes no write offered yet:
+//!   less than `cork_bytes_max`, plus the one append that reaches it and
+//!   writes them all.
+//! - Small frames are copied into the slot's arena (`Slot.h2_write_arena`),
+//!   which queued segments point into, so its room comes back only when the
+//!   queue empties.
 //! - Buffered responses stay within
 //!   `max_h2_pending_response_bytes_per_stream` on a stream and
 //!   `max_h2_pending_response_bytes_per_connection` across the connection,
@@ -150,6 +160,22 @@ pub fn h2PendingResponseChunk(self: *Slot, stream_id: u32) ?*ResponseChunk {
 
 /// Bytes a connection may hold queued toward the client.
 pub const max_queued_write_bytes: usize = 1024 * 1024;
+/// Bytes an unblocked queue holds before the append that reaches them writes
+/// the queue at once instead of at the connection's next flush: four TLS
+/// records of the largest size, so the frames of a pass share records while
+/// a large or streamed body still leaves as it arrives.
+pub const cork_bytes_max: usize = 64 * 1024;
+/// The slot's room for small frames: frame headers, control frames and the
+/// WINDOW_UPDATE frames of a few streams.
+pub const write_arena_bytes: usize = 128;
+
+comptime {
+    // An unblocked queue holds less than the cork plus one append, the
+    // largest of which is a worker's chunk with its frame headers or a
+    // response head, so it stays far from the bound that closes the
+    // connection.
+    std.debug.assert(cork_bytes_max + 2 * limits.http_body.INGRESS_RESPONSE_CHUNK_BYTES < max_queued_write_bytes);
+}
 
 /// What a stream holds when its worker's response fills its credit window.
 /// A stream holds a worker's response or a server response, never both, and
@@ -159,19 +185,35 @@ pub const max_h2_pending_response_bytes_per_stream: usize =
 pub const max_h2_pending_response_bytes_per_connection: usize =
     limits.ingress.streams_per_connection_max * max_h2_pending_response_bytes_per_stream;
 
-/// Bytes wait in the write queue, so reading waits too.
+/// Bytes wait in the write queue for the connection's next write.
 pub fn h2WritesPending(self: *const Slot) bool {
     return self.h2_write_offset < self.h2_write_len;
 }
 
+/// The socket took part of the queue it was offered last, so its write poll
+/// decides when the queue moves again, and reading, more response DATA and
+/// the drain of a worker's output wait for it (the file header).
+pub fn h2WritesBlocked(self: *const Slot) bool {
+    if (self.h2_write_blocked)
+        std.debug.assert(self.h2WritesPending());
+    return self.h2_write_blocked;
+}
+
+/// Bytes queued and not yet written.
+pub fn h2QueuedWriteBytes(self: *const Slot) usize {
+    return self.h2_write_len - self.h2_write_offset;
+}
+
 /// Copies `bytes` to the end of the write queue without writing them.
 pub fn h2AppendWriteCopy(self: *Slot, allocator: std.mem.Allocator, bytes: []const u8) !void {
-    // A small control frame skips the allocation by using the slot's write
-    // buffer, but only while nothing is queued: a queued segment may still
-    // point into that buffer.
-    if (!self.h2WritesPending() and bytes.len <= self.h2_write_buffer.len) {
-        @memcpy(self.h2_write_buffer[0..bytes.len], bytes);
-        return appendSegment(self, allocator, self.h2_write_buffer[0..bytes.len], false, null);
+    // A small frame takes room in the slot's arena instead of an allocation;
+    // the room comes back once the queue empties.
+    if (bytes.len <= self.h2_write_arena.len - self.h2_write_arena_len) {
+        const copy = self.h2_write_arena[self.h2_write_arena_len..][0..bytes.len];
+        @memcpy(copy, bytes);
+        try appendSegment(self, allocator, copy, false, null);
+        self.h2_write_arena_len += bytes.len;
+        return;
     }
     const owned = try allocator.dupe(u8, bytes);
     errdefer allocator.free(owned);
@@ -183,6 +225,20 @@ pub fn h2AppendWriteCopy(self: *Slot, allocator: std.mem.Allocator, bytes: []con
 pub fn h2AppendOwnedWrite(self: *Slot, allocator: std.mem.Allocator, owned: []u8) !void {
     errdefer allocator.free(owned);
     try appendSegment(self, allocator, owned, true, null);
+}
+
+/// Takes room for `segments` more segments holding `bytes` more bytes, so
+/// appends within it fail only for an allocation of their own, such as a
+/// small frame the arena has no room for. Fails with
+/// `error.Http2WriteBackpressure` when the bytes would pass
+/// `max_queued_write_bytes`, or with `error.OutOfMemory`, leaving the queue
+/// as it was.
+pub fn h2ReserveWriteSegments(self: *Slot, allocator: std.mem.Allocator, segments: usize, bytes: usize) !void {
+    const queued_len = self.h2_write_len - self.h2_write_offset;
+    const next_len = std.math.add(usize, queued_len, bytes) catch return error.MessageTooLarge;
+    if (next_len > max_queued_write_bytes)
+        return error.Http2WriteBackpressure;
+    try self.h2_write_queue.ensureUnusedCapacity(allocator, segments);
 }
 
 /// Queues `bytes`, a view into `chunk`, which keeps them alive until the
@@ -291,6 +347,8 @@ pub fn h2ConsumeQueuedWrite(self: *Slot, allocator: std.mem.Allocator, written: 
         self.h2_write_queue_start = 0;
         self.h2_write_len = 0;
         self.h2_write_offset = 0;
+        // No segment points into the arena any more.
+        self.h2_write_arena_len = 0;
         return;
     }
 
@@ -339,6 +397,8 @@ fn h2ClearWriteQueueRetainingCapacity(self: *Slot, allocator: std.mem.Allocator)
     self.h2_write_queue_start = 0;
     self.h2_write_len = 0;
     self.h2_write_offset = 0;
+    self.h2_write_arena_len = 0;
+    self.h2_write_blocked = false;
 }
 
 pub fn h2HasPendingResponse(self: *Slot, stream_id: u32) bool {

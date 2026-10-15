@@ -1599,6 +1599,9 @@ pub const ClientStream = struct {
     /// Informational responses (1xx) before the final one.
     informational_count: u8 = 0,
     body_len: usize = 0,
+    /// The body's bytes in the order they arrived, hashed, so a test checks
+    /// a body too large to keep against what the worker sent.
+    body_digest: std.hash.Fnv1a_64 = .init(),
     ended: bool = false,
     reset_code: ?u32 = null,
     /// RST_STREAM frames the stream received; a server sends one at most.
@@ -1919,6 +1922,7 @@ pub const Client = struct {
             .data => {
                 const entry = self.streamEntry(header.stream_id) orelse return error.FrameOnUnknownStream;
                 entry.body_len += payload.len;
+                entry.body_digest.update(payload);
                 if (header.flags.end_stream)
                     entry.ended = true;
             },

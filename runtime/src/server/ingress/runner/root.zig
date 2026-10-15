@@ -445,6 +445,7 @@ pub fn LaneWorker(comptime Service: type) type {
         pub const responseChunkRetired = dispatch.Methods(Self).responseChunkRetired;
         pub const grantResponseCredit = dispatch.Methods(Self).grantResponseCredit;
         pub const updateConnectionInterest = connection_flow.Methods(Self).updateConnectionInterest;
+        pub const queueConnectionTurn = connection_flow.Methods(Self).queueConnectionTurn;
         pub const closeRuntimeConnection = connection_flow.Methods(Self).closeRuntimeConnection;
     };
 }

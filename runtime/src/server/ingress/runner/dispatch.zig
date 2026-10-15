@@ -30,9 +30,9 @@
 //!   back.
 //! - A send that fails for the worker's doing stops the request's sends. Met
 //!   inside a stream handler, it queues the worker's death path for after the
-//!   handler (`worker_fault.deferWorkerFault`), since that path drives other
-//!   connections; the loop handler that retries blocked sends runs it at once
-//!   (`flushBlockedSends`).
+//!   handler (`worker_fault.deferWorkerFault`), since that path ends requests
+//!   on other streams; the loop handler that retries blocked sends runs it at
+//!   once (`flushBlockedSends`).
 //! - A request's egress token comes from the lane's own lease (`Lease.mint`
 //!   in `server/gateway/lease.zig`), which the loop renews at the start of
 //!   each pass (`ring_driver.zig`), so a dispatch never takes the manager's
