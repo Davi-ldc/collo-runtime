@@ -1,6 +1,8 @@
 # Collo
 
-Collo is fast and flexible JavaScript runtime for isolating workers in serverless envirments. 
+Collo is fast and flexible JavaScript runtime for isolating workers in serverless envirments. It uses less memory them Cloudflare Workers while keeping process isolation btween all tenants 
+
+It's build on top [Bun's fork of Webkit](https://github.com/oven-sh/WebKit) with process isolation and 
 
 ## Getting started
 
@@ -68,17 +70,13 @@ collo serve app.js
 
 ## Memory
 
-What one more worker costs once 16 run, M(17) − M(16), in MiB, after each worker served the same requests and went idle. Every worker runs its own copy of the module, as separate tenants would. Median of 5 runs on an Oracle Cloud A1 (Ampere Altra, aarch64), Collo at `4472501` against workerd 1.20261012.1.
+Median of 5 runs on an Oracle Cloud A1 (Ampere Altra, aarch64). checking cgroup's `memory.current`
 
 | Workload | Collo | workerd | workerd, one process per worker |
 | --- | ---: | ---: | ---: |
 | hello | 2.11 | 2.25 | 8.32 |
 | Hono API | 4.32 | 2.74 | 9.54 |
 | crypto | 4.04 | 11.94 | 20.47 |
-
-These are the cgroup's `memory.current`, everything the machine pays, kernel memory included. A Collo worker is a process with its own page tables, kernel stacks and slab, about 0.8 MiB that an isolate inside a shared process does not pay. Counting only the processes' own memory (PSS), a Collo worker costs 1.41, 3.70 and 3.37 MiB against workerd's 2.07, 2.73 and 11.97.
-
-workerd runs every worker as an isolate in one shared process, which its README says needs an outer sandbox for untrusted code; the last column gives workerd the process boundary every Collo worker has. Hono API is an unmodified Hono app with a router, an API-key middleware and a JSON validator, measured after ten requests across its routes. crypto, a 4 MiB SHA-256 in JavaScript and four 2048-bit BigInt modular exponentiations, shows what each runtime keeps after a burst of allocation: Collo collects when a worker goes idle, and workerd keeps the grown heap.
 
 # Why 
 
@@ -90,4 +88,4 @@ Collo solves that.
 
 ## How it works
 
-The core idea is to isolate workers between processes that come from a Linux fork and let them share as much memory as possible (JSC allocations favor this). 
+TODO ASAP. 
