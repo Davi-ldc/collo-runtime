@@ -1,8 +1,12 @@
 # Collo
 
-Collo is fast and flexible JavaScript runtime for isolating workers in serverless envirments. It uses less memory them Cloudflare Workers while keeping process isolation btween all tenants 
+JavaScript will soon be faster than Go and > 50% of all agent written code. Colo is the cheapest, fastest and most flexible way of running it on the server.
 
-It's build on top [Bun's fork of Webkit](https://github.com/oven-sh/WebKit) with process isolation and 
+Like Cloudflare Workers, Collo aims to reduce JavaScript runtime overhead between tenants. But instead of isolating in the same process (which prevents multi-threading, impacts performance, and compromises security), Collo gives each worker its own process that shares global memory from a zygote. A Collo worker uses 10% less memory (1.95 MiB), and is 10-50% faster than an isolate in Workerd with none of the compromises (no real fs, multithreading, eval/new function, safety[^1])
+
+It's also built on top of Bun's fork of Webkit/JavaScriptCore to support future [aot compilation](https://github.com/oven-sh/WebKit/pull/757), [multithreading](https://github.com/oven-sh/WebKit/pull/249), and [jitcache](https://github.com/Davi-ldc/jitcache) 
+
+[bench](bench.md)
 
 ## Getting started
 
@@ -68,7 +72,7 @@ To serve one module on every path without a `collo.json` (its `fetch` may reach 
 collo serve app.js
 ```
 
-# Why 
+## Why 
 
 With [sound types, aot compilation](https://github.com/oven-sh/WebKit/pull/757), [multithreading](https://github.com/oven-sh/WebKit/pull/249), and [jitcache](https://github.com/Davi-ldc/jitcache) JS will soon be faster them go and > 50% of all agent writen code. 
 
@@ -80,14 +84,6 @@ Collo solves that.
 
 TODO.
 
+## Footnotes
 
-## Bench
-
-### Memory
-Median of 5 runs on an Oracle Cloud A1 (Ampere Altra, aarch64). checking cgroup's `memory.current`
-
-| Workload | Collo | workerd | workerd, one process per worker |
-| --- | ---: | ---: | ---: |
-| hello | 2.11 | 2.25 | 8.32 |
-| Hono API | 4.32 | 2.74 | 9.54 |
-| crypto | 4.04 | 11.94 | 20.47 |
+[^1]: Unlike Collo, workerd is not a hardened sandbox by itself. CloudFlare [uses many additional layers of defense-in-depth.](https://blog.cloudflare.com/mitigating-spectre-and-other-security-threats-the-cloudflare-workers-security-model/)

@@ -1,0 +1,9 @@
+{
+  "name": "collo-memory-bench",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "hono": "4.13.13",
+    "workerd": "1.20261012.1"
+  }
+}
