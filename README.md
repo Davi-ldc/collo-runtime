@@ -82,6 +82,8 @@ Collo solves that.
 
 ## How it works
 
+![How Collo works](assets/collo.gif)
+
 TODO.
 
 ## Footnotes
